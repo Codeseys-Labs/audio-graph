@@ -24,12 +24,22 @@ Date: 2026-08-14
   and v2 inputs. It preserves legacy values as `legacy_unspecified` or
   unavailable, leaves legacy source ordinal absent, and has no fields for
   provider item/segment ids, raw event references, latencies, received time, or
-  storage metadata.
+  storage metadata. Its fields are private, so callers can only obtain a valid
+  record from the legacy/v2 normalization seam and inspect it read-only.
 - Added the dormant `projection_basis_hash_v2` module. Its positioned input uses
   first canonical Accepted sequence only to sort; sequence numbers are not
   encoded. The encoder validates unique nonzero positions, strictly increasing
   same-source v2 ordinals, exact v2 supersession, finite evidence, and semantic
   invariants before emitting `sha256:<lowercase hex>`.
+- Added typed public decode paths for v2 and compatible legacy/v2 JSON. Callers
+  can distinguish unsupported contract, enum, option, and boolean tags from
+  malformed values, identity mismatches, and invalid supersession without any
+  input content appearing in the error.
+- Added a defense-in-depth pre-hash validator that rejects v2 records carrying
+  legacy-unspecified evidence, legacy records carrying provider/app evidence,
+  empty legacy supersession references, and v2 source/ordinal/span-id identity
+  mismatches. The included-field mutation matrix now creates only valid
+  revisions through `SpeechSpanRevisionNormalizer`.
 - Added a shared golden catalog with the four active ADR-0036 digests and an
   independently implemented Bun normalizer/encoder/verifier.
 - Added focused public-seam and conformance tests for v2 access, legacy/v2
@@ -56,18 +66,32 @@ Date: 2026-08-14
    exist.
 4. GREEN — focused `projection_basis_hash_v2` tests passed `5 passed; 0 failed`
    after implementing the encoder one vertical slice at a time.
+5. Correction RED — typed v2 and compatible decoders failed to compile because
+   `SpeechSpanRevisionDecodeError`, `decode_json_value`, and the unsupported-tag
+   variants did not exist. GREEN added matchable content-free categories for
+   unsupported contract/enum/option/boolean tags versus malformed, identity,
+   and supersession failures.
+6. Correction RED — positioned decoding failed with missing hash error variants
+   and no typed JSON constructor. GREEN preserved every typed decode category
+   through `PositionedProjectionSemanticRevision::decode_json_value`.
+7. Correction RED — cross-payload conformance failed because the normalized
+   record allowed crate-internal field mutation and the hash error lacked an
+   unsupported-combination variant. GREEN made all fields private, replaced the
+   invalid mutation matrix with normalizer-built revisions, and added pre-hash
+   rejection for every reviewed impossible combination.
 
 ## Gates and real results
 
 - IPC contract tests:
-  `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml -p audio-graph-ipc-contract speech_span_revision -- --nocapture`
-  — PASS, `5 passed; 0 failed`.
+  `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml -p audio-graph-ipc-contract -- --nocapture`
+  — PASS, `19 passed; 0 failed`; the focused Speech Span subset was
+  `6 passed; 0 failed`.
 - Application speech normalization tests:
   `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud speech_span_revision -- --nocapture --test-threads=1`
-  — PASS, `10 passed; 0 failed`.
+  — PASS, `12 passed; 0 failed`.
 - Focused Rust hash-v2 conformance:
   `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud projection_basis_hash_v2 -- --nocapture --test-threads=1`
-  — PASS, `5 passed; 0 failed`.
+  — PASS, `6 passed; 0 failed`.
 - Independent verifier:
   `bun scripts/verify-projection-basis-hash-v2.mjs`
   — PASS, all four exact design digests reproduced:
@@ -83,9 +107,9 @@ Date: 2026-08-14
 - Locked cloud check:
   `cargo +1.95.0 check --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud`
   — PASS, exit 0.
-- Full serialized cloud lib suite, run once:
+- Full serialized cloud lib suite, rerun once after the correction:
   `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud -- --test-threads=1`
-  — PASS, `1577 passed; 0 failed; 8 ignored`.
+  — PASS, `1580 passed; 0 failed; 8 ignored`.
 - Strict Clippy:
   `cargo +1.95.0 clippy --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud -- -D warnings`
   — PASS, exit 0.
@@ -100,7 +124,7 @@ Date: 2026-08-14
   `bun scripts/check-docs-secret-hygiene.mjs`
   — PASS, `0 findings`.
 - Betterleaks over the implementation footprint:
-  `betterleaks dir --no-banner --redact <owned source, fixture, verifier, and report paths>`
+  `betterleaks dir --no-banner --redact src-tauri/crates/ipc-contract/src/speech_span_revision.rs src-tauri/src/speech_span_revision.rs src-tauri/src/projection_basis_hash_v2.rs src-tauri/src/lib.rs src-tauri/fixtures/projection_basis_hash_v2/goldens.json scripts/verify-projection-basis-hash-v2.mjs docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-ab64-report.md`
   — PASS, no leaks found.
 - Diff hygiene: `git diff --check` — PASS.
 

@@ -1,8 +1,9 @@
 pub use audio_graph_ipc_contract::speech_span_revision::{
     SPEECH_SPAN_CONTRACT_VERSION, SpanObservation, SpeechChannelFidelity, SpeechConfidence,
-    SpeechSpanRevision, SpeechSpanRevisionError, SpeechSpanRevisionNormalizer,
-    SpeechSpanRevisionRef, SpeechSpanSourceOrder, SpeechSpanStability, SpeechSpeakerFidelity,
-    SpeechSpeakerValue, SpeechTiming, SpeechTimingPrecision, SpeechTurnFidelity, SpeechTurnValue,
+    SpeechSpanRevision, SpeechSpanRevisionDecodeError, SpeechSpanRevisionError,
+    SpeechSpanRevisionNormalizer, SpeechSpanRevisionRef, SpeechSpanSourceOrder,
+    SpeechSpanStability, SpeechSpeakerFidelity, SpeechSpeakerValue, SpeechTiming,
+    SpeechTimingPrecision, SpeechTurnFidelity, SpeechTurnValue, expected_speech_span_id,
 };
 
 #[derive(Clone, PartialEq)]
@@ -123,23 +124,29 @@ pub enum ProjectionSemanticChannel {
 /// Operational and storage metadata have no representation in this type, so
 /// neither the hash encoder nor a future projection prompt can accidentally
 /// consume them through this seam.
+///
+/// ```compile_fail
+/// # fn inspect(revision: audio_graph::speech_span_revision::ProjectionSemanticRevision) {
+/// revision.payload_kind = audio_graph::speech_span_revision::ProjectionSemanticPayloadKind::LegacyV1;
+/// # }
+/// ```
 #[derive(Clone, PartialEq)]
 pub struct ProjectionSemanticRevision {
-    pub(crate) payload_kind: ProjectionSemanticPayloadKind,
-    pub(crate) span_id: String,
-    pub(crate) source_id: String,
-    pub(crate) source_ordinal: Option<u64>,
-    pub(crate) provider: String,
-    pub(crate) text: String,
-    pub(crate) stability: ProjectionSemanticStability,
-    pub(crate) is_final: bool,
-    pub(crate) revision_number: u64,
-    pub(crate) supersession: ProjectionSemanticSupersession,
-    pub(crate) timing: ProjectionSemanticTiming,
-    pub(crate) confidence: ProjectionSemanticConfidence,
-    pub(crate) turn: ProjectionSemanticTurn,
-    pub(crate) speaker: ProjectionSemanticSpeaker,
-    pub(crate) channel: ProjectionSemanticChannel,
+    payload_kind: ProjectionSemanticPayloadKind,
+    span_id: String,
+    source_id: String,
+    source_ordinal: Option<u64>,
+    provider: String,
+    text: String,
+    stability: ProjectionSemanticStability,
+    is_final: bool,
+    revision_number: u64,
+    supersession: ProjectionSemanticSupersession,
+    timing: ProjectionSemanticTiming,
+    confidence: ProjectionSemanticConfidence,
+    turn: ProjectionSemanticTurn,
+    speaker: ProjectionSemanticSpeaker,
+    channel: ProjectionSemanticChannel,
 }
 
 impl ProjectionSemanticRevision {
@@ -202,10 +209,102 @@ impl ProjectionSemanticRevision {
     pub fn channel(&self) -> &ProjectionSemanticChannel {
         &self.channel
     }
+
+    pub(crate) fn validate_for_hash(&self) -> Result<(), ProjectionSemanticError> {
+        match self.payload_kind {
+            ProjectionSemanticPayloadKind::LegacyV1 => {
+                if self.source_ordinal.is_some()
+                    || matches!(
+                        self.supersession,
+                        ProjectionSemanticSupersession::V2Exact { .. }
+                    )
+                    || !matches!(
+                        self.timing,
+                        ProjectionSemanticTiming::Unavailable
+                            | ProjectionSemanticTiming::LegacyUnspecified { .. }
+                    )
+                    || !matches!(
+                        self.confidence,
+                        ProjectionSemanticConfidence::Unavailable
+                            | ProjectionSemanticConfidence::LegacyUnspecified { .. }
+                    )
+                    || !matches!(
+                        self.turn,
+                        ProjectionSemanticTurn::Unavailable
+                            | ProjectionSemanticTurn::LegacyUnspecified { .. }
+                    )
+                    || !matches!(
+                        self.speaker,
+                        ProjectionSemanticSpeaker::Unavailable
+                            | ProjectionSemanticSpeaker::LegacyUnspecified { .. }
+                    )
+                    || !matches!(
+                        self.channel,
+                        ProjectionSemanticChannel::Unavailable
+                            | ProjectionSemanticChannel::LegacyUnspecified { .. }
+                    )
+                {
+                    return Err(ProjectionSemanticError::UnsupportedSemanticCombination);
+                }
+                if matches!(
+                    &self.supersession,
+                    ProjectionSemanticSupersession::LegacyReference { reference }
+                        if reference.trim().is_empty()
+                ) {
+                    return Err(ProjectionSemanticError::InvalidSupersession);
+                }
+            }
+            ProjectionSemanticPayloadKind::SpeechSpanRevisionV2 => {
+                let ordinal = self
+                    .source_ordinal
+                    .filter(|ordinal| *ordinal > 0)
+                    .ok_or(ProjectionSemanticError::IdentityMismatch)?;
+                if self.span_id != expected_speech_span_id(&self.source_id, ordinal) {
+                    return Err(ProjectionSemanticError::IdentityMismatch);
+                }
+                if matches!(
+                    self.supersession,
+                    ProjectionSemanticSupersession::LegacyReference { .. }
+                ) || matches!(
+                    self.timing,
+                    ProjectionSemanticTiming::LegacyUnspecified { .. }
+                ) || matches!(
+                    self.confidence,
+                    ProjectionSemanticConfidence::LegacyUnspecified { .. }
+                ) || matches!(self.turn, ProjectionSemanticTurn::LegacyUnspecified { .. })
+                    || matches!(
+                        self.speaker,
+                        ProjectionSemanticSpeaker::LegacyUnspecified { .. }
+                    )
+                    || matches!(
+                        self.channel,
+                        ProjectionSemanticChannel::LegacyUnspecified { .. }
+                    )
+                {
+                    return Err(ProjectionSemanticError::UnsupportedSemanticCombination);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProjectionSemanticError {
+    #[error("unsupported projection semantic contract version")]
+    UnsupportedContractVersion,
+    #[error("unsupported projection semantic enum tag")]
+    UnsupportedEnumTag,
+    #[error("unsupported projection semantic option tag")]
+    UnsupportedOptionTag,
+    #[error("unsupported projection semantic boolean tag")]
+    UnsupportedBooleanTag,
+    #[error("malformed projection semantic value")]
+    MalformedValue,
+    #[error("projection semantic identity mismatch")]
+    IdentityMismatch,
+    #[error("unsupported projection semantic payload/evidence combination")]
+    UnsupportedSemanticCombination,
     #[error("projection semantic revision has an invalid required string")]
     InvalidRequiredString,
     #[error("projection semantic revision has an invalid revision number")]
@@ -332,12 +431,40 @@ impl CompatibleSpeechSpanRevision {
         }
     }
 
+    pub fn decode_json_value(value: serde_json::Value) -> Result<Self, ProjectionSemanticError> {
+        match value.get("contract_version") {
+            None => decode_legacy_json_value(value).map(Self::LegacyV1),
+            Some(serde_json::Value::Number(version)) if version.as_u64() == Some(2) => {
+                SpeechSpanRevision::decode_json_value(value)
+                    .map(Self::V2)
+                    .map_err(ProjectionSemanticError::from)
+            }
+            Some(_) => Err(ProjectionSemanticError::UnsupportedContractVersion),
+        }
+    }
+
     pub fn into_legacy_transcript_event(
         self,
     ) -> Result<crate::projections::TranscriptEvent, SpeechSpanRevisionError> {
         match self {
             Self::LegacyV1(revision) => revision.into_transcript_event(),
             Self::V2(_) => Err(SpeechSpanRevisionError::LegacyProjectionUnavailable),
+        }
+    }
+}
+
+impl From<SpeechSpanRevisionDecodeError> for ProjectionSemanticError {
+    fn from(error: SpeechSpanRevisionDecodeError) -> Self {
+        match error {
+            SpeechSpanRevisionDecodeError::UnsupportedContractVersion => {
+                Self::UnsupportedContractVersion
+            }
+            SpeechSpanRevisionDecodeError::UnsupportedEnumTag => Self::UnsupportedEnumTag,
+            SpeechSpanRevisionDecodeError::UnsupportedOptionTag => Self::UnsupportedOptionTag,
+            SpeechSpanRevisionDecodeError::UnsupportedBooleanTag => Self::UnsupportedBooleanTag,
+            SpeechSpanRevisionDecodeError::MalformedValue => Self::MalformedValue,
+            SpeechSpanRevisionDecodeError::IdentityMismatch => Self::IdentityMismatch,
+            SpeechSpanRevisionDecodeError::InvalidSupersession => Self::InvalidSupersession,
         }
     }
 }
@@ -546,6 +673,85 @@ fn validate_semantic_f64(value: Option<f64>) -> Result<(), ProjectionSemanticErr
     }
 }
 
+fn decode_legacy_json_value(
+    value: serde_json::Value,
+) -> Result<LegacySpeechSpanRevision, ProjectionSemanticError> {
+    validate_legacy_json_tags(&value)?;
+    let wire: LegacyTranscriptEventWire =
+        serde_json::from_value(value).map_err(|_| ProjectionSemanticError::MalformedValue)?;
+    if wire.span_id.trim().is_empty() || wire.source_id.trim().is_empty() {
+        return Err(ProjectionSemanticError::IdentityMismatch);
+    }
+    if wire
+        .supersedes
+        .as_deref()
+        .is_some_and(|reference| reference.trim().is_empty())
+    {
+        return Err(ProjectionSemanticError::InvalidSupersession);
+    }
+    wire.try_into().map_err(|error| match error {
+        SpeechSpanRevisionError::InvalidCorrelation => {
+            ProjectionSemanticError::InvalidRevisionNumber
+        }
+        SpeechSpanRevisionError::InvalidTiming | SpeechSpanRevisionError::InvalidConfidence => {
+            ProjectionSemanticError::MalformedValue
+        }
+        _ => ProjectionSemanticError::MalformedValue,
+    })
+}
+
+fn validate_legacy_json_tags(value: &serde_json::Value) -> Result<(), ProjectionSemanticError> {
+    let object = value
+        .as_object()
+        .ok_or(ProjectionSemanticError::MalformedValue)?;
+    if let Some(stability) = object.get("stability")
+        && !matches!(stability.as_str(), Some("partial" | "final"))
+    {
+        return Err(ProjectionSemanticError::UnsupportedEnumTag);
+    }
+    for field in [
+        "provider_item_id",
+        "transcript_segment_id",
+        "speaker_id",
+        "speaker_label",
+        "channel",
+        "supersedes",
+        "turn_id",
+        "raw_event_ref",
+    ] {
+        validate_legacy_option(object.get(field), serde_json::Value::is_string)?;
+    }
+    for field in ["start_time", "end_time", "confidence"] {
+        validate_legacy_option(object.get(field), serde_json::Value::is_number)?;
+    }
+    for field in ["capture_latency_ms", "asr_latency_ms"] {
+        validate_legacy_option(object.get(field), |value| value.as_u64().is_some())?;
+    }
+    if let Some(value) = object.get("is_final")
+        && !value.is_boolean()
+    {
+        return Err(ProjectionSemanticError::UnsupportedBooleanTag);
+    }
+    if let Some(value) = object.get("end_of_turn")
+        && !value.is_null()
+        && !value.is_boolean()
+    {
+        return Err(ProjectionSemanticError::UnsupportedBooleanTag);
+    }
+    Ok(())
+}
+
+fn validate_legacy_option(
+    value: Option<&serde_json::Value>,
+    valid_present: impl FnOnce(&serde_json::Value) -> bool,
+) -> Result<(), ProjectionSemanticError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(value) if valid_present(value) => Ok(()),
+        Some(_) => Err(ProjectionSemanticError::UnsupportedOptionTag),
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for CompatibleSpeechSpanRevision {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -554,21 +760,8 @@ impl<'de> serde::Deserialize<'de> for CompatibleSpeechSpanRevision {
         use serde::de::Error as _;
 
         let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
-        match value.get("contract_version") {
-            None => serde_json::from_value::<LegacyTranscriptEventWire>(value)
-                .map_err(|_| D::Error::custom("invalid legacy speech span revision"))?
-                .try_into()
-                .map(Self::LegacyV1)
-                .map_err(|_| D::Error::custom("invalid legacy speech span revision")),
-            Some(serde_json::Value::Number(version)) if version.as_u64() == Some(2) => {
-                serde_json::from_value(value)
-                    .map(Self::V2)
-                    .map_err(|_| D::Error::custom("invalid v2 speech span revision"))
-            }
-            Some(_) => Err(D::Error::custom(
-                "unsupported speech span revision contract version",
-            )),
-        }
+        Self::decode_json_value(value)
+            .map_err(|_| D::Error::custom("invalid compatible speech span revision"))
     }
 }
 
@@ -726,10 +919,12 @@ fn validate_legacy_timing(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompatibleSpeechSpanRevision, LegacyEvidence, SpanObservation, SpeechChannelFidelity,
-        SpeechConfidence, SpeechSpanRevisionError, SpeechSpanRevisionNormalizer,
-        SpeechSpanStability, SpeechSpeakerFidelity, SpeechSpeakerValue, SpeechTiming,
-        SpeechTimingPrecision, SpeechTurnFidelity, SpeechTurnValue,
+        CompatibleSpeechSpanRevision, LegacyEvidence, ProjectionSemanticConfidence,
+        ProjectionSemanticSupersession, ProjectionSemanticTiming, SpanObservation,
+        SpeechChannelFidelity, SpeechConfidence, SpeechSpanRevisionError,
+        SpeechSpanRevisionNormalizer, SpeechSpanStability, SpeechSpeakerFidelity,
+        SpeechSpeakerValue, SpeechTiming, SpeechTimingPrecision, SpeechTurnFidelity,
+        SpeechTurnValue,
     };
 
     fn unavailable_observation() -> SpanObservation {
@@ -1204,5 +1399,156 @@ mod tests {
             .projection_semantics()
             .expect("normalize mutated v2 row");
         assert!(original == mutated);
+    }
+
+    #[test]
+    fn typed_compatible_decode_preserves_unsupported_and_semantic_error_classes() {
+        let base = serde_json::json!({
+            "span_id": "legacy-span-1",
+            "provider": "legacy-provider",
+            "source_id": "legacy-source",
+            "text": "legacy hello",
+            "start_time": 0.0,
+            "end_time": 1.0,
+            "confidence": 0.9,
+            "is_final": true,
+            "stability": "final",
+            "revision_number": 1,
+            "end_of_turn": true,
+            "received_at_ms": 1_u64
+        });
+        let cases = [
+            (
+                {
+                    let mut value = base.clone();
+                    value["contract_version"] = serde_json::json!(99);
+                    value
+                },
+                super::ProjectionSemanticError::UnsupportedContractVersion,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["stability"] = serde_json::json!("settled");
+                    value
+                },
+                super::ProjectionSemanticError::UnsupportedEnumTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["speaker_id"] = serde_json::json!([]);
+                    value
+                },
+                super::ProjectionSemanticError::UnsupportedOptionTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["end_of_turn"] = serde_json::json!("yes");
+                    value
+                },
+                super::ProjectionSemanticError::UnsupportedBooleanTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["text"] = serde_json::Value::Null;
+                    value
+                },
+                super::ProjectionSemanticError::MalformedValue,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["span_id"] = serde_json::json!("");
+                    value
+                },
+                super::ProjectionSemanticError::IdentityMismatch,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["revision_number"] = serde_json::json!(2);
+                    value["supersedes"] = serde_json::json!("");
+                    value
+                },
+                super::ProjectionSemanticError::InvalidSupersession,
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let error = match CompatibleSpeechSpanRevision::decode_json_value(value) {
+                Ok(_) => panic!("invalid compatible input must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn hash_rejects_impossible_cross_payload_semantics_before_encoding() {
+        use crate::projection_basis_hash_v2::{
+            PositionedProjectionSemanticRevision, ProjectionBasisHashV2Error,
+            projection_basis_hash_v2,
+        };
+
+        let v2 = SpeechSpanRevisionNormalizer::new()
+            .admit(unavailable_observation())
+            .expect("valid v2");
+        let v2 = CompatibleSpeechSpanRevision::V2(v2)
+            .projection_semantics()
+            .expect("valid v2 semantics");
+        let legacy = CompatibleSpeechSpanRevision::decode_json_value(serde_json::json!({
+            "span_id": "legacy-span-1",
+            "provider": "legacy-provider",
+            "source_id": "legacy-source",
+            "text": "legacy hello",
+            "is_final": true,
+            "stability": "final",
+            "revision_number": 1,
+            "received_at_ms": 1_u64
+        }))
+        .expect("valid legacy")
+        .projection_semantics()
+        .expect("valid legacy semantics");
+
+        let mut v2_with_legacy_evidence = v2.clone();
+        v2_with_legacy_evidence.timing = ProjectionSemanticTiming::LegacyUnspecified {
+            start_time: Some(0.0),
+            end_time: Some(1.0),
+        };
+        let mut legacy_with_provider_evidence = legacy.clone();
+        legacy_with_provider_evidence.confidence =
+            ProjectionSemanticConfidence::Provider { value: 0.9 };
+        let mut empty_legacy_reference = legacy;
+        empty_legacy_reference.supersession = ProjectionSemanticSupersession::LegacyReference {
+            reference: String::new(),
+        };
+        let mut identity_mismatch = v2;
+        identity_mismatch.source_ordinal = Some(2);
+
+        let cases = [
+            (
+                v2_with_legacy_evidence,
+                ProjectionBasisHashV2Error::UnsupportedSemanticCombination,
+            ),
+            (
+                legacy_with_provider_evidence,
+                ProjectionBasisHashV2Error::UnsupportedSemanticCombination,
+            ),
+            (
+                empty_legacy_reference,
+                ProjectionBasisHashV2Error::InvalidSupersession,
+            ),
+            (
+                identity_mismatch,
+                ProjectionBasisHashV2Error::InvalidIdentity,
+            ),
+        ];
+        for (revision, expected) in cases {
+            let positioned = [PositionedProjectionSemanticRevision::new(Some(1), revision)];
+            assert_eq!(projection_basis_hash_v2(&positioned), Err(expected));
+        }
     }
 }

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::speech_span_revision::{
-    ProjectionSemanticChannel, ProjectionSemanticConfidence, ProjectionSemanticPayloadKind,
-    ProjectionSemanticRevision, ProjectionSemanticSpeaker, ProjectionSemanticStability,
-    ProjectionSemanticSupersession, ProjectionSemanticTiming, ProjectionSemanticTurn,
+    CompatibleSpeechSpanRevision, ProjectionSemanticChannel, ProjectionSemanticConfidence,
+    ProjectionSemanticError, ProjectionSemanticPayloadKind, ProjectionSemanticRevision,
+    ProjectionSemanticSpeaker, ProjectionSemanticStability, ProjectionSemanticSupersession,
+    ProjectionSemanticTiming, ProjectionSemanticTurn,
 };
 
 const DOMAIN_SEPARATOR: &[u8] = b"audio-graph:projection-basis:v2";
@@ -36,10 +37,33 @@ impl PositionedProjectionSemanticRevision {
     pub fn revision(&self) -> &ProjectionSemanticRevision {
         &self.revision
     }
+
+    pub fn decode_json_value(
+        first_accepted_sequence: Option<u64>,
+        value: serde_json::Value,
+    ) -> Result<Self, ProjectionBasisHashV2Error> {
+        let revision =
+            CompatibleSpeechSpanRevision::decode_json_value(value)?.projection_semantics()?;
+        Ok(Self::new(first_accepted_sequence, revision))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProjectionBasisHashV2Error {
+    #[error("unsupported projection basis semantic contract version")]
+    UnsupportedContractVersion,
+    #[error("unsupported projection basis semantic enum tag")]
+    UnsupportedEnumTag,
+    #[error("unsupported projection basis semantic option tag")]
+    UnsupportedOptionTag,
+    #[error("unsupported projection basis semantic boolean tag")]
+    UnsupportedBooleanTag,
+    #[error("malformed projection basis semantic value")]
+    MalformedValue,
+    #[error("projection basis semantic identity mismatch")]
+    InvalidIdentity,
+    #[error("unsupported projection basis payload/evidence combination")]
+    UnsupportedSemanticCombination,
     #[error("projection basis hash v2 input is missing a first Accepted position")]
     MissingFirstAcceptedPosition,
     #[error("projection basis hash v2 input has a duplicate first Accepted position")]
@@ -74,6 +98,27 @@ pub enum ProjectionBasisHashV2Error {
     InvalidChannel,
     #[error("projection basis hash v2 input exceeds the canonical length limit")]
     LengthOverflow,
+}
+
+impl From<ProjectionSemanticError> for ProjectionBasisHashV2Error {
+    fn from(error: ProjectionSemanticError) -> Self {
+        match error {
+            ProjectionSemanticError::UnsupportedContractVersion => Self::UnsupportedContractVersion,
+            ProjectionSemanticError::UnsupportedEnumTag => Self::UnsupportedEnumTag,
+            ProjectionSemanticError::UnsupportedOptionTag => Self::UnsupportedOptionTag,
+            ProjectionSemanticError::UnsupportedBooleanTag => Self::UnsupportedBooleanTag,
+            ProjectionSemanticError::MalformedValue => Self::MalformedValue,
+            ProjectionSemanticError::IdentityMismatch => Self::InvalidIdentity,
+            ProjectionSemanticError::UnsupportedSemanticCombination => {
+                Self::UnsupportedSemanticCombination
+            }
+            ProjectionSemanticError::InvalidSupersession => Self::InvalidSupersession,
+            ProjectionSemanticError::InvalidRequiredString => Self::InvalidRequiredString,
+            ProjectionSemanticError::InvalidRevisionNumber => Self::InvalidRevisionNumber,
+            ProjectionSemanticError::NonFiniteTiming => Self::NonFiniteTiming,
+            ProjectionSemanticError::NonFiniteConfidence => Self::NonFiniteConfidence,
+        }
+    }
 }
 
 /// Hash normalized projection semantics using ADR-0036's frozen v2 encoding.
@@ -137,6 +182,7 @@ pub fn projection_basis_hash_v2(
 fn validate_revision(
     revision: &ProjectionSemanticRevision,
 ) -> Result<(), ProjectionBasisHashV2Error> {
+    revision.validate_for_hash()?;
     for value in [
         revision.span_id(),
         revision.source_id(),
@@ -598,9 +644,10 @@ mod tests {
         PositionedProjectionSemanticRevision, ProjectionBasisHashV2Error, projection_basis_hash_v2,
     };
     use crate::speech_span_revision::{
-        CompatibleSpeechSpanRevision, ProjectionSemanticChannel, ProjectionSemanticConfidence,
-        ProjectionSemanticSpeaker, ProjectionSemanticStability, ProjectionSemanticSupersession,
-        ProjectionSemanticTiming, ProjectionSemanticTurn,
+        CompatibleSpeechSpanRevision, SpanObservation, SpeechChannelFidelity, SpeechConfidence,
+        SpeechSpanRevisionError, SpeechSpanRevisionNormalizer, SpeechSpanStability,
+        SpeechSpeakerFidelity, SpeechSpeakerValue, SpeechTiming, SpeechTimingPrecision,
+        SpeechTurnFidelity, SpeechTurnValue,
     };
 
     #[derive(serde::Deserialize)]
@@ -671,38 +718,75 @@ mod tests {
             .collect()
     }
 
+    fn v2_observation() -> SpanObservation {
+        SpanObservation {
+            source_stream_id: "source-stream-a".into(),
+            provider: "fixture-provider".into(),
+            provider_item_id: None,
+            correlation: None,
+            text: "hello".into(),
+            stability: SpeechSpanStability::Final,
+            timing: SpeechTiming::AppEstimated {
+                start_time: 0.0,
+                end_time: 1.5,
+            },
+            confidence: SpeechConfidence::Unavailable {},
+            turn: SpeechTurnFidelity::Unavailable {},
+            speaker: SpeechSpeakerFidelity::Unavailable {},
+            channel: SpeechChannelFidelity::Unavailable {},
+            provider_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn positioned_observation(
+        observation: SpanObservation,
+    ) -> PositionedProjectionSemanticRevision {
+        let revision = SpeechSpanRevisionNormalizer::new()
+            .admit(observation)
+            .expect("test observation must normalize");
+        PositionedProjectionSemanticRevision::new(
+            Some(1),
+            CompatibleSpeechSpanRevision::V2(revision)
+                .projection_semantics()
+                .expect("validated v2 must project"),
+        )
+    }
+
     #[test]
     fn canonicalizes_negative_zero_and_refuses_non_finite_values() {
-        let catalog = catalog();
-        let baseline = positioned(&catalog.goldens[0]);
+        let baseline = [positioned_observation(v2_observation())];
         let expected = projection_basis_hash_v2(&baseline).expect("baseline must hash");
 
-        let mut negative_zero = baseline.clone();
-        negative_zero[0].revision.timing = ProjectionSemanticTiming::AppEstimated {
+        let mut negative_zero = v2_observation();
+        negative_zero.timing = SpeechTiming::AppEstimated {
             start_time: -0.0,
             end_time: 1.5,
         };
+        let negative_zero = [positioned_observation(negative_zero)];
         assert_eq!(
             projection_basis_hash_v2(&negative_zero).expect("negative zero must hash"),
             expected
         );
 
-        let mut non_finite_timing = baseline.clone();
-        non_finite_timing[0].revision.timing = ProjectionSemanticTiming::AppEstimated {
+        let mut non_finite_timing = v2_observation();
+        non_finite_timing.timing = SpeechTiming::AppEstimated {
             start_time: f64::NAN,
             end_time: 1.5,
         };
         assert_eq!(
-            projection_basis_hash_v2(&non_finite_timing),
-            Err(ProjectionBasisHashV2Error::NonFiniteTiming)
+            SpeechSpanRevisionNormalizer::new().admit(non_finite_timing),
+            Err(SpeechSpanRevisionError::InvalidTiming)
         );
 
-        let mut non_finite_confidence = baseline;
-        non_finite_confidence[0].revision.confidence =
-            ProjectionSemanticConfidence::Provider { value: f32::NAN };
-        let error = projection_basis_hash_v2(&non_finite_confidence)
-            .expect_err("non-finite confidence must not produce a digest");
-        assert_eq!(error, ProjectionBasisHashV2Error::NonFiniteConfidence);
+        let mut non_finite_confidence = v2_observation();
+        non_finite_confidence.confidence = SpeechConfidence::Provider { value: f32::NAN };
+        let error = SpeechSpanRevisionNormalizer::new()
+            .admit(non_finite_confidence)
+            .expect_err("non-finite confidence must not reach hashing");
+        assert_eq!(error, SpeechSpanRevisionError::InvalidConfidence);
         let debug = format!("{error:?}");
         for forbidden in ["hello", "fixture-provider", "source-stream-a"] {
             assert!(!debug.contains(forbidden), "errors must be content-free");
@@ -741,8 +825,10 @@ mod tests {
             Err(ProjectionBasisHashV2Error::ReversedSourceOrdinal)
         );
 
-        let mut duplicate_ordinal = baseline;
-        duplicate_ordinal[1].revision.source_ordinal = duplicate_ordinal[0].revision.source_ordinal;
+        let duplicate_ordinal = [
+            PositionedProjectionSemanticRevision::new(Some(1), baseline[0].revision().clone()),
+            PositionedProjectionSemanticRevision::new(Some(2), baseline[0].revision().clone()),
+        ];
         assert_eq!(
             projection_basis_hash_v2(&duplicate_ordinal),
             Err(ProjectionBasisHashV2Error::DuplicateSourceOrdinal)
@@ -750,108 +836,104 @@ mod tests {
     }
 
     #[test]
-    fn semantic_include_matrix_changes_digest_and_exact_supersession_is_enforced() {
-        type Mutation = Box<dyn Fn(&mut PositionedProjectionSemanticRevision)>;
-
-        let catalog = catalog();
-        let baseline = positioned(&catalog.goldens[0]);
+    fn semantic_include_matrix_uses_only_valid_normalized_revisions() {
+        let baseline = [positioned_observation(v2_observation())];
         let expected = projection_basis_hash_v2(&baseline).expect("baseline must hash");
-        let mutations: Vec<(&str, Mutation)> = vec![
-            (
-                "span_id",
-                Box::new(|record| record.revision.span_id.push('0')),
-            ),
-            (
-                "source_id",
-                Box::new(|record| record.revision.source_id.push('b')),
-            ),
-            (
-                "source_ordinal",
-                Box::new(|record| record.revision.source_ordinal = Some(2)),
-            ),
-            (
-                "provider",
-                Box::new(|record| record.revision.provider.push('b')),
-            ),
-            ("text", Box::new(|record| record.revision.text.push('!'))),
-            (
-                "stability/finality",
-                Box::new(|record| {
-                    record.revision.stability = ProjectionSemanticStability::Partial;
-                    record.revision.is_final = false;
-                }),
-            ),
-            (
-                "revision/supersession",
-                Box::new(|record| {
-                    record.revision.revision_number = 2;
-                    record.revision.supersession = ProjectionSemanticSupersession::V2Exact {
-                        span_id: record.revision.span_id.clone(),
-                        revision_number: 1,
-                    };
-                }),
-            ),
-            (
-                "timing",
-                Box::new(|record| {
-                    record.revision.timing = ProjectionSemanticTiming::ProviderExact {
-                        start_time: 0.0,
-                        end_time: 1.5,
-                    };
-                }),
-            ),
-            (
-                "confidence",
-                Box::new(|record| {
-                    record.revision.confidence =
-                        ProjectionSemanticConfidence::Provider { value: 0.875 };
-                }),
-            ),
-            (
-                "turn",
-                Box::new(|record| {
-                    record.revision.turn = ProjectionSemanticTurn::Provider {
-                        turn_id: "turn-a".into(),
-                        end_of_turn: true,
-                    };
-                }),
-            ),
-            (
-                "speaker",
-                Box::new(|record| {
-                    record.revision.speaker = ProjectionSemanticSpeaker::Provider {
-                        speaker_id: Some("speaker-a".into()),
-                        speaker_label: None,
-                    };
-                }),
-            ),
-            (
-                "channel",
-                Box::new(|record| {
-                    record.revision.channel = ProjectionSemanticChannel::Provider {
-                        value: "left".into(),
-                    };
-                }),
-            ),
-        ];
+        let mut mutations = Vec::new();
 
-        for (name, mutate) in mutations {
-            let mut changed = baseline.clone();
-            mutate(&mut changed[0]);
-            let actual = projection_basis_hash_v2(&changed).expect("valid semantic mutation");
+        let mut identity = v2_observation();
+        identity.source_stream_id = "source-stream-b".into();
+        mutations.push(("span/source identity", positioned_observation(identity)));
+
+        let mut provider = v2_observation();
+        provider.provider = "fixture-provider-b".into();
+        mutations.push(("provider", positioned_observation(provider)));
+
+        let mut text = v2_observation();
+        text.text = "hello changed".into();
+        mutations.push(("text", positioned_observation(text)));
+
+        let mut stability = v2_observation();
+        stability.stability = SpeechSpanStability::Partial;
+        mutations.push(("stability/finality", positioned_observation(stability)));
+
+        let mut timing = v2_observation();
+        timing.timing = SpeechTiming::Provider {
+            precision: SpeechTimingPrecision::Exact,
+            start_time: 0.0,
+            end_time: 1.5,
+        };
+        mutations.push(("timing", positioned_observation(timing)));
+
+        let mut confidence = v2_observation();
+        confidence.confidence = SpeechConfidence::Provider { value: 0.875 };
+        mutations.push(("confidence", positioned_observation(confidence)));
+
+        let mut turn = v2_observation();
+        turn.turn = SpeechTurnFidelity::Provider {
+            value: SpeechTurnValue {
+                turn_id: "turn-a".into(),
+                end_of_turn: true,
+            },
+        };
+        mutations.push(("turn", positioned_observation(turn)));
+
+        let mut speaker = v2_observation();
+        speaker.speaker = SpeechSpeakerFidelity::Provider {
+            value: SpeechSpeakerValue {
+                speaker_id: Some("speaker-a".into()),
+                speaker_label: None,
+            },
+        };
+        mutations.push(("speaker", positioned_observation(speaker)));
+
+        let mut channel = v2_observation();
+        channel.channel = SpeechChannelFidelity::Provider {
+            value: "left".into(),
+        };
+        mutations.push(("channel", positioned_observation(channel)));
+
+        let mut ordinal_normalizer = SpeechSpanRevisionNormalizer::new();
+        ordinal_normalizer
+            .admit(v2_observation())
+            .expect("first ordinal");
+        let ordinal_two = ordinal_normalizer
+            .admit(v2_observation())
+            .expect("second ordinal");
+        mutations.push((
+            "span identity/source ordinal",
+            PositionedProjectionSemanticRevision::new(
+                Some(1),
+                CompatibleSpeechSpanRevision::V2(ordinal_two)
+                    .projection_semantics()
+                    .expect("ordinal two must project"),
+            ),
+        ));
+
+        let mut revision_normalizer = SpeechSpanRevisionNormalizer::new();
+        let first = revision_normalizer
+            .admit(v2_observation())
+            .expect("first revision");
+        let mut correction = v2_observation();
+        correction.correlation = Some(first.revision_ref());
+        correction.received_at_ms += 1;
+        let correction = revision_normalizer
+            .admit(correction)
+            .expect("exact correction");
+        mutations.push((
+            "revision/exact supersession",
+            PositionedProjectionSemanticRevision::new(
+                Some(1),
+                CompatibleSpeechSpanRevision::V2(correction)
+                    .projection_semantics()
+                    .expect("correction must project"),
+            ),
+        ));
+
+        for (name, changed) in mutations {
+            let actual = projection_basis_hash_v2(&[changed]).expect("valid semantic mutation");
             assert_ne!(actual, expected, "included {name} must change the digest");
         }
-
-        let mut invalid_supersession = baseline;
-        invalid_supersession[0].revision.revision_number = 2;
-        invalid_supersession[0].revision.supersession = ProjectionSemanticSupersession::V2Exact {
-            span_id: "ssp_00000000000000000000000000000000".into(),
-            revision_number: 1,
-        };
-        assert_eq!(
-            projection_basis_hash_v2(&invalid_supersession),
-            Err(ProjectionBasisHashV2Error::InvalidSupersession)
-        );
     }
 
     #[test]
@@ -864,5 +946,88 @@ mod tests {
             projection_basis_hash_v2(&records).expect("reordered input must hash"),
             expected
         );
+    }
+
+    #[test]
+    fn positioned_decode_preserves_typed_unsupported_and_semantic_failures() {
+        let catalog: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/projection_basis_hash_v2/goldens.json"
+        ))
+        .expect("golden catalog must deserialize");
+        let base = catalog["goldens"][0]["records"][0]["revision"].clone();
+        let cases = [
+            (
+                {
+                    let mut value = base.clone();
+                    value["contract_version"] = serde_json::json!(3);
+                    value
+                },
+                ProjectionBasisHashV2Error::UnsupportedContractVersion,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["timing"]["origin"] = serde_json::json!("legacy_unspecified");
+                    value
+                },
+                ProjectionBasisHashV2Error::UnsupportedEnumTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["supersedes"] = serde_json::json!([]);
+                    value
+                },
+                ProjectionBasisHashV2Error::UnsupportedOptionTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["turn"] = serde_json::json!({
+                        "origin": "provider",
+                        "value": { "turn_id": "turn-a", "end_of_turn": "yes" }
+                    });
+                    value
+                },
+                ProjectionBasisHashV2Error::UnsupportedBooleanTag,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["text"] = serde_json::Value::Null;
+                    value
+                },
+                ProjectionBasisHashV2Error::MalformedValue,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["span_id"] = serde_json::json!("ssp_00000000000000000000000000000000");
+                    value
+                },
+                ProjectionBasisHashV2Error::InvalidIdentity,
+            ),
+            (
+                {
+                    let mut value = base.clone();
+                    value["revision_number"] = serde_json::json!(2);
+                    value["supersedes"] = serde_json::json!({
+                        "span_id": "ssp_00000000000000000000000000000000",
+                        "revision_number": 1
+                    });
+                    value
+                },
+                ProjectionBasisHashV2Error::InvalidSupersession,
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let error =
+                match PositionedProjectionSemanticRevision::decode_json_value(Some(1), value) {
+                    Ok(_) => panic!("invalid positioned input must fail closed"),
+                    Err(error) => error,
+                };
+            assert_eq!(error, expected);
+        }
     }
 }
