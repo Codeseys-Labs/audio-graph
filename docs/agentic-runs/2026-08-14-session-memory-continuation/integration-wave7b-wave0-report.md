@@ -91,3 +91,23 @@ assigned to `codex-1189-wave7b`; integration does not close it. D1
 `audio-graph-c2e3` and M0 `audio-graph-661f` remain open and each is blocked
 only by 1189. After root reconciles the integrated SHIP evidence and closes
 1189, c2e3 and 661f become the next parallel queue-eligible workstreams.
+
+## Wave0 Seed reconciliation
+
+Custody `b890d3c2102c73ebe77ab736de30fb74f9ebdd62` was merged
+history-preservingly at `52a83a308a67a1df833452f284e15323faa11b44`.
+Its one linear commit after custody `dd038da` changes only
+`.seeds/issues.jsonl`; the integrated 639-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seed 1189 is closed with the integrated Wave0 evidence. D1 `c2e3` and M0
+`661f` are both `in_progress`, unblocked, assigned to their Wave1 owners, and
+recorded as parallel `ACTIVE_MILESTONE` workstreams. Parent 8e73 records the
+active parallel Wave1, WIP cap 2, the optional Linux-only Docker boundary, and
+the monitored Blacksmith platform-qualification boundary.
+
+The complete queue contains 90 ready and 101 blocked issues. Seeds output
+stress, all five contracts, pinned `verify:fast`, Betterleaks, docs/Seeds
+secret hygiene, and exact range diff passed. Seeds Doctor reported 10 passed,
+2 custody-carried warning groups, and 0 failures. Product files did not change,
+so no product suite was rerun; no workflow, push, or extra Seed edit occurred.

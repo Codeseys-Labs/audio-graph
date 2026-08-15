@@ -401,3 +401,17 @@ in-progress D0 pending root reconciliation; c2e3 and 661f remain open and
 blocked only by 1189. No product suite, Blacksmith job/Testbox, workflow,
 product change, Seed closure, push, or extra Seed edit occurred. See
 [`integration-wave7b-wave0-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave7b-wave0-report.md).
+
+### Wave 7B Wave1 activation
+
+Custody `b890d3c` was merged history-preservingly at `52a83a3`. Its one-commit
+delta from `dd038da` changes only `.seeds/issues.jsonl`, and the integrated
+639-row queue is byte-identical to custody.
+
+Seed 1189 is closed. D1 `c2e3` and M0 `661f` are now in-progress, unblocked,
+assigned parallel `ACTIVE_MILESTONE` workstreams; parent 8e73 records the WIP
+cap and Docker/Blacksmith execution boundaries. The queue contains 90 ready
+and 101 blocked issues, and Seeds Doctor has 0 failures. Output stress, all
+five contracts, pinned `verify:fast`, Betterleaks, secret, and range gates
+passed. Product suites were not rerun; no workflow, push, or extra Seed edit
+occurred.
