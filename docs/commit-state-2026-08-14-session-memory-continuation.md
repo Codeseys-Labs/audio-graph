@@ -654,3 +654,23 @@ Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no additional Seed
 closure/edit, push, workflow, Blacksmith, Docker, guest, or platform run
 occurred.
+
+### Wave 7B Wave5 qualification-prerequisite split
+
+Custody `382d43e` was merged history-preservingly at `8401ee5`. Its one
+linear commit after `aa7a5a7` changes only `.seeds/issues.jsonl`, and the
+integrated 644-row queue is byte-identical to custody.
+
+Seed 67d3 is `in_progress`, unblocked, and assigned to
+`codex-2df3-portability-wave7b`; it owns test-only Linux, macOS APFS, and
+Windows NTFS qualification with the target-specific refusal and barrier
+contract. Seed 52b9 is blocked by 67d3 and remains `BLOCKED_APPROVAL` pending
+separate workflow authorization. Seed 2df3 is blocked by both children;
+Blacksmith remains native platform authority and Dockurr remains supplemental
+under its recorded boundaries. Parent 8e73 records the exact Wave5 order, and
+b77b remains closed. No workflow or platform action occurred.
+
+The queue has 91 ready and 97 blocked issues, and Doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no extra Seed edit,
+push, workflow, Blacksmith, Docker, guest, or platform run occurred.

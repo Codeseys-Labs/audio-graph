@@ -579,3 +579,40 @@ Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no additional
 Seed closure/edit, push, workflow, Blacksmith, Docker, guest, or platform run
 occurred.
+
+## Wave5 qualification-prerequisite split
+
+Custody `382d43eef33105f63261f094c7ea8880f06e3992` was merged
+history-preservingly without conflict at
+`8401ee5953e5e062e4971ff5e31642171e232ba8`. Its one linear commit after
+custody `aa7a5a7` changes only `.seeds/issues.jsonl`; the integrated 644-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Seed 67d3 is `in_progress`, unblocked, and assigned to
+`codex-2df3-portability-wave7b`. It owns test-only portability qualification:
+the existing Linux process-crash baseline, actual macOS APFS crash cuts and
+parent-barrier evidence, and actual Windows NTFS qualification through the
+typed pre-mutation `NamespaceDurabilityUnsupported` refusal. Its stop lines
+exclude runtime callers, production qualification constructors, and any
+workflow or platform dispatch.
+
+Seed 52b9 remains open, blocked by 67d3, and classified
+`BLOCKED_APPROVAL`. Adding the proposed opt-in Blacksmith Actions workflow
+requires separate product-owner authorization; no workflow was added,
+modified, or dispatched. Seed 2df3 is blocked by both children. Its native
+evidence contract preserves Windows refusal before destructive cuts, macOS
+APFS qualified cuts with the parent barrier recorded, and the Linux ext4
+process-crash/completed-barrier baseline. Blacksmith Actions remain platform
+authority, while Dockurr remains supplemental under the recorded license,
+cleanup, and no-power-loss boundaries.
+
+Parent 8e73 records the exact Wave5 order: 67d3 portability harness, an
+authorized opt-in workflow, native Blacksmith evidence, optional Dockurr
+supplement, then 2df3 closure. Seed b77b remains closed.
+
+The queue contains 91 ready and 97 blocked issues. Seeds output stress parsed
+ready 50, blocked 97, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no additional
+Seed edit, push, workflow, Blacksmith, Docker, guest, or platform run occurred.
