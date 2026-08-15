@@ -17,7 +17,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::canonical_durability::CanonicalPlatform;
+use super::canonical_durability::{
+    AlgorithmTestEnvironment, CanonicalNamespaceOperation, CanonicalPlatform,
+};
 use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
@@ -447,18 +449,43 @@ impl SessionArtifactManifestStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn qualified_for_test_platform(
+    pub(crate) fn qualified_for_algorithm_test(
+        root: impl Into<PathBuf>,
+    ) -> Result<Self, ManifestStoreError> {
+        let root = root.into();
+        let environment =
+            AlgorithmTestEnvironment::bind(&root).map_err(ManifestStoreError::Coordination)?;
+        let (qualification, durability) = environment.into_parts();
+        Ok(Self {
+            root,
+            durability,
+            qualification: Some(qualification),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualified_for_algorithm_test_platform(
         root: impl Into<PathBuf>,
         platform: CanonicalPlatform,
     ) -> Result<Self, ManifestStoreError> {
         let root = root.into();
-        let qualification = CanonicalFilesystemQualification::for_test_root(&root)
+        let environment = AlgorithmTestEnvironment::bind_for_platform(&root, platform)
             .map_err(ManifestStoreError::Coordination)?;
+        let (qualification, durability) = environment.into_parts();
         Ok(Self {
             root,
-            durability: CanonicalDurability::for_test_platform(platform),
+            durability,
             qualification: Some(qualification),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_platform(root: impl Into<PathBuf>, platform: CanonicalPlatform) -> Self {
+        Self {
+            root: root.into(),
+            durability: CanonicalDurability::for_test_platform(platform),
+            qualification: None,
+        }
     }
 }
 
@@ -1648,6 +1675,51 @@ mod tests {
             store.load().expect("load"),
             ManifestLoadOutcome::Present(manifest) if manifest.generation == 2
         ));
+    }
+
+    #[test]
+    fn algorithm_qualification_and_windows_policy_refusal_are_explicitly_separate() {
+        let algorithm_root = root("algorithm-qualified");
+        let algorithm_store = SessionArtifactManifestStore::qualified_for_algorithm_test_platform(
+            &algorithm_root,
+            CanonicalPlatform::Windows,
+        )
+        .expect("Windows-injected synthetic algorithm-qualified store");
+        let mut algorithm_write = algorithm_store.begin_write().expect("algorithm write");
+        assert!(matches!(
+            algorithm_write.compare_and_swap(0, basic_candidate("algorithm-tx-1", 'a')),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 { generation: 1, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            algorithm_write.compare_and_swap(1, basic_candidate("algorithm-tx-2", 'b')),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 { generation: 2, .. },
+                ..
+            }
+        ));
+        drop(algorithm_write);
+
+        let windows_root = root("windows-policy-unqualified");
+        let windows_store = SessionArtifactManifestStore::for_test_platform(
+            &windows_root,
+            CanonicalPlatform::Windows,
+        );
+        assert!(windows_store.qualification.is_none());
+        let mut windows_write = windows_store.begin_write().expect("Windows policy write");
+        assert!(matches!(
+            windows_write.compare_and_swap(0, basic_candidate("windows-tx", 'c')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                }
+            ))
+        ));
+        assert!(!windows_store.manifest_path().exists());
+        assert!(!windows_root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
 
     #[test]
