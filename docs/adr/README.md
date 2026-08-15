@@ -83,6 +83,13 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0036]: 0036-version-projection-basis-hashes-by-speech-semantics.md
 [0037]: 0037-freeze-canonical-event-stream-registry.md
 
+> **ADR-0037 lineage warning:** The immutable restored ADR was authored in a
+> non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
+> references are historical and do not name the current speech-semantics
+> ADR-0035 and ADR-0036. See the
+> [Wave 7B durability plan](../agentic-runs/2026-08-14-session-memory-continuation/audio-graph-8e73-wave7b-plan.md)
+> for the exact blob lineage and implementation boundary.
+
 ## Status legend
 
 - `proposed` — recorded; awaiting team / user sign-off before implementation work begins.

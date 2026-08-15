@@ -6,8 +6,12 @@ Parent Seed: `audio-graph-8e73`
 
 Implementation base: `c7d3fec2db8c60629e0b7c8b93e752c3aee85368`
 
-Research source: commit `f44407ece305396ac91f65e4c277084603d16ddd`,
-`docs/research/canonical-directory-durability-2026-08-14.md`
+Research source: corrected reviewed commit
+`30490249ef08fb59a4b0bebfd855009c24f90117`, Git blob
+`10e0049246f78ba2b2aa31abc67cd95f0866225b`. The
+[corrected primary-source research](../../research/canonical-directory-durability-2026-08-14.md)
+is tracked in this stable D0 snapshot rather than remaining an external
+worktree-only dependency.
 
 Governing decisions: [ADR-0027](../../adr/0027-file-canonical-durable-session-store.md)
 and [ADR-0037](../../adr/0037-freeze-canonical-event-stream-registry.md)
@@ -31,10 +35,12 @@ The accepted platform-result boundary is deliberately asymmetric:
   `NamespaceDurabilityUnsupported`. A successful file flush, ordinary restart,
   or rename does not upgrade that result.
 
-The parent closes only after all seven children are integrated, the complete
-three-platform result evidence is recorded, and no non-test production caller
-exists. A subprocess kill/reopen matrix proves process-crash recovery and
-completed OS barriers; it is never described as power-loss proof.
+The parent closes only after its five durability children (`1189`, `c2e3`,
+`3b8b`, `b77b`, and `2df3`) and the two `be7c`-owned manifest prerequisites
+(`661f` and `a596`) are integrated, the complete three-platform result evidence
+is recorded, and no non-test production caller exists. A subprocess kill/reopen
+matrix proves process-crash recovery and completed OS barriers; it is never
+described as power-loss proof.
 
 ## Evidence and lineage boundary
 
@@ -58,11 +64,16 @@ Those current files remain byte-for-byte unchanged. This lineage clarification
 belongs to this plan and the D0 report, not to the immutable historical ADR
 blob. Discovery reports were message-only and read-only; the authoritative
 planning evidence is the current code, exact Seed records, integration
-checkpoint/report, and the reviewed primary-source research artifact.
+checkpoint/report, and the corrected reviewed primary-source research artifact
+included in this snapshot.
+
+This branch's tracked Seed snapshot predates the custody review corrections.
+No worker mutates it. Final fan-in must include the already-recorded custody
+Seed correction before the conductor reconciles or closes any work.
 
 ## Dependency graph and concurrency
 
-The exact child order is:
+The exact execution dependency order is:
 
 ```text
 D0  audio-graph-1189
@@ -94,17 +105,23 @@ worktree, commits a stable tip and evidence report, and receives Standards and
 Spec review before integrator-only fan-in. The integrator re-runs assembled
 gates; a worktree-green result is not integration acceptance.
 
+Ownership is not implied by the graph layout. D0, D1, R1, T1, and CI1 are
+`audio-graph-8e73` durability children. M0 and M1 are
+`audio-graph-be7c`-owned manifest prerequisites that the 8e73 recovery stack
+must consume after their separate acceptance.
+
 ## D0 — `audio-graph-1189`: restore the accepted registry lineage
 
 Ownership is limited to the exact ADR-0037 blob, the current-format README
-index entry, this plan, and the D0 report. There is no product, Seeds,
-workflow, package, generated-file, or other-ADR ownership.
+index entry and lineage warning, the corrected reviewed durability research
+artifact, this plan, and the D0 report. There is no product, Seeds, workflow,
+package, generated-file, or other-ADR ownership.
 
 The RED proof is absence of the ADR file and index row while the current strict
 reader cites ADR-0037. GREEN requires the exact historical blob, a linked
 accepted index row dated 2026-07-10, unchanged current ADR-0035/0036 blobs,
-resolving relative links, and a base-range footprint limited to the four owned
-files.
+the exact corrected research blob, resolving relative links, and a base-range
+footprint limited to the five owned files.
 
 Stop if the source blob differs, current ADR-0035/0036 changes, any lineage
 clarification would require editing the archival ADR, or any product/Seeds/
@@ -117,10 +134,11 @@ Blacksmith job.
 
 ### D1 — `audio-graph-c2e3`: named file and namespace durability substrate
 
-Ownership is the new persistence `canonical_durability` module, its persistence
-module declaration, the narrow `canonical_log` integration needed to consume
-it, focused tests, and the workstream report. The module atomically
-distinguishes existing and newly created files without a `Path::exists`
+This is an `audio-graph-8e73` durability child. Ownership is the new persistence
+`canonical_durability` module, its persistence module declaration, the narrow
+`canonical_log` integration needed to consume it, focused tests, and the
+workstream report. The module atomically distinguishes existing and newly
+created files without a `Path::exists`
 preflight; exposes content-free typed stages/outcomes and stable cooperative
 coordination locks; flushes then file-syncs existing appends; requires a parent
 barrier for a qualified Linux first-create; conditionally accepts macOS only
@@ -141,13 +159,14 @@ on-disk migration.
 
 ### M0 — `audio-graph-661f`: select and crash-model the manifest transaction
 
-Ownership is a throwaway executable finite model plus its design/report
-artifacts. Compare a versioned atomic snapshot, append-only manifest log, and
-log-plus-materialized-view across prepare, quarantine publish, manifest
-acceptance, source truncate, completion, restart, generation conflict, exact
-residual state, and idempotent retry. The expected candidate is a versioned
-atomic snapshot with generation compare-and-swap, but the executable evidence
-selects the form.
+This is an `audio-graph-be7c`-owned manifest prerequisite related to 8e73, not
+an 8e73 durability child. Ownership is a throwaway executable finite model plus
+its design/report artifacts. Compare a versioned atomic snapshot, append-only
+manifest log, and log-plus-materialized-view across prepare, quarantine
+publish, manifest acceptance, source truncate, completion, restart, generation
+conflict, exact residual state, and idempotent retry. The expected candidate is
+a versioned atomic snapshot with generation compare-and-swap, but the
+executable evidence selects the form.
 
 Gates are syntax validation, the complete finite-model command with case,
 transition, state, assertion, and invariant counts, explicit crash cuts at
@@ -162,13 +181,14 @@ and changes no runtime or persisted state.
 
 ## Wave 2 — `audio-graph-a596`: persisted typed Session Artifact manifest kernel
 
-Starts only after D1 and M0 are integrated. Ownership is the dormant manifest
-kernel and focused tests: versioned `SessionArtifactManifestV1`, typed artifact
-entries, privacy and availability classes, stable relative managed identity,
-hashes, lengths, source identity, generation-checked compare-and-swap, and
-prepared/completed/unavailable/residual quarantine states. Manifest persistence
-must consume D1 and cannot report `Accepted` when namespace durability is
-unsupported.
+This is an `audio-graph-be7c`-owned manifest prerequisite related to 8e73, not
+an 8e73 durability child. It starts only after D1 and M0 are integrated.
+Ownership is the dormant manifest kernel and focused tests: versioned
+`SessionArtifactManifestV1`, typed artifact entries, privacy and availability
+classes, stable relative managed identity, hashes, lengths, source identity,
+generation-checked compare-and-swap, and prepared/completed/unavailable/
+residual quarantine states. Manifest persistence must consume D1 and cannot
+report `Accepted` when namespace durability is unsupported.
 
 Focused gates cover strict load, schema/type validation, generation conflict,
 crash/reopen idempotence, prepared/completed/unavailable residual states,
@@ -183,7 +203,8 @@ written.
 
 ## Wave 3 — `audio-graph-3b8b`: locked manifest-transactional tail recovery
 
-Starts only after D1 and M1 are integrated. Ownership is the dormant
+This is an `audio-graph-8e73` durability child. It starts only after D1 and M1
+are integrated. Ownership is the dormant
 `CanonicalRecoveryTransaction`, its focused recovery tests, and its report.
 It owns one stable exclusive coordination guard and one identity-verified
 source handle. The caller supplies the attempted-event recovery descriptor.
@@ -204,12 +225,14 @@ dormant transaction before runtime adoption.
 
 ## Wave 4 — `audio-graph-b77b`: subprocess crash and exclusion proof
 
-Starts only after R1 is integrated. Ownership is a non-production subprocess
-and cross-process test harness, fixtures, and report. Child/parent handshakes
-and parent kills cover before and after write, userspace flush, file sync,
-new-entry sync, quarantine rename, manifest prepare sync, source truncate,
-source sync, completion, and acknowledgement. Fresh-process reopen must
-converge idempotently.
+This is an `audio-graph-8e73` durability child. It starts only after R1 is
+integrated. Ownership is a non-production subprocess and cross-process test
+harness, fixtures, and report. Child/parent handshakes and parent kills cover
+before and after write, userspace flush, file sync, new-entry sync, quarantine
+rename, quarantine directory-sync, persisted manifest prepare, source truncate,
+source sync, persisted manifest completion, pre-acknowledgement, and
+post-acknowledgement. The manifest-completion cut is explicitly between source
+sync and acknowledgement. Fresh-process reopen must converge idempotently.
 
 The exclusion matrix covers exclusive/exclusive, shared/exclusive,
 release-on-process-death, readers, rename behavior, stable-lock semantics, and
@@ -224,10 +247,11 @@ a later courtesy.
 
 ## Wave 5 — `audio-graph-2df3`: macOS and Windows qualification
 
-Starts only after T1 is integrated. Ownership is external evidence and its
-report; it does not own workflow files. Run the accepted, non-ignored canonical
-durability and subprocess matrix on macOS 15/APFS and Windows 2025/NTFS, while
-keeping the Linux matrix green.
+This is an `audio-graph-8e73` durability child. It starts only after T1 is
+integrated. Ownership is external evidence and its report; it does not own
+workflow files. Run the accepted, non-ignored canonical durability and
+subprocess matrix on macOS 15/APFS and Windows 2025/NTFS, while keeping the
+Linux matrix green.
 
 For every run, record runner OS, filesystem, workflow/job or Testbox ID, exact
 command, status, exit, and durable log location. macOS must either prove the
@@ -259,26 +283,44 @@ evidence is integrated.
 
 ## Common branch and integration gates
 
-Each child starts with a public-seam RED and ends with its focused GREEN. Every
-code-bearing branch also runs Rust 1.95 with `--locked`, relevant cloud-only
+Each workstream starts with a public-seam RED and ends with its focused GREEN.
+Every code-bearing branch also runs Rust 1.95 with `--locked`, relevant cloud-only
 focused tests, locked check, strict Clippy with warnings denied, and rustfmt.
 Run all five generated-contract drift checks, or prove they ran inside the
-pinned fast gate. Every branch runs:
+pinned fast gate. A clean worktree must not install packages or create a
+`node_modules` symlink merely to run Seeds checks. Resolve an already-installed
+repository-pinned package root, validate it, and fail closed if neither the
+worktree-local nor verified repository fallback exists:
 
-```text
-SEEDS_CLI_ROOT=$PWD/node_modules/@os-eco/seeds-cli bun run verify:fast
+```bash
+seeds_cli_root="$PWD/node_modules/@os-eco/seeds-cli"
+if ! test -f "$seeds_cli_root/package.json" ||
+   ! test -f "$seeds_cli_root/src/output.ts"; then
+  seeds_cli_root="/home/codeseys/DevBox/audio-graph/node_modules/@os-eco/seeds-cli"
+fi
+test -f "$seeds_cli_root/package.json"
+test -f "$seeds_cli_root/src/output.ts"
+test "$(jq -r '.name + "@" + .version' "$seeds_cli_root/package.json")" = \
+  '@os-eco/seeds-cli@0.4.5'
+realpath "$seeds_cli_root"
+SEEDS_CLI_ROOT="$seeds_cli_root" bun run verify:fast
 bun run verify:contracts
 bun scripts/check-docs-secret-hygiene.mjs
 betterleaks dir --no-banner --redact <owned files and report>
 git diff --check <exact-base>...HEAD
 ```
 
+The verified absolute fallback for this repository is
+`/home/codeseys/DevBox/audio-graph/node_modules/@os-eco/seeds-cli`. If its
+package identity, version, source shape, or path is unavailable, stop rather
+than install, patch, or silently use a global CLI.
+
 The integrator validates the merge-base footprint, refuses unexpected Seeds,
 workflow, dependency, generated, credential, build-output, or unrelated ADR
 paths, reviews placeholder traps, and re-runs the assembled focused and common
 gates. Seeds remain conductor-owned and close only after integrated acceptance
-evidence. No child push, merge, workflow dispatch, deployment, or release is
-authorized by this plan.
+evidence. No workstream push, merge, workflow dispatch, deployment, or release
+is authorized by this plan.
 
 ## Parent rollback and stop conditions
 
