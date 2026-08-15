@@ -715,3 +715,25 @@ The queue has 91 ready and 96 blocked issues, and Doctor has 0 failures.
 Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no extra Seed edit,
 workflow, push, Blacksmith, Docker, guest, or platform action occurred.
+
+### Wave 7B Wave5 preliminary CI findings backflow
+
+Two linear Seed-only custody commits through `ff1f01e` were merged
+history-preservingly at `164d1b0`. The integrated 646-row queue is
+byte-identical to custody.
+
+New P1 Seed 942a tracks the two cargo-audit advisories from job `95054075109`
+and blocks c395 independently of durability. New P0 Seed 836b is
+`in_progress`, unblocked, and assigned to
+`codex-2df3-windows-fixtures-wave7b`; Windows job `95054075141` reported
+1,618/15/8 and requires cfg-only injected qualification for algorithm tests
+to remain separate from real-NTFS `None` qualification and pre-mutation
+refusal tests. Seeds 2df3 and 52b9 depend on 836b. Seed 67d3 remains closed
+with successor routing.
+
+Run `31901995995` remains active for Linux and macOS terminal evidence; no
+terminal or closure claim is made. The queue has 92 ready and 97 blocked
+issues, and Doctor has 0 failures. Output stress, all five contracts, pinned
+`verify:fast`, Betterleaks, secret, and range gates passed. Product suites
+were not rerun; no extra Seed edit, workflow, push, Blacksmith, Docker, guest,
+or platform action occurred.

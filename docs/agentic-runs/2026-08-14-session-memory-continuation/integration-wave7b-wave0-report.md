@@ -703,3 +703,38 @@ docs/Seeds secret hygiene, and exact range diff passed. Seeds Doctor reported
 10 passed, 2 custody-carried warning groups, and 0 failures. Product files did
 not change, so product suites were not rerun; no extra Seed edit, workflow,
 push, Blacksmith, Docker, guest, or platform action occurred.
+
+## Wave5 preliminary CI findings backflow
+
+Custody `ff1f01e4de4ff00df89b77211df3b9db36c14fde` was merged
+history-preservingly without conflict at
+`164d1b08a49f15c49b7a70f80d48e4d3c9946957`. Its two linear commits after
+custody `88a4031` change only `.seeds/issues.jsonl`; the integrated 646-row
+queue is byte-identical to custody and remains valid JSONL.
+
+New P1 Seed 942a is open and blocks c395. It records cargo-audit job
+`95054075109` in run `31901995995` with `RUSTSEC-2026-0213` for `ammonia`
+4.1.3 and `RUSTSEC-2026-0235` for the lockfile-only `rkyv` 0.7.46 entry. This
+is a separate supply-chain workstream and is not a 2df3 portability defect.
+
+New P0 Seed 836b is `in_progress`, unblocked, and assigned to
+`codex-2df3-windows-fixtures-wave7b`. Native Windows job `95054075141`
+reported 1,618 passed, 15 failed, and 8 ignored because canonical-log recovery
+fixtures assumed an unavailable qualified identity on NTFS. The accepted
+backflow keeps platform-independent algorithm tests on cfg-only injected
+qualification while real Windows policy tests use `None` qualification and
+the pre-mutation namespace refusal contract. No production qualification
+constructor, runtime behavior, dependency, unsafe block, workflow, or
+platform dispatch is admitted.
+
+Seeds 2df3 and 52b9 now depend on 836b. Seed 67d3 remains closed and routes
+the native finding to that successor without reopening its focused policy or
+compile acceptance. Run `31901995995` remains active for Linux and macOS
+terminal evidence; this snapshot makes no terminal or closure claim.
+
+The queue contains 92 ready and 97 blocked issues. Seeds output stress parsed
+ready 50, blocked 97, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no extra Seed
+edit, workflow, push, Blacksmith, Docker, guest, or platform action occurred.
