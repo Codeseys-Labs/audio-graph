@@ -1028,15 +1028,30 @@ impl CanonicalExclusiveGuard {
         }) {
             return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
+        #[cfg(test)]
+        if descendant {
+            crate::persistence::canonical_crash_harness::checkpoint("quarantine_rename_before");
+        }
         if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
             self.rename_source(source, destination)
         }) {
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
+        #[cfg(test)]
+        if descendant {
+            crate::persistence::canonical_crash_harness::checkpoint("quarantine_rename_after");
+            crate::persistence::canonical_crash_harness::checkpoint(
+                "quarantine_parent_sync_before",
+            );
+        }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
             source_parent_directory.sync_all()
         }) {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+        #[cfg(test)]
+        if descendant {
+            crate::persistence::canonical_crash_harness::checkpoint("quarantine_parent_sync_after");
         }
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
@@ -1426,16 +1441,34 @@ impl CanonicalExclusiveGuard {
             return indeterminate(CanonicalDurabilityStage::Flush, &error, recovery_key);
         }
         drop(writer);
+        #[cfg(test)]
+        if parent.is_some() {
+            crate::persistence::canonical_crash_harness::checkpoint(
+                "first_create_file_sync_before",
+            );
+        }
         if let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || file.sync_all()) {
             return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
+        #[cfg(test)]
+        if parent.is_some() {
+            crate::persistence::canonical_crash_harness::checkpoint("first_create_file_sync_after");
+        }
 
         if let Some(parent) = parent {
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint(
+                "first_create_parent_sync_before",
+            );
             if let Err(error) =
                 self.checked(CanonicalDurabilityStage::ParentSync, || parent.sync_all())
             {
                 return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
             }
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint(
+                "first_create_parent_sync_after",
+            );
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation,
                 barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
