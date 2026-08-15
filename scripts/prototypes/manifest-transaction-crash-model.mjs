@@ -623,6 +623,15 @@ function applyTransition(state, action) {
       guard(tx !== null && state.runtime.lockOwner === tx.writer, "complete-without-lock", state);
       guard(state.durable.sourceLength === TARGET_SOURCE_LENGTH, "completion-before-source-sync", state);
       const current = head(state);
+      const expectedPreparedGeneration = tx.expectedGeneration + 1;
+      if (current.generation !== expectedPreparedGeneration) {
+        addDiagnostic(state, "GenerationConflict", "CompletionPersistence", tx.id);
+        setResult(state, "GenerationConflict", "CompletionPersistence", tx, {
+          expected: expectedPreparedGeneration,
+          actual: current.generation,
+        });
+        return;
+      }
       guard(
         current.phase === "Prepared" &&
           current.txId === tx.id &&
@@ -1006,6 +1015,13 @@ function injectFault(input, stage, variant) {
 
   const state = structuredClone(input);
   const tx = state.runtime.activeTx ?? TX_A;
+  if (stage === "Prepare" && variant === "NoMutation") {
+    setResult(state, "IoFailedBeforeAcceptance", "Prepare", tx);
+    state.recovery.residual = residualState(state);
+    verifyState(state, `inject-${stage}-${variant}`);
+    observedStates.add(JSON.stringify(state));
+    return state;
+  }
   if (stage === "Prepare") {
     if (variant === "PartialTemp") {
       state.durable.quarantine = {
@@ -1077,13 +1093,26 @@ function checkFaultMatrix() {
     for (const stage of stages) {
       for (const variant of faultVariants(form, stage)) {
         let state = faultBase(form, stage);
+        const durableBeforeFault = JSON.stringify(state.durable);
         state = injectFault(state, stage, variant);
+        const provenNoMutation = stage === "Prepare" && variant === "NoMutation";
         invariant(
-          state.result.kind === "DurabilityIndeterminate",
-          "visible-failure-remains-uncertain",
-          `${form}/${stage}/${variant} was upgraded after a possibly visible failure`,
+          state.result.kind ===
+            (provenNoMutation ? "IoFailedBeforeAcceptance" : "DurabilityIndeterminate"),
+          provenNoMutation
+            ? "pre-mutation-failure-is-io-before-acceptance"
+            : "visible-failure-remains-uncertain",
+          `${form}/${stage}/${variant} used the wrong failure boundary`,
           state,
         );
+        if (provenNoMutation) {
+          invariant(
+            JSON.stringify(state.durable) === durableBeforeFault,
+            "pre-mutation-failure-has-no-visible-state",
+            `${form}/${stage}/${variant} mutated physical state`,
+            state,
+          );
+        }
         const advancementBeforeRestart = state.counters.manifestAdvancements;
         const repairsBeforeRestart = state.counters.restartRepairs;
         state = transition(
@@ -1096,9 +1125,11 @@ function checkFaultMatrix() {
           `${form}:${stage}:${variant}:restart`,
         );
         invariant(
-          state.recovery.priorIndeterminateStage === stage,
-          "uncertainty-survives-restart",
-          `${form}/${stage}/${variant} lost its indeterminate boundary`,
+          state.recovery.priorIndeterminateStage === (provenNoMutation ? null : stage),
+          provenNoMutation
+            ? "pre-mutation-failure-does-not-create-uncertainty"
+            : "uncertainty-survives-restart",
+          `${form}/${stage}/${variant} retained the wrong recovery boundary`,
           state,
         );
         const observedGeneration = head(state).generation;
@@ -1242,6 +1273,64 @@ function checkConcurrentWriters() {
     formEvidence[form].exactRetries += 1;
     caseCount += 4;
     cases += 4;
+  }
+  return cases;
+}
+
+function checkCompletionGenerationRegression() {
+  let cases = 0;
+  for (const form of FORMS) {
+    let state = initialState(form);
+    state = transition(state, { type: "Prepare", tx: TX_A });
+    state = transition(state, { type: "PublishQuarantine" });
+    state = transition(state, { type: "SyncQuarantineNamespace" });
+    state = transition(state, { type: "PersistPrepared" });
+    state = transition(state, { type: "TruncateSource" });
+    state = transition(state, { type: "SyncSource" });
+
+    const exactPrepared = structuredClone(head(state));
+    exactPrepared.generation = TX_A.expectedGeneration + 2;
+    if (form === "AtomicSnapshotCas") {
+      state.durable.snapshot.head = exactPrepared;
+    } else {
+      const prior = manifestRecord(1, "Prepared", {
+        id: "tx-prior",
+        fingerprint: "fp-prior",
+      });
+      state.durable.log.records = [prior, exactPrepared];
+      if (form === "LogWithMaterializedView") {
+        state.durable.view.head = structuredClone(exactPrepared);
+        state.durable.view.status = "Exact";
+        state.counters.materializedViewWrites = 2;
+      }
+    }
+    state.counters.manifestAdvancements = 2;
+    state.counters.authorityWrites = 2;
+
+    const durableBeforeCompletion = JSON.stringify(state.durable);
+    const countersBeforeCompletion = JSON.stringify(state.counters);
+    state = transition(
+      state,
+      { type: "PersistCompleted" },
+      `${form}:unexpected-prepared-generation`,
+    );
+    invariant(
+      state.result.kind === "GenerationConflict" &&
+        state.result.expectedGeneration === TX_A.expectedGeneration + 1 &&
+        state.result.actualGeneration === TX_A.expectedGeneration + 2,
+      "completion-requires-exact-prepared-generation",
+      `${form}: completion accepted an unexpected same-transaction generation`,
+      state,
+    );
+    invariant(
+      JSON.stringify(state.durable) === durableBeforeCompletion &&
+        JSON.stringify(state.counters) === countersBeforeCompletion,
+      "completion-generation-conflict-does-not-mutate",
+      `${form}: rejected completion changed physical state`,
+      state,
+    );
+    caseCount += 1;
+    cases += 1;
   }
   return cases;
 }
@@ -1407,6 +1496,7 @@ console.log(
 showRepresentativeTrace();
 
 const counts = {
+  completionGenerationRegressionCases: checkCompletionGenerationRegression(),
   successfulFormCases: checkSuccessfulForms(),
   crashCutCases: checkCrashMatrix(),
   visibleFailureCases: checkFaultMatrix(),
