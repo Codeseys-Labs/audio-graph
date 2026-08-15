@@ -674,3 +674,25 @@ The queue has 91 ready and 97 blocked issues, and Doctor has 0 failures.
 Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no extra Seed edit,
 push, workflow, Blacksmith, Docker, guest, or platform run occurred.
+
+### Wave 7B Wave5 reviewed portability-harness fan-in
+
+Two linear Seed-only custody commits through `69877d7` were merged at
+`6039598`, followed by reviewed two-commit candidate `3f0ef50` at `144c6e6`.
+The 644-row queue is byte-identical to custody. The candidate's exact footprint
+is the cfg-only crash harness, inherited durability fixture, and report;
+Standards and Spec returned **SHIP** with no findings.
+
+The assembled gates pass Linux harness 11, Windows-policy simulations 5, log
+46, manifest 18, durability 40, the pinned Windows production/test-object
+module proof, locked check, full serialized cloud 1,671/0/8, strict Clippy,
+fmt, frontend 968, all five contracts, pinned `verify:fast`, Seeds 91
+ready/97 blocked with Doctor 0 failures, Betterleaks, secret, footprint,
+prototype, and diff hygiene. The initial raw wrapper omitted external-crate
+wiring, and the broader Cargo cross-build lacked MSVC `lib.exe`; the corrected
+dependency-minimal Windows probe passed directly.
+
+The harness remains `cfg(test)` and runtime-dark. Apple-native APFS execution
+remains deferred. Seed 67d3 is root-closure eligible; 52b9 remains
+approval-gated, and 2df3 retains native Blacksmith evidence ownership. No
+Seed closure, workflow or platform action, push, Docker, or guest run occurred.

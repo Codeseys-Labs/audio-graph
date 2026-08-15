@@ -616,3 +616,59 @@ Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no additional
 Seed edit, push, workflow, Blacksmith, Docker, guest, or platform run occurred.
+
+## Wave5 reviewed portability-harness fan-in
+
+Custody `69877d7e91b42a84dde8e702ef2d620c77c8366d` was merged
+history-preservingly without conflict at
+`60395987ddea658052b1ad9bb214fbc3dbde058e`. Its two linear commits after
+custody `382d43e` change only `.seeds/issues.jsonl`; the integrated 644-row
+queue is byte-identical to custody and remains valid JSONL. The final custody
+review records Standards and Spec **SHIP**, zero correction rounds, and no
+findings.
+
+Reviewed candidate `3f0ef50e485a37ced20b955fe33fabb65182d4fe`
+was merged history-preservingly without conflict at
+`144c6e6b16f3a9019c9424e870d89350697803d6`. Its two linear commits from
+exact merge-base `4d3bbb6` change exactly the canonical crash harness, the
+inherited durability test fixture, and the 67d3 report. The crash harness
+module remains `cfg(test)`; no runtime caller, production qualification
+constructor, unsafe block, dependency, workflow, platform dispatch, or
+prototype ancestry landed.
+
+The assembled Linux harness retains all 11 process-crash tests and binds its
+fixture to ext4. Five focused Windows-policy simulations pass, including the
+exact corrected c928 snapshot refusal and the inherited `None` qualification
+path. The pinned dependency-minimal Windows probe compiled both a production
+rlib and the full test object from the assembled source. Its object contains
+the required portability, c928, and inherited-refusal symbols. This is
+cross-compile evidence only, not native NTFS execution.
+
+| Gate | Result |
+| --- | --- |
+| Linux crash harness | 11 passed, 0 failed |
+| Windows-policy focused set | 5 passed, 0 failed |
+| canonical log / manifest / durability | 46/0, 18/0, 40/0 |
+| pinned Windows module proof | production rlib and full test object passed; four required symbols present |
+| locked cloud lib/tests check | passed in 19.58 seconds |
+| full direct locked cloud library, serialized | 1,671 passed, 0 failed, 8 ignored in 56.68 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| exact frontend `test:local` | 70 files and 968 tests passed in 131.69 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 91 ready; 97 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 97, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, docs/Seeds secret, footprint, prototype, and diff hygiene | approximately 2.62 MB, no leaks; 0 secret findings; passed |
+
+The first raw Windows wrapper invocation omitted its external-crate wiring and
+failed before compiling the assembled modules. A broader Cargo cross-build
+then stopped in `ring` because this Linux host lacks MSVC `lib.exe`. The
+accepted dependency-minimal command with the pinned Windows dependency
+artifacts passed directly, so these are recorded as harness/environment
+limitations rather than product failures.
+
+No Apple standard-library target is installed and no native APFS run occurred;
+Apple-native evidence remains deferred to 52b9/2df3. Seed 67d3 is eligible for
+root closure after reconciliation. Seed 52b9 remains approval-gated before any
+workflow change, and 2df3 retains native Blacksmith evidence ownership. No
+Seed was closed or additionally edited, and no push, workflow, Blacksmith,
+Docker, guest, or platform execution occurred.
