@@ -195,3 +195,18 @@ reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
 output stress, all five contracts, pinned `verify:fast`, Betterleaks,
 docs/Seeds secret hygiene, and range diff passed. Product files did not change,
 so no product suite was rerun.
+
+## Wave 7B Wave0 integration
+
+Custody `dd038da` and reviewed D0 tip `bc2da20` were merged without conflict at
+`98d4013` and `367d344`. The 639-row queue is byte-identical to custody. The
+corrected research and immutable ADR-0037 blobs, unchanged current
+ADR-0035/0036, lineage warning, five-versus-two ownership split, complete crash
+cuts, and Blacksmith stop/list-clean/no-workflow controls were verified on the
+assembled snapshot. The reviewed research branch was not merged separately.
+
+All 52 local relative-link targets across eight assembled documents, all five
+contracts, Seeds output and doctor, pinned `verify:fast`, Betterleaks, secret
+hygiene, and range diff passed. Seed 1189 remains active pending root
+reconciliation; c2e3 and 661f remain blocked only by 1189. Exact evidence is in
+[`integration-wave7b-wave0-report.md`](integration-wave7b-wave0-report.md).

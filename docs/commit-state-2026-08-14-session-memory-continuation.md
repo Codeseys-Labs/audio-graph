@@ -386,3 +386,18 @@ failures. Seeds JSON/output, all five contracts, pinned `verify:fast`,
 Betterleaks, secret, and range gates passed. Product files were unchanged, so
 product suites were not rerun. No extra Seed was edited, no workflow was
 dispatched, and no branch was pushed.
+
+### Wave 7B Wave0 integrated base
+
+Custody `dd038da` and reviewed D0 `bc2da20` were integrated without conflict at
+`98d4013` and `367d344`. The 639-row queue is byte-identical to custody; the
+research branch was not separately merged. Exact research, ADR-0037, and
+current ADR-0035/0036 blobs, the index lineage warning, ownership split, crash
+cuts, and Blacksmith evidence controls all passed assembled assertions.
+
+Relative links, the five contracts, Seeds output/doctor, pinned `verify:fast`,
+Betterleaks, secret, and range gates passed. Seed 1189 remains the active
+in-progress D0 pending root reconciliation; c2e3 and 661f remain open and
+blocked only by 1189. No product suite, Blacksmith job/Testbox, workflow,
+product change, Seed closure, push, or extra Seed edit occurred. See
+[`integration-wave7b-wave0-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave7b-wave0-report.md).
