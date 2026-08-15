@@ -52,6 +52,10 @@ impl ManagedArtifactIdentity {
         &self.0
     }
 
+    pub(crate) fn ascii_case_equivalent(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+
     fn internal(identity: &'static str) -> Self {
         Self(identity.to_owned())
     }
@@ -493,7 +497,35 @@ impl ManifestWriteTransaction<'_> {
     pub fn compare_and_swap(
         &mut self,
         expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+    ) -> ManifestCasOutcome {
+        self.compare_and_swap_inner(expected_generation, candidate, false, None)
+    }
+
+    pub(crate) fn compare_and_swap_recovery(
+        &mut self,
+        expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+    ) -> ManifestCasOutcome {
+        self.compare_and_swap_inner(expected_generation, candidate, true, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compare_and_swap_recovery_with_fault(
+        &mut self,
+        expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+        injected_fault: super::canonical_durability::CanonicalDurabilityStage,
+    ) -> ManifestCasOutcome {
+        self.compare_and_swap_inner(expected_generation, candidate, true, Some(injected_fault))
+    }
+
+    fn compare_and_swap_inner(
+        &mut self,
+        expected_generation: u64,
         mut candidate: SessionArtifactManifestV1,
+        resume_temporary: bool,
+        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
     ) -> ManifestCasOutcome {
         if let Err(error) = validate_candidate_and_normalize(&mut candidate) {
             return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
@@ -594,14 +626,47 @@ impl ManifestWriteTransaction<'_> {
             .map_or(CanonicalSnapshotExpectation::Absent, |file| {
                 CanonicalSnapshotExpectation::Existing(file)
             });
-        let outcome = self.guard.install_snapshot(
-            &self.temporary_path,
-            &self.manifest_path,
-            &bytes,
-            expectation,
-            self.qualification,
-            recovery_key,
-        );
+        let outcome = if resume_temporary {
+            #[cfg(test)]
+            if let Some(injected_fault) = _injected_fault {
+                self.guard.install_snapshot_recovery_with_fault(
+                    &self.temporary_path,
+                    &self.manifest_path,
+                    &bytes,
+                    expectation,
+                    self.qualification,
+                    recovery_key,
+                    injected_fault,
+                )
+            } else {
+                self.guard.install_snapshot_recovery(
+                    &self.temporary_path,
+                    &self.manifest_path,
+                    &bytes,
+                    expectation,
+                    self.qualification,
+                    recovery_key,
+                )
+            }
+            #[cfg(not(test))]
+            self.guard.install_snapshot_recovery(
+                &self.temporary_path,
+                &self.manifest_path,
+                &bytes,
+                expectation,
+                self.qualification,
+                recovery_key,
+            )
+        } else {
+            self.guard.install_snapshot(
+                &self.temporary_path,
+                &self.manifest_path,
+                &bytes,
+                expectation,
+                self.qualification,
+                recovery_key,
+            )
+        };
         match outcome {
             CanonicalDurabilityOutcome::Accepted(durability) => {
                 match load_manifest_file(&self.manifest_path) {

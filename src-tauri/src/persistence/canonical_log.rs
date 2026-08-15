@@ -284,9 +284,15 @@ impl CanonicalRecoveryDescriptor {
         if !valid_identifier(&descriptor.idempotency_id) {
             return Err(CanonicalRecoveryDescriptorError::InvalidIdempotencyId);
         }
-        if descriptor.source == descriptor.temporary_quarantine
-            || descriptor.source == descriptor.quarantine
-            || descriptor.temporary_quarantine == descriptor.quarantine
+        if descriptor
+            .source
+            .ascii_case_equivalent(&descriptor.temporary_quarantine)
+            || descriptor
+                .source
+                .ascii_case_equivalent(&descriptor.quarantine)
+            || descriptor
+                .temporary_quarantine
+                .ascii_case_equivalent(&descriptor.quarantine)
         {
             return Err(CanonicalRecoveryDescriptorError::IdentityOverlap);
         }
@@ -323,6 +329,7 @@ pub enum CanonicalRecoveryResidual {
     QuarantineTempSourceFull,
     QuarantinePublishedSourceFull,
     ManifestPreparedSourceFull,
+    ManifestPreparedSourceMutationUncertain,
     ManifestPreparedSourceTruncated,
     ManifestCompletedSourceTruncated,
 }
@@ -335,6 +342,7 @@ pub enum CanonicalRecoveryRejection {
     NoRepairableTail,
     IdempotencyConflict,
     PreparedTransitionConflict,
+    ManagedIdentityConflict,
     QuarantineTempConflict,
     QuarantineDestinationConflict,
     Durability(CanonicalDurabilityRejection),
@@ -395,9 +403,17 @@ enum RecoveryFaultStage {
     QuarantineRename,
     QuarantineNamespaceSync,
     ManifestPrepared,
+    #[cfg(test)]
+    ManifestPreparedCandidateConflict,
+    #[cfg(test)]
+    ManifestPreparedInner(CanonicalDurabilityStage),
     SourceTruncate,
     SourceSync,
+    #[cfg(test)]
+    PostTruncateRevalidation,
     ManifestCompleted,
+    #[cfg(test)]
+    ManifestCompletedInner(CanonicalDurabilityStage),
     Acknowledgement,
 }
 
@@ -419,6 +435,8 @@ pub struct CanonicalRecoveryTransaction<'store> {
     tail: Vec<u8>,
     state: RecoveryObservedState,
     expected_generation: u64,
+    quarantine_visible: bool,
+    source_mutation_started: bool,
     fault: Option<RecoveryFaultStage>,
 }
 
@@ -449,6 +467,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
         }
 
         let state = classify_manifest_recovery_state(&head, &descriptor)
+            .map_err(CanonicalRecoveryBeginError::Rejected)?;
+        validate_recovery_identity_reservations(store, &head, &descriptor, state)
             .map_err(CanonicalRecoveryBeginError::Rejected)?;
         let (guard, qualification) = manifest.recovery_durability();
         if state != RecoveryObservedState::Completed {
@@ -590,6 +610,11 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             tail,
             state: observed_state,
             expected_generation: head.generation,
+            quarantine_visible: state != RecoveryObservedState::New,
+            source_mutation_started: matches!(
+                observed_state,
+                RecoveryObservedState::PreparedSourceTruncated | RecoveryObservedState::Completed
+            ),
             fault: None,
         })
     }
@@ -599,7 +624,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             return CanonicalRecoveryOutcome::AlreadyCompleted(self.receipt());
         }
         if let Err(rejection) = self.revalidate_source() {
-            return CanonicalRecoveryOutcome::Rejected(rejection);
+            return self
+                .rejection_after_mutation(CanonicalRecoveryStage::ValidateSource, rejection);
         }
         if self.state == RecoveryObservedState::New {
             if let Some(outcome) = self.publish_quarantine() {
@@ -610,12 +636,22 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 QuarantineResidualState::SourceFull,
             ) {
                 Ok(prepared) => prepared,
-                Err(rejection) => return CanonicalRecoveryOutcome::Rejected(rejection),
+                Err(rejection) => {
+                    return self.rejection_after_mutation(
+                        CanonicalRecoveryStage::ManifestPrepared,
+                        rejection,
+                    );
+                }
             };
-            match self
-                .manifest
-                .compare_and_swap(self.expected_generation, prepared)
+            #[cfg(test)]
+            let mut prepared = prepared;
+            #[cfg(test)]
+            if self.faults(RecoveryFaultStage::ManifestPreparedCandidateConflict)
+                && let Some(first) = prepared.artifacts.first().cloned()
             {
+                prepared.artifacts.push(first);
+            }
+            match self.compare_manifest_recovery(prepared, true) {
                 ManifestCasOutcome::Accepted { manifest, .. } => {
                     self.expected_generation = manifest.generation;
                     self.state = RecoveryObservedState::PreparedSourceFull;
@@ -632,7 +668,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                     return CanonicalRecoveryOutcome::AlreadyCompleted(self.receipt());
                 }
                 ManifestCasOutcome::Rejected(rejection) => {
-                    return CanonicalRecoveryOutcome::Rejected(
+                    return self.rejection_after_mutation(
+                        CanonicalRecoveryStage::ManifestPrepared,
                         CanonicalRecoveryRejection::Manifest(rejection),
                     );
                 }
@@ -648,7 +685,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
 
         if self.state == RecoveryObservedState::PreparedSourceFull {
             if let Err(rejection) = self.revalidate_source() {
-                return CanonicalRecoveryOutcome::Rejected(rejection);
+                return self
+                    .rejection_after_mutation(CanonicalRecoveryStage::ValidateSource, rejection);
             }
             if self.faults(RecoveryFaultStage::SourceTruncate) {
                 return self.injected_indeterminate(
@@ -656,10 +694,11 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                     CanonicalRecoveryResidual::ManifestPreparedSourceFull,
                 );
             }
+            self.source_mutation_started = true;
             if let Err(error) = self.source.set_len(self.source_after.content.byte_length) {
                 return self.io_indeterminate(
                     CanonicalRecoveryStage::SourceTruncate,
-                    CanonicalRecoveryResidual::ManifestPreparedSourceFull,
+                    CanonicalRecoveryResidual::ManifestPreparedSourceMutationUncertain,
                     &error,
                 );
             }
@@ -679,8 +718,17 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 &error,
             );
         }
+        #[cfg(test)]
+        if self.faults(RecoveryFaultStage::PostTruncateRevalidation) {
+            let displaced = self.source_path.with_extension("post-truncate-displaced");
+            std::fs::rename(&self.source_path, &displaced)
+                .expect("test hook displaces truncated source");
+            std::fs::copy(&displaced, &self.source_path)
+                .expect("test hook installs same-content replacement");
+        }
         if let Err(rejection) = self.verify_source_after() {
-            return CanonicalRecoveryOutcome::Rejected(rejection);
+            return self
+                .rejection_after_mutation(CanonicalRecoveryStage::ValidateSource, rejection);
         }
 
         let completed = match self.manifest_candidate(
@@ -688,12 +736,14 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             QuarantineResidualState::SourceTruncated,
         ) {
             Ok(completed) => completed,
-            Err(rejection) => return CanonicalRecoveryOutcome::Rejected(rejection),
+            Err(rejection) => {
+                return self.rejection_after_mutation(
+                    CanonicalRecoveryStage::ManifestCompleted,
+                    rejection,
+                );
+            }
         };
-        match self
-            .manifest
-            .compare_and_swap(self.expected_generation, completed)
-        {
+        match self.compare_manifest_recovery(completed, false) {
             ManifestCasOutcome::Accepted { manifest, .. }
             | ManifestCasOutcome::AlreadyCompleted { manifest } => {
                 self.expected_generation = manifest.generation;
@@ -706,9 +756,10 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 }
             }
             ManifestCasOutcome::Rejected(rejection) => {
-                return CanonicalRecoveryOutcome::Rejected(CanonicalRecoveryRejection::Manifest(
-                    rejection,
-                ));
+                return self.rejection_after_mutation(
+                    CanonicalRecoveryStage::ManifestCompleted,
+                    CanonicalRecoveryRejection::Manifest(rejection),
+                );
             }
             ManifestCasOutcome::DurabilityIndeterminate(indeterminate) => {
                 return self.manifest_indeterminate(
@@ -742,6 +793,7 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 {
                     return Some(CanonicalRecoveryOutcome::Rejected(rejection));
                 }
+                self.quarantine_visible = true;
                 let (guard, qualification) = self.manifest.recovery_durability();
                 return match guard.sync_recovery_namespace_entry(
                     &self.quarantine_path,
@@ -750,7 +802,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 ) {
                     NamespaceDurabilityOutcome::Accepted(_) => None,
                     NamespaceDurabilityOutcome::Rejected(rejection) => {
-                        Some(CanonicalRecoveryOutcome::Rejected(
+                        Some(self.rejection_after_mutation(
+                            CanonicalRecoveryStage::QuarantineNamespaceSync,
                             CanonicalRecoveryRejection::Durability(rejection),
                         ))
                     }
@@ -775,23 +828,41 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             }
         }
 
-        let (mut temporary, created) =
-            match open_or_resume_recovery_temporary(&self.temporary_path, &self.quarantine) {
+        let (mut temporary, written) =
+            match open_or_resume_recovery_temporary(&self.temporary_path, &self.tail) {
                 Ok(temporary) => temporary,
                 Err(rejection) => return Some(CanonicalRecoveryOutcome::Rejected(rejection)),
             };
-        if created {
-            if let Err(error) = temporary.write_all(&self.tail) {
+        self.quarantine_visible = true;
+        if written < self.tail.len() {
+            if let Err(error) = temporary.seek(SeekFrom::Start(written as u64)) {
                 return Some(self.io_indeterminate(
                     CanonicalRecoveryStage::QuarantineWrite,
                     CanonicalRecoveryResidual::QuarantineTempSourceFull,
                     &error,
                 ));
             }
-            if self.faults(RecoveryFaultStage::QuarantineWrite) {
+            let inject_partial = self.faults(RecoveryFaultStage::QuarantineWrite);
+            let remaining = &self.tail[written..];
+            if inject_partial {
+                let partial = (remaining.len() / 2).max(1).min(remaining.len());
+                if let Err(error) = temporary.write_all(&remaining[..partial]) {
+                    return Some(self.io_indeterminate(
+                        CanonicalRecoveryStage::QuarantineWrite,
+                        CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                        &error,
+                    ));
+                }
                 return Some(self.injected_indeterminate(
                     CanonicalRecoveryStage::QuarantineWrite,
                     CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                ));
+            }
+            if let Err(error) = temporary.write_all(remaining) {
+                return Some(self.io_indeterminate(
+                    CanonicalRecoveryStage::QuarantineWrite,
+                    CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                    &error,
                 ));
             }
         }
@@ -829,7 +900,7 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             ));
         }
         let (guard, qualification) = self.manifest.recovery_durability();
-        match guard.rename(
+        match guard.rename_recovery(
             &self.temporary_path,
             &self.quarantine_path,
             qualification,
@@ -845,11 +916,10 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                     None
                 }
             }
-            NamespaceDurabilityOutcome::Rejected(rejection) => {
-                Some(CanonicalRecoveryOutcome::Rejected(
-                    CanonicalRecoveryRejection::Durability(rejection),
-                ))
-            }
+            NamespaceDurabilityOutcome::Rejected(rejection) => Some(self.rejection_after_mutation(
+                CanonicalRecoveryStage::QuarantineRename,
+                CanonicalRecoveryRejection::Durability(rejection),
+            )),
             NamespaceDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
                 Some(self.namespace_indeterminate(
                     if indeterminate.stage == CanonicalDurabilityStage::ParentSync {
@@ -972,6 +1042,35 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
         }
     }
 
+    fn compare_manifest_recovery(
+        &mut self,
+        candidate: SessionArtifactManifestV1,
+        prepared: bool,
+    ) -> ManifestCasOutcome {
+        #[cfg(test)]
+        {
+            let selected = match self.fault {
+                Some(RecoveryFaultStage::ManifestPreparedInner(stage)) if prepared => Some(stage),
+                Some(RecoveryFaultStage::ManifestCompletedInner(stage)) if !prepared => Some(stage),
+                _ => None,
+            };
+            if selected.is_some() {
+                self.fault = None;
+            }
+            if let Some(stage) = selected {
+                return self.manifest.compare_and_swap_recovery_with_fault(
+                    self.expected_generation,
+                    candidate,
+                    stage,
+                );
+            }
+        }
+        #[cfg(not(test))]
+        let _ = prepared;
+        self.manifest
+            .compare_and_swap_recovery(self.expected_generation, candidate)
+    }
+
     fn injected_indeterminate(
         &self,
         stage: CanonicalRecoveryStage,
@@ -1024,6 +1123,96 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
     ) -> CanonicalRecoveryOutcome {
         self.namespace_indeterminate(stage, residual, indeterminate)
     }
+
+    fn rejection_after_mutation(
+        &self,
+        stage: CanonicalRecoveryStage,
+        rejection: CanonicalRecoveryRejection,
+    ) -> CanonicalRecoveryOutcome {
+        if !self.quarantine_visible && !self.source_mutation_started {
+            return CanonicalRecoveryOutcome::Rejected(rejection);
+        }
+        let residual = match self.state {
+            RecoveryObservedState::Completed => {
+                CanonicalRecoveryResidual::ManifestCompletedSourceTruncated
+            }
+            RecoveryObservedState::PreparedSourceTruncated => {
+                CanonicalRecoveryResidual::ManifestPreparedSourceTruncated
+            }
+            RecoveryObservedState::PreparedSourceFull if self.source_mutation_started => {
+                CanonicalRecoveryResidual::ManifestPreparedSourceMutationUncertain
+            }
+            RecoveryObservedState::PreparedSourceFull => {
+                CanonicalRecoveryResidual::ManifestPreparedSourceFull
+            }
+            RecoveryObservedState::New if self.quarantine_path.exists() => {
+                CanonicalRecoveryResidual::QuarantinePublishedSourceFull
+            }
+            RecoveryObservedState::New => CanonicalRecoveryResidual::QuarantineTempSourceFull,
+        };
+        CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+            stage,
+            kind: io::ErrorKind::InvalidData,
+            raw_os_error: None,
+            recovery_key: self.recovery_key(),
+            residual,
+        })
+    }
+}
+
+fn validate_recovery_identity_reservations(
+    store: &SessionArtifactManifestStore,
+    head: &SessionArtifactManifestV1,
+    descriptor: &CanonicalRecoveryDescriptor,
+    state: RecoveryObservedState,
+) -> Result<(), CanonicalRecoveryRejection> {
+    let internal = store.internal_identities();
+    let reserved_internal = [
+        &internal.manifest,
+        &internal.temporary,
+        &internal.coordination,
+    ];
+    if [
+        &descriptor.source,
+        &descriptor.temporary_quarantine,
+        &descriptor.quarantine,
+    ]
+    .into_iter()
+    .any(|identity| {
+        reserved_internal
+            .iter()
+            .any(|reserved| identity.ascii_case_equivalent(reserved))
+    }) {
+        return Err(CanonicalRecoveryRejection::ManagedIdentityConflict);
+    }
+
+    for artifact in &head.artifacts {
+        if descriptor
+            .temporary_quarantine
+            .ascii_case_equivalent(&artifact.managed_identity)
+        {
+            return Err(CanonicalRecoveryRejection::ManagedIdentityConflict);
+        }
+        if descriptor
+            .source
+            .ascii_case_equivalent(&artifact.managed_identity)
+            && descriptor.source != artifact.managed_identity
+        {
+            return Err(CanonicalRecoveryRejection::ManagedIdentityConflict);
+        }
+        if descriptor
+            .quarantine
+            .ascii_case_equivalent(&artifact.managed_identity)
+        {
+            let exact_retry_quarantine = state != RecoveryObservedState::New
+                && descriptor.quarantine == artifact.managed_identity
+                && artifact.kind == SessionArtifactKind::QuarantineRecovery;
+            if !exact_retry_quarantine {
+                return Err(CanonicalRecoveryRejection::ManagedIdentityConflict);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn classify_manifest_recovery_state(
@@ -1148,8 +1337,8 @@ fn ensure_exact_quarantine(
 
 fn open_or_resume_recovery_temporary(
     path: &Path,
-    expected: &ManagedArtifactSourceIdentity,
-) -> Result<(File, bool), CanonicalRecoveryRejection> {
+    expected: &[u8],
+) -> Result<(File, usize), CanonicalRecoveryRejection> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
@@ -1162,7 +1351,7 @@ fn open_or_resume_recovery_temporary(
                     raw_os_error: error.raw_os_error(),
                 }
             })?;
-            if content_identity(&bytes) != expected.content {
+            if bytes.len() > expected.len() || !expected.starts_with(&bytes) {
                 return Err(CanonicalRecoveryRejection::QuarantineTempConflict);
             }
             let file = OpenOptions::new()
@@ -1174,7 +1363,7 @@ fn open_or_resume_recovery_temporary(
                     kind: error.kind(),
                     raw_os_error: error.raw_os_error(),
                 })?;
-            return Ok((file, false));
+            return Ok((file, bytes.len()));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1193,14 +1382,13 @@ fn open_or_resume_recovery_temporary(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
-        .open(path)
-        .map(|file| (file, true))
-        .map_err(|error| CanonicalRecoveryRejection::IoBeforeMutation {
+    options.open(path).map(|file| (file, 0)).map_err(|error| {
+        CanonicalRecoveryRejection::IoBeforeMutation {
             stage: CanonicalRecoveryStage::QuarantineCreate,
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),
-        })
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3013,6 +3201,85 @@ mod tests {
     }
 
     #[test]
+    fn recovery_allows_source_and_quarantine_in_distinct_managed_directories() {
+        let root = temp_log("cross-directory")
+            .parent()
+            .expect("fixture root")
+            .to_path_buf();
+        fs::create_dir_all(root.join("streams")).expect("create stream directory");
+        fs::create_dir_all(root.join("recovery")).expect("create recovery directory");
+        let path = root.join("streams/events.jsonl");
+        let prefix = b"{\"value\":1}\n".to_vec();
+        let tail = b"private incomplete tail".to_vec();
+        let source = [prefix.as_slice(), tail.as_slice()].concat();
+        fs::write(&path, &source).expect("write damaged source");
+        let store = SessionArtifactManifestStore::qualified_for_test(&root)
+            .expect("qualified nested store");
+        let candidate = SessionArtifactManifestV1::candidate(
+            SESSION,
+            ManifestTransition {
+                idempotency_id: "seed-manifest".to_string(),
+                fingerprint: Sha256Digest::new(format!("sha256:{}", "b".repeat(64)))
+                    .expect("seed fingerprint"),
+                state: ManifestTransitionState::Completed,
+            },
+            vec![
+                SessionArtifactEntry {
+                    kind: SessionArtifactKind::OriginalSessionAudio,
+                    privacy_class: ArtifactPrivacyClass::OriginalEvidence,
+                    managed_identity: ManagedArtifactIdentity::new("audio/original.wav")
+                        .expect("audio identity"),
+                    availability: ArtifactAvailability::Unavailable {
+                        reason: ArtifactUnavailableReason::NeverCaptured,
+                    },
+                },
+                SessionArtifactEntry {
+                    kind: SessionArtifactKind::TranscriptRevisions,
+                    privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+                    managed_identity: ManagedArtifactIdentity::new("streams/events.jsonl")
+                        .expect("nested source identity"),
+                    availability: ArtifactAvailability::Present {
+                        content: content_identity(&source),
+                    },
+                },
+            ],
+            None,
+        )
+        .expect("nested seed candidate");
+        let mut write = store.begin_write().expect("seed nested manifest");
+        assert!(matches!(
+            write.compare_and_swap(0, candidate),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(write);
+        let descriptor = CanonicalRecoveryDescriptor::new(
+            SESSION,
+            STREAM,
+            SCHEMA,
+            "attempt-nested",
+            Sha256Digest::new(format!("sha256:{}", "a".repeat(64))).expect("fingerprint"),
+            ManagedArtifactIdentity::new("streams/events.jsonl").expect("source"),
+            ManagedArtifactIdentity::new("recovery/events.tmp").expect("temporary"),
+            ManagedArtifactIdentity::new("recovery/events.bin").expect("quarantine"),
+        )
+        .expect("nested descriptor");
+
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin nested recovery");
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::Accepted(_)
+        ));
+        assert_eq!(fs::read(&path).expect("retained source"), prefix);
+        assert_eq!(
+            fs::read(root.join("recovery/events.bin")).expect("nested quarantine"),
+            tail
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn recovery_transaction_publishes_exact_tail_and_completes_manifest_before_ack() {
         let (path, store, descriptor, prefix, tail) = recovery_fixture("recovery-green");
         let root = path.parent().expect("root");
@@ -3120,6 +3387,220 @@ mod tests {
             assert_eq!(manifest.generation, 3, "cut {cut:?}");
             cleanup(&path);
         }
+    }
+
+    #[test]
+    fn partial_quarantine_write_restarts_from_exact_prefix() {
+        let (path, store, descriptor, prefix, tail) = recovery_fixture("partial-write-restart");
+        let root = path.parent().expect("root");
+        let temporary = root.join("events.recovery.tmp");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                .expect("begin partial write")
+                .fail_once_at(RecoveryFaultStage::QuarantineWrite);
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::QuarantineWrite,
+                residual: CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                ..
+            })
+        ));
+        let partial = fs::read(&temporary).expect("read stable partial temp");
+        assert!(!partial.is_empty());
+        assert!(partial.len() < tail.len());
+        assert!(tail.starts_with(&partial));
+        drop(transaction);
+
+        let mut restarted = CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+            .expect("fresh transaction resumes partial temp");
+        assert!(matches!(
+            restarted.execute(),
+            CanonicalRecoveryOutcome::Accepted(_)
+        ));
+        assert_eq!(fs::read(&path).expect("retained prefix"), prefix);
+        assert_eq!(
+            fs::read(root.join("events.recovery.bin")).expect("exact quarantine"),
+            tail
+        );
+        assert!(!temporary.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn duplicate_manifest_identity_after_quarantine_publish_is_indeterminate() {
+        let (path, store, descriptor, _prefix, tail) = recovery_fixture("post-publish-conflict");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("full source");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin recovery")
+                .fail_once_at(RecoveryFaultStage::ManifestPreparedCandidateConflict);
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::ManifestPrepared,
+                residual: CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).expect("source remains full"), original);
+        assert_eq!(
+            fs::read(root.join("events.recovery.bin")).expect("published quarantine"),
+            tail
+        );
+        drop(transaction);
+        let ManifestLoadOutcome::Present(head) = store.load().expect("load unchanged manifest")
+        else {
+            panic!("manifest remains present");
+        };
+        assert_eq!(head.generation, 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn post_truncate_source_revalidation_failure_is_indeterminate() {
+        let (path, store, descriptor, prefix, tail) = recovery_fixture("post-truncate-revalidate");
+        let root = path.parent().expect("root");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin recovery")
+                .fail_once_at(RecoveryFaultStage::PostTruncateRevalidation);
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::ValidateSource,
+                residual: CanonicalRecoveryResidual::ManifestPreparedSourceTruncated,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).expect("replacement is truncated"), prefix);
+        assert_eq!(
+            fs::read(root.join("events.recovery.bin")).expect("published quarantine"),
+            tail
+        );
+        drop(transaction);
+        let ManifestLoadOutcome::Present(head) = store.load().expect("load prepared manifest")
+        else {
+            panic!("prepared manifest remains present");
+        };
+        assert_eq!(head.generation, 2);
+        assert_eq!(head.transition.state, ManifestTransitionState::Prepared);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_inner_faults_resume_exact_candidate_once_for_both_phases() {
+        let stages = [
+            CanonicalDurabilityStage::Write,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::Rename,
+        ];
+        for completed in [false, true] {
+            for stage in stages {
+                let label = format!(
+                    "manifest-inner-{}-{stage:?}",
+                    if completed { "completed" } else { "prepared" }
+                );
+                let (path, store, descriptor, prefix, tail) = recovery_fixture(&label);
+                let root = path.parent().expect("root");
+                let fault = if completed {
+                    RecoveryFaultStage::ManifestCompletedInner(stage)
+                } else {
+                    RecoveryFaultStage::ManifestPreparedInner(stage)
+                };
+                let mut transaction =
+                    CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                        .expect("begin inner-fault recovery")
+                        .fail_once_at(fault);
+                assert!(matches!(
+                    transaction.execute(),
+                    CanonicalRecoveryOutcome::DurabilityIndeterminate(_)
+                ));
+                assert!(root.join(".audio-graph-session-artifacts.v1.tmp").is_file());
+                drop(transaction);
+
+                let mut restarted =
+                    CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                        .expect("fresh begin resumes manifest temp");
+                assert!(matches!(
+                    restarted.execute(),
+                    CanonicalRecoveryOutcome::Accepted(_)
+                        | CanonicalRecoveryOutcome::AlreadyCompleted(_)
+                ));
+                drop(restarted);
+                assert_eq!(fs::read(&path).expect("retained source"), prefix);
+                assert_eq!(
+                    fs::read(root.join("events.recovery.bin")).expect("one quarantine"),
+                    tail
+                );
+                assert!(!root.join(".audio-graph-session-artifacts.v1.tmp").exists());
+                let ManifestLoadOutcome::Present(head) =
+                    store.load().expect("load converged manifest")
+                else {
+                    panic!("manifest must remain present");
+                };
+                assert_eq!(head.generation, 3, "phase completed={completed}, {stage:?}");
+                cleanup(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_manifest_recovery_temp_is_preserved_as_indeterminate_after_publish() {
+        let (path, store, descriptor, _prefix, tail) = recovery_fixture("manifest-temp-conflict");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("full source");
+        let manifest_temp = root.join(".audio-graph-session-artifacts.v1.tmp");
+        let unrelated = b"unrelated candidate";
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin recovery");
+        fs::write(&manifest_temp, unrelated).expect("install unrelated manifest temp");
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::ManifestPrepared,
+                residual: CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&manifest_temp).expect("temp preserved"), unrelated);
+        assert_eq!(fs::read(&path).expect("source remains full"), original);
+        assert_eq!(
+            fs::read(root.join("events.recovery.bin")).expect("quarantine published"),
+            tail
+        );
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_manifest_recovery_temp_is_preserved_as_indeterminate_after_publish() {
+        let (path, store, descriptor, _prefix, _tail) = recovery_fixture("manifest-temp-special");
+        let root = path.parent().expect("root");
+        let manifest_temp = root.join(".audio-graph-session-artifacts.v1.tmp");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin recovery");
+        fs::create_dir(&manifest_temp).expect("install special manifest temp");
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::ManifestPrepared,
+                residual: CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                ..
+            })
+        ));
+        assert!(manifest_temp.is_dir());
+        cleanup(&path);
     }
 
     #[test]
@@ -3373,6 +3854,78 @@ mod tests {
     fn reserved_internal_quarantine_identity_is_not_constructible() {
         assert!(ManagedArtifactIdentity::new(".audio-graph-canonical.lock").is_err());
         assert!(ManagedArtifactIdentity::new(".AUDIO-GRAPH-SESSION-ARTIFACTS.V1.TMP").is_err());
+    }
+
+    #[test]
+    fn recovery_descriptor_reserves_source_temp_and_final_by_ascii_case_equivalence() {
+        let source = ManagedArtifactIdentity::new("Events.Jsonl").expect("source");
+        let temporary = ManagedArtifactIdentity::new("events.jsonl").expect("temporary alias");
+        let final_identity =
+            ManagedArtifactIdentity::new("events.recovery.bin").expect("final identity");
+
+        assert_eq!(
+            CanonicalRecoveryDescriptor::new(
+                SESSION,
+                STREAM,
+                SCHEMA,
+                "attempt-alias",
+                Sha256Digest::new(format!("sha256:{}", "a".repeat(64))).expect("fingerprint"),
+                source,
+                temporary,
+                final_identity,
+            ),
+            Err(CanonicalRecoveryDescriptorError::IdentityOverlap)
+        );
+    }
+
+    #[test]
+    fn recovery_begin_reserves_absent_temp_and_final_against_manifest_inventory() {
+        let (path, store, descriptor, _prefix, _tail) =
+            recovery_fixture("inventoried-quarantine-alias");
+        let root = path.parent().expect("root");
+        let ManifestLoadOutcome::Present(head) = store.load().expect("load seed head") else {
+            panic!("seed manifest must exist");
+        };
+        let mut artifacts = head.artifacts.clone();
+        artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::MaterializedNotes,
+            privacy_class: ArtifactPrivacyClass::DerivedSessionMemory,
+            managed_identity: ManagedArtifactIdentity::new("EVENTS.RECOVERY.BIN")
+                .expect("inventoried alias"),
+            availability: ArtifactAvailability::Unavailable {
+                reason: ArtifactUnavailableReason::NeverCaptured,
+            },
+        });
+        let candidate = SessionArtifactManifestV1::candidate(
+            SESSION,
+            ManifestTransition {
+                idempotency_id: "inventory-update".to_string(),
+                fingerprint: Sha256Digest::new(format!("sha256:{}", "d".repeat(64)))
+                    .expect("inventory fingerprint"),
+                state: ManifestTransitionState::Completed,
+            },
+            artifacts,
+            None,
+        )
+        .expect("inventory candidate");
+        let mut write = store.begin_write().expect("inventory write");
+        assert!(matches!(
+            write.compare_and_swap(1, candidate),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(write);
+        let before = fs::read(&path).expect("source before");
+
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::ManagedIdentityConflict
+            ))
+        ));
+        assert_eq!(fs::read(&path).expect("source unchanged"), before);
+        assert!(!root.join("events.recovery.tmp").exists());
+        assert!(!root.join("events.recovery.bin").exists());
+        cleanup(&path);
     }
 
     #[test]
