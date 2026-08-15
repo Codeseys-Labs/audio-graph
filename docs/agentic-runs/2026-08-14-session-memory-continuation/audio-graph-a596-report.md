@@ -13,6 +13,8 @@ Worktree:
 
 Implementation commit: `bec56b9f44aed27f113a143cec21b768778256ab`
 
+Review correction commit: `0dfb6e7f20931e33cb36557c4a12d7baf326a566`
+
 ## Outcome
 
 Implemented one dormant, explicit-root deep module for the persisted typed
@@ -120,10 +122,10 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1626 filtered out
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud session_artifact_manifest -- --nocapture --test-threads=1
 ```
 
-Final result:
+Final corrected result:
 
 ```text
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1626 filtered out; finished in 0.05s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1626 filtered out; finished in 6.68s
 ```
 
 The focused suite covers absent strict load without provisioning, present head
@@ -134,6 +136,106 @@ generation, unqualified namespace refusal, Prepared-to-Completed, exact retry,
 fingerprint conflict, completed regression, restart reopen, quarantine
 reference/length/residual invariants, Original Session Audio unavailable
 evidence, and deletion inventory/internal self-reference parity.
+
+### Independent review correction RED/GREEN
+
+Review round 1 identified five admission/read strictness gaps. Each correction
+started with a focused RED against the public seam or one deterministic private
+read-race seam, then passed alone before the consolidated run.
+
+#### Exact Prepared-to-Completed transaction
+
+Initial RED exited 101 because the typed refusal classes did not exist:
+
+```text
+error[E0599]: no variant or associated item named `CompletionRequiresPrepared`
+error[E0599]: no variant or associated item named `PreparedCompletionConflict`
+```
+
+After the first correction, a second RED proved that an unrelated already
+Completed head could still admit a direct Completed quarantine snapshot:
+
+```text
+assertion failed: matches!(..., CompletionRequiresPrepared)
+test result: FAILED. 0 passed; 1 failed
+```
+
+GREEN requires a current durable `Prepared` head for the exact same immutable
+transaction. The only Prepared-to-Completed changes permitted are:
+
+- the manifest generation and manifest/quarantine phase;
+- `SourceFull` to `SourceTruncated` (or retaining an already observed
+  `SourceTruncated` prepared residual);
+- the one source artifact moving from its recorded before content to its
+  recorded target content; and
+- the one matching quarantine entry moving to the corresponding
+  source-truncated residual reason.
+
+Session, id/fingerprint, source-before/source-after/quarantine identities,
+hashes, lengths, kinds, privacy classes, and every unrelated inventory entry
+must remain byte-for-byte equivalent after normalizing those allowed fields.
+Tests independently alter source identity, source-before hash, lengths,
+expected target, quarantine identity/reference, and inventory; each returns
+`PreparedCompletionConflict`. Direct Completed from Absent or from an
+unrelated Completed head returns `CompletionRequiresPrepared`. Exact Completed
+retry still returns `AlreadyCompleted` at the existing generation.
+
+#### Candidate size preflight
+
+RED exited 101:
+
+```text
+error[E0599]: no variant named `ManifestTooLarge` found for enum `ManifestCasRejection`
+```
+
+GREEN serializes the fully normalized generation-assigned candidate before
+calling `install_snapshot`. An exact 16 MiB candidate reaches the typed
+unqualified-namespace refusal; a 16 MiB + 1 byte candidate returns
+`ManifestTooLarge { byte_length: 16777217 }`. Neither case creates a manifest
+or temp, and the oversized case never calls the durability install seam.
+
+#### Bounded, revalidated strict load
+
+RED exited 101:
+
+```text
+error[E0425]: cannot find function `load_manifest_file_with_after_open`
+error[E0599]: no variant or associated item named `ChangedDuringRead`
+```
+
+GREEN rejects symlinks/non-regular pathname entries, opens the head, validates
+the open handle's regular-file type and length, reads through a `MAX + 1`
+`Take` bound, then revalidates handle type and exact length before schema
+probing or decoding. A deterministic test changes the open file length at the
+read seam and receives `ChangedDuringRead`. Same-length mutation by an
+uncooperative process remains outside the documented cooperative-lock threat
+boundary; no unsafe code or dependency was added.
+
+#### Portable control and component floor
+
+RED showed that a newline-bearing identity was admitted:
+
+```text
+control must be rejected: "line\\nbreak"
+test result: FAILED. 0 passed; 1 failed
+```
+
+GREEN rejects ASCII controls including newline, tab, and DEL; Unicode control
+characters; conservative Unicode format/bidirectional controls; and any path
+component longer than 255 UTF-8 bytes.
+
+#### Persisted generation floor
+
+RED exited 101:
+
+```text
+error[E0599]: no variant named `InvalidGeneration` found for enum `ManifestValidationError`
+```
+
+GREEN separates uncommitted candidate validation from persisted-head
+validation. Initial CAS still uses expected coordinate 0 and assigns durable
+generation 1, while strict load and the golden persisted V1 validation reject
+generation 0 as `InvalidGeneration { actual: 0 }`.
 
 Two intermediate failures were fixture corrections rather than interface
 changes: one test attempted a shared load while its own exclusive transaction
@@ -151,7 +253,7 @@ All Rust gates used Rust/Cargo 1.95.0 and the stable worktree-local target
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1
 ```
 
-Result: `38 passed; 0 failed; 0 ignored; 1601 filtered out`.
+Result: `38 passed; 0 failed; 0 ignored; 1605 filtered out`.
 
 ### Locked check, strict Clippy, rustfmt, and diff
 
@@ -162,8 +264,9 @@ cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 git diff --check
 ```
 
-Results: locked check passed in 2m04s; strict Clippy passed in 40.74s after
-boxing the large `Present` load payload; rustfmt and diff checks passed.
+Final corrected results: locked check passed in 19.52s; strict Clippy passed in
+28.63s; rustfmt and diff checks passed. The initial implementation also
+corrected Clippy's large-enum finding by boxing the `Present` load payload.
 
 ### One full serialized locked cloud library suite
 
@@ -174,7 +277,7 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-
 Result:
 
 ```text
-test result: ok. 1631 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 42.03s
+test result: ok. 1635 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 48.67s
 ```
 
 ### Windows actual-module compile evidence
@@ -226,8 +329,15 @@ Result: no leaks found.
 
 ## Exact footprint and non-goals
 
-Implementation range `5444b6630850302128196dcd8b7689afe3a30bb1..bec56b9f44aed27f113a143cec21b768778256ab`
+The review correction range
+`80b97aedc01adc846afedf9734d5909a479a3d89..0dfb6e7f20931e33cb36557c4a12d7baf326a566`
 contains only:
+
+```text
+src-tauri/src/persistence/session_artifact_manifest.rs
+```
+
+The complete implementation footprint remains:
 
 ```text
 src-tauri/src/persistence/mod.rs
