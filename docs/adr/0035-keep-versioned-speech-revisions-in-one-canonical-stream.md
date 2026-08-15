@@ -160,10 +160,9 @@ canonical `transcript_revisions` stream.
 11. This record changes neither provider selectability nor content-egress
     policy. It chooses storage authority only.
 
-This record remains proposed. It constrains no implementation until the
-prospective human deciders accept it. `audio-graph-4249` and
-`audio-graph-48de` remain blocked while it is proposed; this ADR does not
-mutate either Seed.
+This record is accepted and constrains implementation through its Decision
+Outcome and Compliance sections. Acceptance is evidence only: it does not
+close or unblock a Seed, and queue changes remain conductor-owned.
 
 ## Consequences
 
@@ -277,8 +276,7 @@ evidence.
   or display a stale legacy derivative.
 - Existing v1 payload and frame bytes are never rewritten during cutover.
 - No unavailable v2 field is down-converted into a mandatory legacy scalar.
-- `audio-graph-4249` and `audio-graph-48de` remain blocked while this record is
-  proposed.
+- Acceptance of this record does not itself close or unblock any Seed.
 
 ## Reversal Condition
 
@@ -293,5 +291,5 @@ canonical-reader/recovery gate before v2 writer activation.
 Implementation contracts, consumer inventory, old-binary limitations, and the
 cheapest vertical probes are in
 `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-48de-report.md`.
-This proposed record does not edit accepted ADRs and does not authorize code,
-Seed, provider, or workflow changes.
+This accepted record does not authorize code, Seed, provider, or workflow
+changes; those effects require separately authorized work.
