@@ -13,6 +13,8 @@ Exact base: `183f78a80546f2f7fa80c8394ede69d9d56e526b`
 
 Implementation commit: `577c83c93372795692afe5f5c4caedb9574b834b`
 
+Correction source commit: `106364fab97780892b6a1303154bdf680ce973d9`
+
 ## Outcome
 
 Implemented one dormant `CanonicalRecoveryTransaction` deep module. It has no
@@ -252,3 +254,93 @@ Remaining ownership is explicit:
 No durability or manifest interface blocker remains for those successor
 workstreams. The only evidence caveat is the uncaptured intended missing-symbol
 RED described above; all behavior and broad gates are captured and passing.
+
+## Correction round 1
+
+The reviewed snapshot `20e23dfdf711688d52f7d5a0786cdc813e65ff45`
+identified five P1 convergence gaps. Correction commit `106364f` resolves them
+without a runtime caller or scope expansion:
+
+- post-quarantine and post-truncate validation, durability, and CAS refusals
+  are phase-driven `DurabilityIndeterminate` outcomes with an exact
+  content-free stage, recovery key, and residual;
+- source, temporary, and final recovery identities reserve the same portable
+  ASCII-case equivalence as the manifest inventory. Temporary/final identities
+  are checked against every current artifact and all manifest internals before
+  mutation; only the exact intended quarantine artifact is allowed on an exact
+  Prepared/Completed retry;
+- recovery-only namespace binding accepts managed descendants, so a source in
+  `streams/...` and a quarantine pair in `recovery/...` are valid. The
+  quarantine pair must still share one canonical parent/volume, while the
+  public rename API remains immediate-parent and same-directory only;
+- a true partial quarantine write leaves a stable regular strict-prefix temp.
+  Fresh begin validates the unchanged full source and resumes that exact
+  prefix; unrelated and special entries remain preserved conflicts; and
+- the private recovery manifest CAS path resumes an exact or verified
+  strict-prefix fixed temp after inner write, flush, protection, file-sync, or
+  pre-install rename cuts. Public `install_snapshot` still refuses every
+  existing temp and retains its collision-safe contract.
+
+### Correction RED and GREEN evidence
+
+The descriptor alias test produced the first exact correction RED: construction
+returned `Ok(CanonicalRecoveryDescriptor([REDACTED]))` where the test required
+`Err(IdentityOverlap)`. After using `ManagedArtifactIdentity`'s shared portable
+ASCII-case predicate, that test passed.
+
+The absent-but-inventoried identity test then produced this captured compiler
+RED before the typed rejection existed:
+
+```text
+error[E0599]: no variant or associated item named `ManagedIdentityConflict`
+found for enum `canonical_log::CanonicalRecoveryRejection`
+```
+
+The inventory reservation implementation made that test GREEN without creating
+a quarantine temp/final or changing the source. The original public-seam
+missing-symbol RED caveat above remains unchanged: it was authored first but
+the cold build did not reach the crate before implementation began.
+
+The remaining correction cases were added as deterministic colocated tests;
+their first retained focused evidence is GREEN rather than a separately saved
+pre-implementation RED transcript. The final canonical-log suite is:
+
+```text
+running 46 tests
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 1620 filtered out; finished in 1.26s
+```
+
+New cases prove cross-directory managed layout, true partial-quarantine restart,
+duplicate manifest identity after quarantine publish, same-content source
+replacement after truncation, unrelated/special manifest temp preservation,
+and the ten-case inner manifest matrix: Prepared and Completed each cut at
+write, flush, owner protection, file sync, and pre-install rename. Every inner
+cut reopens under a fresh guard and converges to one quarantine and generation
+3 with no fixed temp.
+
+### Correction final gates
+
+Final commands used Rust/Cargo 1.95.0 and the stable worktree-local target.
+
+- canonical log: `46 passed; 0 failed`;
+- manifest: `18 passed; 0 failed`;
+- canonical durability: `38 passed; 0 failed`;
+- locked library/test check: exit 0;
+- strict Clippy with `-D warnings`: exit 0;
+- rustfmt check: exit 0;
+- one final serialized full locked cloud library: `1658 passed; 0 failed; 8
+  ignored` out of 1666 in 51.38 seconds;
+- Windows `x86_64-pc-windows-msvc` production check: exit 0;
+- Windows actual-module `cfg(test)` object compile: exit 0 with only expected
+  unused/dead-code warnings from the dependency-minimal probe;
+- `verify:fast`: exit 0; Biome checked 174 files, TypeScript and all five
+  generated contracts passed, and Seeds JSON stress parsed ready 50, blocked
+  97, and list 50;
+- Betterleaks: no leaks in approximately 425.28 KB;
+- docs/Seeds secret hygiene: 0 findings; and
+- `git diff --check`: exit 0.
+
+The correction footprint is still exactly the three owned persistence files
+plus this report. Searches found no caller outside the dormant persistence
+module and no change to Seeds, dependencies, generated contracts, workflows,
+Docker, Blacksmith, commands, state, scheduler, speech, providers, or UI.
