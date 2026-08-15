@@ -463,3 +463,30 @@ remains blocked until custody reconciliation, then owns subprocess/crash-cut
 proof; native Windows, macOS/APFS, and Linux qualification remains 2df3. No
 Seed was closed or additionally edited, and no push, workflow, Blacksmith,
 Docker, guest, or runtime activation occurred.
+
+## Wave3 closure and subprocess-proof activation
+
+Custody `21396dcf8547e28901e29e36699242458c8e29c3` was merged
+history-preservingly without conflict at
+`5812b86532fa76c1a315266c147e108ee7e97bbb`. Its one linear commit after
+custody `ffb86b0` changes only `.seeds/issues.jsonl`; the integrated 642-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Seed 3b8b is closed and absent from ready and blocked queues. Seed b77b is
+`in_progress`, unblocked, and assigned to `codex-b77b-wave7b`. Parent 8e73's
+exact Wave3 integration extension records integration tip `94a75f1`, closed
+3b8b, active b77b, next 2df3, the assembled gate evidence, and no runtime
+activation.
+
+Seed 464c remains open, unblocked, present in the ready queue, and inactive.
+Its new scheduler-store discovery extension recommends the explicit-root
+session-bound `persistence/scheduler_queue.rs` seam, capacity-one latest-state
+coalescing without treating enqueue as a durability receipt, and no runtime,
+command, projection-evaluation, or UI activation.
+
+The queue contains 91 ready and 96 blocked issues. Seeds output stress parsed
+ready 50, blocked 96, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no additional
+Seed closure/edit, push, workflow, Blacksmith, or Docker action occurred.

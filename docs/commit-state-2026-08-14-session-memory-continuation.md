@@ -590,3 +590,21 @@ probe misses were harness-only; the direct assembled object compile passed.
 Seed 3b8b is root-closure eligible; b77b follows after reconciliation, then
 2df3 owns native platform proof. No Seed closure, push, workflow, Blacksmith,
 Docker, guest, or runtime activation occurred.
+
+### Wave 7B Wave3 closure and subprocess-proof activation
+
+Custody `21396dc` was merged history-preservingly at `5812b86`. Its one
+linear commit after `ffb86b0` changes only `.seeds/issues.jsonl`, and the
+integrated 642-row queue is byte-identical to custody.
+
+Seed 3b8b is closed and absent from open queues. Seed b77b is `in_progress`,
+unblocked, and assigned to `codex-b77b-wave7b`; 8e73 records closed 3b8b,
+active b77b, next 2df3, and no runtime activation. Seed 464c remains open,
+ready, and inactive; its scheduler-store discovery recommends an explicit-root
+session-bound queue store with capacity-one latest-state coalescing and no
+runtime or UI activation.
+
+The queue has 91 ready and 96 blocked issues, and doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no additional Seed
+closure/edit, push, workflow, Blacksmith, or Docker action occurred.
