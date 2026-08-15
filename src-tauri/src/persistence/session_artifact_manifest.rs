@@ -16,6 +16,8 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::canonical_durability::CanonicalPlatform;
 use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
@@ -424,6 +426,10 @@ impl SessionArtifactManifestStore {
         self.root.join(MANIFEST_FILE_NAME)
     }
 
+    pub(crate) fn managed_root(&self) -> &Path {
+        &self.root
+    }
+
     #[cfg(test)]
     pub(crate) fn qualified_for_test(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
         let root = root.into();
@@ -432,6 +438,21 @@ impl SessionArtifactManifestStore {
         Ok(Self {
             root,
             durability: CanonicalDurability::new(),
+            qualification: Some(qualification),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualified_for_test_platform(
+        root: impl Into<PathBuf>,
+        platform: CanonicalPlatform,
+    ) -> Result<Self, ManifestStoreError> {
+        let root = root.into();
+        let qualification = CanonicalFilesystemQualification::for_test_root(&root)
+            .map_err(ManifestStoreError::Coordination)?;
+        Ok(Self {
+            root,
+            durability: CanonicalDurability::for_test_platform(platform),
             qualification: Some(qualification),
         })
     }
@@ -449,6 +470,18 @@ pub struct ManifestWriteTransaction<'store> {
 }
 
 impl ManifestWriteTransaction<'_> {
+    /// Narrow handoff for the lock-owned recovery transaction. The guard and
+    /// qualification remain borrowed from this manifest transaction; callers
+    /// cannot detach either from its lifetime.
+    pub(crate) fn recovery_durability(
+        &self,
+    ) -> (
+        &CanonicalExclusiveGuard,
+        Option<&CanonicalFilesystemQualification>,
+    ) {
+        (&self.guard, self.qualification)
+    }
+
     pub fn head(&self) -> ManifestLoadOutcome {
         self.head
             .clone()

@@ -19,8 +19,9 @@
 //! replace old writers atomically before this appender is used.
 //!
 //! File `sync_all` is intentionally not presented as parent-directory
-//! durability. New-file directory-entry persistence and quarantine lifecycle
-//! registration remain explicit integration blockers.
+//! durability. Dormant tail repair crosses the stronger boundary only through
+//! `CanonicalRecoveryTransaction`, whose manifest-owned guard publishes and
+//! registers quarantine evidence before it truncates the retained source.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -35,6 +36,19 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use super::canonical_durability::{
+    CanonicalDurabilityIndeterminate, CanonicalDurabilityOutcome as NamespaceDurabilityOutcome,
+    CanonicalDurabilityRejection, CanonicalDurabilityStage, CanonicalRecoveryKey,
+};
+use super::session_artifact_manifest::{
+    ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass, ArtifactResidualReason,
+    ManagedArtifactIdentity, ManagedArtifactSourceIdentity, ManifestCasOutcome,
+    ManifestCasRejection, ManifestLoadOutcome, ManifestStoreError, ManifestTransition,
+    ManifestTransitionState, ManifestValidationError, ManifestWriteTransaction,
+    QuarantineResidualState, QuarantineTransaction, SessionArtifactEntry, SessionArtifactKind,
+    SessionArtifactManifestStore, SessionArtifactManifestV1, Sha256Digest,
+};
 
 pub const CANONICAL_LOG_FORMAT_VERSION: u8 = 1;
 
@@ -120,6 +134,8 @@ pub struct CanonicalLogSnapshot<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalTailRecovery {
     Strict,
+    /// Legacy source-compatibility selector. Public readers and appenders are
+    /// strict; only private injected-file regression seams observe this mode.
     QuarantineUnterminatedTail,
 }
 
@@ -213,6 +229,979 @@ impl fmt::Display for CanonicalLogError {
 }
 
 impl std::error::Error for CanonicalLogError {}
+
+/// Caller-owned attempted-event recovery identity and stable managed names.
+///
+/// The descriptor contains no transcript or provider payload. Its `Debug`
+/// representation is deliberately opaque because managed identities and
+/// idempotency ids are still caller-controlled metadata.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CanonicalRecoveryDescriptor {
+    session_id: String,
+    stream_id: String,
+    domain_schema_version: u32,
+    idempotency_id: String,
+    fingerprint: Sha256Digest,
+    source: ManagedArtifactIdentity,
+    temporary_quarantine: ManagedArtifactIdentity,
+    quarantine: ManagedArtifactIdentity,
+}
+
+impl fmt::Debug for CanonicalRecoveryDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalRecoveryDescriptor([REDACTED])")
+    }
+}
+
+impl CanonicalRecoveryDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        domain_schema_version: u32,
+        idempotency_id: impl Into<String>,
+        fingerprint: Sha256Digest,
+        source: ManagedArtifactIdentity,
+        temporary_quarantine: ManagedArtifactIdentity,
+        quarantine: ManagedArtifactIdentity,
+    ) -> Result<Self, CanonicalRecoveryDescriptorError> {
+        let descriptor = Self {
+            session_id: session_id.into(),
+            stream_id: stream_id.into(),
+            domain_schema_version,
+            idempotency_id: idempotency_id.into(),
+            fingerprint,
+            source,
+            temporary_quarantine,
+            quarantine,
+        };
+        validate_stream_context(
+            &descriptor.session_id,
+            &descriptor.stream_id,
+            descriptor.domain_schema_version,
+        )
+        .map_err(CanonicalRecoveryDescriptorError::StreamContext)?;
+        if !valid_identifier(&descriptor.idempotency_id) {
+            return Err(CanonicalRecoveryDescriptorError::InvalidIdempotencyId);
+        }
+        if descriptor.source == descriptor.temporary_quarantine
+            || descriptor.source == descriptor.quarantine
+            || descriptor.temporary_quarantine == descriptor.quarantine
+        {
+            return Err(CanonicalRecoveryDescriptorError::IdentityOverlap);
+        }
+        Ok(descriptor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRecoveryDescriptorError {
+    StreamContext(CanonicalLogError),
+    InvalidIdempotencyId,
+    IdentityOverlap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalRecoveryStage {
+    ValidateSource,
+    QuarantineCreate,
+    QuarantineWrite,
+    QuarantineFlush,
+    QuarantineFileSync,
+    QuarantineRename,
+    QuarantineNamespaceSync,
+    ManifestPrepared,
+    SourceTruncate,
+    SourceSync,
+    ManifestCompleted,
+    Acknowledgement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalRecoveryResidual {
+    SourceFull,
+    QuarantineTempSourceFull,
+    QuarantinePublishedSourceFull,
+    ManifestPreparedSourceFull,
+    ManifestPreparedSourceTruncated,
+    ManifestCompletedSourceTruncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRecoveryRejection {
+    ManifestMissing,
+    SourceNotInventoried,
+    SourceContentMismatch,
+    NoRepairableTail,
+    IdempotencyConflict,
+    PreparedTransitionConflict,
+    QuarantineTempConflict,
+    QuarantineDestinationConflict,
+    Durability(CanonicalDurabilityRejection),
+    Manifest(ManifestCasRejection),
+    Stream(CanonicalLogError),
+    Validation(ManifestValidationError),
+    IoBeforeMutation {
+        stage: CanonicalRecoveryStage,
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRecoveryBeginError {
+    Manifest(ManifestStoreError),
+    Rejected(CanonicalRecoveryRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalRecoveryIndeterminate {
+    pub stage: CanonicalRecoveryStage,
+    pub kind: io::ErrorKind,
+    pub raw_os_error: Option<i32>,
+    pub recovery_key: CanonicalRecoveryKey,
+    pub residual: CanonicalRecoveryResidual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalRecoveryReceipt {
+    pub retained_bytes: u64,
+    pub quarantined_bytes: u64,
+    pub manifest_generation: u64,
+}
+
+#[must_use = "canonical recovery outcomes must be reconciled before acknowledgement"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRecoveryOutcome {
+    Accepted(CanonicalRecoveryReceipt),
+    AlreadyCompleted(CanonicalRecoveryReceipt),
+    Rejected(CanonicalRecoveryRejection),
+    DurabilityIndeterminate(CanonicalRecoveryIndeterminate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryObservedState {
+    New,
+    PreparedSourceFull,
+    PreparedSourceTruncated,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryFaultStage {
+    QuarantineWrite,
+    QuarantineFlush,
+    QuarantineFileSync,
+    QuarantineRename,
+    QuarantineNamespaceSync,
+    ManifestPrepared,
+    SourceTruncate,
+    SourceSync,
+    ManifestCompleted,
+    Acknowledgement,
+}
+
+/// Dormant lock-owned tail recovery transaction.
+///
+/// One manifest transaction owns the stable exclusive namespace guard. This
+/// module additionally retains the exact source `File` used for validation and
+/// uses only that handle for truncation and source synchronization.
+pub struct CanonicalRecoveryTransaction<'store> {
+    manifest: ManifestWriteTransaction<'store>,
+    descriptor: CanonicalRecoveryDescriptor,
+    source_path: PathBuf,
+    temporary_path: PathBuf,
+    quarantine_path: PathBuf,
+    source: File,
+    source_before: ManagedArtifactSourceIdentity,
+    source_after: ManagedArtifactSourceIdentity,
+    quarantine: ManagedArtifactSourceIdentity,
+    tail: Vec<u8>,
+    state: RecoveryObservedState,
+    expected_generation: u64,
+    fault: Option<RecoveryFaultStage>,
+}
+
+impl<'store> CanonicalRecoveryTransaction<'store> {
+    pub fn begin<T: DeserializeOwned>(
+        store: &'store SessionArtifactManifestStore,
+        descriptor: CanonicalRecoveryDescriptor,
+    ) -> Result<Self, CanonicalRecoveryBeginError> {
+        let root = store.managed_root();
+        let source_path = root.join(descriptor.source.as_str());
+        let temporary_path = root.join(descriptor.temporary_quarantine.as_str());
+        let quarantine_path = root.join(descriptor.quarantine.as_str());
+        let manifest = store
+            .begin_write()
+            .map_err(CanonicalRecoveryBeginError::Manifest)?;
+        let head = match manifest.head() {
+            ManifestLoadOutcome::Absent => {
+                return Err(CanonicalRecoveryBeginError::Rejected(
+                    CanonicalRecoveryRejection::ManifestMissing,
+                ));
+            }
+            ManifestLoadOutcome::Present(head) => *head,
+        };
+        if head.session_id != descriptor.session_id {
+            return Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::SourceNotInventoried,
+            ));
+        }
+
+        let state = classify_manifest_recovery_state(&head, &descriptor)
+            .map_err(CanonicalRecoveryBeginError::Rejected)?;
+        let (guard, qualification) = manifest.recovery_durability();
+        if state != RecoveryObservedState::Completed {
+            guard
+                .preflight_recovery_namespace(
+                    &source_path,
+                    &temporary_path,
+                    &quarantine_path,
+                    qualification,
+                )
+                .map_err(|error| {
+                    CanonicalRecoveryBeginError::Rejected(CanonicalRecoveryRejection::Durability(
+                        error,
+                    ))
+                })?;
+        }
+        let mut source = guard.open_recovery_source(&source_path).map_err(|error| {
+            CanonicalRecoveryBeginError::Rejected(CanonicalRecoveryRejection::Durability(error))
+        })?;
+        let bytes = read_recovery_file(&mut source, CanonicalRecoveryStage::ValidateSource)
+            .map_err(CanonicalRecoveryBeginError::Rejected)?;
+        guard
+            .revalidate_recovery_source(&source_path, &source)
+            .map_err(|error| {
+                CanonicalRecoveryBeginError::Rejected(CanonicalRecoveryRejection::Durability(error))
+            })?;
+
+        let (source_before, source_after, quarantine, tail, observed_state) = match state {
+            RecoveryObservedState::New => {
+                let (valid_up_to, tail) = recovery_basis::<T>(
+                    &bytes,
+                    &descriptor.session_id,
+                    &descriptor.stream_id,
+                    descriptor.domain_schema_version,
+                )
+                .map_err(CanonicalRecoveryBeginError::Rejected)?;
+                let source_before = ManagedArtifactSourceIdentity {
+                    managed_identity: descriptor.source.clone(),
+                    content: content_identity(&bytes),
+                };
+                let source_after = ManagedArtifactSourceIdentity {
+                    managed_identity: descriptor.source.clone(),
+                    content: content_identity(&bytes[..valid_up_to]),
+                };
+                let quarantine = ManagedArtifactSourceIdentity {
+                    managed_identity: descriptor.quarantine.clone(),
+                    content: content_identity(tail),
+                };
+                ensure_manifest_source_matches(&head, &source_before)
+                    .map_err(CanonicalRecoveryBeginError::Rejected)?;
+                (
+                    source_before,
+                    source_after,
+                    quarantine,
+                    tail.to_vec(),
+                    RecoveryObservedState::New,
+                )
+            }
+            RecoveryObservedState::PreparedSourceFull
+            | RecoveryObservedState::PreparedSourceTruncated
+            | RecoveryObservedState::Completed => {
+                let transaction = head.quarantine_transaction.as_ref().ok_or({
+                    CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::PreparedTransitionConflict,
+                    )
+                })?;
+                if transaction.source_before.managed_identity != descriptor.source
+                    || transaction.source_after.managed_identity != descriptor.source
+                    || transaction.quarantine.managed_identity != descriptor.quarantine
+                {
+                    return Err(CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::PreparedTransitionConflict,
+                    ));
+                }
+                ensure_exact_quarantine(&quarantine_path, &transaction.quarantine)
+                    .map_err(CanonicalRecoveryBeginError::Rejected)?;
+                let observed = content_identity(&bytes);
+                let observed_state = if observed == transaction.source_before.content {
+                    RecoveryObservedState::PreparedSourceFull
+                } else if observed == transaction.source_after.content {
+                    if state == RecoveryObservedState::Completed {
+                        RecoveryObservedState::Completed
+                    } else {
+                        RecoveryObservedState::PreparedSourceTruncated
+                    }
+                } else {
+                    return Err(CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::SourceContentMismatch,
+                    ));
+                };
+                if state == RecoveryObservedState::Completed
+                    && observed_state != RecoveryObservedState::Completed
+                {
+                    return Err(CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::SourceContentMismatch,
+                    ));
+                }
+                let tail = if observed_state == RecoveryObservedState::PreparedSourceFull {
+                    let retained = usize::try_from(transaction.source_after.content.byte_length)
+                        .map_err(|_| {
+                            CanonicalRecoveryBeginError::Rejected(
+                                CanonicalRecoveryRejection::SourceContentMismatch,
+                            )
+                        })?;
+                    let tail = bytes.get(retained..).ok_or({
+                        CanonicalRecoveryBeginError::Rejected(
+                            CanonicalRecoveryRejection::SourceContentMismatch,
+                        )
+                    })?;
+                    if content_identity(tail) != transaction.quarantine.content {
+                        return Err(CanonicalRecoveryBeginError::Rejected(
+                            CanonicalRecoveryRejection::SourceContentMismatch,
+                        ));
+                    }
+                    tail.to_vec()
+                } else {
+                    Vec::new()
+                };
+                (
+                    transaction.source_before.clone(),
+                    transaction.source_after.clone(),
+                    transaction.quarantine.clone(),
+                    tail,
+                    observed_state,
+                )
+            }
+        };
+
+        Ok(Self {
+            manifest,
+            descriptor,
+            source_path,
+            temporary_path,
+            quarantine_path,
+            source,
+            source_before,
+            source_after,
+            quarantine,
+            tail,
+            state: observed_state,
+            expected_generation: head.generation,
+            fault: None,
+        })
+    }
+
+    pub fn execute(&mut self) -> CanonicalRecoveryOutcome {
+        if self.state == RecoveryObservedState::Completed {
+            return CanonicalRecoveryOutcome::AlreadyCompleted(self.receipt());
+        }
+        if let Err(rejection) = self.revalidate_source() {
+            return CanonicalRecoveryOutcome::Rejected(rejection);
+        }
+        if self.state == RecoveryObservedState::New {
+            if let Some(outcome) = self.publish_quarantine() {
+                return outcome;
+            }
+            let prepared = match self.manifest_candidate(
+                ManifestTransitionState::Prepared,
+                QuarantineResidualState::SourceFull,
+            ) {
+                Ok(prepared) => prepared,
+                Err(rejection) => return CanonicalRecoveryOutcome::Rejected(rejection),
+            };
+            match self
+                .manifest
+                .compare_and_swap(self.expected_generation, prepared)
+            {
+                ManifestCasOutcome::Accepted { manifest, .. } => {
+                    self.expected_generation = manifest.generation;
+                    self.state = RecoveryObservedState::PreparedSourceFull;
+                    if self.faults(RecoveryFaultStage::ManifestPrepared) {
+                        return self.injected_indeterminate(
+                            CanonicalRecoveryStage::ManifestPrepared,
+                            CanonicalRecoveryResidual::ManifestPreparedSourceFull,
+                        );
+                    }
+                }
+                ManifestCasOutcome::AlreadyCompleted { manifest } => {
+                    self.expected_generation = manifest.generation;
+                    self.state = RecoveryObservedState::Completed;
+                    return CanonicalRecoveryOutcome::AlreadyCompleted(self.receipt());
+                }
+                ManifestCasOutcome::Rejected(rejection) => {
+                    return CanonicalRecoveryOutcome::Rejected(
+                        CanonicalRecoveryRejection::Manifest(rejection),
+                    );
+                }
+                ManifestCasOutcome::DurabilityIndeterminate(indeterminate) => {
+                    return self.manifest_indeterminate(
+                        CanonicalRecoveryStage::ManifestPrepared,
+                        CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                        indeterminate,
+                    );
+                }
+            }
+        }
+
+        if self.state == RecoveryObservedState::PreparedSourceFull {
+            if let Err(rejection) = self.revalidate_source() {
+                return CanonicalRecoveryOutcome::Rejected(rejection);
+            }
+            if self.faults(RecoveryFaultStage::SourceTruncate) {
+                return self.injected_indeterminate(
+                    CanonicalRecoveryStage::SourceTruncate,
+                    CanonicalRecoveryResidual::ManifestPreparedSourceFull,
+                );
+            }
+            if let Err(error) = self.source.set_len(self.source_after.content.byte_length) {
+                return self.io_indeterminate(
+                    CanonicalRecoveryStage::SourceTruncate,
+                    CanonicalRecoveryResidual::ManifestPreparedSourceFull,
+                    &error,
+                );
+            }
+            self.state = RecoveryObservedState::PreparedSourceTruncated;
+        }
+
+        if self.faults(RecoveryFaultStage::SourceSync) {
+            return self.injected_indeterminate(
+                CanonicalRecoveryStage::SourceSync,
+                CanonicalRecoveryResidual::ManifestPreparedSourceTruncated,
+            );
+        }
+        if let Err(error) = self.source.sync_all() {
+            return self.io_indeterminate(
+                CanonicalRecoveryStage::SourceSync,
+                CanonicalRecoveryResidual::ManifestPreparedSourceTruncated,
+                &error,
+            );
+        }
+        if let Err(rejection) = self.verify_source_after() {
+            return CanonicalRecoveryOutcome::Rejected(rejection);
+        }
+
+        let completed = match self.manifest_candidate(
+            ManifestTransitionState::Completed,
+            QuarantineResidualState::SourceTruncated,
+        ) {
+            Ok(completed) => completed,
+            Err(rejection) => return CanonicalRecoveryOutcome::Rejected(rejection),
+        };
+        match self
+            .manifest
+            .compare_and_swap(self.expected_generation, completed)
+        {
+            ManifestCasOutcome::Accepted { manifest, .. }
+            | ManifestCasOutcome::AlreadyCompleted { manifest } => {
+                self.expected_generation = manifest.generation;
+                self.state = RecoveryObservedState::Completed;
+                if self.faults(RecoveryFaultStage::ManifestCompleted) {
+                    return self.injected_indeterminate(
+                        CanonicalRecoveryStage::ManifestCompleted,
+                        CanonicalRecoveryResidual::ManifestCompletedSourceTruncated,
+                    );
+                }
+            }
+            ManifestCasOutcome::Rejected(rejection) => {
+                return CanonicalRecoveryOutcome::Rejected(CanonicalRecoveryRejection::Manifest(
+                    rejection,
+                ));
+            }
+            ManifestCasOutcome::DurabilityIndeterminate(indeterminate) => {
+                return self.manifest_indeterminate(
+                    CanonicalRecoveryStage::ManifestCompleted,
+                    CanonicalRecoveryResidual::ManifestPreparedSourceTruncated,
+                    indeterminate,
+                );
+            }
+        }
+
+        if self.faults(RecoveryFaultStage::Acknowledgement) {
+            return self.injected_indeterminate(
+                CanonicalRecoveryStage::Acknowledgement,
+                CanonicalRecoveryResidual::ManifestCompletedSourceTruncated,
+            );
+        }
+        CanonicalRecoveryOutcome::Accepted(self.receipt())
+    }
+
+    #[cfg(test)]
+    fn fail_once_at(mut self, stage: RecoveryFaultStage) -> Self {
+        self.fault = Some(stage);
+        self
+    }
+
+    fn publish_quarantine(&mut self) -> Option<CanonicalRecoveryOutcome> {
+        match std::fs::symlink_metadata(&self.quarantine_path) {
+            Ok(_) => {
+                if let Err(rejection) =
+                    ensure_exact_quarantine(&self.quarantine_path, &self.quarantine)
+                {
+                    return Some(CanonicalRecoveryOutcome::Rejected(rejection));
+                }
+                let (guard, qualification) = self.manifest.recovery_durability();
+                return match guard.sync_recovery_namespace_entry(
+                    &self.quarantine_path,
+                    qualification,
+                    self.recovery_key(),
+                ) {
+                    NamespaceDurabilityOutcome::Accepted(_) => None,
+                    NamespaceDurabilityOutcome::Rejected(rejection) => {
+                        Some(CanonicalRecoveryOutcome::Rejected(
+                            CanonicalRecoveryRejection::Durability(rejection),
+                        ))
+                    }
+                    NamespaceDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
+                        Some(self.namespace_indeterminate(
+                            CanonicalRecoveryStage::QuarantineNamespaceSync,
+                            CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                            indeterminate,
+                        ))
+                    }
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Some(CanonicalRecoveryOutcome::Rejected(
+                    CanonicalRecoveryRejection::IoBeforeMutation {
+                        stage: CanonicalRecoveryStage::QuarantineCreate,
+                        kind: error.kind(),
+                        raw_os_error: error.raw_os_error(),
+                    },
+                ));
+            }
+        }
+
+        let (mut temporary, created) =
+            match open_or_resume_recovery_temporary(&self.temporary_path, &self.quarantine) {
+                Ok(temporary) => temporary,
+                Err(rejection) => return Some(CanonicalRecoveryOutcome::Rejected(rejection)),
+            };
+        if created {
+            if let Err(error) = temporary.write_all(&self.tail) {
+                return Some(self.io_indeterminate(
+                    CanonicalRecoveryStage::QuarantineWrite,
+                    CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                    &error,
+                ));
+            }
+            if self.faults(RecoveryFaultStage::QuarantineWrite) {
+                return Some(self.injected_indeterminate(
+                    CanonicalRecoveryStage::QuarantineWrite,
+                    CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                ));
+            }
+        }
+        if self.faults(RecoveryFaultStage::QuarantineFlush) {
+            return Some(self.injected_indeterminate(
+                CanonicalRecoveryStage::QuarantineFlush,
+                CanonicalRecoveryResidual::QuarantineTempSourceFull,
+            ));
+        }
+        if let Err(error) = temporary.flush() {
+            return Some(self.io_indeterminate(
+                CanonicalRecoveryStage::QuarantineFlush,
+                CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                &error,
+            ));
+        }
+        if self.faults(RecoveryFaultStage::QuarantineFileSync) {
+            return Some(self.injected_indeterminate(
+                CanonicalRecoveryStage::QuarantineFileSync,
+                CanonicalRecoveryResidual::QuarantineTempSourceFull,
+            ));
+        }
+        if let Err(error) = temporary.sync_all() {
+            return Some(self.io_indeterminate(
+                CanonicalRecoveryStage::QuarantineFileSync,
+                CanonicalRecoveryResidual::QuarantineTempSourceFull,
+                &error,
+            ));
+        }
+        drop(temporary);
+        if self.faults(RecoveryFaultStage::QuarantineRename) {
+            return Some(self.injected_indeterminate(
+                CanonicalRecoveryStage::QuarantineRename,
+                CanonicalRecoveryResidual::QuarantineTempSourceFull,
+            ));
+        }
+        let (guard, qualification) = self.manifest.recovery_durability();
+        match guard.rename(
+            &self.temporary_path,
+            &self.quarantine_path,
+            qualification,
+            self.recovery_key(),
+        ) {
+            NamespaceDurabilityOutcome::Accepted(_) => {
+                if self.faults(RecoveryFaultStage::QuarantineNamespaceSync) {
+                    Some(self.injected_indeterminate(
+                        CanonicalRecoveryStage::QuarantineNamespaceSync,
+                        CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                    ))
+                } else {
+                    None
+                }
+            }
+            NamespaceDurabilityOutcome::Rejected(rejection) => {
+                Some(CanonicalRecoveryOutcome::Rejected(
+                    CanonicalRecoveryRejection::Durability(rejection),
+                ))
+            }
+            NamespaceDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
+                Some(self.namespace_indeterminate(
+                    if indeterminate.stage == CanonicalDurabilityStage::ParentSync {
+                        CanonicalRecoveryStage::QuarantineNamespaceSync
+                    } else {
+                        CanonicalRecoveryStage::QuarantineRename
+                    },
+                    CanonicalRecoveryResidual::QuarantinePublishedSourceFull,
+                    indeterminate,
+                ))
+            }
+        }
+    }
+
+    fn manifest_candidate(
+        &self,
+        state: ManifestTransitionState,
+        residual_state: QuarantineResidualState,
+    ) -> Result<SessionArtifactManifestV1, CanonicalRecoveryRejection> {
+        let head = match self.manifest.head() {
+            ManifestLoadOutcome::Absent => return Err(CanonicalRecoveryRejection::ManifestMissing),
+            ManifestLoadOutcome::Present(head) => *head,
+        };
+        let mut artifacts = head.artifacts;
+        let source = artifacts
+            .iter_mut()
+            .find(|artifact| artifact.managed_identity == self.descriptor.source)
+            .ok_or(CanonicalRecoveryRejection::SourceNotInventoried)?;
+        source.availability = ArtifactAvailability::Present {
+            content: if residual_state == QuarantineResidualState::SourceFull {
+                self.source_before.content.clone()
+            } else {
+                self.source_after.content.clone()
+            },
+        };
+        let recovery_reason = if residual_state == QuarantineResidualState::SourceFull {
+            ArtifactResidualReason::QuarantinePrepared
+        } else {
+            ArtifactResidualReason::QuarantineSourceTruncated
+        };
+        if let Some(recovery) = artifacts.iter_mut().find(|artifact| {
+            artifact.kind == SessionArtifactKind::QuarantineRecovery
+                && artifact.managed_identity == self.descriptor.quarantine
+        }) {
+            recovery.availability = ArtifactAvailability::Residual {
+                content: self.quarantine.content.clone(),
+                reason: recovery_reason,
+            };
+        } else {
+            artifacts.push(SessionArtifactEntry {
+                kind: SessionArtifactKind::QuarantineRecovery,
+                privacy_class: ArtifactPrivacyClass::RecoveryMaterial,
+                managed_identity: self.descriptor.quarantine.clone(),
+                availability: ArtifactAvailability::Residual {
+                    content: self.quarantine.content.clone(),
+                    reason: recovery_reason,
+                },
+            });
+        }
+        let transition = ManifestTransition {
+            idempotency_id: self.descriptor.idempotency_id.clone(),
+            fingerprint: self.descriptor.fingerprint.clone(),
+            state,
+        };
+        let quarantine_transaction = QuarantineTransaction {
+            idempotency_id: self.descriptor.idempotency_id.clone(),
+            fingerprint: self.descriptor.fingerprint.clone(),
+            state,
+            source_before: self.source_before.clone(),
+            source_after: self.source_after.clone(),
+            quarantine: self.quarantine.clone(),
+            residual_state,
+        };
+        SessionArtifactManifestV1::candidate(
+            self.descriptor.session_id.clone(),
+            transition,
+            artifacts,
+            Some(quarantine_transaction),
+        )
+        .map_err(CanonicalRecoveryRejection::Validation)
+    }
+
+    fn revalidate_source(&self) -> Result<(), CanonicalRecoveryRejection> {
+        let (guard, _) = self.manifest.recovery_durability();
+        guard
+            .revalidate_recovery_source(&self.source_path, &self.source)
+            .map_err(CanonicalRecoveryRejection::Durability)
+    }
+
+    fn verify_source_after(&mut self) -> Result<(), CanonicalRecoveryRejection> {
+        self.revalidate_source()?;
+        let bytes = read_recovery_file(&mut self.source, CanonicalRecoveryStage::ValidateSource)?;
+        if content_identity(&bytes) != self.source_after.content {
+            return Err(CanonicalRecoveryRejection::SourceContentMismatch);
+        }
+        Ok(())
+    }
+
+    fn receipt(&self) -> CanonicalRecoveryReceipt {
+        CanonicalRecoveryReceipt {
+            retained_bytes: self.source_after.content.byte_length,
+            quarantined_bytes: self.quarantine.content.byte_length,
+            manifest_generation: self.expected_generation,
+        }
+    }
+
+    fn recovery_key(&self) -> CanonicalRecoveryKey {
+        let digest = Sha256::digest(self.descriptor.fingerprint.as_str().as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        CanonicalRecoveryKey::from_opaque_bytes(bytes)
+    }
+
+    fn faults(&mut self, stage: RecoveryFaultStage) -> bool {
+        if self.fault == Some(stage) {
+            self.fault = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn injected_indeterminate(
+        &self,
+        stage: CanonicalRecoveryStage,
+        residual: CanonicalRecoveryResidual,
+    ) -> CanonicalRecoveryOutcome {
+        CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+            stage,
+            kind: io::ErrorKind::Other,
+            raw_os_error: None,
+            recovery_key: self.recovery_key(),
+            residual,
+        })
+    }
+
+    fn io_indeterminate(
+        &self,
+        stage: CanonicalRecoveryStage,
+        residual: CanonicalRecoveryResidual,
+        error: &io::Error,
+    ) -> CanonicalRecoveryOutcome {
+        CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+            stage,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            recovery_key: self.recovery_key(),
+            residual,
+        })
+    }
+
+    fn namespace_indeterminate(
+        &self,
+        stage: CanonicalRecoveryStage,
+        residual: CanonicalRecoveryResidual,
+        indeterminate: CanonicalDurabilityIndeterminate,
+    ) -> CanonicalRecoveryOutcome {
+        CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+            stage,
+            kind: indeterminate.kind,
+            raw_os_error: indeterminate.raw_os_error,
+            recovery_key: indeterminate.recovery_key,
+            residual,
+        })
+    }
+
+    fn manifest_indeterminate(
+        &self,
+        stage: CanonicalRecoveryStage,
+        residual: CanonicalRecoveryResidual,
+        indeterminate: CanonicalDurabilityIndeterminate,
+    ) -> CanonicalRecoveryOutcome {
+        self.namespace_indeterminate(stage, residual, indeterminate)
+    }
+}
+
+fn classify_manifest_recovery_state(
+    head: &SessionArtifactManifestV1,
+    descriptor: &CanonicalRecoveryDescriptor,
+) -> Result<RecoveryObservedState, CanonicalRecoveryRejection> {
+    if head.transition.idempotency_id != descriptor.idempotency_id {
+        return if head.transition.state == ManifestTransitionState::Prepared {
+            Err(CanonicalRecoveryRejection::PreparedTransitionConflict)
+        } else {
+            Ok(RecoveryObservedState::New)
+        };
+    }
+    if head.transition.fingerprint != descriptor.fingerprint {
+        return Err(CanonicalRecoveryRejection::IdempotencyConflict);
+    }
+    match head.transition.state {
+        ManifestTransitionState::Prepared => Ok(RecoveryObservedState::PreparedSourceFull),
+        ManifestTransitionState::Completed if head.quarantine_transaction.is_some() => {
+            Ok(RecoveryObservedState::Completed)
+        }
+        ManifestTransitionState::Completed => Ok(RecoveryObservedState::New),
+    }
+}
+
+fn ensure_manifest_source_matches(
+    head: &SessionArtifactManifestV1,
+    source: &ManagedArtifactSourceIdentity,
+) -> Result<(), CanonicalRecoveryRejection> {
+    let artifact = head
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.managed_identity == source.managed_identity)
+        .ok_or(CanonicalRecoveryRejection::SourceNotInventoried)?;
+    if artifact.availability
+        != (ArtifactAvailability::Present {
+            content: source.content.clone(),
+        })
+    {
+        return Err(CanonicalRecoveryRejection::SourceContentMismatch);
+    }
+    Ok(())
+}
+
+fn recovery_basis<'bytes, T: DeserializeOwned>(
+    bytes: &'bytes [u8],
+    session_id: &str,
+    stream_id: &str,
+    domain_schema_version: u32,
+) -> Result<(usize, &'bytes [u8]), CanonicalRecoveryRejection> {
+    match parse_structural_records(bytes, session_id, stream_id, domain_schema_version) {
+        Ok(_) => Err(CanonicalRecoveryRejection::NoRepairableTail),
+        Err(failure) if failure.repairable_unterminated_tail => {
+            let prefix = parse_structural_records(
+                &bytes[..failure.valid_up_to],
+                session_id,
+                stream_id,
+                domain_schema_version,
+            )
+            .map_err(|failure| CanonicalRecoveryRejection::Stream(failure.error))?;
+            validate_payload_schema::<T>(&prefix.records)
+                .map_err(CanonicalRecoveryRejection::Stream)?;
+            Ok((failure.valid_up_to, &bytes[failure.valid_up_to..]))
+        }
+        Err(failure) => Err(CanonicalRecoveryRejection::Stream(failure.error)),
+    }
+}
+
+fn content_identity(bytes: &[u8]) -> ArtifactContentIdentity {
+    ArtifactContentIdentity {
+        sha256: Sha256Digest::new(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+            .expect("SHA-256 encoding is a valid manifest digest"),
+        byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    }
+}
+
+fn read_recovery_file(
+    file: &mut File,
+    stage: CanonicalRecoveryStage,
+) -> Result<Vec<u8>, CanonicalRecoveryRejection> {
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map(|_| bytes)
+        })
+        .map_err(|error| CanonicalRecoveryRejection::IoBeforeMutation {
+            stage,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        })
+}
+
+fn ensure_exact_quarantine(
+    path: &Path,
+    expected: &ManagedArtifactSourceIdentity,
+) -> Result<(), CanonicalRecoveryRejection> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            CanonicalRecoveryRejection::QuarantineDestinationConflict
+        } else {
+            CanonicalRecoveryRejection::IoBeforeMutation {
+                stage: CanonicalRecoveryStage::ValidateSource,
+                kind: error.kind(),
+                raw_os_error: error.raw_os_error(),
+            }
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() != expected.content.byte_length {
+        return Err(CanonicalRecoveryRejection::QuarantineDestinationConflict);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| CanonicalRecoveryRejection::IoBeforeMutation {
+            stage: CanonicalRecoveryStage::ValidateSource,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        })?;
+    if content_identity(&bytes) != expected.content {
+        return Err(CanonicalRecoveryRejection::QuarantineDestinationConflict);
+    }
+    Ok(())
+}
+
+fn open_or_resume_recovery_temporary(
+    path: &Path,
+    expected: &ManagedArtifactSourceIdentity,
+) -> Result<(File, bool), CanonicalRecoveryRejection> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(CanonicalRecoveryRejection::QuarantineTempConflict);
+            }
+            let bytes = std::fs::read(path).map_err(|error| {
+                CanonicalRecoveryRejection::IoBeforeMutation {
+                    stage: CanonicalRecoveryStage::QuarantineCreate,
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                }
+            })?;
+            if content_identity(&bytes) != expected.content {
+                return Err(CanonicalRecoveryRejection::QuarantineTempConflict);
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| CanonicalRecoveryRejection::IoBeforeMutation {
+                    stage: CanonicalRecoveryStage::QuarantineCreate,
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                })?;
+            return Ok((file, false));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CanonicalRecoveryRejection::IoBeforeMutation {
+                stage: CanonicalRecoveryStage::QuarantineCreate,
+                kind: error.kind(),
+                raw_os_error: error.raw_os_error(),
+            });
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map(|file| (file, true))
+        .map_err(|error| CanonicalRecoveryRejection::IoBeforeMutation {
+            stage: CanonicalRecoveryStage::QuarantineCreate,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurability {
@@ -445,44 +1434,6 @@ struct StructuralFailure {
     repairable_unterminated_tail: bool,
 }
 
-trait LogFileOps {
-    fn read_log(&self, path: &Path) -> io::Result<Vec<u8>>;
-    fn quarantine_and_truncate(
-        &self,
-        path: &Path,
-        valid_up_to: u64,
-        tail: &[u8],
-    ) -> Result<PathBuf, (CanonicalIoOperation, io::ErrorKind)>;
-}
-
-struct StdFileOps;
-
-impl LogFileOps for StdFileOps {
-    fn read_log(&self, path: &Path) -> io::Result<Vec<u8>> {
-        fs::read(path)
-    }
-
-    fn quarantine_and_truncate(
-        &self,
-        path: &Path,
-        valid_up_to: u64,
-        tail: &[u8],
-    ) -> Result<PathBuf, (CanonicalIoOperation, io::ErrorKind)> {
-        let quarantine_path = create_quarantine_file(path, tail)?;
-        let source = OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|error| (CanonicalIoOperation::Truncate, error.kind()))?;
-        source
-            .set_len(valid_up_to)
-            .map_err(|error| (CanonicalIoOperation::Truncate, error.kind()))?;
-        source
-            .sync_all()
-            .map_err(|error| (CanonicalIoOperation::TruncateSync, error.kind()))?;
-        Ok(quarantine_path)
-    }
-}
-
 fn create_quarantine_file(
     source_path: &Path,
     tail: &[u8],
@@ -533,68 +1484,25 @@ fn create_quarantine_file(
     ))
 }
 
-/// Read and validate a canonical stream. Recovery mutates only after the valid
-/// prefix has also decoded as `T`. Callers must quiesce any active writer before
-/// selecting `QuarantineUnterminatedTail`; runtime reader/writer coordination is
-/// intentionally not provided by this isolated kernel.
+/// Strictly read and validate a canonical stream without mutating its tree.
+///
+/// The legacy recovery selector remains in the signature for source
+/// compatibility during dormant integration, but free readers ignore it. All
+/// destructive tail repair is owned by `CanonicalRecoveryTransaction`.
 pub fn load_canonical_stream<T: DeserializeOwned>(
     path: &Path,
     session_id: &str,
     stream_id: &str,
     domain_schema_version: u32,
-    tail_recovery: CanonicalTailRecovery,
-) -> Result<CanonicalLogSnapshot<T>, CanonicalLogError> {
-    load_canonical_stream_with_ops(
-        path,
-        session_id,
-        stream_id,
-        domain_schema_version,
-        tail_recovery,
-        &StdFileOps,
-    )
-}
-
-fn load_canonical_stream_with_ops<T: DeserializeOwned, O: LogFileOps>(
-    path: &Path,
-    session_id: &str,
-    stream_id: &str,
-    domain_schema_version: u32,
-    tail_recovery: CanonicalTailRecovery,
-    ops: &O,
+    _tail_recovery: CanonicalTailRecovery,
 ) -> Result<CanonicalLogSnapshot<T>, CanonicalLogError> {
     validate_stream_context(session_id, stream_id, domain_schema_version)?;
-    let bytes = ops.read_log(path).map_err(|error| CanonicalLogError::Io {
+    let bytes = fs::read(path).map_err(|error| CanonicalLogError::Io {
         operation: CanonicalIoOperation::Read,
         kind: error.kind(),
     })?;
     match parse_structural_records(&bytes, session_id, stream_id, domain_schema_version) {
         Ok(snapshot) => raw_to_typed(snapshot),
-        Err(failure)
-            if failure.repairable_unterminated_tail
-                && tail_recovery == CanonicalTailRecovery::QuarantineUnterminatedTail =>
-        {
-            let tail = &bytes[failure.valid_up_to..];
-            let mut prefix = parse_structural_records(
-                &bytes[..failure.valid_up_to],
-                session_id,
-                stream_id,
-                domain_schema_version,
-            )
-            .map_err(|failure| failure.error)?;
-
-            // Prove the retained prefix is semantically usable before mutation.
-            validate_payload_schema::<T>(&prefix.records)?;
-            let quarantine_path = ops
-                .quarantine_and_truncate(path, failure.valid_up_to as u64, tail)
-                .map_err(|(operation, kind)| CanonicalLogError::Io { operation, kind })?;
-            prefix.byte_len = failure.valid_up_to as u64;
-            prefix.tail_quarantine = Some(CanonicalTailQuarantineReceipt {
-                quarantine_path,
-                retained_bytes: failure.valid_up_to as u64,
-                quarantined_bytes: tail.len() as u64,
-            });
-            raw_to_typed(prefix)
-        }
         Err(failure) => Err(failure.error),
     }
 }
@@ -737,7 +1645,7 @@ where
         session_id: &str,
         stream_id: &str,
         domain_schema_version: u32,
-        tail_recovery: CanonicalTailRecovery,
+        _tail_recovery: CanonicalTailRecovery,
     ) -> Result<Self, CanonicalLogError> {
         validate_stream_context(session_id, stream_id, domain_schema_version)?;
         let file = open_locked_appender(path)?;
@@ -746,7 +1654,7 @@ where
             session_id.to_string(),
             stream_id.to_string(),
             domain_schema_version,
-            tail_recovery,
+            CanonicalTailRecovery::Strict,
             Box::new(file),
         )
     }
@@ -851,10 +1759,10 @@ where
         self.poisoned.is_some()
     }
 
-    /// Drain quarantine receipts so a future runtime integration can register
-    /// them with the typed artifact manifest. The current manifest does not yet
-    /// consume these receipts, so deletion parity remains an open blocker.
-    pub fn take_quarantine_receipts(&mut self) -> Vec<CanonicalTailQuarantineReceipt> {
+    /// Legacy test-only receipts from the private injected-file recovery seam.
+    /// Durable manifest state, never this in-memory list, is recovery authority.
+    #[cfg(test)]
+    fn take_quarantine_receipts(&mut self) -> Vec<CanonicalTailQuarantineReceipt> {
         std::mem::take(&mut self.quarantine_receipts)
     }
 
@@ -1951,6 +2859,10 @@ fn hash_fields(fields: &[&[u8]]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::session_artifact_manifest::{
+        ArtifactUnavailableReason, ManagedArtifactIdentity, SessionArtifactManifestStore,
+        Sha256Digest,
+    };
     use std::sync::{Arc, Mutex};
 
     const SESSION: &str = "session-1";
@@ -1993,6 +2905,509 @@ mod tests {
             CanonicalTailRecovery::QuarantineUnterminatedTail,
         )
         .expect("open canonical appender")
+    }
+
+    #[test]
+    fn public_recovery_transaction_seam_binds_one_descriptor_before_mutation() {
+        let path = temp_log("public-recovery-seam");
+        let root = path.parent().expect("fixture root");
+        fs::create_dir_all(root).expect("create managed root");
+        fs::write(&path, b"{\"value\":1}\nprivate incomplete tail").expect("write damaged stream");
+        let before = fs::read(&path).expect("read source before recovery");
+        let store = SessionArtifactManifestStore::new(root);
+        let descriptor = CanonicalRecoveryDescriptor::new(
+            SESSION,
+            STREAM,
+            SCHEMA,
+            "attempt-1",
+            Sha256Digest::new(format!("sha256:{}", "a".repeat(64))).expect("fingerprint"),
+            ManagedArtifactIdentity::new("events.jsonl").expect("source identity"),
+            ManagedArtifactIdentity::new("events.recovery.tmp").expect("temp identity"),
+            ManagedArtifactIdentity::new("events.recovery.bin").expect("quarantine identity"),
+        )
+        .expect("recovery descriptor");
+
+        let result = CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).expect("read unchanged source"), before);
+        cleanup(&path);
+    }
+
+    fn recovery_descriptor() -> CanonicalRecoveryDescriptor {
+        CanonicalRecoveryDescriptor::new(
+            SESSION,
+            STREAM,
+            SCHEMA,
+            "attempt-1",
+            Sha256Digest::new(format!("sha256:{}", "a".repeat(64))).expect("fingerprint"),
+            ManagedArtifactIdentity::new("events.jsonl").expect("source identity"),
+            ManagedArtifactIdentity::new("events.recovery.tmp").expect("temp identity"),
+            ManagedArtifactIdentity::new("events.recovery.bin").expect("quarantine identity"),
+        )
+        .expect("recovery descriptor")
+    }
+
+    fn seed_recovery_manifest(root: &Path, source_bytes: &[u8]) -> SessionArtifactManifestStore {
+        let store =
+            SessionArtifactManifestStore::qualified_for_test(root).expect("qualified store");
+        let source_identity = ManagedArtifactIdentity::new("events.jsonl").expect("source");
+        let candidate = SessionArtifactManifestV1::candidate(
+            SESSION,
+            ManifestTransition {
+                idempotency_id: "seed-manifest".to_string(),
+                fingerprint: Sha256Digest::new(format!("sha256:{}", "b".repeat(64)))
+                    .expect("seed fingerprint"),
+                state: ManifestTransitionState::Completed,
+            },
+            vec![
+                SessionArtifactEntry {
+                    kind: SessionArtifactKind::OriginalSessionAudio,
+                    privacy_class: ArtifactPrivacyClass::OriginalEvidence,
+                    managed_identity: ManagedArtifactIdentity::new("audio/original.wav")
+                        .expect("audio identity"),
+                    availability: ArtifactAvailability::Unavailable {
+                        reason: ArtifactUnavailableReason::NeverCaptured,
+                    },
+                },
+                SessionArtifactEntry {
+                    kind: SessionArtifactKind::TranscriptRevisions,
+                    privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+                    managed_identity: source_identity,
+                    availability: ArtifactAvailability::Present {
+                        content: content_identity(source_bytes),
+                    },
+                },
+            ],
+            None,
+        )
+        .expect("seed manifest candidate");
+        let mut write = store.begin_write().expect("seed manifest write");
+        assert!(matches!(
+            write.compare_and_swap(0, candidate),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(write);
+        store
+    }
+
+    fn recovery_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        SessionArtifactManifestStore,
+        CanonicalRecoveryDescriptor,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let path = temp_log(label);
+        let root = path.parent().expect("fixture root");
+        fs::create_dir_all(root).expect("create recovery root");
+        let prefix = b"{\"value\":1}\n".to_vec();
+        let tail = b"private incomplete tail".to_vec();
+        let mut source = prefix.clone();
+        source.extend_from_slice(&tail);
+        fs::write(&path, &source).expect("write damaged source");
+        let store = seed_recovery_manifest(root, &source);
+        (path, store, recovery_descriptor(), prefix, tail)
+    }
+
+    #[test]
+    fn recovery_transaction_publishes_exact_tail_and_completes_manifest_before_ack() {
+        let (path, store, descriptor, prefix, tail) = recovery_fixture("recovery-green");
+        let root = path.parent().expect("root");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                .expect("begin recovery");
+
+        let outcome = transaction.execute();
+
+        assert_eq!(
+            outcome,
+            CanonicalRecoveryOutcome::Accepted(CanonicalRecoveryReceipt {
+                retained_bytes: prefix.len() as u64,
+                quarantined_bytes: tail.len() as u64,
+                manifest_generation: 3,
+            })
+        );
+        drop(transaction);
+        assert_eq!(fs::read(&path).expect("read retained prefix"), prefix);
+        assert_eq!(
+            fs::read(root.join("events.recovery.bin")).expect("read exact quarantine"),
+            tail
+        );
+        assert!(!root.join("events.recovery.tmp").exists());
+        let ManifestLoadOutcome::Present(manifest) = store.load().expect("load completed manifest")
+        else {
+            panic!("completed manifest must be present");
+        };
+        assert_eq!(manifest.generation, 3);
+        assert_eq!(
+            manifest.transition.state,
+            ManifestTransitionState::Completed
+        );
+        assert_eq!(
+            manifest
+                .quarantine_transaction
+                .as_ref()
+                .expect("quarantine transaction")
+                .residual_state,
+            QuarantineResidualState::SourceTruncated
+        );
+
+        let mut retry = CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+            .expect("begin exact retry");
+        assert_eq!(
+            retry.execute(),
+            CanonicalRecoveryOutcome::AlreadyCompleted(CanonicalRecoveryReceipt {
+                retained_bytes: prefix.len() as u64,
+                quarantined_bytes: tail.len() as u64,
+                manifest_generation: 3,
+            })
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn every_recovery_fault_cut_restarts_without_duplicate_quarantine_or_generation() {
+        let cuts = [
+            RecoveryFaultStage::QuarantineWrite,
+            RecoveryFaultStage::QuarantineFlush,
+            RecoveryFaultStage::QuarantineFileSync,
+            RecoveryFaultStage::QuarantineRename,
+            RecoveryFaultStage::QuarantineNamespaceSync,
+            RecoveryFaultStage::ManifestPrepared,
+            RecoveryFaultStage::SourceTruncate,
+            RecoveryFaultStage::SourceSync,
+            RecoveryFaultStage::ManifestCompleted,
+            RecoveryFaultStage::Acknowledgement,
+        ];
+        for cut in cuts {
+            let (path, store, descriptor, prefix, tail) =
+                recovery_fixture(&format!("fault-{cut:?}"));
+            let root = path.parent().expect("root");
+            let mut transaction =
+                CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                    .expect("begin faulted recovery")
+                    .fail_once_at(cut);
+            assert!(matches!(
+                transaction.execute(),
+                CanonicalRecoveryOutcome::DurabilityIndeterminate(_)
+            ));
+            drop(transaction);
+            assert!(path.exists());
+
+            let mut restarted =
+                CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                    .expect("restart exact recovery");
+            assert!(matches!(
+                restarted.execute(),
+                CanonicalRecoveryOutcome::Accepted(_)
+                    | CanonicalRecoveryOutcome::AlreadyCompleted(_)
+            ));
+            drop(restarted);
+            assert_eq!(fs::read(&path).expect("read retained prefix"), prefix);
+            assert_eq!(
+                fs::read(root.join("events.recovery.bin")).expect("read one quarantine"),
+                tail
+            );
+            assert!(!root.join("events.recovery.tmp").exists());
+            let ManifestLoadOutcome::Present(manifest) =
+                store.load().expect("load converged manifest")
+            else {
+                panic!("manifest must remain present");
+            };
+            assert_eq!(manifest.generation, 3, "cut {cut:?}");
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn held_source_handle_detects_path_replacement_before_destructive_mutation() {
+        let (path, store, descriptor, _prefix, _tail) = recovery_fixture("source-substitution");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("read original source");
+        let displaced = root.join("displaced.jsonl");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin recovery");
+        fs::rename(&path, &displaced).expect("displace source pathname");
+        fs::write(&path, &original).expect("write same-content replacement");
+
+        assert!(matches!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::Rejected(CanonicalRecoveryRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged
+            ))
+        ));
+        assert_eq!(
+            fs::read(&displaced).expect("held object unchanged"),
+            original
+        );
+        assert!(!root.join("events.recovery.bin").exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unqualified_and_windows_policy_recovery_refuse_before_temp_or_source_mutation() {
+        use crate::persistence::canonical_durability::CanonicalPlatform;
+
+        let (path, qualified, descriptor, _prefix, _tail) = recovery_fixture("unsupported");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("read original");
+        drop(qualified);
+        let unqualified = SessionArtifactManifestStore::new(root);
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&unqualified, descriptor.clone()),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::Durability(
+                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
+                )
+            ))
+        ));
+        let windows = SessionArtifactManifestStore::qualified_for_test_platform(
+            root,
+            CanonicalPlatform::Windows,
+        )
+        .expect("Windows policy store");
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&windows, descriptor),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::Durability(
+                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
+                )
+            ))
+        ));
+        assert_eq!(fs::read(&path).expect("read unchanged source"), original);
+        assert!(!root.join("events.recovery.tmp").exists());
+        assert!(!root.join("events.recovery.bin").exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn quarantine_collisions_and_special_entries_refuse_without_source_mutation() {
+        let (path, store, descriptor, _prefix, _tail) = recovery_fixture("collision");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("read original");
+        fs::write(root.join("events.recovery.tmp"), b"unrelated collision")
+            .expect("write temp collision");
+        let mut transaction =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                .expect("begin collision recovery");
+        assert_eq!(
+            transaction.execute(),
+            CanonicalRecoveryOutcome::Rejected(CanonicalRecoveryRejection::QuarantineTempConflict)
+        );
+        assert_eq!(fs::read(&path).expect("read unchanged source"), original);
+        drop(transaction);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_begin_reports_missing_source_and_coordination_contention_without_mutation() {
+        let (path, store, descriptor, _prefix, _tail) = recovery_fixture("begin-refusals");
+        let root = path.parent().expect("root");
+        let original = fs::read(&path).expect("read original");
+        let guard = crate::persistence::canonical_durability::CanonicalDurability::new()
+            .try_lock_exclusive(root)
+            .expect("hold competing guard");
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone()),
+            Err(CanonicalRecoveryBeginError::Manifest(
+                ManifestStoreError::Coordination(
+                    crate::persistence::canonical_durability::CanonicalCoordinationError::Contended
+                )
+            ))
+        ));
+        drop(guard);
+        fs::remove_file(&path).expect("remove source");
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::Durability(
+                    CanonicalDurabilityRejection::IoFailedBeforeMutation { .. }
+                )
+            ))
+        ));
+        assert!(!root.join("events.recovery.tmp").exists());
+        assert!(!root.join("events.recovery.bin").exists());
+        fs::write(&path, original).expect("restore source for cleanup");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_begin_rejects_untyped_prefix_and_source_content_drift_before_quarantine() {
+        for (label, source, expected) in [
+            (
+                "invalid-prefix",
+                b"{\"wrong\":1}\nprivate tail".as_slice(),
+                "stream",
+            ),
+            (
+                "source-drift",
+                b"{\"value\":1}\nprivate tail".as_slice(),
+                "content",
+            ),
+        ] {
+            let path = temp_log(label);
+            let root = path.parent().expect("root");
+            fs::create_dir_all(root).expect("create root");
+            fs::write(&path, source).expect("write source");
+            let store = seed_recovery_manifest(root, source);
+            if expected == "content" {
+                fs::write(&path, b"{\"value\":1}\nchanged tail").expect("drift source");
+            }
+            let result =
+                CanonicalRecoveryTransaction::begin::<TestPayload>(&store, recovery_descriptor());
+            if expected == "stream" {
+                assert!(matches!(
+                    result,
+                    Err(CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::Stream(CanonicalLogError::PayloadDecode { .. })
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(CanonicalRecoveryBeginError::Rejected(
+                        CanonicalRecoveryRejection::SourceContentMismatch
+                    ))
+                ));
+            }
+            assert!(!root.join("events.recovery.tmp").exists());
+            assert!(!root.join("events.recovery.bin").exists());
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn exact_prepared_manifest_rejects_id_and_fingerprint_substitution() {
+        let (path, store, descriptor, _prefix, _tail) = recovery_fixture("manifest-conflicts");
+        let mut prepared =
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor.clone())
+                .expect("begin prepare")
+                .fail_once_at(RecoveryFaultStage::ManifestPrepared);
+        assert!(matches!(
+            prepared.execute(),
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(_)
+        ));
+        drop(prepared);
+
+        let different_id = CanonicalRecoveryDescriptor::new(
+            SESSION,
+            STREAM,
+            SCHEMA,
+            "different-attempt",
+            descriptor.fingerprint.clone(),
+            descriptor.source.clone(),
+            descriptor.temporary_quarantine.clone(),
+            descriptor.quarantine.clone(),
+        )
+        .expect("different id descriptor");
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, different_id),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::PreparedTransitionConflict
+            ))
+        ));
+        let different_fingerprint = CanonicalRecoveryDescriptor::new(
+            SESSION,
+            STREAM,
+            SCHEMA,
+            "attempt-1",
+            Sha256Digest::new(format!("sha256:{}", "c".repeat(64))).expect("other fingerprint"),
+            descriptor.source.clone(),
+            descriptor.temporary_quarantine.clone(),
+            descriptor.quarantine.clone(),
+        )
+        .expect("different fingerprint descriptor");
+        assert!(matches!(
+            CanonicalRecoveryTransaction::begin::<TestPayload>(&store, different_fingerprint),
+            Err(CanonicalRecoveryBeginError::Rejected(
+                CanonicalRecoveryRejection::IdempotencyConflict
+            ))
+        ));
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_symlink_special_and_final_collisions_refuse_before_truncate() {
+        use std::os::unix::fs::symlink;
+
+        for collision in ["symlink-temp", "directory-temp", "final-file"] {
+            let (path, store, descriptor, _prefix, _tail) =
+                recovery_fixture(&format!("special-{collision}"));
+            let root = path.parent().expect("root");
+            let original = fs::read(&path).expect("read original");
+            match collision {
+                "symlink-temp" => {
+                    fs::write(root.join("outside.bin"), b"outside").expect("write target");
+                    symlink(root.join("outside.bin"), root.join("events.recovery.tmp"))
+                        .expect("create symlink");
+                }
+                "directory-temp" => {
+                    fs::create_dir(root.join("events.recovery.tmp")).expect("create special temp")
+                }
+                "final-file" => fs::write(root.join("events.recovery.bin"), b"collision")
+                    .expect("write final collision"),
+                _ => unreachable!(),
+            }
+            let mut transaction =
+                CanonicalRecoveryTransaction::begin::<TestPayload>(&store, descriptor)
+                    .expect("begin collision case");
+            assert!(matches!(
+                transaction.execute(),
+                CanonicalRecoveryOutcome::Rejected(
+                    CanonicalRecoveryRejection::QuarantineTempConflict
+                        | CanonicalRecoveryRejection::QuarantineDestinationConflict
+                )
+            ));
+            assert_eq!(fs::read(&path).expect("read unchanged source"), original);
+            drop(transaction);
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn reserved_internal_quarantine_identity_is_not_constructible() {
+        assert!(ManagedArtifactIdentity::new(".audio-graph-canonical.lock").is_err());
+        assert!(ManagedArtifactIdentity::new(".AUDIO-GRAPH-SESSION-ARTIFACTS.V1.TMP").is_err());
+    }
+
+    #[test]
+    fn legacy_free_recovery_receipts_are_not_public_authority() {
+        let source = include_str!("canonical_log.rs");
+        assert!(!source.lines().any(|line| {
+            line.trim_start()
+                .starts_with("pub fn take_quarantine_receipts")
+        }));
+        assert!(
+            source
+                .contains("All destructive tail repair is owned by `CanonicalRecoveryTransaction`")
+        );
+    }
+
+    #[test]
+    fn recovery_diagnostics_are_content_free() {
+        let descriptor = recovery_descriptor();
+        let rendered = format!("{descriptor:?}");
+        assert!(!rendered.contains(SESSION));
+        assert!(!rendered.contains(STREAM));
+        assert!(!rendered.contains("events.jsonl"));
+        assert!(!rendered.contains("attempt-1"));
+        let outcome =
+            CanonicalRecoveryOutcome::DurabilityIndeterminate(CanonicalRecoveryIndeterminate {
+                stage: CanonicalRecoveryStage::QuarantineWrite,
+                kind: io::ErrorKind::Other,
+                raw_os_error: Some(5),
+                recovery_key: CanonicalRecoveryKey::from_opaque_bytes([7; 16]),
+                residual: CanonicalRecoveryResidual::QuarantineTempSourceFull,
+            });
+        let rendered = format!("{outcome:?}");
+        assert!(!rendered.contains(SESSION));
+        assert!(!rendered.contains("events"));
+        assert!(!rendered.contains("[7, 7"));
     }
 
     #[test]
@@ -2297,51 +3712,52 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_corrupt_tail_is_quarantined_after_typed_prefix_validation() {
+    fn free_reader_never_quarantines_or_truncates_an_unterminated_corrupt_tail() {
         let path = temp_log("tail-repair");
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
-        fs::write(&path, b"{\"value\":1}\nprivate incomplete tail").expect("write damaged stream");
+        let original = b"{\"value\":1}\nprivate incomplete tail";
+        fs::write(&path, original).expect("write damaged stream");
+        let before = fs::read_dir(path.parent().expect("parent"))
+            .expect("read tree before")
+            .map(|entry| entry.expect("tree entry").file_name())
+            .collect::<Vec<_>>();
 
-        let loaded: CanonicalLogSnapshot<TestPayload> = load_canonical_stream(
+        let error = load_canonical_stream::<TestPayload>(
             &path,
             SESSION,
             STREAM,
             SCHEMA,
             CanonicalTailRecovery::QuarantineUnterminatedTail,
         )
-        .expect("repair tail");
-        assert_eq!(loaded.records.len(), 1);
-        let receipt = loaded.tail_quarantine.expect("quarantine receipt");
-        assert_eq!(
-            fs::read(receipt.quarantine_path).expect("read quarantine"),
-            b"private incomplete tail"
-        );
+        .expect_err("free reader must remain strict");
+        assert!(matches!(error, CanonicalLogError::CorruptRecord { .. }));
+        assert_eq!(fs::read(&path).expect("read unchanged source"), original);
+        let after = fs::read_dir(path.parent().expect("parent"))
+            .expect("read tree after")
+            .map(|entry| entry.expect("tree entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
         cleanup(&path);
     }
 
     #[test]
-    fn appender_repairs_tail_through_its_exclusively_locked_handle() {
+    fn public_appender_open_does_not_repair_a_corrupt_tail() {
         let path = temp_log("locked-tail-repair");
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
-        fs::write(&path, b"{\"value\":1}\nunterminated tail").expect("write damaged stream");
+        let original = b"{\"value\":1}\nunterminated tail";
+        fs::write(&path, original).expect("write damaged stream");
 
-        let mut appender = open_appender(&path);
-        assert_eq!(appender.take_quarantine_receipts().len(), 1);
         assert!(matches!(
-            appender.append(&event("event-2"), &TestPayload { value: 2 }),
-            CanonicalAppendOutcome::Accepted(_)
+            CanonicalAppender::<TestPayload>::open(
+                &path,
+                SESSION,
+                STREAM,
+                SCHEMA,
+                CanonicalTailRecovery::QuarantineUnterminatedTail,
+            ),
+            Err(CanonicalLogError::CorruptRecord { .. })
         ));
-        drop(appender);
-
-        let loaded: CanonicalLogSnapshot<TestPayload> = load_canonical_stream(
-            &path,
-            SESSION,
-            STREAM,
-            SCHEMA,
-            CanonicalTailRecovery::Strict,
-        )
-        .expect("load repaired and extended stream");
-        assert_eq!(loaded.records.len(), 2);
+        assert_eq!(fs::read(&path).expect("read unchanged source"), original);
         cleanup(&path);
     }
 
@@ -2360,10 +3776,7 @@ mod tests {
             CanonicalTailRecovery::QuarantineUnterminatedTail,
         )
         .expect_err("typed-invalid prefix must fail before mutation");
-        assert!(matches!(
-            error,
-            CanonicalLogError::PayloadDecode { record_index: 1 }
-        ));
+        assert!(matches!(error, CanonicalLogError::CorruptRecord { .. }));
         assert_eq!(fs::read(&path).expect("read unchanged"), original);
         assert!(matches!(
             CanonicalAppender::<TestPayload>::open(
@@ -2373,7 +3786,7 @@ mod tests {
                 SCHEMA,
                 CanonicalTailRecovery::QuarantineUnterminatedTail,
             ),
-            Err(CanonicalLogError::PayloadDecode { record_index: 1 })
+            Err(CanonicalLogError::CorruptRecord { .. })
         ));
         cleanup(&path);
     }

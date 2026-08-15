@@ -556,7 +556,7 @@ impl CanonicalDurability {
     }
 
     #[cfg(test)]
-    fn for_test_platform(platform: CanonicalPlatform) -> Self {
+    pub(crate) fn for_test_platform(platform: CanonicalPlatform) -> Self {
         Self {
             platform,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
@@ -625,6 +625,138 @@ impl CanonicalDurability {
 }
 
 impl CanonicalExclusiveGuard {
+    /// Prove that all recovery namespace mutations can use the qualified
+    /// parent barrier before any recovery temp is created.
+    pub(crate) fn preflight_recovery_namespace(
+        &self,
+        source: &Path,
+        temporary: &Path,
+        destination: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([source, temporary, destination])?;
+        if !namespace_supported_for(self.platform) {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        if !self.qualification_status(qualification)? {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let source_parent = self.namespace.bind_parent(source, self.platform)?;
+        let temporary_parent = self.namespace.bind_parent(temporary, self.platform)?;
+        let destination_parent = self.namespace.bind_parent(destination, self.platform)?;
+        if source_parent.directory.is_none()
+            || source_parent.canonical_path != temporary_parent.canonical_path
+            || source_parent.canonical_path != destination_parent.canonical_path
+        {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        Ok(())
+    }
+
+    /// Open one regular canonical source for recovery. The returned handle is
+    /// the handle the recovery transaction must retain through truncation.
+    pub(crate) fn open_recovery_source(
+        &self,
+        path: &Path,
+    ) -> Result<File, CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([path])?;
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| CanonicalDurabilityRejection::CoordinationPoisoned)?;
+        self.namespace.bind_parent(path, self.platform)?;
+        self.open_existing_regular(path)
+    }
+
+    /// Revalidate that the canonical pathname still names the exact retained
+    /// source handle. This is the cooperative-process substitution fence used
+    /// immediately before every destructive source mutation.
+    pub(crate) fn revalidate_recovery_source(
+        &self,
+        path: &Path,
+        source: &File,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([path])?;
+        self.namespace.bind_parent(path, self.platform)?;
+        validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(source))?;
+        Ok(())
+    }
+
+    /// Re-establish the qualified parent barrier for an already-published
+    /// recovery artifact after a prior rename result was lost.
+    pub(crate) fn sync_recovery_namespace_entry(
+        &self,
+        path: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([path]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        if !namespace_supported_for(self.platform) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let qualified = match self.qualification_status(qualification) {
+            Ok(qualified) => qualified,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if !qualified {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let parent = match self.namespace.bind_parent(path, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let Some(parent_directory) = parent.directory else {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        };
+        if let Err(rejection) = self.open_existing_regular(path) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
+            parent_directory.sync_all()
+        }) {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation: CanonicalMutation::Rename,
+            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+        })
+    }
+
     /// Append bytes whose immediate canonical parent is the bound directory.
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
