@@ -3259,8 +3259,10 @@ mod tests {
         let existing = root.join("existing.log");
         let absent = root.join("absent.log");
         let destination = root.join("destination.log");
+        let recovery_temporary = root.join("recovery.tmp");
+        let recovery_destination = root.join("recovery.bin");
         fs::write(&existing, b"prefix").expect("seed existing file");
-        let proof = qualification(&root);
+        fs::write(&recovery_temporary, b"stable recovery temp").expect("seed recovery temp");
         let guard = CanonicalDurability::for_test_platform(CanonicalPlatform::Windows)
             .try_lock_exclusive(&root)
             .expect("acquire simulated Windows guard");
@@ -3278,7 +3280,7 @@ mod tests {
             b"prefix-append"
         );
         assert_eq!(
-            guard.append(&absent, b"must not create", Some(&proof), key),
+            guard.append(&absent, b"must not create", None, key),
             CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: CanonicalPlatform::Windows,
@@ -3287,7 +3289,30 @@ mod tests {
             )
         );
         assert_eq!(
-            guard.rename(&existing, &destination, Some(&proof), key),
+            guard.rename(&existing, &destination, None, key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert_eq!(
+            guard.preflight_recovery_namespace(
+                &existing,
+                &recovery_temporary,
+                &recovery_destination,
+                None,
+            ),
+            Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert_eq!(
+            guard.rename_recovery(&recovery_temporary, &recovery_destination, None, key),
             CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: CanonicalPlatform::Windows,
@@ -3301,6 +3326,11 @@ mod tests {
             fs::read(&existing).expect("source retained"),
             b"prefix-append"
         );
+        assert_eq!(
+            fs::read(&recovery_temporary).expect("recovery temp retained"),
+            b"stable recovery temp"
+        );
+        assert!(!recovery_destination.exists());
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
