@@ -172,3 +172,26 @@ reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
 output stress, all five contracts, pinned `verify:fast`, Betterleaks,
 docs/Seeds secret hygiene, and range diff passed. Product files did not change,
 so no product suite was rerun.
+
+## Wave 7B split-planning base
+
+Custody `bb7c98244083f984518eedaac35143d523eece19` was merged
+history-preservingly at `f44c0b335ea6db23ed41ab3e3a547ab851036a80`.
+Its one linear commit after custody `333c7f2` changes only
+`.seeds/issues.jsonl`; the integrated 639-row queue is byte-identical to
+custody and remains valid JSONL.
+
+The durability stack now starts with active D0 `1189`. D1 `c2e3` and manifest
+model M0 `661f` follow D0 in parallel; manifest kernel M1 `a596` follows both;
+recovery R1 `3b8b` follows D1 and M1; test harness T1 `b77b` follows R1; and
+platform qualification CI1 `2df3` follows T1. Parent `8e73` is blocked on CI1.
+Seed `464c` now depends only on D1 and M1, while `be7c` records M0 and M1.
+Blacksmith work must be monitored, explicitly stopped and verified inactive,
+and may not mutate workflows without separate approval. No detailed 8e73
+implementation plan or product, ADR, research, or workflow change was added.
+
+The complete queue contains 90 ready and 103 blocked issues. Seeds Doctor
+reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
+output stress, all five contracts, pinned `verify:fast`, Betterleaks,
+docs/Seeds secret hygiene, and range diff passed. Product files did not change,
+so no product suite was rerun.

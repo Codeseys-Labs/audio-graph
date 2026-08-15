@@ -367,3 +367,22 @@ failures. Seeds JSON/output, all five contracts, pinned `verify:fast`,
 Betterleaks, secret, and range gates passed. Product files were unchanged, so
 product suites were not rerun. No extra Seed was edited, no workflow was
 dispatched, and no branch was pushed.
+
+### Wave 7B split-planning base
+
+Custody `bb7c982` was merged history-preservingly at `f44c0b3`. Its one-commit
+delta from `333c7f2` changes only `.seeds/issues.jsonl`, and the integrated
+639-row queue is byte-identical to custody.
+
+Active D0 `1189` precedes parallel D1 `c2e3` and M0 `661f`; M1 `a596`, R1
+`3b8b`, T1 `b77b`, and CI1 `2df3` then form the recorded dependency chain into
+parent `8e73`. Seed `464c` depends only on D1 and M1, and `be7c` records the M0
+and M1 manifest slices. Blacksmith work retains monitor, explicit-stop,
+active-list verification, and no-workflow-mutation rules. No detailed 8e73
+implementation plan was written.
+
+The queue now contains 90 ready and 103 blocked issues. Seeds Doctor has 0
+failures. Seeds JSON/output, all five contracts, pinned `verify:fast`,
+Betterleaks, secret, and range gates passed. Product files were unchanged, so
+product suites were not rerun. No extra Seed was edited, no workflow was
+dispatched, and no branch was pushed.
