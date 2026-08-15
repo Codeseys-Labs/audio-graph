@@ -608,3 +608,29 @@ The queue has 91 ready and 96 blocked issues, and doctor has 0 failures.
 Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no additional Seed
 closure/edit, push, workflow, Blacksmith, or Docker action occurred.
+
+### Wave 7B Wave4 reviewed subprocess crash-harness fan-in
+
+Five linear Seed-only custody commits through `9191983` were merged at
+`e6cb819`, followed by reviewed four-commit b77b tip `17a9452` at `6558f8b`.
+The integrated 642-row queue is byte-identical to custody. The candidate's
+exact footprint is the private crash harness, three cfg-only integration
+paths, and report; Standards and Spec final-cap review returned **SHIP**.
+
+The Linux-only harness proves process-crash convergence and cross-process
+exclusion while keeping every checkpoint and platform command `cfg(test)`.
+There is no runtime caller, product API, unsafe/dependency/workflow/platform
+guest action, or prototype landing. The local ext4 result is not power-loss
+or native Windows/macOS qualification.
+
+Independent order 1 and exact 13-pair/26-marker inventory, harness 11, log
+46, manifest 18, durability 40, locked check, full serialized 1,671/0/8,
+strict Clippy, fmt, frontend 968, all contracts, pinned `verify:fast`, Seeds
+91 ready/96 blocked with doctor 0 failures, Betterleaks, secret, cfg-only,
+runtime, footprint, prototype, and diff gates passed. The initial inventory
+extractor undercounted multiline calls; the corrected fail-fast extractor
+matched exactly without changing source.
+
+Seed b77b is root-closure eligible; 2df3 follows reconciliation for native
+platform proof, while 464c remains ready but inactive. No Seed closure, push,
+workflow, Blacksmith, Docker, guest, or platform qualification occurred.

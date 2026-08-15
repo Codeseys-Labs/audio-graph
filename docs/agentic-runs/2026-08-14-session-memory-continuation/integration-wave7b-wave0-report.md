@@ -490,3 +490,58 @@ Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no additional
 Seed closure/edit, push, workflow, Blacksmith, or Docker action occurred.
+
+## Wave4 reviewed subprocess crash-harness fan-in
+
+Custody `91919838844e28d9fbf3db9f7f64af8f66ee1e4e` was merged
+history-preservingly without conflict at
+`e6cb81928822343943b4d9a139e1e4d2d4792b3d`. Its five linear commits after
+custody `21396dc` change only `.seeds/issues.jsonl`; the integrated 642-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Final-cap b77b tip `17a94527bf422c3a7279314b0fdf76cfe533b0f7`
+was merged history-preservingly without conflict at
+`6558f8ba26621d14c29d2577930ec65a602585a2`. Its four linear commits from
+exact merge-base `4a42886` change exactly the private crash harness, the
+`cfg(test)` checkpoint hooks in canonical durability and recovery, the private
+module declaration, and the b77b report. Custody records the final review as
+Standards and Spec **SHIP**, two correction rounds, and no successor defect.
+
+The Linux-only harness self-spawns the exact library-test child, uses bounded
+kill/reap paths, and proves cross-process exclusion plus fresh-process
+convergence across 22 recovery cuts and four first-create cuts. The local
+fixture was resolved as ext4 on `/dev/sdd`; this is process-crash and completed
+OS-barrier evidence only, not power-loss or native Windows/macOS
+qualification. All hooks and platform-command use are `cfg(test)` only. No
+runtime caller, product API, dependency, unsafe block, workflow, platform
+guest/tooling action, or prototype ancestry landed.
+
+| Gate | Result |
+| --- | --- |
+| independent operation-order oracle | 1 passed, 0 failed |
+| independent static checkpoint inventory | all 13 before/after pairs; 26 unique markers |
+| focused subprocess crash harness | 11 passed, 0 failed in 16.64 seconds |
+| focused canonical log | 46 passed, 0 failed in 12.46 seconds |
+| focused manifest | 18 passed, 0 failed in 21.56 seconds |
+| focused canonical durability | 40 passed, 0 failed in 8.36 seconds |
+| locked cloud lib/tests check | passed in 1 minute 48 seconds |
+| full direct locked cloud library, serialized | 1,671 passed, 0 failed, 8 ignored in 141.86 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| exact frontend `test:local` | 70 files and 968 tests passed in 158.88 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 91 ready; 96 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 96, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, secret, cfg-only, runtime, footprint, prototype, and diff hygiene | approximately 3.05 MB, no leaks; 0 secret findings; passed |
+
+The first independent inventory extractor counted only single-line checkpoint
+calls and visibly undercounted five multiline calls. A read-only,
+multiline-aware fail-fast extractor then matched the exact 26-marker expected
+inventory with no duplicates. The operation-order oracle and accepted source
+were unchanged; this was integration-check construction, not a product or
+candidate failure.
+
+Seed b77b is eligible for root closure after this reviewed landing. Seed 2df3
+remains next after custody reconciliation and owns native Windows, macOS/APFS,
+and Linux platform qualification. Seed 464c remains ready but inactive. No
+Seed was closed or additionally edited, and no push, workflow, Blacksmith,
+Docker, guest, or platform-qualification action occurred.
