@@ -1,19 +1,29 @@
 //! Canonical file and namespace durability barriers.
 //!
-//! This dormant module names the barriers needed by later canonical writers.
-//! It does not provision canonical parent directories, activate a runtime
-//! writer, or claim more than the completed operating-system barriers.
+//! This dormant module owns the filesystem sequencing behind a small,
+//! provider-neutral interface. A mutation guard is bound to one existing
+//! managed namespace, safe platform identity where available, and one
+//! deterministic coordination file inside that namespace. Guard-owned
+//! operations cannot be redirected to another root. Locks remain cooperative:
+//! an uncooperative process can still replace roots or race pathname operations
+//! outside this contract.
 
 use std::fmt;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
+
+const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
 
 /// Opaque identity used to reconcile an operation whose durability is unknown.
 ///
 /// The caller must supply the same value when reconciling the same logical
 /// mutation. Its bytes are deliberately absent from `Debug` and there is no
-/// accessor that could accidentally place them in diagnostics.
+/// diagnostic accessor.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CanonicalRecoveryKey([u8; 16]);
 
@@ -29,15 +39,31 @@ impl fmt::Debug for CanonicalRecoveryKey {
     }
 }
 
-/// External qualification evidence supplied by the platform probe owned by a
-/// later Wave 7B workstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CanonicalFilesystemQualification {
-    Unqualified,
-    /// A supported local Linux filesystem whose directory-sync probe passed.
-    LinuxLocalDirectorySyncProven,
-    /// APFS on a supported macOS host whose directory-sync probe passed.
-    MacOsApfsDirectorySyncProven,
+/// Opaque, non-forgeable namespace qualification evidence.
+///
+/// A later platform-probe workstream owns production construction. Evidence is
+/// bound to the canonical root path plus safe filesystem volume and directory
+/// object identity; it cannot be reused for a different root or replacement.
+pub struct CanonicalFilesystemQualification {
+    namespace: ManagedNamespace,
+}
+
+impl fmt::Debug for CanonicalFilesystemQualification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalFilesystemQualification([BOUND])")
+    }
+}
+
+impl CanonicalFilesystemQualification {
+    #[cfg(test)]
+    fn for_test_root(root: &Path) -> Result<Self, CanonicalCoordinationError> {
+        let namespace =
+            ManagedNamespace::load(root, CanonicalCoordinationError::ParentProvisioningRequired)?;
+        if namespace.identity.volume.is_none() || namespace.identity.object.is_none() {
+            return Err(CanonicalCoordinationError::IdentityUnavailable);
+        }
+        Ok(Self { namespace })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +101,8 @@ pub struct CanonicalDurabilityReceipt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityStage {
+    ValidateNamespace,
+    InspectEntry,
     OpenExisting,
     OpenParent,
     CreateNew,
@@ -86,7 +114,7 @@ pub enum CanonicalDurabilityStage {
     ParentSync,
 }
 
-/// A refusal proven before canonical bytes or namespace state were mutated.
+/// A refusal proven before this module mutated canonical bytes or namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityRejection {
     ParentProvisioningRequired,
@@ -94,17 +122,24 @@ pub enum CanonicalDurabilityRejection {
         platform: CanonicalPlatform,
         operation: CanonicalNamespaceOperation,
     },
+    TargetOutsideManagedNamespace,
+    ManagedNamespaceChanged,
+    QualificationBindingMismatch,
+    NonRegularCanonicalEntry,
+    DestinationAlreadyExists,
+    CoordinationPoisoned,
     IoFailedBeforeMutation {
         stage: CanonicalDurabilityStage,
         kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
     },
-    DestinationAlreadyExists,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalDurabilityIndeterminate {
     pub stage: CanonicalDurabilityStage,
     pub kind: io::ErrorKind,
+    pub raw_os_error: Option<i32>,
     pub recovery_key: CanonicalRecoveryKey,
 }
 
@@ -118,6 +153,8 @@ pub enum CanonicalDurabilityOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalCoordinationStage {
+    ResolveRoot,
+    InspectLock,
     Open,
     Lock,
 }
@@ -128,33 +165,148 @@ pub enum CanonicalCoordinationError {
     ParentProvisioningRequired,
     Missing,
     Contended,
+    ManagedRootNotDirectory,
+    IdentityUnavailable,
+    NonRegularLockFile,
     Io {
         stage: CanonicalCoordinationStage,
         kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
     },
 }
 
-/// Exclusive guard for one stable coordination file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VolumeIdentity {
+    #[cfg(unix)]
+    UnixDevice(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectIdentity {
+    #[cfg(unix)]
+    UnixInode(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesystemIdentity {
+    volume: Option<VolumeIdentity>,
+    object: Option<ObjectIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedNamespace {
+    canonical_root: PathBuf,
+    identity: FilesystemIdentity,
+}
+
+impl ManagedNamespace {
+    fn load(
+        root: &Path,
+        missing: CanonicalCoordinationError,
+    ) -> Result<Self, CanonicalCoordinationError> {
+        let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                missing
+            } else {
+                coordination_io(CanonicalCoordinationStage::ResolveRoot, &error)
+            }
+        })?;
+        let metadata = std::fs::metadata(&canonical_root)
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::ResolveRoot, &error))?;
+        if !metadata.is_dir() {
+            return Err(CanonicalCoordinationError::ManagedRootNotDirectory);
+        }
+        Ok(Self {
+            canonical_root,
+            identity: filesystem_identity(&metadata),
+        })
+    }
+
+    fn validate_current(&self) -> Result<(), CanonicalDurabilityRejection> {
+        let current_root = std::fs::canonicalize(&self.canonical_root)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::ValidateNamespace, &error))?;
+        let metadata = std::fs::metadata(&current_root)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::ValidateNamespace, &error))?;
+        if current_root != self.canonical_root
+            || !metadata.is_dir()
+            || filesystem_identity(&metadata) != self.identity
+        {
+            return Err(CanonicalDurabilityRejection::ManagedNamespaceChanged);
+        }
+        Ok(())
+    }
+
+    fn bind_parent(&self, target: &Path) -> Result<BoundParent, CanonicalDurabilityRejection> {
+        self.validate_current()?;
+        if target.file_name().is_none() {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let parent = parent_directory(target);
+        let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CanonicalDurabilityRejection::ParentProvisioningRequired
+            } else {
+                durability_io(CanonicalDurabilityStage::OpenParent, &error)
+            }
+        })?;
+        if !canonical_parent.starts_with(&self.canonical_root) {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let metadata = std::fs::metadata(&canonical_parent)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+        let identity = filesystem_identity(&metadata);
+        if !metadata.is_dir() || identity.volume != self.identity.volume {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let directory = File::open(&canonical_parent)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+        Ok(BoundParent {
+            canonical_path: canonical_parent,
+            directory,
+        })
+    }
+}
+
+struct BoundParent {
+    canonical_path: PathBuf,
+    directory: File,
+}
+
+/// Exclusive mutation transaction bound to one managed namespace.
 ///
-/// The file is created only by this writer-side acquisition and is never
-/// renamed or removed by the module. Dropping the guard releases the OS lock.
+/// The deterministic coordination file and namespace identity are private, so
+/// a caller cannot pair an arbitrary lock with an unrelated mutation target.
 pub struct CanonicalExclusiveGuard {
+    namespace: ManagedNamespace,
     _lock_file: File,
+    operation_lock: Mutex<()>,
+    #[cfg(test)]
+    injected_failure: Option<InjectedFailure>,
+    #[cfg(test)]
+    before_atomic_create: Option<Arc<Barrier>>,
 }
 
-/// Shared guard used by strict readers after a coordination file exists.
-///
-/// Shared acquisition never creates either the file or its parent.
+/// Shared strict-reader guard bound to the same deterministic coordination
+/// file. Acquisition never creates the managed root or lock file.
 pub struct CanonicalSharedGuard {
+    _namespace: ManagedNamespace,
     _lock_file: File,
 }
 
-/// Deep, provider-neutral durability module. The interface returns only typed,
-/// content-free outcomes; all filesystem sequencing remains internal.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct InjectedFailure {
+    stage: CanonicalDurabilityStage,
+    raw_os_error: Option<i32>,
+}
+
+/// Factory for namespace-bound cooperative guards.
 #[derive(Default)]
 pub struct CanonicalDurability {
     #[cfg(test)]
-    injected_failure: Option<CanonicalDurabilityStage>,
+    injected_failure: Option<InjectedFailure>,
+    #[cfg(test)]
+    before_atomic_create: Option<Arc<Barrier>>,
 }
 
 impl CanonicalDurability {
@@ -162,145 +314,224 @@ impl CanonicalDurability {
         Self::default()
     }
 
-    /// Acquire the stable writer coordination file without provisioning its
-    /// parent directory.
+    /// Acquire the deterministic writer coordination file inside an existing
+    /// managed root. The root itself is never provisioned.
     pub fn try_lock_exclusive(
         &self,
-        coordination_path: &Path,
+        managed_root: &Path,
     ) -> Result<CanonicalExclusiveGuard, CanonicalCoordinationError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(coordination_path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    CanonicalCoordinationError::ParentProvisioningRequired
-                } else {
-                    CanonicalCoordinationError::Io {
-                        stage: CanonicalCoordinationStage::Open,
-                        kind: error.kind(),
-                    }
-                }
-            })?;
-        try_lock_exclusive(file)
+        let namespace = ManagedNamespace::load(
+            managed_root,
+            CanonicalCoordinationError::ParentProvisioningRequired,
+        )?;
+        let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
+        let file = open_writer_coordination(&lock_path)?;
+        let file = try_lock_exclusive(file)?;
+        Ok(CanonicalExclusiveGuard {
+            namespace,
+            _lock_file: file,
+            operation_lock: Mutex::new(()),
+            #[cfg(test)]
+            injected_failure: self.injected_failure,
+            #[cfg(test)]
+            before_atomic_create: self.before_atomic_create.clone(),
+        })
     }
 
-    /// Acquire a shared strict-reader lock. Missing state stays missing and no
-    /// directory or file is created as a side effect.
+    /// Acquire a shared strict-reader lock without creating missing state.
     pub fn try_lock_shared(
         &self,
-        coordination_path: &Path,
+        managed_root: &Path,
     ) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+        let namespace = ManagedNamespace::load(managed_root, CanonicalCoordinationError::Missing)?;
+        let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
+        ensure_regular_lock_entry(&lock_path)?;
         let file = OpenOptions::new()
             .read(true)
-            .open(coordination_path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    CanonicalCoordinationError::Missing
-                } else {
-                    CanonicalCoordinationError::Io {
-                        stage: CanonicalCoordinationStage::Open,
-                        kind: error.kind(),
-                    }
-                }
-            })?;
-        try_lock_shared(file)
+            .open(&lock_path)
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
+        let file = try_lock_shared(file)?;
+        Ok(CanonicalSharedGuard {
+            _namespace: namespace,
+            _lock_file: file,
+        })
     }
 
-    /// Append bytes behind an exclusive stable coordination guard.
-    ///
-    /// Existing files are accepted only after buffered write, flush, and file
-    /// `sync_all`. A first-created file additionally requires a qualified
-    /// platform contract and successful parent-directory `sync_all`.
-    pub fn append(
-        &self,
-        _guard: &CanonicalExclusiveGuard,
-        path: &Path,
-        bytes: &[u8],
-        qualification: CanonicalFilesystemQualification,
-        recovery_key: CanonicalRecoveryKey,
-    ) -> CanonicalDurabilityOutcome {
-        match self.open_for_append(path, qualification) {
-            Ok(opened) => self.append_opened(opened, bytes, recovery_key),
-            Err(rejection) => CanonicalDurabilityOutcome::Rejected(rejection),
+    #[cfg(test)]
+    fn failing_at(stage: CanonicalDurabilityStage) -> Self {
+        Self {
+            injected_failure: Some(InjectedFailure {
+                stage,
+                raw_os_error: None,
+            }),
+            before_atomic_create: None,
         }
     }
 
-    /// Publish a pre-existing synchronized file under a new unique name.
+    #[cfg(test)]
+    fn failing_at_with_raw_os_error(stage: CanonicalDurabilityStage, raw_os_error: i32) -> Self {
+        Self {
+            injected_failure: Some(InjectedFailure {
+                stage,
+                raw_os_error: Some(raw_os_error),
+            }),
+            before_atomic_create: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_atomic_create(barrier: Arc<Barrier>) -> Self {
+        Self {
+            injected_failure: None,
+            before_atomic_create: Some(barrier),
+        }
+    }
+}
+
+impl CanonicalExclusiveGuard {
+    /// Append bytes inside the bound managed namespace.
     ///
-    /// The destination must not exist when checked under the cooperative lock.
-    /// Uncooperative pathname races remain outside the advisory-lock contract.
-    /// Windows and unqualified namespace contracts refuse before mutation.
-    pub fn rename(
+    /// Existing files require write, flush, and file `sync_all`. A first-create
+    /// additionally requires matching opaque qualification evidence and parent
+    /// directory `sync_all` on a supported host platform.
+    pub fn append(
         &self,
-        _guard: &CanonicalExclusiveGuard,
-        source: &Path,
-        destination: &Path,
-        qualification: CanonicalFilesystemQualification,
+        path: &Path,
+        bytes: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
-        let platform = current_platform();
-        let source_parent_path = parent_directory(source);
-        let destination_parent_path = parent_directory(destination);
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        let parent = match self.namespace.bind_parent(path) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let namespace_qualified = match self.qualification_status(qualification) {
+            Ok(status) => status,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
 
-        if !namespace_is_qualified(platform, qualification) {
-            if let Err(rejection) = ensure_parent_present(&source_parent_path) {
-                return CanonicalDurabilityOutcome::Rejected(rejection);
+        let opened = if namespace_qualified {
+            self.wait_before_atomic_create();
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => OpenedCanonicalFile::New {
+                    file,
+                    parent: parent.directory,
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    match open_existing_regular(path) {
+                        Ok(file) => OpenedCanonicalFile::Existing(file),
+                        Err(rejection) => {
+                            return CanonicalDurabilityOutcome::Rejected(rejection);
+                        }
+                    }
+                }
+                Err(error) => {
+                    return CanonicalDurabilityOutcome::Rejected(durability_io(
+                        CanonicalDurabilityStage::CreateNew,
+                        &error,
+                    ));
+                }
             }
-            if let Err(rejection) = ensure_parent_present(&destination_parent_path) {
-                return CanonicalDurabilityOutcome::Rejected(rejection);
+        } else {
+            match open_existing_regular(path) {
+                Ok(file) => OpenedCanonicalFile::Existing(file),
+                Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) => {
+                    return CanonicalDurabilityOutcome::Rejected(
+                        CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                            platform: current_platform(),
+                            operation: CanonicalNamespaceOperation::FirstCreate,
+                        },
+                    );
+                }
+                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
             }
+        };
+
+        self.append_opened(opened, bytes, recovery_key)
+    }
+
+    /// Publish a regular source file under a new unique name inside the bound
+    /// managed namespace.
+    pub fn rename(
+        &self,
+        source: &Path,
+        destination: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        let source_parent = match self.namespace.bind_parent(source) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let destination_parent = match self.namespace.bind_parent(destination) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let namespace_qualified = match self.qualification_status(qualification) {
+            Ok(status) => status,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if !namespace_qualified {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                    platform,
+                    platform: current_platform(),
                     operation: CanonicalNamespaceOperation::Rename,
                 },
             );
         }
 
-        let source_file = match open_existing(source) {
+        let source_file = match open_existing_regular(source) {
             Ok(file) => file,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
         if let Err(rejection) = ensure_destination_absent(destination) {
             return CanonicalDurabilityOutcome::Rejected(rejection);
         }
-        let source_parent = match open_parent(&source_parent_path) {
-            Ok(parent) => parent,
-            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
-        };
-        let destination_parent = if source_parent_path == destination_parent_path {
-            None
-        } else {
-            match open_parent(&destination_parent_path) {
-                Ok(parent) => Some(parent),
-                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
-            }
-        };
-
         if let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || {
             source_file.sync_all()
         }) {
-            return indeterminate(CanonicalDurabilityStage::FileSync, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
             std::fs::rename(source, destination)
         }) {
-            return indeterminate(CanonicalDurabilityStage::Rename, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-            source_parent.sync_all()
+            source_parent.directory.sync_all()
         }) {
-            return indeterminate(CanonicalDurabilityStage::ParentSync, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
-        if let Some(destination_parent) = destination_parent
+        if source_parent.canonical_path != destination_parent.canonical_path
             && let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-                destination_parent.sync_all()
+                destination_parent.directory.sync_all()
             })
         {
-            return indeterminate(CanonicalDurabilityStage::ParentSync, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
@@ -309,48 +540,17 @@ impl CanonicalDurability {
         })
     }
 
-    fn open_for_append(
+    fn qualification_status(
         &self,
-        path: &Path,
-        qualification: CanonicalFilesystemQualification,
-    ) -> Result<OpenedCanonicalFile, CanonicalDurabilityRejection> {
-        let platform = current_platform();
-        if namespace_is_qualified(platform, qualification) {
-            let parent_path = parent_directory(path);
-            let parent = open_parent(&parent_path)?;
-            return match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(file) => Ok(OpenedCanonicalFile::New { file, parent }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    open_existing(path).map(OpenedCanonicalFile::Existing)
-                }
-                Err(error) => Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
-                    stage: CanonicalDurabilityStage::CreateNew,
-                    kind: error.kind(),
-                }),
-            };
+        qualification: Option<&CanonicalFilesystemQualification>,
+    ) -> Result<bool, CanonicalDurabilityRejection> {
+        let Some(qualification) = qualification else {
+            return Ok(false);
+        };
+        if qualification.namespace != self.namespace {
+            return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
-
-        match open_existing(path) {
-            Ok(file) => Ok(OpenedCanonicalFile::Existing(file)),
-            Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
-                kind: io::ErrorKind::NotFound,
-                ..
-            }) => {
-                ensure_parent_present(&parent_directory(path))?;
-                Err(
-                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                        platform,
-                        operation: CanonicalNamespaceOperation::FirstCreate,
-                    },
-                )
-            }
-            Err(error) => Err(error),
-        }
+        Ok(namespace_supported_for(current_platform()))
     }
 
     fn append_opened(
@@ -364,7 +564,10 @@ impl CanonicalDurability {
                 if let Err(error) = self.checked(CanonicalDurabilityStage::SeekEnd, || {
                     file.seek(SeekFrom::End(0)).map(|_| ())
                 }) {
-                    return before_mutation(CanonicalDurabilityStage::SeekEnd, error);
+                    return CanonicalDurabilityOutcome::Rejected(durability_io(
+                        CanonicalDurabilityStage::SeekEnd,
+                        &error,
+                    ));
                 }
                 (file, None)
             }
@@ -380,21 +583,21 @@ impl CanonicalDurability {
         if let Err(error) =
             self.checked(CanonicalDurabilityStage::Write, || writer.write_all(bytes))
         {
-            return indeterminate(CanonicalDurabilityStage::Write, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::Flush, || writer.flush()) {
-            return indeterminate(CanonicalDurabilityStage::Flush, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::Flush, &error, recovery_key);
         }
         drop(writer);
         if let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || file.sync_all()) {
-            return indeterminate(CanonicalDurabilityStage::FileSync, error, recovery_key);
+            return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
 
         if let Some(parent) = parent {
             if let Err(error) =
                 self.checked(CanonicalDurabilityStage::ParentSync, || parent.sync_all())
             {
-                return indeterminate(CanonicalDurabilityStage::ParentSync, error, recovery_key);
+                return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
             }
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation,
@@ -414,16 +617,22 @@ impl CanonicalDurability {
         operation: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         #[cfg(test)]
-        if self.injected_failure == Some(_stage) {
-            return Err(io::Error::other("injected failure"));
+        if let Some(failure) = self.injected_failure
+            && failure.stage == _stage
+        {
+            return Err(match failure.raw_os_error {
+                Some(raw_os_error) => io::Error::from_raw_os_error(raw_os_error),
+                None => io::Error::other("injected failure"),
+            });
         }
         operation()
     }
 
-    #[cfg(test)]
-    fn failing_at(stage: CanonicalDurabilityStage) -> Self {
-        Self {
-            injected_failure: Some(stage),
+    fn wait_before_atomic_create(&self) {
+        #[cfg(test)]
+        if let Some(barrier) = &self.before_atomic_create {
+            barrier.wait();
+            barrier.wait();
         }
     }
 }
@@ -433,76 +642,82 @@ enum OpenedCanonicalFile {
     New { file: File, parent: File },
 }
 
-fn try_lock_exclusive(file: File) -> Result<CanonicalExclusiveGuard, CanonicalCoordinationError> {
+fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationError> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            ensure_regular_lock_entry(path)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))
+        }
+        Err(error) => Err(coordination_io(CanonicalCoordinationStage::Open, &error)),
+    }
+}
+
+fn ensure_regular_lock_entry(path: &Path) -> Result<(), CanonicalCoordinationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(CanonicalCoordinationError::NonRegularLockFile),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(CanonicalCoordinationError::Missing)
+        }
+        Err(error) => Err(coordination_io(
+            CanonicalCoordinationStage::InspectLock,
+            &error,
+        )),
+    }
+}
+
+fn try_lock_exclusive(file: File) -> Result<File, CanonicalCoordinationError> {
     match file.try_lock() {
-        Ok(()) => Ok(CanonicalExclusiveGuard { _lock_file: file }),
+        Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(CanonicalCoordinationError::Contended),
-        Err(TryLockError::Error(error)) => Err(CanonicalCoordinationError::Io {
-            stage: CanonicalCoordinationStage::Lock,
-            kind: error.kind(),
-        }),
+        Err(TryLockError::Error(error)) => {
+            Err(coordination_io(CanonicalCoordinationStage::Lock, &error))
+        }
     }
 }
 
-fn try_lock_shared(file: File) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+fn try_lock_shared(file: File) -> Result<File, CanonicalCoordinationError> {
     match file.try_lock_shared() {
-        Ok(()) => Ok(CanonicalSharedGuard { _lock_file: file }),
+        Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(CanonicalCoordinationError::Contended),
-        Err(TryLockError::Error(error)) => Err(CanonicalCoordinationError::Io {
-            stage: CanonicalCoordinationStage::Lock,
-            kind: error.kind(),
-        }),
+        Err(TryLockError::Error(error)) => {
+            Err(coordination_io(CanonicalCoordinationStage::Lock, &error))
+        }
     }
 }
 
-fn open_existing(path: &Path) -> Result<File, CanonicalDurabilityRejection> {
+fn open_existing_regular(path: &Path) -> Result<File, CanonicalDurabilityRejection> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+    if !metadata.file_type().is_file() {
+        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+    }
     OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .map_err(
-            |error| CanonicalDurabilityRejection::IoFailedBeforeMutation {
-                stage: CanonicalDurabilityStage::OpenExisting,
-                kind: error.kind(),
-            },
-        )
-}
-
-fn open_parent(path: &Path) -> Result<File, CanonicalDurabilityRejection> {
-    File::open(path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            CanonicalDurabilityRejection::ParentProvisioningRequired
-        } else {
-            CanonicalDurabilityRejection::IoFailedBeforeMutation {
-                stage: CanonicalDurabilityStage::OpenParent,
-                kind: error.kind(),
-            }
-        }
-    })
+        .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))
 }
 
 fn ensure_destination_absent(path: &Path) -> Result<(), CanonicalDurabilityRejection> {
-    match File::open(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(_) => Err(CanonicalDurabilityRejection::DestinationAlreadyExists),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
-            stage: CanonicalDurabilityStage::OpenExisting,
-            kind: error.kind(),
-        }),
+        Err(error) => Err(durability_io(
+            CanonicalDurabilityStage::InspectEntry,
+            &error,
+        )),
     }
-}
-
-fn ensure_parent_present(path: &Path) -> Result<(), CanonicalDurabilityRejection> {
-    std::fs::metadata(path).map(|_| ()).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            CanonicalDurabilityRejection::ParentProvisioningRequired
-        } else {
-            CanonicalDurabilityRejection::IoFailedBeforeMutation {
-                stage: CanonicalDurabilityStage::OpenParent,
-                kind: error.kind(),
-            }
-        }
-    })
 }
 
 fn parent_directory(path: &Path) -> PathBuf {
@@ -524,40 +739,63 @@ const fn current_platform() -> CanonicalPlatform {
     }
 }
 
-const fn namespace_is_qualified(
-    platform: CanonicalPlatform,
-    qualification: CanonicalFilesystemQualification,
-) -> bool {
+const fn namespace_supported_for(platform: CanonicalPlatform) -> bool {
     matches!(
-        (platform, qualification),
-        (
-            CanonicalPlatform::Linux,
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven
-        ) | (
-            CanonicalPlatform::MacOs,
-            CanonicalFilesystemQualification::MacOsApfsDirectorySyncProven
-        )
+        platform,
+        CanonicalPlatform::Linux | CanonicalPlatform::MacOs
     )
 }
 
-fn before_mutation(
-    stage: CanonicalDurabilityStage,
-    error: io::Error,
-) -> CanonicalDurabilityOutcome {
-    CanonicalDurabilityOutcome::Rejected(CanonicalDurabilityRejection::IoFailedBeforeMutation {
+fn filesystem_identity(metadata: &Metadata) -> FilesystemIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FilesystemIdentity {
+            volume: Some(VolumeIdentity::UnixDevice(metadata.dev())),
+            object: Some(ObjectIdentity::UnixInode(metadata.ino())),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        FilesystemIdentity {
+            volume: None,
+            object: None,
+        }
+    }
+}
+
+fn coordination_io(
+    stage: CanonicalCoordinationStage,
+    error: &io::Error,
+) -> CanonicalCoordinationError {
+    CanonicalCoordinationError::Io {
         stage,
         kind: error.kind(),
-    })
+        raw_os_error: error.raw_os_error(),
+    }
+}
+
+fn durability_io(
+    stage: CanonicalDurabilityStage,
+    error: &io::Error,
+) -> CanonicalDurabilityRejection {
+    CanonicalDurabilityRejection::IoFailedBeforeMutation {
+        stage,
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+    }
 }
 
 fn indeterminate(
     stage: CanonicalDurabilityStage,
-    error: io::Error,
+    error: &io::Error,
     recovery_key: CanonicalRecoveryKey,
 ) -> CanonicalDurabilityOutcome {
     CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
         stage,
         kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
         recovery_key,
     })
 }
@@ -568,6 +806,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
 
     fn temp_root(label: &str) -> PathBuf {
         static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -578,46 +820,34 @@ mod tests {
         ))
     }
 
+    fn qualification(root: &Path) -> CanonicalFilesystemQualification {
+        CanonicalFilesystemQualification::for_test_root(root)
+            .expect("bind test qualification to root identity")
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn public_append_classifies_existing_and_first_created_files_atomically() {
         let root = temp_root("classification");
         fs::create_dir_all(&root).expect("create fixture root");
-        let coordination = root.join("canonical.lock");
         let existing = root.join("existing.log");
         let newly_created = root.join("new.log");
         fs::write(&existing, b"prefix").expect("seed existing file");
-
-        let durability = CanonicalDurability::new();
-        let guard = durability
-            .try_lock_exclusive(&coordination)
-            .expect("acquire stable coordination lock");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
         let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([7; 16]);
 
-        let existing_outcome = durability.append(
-            &guard,
-            &existing,
-            b"-append",
-            CanonicalFilesystemQualification::Unqualified,
-            recovery_key,
-        );
         assert_eq!(
-            existing_outcome,
+            guard.append(&existing, b"-append", None, recovery_key),
             CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::ExistingAppend,
                 barrier: CanonicalDurabilityBarrier::FileDataAndMetadata,
             })
         );
-
-        let new_outcome = durability.append(
-            &guard,
-            &newly_created,
-            b"first",
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-            recovery_key,
-        );
         assert_eq!(
-            new_outcome,
+            guard.append(&newly_created, b"first", Some(&proof), recovery_key),
             CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::FirstCreate,
                 barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
@@ -625,7 +855,52 @@ mod tests {
         );
         assert_eq!(fs::read(existing).expect("read existing"), b"prefix-append");
         assert_eq!(fs::read(newly_created).expect("read new"), b"first");
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn concurrent_creator_is_atomically_classified_as_existing() {
+        let root = temp_root("concurrent-create");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let proof = Arc::new(qualification(&root));
+        let barrier = Arc::new(Barrier::new(2));
+        let durability = CanonicalDurability::with_before_atomic_create(barrier.clone());
+        let guard = Arc::new(
+            durability
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard"),
+        );
+        let target = root.join("events.log");
+        let worker_target = target.clone();
+        let worker_guard = guard.clone();
+        let worker_proof = proof.clone();
+        let worker = thread::spawn(move || {
+            worker_guard.append(
+                &worker_target,
+                b"-append",
+                Some(worker_proof.as_ref()),
+                CanonicalRecoveryKey::from_opaque_bytes([12; 16]),
+            )
+        });
+
+        barrier.wait();
+        fs::write(&target, b"racer").expect("concurrent creator wins create race");
+        barrier.wait();
+        let outcome = worker.join().expect("join append worker");
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::ExistingAppend,
+                barrier: CanonicalDurabilityBarrier::FileDataAndMetadata,
+            })
+        );
+        assert_eq!(
+            fs::read(&target).expect("read raced target"),
+            b"racer-append"
+        );
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
@@ -636,20 +911,18 @@ mod tests {
         let root = temp_root("rename");
         let destination_parent = root.join("quarantine");
         fs::create_dir_all(&destination_parent).expect("create fixture directories");
-        let coordination = root.join("canonical.lock");
         let source = root.join("tail.tmp");
         let destination = destination_parent.join("tail.quarantine");
         fs::write(&source, b"recoverable tail").expect("seed rename source");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
 
-        let durability = CanonicalDurability::new();
-        let guard = durability
-            .try_lock_exclusive(&coordination)
-            .expect("acquire stable coordination lock");
-        let outcome = durability.rename(
-            &guard,
+        let outcome = guard.rename(
             &source,
             &destination,
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
+            Some(&proof),
             CanonicalRecoveryKey::from_opaque_bytes([9; 16]),
         );
 
@@ -662,206 +935,216 @@ mod tests {
         );
         assert!(!source.exists());
         assert_eq!(
-            fs::read(destination).expect("read renamed file"),
+            fs::read(destination).expect("read renamed"),
             b"recoverable tail"
         );
-
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn missing_canonical_parent_requires_external_provisioning() {
-        let root = temp_root("missing-parent");
+    fn missing_parent_and_unqualified_create_refuse_without_mutation() {
+        let root = temp_root("create-refusals");
         fs::create_dir_all(&root).expect("create fixture root");
-        let durability = CanonicalDurability::new();
-        let guard = durability
-            .try_lock_exclusive(&root.join("canonical.lock"))
-            .expect("acquire stable coordination lock");
-        let target = root.join("absent").join("events.log");
-
-        let outcome = durability.append(
-            &guard,
-            &target,
-            b"must not be written",
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-            CanonicalRecoveryKey::from_opaque_bytes([1; 16]),
-        );
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+        let missing_parent_target = root.join("absent").join("events.log");
+        let unqualified_target = root.join("unqualified.log");
+        let key = CanonicalRecoveryKey::from_opaque_bytes([1; 16]);
 
         assert_eq!(
-            outcome,
+            guard.append(&missing_parent_target, b"no", None, key),
             CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::ParentProvisioningRequired
             )
         );
-        assert!(!target.parent().expect("target parent").exists());
-        drop(guard);
-        fs::remove_dir_all(root).expect("clean fixture root");
-    }
-
-    #[test]
-    fn unqualified_first_create_is_refused_before_mutation() {
-        let root = temp_root("unqualified-create");
-        fs::create_dir_all(&root).expect("create fixture root");
-        let durability = CanonicalDurability::new();
-        let guard = durability
-            .try_lock_exclusive(&root.join("canonical.lock"))
-            .expect("acquire stable coordination lock");
-        let target = root.join("events.log");
-
-        let outcome = durability.append(
-            &guard,
-            &target,
-            b"must not be written",
-            CanonicalFilesystemQualification::Unqualified,
-            CanonicalRecoveryKey::from_opaque_bytes([2; 16]),
-        );
-
         assert_eq!(
-            outcome,
+            guard.append(&unqualified_target, b"no", None, key),
             CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                    platform: current_platform(),
+                    platform: CanonicalPlatform::Linux,
                     operation: CanonicalNamespaceOperation::FirstCreate,
                 }
             )
         );
-        assert!(!target.exists());
+        assert!(!missing_parent_target.exists());
+        assert!(!unqualified_target.exists());
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
 
     #[test]
     fn shared_coordination_lock_on_missing_state_is_non_mutating() {
-        let root = temp_root("strict-lock-missing");
-        let coordination = root.join("canonical.lock");
+        let missing_root = temp_root("strict-lock-missing-root");
+        let existing_root = temp_root("strict-lock-missing-entry");
+        fs::create_dir_all(&existing_root).expect("create existing managed root");
         let durability = CanonicalDurability::new();
-
-        let result = durability.try_lock_shared(&coordination);
-
-        assert!(matches!(result, Err(CanonicalCoordinationError::Missing)));
-        assert!(!coordination.exists());
-        assert!(!root.exists());
+        assert!(matches!(
+            durability.try_lock_shared(&missing_root),
+            Err(CanonicalCoordinationError::Missing)
+        ));
+        assert!(matches!(
+            durability.try_lock_shared(&existing_root),
+            Err(CanonicalCoordinationError::Missing)
+        ));
+        assert!(!missing_root.exists());
+        assert!(!existing_root.join(COORDINATION_FILE_NAME).exists());
+        assert_eq!(
+            fs::read_dir(&existing_root)
+                .expect("read existing root")
+                .count(),
+            0
+        );
+        fs::remove_dir_all(existing_root).expect("clean existing root");
     }
 
     #[test]
     fn stable_coordination_locks_contend_share_and_release() {
         let root = temp_root("coordination-locks");
         fs::create_dir_all(&root).expect("create fixture root");
-        let coordination = root.join("canonical.lock");
         let durability = CanonicalDurability::new();
-
         let exclusive = durability
-            .try_lock_exclusive(&coordination)
+            .try_lock_exclusive(&root)
             .expect("acquire exclusive lock");
         assert!(matches!(
-            durability.try_lock_exclusive(&coordination),
+            durability.try_lock_exclusive(&root),
             Err(CanonicalCoordinationError::Contended)
         ));
         assert!(matches!(
-            durability.try_lock_shared(&coordination),
+            durability.try_lock_shared(&root),
             Err(CanonicalCoordinationError::Contended)
         ));
         drop(exclusive);
-
         let shared_one = durability
-            .try_lock_shared(&coordination)
-            .expect("acquire first shared lock after release");
+            .try_lock_shared(&root)
+            .expect("acquire first shared lock");
         let shared_two = durability
-            .try_lock_shared(&coordination)
+            .try_lock_shared(&root)
             .expect("acquire second shared lock");
         assert!(matches!(
-            durability.try_lock_exclusive(&coordination),
+            durability.try_lock_exclusive(&root),
             Err(CanonicalCoordinationError::Contended)
         ));
         drop(shared_two);
         drop(shared_one);
-
         let released = durability
-            .try_lock_exclusive(&coordination)
-            .expect("exclusive lock is available after shared release");
+            .try_lock_exclusive(&root)
+            .expect("exclusive lock available after release");
         drop(released);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
 
     #[test]
-    fn exclusive_coordination_lock_does_not_provision_its_parent() {
+    fn exclusive_coordination_lock_does_not_provision_managed_root() {
         let root = temp_root("coordination-parent");
-        let coordination = root.join("canonical.lock");
-        let durability = CanonicalDurability::new();
-
-        let result = durability.try_lock_exclusive(&coordination);
-
         assert!(matches!(
-            result,
+            CanonicalDurability::new().try_lock_exclusive(&root),
             Err(CanonicalCoordinationError::ParentProvisioningRequired)
         ));
         assert!(!root.exists());
     }
 
     #[test]
-    fn platform_contract_is_linux_qualified_macos_apfs_conditional_and_windows_refused() {
-        assert!(namespace_is_qualified(
-            CanonicalPlatform::Linux,
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven
-        ));
-        assert!(!namespace_is_qualified(
-            CanonicalPlatform::Linux,
-            CanonicalFilesystemQualification::MacOsApfsDirectorySyncProven
-        ));
-        assert!(namespace_is_qualified(
-            CanonicalPlatform::MacOs,
-            CanonicalFilesystemQualification::MacOsApfsDirectorySyncProven
-        ));
-        assert!(!namespace_is_qualified(
-            CanonicalPlatform::MacOs,
-            CanonicalFilesystemQualification::Unqualified
-        ));
-        for qualification in [
-            CanonicalFilesystemQualification::Unqualified,
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-            CanonicalFilesystemQualification::MacOsApfsDirectorySyncProven,
-        ] {
-            assert!(!namespace_is_qualified(
-                CanonicalPlatform::Windows,
-                qualification
-            ));
-        }
+    fn guard_owned_append_rejects_a_target_outside_its_managed_namespace() {
+        let managed_root = temp_root("bound-guard");
+        let outside_root = temp_root("bound-guard-outside");
+        fs::create_dir_all(&managed_root).expect("create managed root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&managed_root)
+            .expect("acquire namespace-bound guard");
+        let outside_target = outside_root.join("events.log");
+
+        assert_eq!(
+            guard.append(
+                &outside_target,
+                b"must not be written",
+                None,
+                CanonicalRecoveryKey::from_opaque_bytes([11; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::TargetOutsideManagedNamespace
+            )
+        );
+        assert!(!outside_target.exists());
+        drop(guard);
+        fs::remove_dir_all(managed_root).expect("clean managed root");
+        fs::remove_dir_all(outside_root).expect("clean outside root");
     }
 
     #[test]
-    fn existing_append_barrier_failures_are_indeterminate() {
-        for stage in [
-            CanonicalDurabilityStage::Write,
-            CanonicalDurabilityStage::Flush,
-            CanonicalDurabilityStage::FileSync,
+    #[cfg(target_os = "linux")]
+    fn qualification_cannot_be_reused_for_another_root() {
+        let first_root = temp_root("proof-first-root");
+        let second_root = temp_root("proof-second-root");
+        fs::create_dir_all(&first_root).expect("create first root");
+        fs::create_dir_all(&second_root).expect("create second root");
+        let first_proof = qualification(&first_root);
+        let second_target = second_root.join("events.log");
+        let second_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&second_root)
+            .expect("acquire second root guard");
+
+        assert_eq!(
+            second_guard.append(
+                &second_target,
+                b"must not be written",
+                Some(&first_proof),
+                CanonicalRecoveryKey::from_opaque_bytes([13; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::QualificationBindingMismatch
+            )
+        );
+        assert!(!second_target.exists());
+        drop(second_guard);
+        fs::remove_dir_all(first_root).expect("clean first root");
+        fs::remove_dir_all(second_root).expect("clean second root");
+    }
+
+    #[test]
+    fn platform_namespace_contract_is_linux_macos_only() {
+        assert!(namespace_supported_for(CanonicalPlatform::Linux));
+        assert!(namespace_supported_for(CanonicalPlatform::MacOs));
+        assert!(!namespace_supported_for(CanonicalPlatform::Windows));
+        assert!(!namespace_supported_for(CanonicalPlatform::Other));
+    }
+
+    #[test]
+    fn append_barrier_failures_are_indeterminate_and_keep_raw_os_error() {
+        for (stage, raw_os_error) in [
+            (CanonicalDurabilityStage::Write, None),
+            (CanonicalDurabilityStage::Flush, Some(28)),
+            (CanonicalDurabilityStage::FileSync, None),
         ] {
             let root = temp_root(&format!("append-failure-{stage:?}"));
             fs::create_dir_all(&root).expect("create fixture root");
             let target = root.join("events.log");
             fs::write(&target, b"prefix").expect("seed existing file");
-            let durability = CanonicalDurability::failing_at(stage);
+            let durability = match raw_os_error {
+                Some(raw) => CanonicalDurability::failing_at_with_raw_os_error(stage, raw),
+                None => CanonicalDurability::failing_at(stage),
+            };
             let guard = durability
-                .try_lock_exclusive(&root.join("canonical.lock"))
-                .expect("acquire stable coordination lock");
-            let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([3; 16]);
-
-            let outcome = durability.append(
-                &guard,
-                &target,
-                b"possibly visible",
-                CanonicalFilesystemQualification::Unqualified,
-                recovery_key,
-            );
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard");
+            let key = CanonicalRecoveryKey::from_opaque_bytes([3; 16]);
+            let outcome = guard.append(&target, b"possibly visible", None, key);
+            let expected_error = raw_os_error.map(io::Error::from_raw_os_error);
+            let expected_kind = expected_error
+                .as_ref()
+                .map_or(io::ErrorKind::Other, io::Error::kind);
 
             assert_eq!(
                 outcome,
                 CanonicalDurabilityOutcome::DurabilityIndeterminate(
                     CanonicalDurabilityIndeterminate {
                         stage,
-                        kind: io::ErrorKind::Other,
-                        recovery_key,
+                        kind: expected_kind,
+                        raw_os_error,
+                        recovery_key: key,
                     }
                 )
             );
@@ -872,132 +1155,155 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn first_create_parent_barrier_failure_is_indeterminate() {
-        let root = temp_root("first-create-parent-failure");
+    fn first_create_and_rename_barrier_failures_are_indeterminate() {
+        let root = temp_root("namespace-failures");
         fs::create_dir_all(&root).expect("create fixture root");
-        let target = root.join("events.log");
-        let durability = CanonicalDurability::failing_at(CanonicalDurabilityStage::ParentSync);
-        let guard = durability
-            .try_lock_exclusive(&root.join("canonical.lock"))
-            .expect("acquire stable coordination lock");
-        let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([4; 16]);
-
-        let outcome = durability.append(
-            &guard,
-            &target,
-            b"visible but not namespace accepted",
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-            recovery_key,
-        );
-
-        assert_eq!(
-            outcome,
+        let proof = qualification(&root);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([4; 16]);
+        let create_target = root.join("create.log");
+        let create_durability =
+            CanonicalDurability::failing_at(CanonicalDurabilityStage::ParentSync);
+        let create_guard = create_durability
+            .try_lock_exclusive(&root)
+            .expect("acquire create guard");
+        assert!(matches!(
+            create_guard.append(&create_target, b"visible", Some(&proof), key),
             CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
                 stage: CanonicalDurabilityStage::ParentSync,
-                kind: io::ErrorKind::Other,
-                recovery_key,
+                ..
             })
-        );
-        assert!(target.exists());
-        drop(guard);
-        fs::remove_dir_all(root).expect("clean fixture root");
-    }
+        ));
+        assert!(create_target.exists());
+        drop(create_guard);
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn rename_failures_after_a_possible_mutation_are_indeterminate() {
         for stage in [
             CanonicalDurabilityStage::FileSync,
             CanonicalDurabilityStage::Rename,
             CanonicalDurabilityStage::ParentSync,
         ] {
-            let root = temp_root(&format!("rename-failure-{stage:?}"));
-            fs::create_dir_all(&root).expect("create fixture root");
-            let source = root.join("source.tmp");
-            let destination = root.join("destination.quarantine");
+            let source = root.join(format!("source-{stage:?}.tmp"));
+            let destination = root.join(format!("destination-{stage:?}.quarantine"));
             fs::write(&source, b"recoverable").expect("seed rename source");
             let durability = CanonicalDurability::failing_at(stage);
             let guard = durability
-                .try_lock_exclusive(&root.join("canonical.lock"))
-                .expect("acquire stable coordination lock");
-            let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([5; 16]);
+                .try_lock_exclusive(&root)
+                .expect("acquire rename guard");
+            assert!(matches!(
+                guard.rename(&source, &destination, Some(&proof), key),
+                CanonicalDurabilityOutcome::DurabilityIndeterminate(
+                    CanonicalDurabilityIndeterminate { stage: actual, .. }
+                ) if actual == stage
+            ));
+            drop(guard);
+        }
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
 
-            let outcome = durability.rename(
-                &guard,
-                &source,
-                &destination,
-                CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-                recovery_key,
-            );
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rename_refuses_regular_dangling_symlink_and_fifo_destinations() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        for entry_kind in ["regular", "symlink", "fifo"] {
+            let root = temp_root(&format!("rename-collision-{entry_kind}"));
+            fs::create_dir_all(&root).expect("create fixture root");
+            let source = root.join("source.tmp");
+            let destination = root.join("destination.quarantine");
+            fs::write(&source, b"source").expect("seed rename source");
+            match entry_kind {
+                "regular" => {
+                    fs::write(&destination, b"destination").expect("seed regular destination")
+                }
+                "symlink" => {
+                    symlink(root.join("missing"), &destination).expect("seed dangling symlink")
+                }
+                "fifo" => {
+                    let status = Command::new("mkfifo")
+                        .arg(&destination)
+                        .status()
+                        .expect("run mkfifo");
+                    assert!(status.success());
+                }
+                _ => unreachable!(),
+            }
+            let proof = qualification(&root);
+            let guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard");
 
             assert_eq!(
-                outcome,
-                CanonicalDurabilityOutcome::DurabilityIndeterminate(
-                    CanonicalDurabilityIndeterminate {
-                        stage,
-                        kind: io::ErrorKind::Other,
-                        recovery_key,
-                    }
+                guard.rename(
+                    &source,
+                    &destination,
+                    Some(&proof),
+                    CanonicalRecoveryKey::from_opaque_bytes([6; 16]),
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::DestinationAlreadyExists
                 )
             );
+            assert_eq!(fs::read(&source).expect("source retained"), b"source");
+            assert!(fs::symlink_metadata(&destination).is_ok());
             drop(guard);
             fs::remove_dir_all(root).expect("clean fixture root");
         }
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn rename_refuses_an_existing_destination_before_mutation() {
-        let root = temp_root("rename-collision");
-        fs::create_dir_all(&root).expect("create fixture root");
-        let source = root.join("source.tmp");
-        let destination = root.join("destination.quarantine");
-        fs::write(&source, b"source").expect("seed rename source");
-        fs::write(&destination, b"destination").expect("seed rename destination");
-        let durability = CanonicalDurability::new();
-        let guard = durability
-            .try_lock_exclusive(&root.join("canonical.lock"))
-            .expect("acquire stable coordination lock");
+    #[cfg(unix)]
+    fn existing_non_regular_canonical_entry_is_refused_without_opening() {
+        use std::process::Command;
 
-        let outcome = durability.rename(
-            &guard,
-            &source,
-            &destination,
-            CanonicalFilesystemQualification::LinuxLocalDirectorySyncProven,
-            CanonicalRecoveryKey::from_opaque_bytes([6; 16]),
-        );
+        let root = temp_root("append-fifo");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let target = root.join("events.log");
+        let status = Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
 
         assert_eq!(
-            outcome,
+            guard.append(
+                &target,
+                b"must not block or write",
+                None,
+                CanonicalRecoveryKey::from_opaque_bytes([14; 16]),
+            ),
             CanonicalDurabilityOutcome::Rejected(
-                CanonicalDurabilityRejection::DestinationAlreadyExists
+                CanonicalDurabilityRejection::NonRegularCanonicalEntry
             )
         );
-        assert_eq!(fs::read(source).expect("source retained"), b"source");
-        assert_eq!(
-            fs::read(destination).expect("destination retained"),
-            b"destination"
+        assert!(
+            fs::symlink_metadata(&target)
+                .expect("fifo retained")
+                .file_type()
+                .is_fifo()
         );
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
 
     #[test]
-    fn indeterminate_diagnostics_redact_path_payload_and_recovery_identity() {
+    fn indeterminate_diagnostics_redact_content_and_keep_numeric_os_error() {
         let root = temp_root("redacted-diagnostics");
         fs::create_dir_all(&root).expect("create fixture root");
         let target = root.join("private-session-name.log");
         fs::write(&target, b"prefix").expect("seed existing file");
-        let durability = CanonicalDurability::failing_at(CanonicalDurabilityStage::Flush);
+        let durability =
+            CanonicalDurability::failing_at_with_raw_os_error(CanonicalDurabilityStage::Flush, 28);
         let guard = durability
-            .try_lock_exclusive(&root.join("canonical.lock"))
-            .expect("acquire stable coordination lock");
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
         let secret_payload = "sensitive spoken words";
-        let outcome = durability.append(
-            &guard,
+        let outcome = guard.append(
             &target,
             secret_payload.as_bytes(),
-            CanonicalFilesystemQualification::Unqualified,
+            None,
             CanonicalRecoveryKey::from_opaque_bytes([0xab; 16]),
         );
 
@@ -1005,6 +1311,7 @@ mod tests {
         assert!(!diagnostic.contains("private-session-name"));
         assert!(!diagnostic.contains(secret_payload));
         assert!(!diagnostic.contains("abab"));
+        assert!(diagnostic.contains("raw_os_error: Some(28)"));
         assert!(diagnostic.contains("[REDACTED]"));
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
