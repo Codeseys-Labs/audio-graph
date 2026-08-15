@@ -23,6 +23,201 @@ impl<T> std::fmt::Debug for LegacyEvidence<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionSemanticPayloadKind {
+    LegacyV1,
+    SpeechSpanRevisionV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionSemanticStability {
+    Partial,
+    Final,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProjectionSemanticSupersession {
+    Absent,
+    LegacyReference {
+        reference: String,
+    },
+    V2Exact {
+        span_id: String,
+        revision_number: u64,
+    },
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ProjectionSemanticTiming {
+    Unavailable,
+    LegacyUnspecified {
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+    },
+    AppEstimated {
+        start_time: f64,
+        end_time: f64,
+    },
+    ProviderCoarse {
+        start_time: f64,
+        end_time: f64,
+    },
+    ProviderExact {
+        start_time: f64,
+        end_time: f64,
+    },
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ProjectionSemanticConfidence {
+    Unavailable,
+    LegacyUnspecified { value: f32 },
+    App { value: f32 },
+    Provider { value: f32 },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProjectionSemanticTurn {
+    Unavailable,
+    LegacyUnspecified {
+        turn_id: Option<String>,
+        end_of_turn: Option<bool>,
+    },
+    App {
+        turn_id: String,
+        end_of_turn: bool,
+    },
+    Provider {
+        turn_id: String,
+        end_of_turn: bool,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProjectionSemanticSpeaker {
+    Unavailable,
+    LegacyUnspecified {
+        speaker_id: Option<String>,
+        speaker_label: Option<String>,
+    },
+    App {
+        speaker_id: Option<String>,
+        speaker_label: Option<String>,
+    },
+    Provider {
+        speaker_id: Option<String>,
+        speaker_label: Option<String>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProjectionSemanticChannel {
+    Unavailable,
+    LegacyUnspecified { value: String },
+    App { value: String },
+    Provider { value: String },
+}
+
+/// The projection-relevant meaning of one validated legacy or v2 revision.
+///
+/// Operational and storage metadata have no representation in this type, so
+/// neither the hash encoder nor a future projection prompt can accidentally
+/// consume them through this seam.
+#[derive(Clone, PartialEq)]
+pub struct ProjectionSemanticRevision {
+    pub(crate) payload_kind: ProjectionSemanticPayloadKind,
+    pub(crate) span_id: String,
+    pub(crate) source_id: String,
+    pub(crate) source_ordinal: Option<u64>,
+    pub(crate) provider: String,
+    pub(crate) text: String,
+    pub(crate) stability: ProjectionSemanticStability,
+    pub(crate) is_final: bool,
+    pub(crate) revision_number: u64,
+    pub(crate) supersession: ProjectionSemanticSupersession,
+    pub(crate) timing: ProjectionSemanticTiming,
+    pub(crate) confidence: ProjectionSemanticConfidence,
+    pub(crate) turn: ProjectionSemanticTurn,
+    pub(crate) speaker: ProjectionSemanticSpeaker,
+    pub(crate) channel: ProjectionSemanticChannel,
+}
+
+impl ProjectionSemanticRevision {
+    pub fn payload_kind(&self) -> ProjectionSemanticPayloadKind {
+        self.payload_kind
+    }
+
+    pub fn span_id(&self) -> &str {
+        &self.span_id
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn source_ordinal(&self) -> Option<u64> {
+        self.source_ordinal
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn stability(&self) -> ProjectionSemanticStability {
+        self.stability
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.is_final
+    }
+
+    pub fn revision_number(&self) -> u64 {
+        self.revision_number
+    }
+
+    pub fn supersession(&self) -> &ProjectionSemanticSupersession {
+        &self.supersession
+    }
+
+    pub fn timing(&self) -> &ProjectionSemanticTiming {
+        &self.timing
+    }
+
+    pub fn confidence(&self) -> &ProjectionSemanticConfidence {
+        &self.confidence
+    }
+
+    pub fn turn(&self) -> &ProjectionSemanticTurn {
+        &self.turn
+    }
+
+    pub fn speaker(&self) -> &ProjectionSemanticSpeaker {
+        &self.speaker
+    }
+
+    pub fn channel(&self) -> &ProjectionSemanticChannel {
+        &self.channel
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProjectionSemanticError {
+    #[error("projection semantic revision has an invalid required string")]
+    InvalidRequiredString,
+    #[error("projection semantic revision has an invalid revision number")]
+    InvalidRevisionNumber,
+    #[error("projection semantic revision has invalid supersession")]
+    InvalidSupersession,
+    #[error("projection semantic revision has non-finite timing")]
+    NonFiniteTiming,
+    #[error("projection semantic revision has non-finite confidence")]
+    NonFiniteConfidence,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct LegacySpeechSpanRevision {
     span_id: String,
@@ -128,6 +323,15 @@ impl CompatibleSpeechSpanRevision {
         }
     }
 
+    pub fn projection_semantics(
+        &self,
+    ) -> Result<ProjectionSemanticRevision, ProjectionSemanticError> {
+        match self {
+            Self::LegacyV1(revision) => revision.projection_semantics(),
+            Self::V2(revision) => Ok(v2_projection_semantics(revision)),
+        }
+    }
+
     pub fn into_legacy_transcript_event(
         self,
     ) -> Result<crate::projections::TranscriptEvent, SpeechSpanRevisionError> {
@@ -135,6 +339,210 @@ impl CompatibleSpeechSpanRevision {
             Self::LegacyV1(revision) => revision.into_transcript_event(),
             Self::V2(_) => Err(SpeechSpanRevisionError::LegacyProjectionUnavailable),
         }
+    }
+}
+
+impl LegacySpeechSpanRevision {
+    fn projection_semantics(&self) -> Result<ProjectionSemanticRevision, ProjectionSemanticError> {
+        for value in [&self.span_id, &self.source_id, &self.provider, &self.text] {
+            if value.trim().is_empty() {
+                return Err(ProjectionSemanticError::InvalidRequiredString);
+            }
+        }
+        if self.revision_number == 0 {
+            return Err(ProjectionSemanticError::InvalidRevisionNumber);
+        }
+
+        let supersession = match &self.supersedes {
+            None => ProjectionSemanticSupersession::Absent,
+            Some(reference) if !reference.trim().is_empty() => {
+                ProjectionSemanticSupersession::LegacyReference {
+                    reference: reference.clone(),
+                }
+            }
+            Some(_) => return Err(ProjectionSemanticError::InvalidSupersession),
+        };
+        let start_time = legacy_option(&self.start_time);
+        let end_time = legacy_option(&self.end_time);
+        validate_semantic_f64(start_time)?;
+        validate_semantic_f64(end_time)?;
+        let timing = if start_time.is_none() && end_time.is_none() {
+            ProjectionSemanticTiming::Unavailable
+        } else {
+            ProjectionSemanticTiming::LegacyUnspecified {
+                start_time,
+                end_time,
+            }
+        };
+        let confidence = match &self.confidence {
+            LegacyEvidence::Unavailable => ProjectionSemanticConfidence::Unavailable,
+            LegacyEvidence::LegacyUnspecified { value } if value.is_finite() => {
+                ProjectionSemanticConfidence::LegacyUnspecified { value: *value }
+            }
+            LegacyEvidence::LegacyUnspecified { .. } => {
+                return Err(ProjectionSemanticError::NonFiniteConfidence);
+            }
+        };
+        let turn = match &self.turn {
+            LegacyEvidence::Unavailable => ProjectionSemanticTurn::Unavailable,
+            LegacyEvidence::LegacyUnspecified { value } => {
+                ProjectionSemanticTurn::LegacyUnspecified {
+                    turn_id: value.turn_id.clone(),
+                    end_of_turn: value.end_of_turn,
+                }
+            }
+        };
+        let speaker = match &self.speaker {
+            LegacyEvidence::Unavailable => ProjectionSemanticSpeaker::Unavailable,
+            LegacyEvidence::LegacyUnspecified { value } => {
+                ProjectionSemanticSpeaker::LegacyUnspecified {
+                    speaker_id: value.speaker_id.clone(),
+                    speaker_label: value.speaker_label.clone(),
+                }
+            }
+        };
+        let channel = match &self.channel {
+            LegacyEvidence::Unavailable => ProjectionSemanticChannel::Unavailable,
+            LegacyEvidence::LegacyUnspecified { value } => {
+                ProjectionSemanticChannel::LegacyUnspecified {
+                    value: value.clone(),
+                }
+            }
+        };
+
+        Ok(ProjectionSemanticRevision {
+            payload_kind: ProjectionSemanticPayloadKind::LegacyV1,
+            span_id: self.span_id.clone(),
+            source_id: self.source_id.clone(),
+            source_ordinal: None,
+            provider: self.provider.clone(),
+            text: self.text.clone(),
+            stability: match self.stability {
+                crate::projections::TranscriptEventStability::Partial => {
+                    ProjectionSemanticStability::Partial
+                }
+                crate::projections::TranscriptEventStability::Final => {
+                    ProjectionSemanticStability::Final
+                }
+            },
+            is_final: self.is_final,
+            revision_number: self.revision_number,
+            supersession,
+            timing,
+            confidence,
+            turn,
+            speaker,
+            channel,
+        })
+    }
+}
+
+fn v2_projection_semantics(revision: &SpeechSpanRevision) -> ProjectionSemanticRevision {
+    let timing = match revision.timing() {
+        SpeechTiming::Unavailable {} => ProjectionSemanticTiming::Unavailable,
+        SpeechTiming::AppEstimated {
+            start_time,
+            end_time,
+        } => ProjectionSemanticTiming::AppEstimated {
+            start_time: *start_time,
+            end_time: *end_time,
+        },
+        SpeechTiming::Provider {
+            precision: SpeechTimingPrecision::Coarse,
+            start_time,
+            end_time,
+        } => ProjectionSemanticTiming::ProviderCoarse {
+            start_time: *start_time,
+            end_time: *end_time,
+        },
+        SpeechTiming::Provider {
+            precision: SpeechTimingPrecision::Exact,
+            start_time,
+            end_time,
+        } => ProjectionSemanticTiming::ProviderExact {
+            start_time: *start_time,
+            end_time: *end_time,
+        },
+    };
+    let confidence = match revision.confidence() {
+        SpeechConfidence::Unavailable {} => ProjectionSemanticConfidence::Unavailable,
+        SpeechConfidence::App { value } => ProjectionSemanticConfidence::App { value: *value },
+        SpeechConfidence::Provider { value } => {
+            ProjectionSemanticConfidence::Provider { value: *value }
+        }
+    };
+    let turn = match revision.turn() {
+        SpeechTurnFidelity::Unavailable {} => ProjectionSemanticTurn::Unavailable,
+        SpeechTurnFidelity::App { value } => ProjectionSemanticTurn::App {
+            turn_id: value.turn_id.clone(),
+            end_of_turn: value.end_of_turn,
+        },
+        SpeechTurnFidelity::Provider { value } => ProjectionSemanticTurn::Provider {
+            turn_id: value.turn_id.clone(),
+            end_of_turn: value.end_of_turn,
+        },
+    };
+    let speaker = match revision.speaker() {
+        SpeechSpeakerFidelity::Unavailable {} => ProjectionSemanticSpeaker::Unavailable,
+        SpeechSpeakerFidelity::App { value } => ProjectionSemanticSpeaker::App {
+            speaker_id: value.speaker_id.clone(),
+            speaker_label: value.speaker_label.clone(),
+        },
+        SpeechSpeakerFidelity::Provider { value } => ProjectionSemanticSpeaker::Provider {
+            speaker_id: value.speaker_id.clone(),
+            speaker_label: value.speaker_label.clone(),
+        },
+    };
+    let channel = match revision.channel() {
+        SpeechChannelFidelity::Unavailable {} => ProjectionSemanticChannel::Unavailable,
+        SpeechChannelFidelity::App { value } => ProjectionSemanticChannel::App {
+            value: value.clone(),
+        },
+        SpeechChannelFidelity::Provider { value } => ProjectionSemanticChannel::Provider {
+            value: value.clone(),
+        },
+    };
+
+    ProjectionSemanticRevision {
+        payload_kind: ProjectionSemanticPayloadKind::SpeechSpanRevisionV2,
+        span_id: revision.span_id().to_string(),
+        source_id: revision.source_order().source_stream_id.clone(),
+        source_ordinal: Some(revision.source_order().ordinal),
+        provider: revision.provider().to_string(),
+        text: revision.text().to_string(),
+        stability: match revision.stability() {
+            SpeechSpanStability::Partial => ProjectionSemanticStability::Partial,
+            SpeechSpanStability::Final => ProjectionSemanticStability::Final,
+        },
+        is_final: revision.is_final(),
+        revision_number: revision.revision_number(),
+        supersession: match revision.supersedes() {
+            None => ProjectionSemanticSupersession::Absent,
+            Some(reference) => ProjectionSemanticSupersession::V2Exact {
+                span_id: reference.span_id.clone(),
+                revision_number: reference.revision_number,
+            },
+        },
+        timing,
+        confidence,
+        turn,
+        speaker,
+        channel,
+    }
+}
+
+fn legacy_option<T: Copy>(evidence: &LegacyEvidence<T>) -> Option<T> {
+    match evidence {
+        LegacyEvidence::Unavailable => None,
+        LegacyEvidence::LegacyUnspecified { value } => Some(*value),
+    }
+}
+
+fn validate_semantic_f64(value: Option<f64>) -> Result<(), ProjectionSemanticError> {
+    if value.is_some_and(|value| !value.is_finite()) {
+        Err(ProjectionSemanticError::NonFiniteTiming)
+    } else {
+        Ok(())
     }
 }
 
@@ -710,5 +1118,91 @@ mod tests {
         let legacy_missing = decoded_missing.as_legacy_v1().expect("legacy v1");
         assert_eq!(legacy_missing.confidence(), &LegacyEvidence::Unavailable);
         assert_eq!(legacy_missing.channel(), &LegacyEvidence::Unavailable);
+    }
+
+    #[test]
+    fn compatible_revision_normalizes_only_projection_semantics() {
+        let legacy_json = serde_json::json!({
+            "span_id": "legacy-span-1",
+            "provider": "legacy-provider",
+            "source_id": "legacy-source",
+            "provider_item_id": "excluded-item-a",
+            "transcript_segment_id": "excluded-segment-a",
+            "speaker_id": "speaker-legacy",
+            "text": "legacy hello",
+            "start_time": 0.0,
+            "end_time": 1.0,
+            "confidence": 0.9,
+            "is_final": true,
+            "stability": "final",
+            "revision_number": 1,
+            "turn_id": "legacy-turn",
+            "end_of_turn": true,
+            "raw_event_ref": "excluded.ref.a",
+            "capture_latency_ms": 10,
+            "asr_latency_ms": 20,
+            "received_at_ms": 1_u64
+        });
+        let mut operational_mutation = legacy_json.clone();
+        operational_mutation["provider_item_id"] = serde_json::json!("excluded-item-b");
+        operational_mutation["transcript_segment_id"] = serde_json::json!("excluded-segment-b");
+        operational_mutation["raw_event_ref"] = serde_json::json!("excluded.ref.b");
+        operational_mutation["capture_latency_ms"] = serde_json::json!(999);
+        operational_mutation["asr_latency_ms"] = serde_json::json!(998);
+        operational_mutation["received_at_ms"] = serde_json::json!(999_u64);
+
+        let original: CompatibleSpeechSpanRevision =
+            serde_json::from_value(legacy_json).expect("decode original legacy row");
+        let mutated: CompatibleSpeechSpanRevision = serde_json::from_value(operational_mutation)
+            .expect("decode operationally mutated legacy row");
+        let original = original
+            .projection_semantics()
+            .expect("normalize original legacy row");
+        let mutated = mutated
+            .projection_semantics()
+            .expect("normalize mutated legacy row");
+
+        assert!(original == mutated);
+        assert_eq!(original.source_ordinal(), None);
+        assert_eq!(original.span_id(), "legacy-span-1");
+        assert_eq!(original.source_id(), "legacy-source");
+        assert_eq!(original.text(), "legacy hello");
+        assert_eq!(original.revision_number(), 1);
+        assert!(original.is_final());
+        assert!(matches!(
+            original.timing(),
+            super::ProjectionSemanticTiming::LegacyUnspecified {
+                start_time: Some(0.0),
+                end_time: Some(1.0)
+            }
+        ));
+        assert!(matches!(
+            original.confidence(),
+            super::ProjectionSemanticConfidence::LegacyUnspecified { value } if *value == 0.9
+        ));
+    }
+
+    #[test]
+    fn v2_operational_mutations_are_absent_from_projection_semantics() {
+        let original = SpeechSpanRevisionNormalizer::new()
+            .admit(unavailable_observation())
+            .expect("admit original v2 row");
+        let mut operational_mutation = unavailable_observation();
+        operational_mutation.provider_item_id = Some("excluded-provider-item".into());
+        operational_mutation.provider_event_ref = Some("excluded.provider.ref".into());
+        operational_mutation.capture_latency_ms = Some(999);
+        operational_mutation.asr_latency_ms = Some(998);
+        operational_mutation.received_at_ms += 999;
+        let mutated = SpeechSpanRevisionNormalizer::new()
+            .admit(operational_mutation)
+            .expect("admit operationally mutated v2 row");
+
+        let original = CompatibleSpeechSpanRevision::V2(original)
+            .projection_semantics()
+            .expect("normalize original v2 row");
+        let mutated = CompatibleSpeechSpanRevision::V2(mutated)
+            .projection_semantics()
+            .expect("normalize mutated v2 row");
+        assert!(original == mutated);
     }
 }

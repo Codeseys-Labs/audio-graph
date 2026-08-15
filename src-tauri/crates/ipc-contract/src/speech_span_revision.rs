@@ -331,6 +331,10 @@ impl SpeechSpanRevision {
         &self.0.span_id
     }
 
+    pub fn contract_version(&self) -> u32 {
+        self.0.contract_version
+    }
+
     pub fn source_order(&self) -> &SpeechSpanSourceOrder {
         &self.0.source_order
     }
@@ -339,12 +343,44 @@ impl SpeechSpanRevision {
         &self.0.provider
     }
 
+    pub fn text(&self) -> &str {
+        &self.0.text
+    }
+
+    pub fn stability(&self) -> SpeechSpanStability {
+        self.0.stability
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.0.stability == SpeechSpanStability::Final
+    }
+
     pub fn revision_number(&self) -> u64 {
         self.0.revision_number
     }
 
     pub fn supersedes(&self) -> Option<&SpeechSpanRevisionRef> {
         self.0.supersedes.as_ref()
+    }
+
+    pub fn timing(&self) -> &SpeechTiming {
+        &self.0.timing
+    }
+
+    pub fn confidence(&self) -> &SpeechConfidence {
+        &self.0.confidence
+    }
+
+    pub fn turn(&self) -> &SpeechTurnFidelity {
+        &self.0.turn
+    }
+
+    pub fn speaker(&self) -> &SpeechSpeakerFidelity {
+        &self.0.speaker
+    }
+
+    pub fn channel(&self) -> &SpeechChannelFidelity {
+        &self.0.channel
     }
 
     pub fn revision_ref(&self) -> SpeechSpanRevisionRef {
@@ -976,6 +1012,28 @@ mod tests {
             })
             .expect("fixture observation should be valid");
         serde_json::to_value(revision).expect("fixture revision should serialize")
+    }
+
+    #[test]
+    fn validated_revision_exposes_every_projection_semantic_field_read_only() {
+        let revision: SpeechSpanRevision = serde_json::from_value(valid_revision_json())
+            .expect("fixture revision should deserialize through validation");
+
+        assert_eq!(revision.contract_version(), 2);
+        assert_eq!(revision.span_id(), "ssp_cbc3c0f3304aaae4a665331575fefad5");
+        assert_eq!(revision.source_order().source_stream_id, "source-stream-a");
+        assert_eq!(revision.source_order().ordinal, 1);
+        assert_eq!(revision.provider(), "fixture-provider");
+        assert_eq!(revision.text(), "fixture transcript");
+        assert_eq!(revision.stability(), SpeechSpanStability::Final);
+        assert!(revision.is_final());
+        assert_eq!(revision.revision_number(), 1);
+        assert_eq!(revision.supersedes(), None);
+        assert_eq!(revision.timing(), &SpeechTiming::Unavailable {});
+        assert_eq!(revision.confidence(), &SpeechConfidence::Unavailable {});
+        assert_eq!(revision.turn(), &SpeechTurnFidelity::Unavailable {});
+        assert_eq!(revision.speaker(), &SpeechSpeakerFidelity::Unavailable {});
+        assert_eq!(revision.channel(), &SpeechChannelFidelity::Unavailable {});
     }
 
     #[test]
