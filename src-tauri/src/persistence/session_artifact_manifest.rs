@@ -236,7 +236,7 @@ impl SessionArtifactManifestV1 {
             artifacts,
             quarantine_transaction,
         };
-        validate_and_normalize(&mut candidate)?;
+        validate_candidate_and_normalize(&mut candidate)?;
         Ok(candidate)
     }
 
@@ -260,6 +260,7 @@ pub struct ManifestInternalIdentities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
     UnsupportedSchema { actual: u32 },
+    InvalidGeneration { actual: u64 },
     EmptySessionId,
     InvalidSessionId,
     EmptyIdempotencyId,
@@ -290,6 +291,7 @@ pub enum ManifestLoadError {
     TooLarge {
         byte_length: u64,
     },
+    ChangedDuringRead,
     Io {
         kind: io::ErrorKind,
         raw_os_error: Option<i32>,
@@ -317,10 +319,13 @@ pub enum ManifestCasRejection {
     GenerationOverflow,
     SessionMismatch,
     IdempotencyConflict,
+    CompletionRequiresPrepared,
+    PreparedCompletionConflict,
     CompletedRegression,
     PreparedTransitionReplacement,
     TransitionConflict,
     Serialization,
+    ManifestTooLarge { byte_length: u64 },
     Durability(CanonicalDurabilityRejection),
 }
 
@@ -452,7 +457,7 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         mut candidate: SessionArtifactManifestV1,
     ) -> ManifestCasOutcome {
-        if let Err(error) = validate_and_normalize(&mut candidate) {
+        if let Err(error) = validate_candidate_and_normalize(&mut candidate) {
             return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
         }
 
@@ -475,7 +480,15 @@ impl ManifestWriteTransaction<'_> {
                     }
                     return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict);
                 }
-                if candidate.transition.state == ManifestTransitionState::Prepared {
+                if candidate.quarantine_transaction.is_some()
+                    && candidate.transition.state == ManifestTransitionState::Completed
+                {
+                    if !prepared_completion_matches(head, &candidate) {
+                        return ManifestCasOutcome::Rejected(
+                            ManifestCasRejection::PreparedCompletionConflict,
+                        );
+                    }
+                } else if candidate.transition.state == ManifestTransitionState::Prepared {
                     return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict);
                 }
             } else if head.transition.state == ManifestTransitionState::Prepared {
@@ -486,6 +499,18 @@ impl ManifestWriteTransaction<'_> {
             if head.session_id != candidate.session_id {
                 return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
             }
+            if candidate.quarantine_transaction.is_some()
+                && candidate.transition.state == ManifestTransitionState::Completed
+                && head.transition.state != ManifestTransitionState::Prepared
+            {
+                return ManifestCasOutcome::Rejected(
+                    ManifestCasRejection::CompletionRequiresPrepared,
+                );
+            }
+        } else if candidate.quarantine_transaction.is_some()
+            && candidate.transition.state == ManifestTransitionState::Completed
+        {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::CompletionRequiresPrepared);
         }
 
         let actual_generation = self.head.as_ref().map_or(0, |head| head.generation);
@@ -499,7 +524,7 @@ impl ManifestWriteTransaction<'_> {
             return ManifestCasOutcome::Rejected(ManifestCasRejection::GenerationOverflow);
         };
         candidate.generation = next_generation;
-        if let Err(error) = validate_and_normalize(&mut candidate) {
+        if let Err(error) = validate_persisted_and_normalize(&mut candidate) {
             return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
         }
         let bytes = match serde_json::to_vec(&candidate) {
@@ -508,6 +533,12 @@ impl ManifestWriteTransaction<'_> {
                 return ManifestCasOutcome::Rejected(ManifestCasRejection::Serialization);
             }
         };
+        let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if byte_length > MAX_MANIFEST_BYTES {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::ManifestTooLarge {
+                byte_length,
+            });
+        }
         let recovery_key = recovery_key(&candidate.transition.fingerprint);
         let expectation = self
             .head_file
@@ -555,6 +586,66 @@ impl ManifestWriteTransaction<'_> {
     }
 }
 
+/// A quarantine completion may change only the assigned generation, the two
+/// phase fields, `SourceFull` to `SourceTruncated`, the source entry from the
+/// recorded before content to the recorded target content, and the matching
+/// quarantine entry's residual reason. Every identity, kind, privacy class,
+/// hash, length, and unrelated inventory entry is immutable.
+fn prepared_completion_matches(
+    prepared: &SessionArtifactManifestV1,
+    completed: &SessionArtifactManifestV1,
+) -> bool {
+    let (Some(prepared_quarantine), Some(completed_quarantine)) = (
+        prepared.quarantine_transaction.as_ref(),
+        completed.quarantine_transaction.as_ref(),
+    ) else {
+        return false;
+    };
+    if prepared.transition.state != ManifestTransitionState::Prepared
+        || completed.transition.state != ManifestTransitionState::Completed
+        || completed_quarantine.residual_state != QuarantineResidualState::SourceTruncated
+    {
+        return false;
+    }
+
+    let mut normalized = completed.clone();
+    normalized.generation = prepared.generation;
+    normalized.transition.state = ManifestTransitionState::Prepared;
+    let Some(normalized_quarantine) = normalized.quarantine_transaction.as_mut() else {
+        return false;
+    };
+    normalized_quarantine.state = ManifestTransitionState::Prepared;
+    normalized_quarantine.residual_state = prepared_quarantine.residual_state;
+
+    let Some(prepared_source) = prepared.artifacts.iter().find(|artifact| {
+        artifact.managed_identity == prepared_quarantine.source_before.managed_identity
+    }) else {
+        return false;
+    };
+    let Some(normalized_source) = normalized.artifacts.iter_mut().find(|artifact| {
+        artifact.managed_identity == completed_quarantine.source_before.managed_identity
+    }) else {
+        return false;
+    };
+    normalized_source.availability = prepared_source.availability.clone();
+
+    let Some(prepared_recovery) = prepared.artifacts.iter().find(|artifact| {
+        artifact.kind == SessionArtifactKind::QuarantineRecovery
+            && artifact.managed_identity == prepared_quarantine.quarantine.managed_identity
+    }) else {
+        return false;
+    };
+    let Some(normalized_recovery) = normalized.artifacts.iter_mut().find(|artifact| {
+        artifact.kind == SessionArtifactKind::QuarantineRecovery
+            && artifact.managed_identity == completed_quarantine.quarantine.managed_identity
+    }) else {
+        return false;
+    };
+    normalized_recovery.availability = prepared_recovery.availability.clone();
+
+    normalized == *prepared
+}
+
 fn entry_exists(path: &Path) -> Result<bool, ManifestLoadError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -564,22 +655,51 @@ fn entry_exists(path: &Path) -> Result<bool, ManifestLoadError> {
 }
 
 fn load_manifest_file(path: &Path) -> Result<(SessionArtifactManifestV1, File), ManifestLoadError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| load_io(&error))?;
-    if !metadata.file_type().is_file() {
+    load_manifest_file_with_after_open(path, || {})
+}
+
+fn load_manifest_file_with_after_open(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<(SessionArtifactManifestV1, File), ManifestLoadError> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|error| load_io(&error))?;
+    if !path_metadata.file_type().is_file() {
         return Err(ManifestLoadError::NonRegularManifest);
-    }
-    if metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(ManifestLoadError::TooLarge {
-            byte_length: metadata.len(),
-        });
     }
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)
         .map_err(|error| load_io(&error))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
+    let opened_metadata = file.metadata().map_err(|error| load_io(&error))?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(ManifestLoadError::NonRegularManifest);
+    }
+    if opened_metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestLoadError::TooLarge {
+            byte_length: opened_metadata.len(),
+        });
+    }
+
+    after_open();
+    let capacity = usize::try_from(opened_metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| load_io(&error))?;
+    let observed_byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed_byte_length > MAX_MANIFEST_BYTES {
+        return Err(ManifestLoadError::TooLarge {
+            byte_length: observed_byte_length,
+        });
+    }
+    let final_metadata = file.metadata().map_err(|error| load_io(&error))?;
+    if !final_metadata.file_type().is_file()
+        || final_metadata.len() != opened_metadata.len()
+        || final_metadata.len() != observed_byte_length
+    {
+        return Err(ManifestLoadError::ChangedDuringRead);
+    }
     let schema_version = probe_schema_version(&bytes)?;
     if schema_version != SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION {
         return Err(ManifestLoadError::Validation(
@@ -590,7 +710,7 @@ fn load_manifest_file(path: &Path) -> Result<(SessionArtifactManifestV1, File), 
     }
     let mut manifest: SessionArtifactManifestV1 =
         serde_json::from_slice(&bytes).map_err(|_| ManifestLoadError::Malformed)?;
-    validate_and_normalize(&mut manifest).map_err(ManifestLoadError::Validation)?;
+    validate_persisted_and_normalize(&mut manifest).map_err(ManifestLoadError::Validation)?;
     Ok((manifest, file))
 }
 
@@ -641,12 +761,36 @@ fn probe_schema_version(bytes: &[u8]) -> Result<u32, ManifestLoadError> {
     Ok(schema_version)
 }
 
+fn validate_candidate_and_normalize(
+    manifest: &mut SessionArtifactManifestV1,
+) -> Result<(), ManifestValidationError> {
+    validate_and_normalize(manifest, ManifestValidationContext::Candidate)
+}
+
+fn validate_persisted_and_normalize(
+    manifest: &mut SessionArtifactManifestV1,
+) -> Result<(), ManifestValidationError> {
+    validate_and_normalize(manifest, ManifestValidationContext::Persisted)
+}
+
+#[derive(Clone, Copy)]
+enum ManifestValidationContext {
+    Candidate,
+    Persisted,
+}
+
 fn validate_and_normalize(
     manifest: &mut SessionArtifactManifestV1,
+    context: ManifestValidationContext,
 ) -> Result<(), ManifestValidationError> {
     if manifest.schema_version != SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION {
         return Err(ManifestValidationError::UnsupportedSchema {
             actual: manifest.schema_version,
+        });
+    }
+    if matches!(context, ManifestValidationContext::Persisted) && manifest.generation == 0 {
+        return Err(ManifestValidationError::InvalidGeneration {
+            actual: manifest.generation,
         });
     }
     validate_session_id(&manifest.session_id)?;
@@ -842,11 +986,13 @@ fn validate_managed_identity(
         || value.ends_with('/')
         || value.contains('\\')
         || value.contains('\0')
+        || value.chars().any(is_portable_control)
     {
         return Err(ManifestValidationError::InvalidManagedIdentity);
     }
     let invalid = value.split('/').any(|segment| {
         segment.is_empty()
+            || segment.len() > 255
             || matches!(segment, "." | "..")
             || segment.ends_with(['.', ' '])
             || segment
@@ -861,6 +1007,34 @@ fn validate_managed_identity(
         return Err(ManifestValidationError::ReservedInternalIdentity);
     }
     Ok(())
+}
+
+fn is_portable_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
 }
 
 fn is_windows_reserved_segment(segment: &str) -> bool {
@@ -1135,6 +1309,52 @@ mod tests {
     }
 
     #[test]
+    fn strict_load_revalidates_the_open_handle_after_a_bounded_read() {
+        let root = root("strict-open-revalidation");
+        let store = SessionArtifactManifestStore::new(&root);
+        let mut manifest = basic_candidate("tx-open", 'a');
+        manifest.generation = 1;
+        write_manifest_bytes(
+            &store,
+            &serde_json::to_vec(&manifest).expect("manifest bytes"),
+        );
+        let manifest_path = store.manifest_path();
+
+        assert!(matches!(
+            load_manifest_file_with_after_open(&manifest_path, || {
+                let mut writer = OpenOptions::new()
+                    .append(true)
+                    .open(&manifest_path)
+                    .expect("open competing writer");
+                std::io::Write::write_all(&mut writer, b" ").expect("append after open");
+            }),
+            Err(ManifestLoadError::ChangedDuringRead)
+        ));
+    }
+
+    #[test]
+    fn persisted_manifest_generation_zero_is_rejected_while_initial_cas_uses_coordinate_zero() {
+        let root = root("persisted-generation-zero");
+        let store = SessionArtifactManifestStore::new(&root);
+        let manifest = basic_candidate("tx-zero", 'a');
+        assert_eq!(
+            manifest.generation, 0,
+            "candidate coordinate is uncommitted"
+        );
+        write_manifest_bytes(
+            &store,
+            &serde_json::to_vec(&manifest).expect("zero-generation wire"),
+        );
+
+        assert_eq!(
+            store.load(),
+            Err(ManifestLoadError::Validation(
+                ManifestValidationError::InvalidGeneration { actual: 0 }
+            ))
+        );
+    }
+
+    #[test]
     fn managed_identities_enforce_the_portable_floor_and_case_equivalence() {
         for invalid in [
             "",
@@ -1155,6 +1375,23 @@ mod tests {
                 "identity must be rejected: {invalid:?}"
             );
         }
+        for invalid_control in [
+            "line\nbreak",
+            "tab\tseparated",
+            "delete\u{007f}control",
+            "unicode\u{0085}control",
+            "bidi\u{202e}control",
+        ] {
+            assert!(
+                ManagedArtifactIdentity::new(invalid_control).is_err(),
+                "control must be rejected: {invalid_control:?}"
+            );
+        }
+        let overlong_component = format!("root/{}", "a".repeat(256));
+        assert_eq!(
+            ManagedArtifactIdentity::new(overlong_component),
+            Err(ManifestValidationError::InvalidManagedIdentity)
+        );
 
         let duplicate = SessionArtifactManifestV1::candidate(
             "session-1",
@@ -1182,18 +1419,19 @@ mod tests {
 
     #[test]
     fn v1_wire_is_a_deterministic_golden_roundtrip() {
-        let candidate = basic_candidate("tx-1", 'a');
+        let mut candidate = basic_candidate("tx-1", 'a');
+        candidate.generation = 1;
         let wire = serde_json::to_string(&candidate).expect("serialize");
         assert_eq!(
             wire,
             format!(
-                "{{\"schema_version\":1,\"session_id\":\"session-1\",\"generation\":0,\"transition\":{{\"idempotency_id\":\"tx-1\",\"fingerprint\":\"sha256:{}\",\"state\":\"completed\"}},\"artifacts\":[{{\"kind\":\"original_session_audio\",\"privacy_class\":\"original_evidence\",\"managed_identity\":\"audio/original.wav\",\"availability\":{{\"unavailable\":{{\"reason\":\"retention_disabled\"}}}}}}],\"quarantine_transaction\":null}}",
+                "{{\"schema_version\":1,\"session_id\":\"session-1\",\"generation\":1,\"transition\":{{\"idempotency_id\":\"tx-1\",\"fingerprint\":\"sha256:{}\",\"state\":\"completed\"}},\"artifacts\":[{{\"kind\":\"original_session_audio\",\"privacy_class\":\"original_evidence\",\"managed_identity\":\"audio/original.wav\",\"availability\":{{\"unavailable\":{{\"reason\":\"retention_disabled\"}}}}}}],\"quarantine_transaction\":null}}",
                 "a".repeat(64)
             )
         );
         let mut decoded: SessionArtifactManifestV1 =
             serde_json::from_str(&wire).expect("decode golden");
-        validate_and_normalize(&mut decoded).expect("validate golden");
+        validate_persisted_and_normalize(&mut decoded).expect("validate golden");
         assert_eq!(decoded, candidate);
     }
 
@@ -1316,6 +1554,62 @@ mod tests {
         assert!(!store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
 
+    #[test]
+    fn manifest_candidate_size_preflight_accepts_exact_boundary_and_rejects_oversize() {
+        fn identity_with_len(byte_length: usize) -> ManagedArtifactIdentity {
+            let mut bytes = vec![b'a'; byte_length];
+            let mut separator = 255;
+            while separator + 1 < bytes.len() {
+                bytes[separator] = b'/';
+                separator += 256;
+            }
+            ManagedArtifactIdentity(String::from_utf8(bytes).expect("ASCII identity"))
+        }
+
+        fn candidate_with_wire_size(byte_length: usize) -> SessionArtifactManifestV1 {
+            let mut candidate = basic_candidate("tx-size", 'a');
+            let baseline = serde_json::to_vec(&candidate).expect("baseline").len();
+            let current_identity_length = candidate.artifacts[0].managed_identity.as_str().len();
+            let target_identity_length = current_identity_length + byte_length - baseline;
+            candidate.artifacts[0].managed_identity = identity_with_len(target_identity_length);
+            assert_eq!(
+                serde_json::to_vec(&candidate)
+                    .expect("sized candidate")
+                    .len(),
+                byte_length
+            );
+            candidate
+        }
+
+        let exact_root = root("size-exact");
+        let exact_store = SessionArtifactManifestStore::new(&exact_root);
+        let mut exact_transaction = exact_store.begin_write().expect("exact transaction");
+        assert!(matches!(
+            exact_transaction
+                .compare_and_swap(0, candidate_with_wire_size(MAX_MANIFEST_BYTES as usize)),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
+            ))
+        ));
+        assert!(!exact_store.manifest_path().exists());
+        assert!(!exact_store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
+
+        let oversized_root = root("size-oversized");
+        let oversized_store = SessionArtifactManifestStore::new(&oversized_root);
+        let mut oversized_transaction = oversized_store
+            .begin_write()
+            .expect("oversized transaction");
+        assert_eq!(
+            oversized_transaction
+                .compare_and_swap(0, candidate_with_wire_size(MAX_MANIFEST_BYTES as usize + 1)),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::ManifestTooLarge {
+                byte_length: MAX_MANIFEST_BYTES + 1,
+            })
+        );
+        assert!(!oversized_store.manifest_path().exists());
+        assert!(!oversized_store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn prepared_completion_retry_conflict_and_restart_are_idempotent() {
@@ -1392,6 +1686,153 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn completed_quarantine_requires_the_exact_prepared_immutable_transaction() {
+        let direct_root = root("direct-completed");
+        let store =
+            SessionArtifactManifestStore::qualified_for_test(&direct_root).expect("qualified");
+        let mut transaction = store.begin_write().expect("transaction");
+        assert!(matches!(
+            transaction.compare_and_swap(
+                0,
+                quarantine_candidate(
+                    ManifestTransitionState::Completed,
+                    QuarantineResidualState::SourceTruncated,
+                )
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::CompletionRequiresPrepared)
+        ));
+        assert!(!store.manifest_path().exists());
+        assert!(!store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
+
+        let prior_root = root("completed-after-prior-completed");
+        let prior_store =
+            SessionArtifactManifestStore::qualified_for_test(&prior_root).expect("qualified");
+        let mut prior_transaction = prior_store.begin_write().expect("transaction");
+        assert!(matches!(
+            prior_transaction.compare_and_swap(0, basic_candidate("prior-completed", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            prior_transaction.compare_and_swap(
+                1,
+                quarantine_candidate(
+                    ManifestTransitionState::Completed,
+                    QuarantineResidualState::SourceTruncated,
+                )
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::CompletionRequiresPrepared)
+        ));
+
+        fn assert_conflict(name: &str, mutate: impl FnOnce(&mut SessionArtifactManifestV1)) {
+            let root = root(name);
+            let store = SessionArtifactManifestStore::qualified_for_test(&root).expect("qualified");
+            let mut transaction = store.begin_write().expect("transaction");
+            assert!(matches!(
+                transaction.compare_and_swap(
+                    0,
+                    quarantine_candidate(
+                        ManifestTransitionState::Prepared,
+                        QuarantineResidualState::SourceFull,
+                    )
+                ),
+                ManifestCasOutcome::Accepted { .. }
+            ));
+            let mut completed = quarantine_candidate(
+                ManifestTransitionState::Completed,
+                QuarantineResidualState::SourceTruncated,
+            );
+            mutate(&mut completed);
+            assert!(matches!(
+                transaction.compare_and_swap(1, completed),
+                ManifestCasOutcome::Rejected(ManifestCasRejection::PreparedCompletionConflict)
+            ));
+        }
+
+        assert_conflict("completion-source-identity", |completed| {
+            let replacement = identity("streams/replacement.jsonl");
+            let quarantine = completed
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine");
+            quarantine.source_before.managed_identity = replacement.clone();
+            quarantine.source_after.managed_identity = replacement.clone();
+            completed
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.kind == SessionArtifactKind::TranscriptRevisions)
+                .expect("source entry")
+                .managed_identity = replacement;
+        });
+        assert_conflict("completion-source-hash", |completed| {
+            completed
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine")
+                .source_before
+                .content
+                .sha256 = digest('f');
+        });
+        assert_conflict("completion-lengths", |completed| {
+            let quarantine = completed
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine");
+            quarantine.source_before.content.byte_length = 110;
+            quarantine.quarantine.content.byte_length = 50;
+            completed
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.kind == SessionArtifactKind::QuarantineRecovery)
+                .expect("quarantine entry")
+                .availability = ArtifactAvailability::Residual {
+                content: quarantine.quarantine.content.clone(),
+                reason: ArtifactResidualReason::QuarantineSourceTruncated,
+            };
+        });
+        assert_conflict("completion-target", |completed| {
+            let target = content('f', 60);
+            completed
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine")
+                .source_after
+                .content = target.clone();
+            completed
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.kind == SessionArtifactKind::TranscriptRevisions)
+                .expect("source entry")
+                .availability = ArtifactAvailability::Present { content: target };
+        });
+        assert_conflict("completion-quarantine-identity", |completed| {
+            let replacement = identity("recovery/replacement-tail.bin");
+            completed
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine")
+                .quarantine
+                .managed_identity = replacement.clone();
+            completed
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.kind == SessionArtifactKind::QuarantineRecovery)
+                .expect("quarantine entry")
+                .managed_identity = replacement;
+        });
+        assert_conflict("completion-inventory", |completed| {
+            completed.artifacts.push(SessionArtifactEntry {
+                kind: SessionArtifactKind::MaterializedNotes,
+                privacy_class: ArtifactPrivacyClass::DerivedSessionMemory,
+                managed_identity: identity("derived/notes.json"),
+                availability: ArtifactAvailability::Present {
+                    content: content('f', 12),
+                },
+            });
+        });
+    }
+
     #[test]
     fn quarantine_reference_length_and_residual_invariants_fail_closed() {
         let completed_full = quarantine_candidate(
@@ -1406,7 +1847,7 @@ mod tests {
             .expect("transaction")
             .state = ManifestTransitionState::Completed;
         assert_eq!(
-            validate_and_normalize(&mut completed_full),
+            validate_candidate_and_normalize(&mut completed_full),
             Err(ManifestValidationError::CompletedResidualMismatch)
         );
 
@@ -1422,7 +1863,7 @@ mod tests {
             .content
             .byte_length = 39;
         assert_eq!(
-            validate_and_normalize(&mut wrong_length),
+            validate_candidate_and_normalize(&mut wrong_length),
             Err(ManifestValidationError::QuarantineLengthMismatch)
         );
 
@@ -1434,7 +1875,7 @@ mod tests {
             .artifacts
             .retain(|entry| entry.kind != SessionArtifactKind::QuarantineRecovery);
         assert_eq!(
-            validate_and_normalize(&mut missing_entry),
+            validate_candidate_and_normalize(&mut missing_entry),
             Err(ManifestValidationError::QuarantineEntryMismatch)
         );
     }
