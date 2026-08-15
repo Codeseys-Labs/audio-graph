@@ -156,6 +156,8 @@ pub enum CanonicalDurabilityRejection {
         raw_os_error: Option<i32>,
     },
     QualificationBindingMismatch,
+    QualifiedDescendantVolumeMismatch,
+    QualifiedDescendantVolumeUnavailable,
     ReservedCoordinationEntry,
     NonRegularCanonicalEntry,
     DestinationAlreadyExists,
@@ -454,6 +456,8 @@ struct InjectedFailure {
 #[derive(Clone, Copy)]
 enum InjectedRenameFault {
     PreflightDeviceMismatch,
+    DescendantQualificationMismatch,
+    DescendantQualificationUnavailable,
     RuntimeExdev { raw_os_error: i32 },
 }
 
@@ -688,7 +692,15 @@ impl CanonicalExclusiveGuard {
                 },
             );
         }
-        if !self.qualification_status(qualification)? {
+        let Some(qualification) = qualification else {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        };
+        if !self.qualification_status(Some(qualification))? {
             return Err(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
@@ -706,9 +718,12 @@ impl CanonicalExclusiveGuard {
             .bind_descendant_parent(destination, self.platform)?;
         if temporary_parent.directory.is_none()
             || temporary_parent.canonical_path != destination_parent.canonical_path
+            || temporary_parent.identity != destination_parent.identity
         {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
+        self.validate_qualified_descendant_volume(&temporary_parent, qualification)?;
+        self.validate_qualified_descendant_volume(&destination_parent, qualification)?;
         Ok(())
     }
 
@@ -1309,6 +1324,38 @@ impl CanonicalExclusiveGuard {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
         Ok(namespace_supported_for(self.platform))
+    }
+
+    fn validate_qualified_descendant_volume(
+        &self,
+        parent: &BoundParent,
+        qualification: &CanonicalFilesystemQualification,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        if qualification.namespace != self.namespace {
+            return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
+        }
+        #[cfg(test)]
+        if let Some(injection) = &self.injected_rename_fault {
+            match injection.fault {
+                InjectedRenameFault::DescendantQualificationMismatch => {
+                    return Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch);
+                }
+                InjectedRenameFault::DescendantQualificationUnavailable => {
+                    return Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable);
+                }
+                _ => {}
+            }
+        }
+        match (
+            qualification.namespace.identity.volume.as_ref(),
+            parent.identity.volume.as_ref(),
+        ) {
+            (Some(qualified), Some(observed)) if qualified == observed => Ok(()),
+            (Some(_), Some(_)) => {
+                Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch)
+            }
+            _ => Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable),
+        }
     }
 
     fn preflight_volumes_differ(
@@ -3309,6 +3356,73 @@ mod tests {
         );
         assert!(!rename_invoked.load(Ordering::SeqCst));
         assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_descendant_volume_must_match_opaque_root_qualification_before_mutation() {
+        let root = temp_root("recovery-descendant-volume-binding");
+        fs::create_dir_all(root.join("streams")).expect("create streams parent");
+        fs::create_dir_all(root.join("recovery")).expect("create recovery parent");
+        let source = root.join("streams/events.jsonl");
+        let temporary = root.join("recovery/events.tmp");
+        let destination = root.join("recovery/events.bin");
+        let manifest = root.join(".audio-graph-session-artifacts.v1.json");
+        fs::write(&source, b"full source").expect("seed source");
+        fs::write(&manifest, b"stable manifest").expect("seed manifest marker");
+        fs::write(root.join(COORDINATION_FILE_NAME), b"").expect("seed coordination entry");
+        let proof = qualification(&root);
+        let rename_invoked = Arc::new(AtomicBool::new(false));
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::DescendantQualificationMismatch,
+            rename_invoked.clone(),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire qualified guard");
+
+        assert_eq!(
+            guard.preflight_recovery_namespace(&source, &temporary, &destination, Some(&proof),),
+            Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch)
+        );
+        assert!(!rename_invoked.load(Ordering::SeqCst));
+        assert_eq!(fs::read(&source).expect("source unchanged"), b"full source");
+        assert_eq!(
+            fs::read(&manifest).expect("manifest unchanged"),
+            b"stable manifest"
+        );
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_descendant_unavailable_volume_is_named_and_non_mutating() {
+        let root = temp_root("recovery-descendant-volume-unavailable");
+        fs::create_dir_all(root.join("streams")).expect("create streams parent");
+        fs::create_dir_all(root.join("recovery")).expect("create recovery parent");
+        let source = root.join("streams/events.jsonl");
+        let temporary = root.join("recovery/events.tmp");
+        let destination = root.join("recovery/events.bin");
+        fs::write(&source, b"full source").expect("seed source");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::DescendantQualificationUnavailable,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire qualified guard");
+
+        assert_eq!(
+            guard.preflight_recovery_namespace(&source, &temporary, &destination, Some(&proof),),
+            Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable)
+        );
+        assert_eq!(fs::read(&source).expect("source unchanged"), b"full source");
+        assert!(!temporary.exists());
         assert!(!destination.exists());
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
