@@ -1,8 +1,7 @@
 # Projection Basis Hash v2 Canonical Encoding
 
-Status: proposed companion design for
+Status: active companion design for accepted
 [ADR-0036](../adr/0036-version-projection-basis-hashes-by-speech-semantics.md).
-It is not active while ADR-0036 remains proposed.
 
 ## Purpose and scope
 
@@ -13,10 +12,10 @@ this document owns implementation detail that does not belong in an ADR.
 
 It does not change canonical-log framing, define the projection patch schema,
 authorize a Session semantics-floor transition, or change provider
-selectability. The Session stream and downgrade decision is proposed separately
-in [ADR-0035](../adr/0035-keep-versioned-speech-revisions-in-one-canonical-stream.md).
+selectability. The Session stream and downgrade decision is established in
+[ADR-0035](../adr/0035-keep-versioned-speech-revisions-in-one-canonical-stream.md).
 
-Normative words `MUST`, `MUST NOT`, and `SHOULD` apply only if ADR-0036 is
+Normative words `MUST`, `MUST NOT`, and `SHOULD` apply because ADR-0036 is
 accepted.
 
 ## Session semantics floor and hash-version selection
@@ -341,5 +340,5 @@ executable gates must prove:
     fallback.
 
 Until those gates exist and pass, `audio-graph-4249` and
-`audio-graph-48de` remain blocked and this proposed design authorizes no writer
-or scheduler activation.
+`audio-graph-48de` remain incomplete, and this design alone authorizes no
+writer or scheduler activation.
