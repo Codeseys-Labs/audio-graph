@@ -13,6 +13,8 @@ Worktree:
 
 Implementation commit: `c5daccc68a4865e90586e8d7c62359922b49a8b7`
 
+Review correction commit: `5a5806135f58635d213b52699b97a7b2174eba27`
+
 ## Outcome
 
 Added one guard-owned `CanonicalExclusiveGuard::install_snapshot` seam for
@@ -77,6 +79,34 @@ runtime rename including `EXDEV`, and parent-sync failures return
 redacted recovery key. Tests reopen only complete old or complete new head
 bytes and preserve any candidate temp needed for reconciliation.
 
+## Review round 1 corrections
+
+Three reviewed findings were corrected without widening production behavior:
+
+1. `CanonicalFilesystemQualification::for_test_root` is now exactly
+   `#[cfg(test)] pub(crate)`. A real standalone crate with
+   `canonical_durability` and a sibling module failed before the correction
+   with private-method error `E0624`; the identical sibling tracer now
+   compiles. Production builds still contain no constructor or qualification
+   forgery path.
+2. The c928 Windows refusal test no longer constructs qualification evidence.
+   It passes `None` for both simulated/current Windows and generic unqualified
+   calls, so an actual Windows run reaches the intended pre-temp
+   `NamespaceDurabilityUnsupported` assertion rather than failing while trying
+   to mint unavailable Unix-style identity.
+3. The Absent initial-head contract now has deterministic late-appearance and
+   pre/post-rename fault-cut coverage. A concurrent complete head appearing
+   after temp sync is never overwritten; the result is indeterminate at
+   `InspectEntry` and the exact candidate temp remains. A pre-rename fault
+   reopens to absent head plus complete temp, while a post-rename parent-sync
+   fault reopens to the complete new head with no temp. No torn head is
+   observed or accepted.
+
+No runtime caller, manifest model, recovery transaction, platform
+qualification, dependency, workflow, Seeds state, Docker, Blacksmith, or guest
+code changed. Native Windows execution remains for the conductor's monitored
+Testbox evidence rather than this implementation worktree.
+
 ## TDD evidence
 
 The agreed public seam was the guard-owned snapshot operation. Tests observe
@@ -127,9 +157,76 @@ The test reads generation-one bytes through the exact expected handle, then
 asserts only the generation-two candidate is visible after accepted
 replacement.
 
+### Review round 1 RED/GREEN
+
+#### Sibling qualification visibility
+
+A standalone test crate imported the real module and called the test-only
+constructor from a sibling module:
+
+```text
+printf <sibling tracer> | rustc +1.95.0 --edition=2024 --cfg test --crate-type lib --emit metadata -o src-tauri/target/c928-round1-tracers/sibling-qualification.rmeta -
+```
+
+RED result: exit 1.
+
+```text
+error[E0624]: associated function `for_test_root` is private
+CanonicalFilesystemQualification::for_test_root(root)
+error: aborting due to 1 previous error
+```
+
+GREEN result: the identical command exited 0 after adding only
+`#[cfg(test)] pub(crate)`. Standalone unused/dead-code warnings were expected;
+there was no compile error.
+
+#### Windows qualification independence
+
+The source gate inspected only the c928 Windows refusal test.
+
+RED result: exit 1.
+
+```text
+8:        let proof = qualification(&root);
+20:                Some(&proof),
+RED: Windows refusal test still requires filesystem qualification identity
+```
+
+After replacing the proof with `None`, the same gate exited 0:
+
+```text
+GREEN: Windows refusal test has no qualification identity dependency
+```
+
+The exact public test then passed on the Linux-host policy simulation:
+
+```text
+test persistence::canonical_durability::tests::snapshot_windows_and_unqualified_paths_refuse_before_temp_or_head_mutation ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 1625 filtered out
+```
+
+#### Absent-head race and rename cuts
+
+The coverage-inventory RED exited 1 on the reviewed tip:
+
+```text
+RED: missing deterministic coverage snapshot_absent_destination_appearance_after_temp_sync_is_preserved
+RED: missing deterministic coverage initial_snapshot_pre_and_post_rename_faults_reopen_to_absent_or_complete_new_head
+```
+
+Each added public-seam test then passed independently:
+
+```text
+test persistence::canonical_durability::tests::snapshot_absent_destination_appearance_after_temp_sync_is_preserved ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 1625 filtered out
+
+test persistence::canonical_durability::tests::initial_snapshot_pre_and_post_rename_faults_reopen_to_absent_or_complete_new_head ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 1625 filtered out
+```
+
 ### Deterministic coverage
 
-Thirteen new tests cover:
+Fifteen new tests cover:
 
 - initial owner-only installation and replacement bound to an open validated
   destination;
@@ -143,6 +240,11 @@ Thirteen new tests cover:
   temp;
 - destination replacement after temp sync, which preserves candidate, old,
   and replacement bytes and returns indeterminate;
+- an Absent destination appearing after temp sync, which preserves the
+  concurrent complete head and recoverable candidate rather than overwriting;
+- initial-install faults immediately before rename and after rename/before
+  namespace acceptance, reopening only to absent-plus-temp or complete new
+  head;
 - safe preflight cross-device refusal versus runtime `EXDEV` after rename
   invocation;
 - Windows and unqualified no-mutation namespace refusal;
@@ -174,7 +276,7 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-
 Final result:
 
 ```text
-test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 1588 filtered out; finished in 3.70s
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1588 filtered out; finished in 3.50s
 ```
 
 This includes every inherited c2e3, ce19, and 83e2 regression, including all
@@ -192,7 +294,7 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-
 Result:
 
 ```text
-test result: ok. 1616 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 43.45s
+test result: ok. 1618 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 42.29s
 ```
 
 ### Locked check, strict Clippy, rustfmt, and diff
@@ -204,7 +306,7 @@ cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --check
 git diff --check
 ```
 
-Results: locked check exit 0 in 8.25s; strict Clippy exit 0 in 17.37s;
+Results: locked check exit 0 in 8.01s; strict Clippy exit 0 in 17.77s;
 rustfmt and diff checks exit 0 with no output.
 
 ### Pinned Windows actual-module compile
@@ -213,12 +315,16 @@ Installed pinned targets included `x86_64-pc-windows-msvc` and
 `x86_64-unknown-linux-gnu`.
 
 ```text
-rustc +1.95.0 --edition=2024 --crate-type lib --target x86_64-pc-windows-msvc src-tauri/src/persistence/canonical_durability.rs --out-dir src-tauri/target/c928-windows-module-proof
+rustc +1.95.0 --edition=2024 --crate-type lib --target x86_64-pc-windows-msvc src-tauri/src/persistence/canonical_durability.rs --out-dir src-tauri/target/c928-round1-windows-proof
+rustc +1.95.0 --edition=2024 --test --emit=obj=src-tauri/target/c928-round1-windows-proof/canonical_durability_tests.obj --target x86_64-pc-windows-msvc src-tauri/src/persistence/canonical_durability.rs
 ```
 
-Result: exit 0; final `libcanonical_durability.rlib` size 674192 bytes. This
-is an actual-module cross-compile proving the Windows unsupported path remains
-buildable, not native NTFS execution or namespace-durability evidence.
+Results: both commands exited 0. Final
+`libcanonical_durability.rlib` size was 679066 bytes and the test object was
+592892 bytes. These are actual production-module and test cross-compiles
+proving the Windows unsupported path and c928 test source remain buildable,
+not native NTFS execution or namespace-durability evidence. Target-specific
+unused test-hook warnings were non-fatal; Linux strict Clippy remained clean.
 
 ### Pinned repository and contract verification
 
@@ -253,6 +359,11 @@ Results: Betterleaks scanned approximately 118.44 KB and found no leaks;
 docs/Seeds secret hygiene found 0 findings; diff checks passed; the exact
 implementation footprint contained only
 `src-tauri/src/persistence/canonical_durability.rs`.
+
+After review correction and before its commit, Betterleaks scanned
+approximately 123.60 KB of the source and found no leaks; docs/Seeds secret
+hygiene again reported 0 findings. The correction footprint contained only
+the owned durability module (`123 insertions`, `3 deletions`).
 
 The report-inclusive security scan, exact base-to-tip footprint, ancestry, and
 clean tip are recorded in the final handoff after the report commit.
