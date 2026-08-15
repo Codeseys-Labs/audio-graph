@@ -60,12 +60,12 @@ mod tests {
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-    use std::thread::JoinHandle;
 
     const ROOT_ENV: &str = "AUDIO_GRAPH_B77B_ROOT";
     const CHILD_TEST: &str =
         "persistence::canonical_crash_harness::tests::subprocess_child_entrypoint";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+    const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const SESSION: &str = "session-1";
     const STREAM: &str = "transcript";
     const SCHEMA: u32 = 1;
@@ -74,32 +74,253 @@ mod tests {
     const QUARANTINE_IDENTITY: &str = "recovery/events.recovery.bin";
     const SOURCE_PREFIX: &[u8] = b"{\"value\":1}\n";
     const SOURCE_TAIL: &[u8] = b"private incomplete tail";
+    const SOURCE_FULL: &[u8] = b"{\"value\":1}\nprivate incomplete tail";
     const FIRST_CREATE_BYTES: &[u8] = b"first-create-proof";
     const CONTINUE_FILE: &str = ".audio-graph-b77b-continue";
 
-    const RECOVERY_CUTS: &[&str] = &[
-        "quarantine_create_before",
-        "quarantine_create_after",
-        "quarantine_write_before",
-        "quarantine_write_after",
-        "quarantine_flush_before",
-        "quarantine_flush_after",
-        "quarantine_file_sync_before",
-        "quarantine_file_sync_after",
-        "quarantine_rename_before",
-        "quarantine_rename_after",
-        "quarantine_parent_sync_before",
-        "quarantine_parent_sync_after",
-        "manifest_prepared_before",
-        "manifest_prepared_after",
-        "source_truncate_before",
-        "source_truncate_after",
-        "source_sync_before",
-        "source_sync_after",
-        "manifest_completed_before",
-        "manifest_completed_after",
-        "acknowledgement_before",
-        "acknowledgement_after",
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ObservedManifestPhase {
+        SeedCompleted,
+        RecoveryPrepared,
+        RecoveryCompleted,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExpectedResidual {
+        phase: ObservedManifestPhase,
+        generation: u64,
+        source: &'static [u8],
+        temporary: Option<&'static [u8]>,
+        quarantine: Option<&'static [u8]>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RecoveryCase {
+        checkpoint: &'static str,
+        residual: ExpectedResidual,
+    }
+
+    const RECOVERY_CASES: &[RecoveryCase] = &[
+        RecoveryCase {
+            checkpoint: "quarantine_create_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_create_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(b""),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_write_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(b""),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_write_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_flush_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_flush_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_file_sync_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_file_sync_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_rename_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: Some(SOURCE_TAIL),
+                quarantine: None,
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_rename_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_parent_sync_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "quarantine_parent_sync_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "manifest_prepared_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::SeedCompleted,
+                generation: 1,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "manifest_prepared_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "source_truncate_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_FULL,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "source_truncate_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "source_sync_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "source_sync_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "manifest_completed_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryPrepared,
+                generation: 2,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "manifest_completed_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryCompleted,
+                generation: 3,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "acknowledgement_before",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryCompleted,
+                generation: 3,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
+        RecoveryCase {
+            checkpoint: "acknowledgement_after",
+            residual: ExpectedResidual {
+                phase: ObservedManifestPhase::RecoveryCompleted,
+                generation: 3,
+                source: SOURCE_PREFIX,
+                temporary: None,
+                quarantine: Some(SOURCE_TAIL),
+            },
+        },
     ];
 
     const FIRST_CREATE_CUTS: &[&str] = &[
@@ -143,7 +364,6 @@ mod tests {
     struct ManagedChild {
         child: Child,
         lines: Receiver<String>,
-        reader: Option<JoinHandle<()>>,
         transcript: Vec<String>,
     }
 
@@ -173,10 +393,7 @@ mod tests {
             let deadline = Instant::now() + CHILD_TIMEOUT;
             loop {
                 match self.child.try_wait() {
-                    Ok(Some(status)) => {
-                        self.finish_reader();
-                        return status;
-                    }
+                    Ok(Some(status)) => return status,
                     Ok(None) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -188,49 +405,72 @@ mod tests {
                         );
                     }
                     Err(error) => {
-                        let status = self.force_kill_and_wait();
-                        panic!("poll bounded child failed: {error}; cleanup status={status:?}");
+                        let cleanup = self.kill_and_reap(CHILD_TIMEOUT);
+                        panic!("poll bounded child failed: {error}; cleanup={cleanup:?}");
                     }
                 }
             }
         }
 
         fn kill_and_wait(&mut self) -> ExitStatus {
-            let status = match self.child.try_wait() {
-                Ok(Some(status)) => status,
-                Ok(None) => {
-                    return self.force_kill_and_wait();
+            self.kill_and_reap(CHILD_TIMEOUT)
+                .expect("checked kill and bounded subprocess reap")
+        }
+
+        fn kill_and_reap(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    self.child.kill().map_err(|kill_error| {
+                        format!(
+                            "initial child poll failed ({error}); checked kill failed ({kill_error})"
+                        )
+                    })?;
+                    return self.reap_until(Instant::now() + timeout);
                 }
-                Err(_) => return self.force_kill_and_wait(),
-            };
-            self.finish_reader();
-            status
+            }
+            if let Err(kill_error) = self.child.kill() {
+                return match self.child.try_wait() {
+                    Ok(Some(status)) => Ok(status),
+                    Ok(None) => Err(format!("checked child kill failed ({kill_error})")),
+                    Err(poll_error) => Err(format!(
+                        "checked child kill failed ({kill_error}); follow-up poll failed ({poll_error})"
+                    )),
+                };
+            }
+            self.reap_until(Instant::now() + timeout)
         }
 
-        fn force_kill_and_wait(&mut self) -> ExitStatus {
-            let _ = self.child.kill();
-            let status = self
-                .child
-                .wait()
-                .expect("wait for bounded subprocess child");
-            self.finish_reader();
-            status
-        }
-
-        fn finish_reader(&mut self) {
-            if let Some(reader) = self.reader.take() {
-                reader.join().expect("join subprocess stdout reader");
+        fn reap_until(&mut self, deadline: Instant) -> Result<ExitStatus, String> {
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => return Ok(status),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => return Err("bounded child reap deadline expired".to_owned()),
+                    Err(error) => return Err(format!("bounded child reap poll failed ({error})")),
+                }
             }
         }
     }
 
     impl Drop for ManagedChild {
         fn drop(&mut self) {
-            if !matches!(self.child.try_wait(), Ok(Some(_))) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
             }
-            self.finish_reader();
+            if self.child.kill().is_err() {
+                return;
+            }
+            let deadline = Instant::now() + DROP_REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
         }
     }
 
@@ -266,7 +506,7 @@ mod tests {
         let mut child = command.spawn().expect("spawn exact lib test child");
         let stdout = child.stdout.take().expect("capture child stdout");
         let (sender, lines) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
+        drop(std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 match line {
                     Ok(line) => {
@@ -277,11 +517,10 @@ mod tests {
                     Err(_) => break,
                 }
             }
-        });
+        }));
         ManagedChild {
             child,
             lines,
-            reader: Some(reader),
             transcript: Vec::new(),
         }
     }
@@ -350,8 +589,7 @@ mod tests {
     fn setup_recovery_fixture(root: &Path) {
         fs::create_dir_all(root.join("streams")).expect("create stream fixture directory");
         fs::create_dir_all(root.join("recovery")).expect("create recovery fixture directory");
-        let source = [SOURCE_PREFIX, SOURCE_TAIL].concat();
-        fs::write(source_path(root), &source).expect("write damaged synthetic stream");
+        fs::write(source_path(root), SOURCE_FULL).expect("write damaged synthetic stream");
 
         let store =
             SessionArtifactManifestStore::qualified_for_test(root).expect("qualify fixture root");
@@ -378,7 +616,7 @@ mod tests {
                     managed_identity: ManagedArtifactIdentity::new(SOURCE_IDENTITY)
                         .expect("source identity"),
                     availability: ArtifactAvailability::Present {
-                        content: content_identity(&source),
+                        content: content_identity(SOURCE_FULL),
                     },
                 },
             ],
@@ -401,12 +639,26 @@ mod tests {
         recovery.execute()
     }
 
-    fn retry_recovery(root: &Path) {
-        assert!(matches!(
-            execute_recovery(root),
-            CanonicalRecoveryOutcome::Accepted(_) | CanonicalRecoveryOutcome::AlreadyCompleted(_)
-        ));
-        emit_handshake("retry_ok");
+    fn converge_recovery(root: &Path) {
+        match execute_recovery(root) {
+            CanonicalRecoveryOutcome::Accepted(_) => emit_handshake("retry_accepted"),
+            CanonicalRecoveryOutcome::AlreadyCompleted(_) => {
+                emit_handshake("retry_already_completed");
+            }
+            outcome => panic!("fresh convergence returned {outcome:?}"),
+        }
+    }
+
+    fn exact_completed_retry(root: &Path) {
+        let receipt = match execute_recovery(root) {
+            CanonicalRecoveryOutcome::AlreadyCompleted(receipt) => receipt,
+            outcome => panic!("second fresh retry must be AlreadyCompleted, got {outcome:?}"),
+        };
+        assert_eq!(receipt.manifest_generation, 3);
+        assert_eq!(receipt.retained_bytes, SOURCE_PREFIX.len() as u64);
+        assert_eq!(receipt.quarantined_bytes, SOURCE_TAIL.len() as u64);
+        assert_final_recovery(root);
+        emit_handshake("second_retry_already_completed");
     }
 
     #[derive(Debug)]
@@ -417,6 +669,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecoveryObservation {
+        phase: ObservedManifestPhase,
         generation: u64,
         source: ObservedFile,
         temporary: Option<ObservedFile>,
@@ -440,7 +693,24 @@ mod tests {
         else {
             panic!("manifest evidence must be present");
         };
+        let phase = match manifest.quarantine_transaction.as_ref() {
+            None => {
+                assert_eq!(
+                    manifest.transition.state,
+                    ManifestTransitionState::Completed
+                );
+                ObservedManifestPhase::SeedCompleted
+            }
+            Some(transaction) => {
+                assert_eq!(manifest.transition.state, transaction.state);
+                match transaction.state {
+                    ManifestTransitionState::Prepared => ObservedManifestPhase::RecoveryPrepared,
+                    ManifestTransitionState::Completed => ObservedManifestPhase::RecoveryCompleted,
+                }
+            }
+        };
         RecoveryObservation {
+            phase,
             generation: manifest.generation,
             source: observe_file(&source_path(root)).expect("source evidence must be present"),
             temporary: observe_file(&temporary_path(root)),
@@ -448,29 +718,66 @@ mod tests {
         }
     }
 
-    fn expected_generation_at_cut(cut: &str) -> u64 {
-        match cut {
-            "manifest_completed_after" | "acknowledgement_before" | "acknowledgement_after" => 3,
-            "manifest_prepared_after"
-            | "source_truncate_before"
-            | "source_truncate_after"
-            | "source_sync_before"
-            | "source_sync_after"
-            | "manifest_completed_before" => 2,
-            _ => 1,
+    fn assert_file_residual(
+        cut: &str,
+        label: &str,
+        observed: Option<&ObservedFile>,
+        expected: Option<&[u8]>,
+    ) {
+        match (observed, expected) {
+            (None, None) => {}
+            (Some(observed), Some(expected)) => {
+                assert_eq!(
+                    observed.length,
+                    expected.len() as u64,
+                    "{cut}: {label} length"
+                );
+                assert_eq!(
+                    observed.sha256,
+                    digest(expected).as_str(),
+                    "{cut}: {label} hash"
+                );
+            }
+            (Some(_), None) => panic!("{cut}: unexpected {label} entry"),
+            (None, Some(_)) => panic!("{cut}: missing {label} entry"),
         }
     }
 
-    fn source_is_truncated_at_cut(cut: &str) -> bool {
-        matches!(
-            cut,
-            "source_truncate_after"
-                | "source_sync_before"
-                | "source_sync_after"
-                | "manifest_completed_before"
-                | "manifest_completed_after"
-                | "acknowledgement_before"
-                | "acknowledgement_after"
+    fn assert_expected_residual(case: RecoveryCase, observed: &RecoveryObservation) {
+        assert_eq!(
+            observed.phase, case.residual.phase,
+            "{}: manifest phase",
+            case.checkpoint
+        );
+        assert_eq!(
+            observed.generation, case.residual.generation,
+            "{}: manifest generation",
+            case.checkpoint
+        );
+        assert_file_residual(
+            case.checkpoint,
+            "source",
+            Some(&observed.source),
+            Some(case.residual.source),
+        );
+        assert_file_residual(
+            case.checkpoint,
+            "temporary quarantine",
+            observed.temporary.as_ref(),
+            case.residual.temporary,
+        );
+        assert_file_residual(
+            case.checkpoint,
+            "final quarantine",
+            observed.quarantine.as_ref(),
+            case.residual.quarantine,
+        );
+    }
+
+    fn optional_file_summary(file: Option<&ObservedFile>) -> String {
+        file.map_or_else(
+            || "absent".to_owned(),
+            |file| format!("length={},sha256={}", file.length, file.sha256),
         )
     }
 
@@ -526,6 +833,43 @@ mod tests {
         drop(guard);
     }
 
+    struct FixtureFilesystemEvidence {
+        queried_path: PathBuf,
+        findmnt: String,
+        statfs: String,
+    }
+
+    fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
+        let findmnt = Command::new("findmnt")
+            .arg("-T")
+            .arg(path)
+            .args(["-o", "TARGET,SOURCE,FSTYPE,OPTIONS", "-n"])
+            .output()
+            .expect("run findmnt for live fixture parent");
+        assert!(findmnt.status.success(), "findmnt fixture query failed");
+        let statfs = Command::new("stat")
+            .args([
+                "-f",
+                "-c",
+                "filesystem_type=%T block_size=%S blocks=%b free_blocks=%f name_max=%l",
+            ])
+            .arg(path)
+            .output()
+            .expect("run stat -f for live fixture parent");
+        assert!(statfs.status.success(), "stat -f fixture query failed");
+        FixtureFilesystemEvidence {
+            queried_path: path.to_path_buf(),
+            findmnt: String::from_utf8(findmnt.stdout)
+                .expect("findmnt evidence is UTF-8")
+                .trim()
+                .to_owned(),
+            statfs: String::from_utf8(statfs.stdout)
+                .expect("stat -f evidence is UTF-8")
+                .trim()
+                .to_owned(),
+        }
+    }
+
     fn child_action(action: &str) {
         match action {
             "seam" => emit_handshake("seam"),
@@ -538,7 +882,8 @@ mod tests {
                 checkpoint("acknowledgement_after");
                 panic!("recovery child returned without reaching its requested checkpoint");
             }
-            "retry" => retry_recovery(&child_root()),
+            "retry_converge" => converge_recovery(&child_root()),
+            "retry_exact_completed" => exact_completed_retry(&child_root()),
             "oracle" => {
                 assert_final_recovery(&child_root());
                 emit_handshake("oracle_ok");
@@ -681,8 +1026,84 @@ mod tests {
     }
 
     #[test]
+    fn kill_and_reap_paths_are_deadline_bounded_and_check_kill() {
+        let source = include_str!("canonical_crash_harness.rs");
+        let ignored_kill = ["let _ = self.child.", "kill()"].concat();
+        let unbounded_wait = ["self.child.", "wait()"].concat();
+        assert!(!source.contains(&ignored_kill));
+        assert!(!source.contains(&unbounded_wait));
+    }
+
+    #[test]
+    fn dropping_a_live_holder_is_bounded_and_releases_its_lock() {
+        let root = TempRoot::new("drop-reap");
+        provision_coordination(root.path());
+        let started = Instant::now();
+        {
+            let mut holder =
+                spawn_root_child("hold_exclusive", root.path(), Some("exclusive_held"));
+            holder.wait_for(&handshake("exclusive_held"));
+        }
+        assert!(started.elapsed() < DROP_REAP_TIMEOUT + Duration::from_secs(1));
+        drop(
+            CanonicalDurability::new()
+                .try_lock_exclusive(root.path())
+                .expect("bounded Drop reaps the holder and releases its lock"),
+        );
+    }
+
+    #[test]
+    fn indistinguishable_after_barrier_checkpoints_follow_the_real_return() {
+        fn assert_after(source: &str, operation: &str, checkpoint: &str) {
+            let checkpoint = source
+                .find(checkpoint)
+                .expect("checkpoint marker exists in production test seam");
+            let operation = source[..checkpoint]
+                .rfind(operation)
+                .expect("synchronous barrier call precedes checkpoint");
+            assert!(operation < checkpoint);
+        }
+
+        let log = include_str!("canonical_log.rs");
+        assert_after(log, "temporary.flush()", "quarantine_flush_after");
+        assert_after(log, "temporary.sync_all()", "quarantine_file_sync_after");
+        assert_after(log, "self.source.sync_all()", "source_sync_after");
+        assert_after(
+            include_str!("canonical_durability.rs"),
+            "source_parent_directory.sync_all()",
+            "quarantine_parent_sync_after",
+        );
+        assert_after(
+            include_str!("canonical_durability.rs"),
+            "file.sync_all()",
+            "first_create_file_sync_after",
+        );
+        assert_after(
+            include_str!("canonical_durability.rs"),
+            "parent.sync_all()",
+            "first_create_parent_sync_after",
+        );
+    }
+
+    #[test]
+    fn filesystem_evidence_is_bound_to_the_live_fixture_parent() {
+        let root = TempRoot::new("fixture-mount-evidence");
+        let evidence = fixture_filesystem_evidence(root.path());
+        assert_eq!(evidence.queried_path, root.path());
+        assert!(!evidence.findmnt.is_empty());
+        assert!(evidence.statfs.contains("filesystem_type="));
+        println!(
+            "AUDIO_GRAPH_B77B_FIXTURE_FS_V1 path={} findmnt={} statfs={}",
+            evidence.queried_path.display(),
+            evidence.findmnt,
+            evidence.statfs
+        );
+    }
+
+    #[test]
     fn recovery_crash_cuts_reopen_and_retry_idempotently_in_fresh_processes() {
-        for cut in RECOVERY_CUTS {
+        for case in RECOVERY_CASES {
+            let cut = case.checkpoint;
             let root = TempRoot::new(cut);
             setup_recovery_fixture(root.path());
 
@@ -692,32 +1113,21 @@ mod tests {
             assert_eq!(killed.signal(), Some(9), "cut {cut}");
 
             let residual = observe_recovery(root.path());
-            assert_eq!(
-                residual.generation,
-                expected_generation_at_cut(cut),
-                "cut {cut}"
-            );
-            let full_source = [SOURCE_PREFIX, SOURCE_TAIL].concat();
-            let expected_source = if source_is_truncated_at_cut(cut) {
-                SOURCE_PREFIX
-            } else {
-                full_source.as_slice()
-            };
-            assert_eq!(residual.source.sha256, digest(expected_source).as_str());
-            if source_is_truncated_at_cut(cut) {
-                assert_eq!(
-                    residual
-                        .quarantine
-                        .as_ref()
-                        .expect("truncation requires published quarantine")
-                        .sha256,
-                    digest(SOURCE_TAIL).as_str()
-                );
-            }
+            assert_expected_residual(*case, &residual);
 
-            let mut retry = spawn_root_child("retry", root.path(), None);
-            retry.wait_for(&handshake("retry_ok"));
-            assert!(retry.wait().success(), "retry cut {cut}");
+            let first_retry_token =
+                if case.residual.phase == ObservedManifestPhase::RecoveryCompleted {
+                    "retry_already_completed"
+                } else {
+                    "retry_accepted"
+                };
+            let mut retry = spawn_root_child("retry_converge", root.path(), None);
+            retry.wait_for(&handshake(first_retry_token));
+            assert!(retry.wait().success(), "first retry cut {cut}");
+
+            let mut second_retry = spawn_root_child("retry_exact_completed", root.path(), None);
+            second_retry.wait_for(&handshake("second_retry_already_completed"));
+            assert!(second_retry.wait().success(), "second retry cut {cut}");
 
             let mut oracle = spawn_root_child("oracle", root.path(), None);
             oracle.wait_for(&handshake("oracle_ok"));
@@ -728,7 +1138,14 @@ mod tests {
                 .as_ref()
                 .expect("final quarantine evidence");
             println!(
-                "AUDIO_GRAPH_B77B_EVIDENCE_V1 cut={cut} child=signal9 reopen=pass retry=pass generation={} source_length={} source_sha256={} recovery_length={} recovery_sha256={} temp_present={}",
+                "AUDIO_GRAPH_B77B_EVIDENCE_V2 cut={cut} child=signal9 crash_phase={:?} crash_generation={} crash_source=length={},sha256={} crash_temp={} crash_final={} first_retry={} second_retry=already_completed reopen=pass generation={} source_length={} source_sha256={} recovery_length={} recovery_sha256={} temp_present={}",
+                residual.phase,
+                residual.generation,
+                residual.source.length,
+                residual.source.sha256,
+                optional_file_summary(residual.temporary.as_ref()),
+                optional_file_summary(residual.quarantine.as_ref()),
+                first_retry_token,
                 final_state.generation,
                 final_state.source.length,
                 final_state.source.sha256,
