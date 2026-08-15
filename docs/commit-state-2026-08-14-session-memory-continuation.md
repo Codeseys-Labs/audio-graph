@@ -258,3 +258,46 @@ shared Cargo artifact lock, then completed successfully without a workaround.
 
 No product code or product contract changed, so product suites were not run.
 No Seed was closed, no workflow was dispatched, and no branch was pushed.
+
+## Wave 7A planning base
+
+Starting from clean tip `142492261ecca4539d457bed0c3578869e75dd1f`,
+custody `bcc70d40cda31faad9d466b19473ab234de7ffc2` was merged
+history-preservingly at `f3e2c966c97cf14c1516ae8cab84560659b48e16`.
+Its one linear commit after custody `7405b2a` changes only
+`.seeds/issues.jsonl`, and the integrated queue is byte-identical to custody.
+
+Docs tip `8f48077af7b52070641a31596fa67e3da911fed9` was merged without
+conflict at `859faba2761b4d5debf14408d5f6fcc12fce05b7`, the assembled Wave 7A
+planning base. Its two linear commits contain only the independently reviewed
+hash-v2 design lifecycle activation and
+[`audio-graph-4249-implementation-plan.md`](agentic-runs/2026-08-14-session-memory-continuation/audio-graph-4249-implementation-plan.md).
+The lifecycle correction is **SAFE_CLERICAL_CORRECTION**. The active design has
+no stale proposed/inactive wording, while its protected encoder and golden body
+retains base SHA-256
+`b8a9af70a485b003661a507888d4cc493c28373e087ca377b3a7cf68e08b75f5`.
+Accepted ADRs are unchanged.
+
+Wave 7A has two immediate tracks with exclusive ownership:
+
+- `audio-graph-ab64` owns the normalized legacy/v2 projection-semantic view,
+  first-position inputs, exact hash-v2 conformance kernel, goldens, and an
+  independent Bun verifier. It does not own ledger, basis, prompt, persistence,
+  writer, scheduler, or adapter activation.
+- `audio-graph-5e41` owns the non-production executable admission/fencing state
+  model across Accepted, retry, restart, epoch replacement, detached
+  completion, and deletion cases. It does not introduce a runtime Session
+  semantics version, writer, or durability claim.
+
+Both immediate tracks are `in_progress`. The dependency order then runs
+`8e73` → `7e81` → `0baf` → `4c82` → `6b9d` → `e969` → `ddb3`, closes `4249`,
+resumes `48de`, and finally extends `2add` with the fresh-process mixed golden.
+The plan child IDs/order match the custody dependency graph; later children and
+4249 remain dependency-blocked as recorded.
+
+The complete queue is 90 ready and 96 blocked. Seeds Doctor reported 10 passed,
+2 custody-carried warning groups, and 0 failures. Seeds JSON/output, docs links,
+all five contracts, repo-authoritative pinned `verify:fast`, Betterleaks,
+docs/Seeds secret, and range-diff gates passed. No product suite was run because
+no product file changed. No Seed was closed, no workflow was dispatched, and no
+branch was pushed.
