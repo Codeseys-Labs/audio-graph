@@ -27,6 +27,9 @@ The model assumes:
 - restart while canonical admission is `Pending` cannot preserve the old
   in-memory capability: it must retain durable pending evidence, quarantine the
   old binding, and issue a current-lease recovery binding;
+- retry cannot manufacture a durability proof or choose a new stream kind: an
+  uncommitted append requires an exact retained-kind proof and a prior
+  authorized `Absent` reconciliation;
 - the barrier flags are abstract inputs. This prototype does not prove that
   Windows, macOS, or Linux supplied them; that proof remains `audio-graph-8e73`;
 - loss of an in-flight remote request produces `ExternalEffectUnknown`; the
@@ -90,11 +93,14 @@ The evidence retains the exact event id/digest/attempted sequence, prior
 receipt, declared crash cut, exact `Existing`/`New` stream kind, and the disk
 outcomes admissible at that cut. A delayed receipt carrying the pre-restart
 binding cannot commit. Current reconciliation either proves durable exact bytes
-and returns `AlreadyAccepted(1)`, or proves absence/torn tail and permits an
-exact retry to commit `Accepted(1)`. Until one of those paths succeeds, the
-lane stays non-materialized and ineligible as a Projection Basis. A later
-rotation invalidates the recovery binding; deletion quarantines it and removes
-the ability to reconcile while the fence is raised.
+and returns `AlreadyAccepted(1)`, proves `Absent` and issues a specifically
+retryable `Rejected` capability, or observes a torn tail and remains uncertain
+pending typed quarantine. Only the `Absent` capability permits an exact retry,
+and that retry must present the retained stream kind and every required barrier
+instead of asking the reducer to invent them. Until one of those paths
+succeeds, the lane stays non-materialized and ineligible as a Projection Basis.
+A later rotation invalidates the recovery binding; deletion quarantines it and
+removes the ability to reconcile while the fence is raised.
 
 ## Admission state and crash reconciliation
 
@@ -103,13 +109,18 @@ the ability to reconcile while the fence is raised.
 | `Pending` | Bounded admission began; no durable claim | No | Reopen/reconcile, then retry exact bytes if absent |
 | `Accepted` | Exact canonical bytes crossed every required barrier and acknowledgement returned | Yes, atomically at the committed sequence | Exact retry becomes `AlreadyAccepted` |
 | `AlreadyAccepted` | Reopen/retry found the exact id and bytes already committed | Yes, at the original sequence | Return the same sequence; never append again |
-| `Rejected` | Definite refusal or exact id with different bytes | No new advancement | Correct the request; an idempotency conflict never overwrites |
+| `Rejected` | Definite refusal, exact id with different bytes, or typed `AbsentRetryAuthorized` recovery | No new advancement | Only the typed Absent-recovery form may retry; other rejections require a new/corrected admission |
 | `OutcomeUncertain` | The caller lost the result after an effect may have begun | No | Reconcile exact bytes before any append or visible advancement |
 
 The durability proof fails closed unless `streamKind` is exactly `Existing` or
 `New`. Truthy write/flush/file/directory flags attached to any other kind do not
 authorize acceptance. All acceptance-producing actions—initial acknowledgement,
 crash reconciliation, and retry—also validate their current receipt binding.
+Direct retry from `Pending` or `OutcomeUncertain` is illegal. Retry from
+`Rejected` is illegal unless exact reconciliation retained an `Absent`
+observation, cut, stream kind, current lease binding, event id/digest, and
+attempted sequence. The retry action must then supply—not synthesize—the
+retained kind's full durability barriers.
 
 The executable matrix explores both existing and newly created streams at each
 cut. The allowed restart observations are deliberately conservative:
@@ -122,15 +133,16 @@ retained cut domain then controls which observations may reconcile.
 | Crash cut | Caller state | Restart observations in the bounded model | Required convergence |
 | --- | --- | --- | --- |
 | before enqueue | `Rejected` | absent | exact new attempt may commit sequence 1 |
-| after enqueue | `Pending` | absent | exact retry may commit sequence 1 |
-| after write | `OutcomeUncertain` | absent, torn tail, or durable exact bytes | typed quarantine/absence permits exact append; exact bytes return `AlreadyAccepted(1)` |
-| after flush | `OutcomeUncertain` | absent, torn tail, or durable exact bytes | same reconciliation rule |
+| after enqueue | `Pending` | absent | `AbsentRetryAuthorized`, then exact retained-kind retry may commit sequence 1 |
+| after write | `OutcomeUncertain` | absent, torn tail, or durable exact bytes | absence authorizes exact append; torn tail stays uncertain; exact bytes return `AlreadyAccepted(1)` |
+| after flush | `OutcomeUncertain` | absent, torn tail, or durable exact bytes | same three-way reconciliation rule |
 | after file sync, existing stream | `OutcomeUncertain` | durable exact bytes | return `AlreadyAccepted(1)` |
-| after file sync, new stream | `OutcomeUncertain` | absent or durable exact bytes because directory-entry durability was not acknowledged | complete recovery barriers, then exact append or `AlreadyAccepted(1)` |
+| after file sync, new stream | `OutcomeUncertain` | absent or durable exact bytes because directory-entry durability was not acknowledged | absence authorizes a retry that still requires directory sync; durable exact returns `AlreadyAccepted(1)` |
 | after directory sync | `OutcomeUncertain` | durable exact bytes | return `AlreadyAccepted(1)` |
 | after acknowledgement | `Accepted` | durable exact bytes | exact retry returns `AlreadyAccepted(1)` |
 
-The `TornTailRequiresTypedQuarantine` diagnostic is only a pointer to later
+The `TornTailRequiresTypedQuarantine` diagnostic leaves the admission
+`OutcomeUncertain`; it does not authorize retry. It is only a pointer to later
 work. This prototype does not choose a quarantine transaction or pretend that
 the current implementation can durably register one.
 
@@ -143,7 +155,8 @@ A job may cross the remote boundary only after its scheduler record is
   attempt began.
 - Restart from canonical `Pending` becomes `OutcomeUncertain`, retains the
   durable pending identity and cut domain, quarantines the retired capability,
-  and admits only a current-lease reconciliation or exact retry.
+  and admits only a current-lease reconciliation. Exact retry becomes possible
+  only after that reconciliation authorizes `Absent`.
 - Restart from `RemoteInFlight` becomes `ExternalEffectUnknown`; it never
   fabricates success, failure, or safe-to-retry.
 - Automatic at-risk reissue retains the first unknown effect and registers a
@@ -209,6 +222,8 @@ real. No row is implemented here.
 | `DurableQueued -> RemoteInFlight -> ExternalEffectUnknown` across restart | Projection scheduler persistence (`audio-graph-3b48`) | Persist exact lane/Session/epoch/lease/job/attempt/effect ownership; do not infer provider outcome; apply the accepted reissue policy |
 | canonical enqueue -> `Pending` | canonical commit boundary (`audio-graph-90f3`, then mixed transcript follow-through in `audio-graph-6b9d`) | Queue admission, writer send, and snapshot write expose no durable state and no Projection Basis eligibility |
 | canonical `Pending` -> restart-rebased `OutcomeUncertain` | scheduler persistence (`audio-graph-3b48`), canonical recovery (`audio-graph-90f3`), and cross-platform crash evidence (`audio-graph-8e73`) | Persist the pending event/digest/attempted sequence and crash domain; quarantine the old receipt binding; issue a current-lease binding; never materialize or advance basis before exact reconciliation |
+| `OutcomeUncertain` -> exact disk reconciliation | canonical recovery (`audio-graph-90f3`) plus cross-platform durability/quarantine (`audio-graph-8e73`) | Match the retained cut and stream kind: durable exact returns `AlreadyAccepted`; Absent alone issues retry authorization; torn tail remains uncertain until typed quarantine; mismatch changes nothing |
+| `AbsentRetryAuthorized` -> retained-kind retry -> `Accepted` | canonical recovery (`audio-graph-90f3`) plus barrier proof (`audio-graph-8e73`) | Require the current binding, exact event bytes, retained stream kind, and supplied write/flush/file/directory barriers; never synthesize proof or accept a cross-kind retry |
 | write -> flush -> file sync | canonical durability (`audio-graph-90f3`) | Any pre-ack lost response is reconciled by exact id and attempted bytes; sequence cannot be reused |
 | new-file directory sync, typed quarantine registration, destructive recovery | cross-platform durability (`audio-graph-8e73`) | Do not produce `Accepted` or user-facing Saved until the platform-specific file/directory/manifest transaction is proven |
 | durable exact commit -> `Accepted(sequence)` | canonical commit integration (`audio-graph-90f3`) | Validate exact owner/Session/lane/event/lifecycle/prestate binding, then atomically advance live materialized state and basis eligibility; snapshot failure is rebuildable-cache lag |
@@ -221,11 +236,11 @@ real. No row is implemented here.
 
 ## Executable evidence boundary
 
-The successful run explores eight policy profiles and 795 exhaustive bounded
-cases: 51 correction regressions, 368 admission/crash cases, 80 receipt cases,
+The successful run explores eight policy profiles and 814 exhaustive bounded
+cases: 70 correction regressions, 368 admission/crash cases, 80 receipt cases,
 32 scheduler-restart cases, 200 two-lane commutativity cases, and 64
-rotation/deletion cases. It evaluates 7,547 reducer transitions, observes 1,273
-unique full states, performs 110,543 invariant assertions across 30 named
+rotation/deletion cases. It evaluates 7,671 reducer transitions, observes 1,262
+unique full states, performs 111,905 invariant assertions across 31 named
 invariant families, and observes all five receipt states.
 
 Those counts describe this finite prototype, not the production state space.

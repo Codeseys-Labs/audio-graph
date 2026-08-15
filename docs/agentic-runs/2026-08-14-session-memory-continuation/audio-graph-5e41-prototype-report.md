@@ -36,6 +36,10 @@ makes no operating-system durability claim.
   at every crash cut must enter a recoverable state, quarantine the old receipt
   binding, converge under current reconciliation/exact retry without duplicate
   advancement, and remain fenced across rotation and deletion.
+- Third review correction acceptance: direct retry from `OutcomeUncertain` or a
+  generic `Rejected` state must fail; only an authorized `Absent`
+  reconciliation may retry using the retained stream kind and supplied barrier
+  proof, while durable exact bytes never append again.
 - Worktree:
   `/home/codeseys/DevBox/audio-graph/.worktrees/5e41-admission-fencing-prototype-wave7a`
 - Branch: `work/5e41-admission-fencing-prototype-wave7a`
@@ -65,6 +69,11 @@ semantics:
   durable pending evidence and its exact crash-cut observation domain,
   quarantines the old binding by opaque reference, and issues a current-lease
   recovery binding;
+- `OutcomeUncertain` cannot retry: durable exact reconciliation yields
+  `AlreadyAccepted`, `Absent` yields a typed `AbsentRetryAuthorized` rejection,
+  and torn tail remains uncertain pending typed quarantine;
+- an authorized retry must match the retained stream kind and supply its full
+  barriers; a cross-kind or weak new-file proof is refused without visibility;
 - `DurableQueued` survives restart as never-dispatched work, while
   `RemoteInFlight` recovers as `ExternalEffectUnknown`;
 - each remote dispatch/reissue retains an exact
@@ -106,20 +115,20 @@ The successful run covered all eight combinations of Saved wording, remote
 reissue policy, and deletion policy. Its bounded dimensions were:
 
 ```text
-correction regression cases:  51
+correction regression cases:  70
 admission/crash cases:       368
 receipt cases:                80
 scheduler restart cases:      32
 lane independence cases:     200
 rotation/deletion cases:       64
-total cases:                  795
-reducer transitions:        7,547
-unique full states:         1,273
-invariant assertions:     110,543
-invariant families:            30
+total cases:                  814
+reducer transitions:        7,671
+unique full states:         1,262
+invariant assertions:     111,905
+invariant families:            31
 ```
 
-All five receipts were observed. The 30 passing invariant families were:
+All five receipts were observed. The 31 passing invariant families were:
 
 ```text
 accepted-only-advancement
@@ -147,6 +156,7 @@ pending-receipt-binding
 pending-restart-recovery
 receipt-binding-refusal
 receipt-domain
+recovery-retry-authorization
 rotation-fence
 saved-label-requires-commit
 structural-diagnostic-regression
@@ -156,7 +166,7 @@ wait-effect-exactness
 
 The pure transition function also fails loudly on illegal admission, scheduler,
 snapshot, deletion, and detached-writer actions. Those reducer precondition
-guards are not included in the 30 reported invariant-family count.
+guards are not included in the 31 reported invariant-family count.
 
 The first executable pass correctly stopped on a prototype assertion bug: the
 Saved invariant used substring matching and therefore mistook `Not saved` for
@@ -215,8 +225,9 @@ and made a separate red/green pass inside the one-command executable.
      recovery domain.
    - Green: every case invokes the real `Restart` action from `Pending`, rejects
      the stale pre-restart receipt, checks no materialization/basis advancement,
-     explores every allowed disk observation, and proves current exact retry
-     converges once without changing sequence `1`.
+     and explores every allowed disk observation. Durable exact converges
+     without appending, Absent authorizes one exact retry, and torn tail remains
+     safely uncertain.
 3. Lifecycle fences:
    - Red: deletion of the recovered admission reported
      `deletion-fence-state-invariants`.
@@ -226,6 +237,34 @@ and made a separate red/green pass inside the one-command executable.
 
 These 21 second-round regression cases bring the complete correction total to
 51 without adding a separate test framework.
+
+### Recovery-retry correction TDD evidence
+
+The third correction reused the pure `transition(state, action)` seam and the
+same in-command exhaustive checker.
+
+1. Direct uncertainty bypass:
+   - Red: all 14 `Existing`/`New` by seven-crash-cut direct retries reported
+     `direct-retry-visible`.
+   - Green: an uncommitted retry now requires an `AbsentRetryAuthorized`
+     recovery state; `OutcomeUncertain`, plain `Rejected`, and torn-tail states
+     cannot append or advance materialized/basis state.
+2. Recovery-domain and barrier proof:
+   - Red: New/AfterEnqueue -> Absent accepted both
+     `cross-kind-retry-visible` and `missing-directory-sync-retry-visible`.
+   - Green: Absent reconciliation retains the exact cut and `New` kind, rebinds
+     authorization to the current lease, rejects `Existing`, and requires the
+     supplied New proof to include directory sync. Restart rebinds but does not
+     broaden the authorization; its stale binding is refused.
+3. Idempotent convergence:
+   - DurableExact reconciliation returns `AlreadyAccepted(1)` and a subsequent
+     exact retry preserves the identical commit rather than appending.
+   - The authorized retained-kind retry commits sequence `1` once; its exact
+     replay returns `AlreadyAccepted(1)` with no duplicate materialization or
+     Projection Basis advancement.
+
+These 19 third-round regression cases bring the complete correction total to
+70 without adding persistence or a separate test framework.
 
 ## Human decisions still open
 
@@ -252,11 +291,12 @@ than hidden defaults:
   remote-reissue policy.
 - `audio-graph-90f3` owns the production `Pending` to receipt-bearing canonical
   commit boundary, stable sequence/idempotency, atomic post-accept materialized
-  advancement, exact receipt binding, restart rebase/reconciliation, and
-  snapshot-cache authority.
+  advancement, exact receipt binding, restart rebase/reconciliation, typed
+  Absent retry authorization, and snapshot-cache authority.
 - `audio-graph-8e73` owns new-file directory entry durability, typed quarantine
-  registration, locked destructive recovery, subprocess cut points, and the
-  rule that a weak platform level cannot claim Accepted/Saved.
+  registration, locked destructive recovery, supplied retry-barrier proof,
+  subprocess cut points, and the rule that a weak platform level cannot claim
+  Accepted/Saved.
 - `audio-graph-7e81` may advance the monotonic Session semantics floor only
   from this model's `Accepted`/`AlreadyAccepted` receipt and must preserve
   guard-ahead idempotency.
@@ -295,11 +335,11 @@ bun scripts/prototype-session-projection-admission.mjs
 Final output summary:
 
 ```text
-cases explored: 795
-transitions evaluated: 7547
-unique full states observed: 1273
-invariant assertions: 110543
-invariant families passed (30)
+cases explored: 814
+transitions evaluated: 7671
+unique full states observed: 1262
+invariant assertions: 111905
+invariant families passed (31)
 Policy decision table (all eight combinations passed safety invariants)
 PASS: finite model exhausted; every invariant held; diagnostics remained content-free.
 ```
@@ -365,7 +405,7 @@ M  scripts/prototype-session-projection-admission.mjs
 
 Result: pass, exit 0. The correction footprint is exactly the same three
 assigned paths. `HEAD` and its merge base with the reviewed correction base
-were both `89a41b78a9bf23126ca987e95f6ada28442ab664` before commit.
+were both `3a869efa187ed302490eb30758ca18b9fb07c14a` before commit.
 
 The repository Biome configuration intentionally ignores the new `.mjs`
 script (`Checked 0 files` / `No files were processed`), so that invocation was

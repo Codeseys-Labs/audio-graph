@@ -345,14 +345,42 @@ function beginOutcomeRecovery(
     crashCut,
     streamKind,
     allowedDiskOutcomes: recoveryDiskOutcomes(streamKind, crashCut),
+    reconciliation: "Required",
+    reconciledDiskOutcome: null,
     currentBinding: makeReceiptBinding(state, laneName, "OutcomeUncertain"),
   };
+}
+
+function authorizeAbsentRetry(state, laneName) {
+  const lane = state.lanes[laneName];
+  const evidence = lane.admission.recoveryEvidence;
+  modelGuard(
+    admissionPrestate(lane) === "OutcomeUncertain" &&
+      evidence?.reconciliation === "Required" &&
+      evidence.allowedDiskOutcomes.includes("Absent"),
+    "recovery-transition",
+    "retry authorization requires retained uncertain evidence that permits Absent",
+    state,
+  );
+  lane.admission.lastReceipt = "Rejected";
+  evidence.reconciliation = "AbsentRetryAuthorized";
+  evidence.reconciledDiskOutcome = "Absent";
+  evidence.currentBinding = makeReceiptBinding(state, laneName, "Rejected");
 }
 
 function fenceAdmissionForDeletion(state, laneName) {
   const lane = state.lanes[laneName];
   const prestate = admissionPrestate(lane);
-  if (prestate !== "Pending" && prestate !== "OutcomeUncertain") return;
+  const retryableRejected =
+    prestate === "Rejected" &&
+    lane.admission.recoveryEvidence?.reconciliation === "AbsentRetryAuthorized";
+  if (
+    prestate !== "Pending" &&
+    prestate !== "OutcomeUncertain" &&
+    !retryableRejected
+  ) {
+    return;
+  }
 
   const retiredBinding =
     lane.admission.pendingBinding ?? lane.admission.recoveryEvidence?.currentBinding;
@@ -374,6 +402,8 @@ function fenceAdmissionForDeletion(state, laneName) {
       crashCut: "Unspecified",
       streamKind: null,
       allowedDiskOutcomes: [],
+      reconciliation: "Required",
+      reconciledDiskOutcome: null,
       currentBinding: null,
       fencedBy: "Deletion",
     };
@@ -441,6 +471,17 @@ function validateReceiptBinding(state, laneName, binding, allowedPrestates) {
         bindingsEqual(binding, lane.admission.recoveryEvidence.currentBinding),
       "receipt-binding",
       "canonical recovery receipt does not match current durable pending evidence",
+      state,
+    );
+  }
+  if (
+    currentPrestate === "Rejected" &&
+    lane.admission.recoveryEvidence !== null
+  ) {
+    modelGuard(
+      bindingsEqual(binding, lane.admission.recoveryEvidence.currentBinding),
+      "receipt-binding",
+      "retry does not match the authorized Absent recovery binding",
       state,
     );
   }
@@ -660,7 +701,8 @@ function transition(input, action) {
       break;
     }
     case "ReconcileCrash": {
-      if (admissionPrestate(lane) === "OutcomeUncertain") {
+      const recoveryPrestate = admissionPrestate(lane);
+      if (recoveryPrestate === "OutcomeUncertain") {
         modelGuard(
           lane.admission.recoveryEvidence?.streamKind === action.streamKind &&
             lane.admission.recoveryEvidence.allowedDiskOutcomes.includes(
@@ -669,6 +711,24 @@ function transition(input, action) {
           "recovery-transition",
           "reconciliation is outside the retained recovery domain",
           state,
+        );
+      } else if (recoveryPrestate === "Pending") {
+        modelGuard(
+          RECOVERY_CUTS.includes(action.crashCut) &&
+            STREAM_KINDS.includes(action.streamKind) &&
+            recoveryDiskOutcomes(action.streamKind, action.crashCut).includes(
+              action.diskOutcome,
+            ),
+          "recovery-transition",
+          "Pending reconciliation requires an allowed retained cut and stream domain",
+          state,
+        );
+      } else {
+        validateReceiptBinding(
+          state,
+          action.lane,
+          action.binding,
+          ["Pending", "OutcomeUncertain"],
         );
       }
       if (action.diskOutcome === "DurableExact") {
@@ -687,7 +747,17 @@ function transition(input, action) {
           action.binding,
           ["Pending", "OutcomeUncertain"],
         );
-        lane.admission.lastReceipt = "Rejected";
+        if (recoveryPrestate === "Pending") {
+          beginOutcomeRecovery(
+            state,
+            action.lane,
+            action.crashCut,
+            action.streamKind,
+          );
+        }
+        if (action.diskOutcome === "Absent") {
+          authorizeAbsentRetry(state, action.lane);
+        }
         if (action.diskOutcome === "TornTail") {
           addDiagnostic(state, "TornTailRequiresTypedQuarantine", {
             lane: action.lane,
@@ -730,13 +800,29 @@ function transition(input, action) {
           "uncommitted retry must match attempted bytes",
           state,
         );
+        const evidence = lane.admission.recoveryEvidence;
+        modelGuard(
+          admissionPrestate(lane) === "Rejected" &&
+            evidence?.reconciliation === "AbsentRetryAuthorized" &&
+            evidence.reconciledDiskOutcome === "Absent",
+          "recovery-transition",
+          "uncommitted retry requires an authorized Absent reconciliation",
+          state,
+        );
+        modelGuard(
+          action.streamKind === evidence.streamKind &&
+            action.proof?.streamKind === evidence.streamKind,
+          "recovery-transition",
+          "retry cannot change the retained recovery stream kind",
+          state,
+        );
         acceptCanonical(
           state,
           action.lane,
           "Accepted",
-          fullDurabilityProof(action.streamKind),
+          action.proof,
           action.binding,
-          ["Pending", "Rejected", "OutcomeUncertain"],
+          ["Rejected"],
         );
       }
       break;
@@ -796,6 +882,37 @@ function transition(input, action) {
             laneName,
             action.crashCut ?? retainedCrashCut,
             action.streamKind ?? retainedStreamKind,
+          );
+        } else if (
+          restartedLane.admission.lastReceipt === "Rejected" &&
+          restartedLane.admission.recoveryEvidence?.reconciliation ===
+            "AbsentRetryAuthorized"
+        ) {
+          const evidence = restartedLane.admission.recoveryEvidence;
+          if (action.streamKind !== undefined) {
+            modelGuard(
+              action.streamKind === evidence.streamKind,
+              "recovery-transition",
+              "restart cannot change the retained retry stream kind",
+              state,
+            );
+          }
+          if (action.crashCut !== undefined) {
+            modelGuard(
+              action.crashCut === evidence.crashCut,
+              "recovery-transition",
+              "restart cannot change the retained retry crash cut",
+              state,
+            );
+          }
+          const retiredRef = opaqueRef(evidence.currentBinding);
+          if (!restartedLane.admission.quarantinedBindingRefs.includes(retiredRef)) {
+            restartedLane.admission.quarantinedBindingRefs.push(retiredRef);
+          }
+          evidence.currentBinding = makeReceiptBinding(
+            state,
+            laneName,
+            "Rejected",
           );
         }
       }
@@ -1041,6 +1158,8 @@ function verifyState(state, where) {
           evidence.attemptedSequence === lane.admission.attemptedSequence &&
           ["Pending", "OutcomeUncertain"].includes(evidence.priorReceipt) &&
           RECOVERY_CUTS.includes(evidence.crashCut) &&
+          evidence.reconciliation === "Required" &&
+          evidence.reconciledDiskOutcome === null &&
           ((STREAM_KINDS.includes(evidence.streamKind) &&
             JSON.stringify(evidence.allowedDiskOutcomes) ===
               JSON.stringify(
@@ -1060,6 +1179,37 @@ function verifyState(state, where) {
               evidence.currentBinding === null)),
         "pending-restart-recovery",
         `${where} did not retain current recoverable evidence for ${laneName}`,
+        state,
+      );
+    }
+    if (
+      lane.admission.lastReceipt === "Rejected" &&
+      lane.admission.recoveryEvidence !== null
+    ) {
+      const evidence = lane.admission.recoveryEvidence;
+      invariant(
+        lane.admission.pendingBinding === null &&
+          evidence.kind === "DurablePendingEvidence" &&
+          evidence.eventId === lane.admission.eventId &&
+          evidence.digest === lane.admission.digest &&
+          evidence.attemptedSequence === lane.admission.attemptedSequence &&
+          ["Pending", "OutcomeUncertain"].includes(evidence.priorReceipt) &&
+          RECOVERY_CUTS.includes(evidence.crashCut) &&
+          STREAM_KINDS.includes(evidence.streamKind) &&
+          evidence.allowedDiskOutcomes.includes("Absent") &&
+          evidence.reconciliation === "AbsentRetryAuthorized" &&
+          evidence.reconciledDiskOutcome === "Absent" &&
+          ((state.session.lifecycle === "Active" &&
+            evidence.fencedBy === undefined &&
+            bindingsEqual(
+              evidence.currentBinding,
+              makeReceiptBinding(state, laneName, "Rejected"),
+            )) ||
+            (state.session.lifecycle === "Deleting" &&
+              evidence.fencedBy === "Deletion" &&
+              evidence.currentBinding === null)),
+        "recovery-retry-authorization",
+        `${where} retained invalid Absent retry authorization for ${laneName}`,
         state,
       );
     }
@@ -1357,6 +1507,7 @@ function checkPendingRestartTracerRegression() {
         eventId: recovered.lanes.Notes.admission.eventId,
         digest: recovered.lanes.Notes.admission.digest,
         streamKind: "New",
+        proof: fullDurabilityProof("New"),
         binding: makeReceiptBinding(recovered, "Notes"),
       });
     }
@@ -1423,6 +1574,230 @@ function checkPendingRestartTracerRegression() {
   invariantFamilies.add("pending-restart-recovery");
   assertionCount += 7;
   return 7;
+}
+
+function checkRetryRecoveryDomainRegressions() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "WaitForRemote",
+  };
+  const expectedOutcomes = {
+    Existing: {
+      BeforeEnqueue: ["Absent"],
+      AfterEnqueue: ["Absent"],
+      AfterWrite: ["Absent", "TornTail", "DurableExact"],
+      AfterFlush: ["Absent", "TornTail", "DurableExact"],
+      AfterFileSync: ["DurableExact"],
+      AfterDirectorySync: ["DurableExact"],
+      AfterAck: ["DurableExact"],
+    },
+    New: {
+      BeforeEnqueue: ["Absent"],
+      AfterEnqueue: ["Absent"],
+      AfterWrite: ["Absent", "TornTail", "DurableExact"],
+      AfterFlush: ["Absent", "TornTail", "DurableExact"],
+      AfterFileSync: ["Absent", "DurableExact"],
+      AfterDirectorySync: ["DurableExact"],
+      AfterAck: ["DurableExact"],
+    },
+  };
+  const missed = [];
+
+  for (const streamKind of STREAM_KINDS) {
+    for (const crashCut of CUTS) {
+      const pending = prepareAdmission(initialState(policy), "Notes");
+      const uncertain = transition(pending, {
+        type: "Restart",
+        crashCut,
+        streamKind,
+      });
+      try {
+        const bypassed = transition(uncertain, {
+          type: "Retry",
+          lane: "Notes",
+          eventId: uncertain.lanes.Notes.admission.eventId,
+          digest: uncertain.lanes.Notes.admission.digest,
+          streamKind,
+          proof: fullDurabilityProof(streamKind),
+          binding: makeReceiptBinding(uncertain, "Notes"),
+        });
+        if (
+          bypassed.lanes.Notes.materializedSequence !== null ||
+          bypassed.lanes.Notes.basisEligibleSequence !== null
+        ) {
+          missed.push(`${streamKind}/${crashCut}/direct-retry-visible`);
+        } else {
+          missed.push(`${streamKind}/${crashCut}/direct-retry-accepted`);
+        }
+      } catch (error) {
+        assert.match(String(error), /\[recovery-transition\]/u);
+      }
+
+      if (expectedOutcomes[streamKind][crashCut].includes("DurableExact")) {
+        const reconciled = transition(uncertain, {
+          type: "ReconcileCrash",
+          lane: "Notes",
+          streamKind,
+          diskOutcome: "DurableExact",
+          binding: makeReceiptBinding(uncertain, "Notes"),
+        });
+        const committedBefore = structuredClone(
+          reconciled.lanes.Notes.admission.committed,
+        );
+        const retried = transition(reconciled, {
+          type: "Retry",
+          lane: "Notes",
+          eventId: reconciled.lanes.Notes.admission.eventId,
+          digest: reconciled.lanes.Notes.admission.digest,
+          streamKind,
+          proof: fullDurabilityProof(streamKind),
+          binding: makeReceiptBinding(reconciled, "Notes"),
+        });
+        if (
+          retried.lanes.Notes.admission.lastReceipt !== "AlreadyAccepted" ||
+          JSON.stringify(retried.lanes.Notes.admission.committed) !==
+            JSON.stringify(committedBefore) ||
+          retried.lanes.Notes.materializedSequence !== 1 ||
+          retried.lanes.Notes.basisEligibleSequence !== 1
+        ) {
+          missed.push(`${streamKind}/${crashCut}/durable-exact-appended`);
+        }
+      }
+    }
+  }
+
+  const pending = prepareAdmission(initialState(policy), "Notes");
+  const plainRejected = transition(
+    pending,
+    boundReceiptAction(pending, "Notes", "Rejected", "New"),
+  );
+  try {
+    const bypassed = transition(plainRejected, {
+      type: "Retry",
+      lane: "Notes",
+      eventId: plainRejected.lanes.Notes.admission.eventId,
+      digest: plainRejected.lanes.Notes.admission.digest,
+      streamKind: "New",
+      proof: fullDurabilityProof("New"),
+      binding: makeReceiptBinding(plainRejected, "Notes"),
+    });
+    if (
+      bypassed.lanes.Notes.materializedSequence !== null ||
+      bypassed.lanes.Notes.basisEligibleSequence !== null
+    ) {
+      missed.push("plain-rejected-retry-visible");
+    } else {
+      missed.push("plain-rejected-retry-accepted");
+    }
+  } catch (error) {
+    assert.match(String(error), /\[recovery-transition\]/u);
+  }
+
+  const uncertain = transition(pending, {
+    type: "Restart",
+    crashCut: "AfterEnqueue",
+    streamKind: "New",
+  });
+  const retryable = transition(uncertain, {
+    type: "ReconcileCrash",
+    lane: "Notes",
+    streamKind: "New",
+    diskOutcome: "Absent",
+    binding: makeReceiptBinding(uncertain, "Notes"),
+  });
+  for (const [name, streamKind, proof] of [
+    ["cross-kind", "Existing", fullDurabilityProof("Existing")],
+    [
+      "missing-directory-sync",
+      "New",
+      { ...fullDurabilityProof("New"), directorySynced: false },
+    ],
+  ]) {
+    try {
+      const bypassed = transition(retryable, {
+        type: "Retry",
+        lane: "Notes",
+        eventId: retryable.lanes.Notes.admission.eventId,
+        digest: retryable.lanes.Notes.admission.digest,
+        streamKind,
+        proof,
+        binding: makeReceiptBinding(retryable, "Notes"),
+      });
+      if (
+        bypassed.lanes.Notes.materializedSequence !== null ||
+        bypassed.lanes.Notes.basisEligibleSequence !== null
+      ) {
+        missed.push(`${name}-retry-visible`);
+      } else {
+        missed.push(`${name}-retry-accepted`);
+      }
+    } catch (error) {
+      assert.match(
+        String(error),
+        name === "cross-kind"
+          ? /\[recovery-transition\]/u
+          : /\[accepted-requires-durability\]/u,
+      );
+    }
+  }
+  if (
+    retryable.lanes.Notes.admission.lastReceipt !== "Rejected" ||
+    retryable.lanes.Notes.materializedSequence !== null ||
+    retryable.lanes.Notes.basisEligibleSequence !== null
+  ) {
+    missed.push("failed-retry-mutated-authorized-state");
+  }
+
+  const staleRetryBinding = makeReceiptBinding(retryable, "Notes");
+  const retryableRebased = transition(retryable, { type: "Restart" });
+  verifyState(retryableRebased, "retry-authorization-rebased-after-restart");
+  try {
+    transition(retryableRebased, {
+      type: "Retry",
+      lane: "Notes",
+      eventId: retryableRebased.lanes.Notes.admission.eventId,
+      digest: retryableRebased.lanes.Notes.admission.digest,
+      streamKind: "New",
+      proof: fullDurabilityProof("New"),
+      binding: staleRetryBinding,
+    });
+    missed.push("stale-authorized-retry-binding");
+  } catch (error) {
+    assert.match(String(error), /\[receipt-binding\]/u);
+  }
+
+  let accepted = transition(retryableRebased, {
+    type: "Retry",
+    lane: "Notes",
+    eventId: retryableRebased.lanes.Notes.admission.eventId,
+    digest: retryableRebased.lanes.Notes.admission.digest,
+    streamKind: "New",
+    proof: fullDurabilityProof("New"),
+    binding: makeReceiptBinding(retryableRebased, "Notes"),
+  });
+  const committedBefore = structuredClone(accepted.lanes.Notes.admission.committed);
+  accepted = transition(accepted, {
+    type: "Retry",
+    lane: "Notes",
+    eventId: accepted.lanes.Notes.admission.eventId,
+    digest: accepted.lanes.Notes.admission.digest,
+    streamKind: "New",
+    proof: fullDurabilityProof("New"),
+    binding: makeReceiptBinding(accepted, "Notes"),
+  });
+  if (
+    accepted.lanes.Notes.admission.lastReceipt !== "AlreadyAccepted" ||
+    JSON.stringify(accepted.lanes.Notes.admission.committed) !==
+      JSON.stringify(committedBefore)
+  ) {
+    missed.push("retained-kind-retry-duplicated");
+  }
+
+  assert.deepEqual(missed, [], `retry recovery bypasses: ${missed.join(", ")}`);
+  invariantFamilies.add("recovery-retry-authorization");
+  assertionCount += STREAM_KINDS.length * CUTS.length + 5;
+  return STREAM_KINDS.length * CUTS.length + 5;
 }
 
 function checkPendingRestartCutMatrix() {
@@ -1496,9 +1871,11 @@ function checkPendingRestartCutMatrix() {
           diskOutcome,
           binding: makeReceiptBinding(restarted, "Notes"),
         });
-        if (diskOutcome !== "DurableExact") {
+        if (diskOutcome === "Absent") {
           if (
             reconciled.lanes.Notes.admission.lastReceipt !== "Rejected" ||
+            reconciled.lanes.Notes.admission.recoveryEvidence?.reconciliation !==
+              "AbsentRetryAuthorized" ||
             reconciled.lanes.Notes.materializedSequence !== null ||
             reconciled.lanes.Notes.basisEligibleSequence !== null
           ) {
@@ -1510,8 +1887,24 @@ function checkPendingRestartCutMatrix() {
             eventId: reconciled.lanes.Notes.admission.eventId,
             digest: reconciled.lanes.Notes.admission.digest,
             streamKind,
+            proof: fullDurabilityProof(streamKind),
             binding: makeReceiptBinding(reconciled, "Notes"),
           });
+        } else if (diskOutcome === "TornTail") {
+          if (
+            reconciled.lanes.Notes.admission.lastReceipt !== "OutcomeUncertain" ||
+            reconciled.lanes.Notes.admission.recoveryEvidence?.reconciliation !==
+              "Required" ||
+            reconciled.lanes.Notes.materializedSequence !== null ||
+            reconciled.lanes.Notes.basisEligibleSequence !== null
+          ) {
+            missed.push(`${streamKind}/${crashCut}/${diskOutcome}/unsafe-state`);
+          }
+          verifyState(
+            reconciled,
+            `${streamKind}-${crashCut}-${diskOutcome}-quarantine-required`,
+          );
+          continue;
         }
         if (
           !["Accepted", "AlreadyAccepted"].includes(
@@ -1890,7 +2283,13 @@ function checkAdmissionCrashMatrix() {
               state,
             );
 
-            if (cut === "AfterAck") {
+            if (cut === "BeforeEnqueue") {
+              state = prepareAdmission(state, laneName);
+              state = reduce(
+                state,
+                boundReceiptAction(state, laneName, "Accepted", streamKind),
+              );
+            } else if (cut === "AfterAck") {
               state = reduce(state, {
                 type: "Retry",
                 lane: laneName,
@@ -1899,25 +2298,44 @@ function checkAdmissionCrashMatrix() {
                 streamKind,
                 binding: makeReceiptBinding(state, laneName),
               });
-            } else if (cut !== "BeforeEnqueue" || diskOutcome !== "Absent") {
+            } else {
               state = reduce(state, {
                 type: "ReconcileCrash",
                 lane: laneName,
                 streamKind,
                 diskOutcome,
+                crashCut: cut,
                 binding: makeReceiptBinding(state, laneName),
               });
             }
 
-            if (state.lanes[laneName].admission.committed === null) {
+            if (
+              state.lanes[laneName].admission.lastReceipt === "Rejected" &&
+              state.lanes[laneName].admission.recoveryEvidence?.reconciliation ===
+                "AbsentRetryAuthorized"
+            ) {
               state = reduce(state, {
                 type: "Retry",
                 lane: laneName,
                 eventId: state.lanes[laneName].admission.eventId,
                 digest: state.lanes[laneName].admission.digest,
                 streamKind,
+                proof: fullDurabilityProof(streamKind),
                 binding: makeReceiptBinding(state, laneName),
               });
+            }
+
+            if (state.lanes[laneName].admission.committed === null) {
+              invariant(
+                state.lanes[laneName].admission.lastReceipt ===
+                  "OutcomeUncertain" &&
+                  state.lanes[laneName].materializedSequence === null &&
+                  state.lanes[laneName].basisEligibleSequence === null,
+                "recovery-retry-authorization",
+                `${streamKind}/${cut}/${diskOutcome} bypassed required reconciliation`,
+                state,
+              );
+              continue;
             }
 
             invariant(
@@ -2305,6 +2723,7 @@ console.log(
 const correctionRegressionCases =
   checkReceiptBindingRegressions() +
   checkPendingRestartTracerRegression() +
+  checkRetryRecoveryDomainRegressions() +
   checkPendingRestartCutMatrix() +
   checkReceiptForgeryMatrix() +
   checkWaitEffectIdentityRegressions() +
