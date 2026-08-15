@@ -17,6 +17,9 @@ The model assumes:
   boundary; its attempted per-stream sequence is `1`;
 - the idempotency identity is the exact event id plus exact attempted-byte
   digest, and `AlreadyAccepted` must return the original committed sequence;
+- each canonical receipt is a capability bound to the exact lane, current
+  Session key/epoch/lease and job owner, event id/digest, lifecycle, and
+  admission prestate that produced it;
 - a durable scheduler-queue record and a durable canonical projection event
   are different records and different transitions;
 - an existing canonical stream needs completed write, flush, and file-sync
@@ -25,6 +28,8 @@ The model assumes:
   Windows, macOS, or Linux supplied them; that proof remains `audio-graph-8e73`;
 - loss of an in-flight remote request produces `ExternalEffectUnknown`; the
   process cannot infer whether cost, egress, or a provider-side result occurred;
+- every remote dispatch attempt owns an exact effect identity, including an
+  opaque result correlation reference; a job id alone is not an effect identity;
 - a deletion or Session replacement raises its fence before waiting for or
   discarding remote results; and
 - all state and diagnostics are synthetic metadata held only in memory. The
@@ -46,7 +51,10 @@ The model supports the proposed shape, with one non-negotiable boundary:
 materialized state and Projection Basis eligibility advance atomically from a
 canonical `Accepted` or exact-retry `AlreadyAccepted` receipt, never from
 `Pending`, `Rejected`, `OutcomeUncertain`, queue admission, a remote result, or
-a snapshot write.
+a snapshot write. The receipt is accepted only against the exact Pending or
+recovery prestate that created its binding. An Idle lane, a replacement Session,
+a retired lease, a deleting Session, a different lane/event/digest, or a forged
+prestate cannot use it.
 
 An accepted event owns its per-stream committed sequence forever. An exact
 retry returns `AlreadyAccepted` with that sequence. Reusing its idempotency id
@@ -57,7 +65,8 @@ not roll back the accepted logical state or free the sequence for reuse.
 The model also supports one Session ownership token:
 
 ```text
-(session key, session epoch, process lease, projection lane, exact job id)
+(session key, session epoch, process lease, projection lane, exact job id,
+ remote attempt, opaque result correlation)
 ```
 
 Restart replaces the process lease. Session rotation replaces both the epoch
@@ -74,6 +83,11 @@ observable refusals; success and failure have the same fence behavior.
 | `AlreadyAccepted` | Reopen/retry found the exact id and bytes already committed | Yes, at the original sequence | Return the same sequence; never append again |
 | `Rejected` | Definite refusal or exact id with different bytes | No new advancement | Correct the request; an idempotency conflict never overwrites |
 | `OutcomeUncertain` | The caller lost the result after an effect may have begun | No | Reconcile exact bytes before any append or visible advancement |
+
+The durability proof fails closed unless `streamKind` is exactly `Existing` or
+`New`. Truthy write/flush/file/directory flags attached to any other kind do not
+authorize acceptance. All acceptance-producing actions—initial acknowledgement,
+crash reconciliation, and retry—also validate their current receipt binding.
 
 The executable matrix explores both existing and newly created streams at each
 cut. The allowed restart observations are deliberately conservative:
@@ -102,6 +116,9 @@ A job may cross the remote boundary only after its scheduler record is
   attempt began.
 - Restart from `RemoteInFlight` becomes `ExternalEffectUnknown`; it never
   fabricates success, failure, or safe-to-retry.
+- Automatic at-risk reissue retains the first unknown effect and registers a
+  second exact attempt. Neither attempt aliases the other even when the stable
+  job id is the same.
 - Late success and late failure from the retired lease are both refused.
 - Notes and Graph own separate scheduler states, canonical sequences,
   materialized heads, and basis-eligible heads. The checker runs all 25 receipt
@@ -122,14 +139,22 @@ writes.
 - `DiscardImmediately` removes managed artifact state without waiting for a
   provider terminal. A later success or failure is counted and discarded.
 - `WaitForRemote` retains artifacts while it observes terminals for the set of
-  requests already in flight. Results are still discarded and cannot advance
-  canonical or materialized state. Artifact removal occurs only after that set
-  is empty.
+  exact effect identities already in flight. Results are still discarded and
+  cannot advance canonical or materialized state. One terminal removes only
+  its exact lane/Session/epoch/lease/job/attempt/result-correlation tuple;
+  replayed, cross-lane, forged, or merely same-job terminals do not drain the
+  wait. Artifact removal occurs only after that exact set is empty.
 
 Neither policy cancels the fence, accepts a late result, or lets a detached
 writer recreate an artifact. Actual artifact inventory, locked writer
 quiescence, directory barriers, residual manifests, and purge behavior remain
 production work.
+
+Diagnostics use a closed schema. Codes and reasons are fixed enums; lane and
+numeric fields are validated; caller-controlled job and effect identifiers are
+represented only as `opaque:xxxxxxxx` hashes. Raw job ids, result/status
+strings, transcript, prompt, provider payload, credentials, and other content
+cannot enter the diagnostic object through metadata spreading.
 
 ## Human policy decisions
 
@@ -151,26 +176,26 @@ real. No row is implemented here.
 | Prototype transition | Required production owner | Contract carried forward |
 | --- | --- | --- |
 | `Idle -> DurableQueued` before remote dispatch | Projection Backlog/scheduler persistence (`audio-graph-3b48`) | A restart can distinguish never-dispatched durable work from external-effect-unknown work; Notes and Graph queue independently |
-| `DurableQueued -> RemoteInFlight -> ExternalEffectUnknown` across restart | Projection scheduler persistence (`audio-graph-3b48`) | Persist exact job/attempt ownership; do not infer provider outcome; apply the accepted reissue policy |
+| `DurableQueued -> RemoteInFlight -> ExternalEffectUnknown` across restart | Projection scheduler persistence (`audio-graph-3b48`) | Persist exact lane/Session/epoch/lease/job/attempt/effect ownership; do not infer provider outcome; apply the accepted reissue policy |
 | canonical enqueue -> `Pending` | canonical commit boundary (`audio-graph-90f3`, then mixed transcript follow-through in `audio-graph-6b9d`) | Queue admission, writer send, and snapshot write expose no durable state and no Projection Basis eligibility |
 | write -> flush -> file sync | canonical durability (`audio-graph-90f3`) | Any pre-ack lost response is reconciled by exact id and attempted bytes; sequence cannot be reused |
 | new-file directory sync, typed quarantine registration, destructive recovery | cross-platform durability (`audio-graph-8e73`) | Do not produce `Accepted` or user-facing Saved until the platform-specific file/directory/manifest transaction is proven |
-| durable exact commit -> `Accepted(sequence)` | canonical commit integration (`audio-graph-90f3`) | Atomically advance live materialized state and basis eligibility; snapshot failure is rebuildable-cache lag |
-| exact reopen/retry -> `AlreadyAccepted(original sequence)` | canonical durability/recovery (`audio-graph-90f3` plus `audio-graph-8e73`) | Reconcile before append; exact retry cannot duplicate or renumber the event |
+| durable exact commit -> `Accepted(sequence)` | canonical commit integration (`audio-graph-90f3`) | Validate exact owner/Session/lane/event/lifecycle/prestate binding, then atomically advance live materialized state and basis eligibility; snapshot failure is rebuildable-cache lag |
+| exact reopen/retry -> `AlreadyAccepted(original sequence)` | canonical durability/recovery (`audio-graph-90f3` plus `audio-graph-8e73`) | Rebind recovery to the current owner and exact event bytes before reconciliation; exact retry cannot duplicate or renumber the event |
 | `Accepted`/`AlreadyAccepted` provenance guard -> v2 Session floor | Session-provenance floor (`audio-graph-7e81`) | The monotonic floor advances only from these receipts; guard-ahead retry is idempotent |
 | accepted sequence -> first-position ledger/basis | unified ledger (`audio-graph-0baf`) and scheduler/currency (`audio-graph-4c82`) | Only accepted canonical order may become a Projection Basis position; Pending and uncertain work remain ineligible |
 | restart lease replacement and Session epoch rotation | scheduler persistence (`audio-graph-3b48`) plus Session lifecycle/load (`audio-graph-9c89`, later `audio-graph-e969`) | Match exact Session, epoch, lease, lane, and job id before any terminal mutation |
-| deletion fence -> discard or fenced wait -> artifact removal | Session deletion (`audio-graph-9c89`, later checked mixed deletion in `audio-graph-e969`) plus `audio-graph-8e73` durability | Revoke writers before removal/wait; late results cannot publish; typed inventory and residual reporting determine completion |
-| deterministic failure code/counter | trustworthy acceptance evidence (`audio-graph-44c1`) | Diagnostics contain only state metadata, never transcript, prompt, provider payload, credentials, or other user content |
+| deletion fence -> discard or fenced wait -> artifact removal | Session deletion (`audio-graph-9c89`, later checked mixed deletion in `audio-graph-e969`) plus `audio-graph-8e73` durability | Revoke writers before removal/wait; exact outstanding effect identities—not job ids—govern wait completion; late results cannot publish; typed inventory and residual reporting determine completion |
+| deterministic failure code/counter | trustworthy acceptance evidence (`audio-graph-44c1`) | Emit closed code/reason enums, validated numeric/lane fields, and opaque identifier hashes; never spread arbitrary result/status/id or user content into diagnostics |
 
 ## Executable evidence boundary
 
-The successful run explores eight policy profiles and 744 exhaustive bounded
-cases: 368 admission/crash cases, 80 receipt cases, 32 scheduler-restart cases,
-200 two-lane commutativity cases, and 64 rotation/deletion cases. It evaluates
-7,434 reducer transitions, observes 936 unique full states, performs 55,638
-invariant assertions across 23 named invariant families, and observes all five
-receipt states.
+The successful run explores eight policy profiles and 774 exhaustive bounded
+cases: 30 correction regressions, 368 admission/crash cases, 80 receipt cases,
+32 scheduler-restart cases, 200 two-lane commutativity cases, and 64
+rotation/deletion cases. It evaluates 7,472 reducer transitions, observes 906
+unique full states, performs 92,110 invariant assertions across 29 named
+invariant families, and observes all five receipt states.
 
 Those counts describe this finite prototype, not the production state space.
 They do not prove filesystem, subprocess, operating-system, provider, or UI

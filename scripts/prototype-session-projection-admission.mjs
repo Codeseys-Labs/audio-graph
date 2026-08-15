@@ -10,7 +10,9 @@
  * Assumptions: the model is finite, in-memory, metadata-only, and deliberately
  * smaller than the production filesystem/provider implementation. It treats a
  * newly created canonical stream as durable only after file and parent-directory
- * barriers. Remote side effects cannot be inferred after a process loses an
+ * barriers, binds receipts to the exact Pending/recovery capability, tracks
+ * each remote attempt by exact effect identity, and emits only closed-schema
+ * diagnostics. Remote side effects cannot be inferred after a process loses an
  * in-flight request. The three product policies remain parameters, not decisions.
  *
  * Run: bun scripts/prototype-session-projection-admission.mjs
@@ -37,6 +39,30 @@ const CUTS = [
 ];
 const STREAM_KINDS = ["Existing", "New"];
 const RESULT_KINDS = ["Success", "Failure"];
+const DIAGNOSTIC_CODES = [
+  "AutomaticReissueDuplicateRisk",
+  "DeletionFenceRaised",
+  "DerivedCacheLagging",
+  "DetachedResultRefused",
+  "DetachedWriterRefused",
+  "IdempotencyConflictRejected",
+  "RemoteEffectNeedsDecision",
+  "SessionEpochReplaced",
+  "SessionLeaseReplaced",
+  "TornTailRequiresTypedQuarantine",
+];
+const DIAGNOSTIC_REASONS = [
+  "DeletionTerminalObserved",
+  "DerivedCacheLag",
+  "DuplicateCostEgressRisk",
+  "EffectIdentityMismatch",
+  "ExternalEffectUnknown",
+  "IdempotencyConflict",
+  "InvalidResultKind",
+  "LaneMismatch",
+  "RetiredOwner",
+  "TypedQuarantineRequired",
+];
 
 const policyProfiles = [];
 for (const savedWording of ["Saved", "Durably saved"]) {
@@ -84,12 +110,14 @@ function makeLane(lane, session) {
     scheduler: "Idle",
     queueDurable: false,
     remoteAttempt: 0,
+    outstandingEffects: [],
     duplicateCostEgressRisk: false,
     admission: {
       eventId: `${lane.toLowerCase()}-event-${session.epoch}`,
       digest: `prototype-digest-${lane.toLowerCase()}-${session.epoch}`,
       attemptedSequence: 1,
       lastReceipt: "None",
+      pendingBinding: null,
       committed: null,
     },
     materializedSequence: null,
@@ -108,7 +136,7 @@ function initialState(policy) {
     lifecycle: "Active",
     deletionFence: 0,
     artifacts: "Present",
-    pendingRemoteJobs: [],
+    pendingRemoteEffects: [],
   };
 
   return {
@@ -124,9 +152,36 @@ function initialState(policy) {
   };
 }
 
+function opaqueRef(value) {
+  const serialized = typeof value === "string" ? value : JSON.stringify(value ?? null);
+  const input = typeof serialized === "string" ? serialized : "unrepresentable";
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `opaque:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 function addDiagnostic(state, code, metadata = {}) {
+  modelGuard(
+    DIAGNOSTIC_CODES.includes(code),
+    "diagnostic-schema",
+    "diagnostic code must be a closed enum",
+    state,
+  );
+  const diagnostic = { code };
+  if (LANES.includes(metadata.lane)) diagnostic.lane = metadata.lane;
+  if (DIAGNOSTIC_REASONS.includes(metadata.reason)) diagnostic.reason = metadata.reason;
+  for (const key of ["sessionEpoch", "lease", "sequence", "attempt"]) {
+    if (Number.isSafeInteger(metadata[key]) && metadata[key] >= 0) {
+      diagnostic[key] = metadata[key];
+    }
+  }
+  if (metadata.jobId !== undefined) diagnostic.jobRef = opaqueRef(metadata.jobId);
+  if (metadata.effect !== undefined) diagnostic.effectRef = opaqueRef(metadata.effect);
   state.diagnostics.count += 1;
-  state.diagnostics.last = { code, ...metadata };
+  state.diagnostics.last = diagnostic;
 }
 
 function ownerMatches(state, owner) {
@@ -136,6 +191,159 @@ function ownerMatches(state, owner) {
     owner.epoch === state.session.epoch &&
     owner.lease === state.session.lease
   );
+}
+
+function ownersEqual(left, right) {
+  return (
+    left !== null &&
+    right !== null &&
+    left.sessionKey === right.sessionKey &&
+    left.epoch === right.epoch &&
+    left.lease === right.lease &&
+    left.jobId === right.jobId
+  );
+}
+
+function makeEffectIdentity(laneName, owner, attempt) {
+  return {
+    lane: laneName,
+    sessionKey: owner.sessionKey,
+    sessionEpoch: owner.epoch,
+    lease: owner.lease,
+    jobId: owner.jobId,
+    attempt,
+    resultRef: `${laneName.toLowerCase()}-result-${owner.epoch}-${owner.lease}-${attempt}`,
+    owner: structuredClone(owner),
+  };
+}
+
+function effectsEqual(left, right) {
+  return (
+    left !== null &&
+    right !== null &&
+    left.lane === right.lane &&
+    left.sessionKey === right.sessionKey &&
+    left.sessionEpoch === right.sessionEpoch &&
+    left.lease === right.lease &&
+    left.jobId === right.jobId &&
+    left.attempt === right.attempt &&
+    left.resultRef === right.resultRef &&
+    ownersEqual(left.owner, right.owner)
+  );
+}
+
+function effectIsStructurallyValid(effect, laneName) {
+  return (
+    effect !== null &&
+    effect.lane === laneName &&
+    typeof effect.sessionKey === "string" &&
+    Number.isSafeInteger(effect.sessionEpoch) &&
+    effect.sessionEpoch >= 0 &&
+    Number.isSafeInteger(effect.lease) &&
+    effect.lease >= 0 &&
+    typeof effect.jobId === "string" &&
+    Number.isSafeInteger(effect.attempt) &&
+    effect.attempt >= 1 &&
+    typeof effect.resultRef === "string" &&
+    effect.owner !== null &&
+    effect.sessionKey === effect.owner.sessionKey &&
+    effect.sessionEpoch === effect.owner.epoch &&
+    effect.lease === effect.owner.lease &&
+    effect.jobId === effect.owner.jobId
+  );
+}
+
+function effectIndex(effects, candidate) {
+  return effects.findIndex((effect) => effectsEqual(effect, candidate));
+}
+
+function admissionPrestate(lane) {
+  return lane.admission.committed === null ? lane.admission.lastReceipt : "Committed";
+}
+
+function makeReceiptBinding(state, laneName, expectedPrestate = undefined) {
+  const lane = state.lanes[laneName];
+  return {
+    lane: laneName,
+    owner: structuredClone(lane.owner),
+    sessionKey: state.session.key,
+    sessionEpoch: state.session.epoch,
+    lease: state.session.lease,
+    eventId: lane.admission.eventId,
+    digest: lane.admission.digest,
+    expectedLifecycle: "Active",
+    expectedPrestate: expectedPrestate ?? admissionPrestate(lane),
+  };
+}
+
+function bindingsEqual(left, right) {
+  return (
+    left !== null &&
+    right !== null &&
+    left.lane === right.lane &&
+    ownersEqual(left.owner, right.owner) &&
+    left.sessionKey === right.sessionKey &&
+    left.sessionEpoch === right.sessionEpoch &&
+    left.lease === right.lease &&
+    left.eventId === right.eventId &&
+    left.digest === right.digest &&
+    left.expectedLifecycle === right.expectedLifecycle &&
+    left.expectedPrestate === right.expectedPrestate
+  );
+}
+
+function validateReceiptBinding(state, laneName, binding, allowedPrestates) {
+  const lane = state.lanes[laneName];
+  const currentPrestate = admissionPrestate(lane);
+  modelGuard(
+    binding !== null && typeof binding === "object",
+    "receipt-binding",
+    "canonical receipt requires a binding",
+    state,
+  );
+  modelGuard(
+    LANES.includes(laneName) && binding.lane === laneName,
+    "receipt-binding",
+    "canonical receipt lane mismatch",
+    state,
+  );
+  modelGuard(
+    state.session.lifecycle === "Active" && binding.expectedLifecycle === "Active",
+    "receipt-binding",
+    "canonical receipt requires the Active lifecycle",
+    state,
+  );
+  modelGuard(
+    binding.sessionKey === state.session.key &&
+      binding.sessionEpoch === state.session.epoch &&
+      binding.lease === state.session.lease &&
+      ownersEqual(binding.owner, lane.owner),
+    "receipt-binding",
+    "canonical receipt owner or Session generation mismatch",
+    state,
+  );
+  modelGuard(
+    binding.eventId === lane.admission.eventId && binding.digest === lane.admission.digest,
+    "receipt-binding",
+    "canonical receipt event identity mismatch",
+    state,
+  );
+  modelGuard(
+    allowedPrestates.includes(currentPrestate) &&
+      binding.expectedPrestate === currentPrestate,
+    "receipt-binding",
+    "canonical receipt prestate mismatch",
+    state,
+  );
+  if (currentPrestate === "Pending") {
+    modelGuard(
+      lane.admission.pendingBinding !== null &&
+        bindingsEqual(binding, lane.admission.pendingBinding),
+      "receipt-binding",
+      "canonical receipt does not match the Pending admission",
+      state,
+    );
+  }
 }
 
 function fullDurabilityProof(streamKind) {
@@ -150,14 +358,17 @@ function fullDurabilityProof(streamKind) {
 
 function isDurableProof(proof) {
   return (
+    STREAM_KINDS.includes(proof?.streamKind) &&
     proof?.writeComplete === true &&
     proof.flushComplete === true &&
     proof.fileSynced === true &&
-    (proof.streamKind === "Existing" || proof.directorySynced === true)
+    (proof.streamKind === "Existing" ||
+      (proof.streamKind === "New" && proof.directorySynced === true))
   );
 }
 
-function acceptCanonical(lane, status, proof) {
+function acceptCanonical(state, laneName, status, proof, binding, allowedPrestates) {
+  const lane = state.lanes[laneName];
   modelGuard(
     status === "Accepted" || status === "AlreadyAccepted",
     "receipt-domain",
@@ -170,6 +381,7 @@ function acceptCanonical(lane, status, proof) {
     `${status} lacks its declared durability proof`,
     lane,
   );
+  validateReceiptBinding(state, laneName, binding, allowedPrestates);
 
   const candidate = {
     eventId: lane.admission.eventId,
@@ -185,6 +397,7 @@ function acceptCanonical(lane, status, proof) {
   }
 
   lane.admission.lastReceipt = status;
+  lane.admission.pendingBinding = null;
   lane.materializedSequence = candidate.sequence;
   lane.basisEligibleSequence = candidate.sequence;
   lane.derivedCache = "Current";
@@ -193,12 +406,13 @@ function acceptCanonical(lane, status, proof) {
 function finishDeletion(state) {
   state.session.lifecycle = "Deleted";
   state.session.artifacts = "Absent";
-  state.session.pendingRemoteJobs = [];
+  state.session.pendingRemoteEffects = [];
   for (const laneName of LANES) {
     const lane = state.lanes[laneName];
     lane.owner = null;
     lane.scheduler = "Fenced";
     lane.queueDurable = false;
+    lane.outstandingEffects = [];
     lane.admission.lastReceipt = "None";
     lane.admission.committed = null;
     lane.materializedSequence = null;
@@ -232,21 +446,55 @@ function transition(input, action) {
       );
       lane.scheduler = "RemoteInFlight";
       lane.remoteAttempt += 1;
+      lane.outstandingEffects.push(
+        makeEffectIdentity(action.lane, lane.owner, lane.remoteAttempt),
+      );
       break;
     }
     case "RemoteResult": {
-      if (!ownerMatches(state, action.owner) || lane.owner?.jobId !== action.owner.jobId) {
+      const resultKindValid = RESULT_KINDS.includes(action.result);
+      const laneEffectIndex = effectIndex(lane.outstandingEffects, action.effect);
+      const exactCurrentEffect =
+        resultKindValid &&
+        ownerMatches(state, action.owner) &&
+        ownersEqual(action.owner, lane.owner) &&
+        action.effect?.lane === action.lane &&
+        ownersEqual(action.owner, action.effect?.owner) &&
+        laneEffectIndex >= 0;
+      if (!exactCurrentEffect) {
         lane.refusedResults += 1;
-        const pendingIndex = state.session.pendingRemoteJobs.indexOf(action.owner.jobId);
-        if (state.session.lifecycle === "Deleting" && pendingIndex >= 0) {
-          state.session.pendingRemoteJobs.splice(pendingIndex, 1);
+        const pendingIndex = effectIndex(
+          state.session.pendingRemoteEffects,
+          action.effect,
+        );
+        const exactDeletingEffect =
+          state.session.lifecycle === "Deleting" &&
+          resultKindValid &&
+          action.effect?.lane === action.lane &&
+          ownersEqual(action.owner, action.effect?.owner) &&
+          pendingIndex >= 0;
+        if (exactDeletingEffect) {
+          state.session.pendingRemoteEffects.splice(pendingIndex, 1);
+          const deletingLaneEffect = effectIndex(lane.outstandingEffects, action.effect);
+          if (deletingLaneEffect >= 0) lane.outstandingEffects.splice(deletingLaneEffect, 1);
         }
+        const refusalReason = !resultKindValid
+          ? "InvalidResultKind"
+          : exactDeletingEffect
+            ? "DeletionTerminalObserved"
+            : action.effect?.lane !== action.lane
+              ? "LaneMismatch"
+              : !ownerMatches(state, action.owner)
+                ? "RetiredOwner"
+                : "EffectIdentityMismatch";
         addDiagnostic(state, "DetachedResultRefused", {
           lane: action.lane,
-          sessionEpoch: action.owner.epoch,
-          lease: action.owner.lease,
-          jobId: action.owner.jobId,
-          status: action.result,
+          reason: refusalReason,
+          sessionEpoch: action.owner?.epoch,
+          lease: action.owner?.lease,
+          attempt: action.effect?.attempt,
+          jobId: action.owner?.jobId,
+          effect: action.effect,
         });
         break;
       }
@@ -256,6 +504,7 @@ function transition(input, action) {
         "current result requires RemoteInFlight",
         state,
       );
+      lane.outstandingEffects.splice(laneEffectIndex, 1);
       lane.scheduler = action.result === "Success" ? "ResultReady" : "RemoteFailed";
       break;
     }
@@ -267,6 +516,7 @@ function transition(input, action) {
         state,
       );
       lane.admission.lastReceipt = "Pending";
+      lane.admission.pendingBinding = makeReceiptBinding(state, action.lane, "Pending");
       break;
     }
     case "Receipt": {
@@ -277,8 +527,16 @@ function transition(input, action) {
         state,
       );
       if (action.status === "Accepted" || action.status === "AlreadyAccepted") {
-        acceptCanonical(lane, action.status, action.proof);
+        acceptCanonical(
+          state,
+          action.lane,
+          action.status,
+          action.proof,
+          action.binding,
+          action.status === "Accepted" ? ["Pending"] : ["Committed"],
+        );
       } else {
+        validateReceiptBinding(state, action.lane, action.binding, ["Pending"]);
         lane.admission.lastReceipt = action.status;
       }
       break;
@@ -289,13 +547,26 @@ function transition(input, action) {
     }
     case "ReconcileCrash": {
       if (action.diskOutcome === "DurableExact") {
-        acceptCanonical(lane, "AlreadyAccepted", fullDurabilityProof(action.streamKind));
+        acceptCanonical(
+          state,
+          action.lane,
+          "AlreadyAccepted",
+          fullDurabilityProof(action.streamKind),
+          action.binding,
+          ["Pending", "OutcomeUncertain"],
+        );
       } else {
+        validateReceiptBinding(
+          state,
+          action.lane,
+          action.binding,
+          ["Pending", "OutcomeUncertain"],
+        );
         lane.admission.lastReceipt = "Rejected";
         if (action.diskOutcome === "TornTail") {
           addDiagnostic(state, "TornTailRequiresTypedQuarantine", {
             lane: action.lane,
-            status: "Rejected",
+            reason: "TypedQuarantineRequired",
           });
         }
       }
@@ -311,13 +582,20 @@ function transition(input, action) {
           action.eventId === committed.eventId &&
           action.digest === committed.digest
         ) {
-          acceptCanonical(lane, "AlreadyAccepted", committed.proof);
+          acceptCanonical(
+            state,
+            action.lane,
+            "AlreadyAccepted",
+            committed.proof,
+            action.binding,
+            ["Committed"],
+          );
         } else {
           lane.admission.lastReceipt = "Rejected";
           addDiagnostic(state, "IdempotencyConflictRejected", {
             lane: action.lane,
+            reason: "IdempotencyConflict",
             sequence: committed.sequence,
-            status: "Rejected",
           });
         }
       } else {
@@ -327,7 +605,14 @@ function transition(input, action) {
           "uncommitted retry must match attempted bytes",
           state,
         );
-        acceptCanonical(lane, "Accepted", fullDurabilityProof(action.streamKind));
+        acceptCanonical(
+          state,
+          action.lane,
+          "Accepted",
+          fullDurabilityProof(action.streamKind),
+          action.binding,
+          ["Pending", "Rejected", "OutcomeUncertain"],
+        );
       }
       break;
     }
@@ -341,6 +626,7 @@ function transition(input, action) {
       lane.derivedCache = "LaggingRebuildable";
       addDiagnostic(state, "DerivedCacheLagging", {
         lane: action.lane,
+        reason: "DerivedCacheLag",
         sequence: lane.admission.committed.sequence,
       });
       break;
@@ -373,20 +659,27 @@ function transition(input, action) {
       if (state.policy.remoteReissue === "AutomaticAtRisk") {
         lane.scheduler = "RemoteInFlight";
         lane.remoteAttempt += 1;
+        lane.outstandingEffects.push(
+          makeEffectIdentity(action.lane, lane.owner, lane.remoteAttempt),
+        );
         lane.duplicateCostEgressRisk = true;
         addDiagnostic(state, "AutomaticReissueDuplicateRisk", {
           lane: action.lane,
+          reason: "DuplicateCostEgressRisk",
           sessionEpoch: state.session.epoch,
           lease: state.session.lease,
           jobId: lane.owner.jobId,
+          effect: lane.outstandingEffects.at(-1),
         });
       } else {
         lane.scheduler = "AwaitingDecision";
         addDiagnostic(state, "RemoteEffectNeedsDecision", {
           lane: action.lane,
+          reason: "ExternalEffectUnknown",
           sessionEpoch: state.session.epoch,
           lease: state.session.lease,
           jobId: lane.owner.jobId,
+          effect: lane.outstandingEffects.at(-1),
         });
       }
       break;
@@ -402,7 +695,7 @@ function transition(input, action) {
       state.session.lease += 1;
       state.session.lifecycle = "Active";
       state.session.artifacts = "Present";
-      state.session.pendingRemoteJobs = [];
+      state.session.pendingRemoteEffects = [];
       state.lanes = Object.fromEntries(
         LANES.map((laneName) => [laneName, makeLane(laneName, state.session)]),
       );
@@ -422,9 +715,10 @@ function transition(input, action) {
       lane.refusedWrites += 1;
       addDiagnostic(state, "DetachedWriterRefused", {
         lane: action.lane,
-        sessionEpoch: action.owner.epoch,
-        lease: action.owner.lease,
-        jobId: action.owner.jobId,
+        reason: "RetiredOwner",
+        sessionEpoch: action.owner?.epoch,
+        lease: action.owner?.lease,
+        jobId: action.owner?.jobId,
       });
       break;
     }
@@ -438,18 +732,15 @@ function transition(input, action) {
       state.session.lifecycle = "Deleting";
       state.session.deletionFence += 1;
       state.session.lease += 1;
-      state.session.pendingRemoteJobs = [];
+      state.session.pendingRemoteEffects = [];
       for (const laneName of LANES) {
         const deletingLane = state.lanes[laneName];
         if (deletingLane.owner !== null) {
           state.detachedOwners.push(deletingLane.owner);
         }
-        if (
-          deletingLane.scheduler === "RemoteInFlight" ||
-          deletingLane.scheduler === "ExternalEffectUnknown"
-        ) {
-          state.session.pendingRemoteJobs.push(deletingLane.owner.jobId);
-        }
+        state.session.pendingRemoteEffects.push(
+          ...deletingLane.outstandingEffects.map((effect) => structuredClone(effect)),
+        );
         deletingLane.owner = null;
         deletingLane.scheduler = "Fenced";
       }
@@ -463,7 +754,7 @@ function transition(input, action) {
     case "CompleteDelete": {
       modelGuard(
         state.session.lifecycle === "Deleting" &&
-          state.session.pendingRemoteJobs.length === 0,
+          state.session.pendingRemoteEffects.length === 0,
         "deletion-transition",
         "wait deletion completes only after every remote terminal is observed",
         state,
@@ -575,7 +866,35 @@ function verifyState(state, where) {
         `${where} changed the attempted sequence for ${laneName}`,
         state,
       );
+      invariant(
+        lane.admission.pendingBinding === null,
+        "pending-receipt-binding",
+        `${where} retained a Pending binding after ${laneName} committed`,
+        state,
+      );
     }
+    if (lane.admission.lastReceipt === "Pending") {
+      invariant(
+        lane.admission.pendingBinding !== null &&
+          (state.session.lifecycle !== "Active" ||
+            bindingsEqual(
+              lane.admission.pendingBinding,
+              makeReceiptBinding(state, laneName, "Pending"),
+            )),
+        "pending-receipt-binding",
+        `${where} did not bind ${laneName} Pending to the current owner and prestate`,
+        state,
+      );
+    }
+    const effectKeys = lane.outstandingEffects.map((effect) => JSON.stringify(effect));
+    invariant(
+      lane.outstandingEffects.every((effect) =>
+        effectIsStructurallyValid(effect, laneName),
+      ) && new Set(effectKeys).size === effectKeys.length,
+      "outstanding-effect-identity",
+      `${where} retained a malformed or duplicate ${laneName} effect identity`,
+      state,
+    );
     invariant(
       committed !== null || savedLabel(state, laneName) !== state.policy.savedWording,
       "saved-label-requires-commit",
@@ -600,6 +919,29 @@ function verifyState(state, where) {
     }
   }
 
+  const pendingEffectKeys = state.session.pendingRemoteEffects.map((effect) =>
+    JSON.stringify(effect),
+  );
+  invariant(
+    new Set(pendingEffectKeys).size === pendingEffectKeys.length &&
+      state.session.pendingRemoteEffects.every(
+        (effect) =>
+          effectIsStructurallyValid(effect, effect.lane) &&
+          effectIndex(state.lanes[effect.lane].outstandingEffects, effect) >= 0,
+      ),
+    "deletion-effect-identity",
+    `${where} retained a malformed, duplicate, or unowned deletion effect`,
+    state,
+  );
+  if (state.session.lifecycle === "Active") {
+    invariant(
+      state.session.pendingRemoteEffects.length === 0,
+      "deletion-effect-identity",
+      `${where} exposed deletion wait effects while Active`,
+      state,
+    );
+  }
+
   if (state.session.lifecycle === "Deleted") {
     invariant(
       state.session.artifacts === "Absent" &&
@@ -619,16 +961,37 @@ function verifyState(state, where) {
     const allowedKeys = new Set([
       "code",
       "lane",
+      "reason",
       "sessionEpoch",
       "lease",
-      "jobId",
-      "status",
       "sequence",
+      "attempt",
+      "jobRef",
+      "effectRef",
     ]);
     invariant(
       Object.keys(diagnostic).every((key) => allowedKeys.has(key)),
       "content-free-diagnostics",
       `${where} diagnostic used a content-bearing field`,
+      state,
+    );
+    invariant(
+      DIAGNOSTIC_CODES.includes(diagnostic.code) &&
+        (diagnostic.lane === undefined || LANES.includes(diagnostic.lane)) &&
+        (diagnostic.reason === undefined ||
+          DIAGNOSTIC_REASONS.includes(diagnostic.reason)) &&
+        ["sessionEpoch", "lease", "sequence", "attempt"].every(
+          (key) =>
+            diagnostic[key] === undefined ||
+            (Number.isSafeInteger(diagnostic[key]) && diagnostic[key] >= 0),
+        ) &&
+        ["jobRef", "effectRef"].every(
+          (key) =>
+            diagnostic[key] === undefined ||
+            /^opaque:[0-9a-f]{8}$/u.test(diagnostic[key]),
+        ),
+      "content-free-diagnostics",
+      `${where} diagnostic violated its closed typed schema`,
       state,
     );
     invariant(
@@ -650,44 +1013,337 @@ function prepareRemote(state, laneName) {
   return next;
 }
 
+function currentOutstandingEffect(state, laneName) {
+  return structuredClone(state.lanes[laneName].outstandingEffects.at(-1));
+}
+
 function prepareAdmission(state, laneName) {
   let next = prepareRemote(state, laneName);
   next = reduce(next, {
     type: "RemoteResult",
     lane: laneName,
     owner: structuredClone(next.lanes[laneName].owner),
+    effect: currentOutstandingEffect(next, laneName),
     result: "Success",
   });
   return reduce(next, { type: "BeginAdmission", lane: laneName });
+}
+
+function boundReceiptAction(state, laneName, status, streamKind = "New") {
+  const lane = state.lanes[laneName];
+  return {
+    type: "Receipt",
+    lane: laneName,
+    status,
+    proof: fullDurabilityProof(streamKind),
+    binding: structuredClone(
+      lane.admission.pendingBinding ?? makeReceiptBinding(state, laneName),
+    ),
+  };
+}
+
+function checkReceiptBindingRegressions() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "WaitForRemote",
+  };
+  const missedRefusals = [];
+
+  let pending = prepareAdmission(initialState(policy), "Notes");
+  const delayedReceipt = boundReceiptAction(pending, "Notes", "Accepted");
+  const rotated = transition(pending, { type: "RotateSession" });
+  try {
+    transition(rotated, delayedReceipt);
+    missedRefusals.push("delayed-pre-rotation-receipt");
+  } catch (error) {
+    assert.match(String(error), /\[receipt-binding\]/u);
+  }
+
+  pending = prepareAdmission(initialState(policy), "Notes");
+  const deletingReceipt = boundReceiptAction(pending, "Notes", "Accepted");
+  const deleting = transition(pending, { type: "BeginDelete" });
+  try {
+    transition(deleting, deletingReceipt);
+    missedRefusals.push("accepted-during-deletion");
+  } catch (error) {
+    assert.match(String(error), /\[receipt-binding\]/u);
+  }
+
+  pending = prepareAdmission(initialState(policy), "Notes");
+  const bogusStreamReceipt = boundReceiptAction(pending, "Notes", "Accepted");
+  bogusStreamReceipt.proof = {
+    ...fullDurabilityProof("New"),
+    streamKind: "Bogus",
+  };
+  try {
+    transition(pending, bogusStreamReceipt);
+    missedRefusals.push("bogus-stream-kind");
+  } catch (error) {
+    assert.match(String(error), /\[accepted-requires-durability\]/u);
+  }
+
+  assert.deepEqual(
+    missedRefusals,
+    [],
+    `receipt-boundary regressions accepted: ${missedRefusals.join(", ")}`,
+  );
+  invariantFamilies.add("receipt-binding-refusal");
+  assertionCount += 3;
+  return 3;
+}
+
+function checkReceiptForgeryMatrix() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "WaitForRemote",
+  };
+  const pending = prepareAdmission(initialState(policy), "Notes");
+  const baseAction = boundReceiptAction(pending, "Notes", "Accepted");
+  const mutations = [
+    ["action-lane", (action) => (action.lane = "Graph")],
+    ["binding-lane", (action) => (action.binding.lane = "Graph")],
+    ["owner-session", (action) => (action.binding.owner.sessionKey = "session-forged")],
+    ["owner-epoch", (action) => (action.binding.owner.epoch += 1)],
+    ["owner-lease", (action) => (action.binding.owner.lease += 1)],
+    ["owner-job", (action) => (action.binding.owner.jobId = "forged-job")],
+    ["session-key", (action) => (action.binding.sessionKey = "session-forged")],
+    ["session-epoch", (action) => (action.binding.sessionEpoch += 1)],
+    ["lease", (action) => (action.binding.lease += 1)],
+    ["event-id", (action) => (action.binding.eventId = "forged-event")],
+    ["digest", (action) => (action.binding.digest = "forged-digest")],
+    ["lifecycle", (action) => (action.binding.expectedLifecycle = "Deleting")],
+    ["prestate", (action) => (action.binding.expectedPrestate = "None")],
+  ];
+  const missedRefusals = [];
+  for (const [name, mutate] of mutations) {
+    const action = structuredClone(baseAction);
+    mutate(action);
+    try {
+      transition(pending, action);
+      missedRefusals.push(name);
+    } catch (error) {
+      assert.match(String(error), /\[receipt-binding\]/u);
+    }
+  }
+
+  const idle = initialState(policy);
+  try {
+    transition(idle, {
+      type: "Receipt",
+      lane: "Notes",
+      status: "Accepted",
+      proof: fullDurabilityProof("New"),
+      binding: makeReceiptBinding(idle, "Notes"),
+    });
+    missedRefusals.push("idle-prestate");
+  } catch (error) {
+    assert.match(String(error), /\[receipt-binding\]/u);
+  }
+
+  assert.deepEqual(
+    missedRefusals,
+    [],
+    `receipt-forgery matrix accepted: ${missedRefusals.join(", ")}`,
+  );
+  assertionCount += 14;
+  return 14;
+}
+
+function prototypeEffectIdentity(state, laneName, owner = undefined, attempt = undefined) {
+  const lane = state.lanes[laneName];
+  const effectOwner = structuredClone(owner ?? lane.owner);
+  const effectAttempt = attempt ?? lane.remoteAttempt;
+  return makeEffectIdentity(laneName, effectOwner, effectAttempt);
+}
+
+function waitEffectCount(state) {
+  return state.session.pendingRemoteEffects.length;
+}
+
+function checkWaitEffectIdentityRegressions() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "AutomaticAtRisk",
+    deletion: "WaitForRemote",
+  };
+  const missedRefusals = [];
+
+  let twoAttempt = prepareRemote(initialState(policy), "Notes");
+  const firstEffect = prototypeEffectIdentity(twoAttempt, "Notes");
+  twoAttempt = reduce(twoAttempt, { type: "Restart" });
+  twoAttempt = reduce(twoAttempt, { type: "RecoverExternalUnknown", lane: "Notes" });
+  const secondEffect = prototypeEffectIdentity(twoAttempt, "Notes");
+  twoAttempt = transition(twoAttempt, { type: "BeginDelete" });
+  if (waitEffectCount(twoAttempt) !== 2) missedRefusals.push("two-attempt-registration");
+
+  const afterFirst = transition(twoAttempt, {
+    type: "RemoteResult",
+    lane: "Notes",
+    owner: firstEffect.owner,
+    effect: firstEffect,
+    result: "Success",
+  });
+  if (waitEffectCount(afterFirst) !== 1) missedRefusals.push("exact-first-attempt");
+  const afterFirstReplay = transition(afterFirst, {
+    type: "RemoteResult",
+    lane: "Notes",
+    owner: firstEffect.owner,
+    effect: firstEffect,
+    result: "Failure",
+  });
+  if (waitEffectCount(afterFirstReplay) !== 1) {
+    missedRefusals.push("replayed-first-attempt");
+  }
+  const afterSecond = transition(afterFirstReplay, {
+    type: "RemoteResult",
+    lane: "Notes",
+    owner: secondEffect.owner,
+    effect: secondEffect,
+    result: "Failure",
+  });
+  if (waitEffectCount(afterSecond) !== 0) missedRefusals.push("exact-second-attempt");
+
+  for (const [field, value] of [
+    ["lane", "Graph"],
+    ["sessionKey", "session-forged"],
+    ["sessionEpoch", firstEffect.sessionEpoch + 1],
+    ["lease", firstEffect.lease + 1],
+    ["resultRef", "forged-result-ref"],
+  ]) {
+    const deleting = transition(prepareRemote(initialState(policy), "Notes"), {
+      type: "BeginDelete",
+    });
+    const forgedEffect = { ...firstEffect, [field]: value };
+    const refused = transition(deleting, {
+      type: "RemoteResult",
+      lane: "Notes",
+      owner: firstEffect.owner,
+      effect: forgedEffect,
+      result: "Success",
+    });
+    if (waitEffectCount(refused) !== 1) missedRefusals.push(`mismatched-${field}`);
+  }
+
+  let invalidResult = prepareRemote(initialState(policy), "Notes");
+  const invalidResultEffect = currentOutstandingEffect(invalidResult, "Notes");
+  invalidResult = transition(invalidResult, { type: "BeginDelete" });
+  invalidResult = transition(invalidResult, {
+    type: "RemoteResult",
+    lane: "Notes",
+    owner: invalidResultEffect.owner,
+    effect: invalidResultEffect,
+    result: "ForgedTerminal",
+  });
+  if (waitEffectCount(invalidResult) !== 1) {
+    missedRefusals.push("invalid-result-kind");
+  }
+
+  let crossLane = prepareRemote(initialState(policy), "Notes");
+  const staleNotesEffect = prototypeEffectIdentity(crossLane, "Notes");
+  crossLane = prepareRemote(crossLane, "Graph");
+  crossLane = transition(crossLane, { type: "BeginDelete" });
+  const crossLaneRefused = transition(crossLane, {
+    type: "RemoteResult",
+    lane: "Graph",
+    owner: staleNotesEffect.owner,
+    effect: staleNotesEffect,
+    result: "Success",
+  });
+  if (waitEffectCount(crossLaneRefused) !== 2) {
+    missedRefusals.push("cross-lane-stale-token");
+  }
+
+  assert.deepEqual(
+    missedRefusals,
+    [],
+    `wait-effect regressions failed: ${missedRefusals.join(", ")}`,
+  );
+  invariantFamilies.add("wait-effect-exactness");
+  assertionCount += 11;
+  return 11;
+}
+
+function checkStructuralDiagnosticRegression() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "DiscardImmediately",
+  };
+  let state = prepareRemote(initialState(policy), "Notes");
+  const originalEffect = currentOutstandingEffect(state, "Notes");
+  const maliciousOwner = {
+    ...structuredClone(originalEffect.owner),
+    jobId: "transcript prompt bearer credential payload secret",
+  };
+  const maliciousEffect = {
+    ...structuredClone(originalEffect),
+    jobId: maliciousOwner.jobId,
+    resultRef: "content audio secret result",
+    owner: maliciousOwner,
+  };
+  state = transition(state, { type: "RotateSession" });
+  const maliciousResult = transition(state, {
+    type: "RemoteResult",
+    lane: "Notes",
+    owner: maliciousOwner,
+    effect: maliciousEffect,
+    result: "secret transcript result",
+  });
+  const maliciousWriter = transition(state, {
+    type: "DetachedWrite",
+    lane: "Notes",
+    owner: maliciousOwner,
+  });
+
+  const violations = [];
+  for (const [name, diagnostic] of [
+    ["result", maliciousResult.diagnostics.last],
+    ["writer", maliciousWriter.diagnostics.last],
+  ]) {
+    const keys = Object.keys(diagnostic);
+    if (keys.includes("jobId") || keys.includes("status") || keys.includes("result")) {
+      violations.push(`${name}-arbitrary-field`);
+    }
+    if (/transcript|prompt|bearer|credential|payload|secret|content|audio/iu.test(JSON.stringify(diagnostic))) {
+      violations.push(`${name}-raw-value`);
+    }
+    for (const key of ["jobRef", "effectRef"]) {
+      if (key in diagnostic && !/^opaque:[0-9a-f]{8}$/u.test(diagnostic[key])) {
+        violations.push(`${name}-${key}-not-opaque`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    violations,
+    [],
+    `diagnostic regressions leaked structure: ${violations.join(", ")}`,
+  );
+  invariantFamilies.add("structural-diagnostic-regression");
+  assertionCount += 2;
+  return 2;
 }
 
 function applyReceiptPath(state, laneName, status, streamKind = "New") {
   let next = prepareAdmission(state, laneName);
   if (status === "Pending") return next;
   if (status === "Accepted") {
-    return reduce(next, {
-      type: "Receipt",
-      lane: laneName,
-      status,
-      proof: fullDurabilityProof(streamKind),
-    });
+    return reduce(next, boundReceiptAction(next, laneName, status, streamKind));
   }
   if (status === "AlreadyAccepted") {
-    next = reduce(next, {
-      type: "Receipt",
-      lane: laneName,
-      status: "Accepted",
-      proof: fullDurabilityProof(streamKind),
-    });
+    next = reduce(next, boundReceiptAction(next, laneName, "Accepted", streamKind));
     return reduce(next, {
       type: "Retry",
       lane: laneName,
       eventId: next.lanes[laneName].admission.eventId,
       digest: next.lanes[laneName].admission.digest,
       streamKind,
+      binding: makeReceiptBinding(next, laneName),
     });
   }
-  return reduce(next, { type: "Receipt", lane: laneName, status });
+  return reduce(next, boundReceiptAction(next, laneName, status, streamKind));
 }
 
 function diskOutcomes(streamKind, cut) {
@@ -732,15 +1388,10 @@ function checkAdmissionCrashMatrix() {
               state = prepareAdmission(state, laneName);
               const callerStatus = callerReceiptAtCut(cut);
               if (callerStatus !== "Pending") {
-                state = reduce(state, {
-                  type: "Receipt",
-                  lane: laneName,
-                  status: callerStatus,
-                  proof:
-                    callerStatus === "Accepted"
-                      ? fullDurabilityProof(streamKind)
-                      : undefined,
-                });
+                state = reduce(
+                  state,
+                  boundReceiptAction(state, laneName, callerStatus, streamKind),
+                );
               }
             }
 
@@ -758,6 +1409,7 @@ function checkAdmissionCrashMatrix() {
                 eventId: state.lanes[laneName].admission.eventId,
                 digest: state.lanes[laneName].admission.digest,
                 streamKind,
+                binding: makeReceiptBinding(state, laneName),
               });
             } else if (cut !== "BeforeEnqueue" || diskOutcome !== "Absent") {
               state = reduce(state, {
@@ -765,6 +1417,7 @@ function checkAdmissionCrashMatrix() {
                 lane: laneName,
                 streamKind,
                 diskOutcome,
+                binding: makeReceiptBinding(state, laneName),
               });
             }
 
@@ -775,6 +1428,7 @@ function checkAdmissionCrashMatrix() {
                 eventId: state.lanes[laneName].admission.eventId,
                 digest: state.lanes[laneName].admission.digest,
                 streamKind,
+                binding: makeReceiptBinding(state, laneName),
               });
             }
 
@@ -816,6 +1470,7 @@ function checkReceiptAndRetryMatrix() {
         eventId: exact.lanes[laneName].admission.eventId,
         digest: exact.lanes[laneName].admission.digest,
         streamKind: "New",
+        binding: makeReceiptBinding(exact, laneName),
       });
       assert.deepEqual(exact.lanes[laneName].admission.committed, committedBefore);
       invariantFamilies.add("exact-retry");
@@ -827,6 +1482,7 @@ function checkReceiptAndRetryMatrix() {
         eventId: exact.lanes[laneName].admission.eventId,
         digest: "prototype-digest-conflict",
         streamKind: "New",
+        binding: makeReceiptBinding(exact, laneName),
       });
       assert.deepEqual(conflicted.lanes[laneName].admission.committed, committedBefore);
       invariant(
@@ -859,6 +1515,7 @@ function checkSchedulerRestartMatrix() {
 
       let unknown = reduce(queued, { type: "DispatchRemote", lane: laneName });
       const detachedOwner = structuredClone(unknown.lanes[laneName].owner);
+      const detachedEffect = currentOutstandingEffect(unknown, laneName);
       unknown = reduce(unknown, { type: "Restart" });
       invariant(
         unknown.lanes[laneName].scheduler === "ExternalEffectUnknown",
@@ -871,6 +1528,7 @@ function checkSchedulerRestartMatrix() {
         type: "RemoteResult",
         lane: laneName,
         owner: detachedOwner,
+        effect: detachedEffect,
         result: "Success",
       });
       assert.deepEqual(unknown.lanes[laneName].admission, beforeLateResult);
@@ -947,6 +1605,9 @@ function checkRotationAndDeletionMatrix() {
         const oldOwners = Object.fromEntries(
           LANES.map((laneName) => [laneName, structuredClone(rotating.lanes[laneName].owner)]),
         );
+        const oldEffects = Object.fromEntries(
+          LANES.map((laneName) => [laneName, currentOutstandingEffect(rotating, laneName)]),
+        );
         rotating = reduce(rotating, { type: "RotateSession" });
         const cleanRotatedLanes = structuredClone(rotating.lanes);
         for (const [laneName, result] of [
@@ -957,6 +1618,7 @@ function checkRotationAndDeletionMatrix() {
             type: "RemoteResult",
             lane: laneName,
             owner: oldOwners[laneName],
+            effect: oldEffects[laneName],
             result,
           });
           rotating = reduce(rotating, {
@@ -984,6 +1646,9 @@ function checkRotationAndDeletionMatrix() {
         const deletingOwners = Object.fromEntries(
           LANES.map((laneName) => [laneName, structuredClone(deleting.lanes[laneName].owner)]),
         );
+        const deletingEffects = Object.fromEntries(
+          LANES.map((laneName) => [laneName, currentOutstandingEffect(deleting, laneName)]),
+        );
         deleting = reduce(deleting, { type: "BeginDelete" });
 
         if (policy.deletion === "DiscardImmediately") {
@@ -996,9 +1661,9 @@ function checkRotationAndDeletionMatrix() {
           );
         } else {
           invariant(
-            deleting.session.lifecycle === "Deleting" &&
+              deleting.session.lifecycle === "Deleting" &&
               deleting.session.artifacts === "Present" &&
-              deleting.session.pendingRemoteJobs.length === 2,
+              deleting.session.pendingRemoteEffects.length === 2,
             "wait-delete-policy",
             "wait policy removed artifacts before remote terminals",
             deleting,
@@ -1013,6 +1678,7 @@ function checkRotationAndDeletionMatrix() {
             type: "RemoteResult",
             lane: laneName,
             owner: deletingOwners[laneName],
+            effect: deletingEffects[laneName],
             result,
           });
           deleting = reduce(deleting, {
@@ -1024,7 +1690,7 @@ function checkRotationAndDeletionMatrix() {
         if (policy.deletion === "WaitForRemote") {
           invariant(
             deleting.session.lifecycle === "Deleting" &&
-              deleting.session.pendingRemoteJobs.length === 0,
+              deleting.session.pendingRemoteEffects.length === 0,
             "wait-delete-policy",
             "wait policy did not observe all remote terminals",
             deleting,
@@ -1058,6 +1724,7 @@ function compactState(state) {
             scheduler: lane.scheduler,
             queueDurable: lane.queueDurable,
             remoteAttempt: lane.remoteAttempt,
+            outstandingEffects: lane.outstandingEffects,
             duplicateCostEgressRisk: lane.duplicateCostEgressRisk,
             admission: lane.admission,
             materializedSequence: lane.materializedSequence,
@@ -1097,33 +1764,33 @@ function showRepresentativeTrace() {
     type: "RemoteResult",
     lane: "Notes",
     owner: structuredClone(state.lanes.Notes.owner),
+    effect: currentOutstandingEffect(state, "Notes"),
     result: "Success",
   });
   traceStep("3 remote result ready", state);
   state = reduce(state, { type: "BeginAdmission", lane: "Notes" });
   traceStep("4 canonical Pending", state);
-  state = reduce(state, {
-    type: "Receipt",
-    lane: "Notes",
-    status: "OutcomeUncertain",
-  });
+  state = reduce(state, boundReceiptAction(state, "Notes", "OutcomeUncertain"));
   traceStep("5 crash after file sync but before new-file directory sync/ack", state);
   state = reduce(state, {
     type: "ReconcileCrash",
     lane: "Notes",
     streamKind: "New",
     diskOutcome: "DurableExact",
+    binding: makeReceiptBinding(state, "Notes"),
   });
   traceStep("6 exact reopen/retry returns AlreadyAccepted", state);
   state = reduce(state, { type: "SnapshotFailure", lane: "Notes" });
   traceStep("7 derived cache lags without rolling back canonical state", state);
   const oldOwner = structuredClone(state.lanes.Notes.owner);
+  const oldEffect = makeEffectIdentity("Notes", oldOwner, 1);
   state = reduce(state, { type: "RotateSession" });
   traceStep("8 epoch and lease replaced", state);
   state = reduce(state, {
     type: "RemoteResult",
     lane: "Notes",
     owner: oldOwner,
+    effect: oldEffect,
     result: "Failure",
   });
   traceStep("9 late failure refused", state);
@@ -1143,9 +1810,15 @@ console.log(
   "Assumptions: finite metadata-only model; new files need file + directory barriers; unknown remote effect stays unknown; policies are parameters.",
 );
 
+const correctionRegressionCases =
+  checkReceiptBindingRegressions() +
+  checkReceiptForgeryMatrix() +
+  checkWaitEffectIdentityRegressions() +
+  checkStructuralDiagnosticRegression();
 showRepresentativeTrace();
 
 const counts = {
+  correctionRegressionCases,
   admissionCrashCases: checkAdmissionCrashMatrix(),
   receiptCases: checkReceiptAndRetryMatrix(),
   schedulerRestartCases: checkSchedulerRestartMatrix(),
@@ -1159,7 +1832,7 @@ assertionCount += 1;
 
 console.log("\nExhaustive finite-model result:");
 console.log(JSON.stringify({ policyProfiles: policyProfiles.length, ...counts }, null, 2));
-console.log(`cases explored: ${caseCount}`);
+console.log(`cases explored: ${caseCount + correctionRegressionCases}`);
 console.log(`transitions evaluated: ${transitionCount}`);
 console.log(`unique full states observed: ${observedStates.size}`);
 console.log(`invariant assertions: ${assertionCount}`);
