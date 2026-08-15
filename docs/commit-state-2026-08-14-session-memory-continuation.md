@@ -450,3 +450,17 @@ fmt, Windows module compile, frontend 968, contracts, pinned `verify:fast`,
 Seeds 90 ready/102 blocked with doctor 0 failures, Betterleaks, secret,
 placeholder, and diff gates passed. No Docker, Blacksmith, workflow, push,
 prototype merge, Seed closure, or extra edit occurred.
+
+### Wave 7B Wave1b closure and manifest activation
+
+Custody `4204565` was merged history-preservingly at `315037e`. Its one linear
+commit after `8dd2dc1` changes only `.seeds/issues.jsonl`, and the integrated
+641-row queue is byte-identical to custody.
+
+Seeds c2e3, ce19, and 83e2 are closed and absent from ready and blocked queues.
+Seed a596 is now `in_progress`, unblocked, and assigned to
+`codex-a596-wave7b`; 8e73 records a596, 3b8b, b77b, and 2df3 as the remaining
+ordered path. The queue has 90 ready and 100 blocked issues, and doctor has 0
+failures. Output stress, all five contracts, pinned `verify:fast`,
+Betterleaks, secret, and range gates passed. Product suites were not rerun;
+no workflow, push, or extra Seed edit occurred.

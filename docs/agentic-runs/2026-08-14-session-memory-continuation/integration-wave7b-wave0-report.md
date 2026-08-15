@@ -205,3 +205,23 @@ Custody has closed 661f. Seeds c2e3, ce19, and 83e2 remain open or in-progress
 for root reconciliation even though the reviewed complete stack is now
 integrated. No Docker, Blacksmith, workflow, push, extra Seed edit, or
 prototype merge occurred.
+
+## Wave1b Seed reconciliation
+
+Custody `42045658e96a65e72d2c8fdda62c04c6184e48c7` was merged
+history-preservingly at `315037ee121ae7a6234eac17c2e2fe882647b307`.
+Its one linear commit after custody `8dd2dc1` changes only
+`.seeds/issues.jsonl`; the integrated 641-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seeds c2e3, ce19, and 83e2 are closed and absent from both ready and blocked
+queues. Seed a596 is `in_progress`, unblocked, and assigned to
+`codex-a596-wave7b`. Parent 8e73 records the active order as a596, then 3b8b,
+b77b, and 2df3.
+
+The complete queue contains 90 ready and 100 blocked issues. Seeds output
+stress parsed ready 50, blocked 100, and list 50. All five contracts, pinned
+`verify:fast`, Betterleaks, docs/Seeds secret hygiene, and exact range diff
+passed. Seeds Doctor reported 10 passed, 2 custody-carried warning groups, and
+0 failures. Product files did not change, so product suites were not rerun;
+no workflow, push, or extra Seed edit occurred.
