@@ -634,3 +634,23 @@ matched exactly without changing source.
 Seed b77b is root-closure eligible; 2df3 follows reconciliation for native
 platform proof, while 464c remains ready but inactive. No Seed closure, push,
 workflow, Blacksmith, Docker, guest, or platform qualification occurred.
+
+### Wave 7B Wave4 closure and platform-qualification activation
+
+Custody `aa7a5a7` was merged history-preservingly at `8e4c137`. Its one
+linear commit after `9191983` changes only `.seeds/issues.jsonl`, and the
+integrated 642-row queue is byte-identical to custody.
+
+Seed b77b is closed and absent from open queues with exact reviewed
+integration evidence. Seed 2df3 is `in_progress`, unblocked, and assigned to
+`codex-2df3-wave7b`; 8e73 records closed b77b, active 2df3, and no runtime
+activation. Existing Blacksmith Actions jobs remain platform authority with
+terminal monitoring and explicit Testbox stop/list-empty cleanup. Authorized
+Dockurr guests remain supplemental only, with no license material, complete
+container/storage/image cleanup, and no power-loss claim.
+
+The queue has 91 ready and 95 blocked issues, and doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no additional Seed
+closure/edit, push, workflow, Blacksmith, Docker, guest, or platform run
+occurred.

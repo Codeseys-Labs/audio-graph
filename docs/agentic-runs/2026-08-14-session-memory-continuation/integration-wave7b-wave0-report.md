@@ -545,3 +545,37 @@ remains next after custody reconciliation and owns native Windows, macOS/APFS,
 and Linux platform qualification. Seed 464c remains ready but inactive. No
 Seed was closed or additionally edited, and no push, workflow, Blacksmith,
 Docker, guest, or platform-qualification action occurred.
+
+## Wave4 closure and platform-qualification activation
+
+Custody `aa7a5a7fd3ddc77e7a77c053d9355c3e638f9ce2` was merged
+history-preservingly without conflict at
+`8e4c137b60d3c649e7e2223d995a8df63565255c`. Its one linear commit after
+custody `9191983` changes only `.seeds/issues.jsonl`; the integrated 642-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Seed b77b is closed and absent from ready and blocked queues. Its exact
+integration evidence records candidate `17a9452`, integration tip `2b477ec`,
+Standards and Spec **SHIP**, two correction rounds, harness 11, log 46,
+manifest 18, durability 40, full cloud 1,671/0/8, frontend 968, 13 checkpoint
+pairs, process-crash/returned-barrier-only scope, and no runtime activation.
+
+Seed 2df3 is `in_progress`, unblocked, and assigned to
+`codex-2df3-wave7b`. Existing Blacksmith macOS and Windows Actions jobs are
+platform authority; any supported Testbox must be monitored to terminal,
+explicitly stopped, and followed by an empty active-list check. Authorized
+Dockurr Windows/macOS guests are supplemental only, require no requested,
+stored, or logged license material, and require container, dedicated storage,
+and downloaded-image cleanup. No VM-backed result may be called power-loss
+proof. Parent 8e73's exact Wave4 extension records integration tip `2b477ec`,
+closed b77b, active 2df3, the assembled evidence, no runtime activation, and
+closure only after macOS, Windows, and Linux evidence is integrated with no
+non-test production caller.
+
+The queue contains 91 ready and 95 blocked issues. Seeds output stress parsed
+ready 50, blocked 95, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no additional
+Seed closure/edit, push, workflow, Blacksmith, Docker, guest, or platform run
+occurred.
