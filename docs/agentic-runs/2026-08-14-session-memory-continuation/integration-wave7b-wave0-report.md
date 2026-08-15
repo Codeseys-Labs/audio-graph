@@ -325,3 +325,61 @@ Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no product,
 workflow, push, extra Seed edit, Blacksmith, or Docker action occurred.
+
+## Wave2 reviewed manifest-kernel fan-in
+
+Custody `6c7037f5f9f75d59627cfeee6e8024780e7c0109` was merged
+history-preservingly at `c82a003268fcd341e2ffdf7f6a8573a6817fafba`.
+Its four linear commits after custody `c3a0d88` are exactly `2360fd3`,
+`f7c8a5f`, `2465262`, and `6c7037f`, change only `.seeds/issues.jsonl`, and
+preserve the byte-identical valid 642-row custody queue.
+
+Final-cap a596 tip `e1dd22b281f9ebee51b87bf8d2ec6595de167496`
+was merged history-preservingly without conflict at
+`b8988fb4f550aadfb1306ea5fca1d5ad20369a48`. Its six linear commits from
+exact merge-base `5444b66` add only `session_artifact_manifest.rs`, the narrow
+module declaration, and the a596 report. Standards and Spec final-cap
+re-reviews returned **SHIP** with no findings.
+
+The dormant explicit-root kernel enforces strict V1 schema and portable
+identity admission, including the 1,023-byte total identity ceiling and
+persisted generation floor. Its transaction owns the canonical guard and
+performs initial or exact-open-head replacement CAS. Durable Prepared state
+drives exact immutable completion and cannot be dropped; exact Completed
+retry remains `AlreadyCompleted`. Candidate serialization is capped at 16
+MiB before durability mutation, and strict loads use bounded opened-handle
+reads with metadata/length revalidation. Quarantine and Original Session
+Audio unavailable evidence, deletion parity, and internal identities remain
+typed and explicit.
+
+There is no non-test runtime consumer, dependency or unsafe addition,
+workflow, default root, provisioning, broad repository/adapter/UI adoption,
+recovery transaction, or prototype ancestry.
+
+| Gate | Result |
+| --- | --- |
+| focused serialized manifest | 18 passed, 0 failed in 8.75 seconds |
+| focused serialized canonical durability | 38 passed, 0 failed in 3.66 seconds |
+| locked cloud lib/tests check | passed in 25.82 seconds |
+| full direct locked cloud library, serialized | 1,636 passed, 0 failed, 8 ignored in 49.95 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| pinned Windows production and test-object module probes | passed; 10,089,418-byte rlib and 2,824,992-byte object |
+| exact frontend `test:local` | 70 files and 968 tests passed in 107.48 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 90 ready; 100 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 100, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, secret, footprint, placeholder, prototype, and diff hygiene | approximately 2.70 MB, no leaks; 0 secret findings; passed |
+
+The first two Windows test-object wrapper attempts used `cargo rustc --test`,
+which selected metadata-form dependency externs and stopped before module
+compilation. The production Cargo probe was already green; direct pinned
+`rustc` with the built Windows-target rlibs then compiled the actual two-module
+test object successfully. This was probe construction, not a product failure,
+and the result remains cross-compilation rather than native filesystem proof.
+
+The first preflight forbidden-path scan also classified `src-tauri/src` as
+frontend `src/`; the exact three-path candidate allowlist and corrected
+contamination scan passed. Seed a596 is eligible for root closure after the
+reviewed landing; 3b8b is next only after custody reconciliation. No Seed was
+closed or additionally edited, and no push, workflow, Blacksmith, Docker, or
+runtime activation occurred.

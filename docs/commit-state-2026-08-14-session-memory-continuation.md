@@ -518,3 +518,31 @@ The queue has 90 ready and 100 blocked issues, and doctor has 0 failures.
 Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no product, workflow,
 push, extra Seed edit, Blacksmith, or Docker action occurred.
+
+### Wave 7B Wave2 reviewed manifest-kernel fan-in
+
+Four linear Seed-only custody commits through `6c7037f` were merged at
+`c82a003`, followed by reviewed six-commit a596 tip `e1dd22b` at `b8988fb`.
+The integrated 642-row queue is byte-identical to custody. The candidate's
+exact footprint is the new manifest kernel, its one-line module declaration,
+and report; Standards and Spec final-cap re-reviews returned **SHIP** with no
+findings.
+
+The dormant explicit-root kernel enforces strict V1 schema and identity,
+1,023-byte total identity and 16 MiB wire ceilings, persisted generation
+floor, guard-owned initial/replacement CAS, head-driven immutable Prepared
+completion, exact retry, bounded handle reads, and quarantine/audio/deletion
+parity. There is no runtime consumer, default root/provisioning,
+unsafe/dependency/workflow/UI/recovery, broad adoption, or prototype landing.
+
+Manifest 18, canonical durability 38, locked check, full serialized
+1,636/0/8, strict Clippy, fmt, Windows production/test-object module probes,
+frontend 968, all contracts, pinned `verify:fast`, Seeds 90 ready/100 blocked
+with doctor 0 failures, Betterleaks, secret, footprint, placeholder,
+prototype, and diff gates passed. The initial Cargo test-object wrappers
+selected metadata externs; direct pinned `rustc` with built target rlibs
+passed, so this was probe construction rather than a product failure.
+
+Seed a596 is root-closure eligible; 3b8b is next only after reconciliation.
+No Seed closure, push, workflow, Blacksmith, Docker, or runtime activation
+occurred.
