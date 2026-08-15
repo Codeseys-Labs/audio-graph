@@ -195,3 +195,39 @@ ADR-0036 remain proposed.
 Seeds Doctor has 0 failures. Pinned `verify:fast`, all five contracts, Seeds
 JSON/output, Betterleaks, secret, and range-diff gates passed. No product suite
 was rerun because this reconciliation changes only Seeds and integration docs.
+
+## Wave 7 accepted implementation base
+
+Starting from clean tip `0fdc746687c48e0b2d4fcbd75d91b26c4e3886fc`,
+custody `f61cbe15ae2068fa40c2e4b51e95f026a6033779` was merged
+history-preservingly at `1760badc15306e4eb736ec54f2c7e3cb74fc2624`.
+Its one linear commit after custody `9738ca3` changes only
+`.seeds/issues.jsonl`, and the integrated queue is byte-identical to custody.
+
+Human-authorized acceptance tip
+`4eaa99c239b8b4b8e7b8aba41d4c8c30a1395fc8` was then merged without conflict
+at `17e5ab266165ae7a1d2f8f735e19967d9d7377dc`. Its one commit from the exact
+starting base changes only ADR-0035, ADR-0036, and their README index rows. Both
+ADRs are accepted, name only the AudioGraph user and product owner as human
+decider, retain byte-identical decision bodies, and preserve all previously
+accepted ADR files.
+
+`audio-graph-4249` is active and `in_progress`; the CLI therefore excludes it
+from both ready and blocked output. Its accepted implementation order is:
+
+1. add the durable monotonic `session_semantics_version` guard;
+2. implement unified strict v1/v2 canonical ledger writer, reader, and replay;
+3. implement explicit hash-v2 basis creation, currency, and prompt ordering;
+4. complete session load/export/timeline/recovery and predecessor-refusal
+   fixtures.
+
+`audio-graph-48de` remains blocked by 4249, and `audio-graph-ada2` remains
+`in_progress` and transitively blocked through 48de. The complete queue is 91
+ready and 89 blocked. Seeds Doctor reported 10 passed, 2 custody-carried
+warning groups, and 0 failures.
+
+Seeds JSON/output, ADR status/index/link/relationship, all five contracts,
+repo-authoritative pinned `verify:fast`, Betterleaks, docs/Seeds secret, and
+range-diff gates passed. Product code did not change, so product suites were
+not run. No Seed was closed, no workflow was dispatched, and no branch was
+pushed.
