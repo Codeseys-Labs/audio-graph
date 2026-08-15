@@ -696,3 +696,22 @@ The harness remains `cfg(test)` and runtime-dark. Apple-native APFS execution
 remains deferred. Seed 67d3 is root-closure eligible; 52b9 remains
 approval-gated, and 2df3 retains native Blacksmith evidence ownership. No
 Seed closure, workflow or platform action, push, Docker, or guest run occurred.
+
+### Wave 7B Wave5 portability closure and workflow decision gate
+
+Custody `88a4031` was merged history-preservingly at `eeb5eb9`. Its one
+linear commit after `69877d7` changes only `.seeds/issues.jsonl`, and the
+integrated 644-row queue is byte-identical to custody.
+
+Seed 67d3 is closed with exact reviewed `de77de1` integration evidence; b77b
+remains closed. Seed 52b9 is `in_progress`, assigned to `product-owner`, and
+awaits the human decision on one `workflow_dispatch`-only native evidence
+workflow. Seed 2df3 is blocked only by 52b9. Existing `ci.yml` on the evidence
+branch is preliminary regression progress only and remains insufficient for
+closure because the required per-cut filesystem evidence is not retained.
+Parent 8e73 records the same state and no runtime activation.
+
+The queue has 91 ready and 96 blocked issues, and Doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no extra Seed edit,
+workflow, push, Blacksmith, Docker, guest, or platform action occurred.

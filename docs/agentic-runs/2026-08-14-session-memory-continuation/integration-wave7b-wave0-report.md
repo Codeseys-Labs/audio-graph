@@ -672,3 +672,34 @@ root closure after reconciliation. Seed 52b9 remains approval-gated before any
 workflow change, and 2df3 retains native Blacksmith evidence ownership. No
 Seed was closed or additionally edited, and no push, workflow, Blacksmith,
 Docker, guest, or platform execution occurred.
+
+## Wave5 portability closure and workflow decision gate
+
+Custody `88a403162f236e79b02c6fd32c313ab80dee1a78` was merged
+history-preservingly without conflict at
+`eeb5eb9c5ecac66eb09024bb3539803dad226507`. Its one linear commit after
+custody `69877d7` changes only `.seeds/issues.jsonl`; the integrated 644-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Seed 67d3 is closed with exact reviewed integration evidence for `de77de1`:
+Standards and Spec **SHIP**, Linux harness 11/11, Windows-policy simulations
+5/5, full cloud 1,671/0/8, pinned Windows production and test-object proofs,
+frontend 968, and no runtime activation. Seed b77b remains closed.
+
+Seed 52b9 is `in_progress`, assigned to `product-owner`, and records
+`AWAITING_HUMAN_DECISION` for exactly one new `workflow_dispatch`-only native
+evidence workflow with no push, pull-request, schedule, release trigger, or
+secret. Seed 2df3 is blocked only by 52b9. Dispatching the existing `ci.yml`
+from the recorded evidence branch is permitted preliminary regression
+progress without workflow mutation, but it does not retain the per-cut
+filesystem output and artifacts required for closure. No dispatch occurred in
+this reconciliation.
+
+Parent 8e73 records closed 67d3, approval-pending 52b9, parent 2df3, the same
+preliminary-CI limitation, and no runtime activation. The queue contains 91
+ready and 96 blocked issues. Seeds output stress parsed ready 50, blocked 96,
+and list 50. All five contracts, pinned `verify:fast`, Betterleaks,
+docs/Seeds secret hygiene, and exact range diff passed. Seeds Doctor reported
+10 passed, 2 custody-carried warning groups, and 0 failures. Product files did
+not change, so product suites were not rerun; no extra Seed edit, workflow,
+push, Blacksmith, Docker, guest, or platform action occurred.
