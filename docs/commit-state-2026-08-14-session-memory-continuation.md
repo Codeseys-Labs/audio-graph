@@ -432,3 +432,21 @@ ready and 103 blocked issues; doctor has 0 failures. Model, links, output
 stress, all five contracts, pinned `verify:fast`, Betterleaks, secret, and
 range gates passed. No product/full-suite, runtime, workflow, push, or extra
 Seed mutation occurred.
+
+### Wave 7B Wave1b durability stack
+
+Two linear Seed-only custody commits through `8dd2dc1` were merged at
+`509813c`, followed by the one history-preserving merge of final stacked Rust
+tip `234ebe9` at `45c5159`. The exact stack is c2e3 `477df40` (three commits),
+ce19 `28961a7` (two), and 83e2 `234ebe9` (two); only the final tip was merged.
+The integrated 641-row queue is byte-identical to custody, and prototype
+`88849b8` remains outside ancestry.
+
+The dormant module preserves reserved-name-before-access, exact-parent,
+Windows refusal, preflight cross-device refusal, and runtime EXDEV
+indeterminate/raw-code/recovery-key semantics with no new unsafe or runtime
+caller. Focused 23, locked check, full serialized 1,603/0/8, strict Clippy,
+fmt, Windows module compile, frontend 968, contracts, pinned `verify:fast`,
+Seeds 90 ready/102 blocked with doctor 0 failures, Betterleaks, secret,
+placeholder, and diff gates passed. No Docker, Blacksmith, workflow, push,
+prototype merge, Seed closure, or extra edit occurred.

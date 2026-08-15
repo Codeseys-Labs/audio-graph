@@ -149,3 +149,59 @@ docs/Seeds secret hygiene, and exact three-file pre-report range passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 No Rust or frontend full suite ran because no product file changed; no product,
 runtime, prototype, workflow, push, or extra Seed mutation occurred.
+
+## Wave1b durability-stack fan-in
+
+Custody `8dd2dc1036ab625a4a73d8b913b865bd059ecbd1` was merged
+history-preservingly at `509813c37596dabf62c98202831197846880a799`.
+Its two linear commits after custody `566fd95` change only
+`.seeds/issues.jsonl`; the integrated 641-row queue is byte-identical to
+custody and remains valid JSONL.
+
+The reviewed Rust stack is exact and linear: base `d259105` to c2e3 tip
+`477df40` in three commits, to ce19 tip `28961a7` in two commits, and to 83e2
+tip `234ebe9` in two commits. Only the final tip was merged, once,
+history-preservingly at `45c51592ea03f38087d21baa16390edf684f9b76`.
+Its true contribution is exactly `canonical_durability.rs`, the persistence
+module declaration, and the c2e3, ce19, and 83e2 reports. The c2e3 review cap
+backflow is resolved by the stacked successors; ce19 was reviewed Standards
+**SHIP-WITH-NITS** and Spec **SHIP**, and 83e2 was reviewed Standards and Spec
+**SHIP**.
+
+The assembled module reserves every ASCII-case coordination basename before
+filesystem access, binds mutation to the exact managed parent, refuses Windows
+absent append and rename before mutation, returns
+`CrossDeviceRenameRefused` only for a proven preflight device mismatch, and
+returns `DurabilityIndeterminate` with raw OS code and recovery key for runtime
+`EXDEV`. There is no new unsafe code and no non-test runtime caller; the only
+outside reference is the dormant persistence module declaration. Prototype
+tip `88849b8` remains a non-ancestor and its file is absent.
+
+| Gate | Result |
+| --- | --- |
+| focused serialized durability | 23 passed, 0 failed |
+| locked cloud lib/tests check | passed |
+| full direct locked cloud library, serialized | 1,603 passed, 0 failed, 8 ignored in 43.84 seconds |
+| strict cloud Clippy | passed with `-D warnings` in 30.49 seconds |
+| rustfmt | passed |
+| pinned Windows actual-module compile | passed; 571,590-byte rlib emitted |
+| exact frontend `test:local` | 70 files and 968 tests passed in 105.33 seconds |
+| all generated contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 90 ready; 102 blocked |
+| Seeds output stress | ready 50, blocked 102, and list 50 parsed |
+| Seeds Doctor | 10 passed, 2 custody-carried warning groups, 0 failures |
+| Betterleaks and docs/Seeds secret hygiene | approximately 2.70 MB, no leaks; 0 secret findings |
+| exact range, placeholder, and diff hygiene | passed |
+
+Two integration assertions were initially overbroad. The unsafe scan covered
+all of `persistence/mod.rs` and found four unchanged test-only unsafe blocks;
+the corrected merge-base delta proved zero added unsafe. The placeholder scan
+covered the complete Seeds authority and matched an old closed issue's task-marker
+string; the corrected custody-added-lines plus five stack-owned-file scan
+passed. Both were harness-scope false positives, not accepted-input or product
+failures.
+
+Custody has closed 661f. Seeds c2e3, ce19, and 83e2 remain open or in-progress
+for root reconciliation even though the reviewed complete stack is now
+integrated. No Docker, Blacksmith, workflow, push, extra Seed edit, or
+prototype merge occurred.
