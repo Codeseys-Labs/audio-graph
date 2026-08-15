@@ -1,7 +1,9 @@
-//! Linux subprocess evidence for dormant canonical durability and recovery.
+//! Native subprocess evidence for dormant canonical durability and recovery.
 //!
 //! This module is compiled only into the library test binary. Handshakes are
 //! versioned stage tokens and never include managed paths or fixture bytes.
+//! Linux and qualified macOS/APFS fixtures exercise the accepted namespace
+//! barriers. Windows/NTFS exercises the typed pre-mutation refusal boundary.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -34,7 +36,10 @@ pub(crate) fn checkpoint(stage: &str) {
     panic!("subprocess checkpoint exceeded its bounded parent-kill window");
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 mod tests {
     use super::*;
     use crate::persistence::canonical_durability::{
@@ -55,7 +60,6 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +81,228 @@ mod tests {
     const SOURCE_FULL: &[u8] = b"{\"value\":1}\nprivate incomplete tail";
     const FIRST_CREATE_BYTES: &[u8] = b"first-create-proof";
     const CONTINUE_FILE: &str = ".audio-graph-b77b-continue";
+
+    #[cfg(target_os = "windows")]
+    use crate::persistence::canonical_durability::{
+        CanonicalNamespaceOperation, CanonicalPlatform, CanonicalSnapshotExpectation,
+    };
+
+    #[derive(Debug)]
+    struct FixtureFilesystemEvidence {
+        queried_path: PathBuf,
+        platform: &'static str,
+        expected_filesystem: &'static str,
+        observed_filesystem: String,
+        detail: String,
+    }
+
+    impl FixtureFilesystemEvidence {
+        fn is_qualified(&self) -> bool {
+            self.observed_filesystem
+                .eq_ignore_ascii_case(self.expected_filesystem)
+        }
+    }
+
+    fn parse_macos_filesystem_plist(output: &str) -> Option<String> {
+        let key = "<key>FilesystemType</key>";
+        let after_key = output.split_once(key)?.1;
+        let after_open = after_key.split_once("<string>")?.1;
+        let value = after_open.split_once("</string>")?.0.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+
+    fn parse_windows_filesystem_output(output: &str) -> Option<String> {
+        output.split_whitespace().find_map(|token| {
+            let normalized =
+                token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            ["NTFS", "ReFS", "exFAT", "FAT32", "FAT"]
+                .into_iter()
+                .find(|candidate| normalized.eq_ignore_ascii_case(candidate))
+                .map(str::to_owned)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    mod platform {
+        use super::*;
+        use std::os::unix::process::ExitStatusExt;
+
+        pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = false;
+
+        pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
+            assert_eq!(status.signal(), Some(9), "{context}");
+        }
+
+        pub(super) fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
+            let findmnt = Command::new("findmnt")
+                .arg("-T")
+                .arg(path)
+                .args(["-o", "FSTYPE", "-n"])
+                .output()
+                .expect("run findmnt for live fixture parent");
+            assert!(findmnt.status.success(), "findmnt fixture query failed");
+            let statfs = Command::new("stat")
+                .args([
+                    "-f",
+                    "-c",
+                    "filesystem_type=%T block_size=%S blocks=%b free_blocks=%f name_max=%l",
+                ])
+                .arg(path)
+                .output()
+                .expect("run stat -f for live fixture parent");
+            assert!(statfs.status.success(), "stat -f fixture query failed");
+            FixtureFilesystemEvidence {
+                queried_path: path.to_path_buf(),
+                platform: "linux",
+                expected_filesystem: "ext4",
+                observed_filesystem: String::from_utf8(findmnt.stdout)
+                    .expect("findmnt evidence is UTF-8")
+                    .trim()
+                    .to_owned(),
+                detail: String::from_utf8(statfs.stdout)
+                    .expect("stat -f evidence is UTF-8")
+                    .trim()
+                    .to_owned(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod platform {
+        use super::*;
+        use std::os::unix::process::ExitStatusExt;
+
+        pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = true;
+
+        pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
+            assert_eq!(status.signal(), Some(9), "{context}");
+        }
+
+        pub(super) fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
+            let df = Command::new("/bin/df")
+                .arg("-P")
+                .arg(path)
+                .output()
+                .expect("run df for live fixture parent");
+            let df_output = String::from_utf8_lossy(&df.stdout);
+            let mount_point = df_output
+                .lines()
+                .last()
+                .and_then(|line| line.split_whitespace().last());
+            let diskutil = mount_point.and_then(|mount_point| {
+                let output = Command::new("/usr/sbin/diskutil")
+                    .args(["info", "-plist", mount_point])
+                    .output()
+                    .expect("run diskutil for live fixture mount");
+                output.status.success().then_some(output)
+            });
+            let observed_filesystem = diskutil
+                .as_ref()
+                .and_then(|output| {
+                    parse_macos_filesystem_plist(&String::from_utf8_lossy(&output.stdout))
+                })
+                .unwrap_or_else(|| "unavailable".to_owned());
+            FixtureFilesystemEvidence {
+                queried_path: path.to_path_buf(),
+                platform: "macos",
+                expected_filesystem: "apfs",
+                observed_filesystem,
+                detail: if df.status.success() && diskutil.is_some() {
+                    "df-and-diskutil-ok".to_owned()
+                } else {
+                    "filesystem-probe-refused".to_owned()
+                },
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    mod platform {
+        use super::*;
+        use std::path::{Component, Prefix};
+
+        pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = false;
+
+        pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
+            assert!(
+                !status.success() && status.code().is_some(),
+                "{context}: TerminateProcess must yield a reaped unsuccessful child, got {status:?}"
+            );
+        }
+
+        fn volume_argument(path: &Path) -> Option<String> {
+            let canonical = fs::canonicalize(path).ok()?;
+            let Component::Prefix(prefix) = canonical.components().next()? else {
+                return None;
+            };
+            match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    Some(format!("{}:", char::from(letter)))
+                }
+                _ => None,
+            }
+        }
+
+        pub(super) fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
+            let output = volume_argument(path).and_then(|volume| {
+                let output = Command::new("fsutil")
+                    .args(["fsinfo", "volumeinfo", &volume])
+                    .output()
+                    .expect("run fsutil for live fixture volume");
+                output.status.success().then_some(output)
+            });
+            let observed_filesystem = output
+                .as_ref()
+                .and_then(|output| {
+                    parse_windows_filesystem_output(&String::from_utf8_lossy(&output.stdout))
+                })
+                .unwrap_or_else(|| "unavailable".to_owned());
+            FixtureFilesystemEvidence {
+                queried_path: path.to_path_buf(),
+                platform: "windows",
+                expected_filesystem: "ntfs",
+                observed_filesystem,
+                detail: if output.is_some() {
+                    "fsutil-ok".to_owned()
+                } else {
+                    "filesystem-probe-refused".to_owned()
+                },
+            }
+        }
+    }
+
+    fn fixture_contract_is_qualified(path: &Path, context: &str) -> bool {
+        let evidence = platform::fixture_filesystem_evidence(path);
+        assert_eq!(evidence.queried_path, path);
+        let qualified = evidence.is_qualified();
+        let outcome = if qualified { "qualified" } else { "refused" };
+        println!(
+            "AUDIO_GRAPH_67D3_FIXTURE_FS_V1 platform={} expected={} observed={} outcome={} detail={} context={context}",
+            evidence.platform,
+            evidence.expected_filesystem,
+            evidence.observed_filesystem,
+            outcome,
+            evidence.detail,
+        );
+        assert!(
+            qualified || platform::ALLOW_EXPLICIT_FIXTURE_REFUSAL,
+            "{context}: required filesystem contract refused: platform={}, expected={}, observed={}",
+            evidence.platform,
+            evidence.expected_filesystem,
+            evidence.observed_filesystem,
+        );
+        qualified
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_fixture_is_qualified(path: &Path, context: &str) -> bool {
+        fixture_contract_is_qualified(path, context)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn macos_fixture_is_qualified(_path: &Path, _context: &str) -> bool {
+        true
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ObservedManifestPhase {
@@ -458,18 +684,8 @@ mod tests {
 
     impl Drop for ManagedChild {
         fn drop(&mut self) {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            if self.child.kill().is_err() {
-                return;
-            }
-            let deadline = Instant::now() + DROP_REAP_TIMEOUT;
-            while Instant::now() < deadline {
-                match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                }
+            if let Err(error) = self.kill_and_reap(DROP_REAP_TIMEOUT) {
+                eprintln!("AUDIO_GRAPH_67D3_CHILD_CLEANUP_V1 outcome=failed detail={error}");
             }
         }
     }
@@ -833,43 +1049,6 @@ mod tests {
         drop(guard);
     }
 
-    struct FixtureFilesystemEvidence {
-        queried_path: PathBuf,
-        findmnt: String,
-        statfs: String,
-    }
-
-    fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
-        let findmnt = Command::new("findmnt")
-            .arg("-T")
-            .arg(path)
-            .args(["-o", "TARGET,SOURCE,FSTYPE,OPTIONS", "-n"])
-            .output()
-            .expect("run findmnt for live fixture parent");
-        assert!(findmnt.status.success(), "findmnt fixture query failed");
-        let statfs = Command::new("stat")
-            .args([
-                "-f",
-                "-c",
-                "filesystem_type=%T block_size=%S blocks=%b free_blocks=%f name_max=%l",
-            ])
-            .arg(path)
-            .output()
-            .expect("run stat -f for live fixture parent");
-        assert!(statfs.status.success(), "stat -f fixture query failed");
-        FixtureFilesystemEvidence {
-            queried_path: path.to_path_buf(),
-            findmnt: String::from_utf8(findmnt.stdout)
-                .expect("findmnt evidence is UTF-8")
-                .trim()
-                .to_owned(),
-            statfs: String::from_utf8(statfs.stdout)
-                .expect("stat -f evidence is UTF-8")
-                .trim()
-                .to_owned(),
-        }
-    }
-
     fn child_action(action: &str) {
         match action {
             "seam" => emit_handshake("seam"),
@@ -945,20 +1124,23 @@ mod tests {
                 checkpoint("strict_reader_held");
                 unreachable!("strict reader must be killed");
             }
-            "reader_inode" => {
+            "reader_handle" => {
                 let root = child_root();
                 let _guard = CanonicalDurability::new()
                     .try_lock_shared(&root)
-                    .expect("reader inode shared guard");
+                    .expect("reader handle shared guard");
                 let path = root.join("data.bin");
-                let mut file = File::open(&path).expect("open reader inode");
-                await_parent_signal(&root, "reader_inode_open");
-                file.seek(SeekFrom::Start(0)).expect("rewind reader inode");
+                let mut file = File::open(&path).expect("open reader handle");
+                await_parent_signal(&root, "reader_handle_open");
+                file.seek(SeekFrom::Start(0)).expect("rewind reader handle");
                 let mut held = Vec::new();
-                file.read_to_end(&mut held).expect("read retained inode");
-                assert_eq!(held, b"old-inode");
-                assert_eq!(fs::read(path).expect("read replacement path"), b"new-inode");
-                emit_handshake("reader_inode_stable");
+                file.read_to_end(&mut held).expect("read retained handle");
+                assert_eq!(held, b"old-handle");
+                assert_eq!(
+                    fs::read(path).expect("read replacement path"),
+                    b"new-handle"
+                );
+                emit_handshake("reader_handle_stable");
             }
             "try_exclusive_contended" => {
                 assert!(matches!(
@@ -1240,21 +1422,37 @@ mod tests {
 
     #[test]
     fn filesystem_evidence_is_bound_to_the_live_fixture_parent() {
-        let root = TempRoot::new("fixture-mount-evidence");
-        let evidence = fixture_filesystem_evidence(root.path());
-        assert_eq!(evidence.queried_path, root.path());
-        assert!(!evidence.findmnt.is_empty());
-        assert!(evidence.statfs.contains("filesystem_type="));
-        println!(
-            "AUDIO_GRAPH_B77B_FIXTURE_FS_V1 path={} findmnt={} statfs={}",
-            evidence.queried_path.display(),
-            evidence.findmnt,
-            evidence.statfs
+        assert_eq!(
+            parse_macos_filesystem_plist(
+                "<plist><dict><key>FilesystemType</key><string>apfs</string></dict></plist>"
+            )
+            .as_deref(),
+            Some("apfs")
         );
+        assert_eq!(
+            parse_windows_filesystem_output("File System Name : NTFS").as_deref(),
+            Some("NTFS")
+        );
+        assert_eq!(parse_windows_filesystem_output("no filesystem token"), None);
+
+        let root = TempRoot::new("fixture-mount-evidence");
+        if !fixture_contract_is_qualified(root.path(), "filesystem-evidence") {
+            println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 platform=macos outcome=refused_not_apfs"
+            );
+        }
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn recovery_crash_cuts_reopen_and_retry_idempotently_in_fresh_processes() {
+        let qualification_root = TempRoot::new("recovery-platform-qualification");
+        if !macos_fixture_is_qualified(qualification_root.path(), "recovery-crash-cuts") {
+            println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 platform=macos test=recovery-crash-cuts outcome=refused_not_apfs"
+            );
+            return;
+        }
         for case in RECOVERY_CASES {
             let cut = case.checkpoint;
             let root = TempRoot::new(cut);
@@ -1263,7 +1461,7 @@ mod tests {
             let mut recovery = spawn_root_child("recover", root.path(), Some(cut));
             recovery.wait_for(&handshake(cut));
             let killed = recovery.kill_and_wait();
-            assert_eq!(killed.signal(), Some(9), "cut {cut}");
+            platform::assert_forced_termination(killed, &format!("cut {cut}"));
 
             let residual = observe_recovery(root.path());
             assert_expected_residual(*case, &residual);
@@ -1310,13 +1508,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn first_create_distinguishes_file_sync_from_parent_namespace_sync() {
+        let qualification_root = TempRoot::new("first-create-platform-qualification");
+        if !macos_fixture_is_qualified(qualification_root.path(), "first-create-cuts") {
+            println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 platform=macos test=first-create-cuts outcome=refused_not_apfs"
+            );
+            return;
+        }
         for cut in FIRST_CREATE_CUTS {
             let root = TempRoot::new(cut);
             let mut creator = spawn_root_child("first_create", root.path(), Some(cut));
             creator.wait_for(&handshake(cut));
             let killed = creator.kill_and_wait();
-            assert_eq!(killed.signal(), Some(9), "cut {cut}");
+            platform::assert_forced_termination(killed, &format!("cut {cut}"));
 
             let mut oracle = spawn_root_child("first_create_oracle", root.path(), None);
             oracle.wait_for(&handshake("first_create_oracle_ok"));
@@ -1346,7 +1552,7 @@ mod tests {
             durability.try_lock_shared(root.path()),
             Err(CanonicalCoordinationError::Contended)
         ));
-        assert_eq!(exclusive.kill_and_wait().signal(), Some(9));
+        platform::assert_forced_termination(exclusive.kill_and_wait(), "exclusive holder");
         drop(
             durability
                 .try_lock_exclusive(root.path())
@@ -1363,7 +1569,7 @@ mod tests {
             .try_lock_shared(root.path())
             .expect("shared and shared coexist across processes");
         drop(second_shared);
-        assert_eq!(shared.kill_and_wait().signal(), Some(9));
+        platform::assert_forced_termination(shared.kill_and_wait(), "shared holder");
         drop(
             durability
                 .try_lock_exclusive(root.path())
@@ -1372,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_reader_participates_and_open_inode_survives_uncooperative_raw_rename() {
+    fn strict_reader_participates_and_open_handle_survives_uncooperative_raw_rename() {
         let reader_root = TempRoot::new("strict-reader");
         fs::write(reader_root.path().join("events.jsonl"), SOURCE_PREFIX)
             .expect("seed strict reader stream");
@@ -1387,27 +1593,39 @@ mod tests {
             CanonicalDurability::new().try_lock_exclusive(reader_root.path()),
             Err(CanonicalCoordinationError::Contended)
         ));
-        assert_eq!(reader.kill_and_wait().signal(), Some(9));
+        platform::assert_forced_termination(reader.kill_and_wait(), "strict reader");
 
-        let inode_root = TempRoot::new("reader-inode");
-        fs::write(inode_root.path().join("data.bin"), b"old-inode").expect("seed reader inode");
-        provision_coordination(inode_root.path());
-        let mut inode_reader = spawn_root_child("reader_inode", inode_root.path(), None);
-        inode_reader.wait_for(&handshake("reader_inode_open"));
+        let handle_root = TempRoot::new("reader-handle");
+        fs::write(handle_root.path().join("data.bin"), b"old-handle").expect("seed reader handle");
+        provision_coordination(handle_root.path());
+        let mut handle_reader = spawn_root_child("reader_handle", handle_root.path(), None);
+        handle_reader.wait_for(&handshake("reader_handle_open"));
         fs::rename(
-            inode_root.path().join("data.bin"),
-            inode_root.path().join("moved.bin"),
+            handle_root.path().join("data.bin"),
+            handle_root.path().join("moved.bin"),
         )
         .expect("uncooperative raw rename remains possible under advisory lock");
-        fs::write(inode_root.path().join("data.bin"), b"new-inode")
-            .expect("install replacement inode");
-        fs::write(inode_root.path().join(CONTINUE_FILE), b"go").expect("signal reader inode child");
-        inode_reader.wait_for(&handshake("reader_inode_stable"));
-        assert!(inode_reader.wait().success());
+        fs::write(handle_root.path().join("data.bin"), b"new-handle")
+            .expect("install replacement file");
+        fs::write(handle_root.path().join(CONTINUE_FILE), b"go")
+            .expect("signal reader handle child");
+        handle_reader.wait_for(&handshake("reader_handle_stable"));
+        assert!(handle_reader.wait().success());
+        println!(
+            "AUDIO_GRAPH_67D3_ADVISORY_LOCK_V1 outcome=observed limitation=cooperating_processes_only open_handle=stable raw_rename=outside_contract"
+        );
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn rename_refusals_and_stable_coordination_identity_cross_processes() {
+        let qualification_root = TempRoot::new("rename-platform-qualification");
+        if !macos_fixture_is_qualified(qualification_root.path(), "rename-matrix") {
+            println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 platform=macos test=rename-matrix outcome=refused_not_apfs"
+            );
+            return;
+        }
         let refusal_root = TempRoot::new("rename-refusals");
         fs::create_dir_all(refusal_root.path().join("nested")).expect("create nested directory");
         fs::write(refusal_root.path().join("source.bin"), b"source").expect("seed rename source");
@@ -1441,5 +1659,116 @@ mod tests {
         let mut successor = spawn_root_child("try_exclusive_acquired", stable_root.path(), None);
         successor.wait_for(&handshake("exclusive_acquired_ok"));
         assert!(successor.wait().success());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_ntfs_namespace_paths_refuse_before_temp_head_or_source_mutation() {
+        let root = TempRoot::new("windows-ntfs-refusal");
+        assert!(fixture_contract_is_qualified(
+            root.path(),
+            "windows-namespace-refusal"
+        ));
+        fs::create_dir_all(root.path().join("streams")).expect("create stream fixture directory");
+        fs::create_dir_all(root.path().join("recovery"))
+            .expect("create recovery fixture directory");
+
+        let source = root.path().join("streams/events.jsonl");
+        let rename_destination = root.path().join("streams/events-renamed.jsonl");
+        let first_create = root.path().join("first-create.jsonl");
+        let recovery_temporary = root.path().join("recovery/events.tmp");
+        let recovery_destination = root.path().join("recovery/events.bin");
+        let snapshot_temporary = root.path().join("manifest.snapshot.tmp");
+        let snapshot_head = root.path().join("manifest.snapshot.json");
+        fs::write(&source, b"stable-source").expect("seed stable source");
+        fs::write(&recovery_temporary, b"stable-recovery-temp").expect("seed stable recovery temp");
+        fs::write(&snapshot_head, b"stable-head").expect("seed stable snapshot head");
+        let expected_head = File::open(&snapshot_head).expect("open stable snapshot head");
+        let key = CanonicalRecoveryKey::from_opaque_bytes([0x67; 16]);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(root.path())
+            .expect("acquire native Windows guard");
+
+        assert_eq!(
+            guard.append(&first_create, b"must-not-create", None, key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::FirstCreate,
+                }
+            )
+        );
+        assert_eq!(
+            guard.rename(&source, &rename_destination, None, key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert_eq!(
+            guard.preflight_recovery_namespace(
+                &source,
+                &recovery_temporary,
+                &recovery_destination,
+                None,
+            ),
+            Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert_eq!(
+            guard.rename_recovery(&recovery_temporary, &recovery_destination, None, key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert_eq!(
+            guard.install_snapshot(
+                &snapshot_temporary,
+                &snapshot_head,
+                b"must-not-install",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                None,
+                key,
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                }
+            )
+        );
+
+        assert!(!first_create.exists());
+        assert!(!rename_destination.exists());
+        assert_eq!(fs::read(&source).expect("source remains"), b"stable-source");
+        assert_eq!(
+            fs::read(&recovery_temporary).expect("recovery temp remains"),
+            b"stable-recovery-temp"
+        );
+        assert!(!recovery_destination.exists());
+        assert!(!snapshot_temporary.exists());
+        assert_eq!(
+            fs::read(&snapshot_head).expect("snapshot head remains"),
+            b"stable-head"
+        );
+        let mut contender = spawn_root_child("try_exclusive_contended", root.path(), None);
+        contender.wait_for(&handshake("exclusive_contended_ok"));
+        assert!(contender.wait().success());
+        drop(guard);
+        let mut successor = spawn_root_child("try_exclusive_acquired", root.path(), None);
+        successor.wait_for(&handshake("exclusive_acquired_ok"));
+        assert!(successor.wait().success());
+        println!(
+            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem=ntfs first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
+        );
     }
 }
