@@ -546,3 +546,19 @@ passed, so this was probe construction rather than a product failure.
 Seed a596 is root-closure eligible; 3b8b is next only after reconciliation.
 No Seed closure, push, workflow, Blacksmith, Docker, or runtime activation
 occurred.
+
+### Wave 7B Wave2 closure and locked-recovery activation
+
+Custody `3bdc6e5` was merged history-preservingly at `1be6180`. Its one
+linear commit after `6c7037f` changes only `.seeds/issues.jsonl`, and the
+integrated 642-row queue is byte-identical to custody.
+
+Seed a596 is closed and absent from open queues. Seed 3b8b is `in_progress`,
+unblocked, and assigned to `codex-3b8b-wave7b`; 8e73 records 3b8b, b77b, and
+2df3 as the active order. Seed 464c is open, unblocked, and ready but not
+active. Parent be7c remains open for broad artifact-consumer adoption.
+
+The queue has 91 ready and 97 blocked issues, and doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no product, workflow,
+push, extra Seed edit, Blacksmith, or Docker action occurred.

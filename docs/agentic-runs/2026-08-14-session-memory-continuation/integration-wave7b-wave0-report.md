@@ -383,3 +383,26 @@ contamination scan passed. Seed a596 is eligible for root closure after the
 reviewed landing; 3b8b is next only after custody reconciliation. No Seed was
 closed or additionally edited, and no push, workflow, Blacksmith, Docker, or
 runtime activation occurred.
+
+## Wave2 closure and locked-recovery activation
+
+Custody `3bdc6e548ddd4133ed47c9672b38abad652535b4` was merged
+history-preservingly at `1be6180848c51ba2d48f80d97dae5b9f7789fcab`.
+Its one linear commit after custody `6c7037f` changes only
+`.seeds/issues.jsonl`; the integrated 642-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seed a596 is closed and absent from ready and blocked queues. Seed 3b8b is
+`in_progress`, unblocked, and assigned to `codex-3b8b-wave7b`. Parent 8e73
+records the active order as 3b8b, b77b, and 2df3. Seed 464c is open, unblocked,
+and present in the ready queue, but is not active; its persistence-module
+overlap remains subject to serial or conflict-safe ownership. Parent be7c
+remains open for broad export, delete, purge, recovery, backup, retention,
+accounting, and typed residual IPC adoption.
+
+The queue contains 91 ready and 97 blocked issues. Seeds output stress parsed
+ready 50, blocked 97, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no product,
+workflow, push, extra Seed edit, Blacksmith, or Docker action occurred.
