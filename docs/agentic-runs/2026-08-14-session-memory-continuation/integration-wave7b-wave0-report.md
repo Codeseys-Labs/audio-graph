@@ -111,3 +111,41 @@ stress, all five contracts, pinned `verify:fast`, Betterleaks, docs/Seeds
 secret hygiene, and exact range diff passed. Seeds Doctor reported 10 passed,
 2 custody-carried warning groups, and 0 failures. Product files did not change,
 so no product suite was rerun; no workflow, push, or extra Seed edit occurred.
+
+## Wave1a partial fan-in
+
+Custody `566fd959619b810116f055619e95e3d4bc488225` was merged
+history-preservingly at `6c3b7ea70a4bd13600c1cf5341246d7603a7a027`.
+Its seven linear commits after custody `b890d3c` change only
+`.seeds/issues.jsonl`; the integrated 641-row queue is byte-identical to
+custody and remains valid JSONL. Reviewed 661f integration tip
+`e0b8c941145445973975acd4ca2076f2a206c99b` was then merged
+history-preservingly at `259dfee74b9323d73c6c4c74d5d4fb788fb349d0`.
+Its direct one-commit contribution from `d259105` is exactly the manifest
+transaction design and implementation report. Standards and Spec returned
+**SHIP** after correction.
+
+The dedicated prototype tip `88849b89cea3aaf476ffcf5fdd98029a4f095822`
+remains separate and is not an integration ancestor; its prototype path is
+absent from the assembled tree. Streaming that Git object directly through
+Node in ESM mode passed syntax and reproduced 124 cases, 1,158 transitions,
+411 states, 22,121 assertions, and 48 invariant families, selecting the
+versioned atomic snapshot with generation CAS. The first syntax pipe used
+Node's default CommonJS stdin mode, and the next shell assertion expected
+comma-formatted summaries rather than the model's labeled integer lines. Both
+wrapper-only attempts occurred before merge; the corrected exact-label ESM
+pipe passed.
+
+Blocked c2e3 tip `477df40` was not merged. Seed c2e3 is open and blocked by
+review-cap successors `ce19` and `83e2`; ce19 is `READY_NEXT`, and 83e2 remains
+blocked by ce19. Custody also records the authorized supplemental Dockurr guest
+runbook, audio E2E, Windows durability, and macOS/Windows virtualization
+boundaries while keeping native Blacksmith evidence authoritative and the
+Windows virtual-driver scope open.
+
+The complete queue contains 91 ready and 103 blocked issues. The 661f links,
+all five contracts, pinned `verify:fast`, Seeds output stress, Betterleaks,
+docs/Seeds secret hygiene, and exact three-file pre-report range passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+No Rust or frontend full suite ran because no product file changed; no product,
+runtime, prototype, workflow, push, or extra Seed mutation occurred.

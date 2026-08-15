@@ -415,3 +415,20 @@ and 101 blocked issues, and Seeds Doctor has 0 failures. Output stress, all
 five contracts, pinned `verify:fast`, Betterleaks, secret, and range gates
 passed. Product suites were not rerun; no workflow, push, or extra Seed edit
 occurred.
+
+### Wave 7B Wave1a partial fan-in
+
+Seven linear Seed-only custody commits through `566fd95` were merged at
+`6c3b7ea`, followed by reviewed docs-only 661f tip `e0b8c94` at `259dfee`.
+The integrated 641-row queue is byte-identical to custody. The 661f prototype
+remains separate and reproduced through `git show` with 124 cases, 1,158
+transitions, 411 states, 22,121 assertions, and 48 families; no prototype file
+or ancestry landed.
+
+Seed 661f has corrected Standards and Spec **SHIP** evidence. Blocked c2e3 tip
+`477df40` was not merged; c2e3 is blocked by ce19 and 83e2. Dockurr guest/audio
+extensions remain supplemental to native Blacksmith evidence. The queue has 91
+ready and 103 blocked issues; doctor has 0 failures. Model, links, output
+stress, all five contracts, pinned `verify:fast`, Betterleaks, secret, and
+range gates passed. No product/full-suite, runtime, workflow, push, or extra
+Seed mutation occurred.
