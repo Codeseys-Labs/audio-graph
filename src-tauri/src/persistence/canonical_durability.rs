@@ -1,12 +1,13 @@
 //! Canonical file and namespace durability barriers.
 //!
 //! This dormant module owns the filesystem sequencing behind a small,
-//! provider-neutral interface. A mutation guard is bound to one existing
-//! managed namespace, safe platform identity where available, and one
-//! deterministic coordination file inside that namespace. Guard-owned
-//! operations cannot be redirected to another root. Locks remain cooperative:
-//! an uncooperative process can still replace roots or race pathname operations
-//! outside this contract.
+//! provider-neutral interface. A mutation guard is bound to one exact target
+//! parent, safe platform identity where available, and one deterministic
+//! coordination file inside that directory. Append accepts only immediate
+//! children and rename is same-directory only, so one target can never select
+//! overlapping coordination roots. Locks remain cooperative: an uncooperative
+//! process can still replace roots or race pathname operations outside this
+//! contract.
 
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions, TryLockError};
@@ -123,8 +124,12 @@ pub enum CanonicalDurabilityRejection {
         operation: CanonicalNamespaceOperation,
     },
     TargetOutsideManagedNamespace,
-    ManagedNamespaceChanged,
+    IdentityChanged,
+    CrossDeviceRenameRefused {
+        raw_os_error: Option<i32>,
+    },
     QualificationBindingMismatch,
+    ReservedCoordinationEntry,
     NonRegularCanonicalEntry,
     DestinationAlreadyExists,
     CoordinationPoisoned,
@@ -231,15 +236,25 @@ impl ManagedNamespace {
             || !metadata.is_dir()
             || filesystem_identity(&metadata) != self.identity
         {
-            return Err(CanonicalDurabilityRejection::ManagedNamespaceChanged);
+            return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
         Ok(())
     }
 
-    fn bind_parent(&self, target: &Path) -> Result<BoundParent, CanonicalDurabilityRejection> {
+    fn bind_parent(
+        &self,
+        target: &Path,
+        platform: CanonicalPlatform,
+    ) -> Result<BoundParent, CanonicalDurabilityRejection> {
         self.validate_current()?;
         if target.file_name().is_none() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        if target
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(COORDINATION_FILE_NAME))
+        {
+            return Err(CanonicalDurabilityRejection::ReservedCoordinationEntry);
         }
         let parent = parent_directory(target);
         let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
@@ -249,17 +264,28 @@ impl ManagedNamespace {
                 durability_io(CanonicalDurabilityStage::OpenParent, &error)
             }
         })?;
-        if !canonical_parent.starts_with(&self.canonical_root) {
+        if canonical_parent != self.canonical_root {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
         let metadata = std::fs::metadata(&canonical_parent)
             .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
         let identity = filesystem_identity(&metadata);
-        if !metadata.is_dir() || identity.volume != self.identity.volume {
+        if !metadata.is_dir() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
-        let directory = File::open(&canonical_parent)
-            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+        if identity_is_available(&self.identity) && identity != self.identity {
+            return Err(CanonicalDurabilityRejection::IdentityChanged);
+        }
+        let directory = open_parent_directory(platform, &canonical_parent)?;
+        if let Some(directory) = &directory {
+            let opened_metadata = directory
+                .metadata()
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            let opened_identity = filesystem_identity(&opened_metadata);
+            if identity_is_available(&identity) && opened_identity != identity {
+                return Err(CanonicalDurabilityRejection::IdentityChanged);
+            }
+        }
         Ok(BoundParent {
             canonical_path: canonical_parent,
             directory,
@@ -269,7 +295,33 @@ impl ManagedNamespace {
 
 struct BoundParent {
     canonical_path: PathBuf,
-    directory: File,
+    directory: Option<File>,
+}
+
+#[cfg(target_os = "windows")]
+fn open_parent_directory(
+    _platform: CanonicalPlatform,
+    _path: &Path,
+) -> Result<Option<File>, CanonicalDurabilityRejection> {
+    // Rust's ordinary `File::open` does not request the directory-handle flags
+    // required by Windows. Existing-file append needs no directory handle, and
+    // every Windows namespace mutation is refused before a parent barrier.
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_parent_directory(
+    platform: CanonicalPlatform,
+    path: &Path,
+) -> Result<Option<File>, CanonicalDurabilityRejection> {
+    // The test policy can exercise Windows refusal on a Unix host without
+    // accidentally taking a Unix directory handle first.
+    if platform == CanonicalPlatform::Windows {
+        return Ok(None);
+    }
+    File::open(path)
+        .map(Some)
+        .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))
 }
 
 /// Exclusive mutation transaction bound to one managed namespace.
@@ -278,12 +330,15 @@ struct BoundParent {
 /// a caller cannot pair an arbitrary lock with an unrelated mutation target.
 pub struct CanonicalExclusiveGuard {
     namespace: ManagedNamespace,
+    platform: CanonicalPlatform,
     _lock_file: File,
     operation_lock: Mutex<()>,
     #[cfg(test)]
     injected_failure: Option<InjectedFailure>,
     #[cfg(test)]
     before_atomic_create: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    before_existing_open: Option<Arc<Barrier>>,
 }
 
 /// Shared strict-reader guard bound to the same deterministic coordination
@@ -301,12 +356,28 @@ struct InjectedFailure {
 }
 
 /// Factory for namespace-bound cooperative guards.
-#[derive(Default)]
 pub struct CanonicalDurability {
+    platform: CanonicalPlatform,
     #[cfg(test)]
     injected_failure: Option<InjectedFailure>,
     #[cfg(test)]
     before_atomic_create: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    before_existing_open: Option<Arc<Barrier>>,
+}
+
+impl Default for CanonicalDurability {
+    fn default() -> Self {
+        Self {
+            platform: current_platform(),
+            #[cfg(test)]
+            injected_failure: None,
+            #[cfg(test)]
+            before_atomic_create: None,
+            #[cfg(test)]
+            before_existing_open: None,
+        }
+    }
 }
 
 impl CanonicalDurability {
@@ -315,7 +386,7 @@ impl CanonicalDurability {
     }
 
     /// Acquire the deterministic writer coordination file inside an existing
-    /// managed root. The root itself is never provisioned.
+    /// exact target parent. The directory itself is never provisioned.
     pub fn try_lock_exclusive(
         &self,
         managed_root: &Path,
@@ -329,12 +400,15 @@ impl CanonicalDurability {
         let file = try_lock_exclusive(file)?;
         Ok(CanonicalExclusiveGuard {
             namespace,
+            platform: self.platform,
             _lock_file: file,
             operation_lock: Mutex::new(()),
             #[cfg(test)]
             injected_failure: self.injected_failure,
             #[cfg(test)]
             before_atomic_create: self.before_atomic_create.clone(),
+            #[cfg(test)]
+            before_existing_open: self.before_existing_open.clone(),
         })
     }
 
@@ -360,36 +434,62 @@ impl CanonicalDurability {
     #[cfg(test)]
     fn failing_at(stage: CanonicalDurabilityStage) -> Self {
         Self {
+            platform: current_platform(),
             injected_failure: Some(InjectedFailure {
                 stage,
                 raw_os_error: None,
             }),
             before_atomic_create: None,
+            before_existing_open: None,
         }
     }
 
     #[cfg(test)]
     fn failing_at_with_raw_os_error(stage: CanonicalDurabilityStage, raw_os_error: i32) -> Self {
         Self {
+            platform: current_platform(),
             injected_failure: Some(InjectedFailure {
                 stage,
                 raw_os_error: Some(raw_os_error),
             }),
             before_atomic_create: None,
+            before_existing_open: None,
         }
     }
 
     #[cfg(test)]
     fn with_before_atomic_create(barrier: Arc<Barrier>) -> Self {
         Self {
+            platform: current_platform(),
             injected_failure: None,
             before_atomic_create: Some(barrier),
+            before_existing_open: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_platform(platform: CanonicalPlatform) -> Self {
+        Self {
+            platform,
+            injected_failure: None,
+            before_atomic_create: None,
+            before_existing_open: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_existing_open(barrier: Arc<Barrier>) -> Self {
+        Self {
+            platform: current_platform(),
+            injected_failure: None,
+            before_atomic_create: None,
+            before_existing_open: Some(barrier),
         }
     }
 }
 
 impl CanonicalExclusiveGuard {
-    /// Append bytes inside the bound managed namespace.
+    /// Append bytes whose immediate canonical parent is the bound directory.
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
     /// additionally requires matching opaque qualification evidence and parent
@@ -409,7 +509,7 @@ impl CanonicalExclusiveGuard {
                 );
             }
         };
-        let parent = match self.namespace.bind_parent(path) {
+        let parent = match self.namespace.bind_parent(path, self.platform) {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
@@ -419,6 +519,14 @@ impl CanonicalExclusiveGuard {
         };
 
         let opened = if namespace_qualified {
+            let Some(parent_directory) = parent.directory else {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                        platform: self.platform,
+                        operation: CanonicalNamespaceOperation::FirstCreate,
+                    },
+                );
+            };
             self.wait_before_atomic_create();
             match OpenOptions::new()
                 .read(true)
@@ -428,10 +536,10 @@ impl CanonicalExclusiveGuard {
             {
                 Ok(file) => OpenedCanonicalFile::New {
                     file,
-                    parent: parent.directory,
+                    parent: parent_directory,
                 },
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    match open_existing_regular(path) {
+                    match self.open_existing_regular(path) {
                         Ok(file) => OpenedCanonicalFile::Existing(file),
                         Err(rejection) => {
                             return CanonicalDurabilityOutcome::Rejected(rejection);
@@ -446,7 +554,7 @@ impl CanonicalExclusiveGuard {
                 }
             }
         } else {
-            match open_existing_regular(path) {
+            match self.open_existing_regular(path) {
                 Ok(file) => OpenedCanonicalFile::Existing(file),
                 Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
                     kind: io::ErrorKind::NotFound,
@@ -454,7 +562,7 @@ impl CanonicalExclusiveGuard {
                 }) => {
                     return CanonicalDurabilityOutcome::Rejected(
                         CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                            platform: current_platform(),
+                            platform: self.platform,
                             operation: CanonicalNamespaceOperation::FirstCreate,
                         },
                     );
@@ -466,8 +574,8 @@ impl CanonicalExclusiveGuard {
         self.append_opened(opened, bytes, recovery_key)
     }
 
-    /// Publish a regular source file under a new unique name inside the bound
-    /// managed namespace.
+    /// Publish a regular source file under a new unique name in the same bound
+    /// directory. Cross-directory rename is outside this module's interface.
     pub fn rename(
         &self,
         source: &Path,
@@ -483,11 +591,19 @@ impl CanonicalExclusiveGuard {
                 );
             }
         };
-        let source_parent = match self.namespace.bind_parent(source) {
+        if !namespace_supported_for(self.platform) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let source_parent = match self.namespace.bind_parent(source, self.platform) {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
-        let destination_parent = match self.namespace.bind_parent(destination) {
+        let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
@@ -498,16 +614,46 @@ impl CanonicalExclusiveGuard {
         if !namespace_qualified {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                    platform: current_platform(),
+                    platform: self.platform,
                     operation: CanonicalNamespaceOperation::Rename,
                 },
             );
         }
+        let Some(source_parent_directory) = source_parent.directory.as_ref() else {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        };
+        if source_parent.canonical_path != destination_parent.canonical_path {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
+            );
+        }
 
-        let source_file = match open_existing_regular(source) {
+        let source_file = match self.open_existing_regular(source) {
             Ok(file) => file,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
+        let source_metadata = match source_file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::OpenExisting,
+                    &error,
+                ));
+            }
+        };
+        if volumes_differ(
+            &filesystem_identity(&source_metadata),
+            &self.namespace.identity,
+        ) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None },
+            );
+        }
         if let Err(rejection) = ensure_destination_absent(destination) {
             return CanonicalDurabilityOutcome::Rejected(rejection);
         }
@@ -519,18 +665,18 @@ impl CanonicalExclusiveGuard {
         if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
             std::fs::rename(source, destination)
         }) {
+            if error.kind() == io::ErrorKind::CrossesDevices {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CrossDeviceRenameRefused {
+                        raw_os_error: error.raw_os_error(),
+                    },
+                );
+            }
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-            source_parent.directory.sync_all()
+            source_parent_directory.sync_all()
         }) {
-            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
-        }
-        if source_parent.canonical_path != destination_parent.canonical_path
-            && let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-                destination_parent.directory.sync_all()
-            })
-        {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
 
@@ -550,7 +696,7 @@ impl CanonicalExclusiveGuard {
         if qualification.namespace != self.namespace {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
-        Ok(namespace_supported_for(current_platform()))
+        Ok(namespace_supported_for(self.platform))
     }
 
     fn append_opened(
@@ -611,6 +757,30 @@ impl CanonicalExclusiveGuard {
         })
     }
 
+    fn open_existing_regular(&self, path: &Path) -> Result<File, CanonicalDurabilityRejection> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+        if !metadata.file_type().is_file() {
+            return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+        }
+        let expected_identity = filesystem_identity(&metadata);
+        self.wait_before_existing_open();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
+        if identity_is_available(&expected_identity)
+            && filesystem_identity(&opened_metadata) != expected_identity
+        {
+            return Err(CanonicalDurabilityRejection::IdentityChanged);
+        }
+        Ok(file)
+    }
+
     fn checked(
         &self,
         _stage: CanonicalDurabilityStage,
@@ -631,6 +801,14 @@ impl CanonicalExclusiveGuard {
     fn wait_before_atomic_create(&self) {
         #[cfg(test)]
         if let Some(barrier) = &self.before_atomic_create {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+
+    fn wait_before_existing_open(&self) {
+        #[cfg(test)]
+        if let Some(barrier) = &self.before_existing_open {
             barrier.wait();
             barrier.wait();
         }
@@ -696,19 +874,6 @@ fn try_lock_shared(file: File) -> Result<File, CanonicalCoordinationError> {
     }
 }
 
-fn open_existing_regular(path: &Path) -> Result<File, CanonicalDurabilityRejection> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
-    if !metadata.file_type().is_file() {
-        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
-    }
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))
-}
-
 fn ensure_destination_absent(path: &Path) -> Result<(), CanonicalDurabilityRejection> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(CanonicalDurabilityRejection::DestinationAlreadyExists),
@@ -763,6 +928,17 @@ fn filesystem_identity(metadata: &Metadata) -> FilesystemIdentity {
             object: None,
         }
     }
+}
+
+fn identity_is_available(identity: &FilesystemIdentity) -> bool {
+    identity.volume.is_some() && identity.object.is_some()
+}
+
+fn volumes_differ(left: &FilesystemIdentity, right: &FilesystemIdentity) -> bool {
+    matches!(
+        (&left.volume, &right.volume),
+        (Some(left), Some(right)) if left != right
+    )
 }
 
 fn coordination_io(
@@ -907,12 +1083,11 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn public_rename_syncs_the_file_and_changed_parent_namespace() {
+    fn public_same_directory_rename_syncs_the_file_and_parent_namespace() {
         let root = temp_root("rename");
-        let destination_parent = root.join("quarantine");
-        fs::create_dir_all(&destination_parent).expect("create fixture directories");
+        fs::create_dir_all(&root).expect("create fixture directory");
         let source = root.join("tail.tmp");
-        let destination = destination_parent.join("tail.quarantine");
+        let destination = root.join("tail.quarantine");
         fs::write(&source, b"recoverable tail").expect("seed rename source");
         let proof = qualification(&root);
         let guard = CanonicalDurability::new()
@@ -1076,6 +1251,89 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn only_the_exact_target_parent_can_coordinate_a_nested_target() {
+        let ancestor_root = temp_root("overlapping-root");
+        let exact_root = ancestor_root.join("nested");
+        fs::create_dir_all(&exact_root).expect("create nested target parent");
+        let target = exact_root.join("events.log");
+        let proof = qualification(&exact_root);
+        let durability = CanonicalDurability::new();
+        let ancestor_guard = durability
+            .try_lock_exclusive(&ancestor_root)
+            .expect("acquire ancestor guard");
+        let exact_guard = durability
+            .try_lock_exclusive(&exact_root)
+            .expect("acquire exact-parent guard");
+
+        assert_eq!(
+            ancestor_guard.append(
+                &target,
+                b"must not be written",
+                Some(&proof),
+                CanonicalRecoveryKey::from_opaque_bytes([15; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::TargetOutsideManagedNamespace
+            )
+        );
+        assert!(!target.exists());
+        assert!(matches!(
+            exact_guard.append(
+                &target,
+                b"exact parent",
+                Some(&proof),
+                CanonicalRecoveryKey::from_opaque_bytes([16; 16]),
+            ),
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::FirstCreate,
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(&target).expect("read exact target"),
+            b"exact parent"
+        );
+        drop(exact_guard);
+        drop(ancestor_guard);
+        fs::remove_dir_all(ancestor_root).expect("clean overlapping roots");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn coordination_entry_is_reserved_from_append_and_rename() {
+        let root = temp_root("reserved-coordination-entry");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.tmp");
+        let destination = root.join("destination.quarantine");
+        let lock_path = root.join(COORDINATION_FILE_NAME);
+        fs::write(&source, b"source").expect("seed source");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire exact-parent guard");
+        let key = CanonicalRecoveryKey::from_opaque_bytes([17; 16]);
+
+        for outcome in [
+            guard.append(&lock_path, b"must not write", None, key),
+            guard.rename(&lock_path, &destination, Some(&proof), key),
+            guard.rename(&source, &lock_path, Some(&proof), key),
+        ] {
+            assert_eq!(
+                outcome,
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::ReservedCoordinationEntry
+                )
+            );
+        }
+        assert_eq!(fs::metadata(&lock_path).expect("lock retained").len(), 0);
+        assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn qualification_cannot_be_reused_for_another_root() {
         let first_root = temp_root("proof-first-root");
         let second_root = temp_root("proof-second-root");
@@ -1110,6 +1368,146 @@ mod tests {
         assert!(namespace_supported_for(CanonicalPlatform::MacOs));
         assert!(!namespace_supported_for(CanonicalPlatform::Windows));
         assert!(!namespace_supported_for(CanonicalPlatform::Other));
+    }
+
+    #[test]
+    fn windows_policy_path_allows_existing_append_and_refuses_namespace_mutation() {
+        let root = temp_root("windows-policy-path");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let existing = root.join("existing.log");
+        let absent = root.join("absent.log");
+        let destination = root.join("destination.log");
+        fs::write(&existing, b"prefix").expect("seed existing file");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::for_test_platform(CanonicalPlatform::Windows)
+            .try_lock_exclusive(&root)
+            .expect("acquire simulated Windows guard");
+        let key = CanonicalRecoveryKey::from_opaque_bytes([18; 16]);
+
+        assert!(matches!(
+            guard.append(&existing, b"-append", None, key),
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::ExistingAppend,
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(&existing).expect("read existing"),
+            b"prefix-append"
+        );
+        assert_eq!(
+            guard.append(&absent, b"must not create", Some(&proof), key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::FirstCreate,
+                }
+            )
+        );
+        assert_eq!(
+            guard.rename(&existing, &destination, Some(&proof), key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::Rename,
+                }
+            )
+        );
+        assert!(!absent.exists());
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(&existing).expect("source retained"),
+            b"prefix-append"
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn source_identity_replacement_is_refused_before_rename() {
+        let root = temp_root("source-identity-change");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.tmp");
+        let displaced = root.join("source.displaced");
+        let destination = root.join("destination.quarantine");
+        fs::write(&source, b"original").expect("seed source");
+        let proof = Arc::new(qualification(&root));
+        let barrier = Arc::new(Barrier::new(2));
+        let guard = Arc::new(
+            CanonicalDurability::with_before_existing_open(barrier.clone())
+                .try_lock_exclusive(&root)
+                .expect("acquire exact-parent guard"),
+        );
+        let worker_guard = guard.clone();
+        let worker_proof = proof.clone();
+        let worker_source = source.clone();
+        let worker_destination = destination.clone();
+        let worker = thread::spawn(move || {
+            worker_guard.rename(
+                &worker_source,
+                &worker_destination,
+                Some(worker_proof.as_ref()),
+                CanonicalRecoveryKey::from_opaque_bytes([19; 16]),
+            )
+        });
+
+        barrier.wait();
+        fs::rename(&source, &displaced).expect("displace validated source");
+        fs::write(&source, b"replacement").expect("replace source identity");
+        barrier.wait();
+        let outcome = worker.join().expect("join rename worker");
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Rejected(CanonicalDurabilityRejection::IdentityChanged)
+        );
+        assert_eq!(
+            fs::read(&source).expect("replacement retained"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(&displaced).expect("original retained"),
+            b"original"
+        );
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cross_device_rename_is_refused_with_zero_mutation() {
+        let root = temp_root("cross-device-refusal");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.tmp");
+        let destination = root.join("destination.quarantine");
+        fs::write(&source, b"source").expect("seed source");
+        let proof = qualification(&root);
+        let guard =
+            CanonicalDurability::failing_at_with_raw_os_error(CanonicalDurabilityStage::Rename, 18)
+                .try_lock_exclusive(&root)
+                .expect("acquire exact-parent guard");
+
+        let outcome = guard.rename(
+            &source,
+            &destination,
+            Some(&proof),
+            CanonicalRecoveryKey::from_opaque_bytes([20; 16]),
+        );
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::CrossDeviceRenameRefused {
+                    raw_os_error: Some(18),
+                }
+            )
+        );
+        assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
     }
 
     #[test]

@@ -24,6 +24,14 @@ coordination file, and safe filesystem identity where stable Rust exposes it.
 Append and rename are guard-owned operations; an arbitrary lock can no longer
 be paired with an unrelated target.
 
+Review/fix round 2 corrected reviewed tip
+`3e05edf3480a0139cc252e9a0b785ddf1a4c8e52`. The final contract binds a guard to
+the target's exact canonical parent, reserves the coordination entry from every
+mutation, restricts publication to same-directory rename, and exposes typed
+identity-drift and cross-device refusals. Windows namespace policy is checked
+before an ordinary parent open or any mutation; existing-file append remains
+available and retains its file barrier.
+
 The implementation:
 
 - classifies first-create versus existing files from `create_new` and
@@ -45,6 +53,11 @@ The implementation:
   missing strict-reader lock acquisition creates neither the file nor parent;
 - refuses dangling symlink, FIFO, socket, directory, and other non-regular
   existing entries without opening or following them;
+- refuses the deterministic coordination entry as an append target, rename
+  source, or rename destination, preserving the lock inode and pathname;
+- returns `IdentityChanged` when stable source, parent, or root identity drifts,
+  and `CrossDeviceRenameRefused` for a safe preflight volume mismatch or
+  `EXDEV`/`CrossesDevices`;
 - retains both `ErrorKind` and `raw_os_error: Option<i32>` in content-free I/O
   failures; and
 - keeps filesystem qualification opaque, non-forgeable, and bound to the exact
@@ -60,14 +73,15 @@ does not activate a writer or make strict reads mutate.
 `CanonicalDurability` is a guard factory. Its small interface consists of:
 
 - `try_lock_exclusive`: acquire an opaque mutation guard for one existing
-  managed root and its deterministic coordination file; and
+  exact target parent and its deterministic coordination file; and
 - `try_lock_shared`: open-only strict-reader acquisition;
 
 `CanonicalExclusiveGuard` owns the two mutation operations:
 
 - `append`: existing append or atomically classified first-create inside the
   bound root; and
-- `rename`: unique-destination publication inside the bound root.
+- `rename`: unique-destination publication between two immediate children of
+  the same bound parent.
 
 Callers receive typed `Accepted`, `Rejected`, or
 `DurabilityIndeterminate` outcomes. Paths, payload bytes, OS error messages,
@@ -82,13 +96,13 @@ claiming that the local test filesystem is production-qualified.
 1. `Accepted(ExistingAppend)` follows write, flush, and file `sync_all`.
 2. `Accepted(FirstCreate)` follows `create_new`, write, flush, file `sync_all`,
    and qualified parent-directory `sync_all`.
-3. `Accepted(Rename)` follows source file `sync_all`, rename, and every changed
-   parent-directory `sync_all`.
+3. `Accepted(Rename)` follows source file `sync_all`, same-directory rename,
+   and the changed parent-directory `sync_all`.
 4. A first-created name is never inferred from a preflight existence check.
 5. A canonical parent directory is never provisioned by this module.
-6. The deterministic lock path is derived internally from the managed root;
-   guard-owned operations reject parents outside the bound canonical root or
-   on a different bound volume.
+6. The deterministic lock path is derived internally from the exact target
+   parent. Guard-owned operations reject every other parent, including a
+   descendant selected through an overlapping ancestor root.
 7. Qualification evidence is opaque and must exactly match the guard's root,
    volume, and directory object identity. Production remains unqualified until
    the later platform probe adds a reviewed construction path.
@@ -103,12 +117,14 @@ claiming that the local test filesystem is production-qualified.
     raw OS error number. The recovery identity has no diagnostic byte accessor
     and formats only as `[REDACTED]`.
 12. Destination and existing-entry probes use non-following metadata and refuse
-    all non-regular entries before open. This is safe for cooperating processes;
-    an uncooperative pathname swap remains outside the advisory-lock contract.
-13. The coordination file is never renamed or removed by the module. Shared
-    acquisition opens existing state only. Locks remain cooperative/advisory;
-    uncooperative root replacement or pathname mutation is outside this
-    contract.
+   all non-regular entries before open. Stable source, parent, and root identity
+   is compared where safe `std` metadata exposes it.
+13. The coordination file is reserved from append and both sides of rename; it
+   is never renamed or removed by the module. Shared acquisition opens existing
+   state only.
+14. Locks remain cooperative/advisory. An uncooperative pathname swap after a
+   validated open remains outside this contract; no absolute namespace lease is
+   claimed.
 
 ## TDD evidence
 
@@ -232,6 +248,57 @@ barrier failure, numeric raw OS error retention, regular/dangling-symlink/FIFO
 destination collision, non-regular existing-entry refusal, and diagnostic
 redaction.
 
+### Review round 2 RED/GREEN
+
+Each RED used the same locked, cloud-only, serialized public-module command,
+with the named test substituted for `TEST`:
+
+```text
+CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud TEST -- --nocapture --test-threads=1
+```
+
+The five exact RED cases were:
+
+1. `only_the_exact_target_parent_can_coordinate_a_nested_target`: exit 101;
+   the ancestor guard reached qualification validation and returned
+   `QualificationBindingMismatch` instead of refusing the overlapping root as
+   `TargetOutsideManagedNamespace`.
+2. `coordination_entry_is_reserved_from_append_and_rename`: exit 101 at compile
+   time because `CanonicalDurabilityRejection::ReservedCoordinationEntry` did
+   not exist. The fixture covered append, rename source, rename destination,
+   lock length, source retention, and absent destination.
+3. `windows_policy_path_allows_existing_append_and_refuses_namespace_mutation`:
+   exit 101 at compile time because the actual guard factory had no injected
+   platform constructor. The fixture exercised guard-owned existing append,
+   absent append, and rename rather than only testing a policy predicate.
+4. `source_identity_replacement_is_refused_before_rename`: exit 101 at compile
+   time because the identity-race seam and typed `IdentityChanged` refusal did
+   not exist.
+5. `cross_device_rename_is_refused_with_zero_mutation`: exit 101 at compile time
+   because typed `CrossDeviceRenameRefused` did not exist. The fixture injects
+   Linux raw OS error 18 at rename and checks source retention and destination
+   absence.
+
+GREEN implemented exact-parent binding, reserved-name rejection, cfg-specific
+parent opening, pre-mutation Windows policy, safe identity comparison, and
+cross-device classification. Each named test first passed alone as 1/1. The
+final consolidated focused command was:
+
+```text
+CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1
+```
+
+Final real result after the last production edit:
+
+```text
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 1588 filtered out; finished in 0.07s
+```
+
+The five new tests add overlapping-root coordination, reserved lock entry,
+actual Windows guard policy, source identity replacement, and typed
+cross-device zero-mutation coverage to the round-1 set.
+
 ## Rust gates
 
 All Rust commands used the one stable worktree-local target directory
@@ -249,7 +316,7 @@ Final real output:
 
 ```text
 Checking audio-graph v0.1.0-rc.1 (.../src-tauri)
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.41s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.57s
 ```
 
 An earlier check correctly exposed one non-test-build unused-variable warning
@@ -267,7 +334,7 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 clippy --locked --manifes
 Real output:
 
 ```text
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.16s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.85s
 ```
 
 ### Rustfmt
@@ -291,9 +358,29 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-
 Real result:
 
 ```text
-running 1603 tests
-test result: ok. 1595 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 38.54s
+running 1608 tests
+test result: ok. 1600 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 39.90s
 ```
+
+### Windows actual-module compile proof
+
+The default toolchain target listing was not authoritative for the pinned
+toolchain. `rustup component list --toolchain
+1.95.0-x86_64-unknown-linux-gnu --installed` confirmed both
+`rust-std-x86_64-pc-windows-msvc` and the Linux standard library. The actual
+dormant module, including its real `cfg(target_os = "windows")` branch, was then
+cross-compiled directly:
+
+```text
+mkdir -p src-tauri/target/c2e3-windows-module-proof
+rustc +1.95.0 --edition=2024 --crate-type lib --target x86_64-pc-windows-msvc src-tauri/src/persistence/canonical_durability.rs --out-dir src-tauri/target/c2e3-windows-module-proof
+```
+
+Real result: exit 0; `libcanonical_durability.rlib` was emitted. A source check
+also confirmed the Windows directory-opening branch contains no ordinary
+`File::open`. This is a compile proof of the actual module, not native NTFS
+durability execution; the later platform qualification workstream still owns
+native Windows evidence.
 
 ## Repository and security gates
 
@@ -319,7 +406,7 @@ SEEDS_CLI_ROOT="$seeds_cli_root" bun run verify:fast
 Real result: exit 0.
 
 ```text
-Checked 174 files in 306ms. No fixes applied.
+Checked 174 files in 427ms. No fixes applied.
 audio source contract is current
 provider registry is current
 session data movement contract is current
@@ -360,7 +447,7 @@ betterleaks dir --no-banner --redact src-tauri/src/persistence/canonical_durabil
 Real output from the complete implementation and evidence artifact set:
 
 ```text
-scanned ~303527 bytes (303.53 KB)
+scanned ~323414 bytes (323.41 KB)
 no leaks found
 ```
 
@@ -381,15 +468,19 @@ manifest or recovery transaction, Session semantics floor, prompt, adapter,
 UI, workflow, generated artifact, or Seeds mutation.
 
 The module is dormant and writes no production data. Before adoption, rollback
-is reversal of the isolated c2e3 commit or branch disposal. No on-disk migration
-or runtime reconciliation is required.
+is reversal of the isolated c2e3 commits or branch disposal. Round 2 is a
+separate correction commit on reviewed tip
+`3e05edf3480a0139cc252e9a0b785ddf1a4c8e52`; it is not an amendment. No on-disk
+migration or runtime reconciliation is required.
 
 ## Findings and open questions
 
 - No unrelated problem was changed.
-- macOS APFS and Windows NTFS execution remain owned by the later platform
-  qualification workstream. This implementation preserves the conditional and
-  refusal contracts without simulating those platforms locally.
+- macOS APFS and native Windows NTFS execution remain owned by the later
+  platform qualification workstream. This implementation preserves the
+  conditional and refusal contracts; the module itself cross-compiles for
+  Windows, while the injected-platform test executes its policy sequencing on
+  Linux.
 - Rust 1.95 local standard-library documentation marks Windows
   `volume_serial_number` and `file_index` metadata methods as nightly-only.
   The correction therefore uses no unstable/unsafe platform expansion:
