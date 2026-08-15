@@ -102,6 +102,7 @@ pub enum CanonicalPlatform {
 pub enum CanonicalNamespaceOperation {
     FirstCreate,
     Rename,
+    AtomicSnapshotInstall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,8 @@ pub enum CanonicalMutation {
     ExistingAppend,
     FirstCreate,
     Rename,
+    InitialSnapshotInstall,
+    SnapshotReplacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +136,7 @@ pub enum CanonicalDurabilityStage {
     SeekEnd,
     Write,
     Flush,
+    ProtectTemp,
     FileSync,
     Rename,
     ParentSync,
@@ -155,6 +159,8 @@ pub enum CanonicalDurabilityRejection {
     ReservedCoordinationEntry,
     NonRegularCanonicalEntry,
     DestinationAlreadyExists,
+    SnapshotTempAlreadyExists,
+    SnapshotPathOverlap,
     CoordinationPoisoned,
     IoFailedBeforeMutation {
         stage: CanonicalDurabilityStage,
@@ -177,6 +183,28 @@ pub enum CanonicalDurabilityOutcome {
     Accepted(CanonicalDurabilityReceipt),
     Rejected(CanonicalDurabilityRejection),
     DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
+}
+
+/// Expected snapshot-head identity at atomic installation time.
+///
+/// An existing snapshot is represented by the exact open file from which the
+/// caller validated its generation. The guard verifies that handle still
+/// names the destination before replacing it. `Debug` never exposes the file
+/// descriptor or path.
+pub enum CanonicalSnapshotExpectation<'a> {
+    Absent,
+    Existing(&'a File),
+}
+
+impl fmt::Debug for CanonicalSnapshotExpectation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("CanonicalSnapshotExpectation::Absent"),
+            Self::Existing(_) => {
+                formatter.write_str("CanonicalSnapshotExpectation::Existing([BOUND])")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +386,8 @@ pub struct CanonicalExclusiveGuard {
     #[cfg(test)]
     before_existing_open: Option<Arc<Barrier>>,
     #[cfg(test)]
+    before_snapshot_revalidation: Option<Arc<Barrier>>,
+    #[cfg(test)]
     injected_rename_fault: Option<InjectedRenameFaultState>,
 }
 
@@ -400,6 +430,8 @@ pub struct CanonicalDurability {
     #[cfg(test)]
     before_existing_open: Option<Arc<Barrier>>,
     #[cfg(test)]
+    before_snapshot_revalidation: Option<Arc<Barrier>>,
+    #[cfg(test)]
     injected_rename_fault: Option<InjectedRenameFaultState>,
 }
 
@@ -414,6 +446,8 @@ impl Default for CanonicalDurability {
             before_atomic_create: None,
             #[cfg(test)]
             before_existing_open: None,
+            #[cfg(test)]
+            before_snapshot_revalidation: None,
             #[cfg(test)]
             injected_rename_fault: None,
         }
@@ -451,6 +485,8 @@ impl CanonicalDurability {
             #[cfg(test)]
             before_existing_open: self.before_existing_open.clone(),
             #[cfg(test)]
+            before_snapshot_revalidation: self.before_snapshot_revalidation.clone(),
+            #[cfg(test)]
             injected_rename_fault: self.injected_rename_fault.clone(),
         })
     }
@@ -485,6 +521,7 @@ impl CanonicalDurability {
             }),
             before_atomic_create: None,
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: None,
         }
     }
@@ -500,6 +537,7 @@ impl CanonicalDurability {
             }),
             before_atomic_create: None,
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: None,
         }
     }
@@ -512,6 +550,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: Some(barrier),
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: None,
         }
     }
@@ -524,6 +563,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: None,
         }
     }
@@ -536,6 +576,20 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: Some(barrier),
+            before_snapshot_revalidation: None,
+            injected_rename_fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_snapshot_revalidation(barrier: Arc<Barrier>) -> Self {
+        Self {
+            platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
+            injected_failure: None,
+            before_atomic_create: None,
+            before_existing_open: None,
+            before_snapshot_revalidation: Some(barrier),
             injected_rename_fault: None,
         }
     }
@@ -548,6 +602,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: None,
         }
     }
@@ -560,6 +615,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
+            before_snapshot_revalidation: None,
             injected_rename_fault: Some(InjectedRenameFaultState {
                 fault,
                 rename_invoked,
@@ -765,6 +821,157 @@ impl CanonicalExclusiveGuard {
         })
     }
 
+    /// Atomically install a complete snapshot under this guard.
+    ///
+    /// The caller supplies one exact temporary pathname in the same managed
+    /// directory. It is created exclusively and never opened as an append
+    /// fallback. An existing destination expectation must carry the same open
+    /// file from which the caller validated its generation. `Accepted` follows
+    /// owner-only protection, complete temp write and flush, temp `sync_all`,
+    /// one atomic same-directory install, and the qualified parent-directory
+    /// barrier. Windows and unqualified namespaces refuse before temp creation.
+    /// Once the temp may be visible, every failed barrier or destination
+    /// revalidation is indeterminate and retains a caller recovery key.
+    pub fn install_snapshot(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([temporary, destination]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if snapshot_paths_overlap(temporary, destination) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::SnapshotPathOverlap,
+            );
+        }
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        if !namespace_supported_for(self.platform) {
+            return snapshot_namespace_unsupported(self.platform);
+        }
+        let namespace_qualified = match self.qualification_status(qualification) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if !namespace_qualified {
+            return snapshot_namespace_unsupported(self.platform);
+        }
+
+        let temporary_parent = match self.namespace.bind_parent(temporary, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if temporary_parent.canonical_path != destination_parent.canonical_path {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
+            );
+        }
+        if snapshot_basenames_overlap(temporary, destination) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::SnapshotPathOverlap,
+            );
+        }
+        let Some(parent_directory) = temporary_parent.directory.as_ref() else {
+            return snapshot_namespace_unsupported(self.platform);
+        };
+
+        self.wait_before_existing_open();
+        let validated_destination = match validate_snapshot_destination(destination, expectation) {
+            Ok(destination) => destination,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if self.preflight_volumes_differ(
+            validated_destination.filesystem_identity(),
+            &self.namespace.identity,
+        ) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None },
+            );
+        }
+
+        if let Some(error) = self.injected_error(CanonicalDurabilityStage::CreateNew) {
+            return CanonicalDurabilityOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::CreateNew,
+                &error,
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        configure_owner_only_creation(&mut options);
+        self.wait_before_atomic_create();
+        let mut temporary_file = match options.open(temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+                );
+            }
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::CreateNew,
+                    &error,
+                ));
+            }
+        };
+
+        let mut writer = BufWriter::new(&mut temporary_file);
+        if let Err(error) =
+            self.checked(CanonicalDurabilityStage::Write, || writer.write_all(bytes))
+        {
+            return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::Flush, || writer.flush()) {
+            return indeterminate(CanonicalDurabilityStage::Flush, &error, recovery_key);
+        }
+        drop(writer);
+        if let Err(error) = self.checked(CanonicalDurabilityStage::ProtectTemp, || {
+            apply_owner_only_protection(&temporary_file)
+        }) {
+            return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || {
+            temporary_file.sync_all()
+        }) {
+            return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
+        }
+
+        self.wait_before_snapshot_revalidation();
+        if let Err(error) = revalidate_snapshot_destination(destination, &validated_destination) {
+            return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
+            self.rename_source(temporary, destination)
+        }) {
+            return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
+            parent_directory.sync_all()
+        }) {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation: validated_destination.mutation(),
+            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+        })
+    }
+
     fn preflight_mutation_targets<const N: usize>(
         &self,
         targets: [&Path; N],
@@ -910,16 +1117,23 @@ impl CanonicalExclusiveGuard {
         _stage: CanonicalDurabilityStage,
         operation: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        if let Some(error) = self.injected_error(_stage) {
+            return Err(error);
+        }
+        operation()
+    }
+
+    fn injected_error(&self, _stage: CanonicalDurabilityStage) -> Option<io::Error> {
         #[cfg(test)]
         if let Some(failure) = self.injected_failure
             && failure.stage == _stage
         {
-            return Err(match failure.raw_os_error {
+            return Some(match failure.raw_os_error {
                 Some(raw_os_error) => io::Error::from_raw_os_error(raw_os_error),
                 None => io::Error::other("injected failure"),
             });
         }
-        operation()
+        None
     }
 
     fn wait_before_atomic_create(&self) {
@@ -937,11 +1151,129 @@ impl CanonicalExclusiveGuard {
             barrier.wait();
         }
     }
+
+    fn wait_before_snapshot_revalidation(&self) {
+        #[cfg(test)]
+        if let Some(barrier) = &self.before_snapshot_revalidation {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
 }
 
 enum OpenedCanonicalFile {
     Existing(File),
     New { file: File, parent: File },
+}
+
+enum ValidatedSnapshotDestination {
+    Absent,
+    Existing(FilesystemIdentity),
+}
+
+impl ValidatedSnapshotDestination {
+    fn filesystem_identity(&self) -> &FilesystemIdentity {
+        match self {
+            Self::Absent => &ABSENT_FILESYSTEM_IDENTITY,
+            Self::Existing(identity) => identity,
+        }
+    }
+
+    fn mutation(&self) -> CanonicalMutation {
+        match self {
+            Self::Absent => CanonicalMutation::InitialSnapshotInstall,
+            Self::Existing(_) => CanonicalMutation::SnapshotReplacement,
+        }
+    }
+}
+
+const ABSENT_FILESYSTEM_IDENTITY: FilesystemIdentity = FilesystemIdentity {
+    volume: None,
+    object: None,
+};
+
+fn validate_snapshot_destination(
+    destination: &Path,
+    expectation: CanonicalSnapshotExpectation<'_>,
+) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
+    match expectation {
+        CanonicalSnapshotExpectation::Absent => {
+            ensure_destination_absent(destination)?;
+            Ok(ValidatedSnapshotDestination::Absent)
+        }
+        CanonicalSnapshotExpectation::Existing(expected_file) => {
+            let expected_metadata = expected_file
+                .metadata()
+                .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+            if !expected_metadata.file_type().is_file() {
+                return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+            }
+            let actual_metadata = std::fs::symlink_metadata(destination).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    CanonicalDurabilityRejection::IdentityChanged
+                } else {
+                    durability_io(CanonicalDurabilityStage::InspectEntry, &error)
+                }
+            })?;
+            if !actual_metadata.file_type().is_file() {
+                return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+            }
+            let expected_identity = filesystem_identity(&expected_metadata);
+            let actual_identity = filesystem_identity(&actual_metadata);
+            if !identity_is_available(&expected_identity) || actual_identity != expected_identity {
+                return Err(CanonicalDurabilityRejection::IdentityChanged);
+            }
+            Ok(ValidatedSnapshotDestination::Existing(expected_identity))
+        }
+    }
+}
+
+fn revalidate_snapshot_destination(
+    destination: &Path,
+    validated: &ValidatedSnapshotDestination,
+) -> io::Result<()> {
+    match validated {
+        ValidatedSnapshotDestination::Absent => match std::fs::symlink_metadata(destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot destination appeared before installation",
+            )),
+            Err(error) => Err(error),
+        },
+        ValidatedSnapshotDestination::Existing(expected_identity) => {
+            let metadata = std::fs::symlink_metadata(destination)?;
+            if metadata.file_type().is_file()
+                && filesystem_identity(&metadata) == *expected_identity
+            {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "snapshot destination identity changed before installation",
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_owner_only_creation(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn configure_owner_only_creation(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn apply_owner_only_protection(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn apply_owner_only_protection(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationError> {
@@ -1007,6 +1339,20 @@ fn ensure_destination_absent(path: &Path) -> Result<(), CanonicalDurabilityRejec
             &error,
         )),
     }
+}
+
+fn snapshot_paths_overlap(temporary: &Path, destination: &Path) -> bool {
+    temporary == destination
+        || (parent_directory(temporary) == parent_directory(destination)
+            && snapshot_basenames_overlap(temporary, destination))
+}
+
+fn snapshot_basenames_overlap(temporary: &Path, destination: &Path) -> bool {
+    temporary.file_name().is_some_and(|temporary_name| {
+        destination
+            .file_name()
+            .is_some_and(|destination_name| temporary_name.eq_ignore_ascii_case(destination_name))
+    })
 }
 
 fn parent_directory(path: &Path) -> PathBuf {
@@ -1100,6 +1446,15 @@ fn indeterminate(
     })
 }
 
+fn snapshot_namespace_unsupported(platform: CanonicalPlatform) -> CanonicalDurabilityOutcome {
+    CanonicalDurabilityOutcome::Rejected(
+        CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+            platform,
+            operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,7 +1470,7 @@ mod tests {
         static NONCE: AtomicU64 = AtomicU64::new(0);
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "audio-graph-canonical-durability-{label}-{}-{nonce}",
+            "ag-canonical-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -1236,6 +1591,737 @@ mod tests {
         assert_eq!(
             fs::read(destination).expect("read renamed"),
             b"recoverable tail"
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn public_snapshot_install_creates_an_owner_only_durable_head() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("snapshot-initial-install");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+
+        let outcome = guard.install_snapshot(
+            &temporary,
+            &destination,
+            b"{\"generation\":1}",
+            CanonicalSnapshotExpectation::Absent,
+            Some(&proof),
+            CanonicalRecoveryKey::from_opaque_bytes([23; 16]),
+        );
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::InitialSnapshotInstall,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            })
+        );
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(&destination).expect("read installed snapshot"),
+            b"{\"generation\":1}"
+        );
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("read installed metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn public_snapshot_install_replaces_only_the_open_expected_head() {
+        use std::io::Read;
+
+        let root = temp_root("snapshot-replace-existing");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        let old_bytes = b"{\"generation\":1}";
+        let new_bytes = b"{\"generation\":2}";
+        fs::write(&destination, old_bytes).expect("seed old snapshot");
+        let mut expected_head = File::open(&destination).expect("open validated old head");
+        let mut validated_generation = String::new();
+        expected_head
+            .read_to_string(&mut validated_generation)
+            .expect("validate old generation through expected handle");
+        assert_eq!(validated_generation.as_bytes(), old_bytes);
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+
+        let outcome = guard.install_snapshot(
+            &temporary,
+            &destination,
+            new_bytes,
+            CanonicalSnapshotExpectation::Existing(&expected_head),
+            Some(&proof),
+            CanonicalRecoveryKey::from_opaque_bytes([24; 16]),
+        );
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::SnapshotReplacement,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            })
+        );
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(&destination).expect("reopen installed head"),
+            new_bytes
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_temp_collisions_refuse_regular_symlink_directory_and_fifo_entries() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        for entry_kind in ["regular", "symlink", "directory", "fifo", "socket"] {
+            let root = temp_root(&format!("snapshot-temp-collision-{entry_kind}"));
+            fs::create_dir_all(&root).expect("create fixture root");
+            let temporary = root.join("manifest.snapshot.tmp");
+            let destination = root.join("manifest.snapshot.json");
+            match entry_kind {
+                "regular" => fs::write(&temporary, b"competitor").expect("seed regular temp"),
+                "symlink" => symlink(root.join("missing"), &temporary).expect("seed temp symlink"),
+                "directory" => fs::create_dir(&temporary).expect("seed temp directory"),
+                "fifo" => {
+                    let status = Command::new("mkfifo")
+                        .arg(&temporary)
+                        .status()
+                        .expect("run mkfifo");
+                    assert!(status.success());
+                }
+                "socket" => {
+                    std::os::unix::net::UnixListener::bind(&temporary).expect("seed temp socket");
+                }
+                _ => unreachable!(),
+            }
+            let proof = qualification(&root);
+            let guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard");
+
+            assert_eq!(
+                guard.install_snapshot(
+                    &temporary,
+                    &destination,
+                    b"must not publish",
+                    CanonicalSnapshotExpectation::Absent,
+                    Some(&proof),
+                    CanonicalRecoveryKey::from_opaque_bytes([25; 16]),
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::SnapshotTempAlreadyExists
+                )
+            );
+            assert!(fs::symlink_metadata(&temporary).is_ok());
+            assert!(!destination.exists());
+            drop(guard);
+            fs::remove_dir_all(root).expect("clean fixture root");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_destination_collisions_refuse_regular_symlink_directory_and_fifo_entries() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        for entry_kind in ["regular", "symlink", "directory", "fifo", "socket"] {
+            let root = temp_root(&format!("snapshot-destination-collision-{entry_kind}"));
+            fs::create_dir_all(&root).expect("create fixture root");
+            let temporary = root.join("manifest.snapshot.tmp");
+            let destination = root.join("manifest.snapshot.json");
+            match entry_kind {
+                "regular" => {
+                    fs::write(&destination, b"existing").expect("seed regular destination")
+                }
+                "symlink" => {
+                    symlink(root.join("missing"), &destination).expect("seed destination symlink")
+                }
+                "directory" => fs::create_dir(&destination).expect("seed destination directory"),
+                "fifo" => {
+                    let status = Command::new("mkfifo")
+                        .arg(&destination)
+                        .status()
+                        .expect("run mkfifo");
+                    assert!(status.success());
+                }
+                "socket" => {
+                    std::os::unix::net::UnixListener::bind(&destination)
+                        .expect("seed destination socket");
+                }
+                _ => unreachable!(),
+            }
+            let proof = qualification(&root);
+            let guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard");
+
+            assert_eq!(
+                guard.install_snapshot(
+                    &temporary,
+                    &destination,
+                    b"must not publish",
+                    CanonicalSnapshotExpectation::Absent,
+                    Some(&proof),
+                    CanonicalRecoveryKey::from_opaque_bytes([26; 16]),
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::DestinationAlreadyExists
+                )
+            );
+            assert!(!temporary.exists());
+            assert!(fs::symlink_metadata(&destination).is_ok());
+            drop(guard);
+            fs::remove_dir_all(root).expect("clean fixture root");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn competing_snapshot_temp_create_is_atomically_refused_without_fallback() {
+        let root = temp_root("snapshot-competing-create");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        let proof = Arc::new(qualification(&root));
+        let barrier = Arc::new(Barrier::new(2));
+        let guard = Arc::new(
+            CanonicalDurability::with_before_atomic_create(barrier.clone())
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard"),
+        );
+        let worker_guard = guard.clone();
+        let worker_proof = proof.clone();
+        let worker_temporary = temporary.clone();
+        let worker_destination = destination.clone();
+        let worker = thread::spawn(move || {
+            worker_guard.install_snapshot(
+                &worker_temporary,
+                &worker_destination,
+                b"candidate",
+                CanonicalSnapshotExpectation::Absent,
+                Some(worker_proof.as_ref()),
+                CanonicalRecoveryKey::from_opaque_bytes([27; 16]),
+            )
+        });
+
+        barrier.wait();
+        fs::write(&temporary, b"competitor").expect("competitor creates exact temp");
+        barrier.wait();
+        let outcome = worker.join().expect("join snapshot worker");
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists
+            )
+        );
+        assert_eq!(fs::read(&temporary).expect("temp retained"), b"competitor");
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_destination_identity_change_refuses_before_temp_creation() {
+        let root = temp_root("snapshot-destination-identity-change");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        let displaced = root.join("manifest.snapshot.displaced");
+        fs::write(&destination, b"validated-old").expect("seed validated head");
+        let expected_head = File::open(&destination).expect("open validated head");
+        let proof = Arc::new(qualification(&root));
+        let barrier = Arc::new(Barrier::new(2));
+        let guard = Arc::new(
+            CanonicalDurability::with_before_existing_open(barrier.clone())
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard"),
+        );
+        let worker_guard = guard.clone();
+        let worker_proof = proof.clone();
+        let worker_temporary = temporary.clone();
+        let worker_destination = destination.clone();
+        let worker = thread::spawn(move || {
+            worker_guard.install_snapshot(
+                &worker_temporary,
+                &worker_destination,
+                b"candidate-new",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                Some(worker_proof.as_ref()),
+                CanonicalRecoveryKey::from_opaque_bytes([28; 16]),
+            )
+        });
+
+        barrier.wait();
+        fs::rename(&destination, &displaced).expect("displace validated destination");
+        fs::write(&destination, b"uncooperative-replacement")
+            .expect("replace destination identity");
+        barrier.wait();
+        let outcome = worker.join().expect("join snapshot worker");
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::Rejected(CanonicalDurabilityRejection::IdentityChanged)
+        );
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(&destination).expect("replacement retained"),
+            b"uncooperative-replacement"
+        );
+        assert_eq!(
+            fs::read(&displaced).expect("validated head retained"),
+            b"validated-old"
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_destination_change_after_temp_sync_is_indeterminate_and_preserved() {
+        let root = temp_root("snapshot-late-destination-change");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        let displaced = root.join("manifest.snapshot.displaced");
+        fs::write(&destination, b"validated-old").expect("seed validated head");
+        let expected_head = File::open(&destination).expect("open validated head");
+        let proof = Arc::new(qualification(&root));
+        let barrier = Arc::new(Barrier::new(2));
+        let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([35; 16]);
+        let guard = Arc::new(
+            CanonicalDurability::with_before_snapshot_revalidation(barrier.clone())
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard"),
+        );
+        let worker_guard = guard.clone();
+        let worker_proof = proof.clone();
+        let worker_temporary = temporary.clone();
+        let worker_destination = destination.clone();
+        let worker = thread::spawn(move || {
+            worker_guard.install_snapshot(
+                &worker_temporary,
+                &worker_destination,
+                b"candidate-new",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                Some(worker_proof.as_ref()),
+                recovery_key,
+            )
+        });
+
+        barrier.wait();
+        assert_eq!(
+            fs::read(&temporary).expect("candidate temp is synchronized"),
+            b"candidate-new"
+        );
+        fs::rename(&destination, &displaced).expect("displace validated destination");
+        fs::write(&destination, b"uncooperative-replacement")
+            .expect("replace destination identity");
+        barrier.wait();
+        let outcome = worker.join().expect("join snapshot worker");
+
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::InspectEntry,
+                kind: io::ErrorKind::Other,
+                raw_os_error: None,
+                recovery_key,
+            })
+        );
+        assert_eq!(
+            fs::read(&temporary).expect("recoverable candidate retained"),
+            b"candidate-new"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("replacement retained"),
+            b"uncooperative-replacement"
+        );
+        assert_eq!(
+            fs::read(&displaced).expect("validated old head retained"),
+            b"validated-old"
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_temp_and_destination_aliases_refuse_before_mutation() {
+        let root = temp_root("snapshot-path-overlap");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+
+        for (temporary, destination) in [
+            (root.join("manifest.tmp"), root.join("manifest.tmp")),
+            (root.join("Manifest.TMP"), root.join("manifest.tmp")),
+        ] {
+            assert_eq!(
+                guard.install_snapshot(
+                    &temporary,
+                    &destination,
+                    b"must not publish",
+                    CanonicalSnapshotExpectation::Absent,
+                    Some(&proof),
+                    CanonicalRecoveryKey::from_opaque_bytes([36; 16]),
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::SnapshotPathOverlap
+                )
+            );
+            assert!(!temporary.exists());
+            assert!(!destination.exists());
+        }
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_refuses_overlapping_and_replaced_managed_roots_before_mutation() {
+        let ancestor_root = temp_root("snapshot-overlapping-root");
+        let exact_root = ancestor_root.join("nested");
+        fs::create_dir_all(&exact_root).expect("create nested root");
+        let ancestor_proof = qualification(&ancestor_root);
+        let ancestor_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&ancestor_root)
+            .expect("acquire ancestor guard");
+        let nested_temporary = exact_root.join("manifest.tmp");
+        let nested_destination = exact_root.join("manifest.json");
+
+        assert_eq!(
+            ancestor_guard.install_snapshot(
+                &nested_temporary,
+                &nested_destination,
+                b"must not publish",
+                CanonicalSnapshotExpectation::Absent,
+                Some(&ancestor_proof),
+                CanonicalRecoveryKey::from_opaque_bytes([29; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::TargetOutsideManagedNamespace
+            )
+        );
+        assert!(!nested_temporary.exists());
+        assert!(!nested_destination.exists());
+        drop(ancestor_guard);
+        fs::remove_dir_all(&ancestor_root).expect("clean ancestor fixture");
+
+        let root = temp_root("snapshot-replaced-root");
+        let displaced = temp_root("snapshot-replaced-root-displaced");
+        fs::create_dir_all(&root).expect("create managed root");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire exact-root guard");
+        fs::rename(&root, &displaced).expect("displace managed root");
+        fs::create_dir_all(&root).expect("replace managed root path");
+        let temporary = root.join("manifest.tmp");
+        let destination = root.join("manifest.json");
+
+        assert_eq!(
+            guard.install_snapshot(
+                &temporary,
+                &destination,
+                b"must not publish",
+                CanonicalSnapshotExpectation::Absent,
+                Some(&proof),
+                CanonicalRecoveryKey::from_opaque_bytes([30; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(CanonicalDurabilityRejection::IdentityChanged)
+        );
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean replacement root");
+        fs::remove_dir_all(displaced).expect("clean displaced root");
+    }
+
+    #[test]
+    fn snapshot_windows_and_unqualified_paths_refuse_before_temp_or_head_mutation() {
+        let root = temp_root("snapshot-unsupported");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("manifest.snapshot.tmp");
+        let destination = root.join("manifest.snapshot.json");
+        fs::write(&destination, b"old-head").expect("seed existing head");
+        let expected_head = File::open(&destination).expect("open expected head");
+        let proof = qualification(&root);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([31; 16]);
+
+        let windows_guard = CanonicalDurability::for_test_platform(CanonicalPlatform::Windows)
+            .try_lock_exclusive(&root)
+            .expect("acquire simulated Windows guard");
+        assert_eq!(
+            windows_guard.install_snapshot(
+                &temporary,
+                &destination,
+                b"must not install",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                Some(&proof),
+                key,
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                }
+            )
+        );
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(&destination).expect("head retained"), b"old-head");
+        drop(windows_guard);
+
+        let unqualified_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire unqualified guard");
+        assert_eq!(
+            unqualified_guard.install_snapshot(
+                &temporary,
+                &destination,
+                b"must not install",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                None,
+                key,
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: current_platform(),
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                }
+            )
+        );
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(&destination).expect("head retained"), b"old-head");
+        drop(unqualified_guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_preflight_cross_device_refuses_and_runtime_exdev_is_indeterminate() {
+        let preflight_root = temp_root("snapshot-preflight-exdev");
+        fs::create_dir_all(&preflight_root).expect("create preflight root");
+        let preflight_temp = preflight_root.join("manifest.tmp");
+        let preflight_destination = preflight_root.join("manifest.json");
+        let preflight_proof = qualification(&preflight_root);
+        let preflight_invoked = Arc::new(AtomicBool::new(false));
+        let preflight_guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::PreflightDeviceMismatch,
+            preflight_invoked.clone(),
+        )
+        .try_lock_exclusive(&preflight_root)
+        .expect("acquire preflight guard");
+
+        assert_eq!(
+            preflight_guard.install_snapshot(
+                &preflight_temp,
+                &preflight_destination,
+                b"candidate",
+                CanonicalSnapshotExpectation::Absent,
+                Some(&preflight_proof),
+                CanonicalRecoveryKey::from_opaque_bytes([32; 16]),
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None }
+            )
+        );
+        assert!(!preflight_invoked.load(Ordering::SeqCst));
+        assert!(!preflight_temp.exists());
+        assert!(!preflight_destination.exists());
+        drop(preflight_guard);
+        fs::remove_dir_all(preflight_root).expect("clean preflight root");
+
+        let runtime_root = temp_root("snapshot-runtime-exdev");
+        fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let runtime_temp = runtime_root.join("manifest.tmp");
+        let runtime_destination = runtime_root.join("manifest.json");
+        fs::write(&runtime_destination, b"old-head").expect("seed old head");
+        let expected_head = File::open(&runtime_destination).expect("open old head");
+        let runtime_proof = qualification(&runtime_root);
+        let runtime_invoked = Arc::new(AtomicBool::new(false));
+        let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([33; 16]);
+        let runtime_guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::RuntimeExdev { raw_os_error: 18 },
+            runtime_invoked.clone(),
+        )
+        .try_lock_exclusive(&runtime_root)
+        .expect("acquire runtime guard");
+
+        assert_eq!(
+            runtime_guard.install_snapshot(
+                &runtime_temp,
+                &runtime_destination,
+                b"candidate-new",
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                Some(&runtime_proof),
+                recovery_key,
+            ),
+            CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::Rename,
+                kind: io::ErrorKind::CrossesDevices,
+                raw_os_error: Some(18),
+                recovery_key,
+            })
+        );
+        assert!(runtime_invoked.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::read(&runtime_destination).expect("old head retained"),
+            b"old-head"
+        );
+        assert_eq!(
+            fs::read(&runtime_temp).expect("recoverable temp retained"),
+            b"candidate-new"
+        );
+        drop(runtime_guard);
+        fs::remove_dir_all(runtime_root).expect("clean runtime root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_fault_cuts_reopen_to_only_old_or_new_complete_bytes() {
+        let old_bytes = b"{\"generation\":7,\"state\":\"old\"}";
+        let new_bytes = b"{\"generation\":8,\"state\":\"new\"}";
+
+        for stage in [
+            CanonicalDurabilityStage::CreateNew,
+            CanonicalDurabilityStage::Write,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::Rename,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = temp_root(&format!("snapshot-fault-{stage:?}"));
+            fs::create_dir_all(&root).expect("create fixture root");
+            let temporary = root.join("manifest.snapshot.tmp");
+            let destination = root.join("manifest.snapshot.json");
+            fs::write(&destination, old_bytes).expect("seed old head");
+            let expected_head = File::open(&destination).expect("open expected head");
+            let proof = qualification(&root);
+            let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([34; 16]);
+            let guard = CanonicalDurability::failing_at(stage)
+                .try_lock_exclusive(&root)
+                .expect("acquire fault guard");
+
+            let outcome = guard.install_snapshot(
+                &temporary,
+                &destination,
+                new_bytes,
+                CanonicalSnapshotExpectation::Existing(&expected_head),
+                Some(&proof),
+                recovery_key,
+            );
+
+            if stage == CanonicalDurabilityStage::CreateNew {
+                assert_eq!(
+                    outcome,
+                    CanonicalDurabilityOutcome::Rejected(
+                        CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                            stage,
+                            kind: io::ErrorKind::Other,
+                            raw_os_error: None,
+                        }
+                    )
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    CanonicalDurabilityOutcome::DurabilityIndeterminate(
+                        CanonicalDurabilityIndeterminate {
+                            stage,
+                            kind: io::ErrorKind::Other,
+                            raw_os_error: None,
+                            recovery_key,
+                        }
+                    )
+                );
+            }
+            drop(guard);
+
+            let reopened = fs::read(&destination).expect("reopen installed head");
+            if stage == CanonicalDurabilityStage::ParentSync {
+                assert_eq!(reopened, new_bytes, "post-rename head must be complete");
+                assert!(!temporary.exists());
+            } else {
+                assert_eq!(reopened, old_bytes, "pre-rename head must stay complete");
+                assert_eq!(
+                    temporary.exists(),
+                    stage != CanonicalDurabilityStage::CreateNew,
+                    "only a successful create may leave a recoverable temp"
+                );
+            }
+            fs::remove_dir_all(root).expect("clean fixture root");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_indeterminate_diagnostics_are_content_free() {
+        let root = temp_root("snapshot-redacted-diagnostics");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let temporary = root.join("private-session-manifest.tmp");
+        let destination = root.join("private-session-manifest.json");
+        fs::write(&destination, b"old").expect("seed old head");
+        let expected_head = File::open(&destination).expect("open old head");
+        let proof = qualification(&root);
+        let payload = b"sensitive inferred user-world detail";
+        let guard = CanonicalDurability::failing_at_with_raw_os_error(
+            CanonicalDurabilityStage::FileSync,
+            28,
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire fault guard");
+
+        let outcome = guard.install_snapshot(
+            &temporary,
+            &destination,
+            payload,
+            CanonicalSnapshotExpectation::Existing(&expected_head),
+            Some(&proof),
+            CanonicalRecoveryKey::from_opaque_bytes([0xcd; 16]),
+        );
+
+        let diagnostic = format!("{outcome:?}");
+        assert!(!diagnostic.contains("private-session"));
+        assert!(!diagnostic.contains("sensitive inferred"));
+        assert!(!diagnostic.contains("cdcd"));
+        assert!(diagnostic.contains("raw_os_error: Some(28)"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert_eq!(
+            format!(
+                "{:?}",
+                CanonicalSnapshotExpectation::Existing(&expected_head)
+            ),
+            "CanonicalSnapshotExpectation::Existing([BOUND])"
         );
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
@@ -1482,6 +2568,22 @@ mod tests {
             guard.append(&mixed_case_alias, b"must not write", None, key),
             guard.rename(&mixed_case_alias, &destination, None, key),
             guard.rename(&source, &mixed_case_alias, None, key),
+            guard.install_snapshot(
+                &mixed_case_alias,
+                &destination,
+                b"must not install",
+                CanonicalSnapshotExpectation::Absent,
+                None,
+                key,
+            ),
+            guard.install_snapshot(
+                &source,
+                &mixed_case_alias,
+                b"must not install",
+                CanonicalSnapshotExpectation::Absent,
+                None,
+                key,
+            ),
         ] {
             assert_eq!(
                 outcome,
