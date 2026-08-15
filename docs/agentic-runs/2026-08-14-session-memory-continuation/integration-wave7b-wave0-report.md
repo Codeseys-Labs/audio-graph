@@ -225,3 +225,25 @@ stress parsed ready 50, blocked 100, and list 50. All five contracts, pinned
 passed. Seeds Doctor reported 10 passed, 2 custody-carried warning groups, and
 0 failures. Product files did not change, so product suites were not rerun;
 no workflow, push, or extra Seed edit occurred.
+
+## Wave1c snapshot-replace prerequisite reconciliation
+
+Custody `aca962113bc0d6cf90a44e022471924d25b98358` was merged
+history-preservingly at `3f23d5be7851da800a28f1d719577f5e6c597101`.
+Its one linear commit after custody `4204565` changes only
+`.seeds/issues.jsonl`; the integrated 642-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seed c928 is `in_progress`, unblocked, and assigned to
+`codex-c928-wave7b`. Seed a596 remains open and is blocked directly and only
+by c928. Parent 8e73 records the active order as c928, a596, 3b8b, b77b, and
+2df3; c2e3 remains closed.
+
+The complete queue contains 90 ready and 101 blocked issues. Seeds output
+stress parsed ready 50, blocked 101, and list 50. All five contracts, pinned
+`verify:fast`, Betterleaks, docs/Seeds secret hygiene, and exact range diff
+passed. Seeds Doctor reported 10 passed, 2 custody-carried warning groups, and
+0 failures. An initial output assertion incorrectly expected an already
+`in_progress` Seed in `ready-all`; direct record and blocked-queue assertions
+passed after correcting that harness scope. Product files did not change, so
+product suites were not rerun; no workflow, push, or extra Seed edit occurred.

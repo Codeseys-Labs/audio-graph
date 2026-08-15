@@ -464,3 +464,17 @@ ordered path. The queue has 90 ready and 100 blocked issues, and doctor has 0
 failures. Output stress, all five contracts, pinned `verify:fast`,
 Betterleaks, secret, and range gates passed. Product suites were not rerun;
 no workflow, push, or extra Seed edit occurred.
+
+### Wave 7B Wave1c snapshot-replace prerequisite
+
+Custody `aca9621` was merged history-preservingly at `3f23d5b`. Its one linear
+commit after `4204565` changes only `.seeds/issues.jsonl`, and the integrated
+642-row queue is byte-identical to custody.
+
+Seed c928 is now `in_progress`, unblocked, and assigned to
+`codex-c928-wave7b`; a596 is open and blocked directly only by c928. Parent
+8e73 records c928, a596, 3b8b, b77b, and 2df3 as the remaining order, while
+c2e3 remains closed. The queue has 90 ready and 101 blocked issues, and doctor
+has 0 failures. Output stress, all five contracts, pinned `verify:fast`,
+Betterleaks, secret, and range gates passed. Product suites were not rerun;
+no workflow, push, or extra Seed edit occurred.
