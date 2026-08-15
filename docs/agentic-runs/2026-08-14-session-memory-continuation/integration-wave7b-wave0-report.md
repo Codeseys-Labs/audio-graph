@@ -834,3 +834,54 @@ change, so the assembled product-suite evidence at `dc4f5cf` remains
 applicable and was not rerun. No extra Seed edit or closure, workflow change
 or dispatch, push, Blacksmith, Testbox, Docker, guest, or platform action
 occurred.
+
+## Wave5 reviewed supply-chain audit remediation fan-in
+
+Custody `b5cbb2acb48250d3f1119afdbc961d58ad4f6320` was merged
+history-preservingly without conflict at
+`9acd342195e728af7b79a89f08e92e88bc82e6e0`. Its six linear commits after
+custody `d092375` change only `.seeds/issues.jsonl`; the integrated 647-row
+queue is byte-identical to custody and remains valid JSONL. Custody records
+942a activation, the discovery decision, independent c65d creation, the
+candidate, the first review block, the correction, and final review evidence.
+
+Reviewed candidate `5331f5c6f6b31a4be3382401c18f7f93b3570526` was merged
+history-preservingly without conflict at
+`0237f142a50cd5187b6c3081f831b3cf3cc2e3d7`. Its four linear commits from
+exact merge-base `9177799` change exactly `src-tauri/Cargo.lock`,
+`src-tauri/.cargo/audit.toml`, and the 942a report. Standards initially
+blocked the report's residual-risk wording and audit-policy blocker rationale;
+Spec returned **SHIP**. Correction round one resolved both findings, and the
+final Standards and Spec reviews returned **SHIP**. Dependency blobs were
+unchanged after the correction and final report-only footprint hygiene.
+
+The lockfile retains 1,186 package stanzas and changes only `ammonia` 4.1.3 to
+4.1.4 plus its checksum. `surrealdb 3.2.0`, `rust_decimal 1.42.1`, and
+resolver-retained `rkyv 0.7.46` are unchanged. The exact
+`RUSTSEC-2026-0235` exception is limited to the inactive rust_decimal optional
+`^0.7.46` edge; it records the semver/resolver blocker, c65d ownership, and
+immediate removal triggers if the edge activates or upstream makes pruning
+possible. The live audit found 0 unignored vulnerabilities, one exact ignored
+inactive advisory, and four pre-existing allowed warnings. The required
+all-target, all-feature, all-edge inverse tree printed `nothing to print`.
+
+| Gate | Result |
+| --- | --- |
+| live `cargo audit` and TOML policy parse | exit 0; 1,186 dependencies; 25 exact policy entries; one `RUSTSEC-2026-0235` entry |
+| locked metadata and inverse tree | 1,186 packages; required versions unchanged; inverse tree empty |
+| focused SurrealDB / sessions | 3/0 and 35/0 |
+| locked cloud plus `surrealdb-embedded` lib/tests check | passed |
+| serialized full locked library | 1,678 passed, 0 failed, 8 ignored |
+| strict Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| exact frontend `test:local` | 70 files and 968 tests passed |
+| all contracts and pinned `verify:fast` | all five current; Biome 174, typecheck, output, secret, and diff green |
+| Seeds ready-all / blocked | 92 ready; 96 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 96, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, docs/Seeds secret, footprint, and range diff | no leaks or secret findings; exact scope and diff checks passed |
+
+No `Cargo.toml`, product source, workflow, storage probe, persisted-format,
+generated, or unrelated dependency change landed. Seed 942a remains
+`in_progress` pending remote CI and was not closed. Seed c65d remains open and
+ready as the independent storage-probe lock-graph follow-up. No extra Seed
+edit, push, workflow change or dispatch, Blacksmith, Testbox, Docker, guest,
+or platform action occurred.

@@ -791,3 +791,31 @@ Product files did not change, so the assembled `dc4f5cf` product-suite
 evidence remains applicable and was not rerun. No extra Seed closure/edit,
 workflow change or dispatch, push, Blacksmith, Testbox, Docker, guest, or
 platform action occurred.
+
+### Wave 7B Wave5 reviewed supply-chain audit fan-in
+
+Six linear Seed-only custody commits through `b5cbb2a` were merged at
+`9acd342`, followed by reviewed four-commit candidate `5331f5c` at `0237f14`.
+The 647-row queue is byte-identical to custody. The candidate's exact footprint
+is `Cargo.lock`, `.cargo/audit.toml`, and the 942a report. One Standards
+correction round resolved the residual-risk wording and blocker rationale;
+final Standards and Spec reviews returned **SHIP**.
+
+The lockfile changes only ammonia 4.1.3 to 4.1.4 and its checksum while
+retaining 1,186 packages. SurrealDB 3.2.0, rust_decimal 1.42.1, and inactive
+rkyv 0.7.46 remain unchanged. The exact `RUSTSEC-2026-0235` exception records
+the rust_decimal constraint, semver/resolver blocker, activation/removal
+triggers, and independent c65d ownership. Live audit reports 0 unignored and
+one exact ignored inactive advisory; the all-target/all-feature inverse tree
+is empty.
+
+Focused SurrealDB 3/0 and sessions 35/0, locked check, full serialized library
+1,678/0/8, strict Clippy, fmt, frontend 968, all five contracts, pinned
+`verify:fast`, Seeds 92 ready/96 blocked with Doctor 0 failures, Betterleaks,
+secret, footprint, and range gates passed. No `Cargo.toml`, product source,
+workflow, storage-probe, persisted-format, or generated-file change landed.
+
+Seed 942a remains `in_progress` pending remote CI; c65d remains open and ready
+as the independent storage-probe lock-graph follow-up. No Seed closure or
+extra edit, push, workflow or platform action, Blacksmith, Testbox, Docker, or
+guest run occurred.
