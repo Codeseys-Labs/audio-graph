@@ -3172,9 +3172,12 @@ mod tests {
         .expect("recovery descriptor")
     }
 
-    fn seed_recovery_manifest(root: &Path, source_bytes: &[u8]) -> SessionArtifactManifestStore {
-        let store =
-            SessionArtifactManifestStore::qualified_for_test(root).expect("qualified store");
+    fn seed_algorithm_recovery_manifest(
+        root: &Path,
+        source_bytes: &[u8],
+    ) -> SessionArtifactManifestStore {
+        let store = SessionArtifactManifestStore::qualified_for_algorithm_test(root)
+            .expect("synthetic algorithm-qualified store");
         let source_identity = ManagedArtifactIdentity::new("events.jsonl").expect("source");
         let candidate = SessionArtifactManifestV1::candidate(
             SESSION,
@@ -3215,6 +3218,8 @@ mod tests {
         store
     }
 
+    /// Platform-independent recovery algorithm fixture. Its qualification is
+    /// synthetic test evidence, not native filesystem durability evidence.
     fn recovery_fixture(
         label: &str,
     ) -> (
@@ -3232,7 +3237,7 @@ mod tests {
         let mut source = prefix.clone();
         source.extend_from_slice(&tail);
         fs::write(&path, &source).expect("write damaged source");
-        let store = seed_recovery_manifest(root, &source);
+        let store = seed_algorithm_recovery_manifest(root, &source);
         (path, store, recovery_descriptor(), prefix, tail)
     }
 
@@ -3249,8 +3254,8 @@ mod tests {
         let tail = b"private incomplete tail".to_vec();
         let source = [prefix.as_slice(), tail.as_slice()].concat();
         fs::write(&path, &source).expect("write damaged source");
-        let store = SessionArtifactManifestStore::qualified_for_test(&root)
-            .expect("qualified nested store");
+        let store = SessionArtifactManifestStore::qualified_for_algorithm_test(&root)
+            .expect("synthetic algorithm-qualified nested store");
         let candidate = SessionArtifactManifestV1::candidate(
             SESSION,
             ManifestTransition {
@@ -3682,11 +3687,8 @@ mod tests {
                 )
             ))
         ));
-        let windows = SessionArtifactManifestStore::qualified_for_test_platform(
-            root,
-            CanonicalPlatform::Windows,
-        )
-        .expect("Windows policy store");
+        let windows =
+            SessionArtifactManifestStore::for_test_platform(root, CanonicalPlatform::Windows);
         assert!(matches!(
             CanonicalRecoveryTransaction::begin::<TestPayload>(&windows, descriptor),
             Err(CanonicalRecoveryBeginError::Rejected(
@@ -3770,7 +3772,7 @@ mod tests {
             let root = path.parent().expect("root");
             fs::create_dir_all(root).expect("create root");
             fs::write(&path, source).expect("write source");
-            let store = seed_recovery_manifest(root, source);
+            let store = seed_algorithm_recovery_manifest(root, source);
             if expected == "content" {
                 fs::write(&path, b"{\"value\":1}\nchanged tail").expect("drift source");
             }
