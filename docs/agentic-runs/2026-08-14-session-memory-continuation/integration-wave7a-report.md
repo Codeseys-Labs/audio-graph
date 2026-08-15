@@ -122,3 +122,29 @@ three human policy decisions unresolved:
 Cross-platform directory-entry durability, typed quarantine registration, and
 the exact predecessor canary remain later executable evidence; this wave makes
 no claim for them.
+
+## Final Seed reconciliation
+
+Custody `faa8fe69a739220da05c8e859dc219a8db98d240` was merged
+history-preservingly at `30fcc90b8057b848c7e4c619d67ccd774a7fb2f3`.
+Its one linear commit after custody `bcc70d4` changes only
+`.seeds/issues.jsonl`; the integrated 632-row queue is byte-identical to
+custody and remains valid JSONL.
+
+`audio-graph-ab64` is closed with the exact reviewed implementation tip,
+integration tip, SHIP verdicts, focused/full Rust, four-golden, Clippy, fmt,
+and contract evidence. It is no longer a blocker for 0baf or 4249.
+`audio-graph-0baf` is now blocked only by `audio-graph-7e81`.
+
+`audio-graph-5e41` remains `in_progress` and
+`AWAITING_HUMAN_DECISION`. Its durable evidence retains the exact 814 cases,
+7,671 transitions, 1,262 states, 111,905 assertions, and 31 families, plus the
+same three recommendations. None was selected by integration. Seed 4249
+remains `in_progress`; its next executable dependency is 8e73 only after the
+5e41 policy decision and closure. Seed 8e73 remains blocked by 5e41.
+
+The complete queue remains 90 ready and 96 blocked. Seeds Doctor again
+reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
+output stress, all five contracts, pinned `verify:fast`, Betterleaks,
+docs/Seeds secret hygiene, and range diff passed. Product files did not change,
+so no product suite was rerun.

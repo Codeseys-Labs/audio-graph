@@ -329,3 +329,23 @@ selected. Human decisions remain for durable Saved wording, remote reissue
 under externally uncertain effects, and immediate-discard versus fenced-wait
 deletion behavior. Exact evidence is in
 [`integration-wave7a-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave7a-report.md).
+
+### Wave 7A final Seed reconciliation
+
+Custody `faa8fe6` was merged history-preservingly at `30fcc90`. Its one-commit
+delta from `bcc70d4` changes only `.seeds/issues.jsonl`, and the integrated
+632-row queue is byte-identical to custody.
+
+`audio-graph-ab64` is closed with its exact integrated SHIP and gate evidence
+and has been removed from the 0baf/4249 blockers. `audio-graph-0baf` is blocked
+only by 7e81. `audio-graph-5e41` remains `in_progress` and
+`AWAITING_HUMAN_DECISION`, retaining the exact 814-case / 7,671-transition /
+111,905-assertion / 31-family evidence and all three unselected policy
+recommendations. `audio-graph-4249` remains `in_progress`; 8e73 is next only
+after the 5e41 decision and closure.
+
+The queue remains 90 ready and 96 blocked. Seeds Doctor has 0 failures. Seeds
+JSON/output, all five contracts, pinned `verify:fast`, Betterleaks, secret, and
+range gates passed. Product files were unchanged, so product suites were not
+rerun. No extra Seed was edited, no policy was selected, no workflow was
+dispatched, and no branch was pushed.
