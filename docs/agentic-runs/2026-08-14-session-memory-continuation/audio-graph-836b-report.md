@@ -13,6 +13,11 @@ Exact base: `cffb0c5f340d73ec9377319dc3cdbcfbae9074fc`
 
 Implementation commit: `eda0a8a2f47470bb990bb51a0d0708e312497478`
 
+Original report commit and correction-round-1 direct parent:
+`9221e3286b6bf67dc94df21b3fdfa9c167aff607`
+
+Correction-round-1 commit: `90703fc6c9709caca1abf1d6f689329c7958ad8b`
+
 ## Outcome
 
 The 15 platform-independent canonical recovery fixtures now opt into one
@@ -97,9 +102,9 @@ All Rust commands used Rust/Cargo 1.95.0, `--locked`, cloud-only features, and
 the worktree-local `src-tauri/target`.
 
 ```text
-canonical_log: 46 passed; 0 failed; 1635 filtered out; 2.22s
-session_artifact_manifest: 19 passed; 0 failed; 1662 filtered out; 13.06s
-canonical_durability: 41 passed; 0 failed; 1640 filtered out; 6.12s
+canonical_log: 47 passed; 0 failed; 1636 filtered out; 3.17s
+session_artifact_manifest: 19 passed; 0 failed; 1664 filtered out; 10.11s
+canonical_durability: 42 passed; 0 failed; 1641 filtered out; 4.47s
 ```
 
 The 41-test durability suite includes the unchanged c928 snapshot refusal and
@@ -139,8 +144,8 @@ dependency artifacts without creating or editing a Cargo manifest. Direct
 Rust 1.95 compilation for `x86_64-pc-windows-msvc` produced:
 
 ```text
-libnative_wrapper.rlib 6563504 bytes
-canonical_native_tests.obj 6488104 bytes
+libnative_wrapper.rlib 6565740 bytes
+canonical_native_tests.obj 6558100 bytes
 ```
 
 The production rlib string gate passed: no synthetic identity or algorithm
@@ -185,8 +190,8 @@ The final serialized locked cloud library snapshot passed after all source
 corrections and static review:
 
 ```text
-running 1681 tests
-test result: ok. 1673 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 69.37s
+running 1683 tests
+test result: ok. 1675 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 69.75s
 ```
 
 The Linux host emitted the existing PipeWire/ALSA no-device diagnostics; they
@@ -241,13 +246,101 @@ The report-inclusive Betterleaks rerun scanned approximately 458.77 KB with no
 leaks; docs/Seeds secret hygiene again reported 0 findings, and
 `git diff --check` exited 0.
 
+## Correction round 1 of 2
+
+Both independent reviews blocked the original candidate. They found four
+load-bearing proof gaps:
+
+1. `CanonicalDurability::for_algorithm_test` retained `current_platform()`, so
+   the native Windows target still took `NamespaceDurabilityUnsupported`
+   before exercising the synthetic identity.
+2. Snapshot temporary revalidation called the native free function instead of
+   the guard's cfg(test)-aware identity seam.
+3. Windows has no native directory handle in this module, so the algorithm
+   fixture still lacked an honest test-only parent-barrier model.
+4. One global synthetic identity plus independent qualification/durability
+   constructors was forgeable and could not reject same-path root replacement.
+
+The first retained correction RED was executable. The new source mutation
+oracle failed with:
+
+```text
+algorithm_snapshot_temp_revalidation_stays_on_the_guard_identity_seam ... FAILED
+snapshot temp must use the cfg(test)-aware guard identity seam
+```
+
+Routing the temporary through `self.validate_snapshot_destination` made it
+green 1/1. The second RED failed compilation with E0433 because
+`AlgorithmTestEnvironment` did not exist. The correction replaces the two
+independent constructors with that one opaque cfg(test)-only environment. It
+creates a root-local token anchor, binds the exact canonical root and token to
+both qualification and durability, overrides namespace support only inside
+the bound algorithm environment, and supplies a cfg(test)-only parent barrier
+when the platform has no native directory handle.
+
+The environment test is mutation-sensitive. An executable
+`CanonicalPlatform::Windows` first-create returns `Accepted` with
+`FileAndParentNamespace`; using the bound durability on another root returns
+`IdentityUnavailable`; after the original root is displaced and replaced at
+the same pathname, reacquisition also returns `IdentityUnavailable` before a
+target or coordination entry is created.
+
+Two executable Windows-platform algorithm tracers are green on the Linux host:
+
+```text
+algorithm_qualification_and_windows_policy_refusal_are_explicitly_separate ... ok
+recovery_algorithm_accepts_with_injected_windows_platform_semantics ... ok
+```
+
+The first completes manifest generations 1 and 2. The second seeds generation
+1, completes the full recovery transaction at generation 3, truncates the
+source to the exact prefix, and publishes the exact quarantine. Because the
+injected platform is Windows, both tests require the synthetic parent-barrier
+model and the algorithm-only namespace-support override. The same manifest
+test independently constructs the real Windows store, proves its qualification
+is `None`, and preserves pre-mutation `NamespaceDurabilityUnsupported`.
+
+The first broad harness pass found one inherited source-order oracle still
+looked for `source_parent_directory.sync_all()`. The owned durability code now
+retains that exact concrete-operation marker while routing it through the
+barrier object. The harness then passed all 11 tests with unchanged hashes,
+generations, checkpoints, and ext4 evidence. No unowned harness edit occurred.
+
+Correction-round final gates are:
+
+```text
+canonical_log: 47 passed; 0 failed
+session_artifact_manifest: 19 passed; 0 failed
+canonical_durability: 42 passed; 0 failed
+canonical_crash_harness: 11 passed; 0 failed
+locked check: pass, 35.14s
+strict Clippy -D warnings: pass, 43.50s
+rustfmt: pass
+verify:fast and all five explicit contracts: pass
+Betterleaks: ~456.94 KB, no leaks
+docs/Seeds secret hygiene: 0 findings
+final cloud library: 1675 passed; 0 failed; 8 ignored; 69.75s
+```
+
+The corrected Windows production rlib and full cfg(test) object compile. All
+15 original fixture names and all new mutation-sensitive/policy symbols are
+present. `llvm-nm` finds no `AlgorithmTestEnvironment`, synthetic identity, or
+algorithm-store symbol in the production rlib. Static gates report no
+independent algorithm constructors, no runtime caller, no unsafe addition,
+real Windows `qualification: None`, and an exact three-Rust-file correction
+footprint.
+
+The correction-report-inclusive Betterleaks rerun scanned approximately
+472.24 KB with no leaks. Docs/Seeds secret hygiene again reported 0 findings,
+and `git diff --check` passed.
+
 ## Review, findings, and open questions
 
-One bounded implementation critique corrected cfg shadowing so the direct
-non-test Windows compile did not carry avoidable `unused_mut` warnings. The
-post-correction production rlib, full Windows cfg(test) object, focused suites,
-locked check, strict Clippy/fmt, contracts, static gates, and final serialized
-library are all green. No second correction round was needed.
+Correction round 1 resolves both blocking reviews. This is the first of the
+two permitted review-fix rounds. The final post-correction production rlib,
+full Windows cfg(test) object, focused suites, Linux crash harness, locked
+check, strict Clippy/fmt, contracts, static gates, and serialized library are
+green.
 
 No production defect or scope blocker was found. The native Windows failures
 were fixture-only, and the synthetic seam remains impossible to construct in
