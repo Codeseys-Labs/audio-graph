@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions, TryLockError};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -156,6 +156,8 @@ pub enum CanonicalDurabilityRejection {
         raw_os_error: Option<i32>,
     },
     QualificationBindingMismatch,
+    QualifiedDescendantVolumeMismatch,
+    QualifiedDescendantVolumeUnavailable,
     ReservedCoordinationEntry,
     NonRegularCanonicalEntry,
     DestinationAlreadyExists,
@@ -333,6 +335,50 @@ impl ManagedNamespace {
         }
         Ok(BoundParent {
             canonical_path: canonical_parent,
+            identity,
+            directory,
+        })
+    }
+
+    fn bind_descendant_parent(
+        &self,
+        target: &Path,
+        platform: CanonicalPlatform,
+    ) -> Result<BoundParent, CanonicalDurabilityRejection> {
+        self.validate_current()?;
+        if target.file_name().is_none() {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let parent = parent_directory(target);
+        let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CanonicalDurabilityRejection::ParentProvisioningRequired
+            } else {
+                durability_io(CanonicalDurabilityStage::OpenParent, &error)
+            }
+        })?;
+        if !canonical_parent.starts_with(&self.canonical_root) {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let metadata = std::fs::metadata(&canonical_parent)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+        if !metadata.is_dir() {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        let identity = filesystem_identity(&metadata);
+        let directory = open_parent_directory(platform, &canonical_parent)?;
+        if let Some(directory) = &directory {
+            let opened_metadata = directory
+                .metadata()
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            if identity_is_available(&identity) && filesystem_identity(&opened_metadata) != identity
+            {
+                return Err(CanonicalDurabilityRejection::IdentityChanged);
+            }
+        }
+        Ok(BoundParent {
+            canonical_path: canonical_parent,
+            identity,
             directory,
         })
     }
@@ -340,6 +386,7 @@ impl ManagedNamespace {
 
 struct BoundParent {
     canonical_path: PathBuf,
+    identity: FilesystemIdentity,
     directory: Option<File>,
 }
 
@@ -409,6 +456,8 @@ struct InjectedFailure {
 #[derive(Clone, Copy)]
 enum InjectedRenameFault {
     PreflightDeviceMismatch,
+    DescendantQualificationMismatch,
+    DescendantQualificationUnavailable,
     RuntimeExdev { raw_os_error: i32 },
 }
 
@@ -556,7 +605,7 @@ impl CanonicalDurability {
     }
 
     #[cfg(test)]
-    fn for_test_platform(platform: CanonicalPlatform) -> Self {
+    pub(crate) fn for_test_platform(platform: CanonicalPlatform) -> Self {
         Self {
             platform,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
@@ -625,6 +674,153 @@ impl CanonicalDurability {
 }
 
 impl CanonicalExclusiveGuard {
+    /// Prove that all recovery namespace mutations can use the qualified
+    /// parent barrier before any recovery temp is created.
+    pub(crate) fn preflight_recovery_namespace(
+        &self,
+        source: &Path,
+        temporary: &Path,
+        destination: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([source, temporary, destination])?;
+        if !namespace_supported_for(self.platform) {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let Some(qualification) = qualification else {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        };
+        if !self.qualification_status(Some(qualification))? {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        self.namespace
+            .bind_descendant_parent(source, self.platform)?;
+        let temporary_parent = self
+            .namespace
+            .bind_descendant_parent(temporary, self.platform)?;
+        let destination_parent = self
+            .namespace
+            .bind_descendant_parent(destination, self.platform)?;
+        if temporary_parent.directory.is_none()
+            || temporary_parent.canonical_path != destination_parent.canonical_path
+            || temporary_parent.identity != destination_parent.identity
+        {
+            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+        }
+        self.validate_qualified_descendant_volume(&temporary_parent, qualification)?;
+        self.validate_qualified_descendant_volume(&destination_parent, qualification)?;
+        Ok(())
+    }
+
+    /// Open one regular canonical source for recovery. The returned handle is
+    /// the handle the recovery transaction must retain through truncation.
+    pub(crate) fn open_recovery_source(
+        &self,
+        path: &Path,
+    ) -> Result<File, CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([path])?;
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| CanonicalDurabilityRejection::CoordinationPoisoned)?;
+        self.namespace.bind_descendant_parent(path, self.platform)?;
+        self.open_existing_regular(path)
+    }
+
+    /// Revalidate that the canonical pathname still names the exact retained
+    /// source handle. This is the cooperative-process substitution fence used
+    /// immediately before every destructive source mutation.
+    pub(crate) fn revalidate_recovery_source(
+        &self,
+        path: &Path,
+        source: &File,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([path])?;
+        self.namespace.bind_descendant_parent(path, self.platform)?;
+        validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(source))?;
+        Ok(())
+    }
+
+    /// Re-establish the qualified parent barrier for an already-published
+    /// recovery artifact after a prior rename result was lost.
+    pub(crate) fn sync_recovery_namespace_entry(
+        &self,
+        path: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([path]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        if !namespace_supported_for(self.platform) {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let qualified = match self.qualification_status(qualification) {
+            Ok(qualified) => qualified,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if !qualified {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        }
+        let parent = match self.namespace.bind_descendant_parent(path, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        let Some(parent_directory) = parent.directory else {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::Rename,
+                },
+            );
+        };
+        if let Err(rejection) = self.open_existing_regular(path) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
+            parent_directory.sync_all()
+        }) {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation: CanonicalMutation::Rename,
+            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+        })
+    }
+
     /// Append bytes whose immediate canonical parent is the bound directory.
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
@@ -722,6 +918,27 @@ impl CanonicalExclusiveGuard {
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
+        self.rename_inner(source, destination, qualification, recovery_key, false)
+    }
+
+    pub(crate) fn rename_recovery(
+        &self,
+        source: &Path,
+        destination: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.rename_inner(source, destination, qualification, recovery_key, true)
+    }
+
+    fn rename_inner(
+        &self,
+        source: &Path,
+        destination: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        descendant: bool,
+    ) -> CanonicalDurabilityOutcome {
         if let Err(rejection) = self.preflight_mutation_targets([source, destination]) {
             return CanonicalDurabilityOutcome::Rejected(rejection);
         }
@@ -741,11 +958,18 @@ impl CanonicalExclusiveGuard {
                 },
             );
         }
-        let source_parent = match self.namespace.bind_parent(source, self.platform) {
+        let bind_parent = |path| {
+            if descendant {
+                self.namespace.bind_descendant_parent(path, self.platform)
+            } else {
+                self.namespace.bind_parent(path, self.platform)
+            }
+        };
+        let source_parent = match bind_parent(source) {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
-        let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
+        let destination_parent = match bind_parent(destination) {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
@@ -790,7 +1014,7 @@ impl CanonicalExclusiveGuard {
         };
         if self.preflight_volumes_differ(
             &filesystem_identity(&source_metadata),
-            &self.namespace.identity,
+            &source_parent.identity,
         ) {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None },
@@ -840,6 +1064,76 @@ impl CanonicalExclusiveGuard {
         expectation: CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.install_snapshot_inner(
+            temporary,
+            destination,
+            bytes,
+            expectation,
+            qualification,
+            recovery_key,
+            false,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_snapshot_recovery(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.install_snapshot_inner(
+            temporary,
+            destination,
+            bytes,
+            expectation,
+            qualification,
+            recovery_key,
+            true,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_snapshot_recovery_with_fault(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalDurabilityOutcome {
+        self.install_snapshot_inner(
+            temporary,
+            destination,
+            bytes,
+            expectation,
+            qualification,
+            recovery_key,
+            true,
+            Some(injected_fault),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_snapshot_inner(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        resume_temporary: bool,
+        injected_fault: Option<CanonicalDurabilityStage>,
     ) -> CanonicalDurabilityOutcome {
         if let Err(rejection) = self.preflight_mutation_targets([temporary, destination]) {
             return CanonicalDurabilityOutcome::Rejected(rejection);
@@ -911,53 +1205,75 @@ impl CanonicalExclusiveGuard {
                 &error,
             ));
         }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        configure_owner_only_creation(&mut options);
         self.wait_before_atomic_create();
-        let mut temporary_file = match options.open(temporary) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return CanonicalDurabilityOutcome::Rejected(
-                    CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
-                );
-            }
-            Err(error) => {
-                return CanonicalDurabilityOutcome::Rejected(durability_io(
-                    CanonicalDurabilityStage::CreateNew,
-                    &error,
-                ));
-            }
-        };
+        let (mut temporary_file, already_written) =
+            match open_snapshot_temporary(temporary, bytes, resume_temporary) {
+                Ok(opened) => opened,
+                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+            };
 
         let mut writer = BufWriter::new(&mut temporary_file);
-        if let Err(error) =
-            self.checked(CanonicalDurabilityStage::Write, || writer.write_all(bytes))
-        {
+        let remaining = &bytes[already_written..];
+        if injected_fault == Some(CanonicalDurabilityStage::Write) && !remaining.is_empty() {
+            let partial = (remaining.len() / 2).max(1).min(remaining.len());
+            if let Err(error) = writer.write_all(&remaining[..partial]) {
+                return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
+            }
+            return indeterminate(
+                CanonicalDurabilityStage::Write,
+                &io::Error::other("injected recovery snapshot write cut"),
+                recovery_key,
+            );
+        }
+        if let Err(error) = self.checked(CanonicalDurabilityStage::Write, || {
+            writer.write_all(remaining)
+        }) {
             return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
         }
-        if let Err(error) = self.checked(CanonicalDurabilityStage::Flush, || writer.flush()) {
+        if let Err(error) =
+            self.checked_snapshot(CanonicalDurabilityStage::Flush, injected_fault, || {
+                writer.flush()
+            })
+        {
             return indeterminate(CanonicalDurabilityStage::Flush, &error, recovery_key);
         }
         drop(writer);
-        if let Err(error) = self.checked(CanonicalDurabilityStage::ProtectTemp, || {
-            apply_owner_only_protection(&temporary_file)
-        }) {
+        if let Err(error) = self.checked_snapshot(
+            CanonicalDurabilityStage::ProtectTemp,
+            injected_fault,
+            || apply_owner_only_protection(&temporary_file),
+        ) {
             return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
         }
-        if let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || {
-            temporary_file.sync_all()
-        }) {
+        if let Err(error) =
+            self.checked_snapshot(CanonicalDurabilityStage::FileSync, injected_fault, || {
+                temporary_file.sync_all()
+            })
+        {
             return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
 
         self.wait_before_snapshot_revalidation();
+        if validate_snapshot_destination(
+            temporary,
+            CanonicalSnapshotExpectation::Existing(&temporary_file),
+        )
+        .is_err()
+        {
+            return indeterminate(
+                CanonicalDurabilityStage::InspectEntry,
+                &io::Error::other("snapshot temporary identity changed"),
+                recovery_key,
+            );
+        }
         if let Err(error) = revalidate_snapshot_destination(destination, &validated_destination) {
             return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
         }
-        if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
-            self.rename_source(temporary, destination)
-        }) {
+        if let Err(error) =
+            self.checked_snapshot(CanonicalDurabilityStage::Rename, injected_fault, || {
+                self.rename_source(temporary, destination)
+            })
+        {
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
@@ -970,6 +1286,18 @@ impl CanonicalExclusiveGuard {
             mutation: validated_destination.mutation(),
             barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
         })
+    }
+
+    fn checked_snapshot(
+        &self,
+        stage: CanonicalDurabilityStage,
+        injected_fault: Option<CanonicalDurabilityStage>,
+        operation: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if injected_fault == Some(stage) {
+            return Err(io::Error::other("injected recovery snapshot cut"));
+        }
+        self.checked(stage, operation)
     }
 
     fn preflight_mutation_targets<const N: usize>(
@@ -996,6 +1324,38 @@ impl CanonicalExclusiveGuard {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
         Ok(namespace_supported_for(self.platform))
+    }
+
+    fn validate_qualified_descendant_volume(
+        &self,
+        parent: &BoundParent,
+        qualification: &CanonicalFilesystemQualification,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        if qualification.namespace != self.namespace {
+            return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
+        }
+        #[cfg(test)]
+        if let Some(injection) = &self.injected_rename_fault {
+            match injection.fault {
+                InjectedRenameFault::DescendantQualificationMismatch => {
+                    return Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch);
+                }
+                InjectedRenameFault::DescendantQualificationUnavailable => {
+                    return Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable);
+                }
+                _ => {}
+            }
+        }
+        match (
+            qualification.namespace.identity.volume.as_ref(),
+            parent.identity.volume.as_ref(),
+        ) {
+            (Some(qualified), Some(observed)) if qualified == observed => Ok(()),
+            (Some(_), Some(_)) => {
+                Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch)
+            }
+            _ => Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable),
+        }
     }
 
     fn preflight_volumes_differ(
@@ -1274,6 +1634,46 @@ fn apply_owner_only_protection(file: &File) -> io::Result<()> {
 #[cfg(not(unix))]
 fn apply_owner_only_protection(_file: &File) -> io::Result<()> {
     Ok(())
+}
+
+fn open_snapshot_temporary(
+    path: &Path,
+    expected: &[u8],
+    resume: bool,
+) -> Result<(File, usize), CanonicalDurabilityRejection> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    configure_owner_only_creation(&mut options);
+    match options.open(path) {
+        Ok(file) => Ok((file, 0)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && resume => {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+            if !metadata.file_type().is_file() {
+                return Err(CanonicalDurabilityRejection::SnapshotTempAlreadyExists);
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
+            let mut observed = Vec::new();
+            (&mut file)
+                .take(u64::try_from(expected.len()).unwrap_or(u64::MAX) + 1)
+                .read_to_end(&mut observed)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
+            if observed.len() > expected.len() || !expected.starts_with(&observed) {
+                return Err(CanonicalDurabilityRejection::SnapshotTempAlreadyExists);
+            }
+            file.seek(SeekFrom::Start(observed.len() as u64))
+                .map_err(|error| durability_io(CanonicalDurabilityStage::SeekEnd, &error))?;
+            Ok((file, observed.len()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(CanonicalDurabilityRejection::SnapshotTempAlreadyExists)
+        }
+        Err(error) => Err(durability_io(CanonicalDurabilityStage::CreateNew, &error)),
+    }
 }
 
 fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationError> {
@@ -2956,6 +3356,73 @@ mod tests {
         );
         assert!(!rename_invoked.load(Ordering::SeqCst));
         assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_descendant_volume_must_match_opaque_root_qualification_before_mutation() {
+        let root = temp_root("recovery-descendant-volume-binding");
+        fs::create_dir_all(root.join("streams")).expect("create streams parent");
+        fs::create_dir_all(root.join("recovery")).expect("create recovery parent");
+        let source = root.join("streams/events.jsonl");
+        let temporary = root.join("recovery/events.tmp");
+        let destination = root.join("recovery/events.bin");
+        let manifest = root.join(".audio-graph-session-artifacts.v1.json");
+        fs::write(&source, b"full source").expect("seed source");
+        fs::write(&manifest, b"stable manifest").expect("seed manifest marker");
+        fs::write(root.join(COORDINATION_FILE_NAME), b"").expect("seed coordination entry");
+        let proof = qualification(&root);
+        let rename_invoked = Arc::new(AtomicBool::new(false));
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::DescendantQualificationMismatch,
+            rename_invoked.clone(),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire qualified guard");
+
+        assert_eq!(
+            guard.preflight_recovery_namespace(&source, &temporary, &destination, Some(&proof),),
+            Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeMismatch)
+        );
+        assert!(!rename_invoked.load(Ordering::SeqCst));
+        assert_eq!(fs::read(&source).expect("source unchanged"), b"full source");
+        assert_eq!(
+            fs::read(&manifest).expect("manifest unchanged"),
+            b"stable manifest"
+        );
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_descendant_unavailable_volume_is_named_and_non_mutating() {
+        let root = temp_root("recovery-descendant-volume-unavailable");
+        fs::create_dir_all(root.join("streams")).expect("create streams parent");
+        fs::create_dir_all(root.join("recovery")).expect("create recovery parent");
+        let source = root.join("streams/events.jsonl");
+        let temporary = root.join("recovery/events.tmp");
+        let destination = root.join("recovery/events.bin");
+        fs::write(&source, b"full source").expect("seed source");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::DescendantQualificationUnavailable,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire qualified guard");
+
+        assert_eq!(
+            guard.preflight_recovery_namespace(&source, &temporary, &destination, Some(&proof),),
+            Err(CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable)
+        );
+        assert_eq!(fs::read(&source).expect("source unchanged"), b"full source");
+        assert!(!temporary.exists());
         assert!(!destination.exists());
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
