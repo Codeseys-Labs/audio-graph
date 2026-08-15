@@ -148,3 +148,27 @@ reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
 output stress, all five contracts, pinned `verify:fast`, Betterleaks,
 docs/Seeds secret hygiene, and range diff passed. Product files did not change,
 so no product suite was rerun.
+
+## Wave 7B policy-accepted base
+
+Custody `333c7f2e090aacf493dbdad50d80601185c0bd09` was merged
+history-preservingly at `cc7aa79c8ef0a161c3ee7cadd2672d52114efde2`.
+Its one linear commit after custody `faa8fe6` changes only
+`.seeds/issues.jsonl`; the integrated 632-row queue is byte-identical to
+custody and remains valid JSONL.
+
+`audio-graph-5e41` is closed after human acceptance of all three prototype
+recommendations: display `Saved` only after durable `Accepted` or
+`AlreadyAccepted`; never automatically reissue externally uncertain remote
+work without provider idempotency proof plus explicit cost and content-egress
+authorization; and immediately fence a deleted Session and discard late
+remote results. Its dependency was removed from 8873, 3b48, 44c1, 8e73, and
+7e81. Seed 8e73 is now the `ACTIVE_MILESTONE`, assigned to
+`codex-8e73-wave7b`; 7e81 is blocked only by 8e73, and 4249 records the Wave 7B
+implementation sequence.
+
+The complete queue contains 90 ready and 95 blocked issues. Seeds Doctor
+reported 10 passed, 2 custody-carried warning groups, and 0 failures. Seeds
+output stress, all five contracts, pinned `verify:fast`, Betterleaks,
+docs/Seeds secret hygiene, and range diff passed. Product files did not change,
+so no product suite was rerun.

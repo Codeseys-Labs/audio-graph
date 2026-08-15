@@ -349,3 +349,21 @@ JSON/output, all five contracts, pinned `verify:fast`, Betterleaks, secret, and
 range gates passed. Product files were unchanged, so product suites were not
 rerun. No extra Seed was edited, no policy was selected, no workflow was
 dispatched, and no branch was pushed.
+
+### Wave 7B policy-accepted base
+
+Custody `333c7f2` was merged history-preservingly at `cc7aa79`. Its one-commit
+delta from `faa8fe6` changes only `.seeds/issues.jsonl`, and the integrated
+632-row queue is byte-identical to custody.
+
+`audio-graph-5e41` is closed after human acceptance of its durable Saved,
+externally uncertain remote-reissue, and deletion-fencing recommendations.
+Its dependency is removed from the five downstream children. Seed 8e73 is now
+the `ACTIVE_MILESTONE`, assigned to `codex-8e73-wave7b`; 7e81 is blocked only
+by 8e73, and 4249 records the Wave 7B continuation order.
+
+The queue now contains 90 ready and 95 blocked issues. Seeds Doctor has 0
+failures. Seeds JSON/output, all five contracts, pinned `verify:fast`,
+Betterleaks, secret, and range gates passed. Product files were unchanged, so
+product suites were not rerun. No extra Seed was edited, no workflow was
+dispatched, and no branch was pushed.
