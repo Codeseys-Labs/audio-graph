@@ -107,7 +107,7 @@ session_artifact_manifest: 19 passed; 0 failed; 1664 filtered out; 10.11s
 canonical_durability: 42 passed; 0 failed; 1641 filtered out; 4.47s
 ```
 
-The 41-test durability suite includes the unchanged c928 snapshot refusal and
+The 42-test durability suite includes the unchanged c928 snapshot refusal and
 67d3 Windows policy tests:
 
 ```text
@@ -127,7 +127,7 @@ The inherited Linux crash harness remained exact:
 ```text
 running 11 tests
 AUDIO_GRAPH_67D3_FIXTURE_FS_V1 platform=linux expected=ext4 observed=ext4 outcome=qualified ...
-test result: ok. 11 passed; 0 failed; 0 ignored; 1670 filtered out; 7.66s
+test result: ok. 11 passed; 0 failed; 0 ignored; 1672 filtered out; 7.66s
 ```
 
 All b77b crash residuals, hashes, generations, fresh-process retries, and four
