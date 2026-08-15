@@ -15,6 +15,8 @@ Implementation commit: `577c83c93372795692afe5f5c4caedb9574b834b`
 
 Correction source commit: `106364fab97780892b6a1303154bdf680ce973d9`
 
+Final-cap source commit: `c35eda14db39a38b54569311a80b7c31c8a9ad42`
+
 ## Outcome
 
 Implemented one dormant `CanonicalRecoveryTransaction` deep module. It has no
@@ -344,3 +346,71 @@ The correction footprint is still exactly the three owned persistence files
 plus this report. Searches found no caller outside the dormant persistence
 module and no change to Seeds, dependencies, generated contracts, workflows,
 Docker, Blacksmith, commands, state, scheduler, speech, providers, or UI.
+
+## Correction round 2: final cap
+
+The final reviewed P1 observed that canonical containment alone did not bind a
+nested quarantine directory's filesystem volume to the opaque managed-root
+qualification. Source commit `c35eda1` closes that gap without changing the
+qualification's public surface.
+
+Recovery preflight now requires both independently bound quarantine paths to
+name the same exact parent identity and requires that parent's volume identity
+to equal the qualified managed root's recorded volume. This occurs before any
+temporary create or rename. A mismatch returns
+`QualifiedDescendantVolumeMismatch`; missing volume evidence returns
+`QualifiedDescendantVolumeUnavailable`. Neither outcome can become Accepted.
+The source may remain in a different same-root directory because truncation is
+still fenced by its retained exact file handle; only the quarantine publish
+parent must carry the qualified volume binding.
+
+### Final-cap RED and GREEN
+
+The new descendant-volume preflight test was authored first and produced this
+captured compiler RED:
+
+```text
+error[E0599]: no variant or associated item named
+`DescendantQualificationMismatch` found for enum `InjectedRenameFault`
+
+error[E0599]: no variant or associated item named
+`QualifiedDescendantVolumeMismatch` found for enum
+`CanonicalDurabilityRejection`
+```
+
+After implementation, the mismatch and unavailable-evidence cases were GREEN:
+
+```text
+running 2 tests
+test persistence::canonical_durability::tests::recovery_descendant_unavailable_volume_is_named_and_non_mutating ... ok
+test persistence::canonical_durability::tests::recovery_descendant_volume_must_match_opaque_root_qualification_before_mutation ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored
+```
+
+The mismatch fixture pre-seeds the source, manifest marker, coordination entry,
+and both descendant directories. It proves no temp/final creation, no rename
+invocation, and byte-identical source/manifest state. The unavailable-volume
+fixture proves the named non-Accepted outcome rather than inferred equivalence.
+The existing same-volume `streams/...` plus `recovery/...` transaction remains
+GREEN in the canonical-log suite.
+
+### Final-cap gates
+
+- canonical log: `46 passed; 0 failed`;
+- manifest: `18 passed; 0 failed`;
+- canonical durability: `40 passed; 0 failed`;
+- locked check, strict Clippy with `-D warnings`, and rustfmt: exit 0;
+- final serialized cloud library: `1660 passed; 0 failed; 8 ignored` out
+  of 1668 in 51.82 seconds;
+- Windows production check and actual-module `cfg(test)` object compile: exit
+  0, with only expected dependency-minimal probe warnings;
+- `verify:fast`: exit 0; Biome checked 174 files, TypeScript and five generated
+  contracts passed, and Seeds stress parsed ready 50, blocked 97, list 50;
+- Betterleaks: no leaks in approximately 142.59 KB of the changed source;
+- docs/Seeds secret hygiene: 0 findings; and
+- `git diff --check`: exit 0.
+
+This is the final `audio-graph-3b8b` correction cap. No architectural blocker
+or third correction remains. Runtime activation and native filesystem
+qualification evidence continue to belong to their already-recorded successor
+Seeds.
