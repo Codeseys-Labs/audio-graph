@@ -24,6 +24,9 @@ The model assumes:
   are different records and different transitions;
 - an existing canonical stream needs completed write, flush, and file-sync
   barriers, while a newly created stream also needs a parent-directory barrier;
+- restart while canonical admission is `Pending` cannot preserve the old
+  in-memory capability: it must retain durable pending evidence, quarantine the
+  old binding, and issue a current-lease recovery binding;
 - the barrier flags are abstract inputs. This prototype does not prove that
   Windows, macOS, or Linux supplied them; that proof remains `audio-graph-8e73`;
 - loss of an in-flight remote request produces `ExternalEffectUnknown`; the
@@ -74,6 +77,25 @@ and lease. Deletion raises a fence and replaces the lease before artifact
 removal or waiting. Results and writer calls bearing any retired token are
 observable refusals; success and failure have the same fence behavior.
 
+Restart while either lane is canonical `Pending` performs one explicit
+transition:
+
+```text
+Pending(old lease/binding)
+  -> OutcomeUncertain(durable pending evidence, current lease/binding,
+                      opaque quarantine reference to old binding)
+```
+
+The evidence retains the exact event id/digest/attempted sequence, prior
+receipt, declared crash cut, exact `Existing`/`New` stream kind, and the disk
+outcomes admissible at that cut. A delayed receipt carrying the pre-restart
+binding cannot commit. Current reconciliation either proves durable exact bytes
+and returns `AlreadyAccepted(1)`, or proves absence/torn tail and permits an
+exact retry to commit `Accepted(1)`. Until one of those paths succeeds, the
+lane stays non-materialized and ineligible as a Projection Basis. A later
+rotation invalidates the recovery binding; deletion quarantines it and removes
+the ability to reconcile while the fence is raised.
+
 ## Admission state and crash reconciliation
 
 | State returned to caller | Canonical meaning | Materialized/basis eligible? | Retry rule |
@@ -91,6 +113,11 @@ crash reconciliation, and retry—also validate their current receipt binding.
 
 The executable matrix explores both existing and newly created streams at each
 cut. The allowed restart observations are deliberately conservative:
+
+In addition to the caller-state matrix below, a dedicated matrix invokes the
+actual `Restart` action from `Pending` at every one of the seven cuts for both
+stream kinds. Every case first becomes recoverable `OutcomeUncertain`; the
+retained cut domain then controls which observations may reconcile.
 
 | Crash cut | Caller state | Restart observations in the bounded model | Required convergence |
 | --- | --- | --- | --- |
@@ -114,6 +141,9 @@ A job may cross the remote boundary only after its scheduler record is
 
 - Restart from `DurableQueued` remains safe to dispatch because no remote
   attempt began.
+- Restart from canonical `Pending` becomes `OutcomeUncertain`, retains the
+  durable pending identity and cut domain, quarantines the retired capability,
+  and admits only a current-lease reconciliation or exact retry.
 - Restart from `RemoteInFlight` becomes `ExternalEffectUnknown`; it never
   fabricates success, failure, or safe-to-retry.
 - Automatic at-risk reissue retains the first unknown effect and registers a
@@ -178,6 +208,7 @@ real. No row is implemented here.
 | `Idle -> DurableQueued` before remote dispatch | Projection Backlog/scheduler persistence (`audio-graph-3b48`) | A restart can distinguish never-dispatched durable work from external-effect-unknown work; Notes and Graph queue independently |
 | `DurableQueued -> RemoteInFlight -> ExternalEffectUnknown` across restart | Projection scheduler persistence (`audio-graph-3b48`) | Persist exact lane/Session/epoch/lease/job/attempt/effect ownership; do not infer provider outcome; apply the accepted reissue policy |
 | canonical enqueue -> `Pending` | canonical commit boundary (`audio-graph-90f3`, then mixed transcript follow-through in `audio-graph-6b9d`) | Queue admission, writer send, and snapshot write expose no durable state and no Projection Basis eligibility |
+| canonical `Pending` -> restart-rebased `OutcomeUncertain` | scheduler persistence (`audio-graph-3b48`), canonical recovery (`audio-graph-90f3`), and cross-platform crash evidence (`audio-graph-8e73`) | Persist the pending event/digest/attempted sequence and crash domain; quarantine the old receipt binding; issue a current-lease binding; never materialize or advance basis before exact reconciliation |
 | write -> flush -> file sync | canonical durability (`audio-graph-90f3`) | Any pre-ack lost response is reconciled by exact id and attempted bytes; sequence cannot be reused |
 | new-file directory sync, typed quarantine registration, destructive recovery | cross-platform durability (`audio-graph-8e73`) | Do not produce `Accepted` or user-facing Saved until the platform-specific file/directory/manifest transaction is proven |
 | durable exact commit -> `Accepted(sequence)` | canonical commit integration (`audio-graph-90f3`) | Validate exact owner/Session/lane/event/lifecycle/prestate binding, then atomically advance live materialized state and basis eligibility; snapshot failure is rebuildable-cache lag |
@@ -190,11 +221,11 @@ real. No row is implemented here.
 
 ## Executable evidence boundary
 
-The successful run explores eight policy profiles and 774 exhaustive bounded
-cases: 30 correction regressions, 368 admission/crash cases, 80 receipt cases,
+The successful run explores eight policy profiles and 795 exhaustive bounded
+cases: 51 correction regressions, 368 admission/crash cases, 80 receipt cases,
 32 scheduler-restart cases, 200 two-lane commutativity cases, and 64
-rotation/deletion cases. It evaluates 7,472 reducer transitions, observes 906
-unique full states, performs 92,110 invariant assertions across 29 named
+rotation/deletion cases. It evaluates 7,547 reducer transitions, observes 1,273
+unique full states, performs 110,543 invariant assertions across 30 named
 invariant families, and observes all five receipt states.
 
 Those counts describe this finite prototype, not the production state space.

@@ -37,6 +37,7 @@ const CUTS = [
   "AfterDirectorySync",
   "AfterAck",
 ];
+const RECOVERY_CUTS = [...CUTS, "Unspecified"];
 const STREAM_KINDS = ["Existing", "New"];
 const RESULT_KINDS = ["Success", "Failure"];
 const DIAGNOSTIC_CODES = [
@@ -118,6 +119,8 @@ function makeLane(lane, session) {
       attemptedSequence: 1,
       lastReceipt: "None",
       pendingBinding: null,
+      recoveryEvidence: null,
+      quarantinedBindingRefs: [],
       committed: null,
     },
     materializedSequence: null,
@@ -292,6 +295,94 @@ function bindingsEqual(left, right) {
   );
 }
 
+function recoveryDiskOutcomes(streamKind, crashCut) {
+  if (crashCut === "Unspecified") return ["Absent", "TornTail", "DurableExact"];
+  return diskOutcomes(streamKind, crashCut);
+}
+
+function beginOutcomeRecovery(
+  state,
+  laneName,
+  crashCut = "Unspecified",
+  streamKind = undefined,
+) {
+  const lane = state.lanes[laneName];
+  const priorReceipt = admissionPrestate(lane);
+  const retiredBinding =
+    lane.admission.pendingBinding ?? lane.admission.recoveryEvidence?.currentBinding;
+  modelGuard(
+    priorReceipt === "Pending" || priorReceipt === "OutcomeUncertain",
+    "recovery-transition",
+    "recovery requires Pending or OutcomeUncertain",
+    state,
+  );
+  modelGuard(
+    RECOVERY_CUTS.includes(crashCut),
+    "recovery-transition",
+    "recovery requires a declared crash cut",
+    state,
+  );
+  modelGuard(
+    STREAM_KINDS.includes(streamKind),
+    "recovery-transition",
+    "recovery requires Existing or New stream kind",
+    state,
+  );
+  if (retiredBinding !== null && retiredBinding !== undefined) {
+    const retiredRef = opaqueRef(retiredBinding);
+    if (!lane.admission.quarantinedBindingRefs.includes(retiredRef)) {
+      lane.admission.quarantinedBindingRefs.push(retiredRef);
+    }
+  }
+  lane.admission.lastReceipt = "OutcomeUncertain";
+  lane.admission.pendingBinding = null;
+  lane.admission.recoveryEvidence = {
+    kind: "DurablePendingEvidence",
+    eventId: lane.admission.eventId,
+    digest: lane.admission.digest,
+    attemptedSequence: lane.admission.attemptedSequence,
+    priorReceipt,
+    crashCut,
+    streamKind,
+    allowedDiskOutcomes: recoveryDiskOutcomes(streamKind, crashCut),
+    currentBinding: makeReceiptBinding(state, laneName, "OutcomeUncertain"),
+  };
+}
+
+function fenceAdmissionForDeletion(state, laneName) {
+  const lane = state.lanes[laneName];
+  const prestate = admissionPrestate(lane);
+  if (prestate !== "Pending" && prestate !== "OutcomeUncertain") return;
+
+  const retiredBinding =
+    lane.admission.pendingBinding ?? lane.admission.recoveryEvidence?.currentBinding;
+  if (retiredBinding !== null && retiredBinding !== undefined) {
+    const retiredRef = opaqueRef(retiredBinding);
+    if (!lane.admission.quarantinedBindingRefs.includes(retiredRef)) {
+      lane.admission.quarantinedBindingRefs.push(retiredRef);
+    }
+  }
+  if (prestate === "Pending") {
+    lane.admission.lastReceipt = "OutcomeUncertain";
+    lane.admission.pendingBinding = null;
+    lane.admission.recoveryEvidence = {
+      kind: "DurablePendingEvidence",
+      eventId: lane.admission.eventId,
+      digest: lane.admission.digest,
+      attemptedSequence: lane.admission.attemptedSequence,
+      priorReceipt: "Pending",
+      crashCut: "Unspecified",
+      streamKind: null,
+      allowedDiskOutcomes: [],
+      currentBinding: null,
+      fencedBy: "Deletion",
+    };
+  } else {
+    lane.admission.recoveryEvidence.currentBinding = null;
+    lane.admission.recoveryEvidence.fencedBy = "Deletion";
+  }
+}
+
 function validateReceiptBinding(state, laneName, binding, allowedPrestates) {
   const lane = state.lanes[laneName];
   const currentPrestate = admissionPrestate(lane);
@@ -341,6 +432,15 @@ function validateReceiptBinding(state, laneName, binding, allowedPrestates) {
         bindingsEqual(binding, lane.admission.pendingBinding),
       "receipt-binding",
       "canonical receipt does not match the Pending admission",
+      state,
+    );
+  }
+  if (currentPrestate === "OutcomeUncertain") {
+    modelGuard(
+      lane.admission.recoveryEvidence !== null &&
+        bindingsEqual(binding, lane.admission.recoveryEvidence.currentBinding),
+      "receipt-binding",
+      "canonical recovery receipt does not match current durable pending evidence",
       state,
     );
   }
@@ -398,6 +498,7 @@ function acceptCanonical(state, laneName, status, proof, binding, allowedPrestat
 
   lane.admission.lastReceipt = status;
   lane.admission.pendingBinding = null;
+  lane.admission.recoveryEvidence = null;
   lane.materializedSequence = candidate.sequence;
   lane.basisEligibleSequence = candidate.sequence;
   lane.derivedCache = "Current";
@@ -414,6 +515,9 @@ function finishDeletion(state) {
     lane.queueDurable = false;
     lane.outstandingEffects = [];
     lane.admission.lastReceipt = "None";
+    lane.admission.pendingBinding = null;
+    lane.admission.recoveryEvidence = null;
+    lane.admission.quarantinedBindingRefs = [];
     lane.admission.committed = null;
     lane.materializedSequence = null;
     lane.basisEligibleSequence = null;
@@ -537,7 +641,17 @@ function transition(input, action) {
         );
       } else {
         validateReceiptBinding(state, action.lane, action.binding, ["Pending"]);
-        lane.admission.lastReceipt = action.status;
+        if (action.status === "OutcomeUncertain") {
+          beginOutcomeRecovery(
+            state,
+            action.lane,
+            action.crashCut,
+            action.proof?.streamKind,
+          );
+        } else {
+          lane.admission.lastReceipt = action.status;
+          lane.admission.pendingBinding = null;
+        }
       }
       break;
     }
@@ -546,6 +660,17 @@ function transition(input, action) {
       break;
     }
     case "ReconcileCrash": {
+      if (admissionPrestate(lane) === "OutcomeUncertain") {
+        modelGuard(
+          lane.admission.recoveryEvidence?.streamKind === action.streamKind &&
+            lane.admission.recoveryEvidence.allowedDiskOutcomes.includes(
+              action.diskOutcome,
+            ),
+          "recovery-transition",
+          "reconciliation is outside the retained recovery domain",
+          state,
+        );
+      }
       if (action.diskOutcome === "DurableExact") {
         acceptCanonical(
           state,
@@ -642,6 +767,37 @@ function transition(input, action) {
           restartedLane.scheduler = "ExternalEffectUnknown";
         }
         restartedLane.owner = makeOwner(laneName, state.session);
+        if (
+          restartedLane.admission.lastReceipt === "Pending" ||
+          restartedLane.admission.lastReceipt === "OutcomeUncertain"
+        ) {
+          const retainedStreamKind =
+            restartedLane.admission.recoveryEvidence?.streamKind;
+          const retainedCrashCut =
+            restartedLane.admission.recoveryEvidence?.crashCut;
+          if (retainedStreamKind !== undefined && action.streamKind !== undefined) {
+            modelGuard(
+              retainedStreamKind === action.streamKind,
+              "recovery-transition",
+              "restart cannot change the retained recovery stream kind",
+              state,
+            );
+          }
+          if (retainedCrashCut !== undefined && action.crashCut !== undefined) {
+            modelGuard(
+              retainedCrashCut === action.crashCut,
+              "recovery-transition",
+              "restart cannot change the retained recovery crash cut",
+              state,
+            );
+          }
+          beginOutcomeRecovery(
+            state,
+            laneName,
+            action.crashCut ?? retainedCrashCut,
+            action.streamKind ?? retainedStreamKind,
+          );
+        }
       }
       addDiagnostic(state, "SessionLeaseReplaced", {
         sessionEpoch: state.session.epoch,
@@ -741,6 +897,7 @@ function transition(input, action) {
         state.session.pendingRemoteEffects.push(
           ...deletingLane.outstandingEffects.map((effect) => structuredClone(effect)),
         );
+        fenceAdmissionForDeletion(state, laneName);
         deletingLane.owner = null;
         deletingLane.scheduler = "Fenced";
       }
@@ -867,12 +1024,55 @@ function verifyState(state, where) {
         state,
       );
       invariant(
-        lane.admission.pendingBinding === null,
+        lane.admission.pendingBinding === null &&
+          lane.admission.recoveryEvidence === null,
         "pending-receipt-binding",
-        `${where} retained a Pending binding after ${laneName} committed`,
+        `${where} retained pending/recovery admission state after ${laneName} committed`,
         state,
       );
     }
+    if (lane.admission.lastReceipt === "OutcomeUncertain") {
+      const evidence = lane.admission.recoveryEvidence;
+      invariant(
+        lane.admission.pendingBinding === null &&
+          evidence?.kind === "DurablePendingEvidence" &&
+          evidence.eventId === lane.admission.eventId &&
+          evidence.digest === lane.admission.digest &&
+          evidence.attemptedSequence === lane.admission.attemptedSequence &&
+          ["Pending", "OutcomeUncertain"].includes(evidence.priorReceipt) &&
+          RECOVERY_CUTS.includes(evidence.crashCut) &&
+          ((STREAM_KINDS.includes(evidence.streamKind) &&
+            JSON.stringify(evidence.allowedDiskOutcomes) ===
+              JSON.stringify(
+                recoveryDiskOutcomes(evidence.streamKind, evidence.crashCut),
+              )) ||
+            (state.session.lifecycle === "Deleting" &&
+              evidence.streamKind === null &&
+              evidence.allowedDiskOutcomes.length === 0)) &&
+          ((state.session.lifecycle === "Active" &&
+            evidence.fencedBy === undefined &&
+            bindingsEqual(
+              evidence.currentBinding,
+              makeReceiptBinding(state, laneName, "OutcomeUncertain"),
+            )) ||
+            (state.session.lifecycle === "Deleting" &&
+              evidence.fencedBy === "Deletion" &&
+              evidence.currentBinding === null)),
+        "pending-restart-recovery",
+        `${where} did not retain current recoverable evidence for ${laneName}`,
+        state,
+      );
+    }
+    invariant(
+      lane.admission.quarantinedBindingRefs.every((reference) =>
+        /^opaque:[0-9a-f]{8}$/u.test(reference),
+      ) &&
+        new Set(lane.admission.quarantinedBindingRefs).size ===
+          lane.admission.quarantinedBindingRefs.length,
+      "pending-restart-recovery",
+      `${where} retained a raw or duplicate retired binding for ${laneName}`,
+      state,
+    );
     if (lane.admission.lastReceipt === "Pending") {
       invariant(
         lane.admission.pendingBinding !== null &&
@@ -1029,13 +1229,20 @@ function prepareAdmission(state, laneName) {
   return reduce(next, { type: "BeginAdmission", lane: laneName });
 }
 
-function boundReceiptAction(state, laneName, status, streamKind = "New") {
+function boundReceiptAction(
+  state,
+  laneName,
+  status,
+  streamKind = "New",
+  crashCut = "Unspecified",
+) {
   const lane = state.lanes[laneName];
   return {
     type: "Receipt",
     lane: laneName,
     status,
     proof: fullDurabilityProof(streamKind),
+    crashCut,
     binding: structuredClone(
       lane.admission.pendingBinding ?? makeReceiptBinding(state, laneName),
     ),
@@ -1091,6 +1298,281 @@ function checkReceiptBindingRegressions() {
   invariantFamilies.add("receipt-binding-refusal");
   assertionCount += 3;
   return 3;
+}
+
+function checkPendingRestartTracerRegression() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "WaitForRemote",
+  };
+  const pending = prepareAdmission(initialState(policy), "Notes");
+  const staleReceipt = boundReceiptAction(pending, "Notes", "Accepted");
+  const missed = [];
+  let restarted;
+  try {
+    restarted = reduce(pending, {
+      type: "Restart",
+      crashCut: "AfterEnqueue",
+      streamKind: "New",
+    });
+  } catch (_error) {
+    missed.push("restart-state-invariants");
+    restarted = transition(pending, {
+      type: "Restart",
+      crashCut: "AfterEnqueue",
+      streamKind: "New",
+    });
+  }
+  const admission = restarted.lanes.Notes.admission;
+  if (
+    admission.lastReceipt !== "OutcomeUncertain" ||
+    admission.pendingBinding !== null ||
+    admission.recoveryEvidence?.crashCut !== "AfterEnqueue" ||
+    admission.quarantinedBindingRefs?.length !== 1
+  ) {
+    missed.push("pending-to-recoverable-uncertain");
+  }
+
+  try {
+    transition(restarted, staleReceipt);
+    missed.push("stale-binding-committed");
+  } catch (error) {
+    assert.match(String(error), /\[receipt-binding\]/u);
+  }
+
+  let recovered;
+  try {
+    recovered = transition(restarted, {
+      type: "ReconcileCrash",
+      lane: "Notes",
+      streamKind: "New",
+      diskOutcome: "Absent",
+      binding: makeReceiptBinding(restarted, "Notes"),
+    });
+    if (recovered.lanes.Notes.admission.lastReceipt === "Rejected") {
+      recovered = transition(recovered, {
+        type: "Retry",
+        lane: "Notes",
+        eventId: recovered.lanes.Notes.admission.eventId,
+        digest: recovered.lanes.Notes.admission.digest,
+        streamKind: "New",
+        binding: makeReceiptBinding(recovered, "Notes"),
+      });
+    }
+    if (
+      !["Accepted", "AlreadyAccepted"].includes(
+        recovered.lanes.Notes.admission.lastReceipt,
+      ) ||
+      recovered.lanes.Notes.materializedSequence !== 1 ||
+      recovered.lanes.Notes.basisEligibleSequence !== 1
+    ) {
+      missed.push("current-reconciliation-did-not-converge");
+    }
+  } catch (_error) {
+    missed.push("current-reconciliation-rejected");
+  }
+
+  if (recovered !== undefined) {
+    const committedBefore = structuredClone(recovered.lanes.Notes.admission.committed);
+    const retried = transition(recovered, {
+      type: "Retry",
+      lane: "Notes",
+      eventId: recovered.lanes.Notes.admission.eventId,
+      digest: recovered.lanes.Notes.admission.digest,
+      streamKind: "New",
+      binding: makeReceiptBinding(recovered, "Notes"),
+    });
+    if (
+      retried.lanes.Notes.admission.lastReceipt !== "AlreadyAccepted" ||
+      !bindingsEqual(
+        makeReceiptBinding(retried, "Notes"),
+        makeReceiptBinding(recovered, "Notes"),
+      ) ||
+      JSON.stringify(retried.lanes.Notes.admission.committed) !==
+        JSON.stringify(committedBefore)
+    ) {
+      missed.push("idempotent-retry-duplicated");
+    }
+  }
+
+  for (const [fenceName, fenced] of [
+    ["rotation", transition(restarted, { type: "RotateSession" })],
+    ["deletion", transition(restarted, { type: "BeginDelete" })],
+  ]) {
+    try {
+      verifyState(fenced, `pending-restart-${fenceName}-fence`);
+    } catch (_error) {
+      missed.push(`${fenceName}-fence-state-invariants`);
+    }
+    try {
+      transition(fenced, {
+        type: "ReconcileCrash",
+        lane: "Notes",
+        streamKind: "New",
+        diskOutcome: "Absent",
+        binding: makeReceiptBinding(restarted, "Notes"),
+      });
+      missed.push("lifecycle-fence-accepted-recovery");
+    } catch (error) {
+      assert.match(String(error), /\[receipt-binding\]/u);
+    }
+  }
+
+  assert.deepEqual(missed, [], `Pending restart tracer failed: ${missed.join(", ")}`);
+  invariantFamilies.add("pending-restart-recovery");
+  assertionCount += 7;
+  return 7;
+}
+
+function checkPendingRestartCutMatrix() {
+  const policy = {
+    savedWording: "Saved",
+    remoteReissue: "RequireDecision",
+    deletion: "WaitForRemote",
+  };
+  const expectedOutcomes = {
+    Existing: {
+      BeforeEnqueue: ["Absent"],
+      AfterEnqueue: ["Absent"],
+      AfterWrite: ["Absent", "TornTail", "DurableExact"],
+      AfterFlush: ["Absent", "TornTail", "DurableExact"],
+      AfterFileSync: ["DurableExact"],
+      AfterDirectorySync: ["DurableExact"],
+      AfterAck: ["DurableExact"],
+    },
+    New: {
+      BeforeEnqueue: ["Absent"],
+      AfterEnqueue: ["Absent"],
+      AfterWrite: ["Absent", "TornTail", "DurableExact"],
+      AfterFlush: ["Absent", "TornTail", "DurableExact"],
+      AfterFileSync: ["Absent", "DurableExact"],
+      AfterDirectorySync: ["DurableExact"],
+      AfterAck: ["DurableExact"],
+    },
+  };
+  const missed = [];
+
+  for (const streamKind of STREAM_KINDS) {
+    for (const crashCut of CUTS) {
+      const pending = prepareAdmission(initialState(policy), "Notes");
+      const staleReceipt = boundReceiptAction(
+        pending,
+        "Notes",
+        "Accepted",
+        streamKind,
+      );
+      const restarted = reduce(pending, {
+        type: "Restart",
+        crashCut,
+        streamKind,
+      });
+      const evidence = restarted.lanes.Notes.admission.recoveryEvidence;
+      if (
+        evidence?.streamKind !== streamKind ||
+        JSON.stringify(evidence?.allowedDiskOutcomes) !==
+          JSON.stringify(expectedOutcomes[streamKind][crashCut])
+      ) {
+        missed.push(`${streamKind}/${crashCut}/recovery-domain`);
+      }
+      if (
+        restarted.lanes.Notes.materializedSequence !== null ||
+        restarted.lanes.Notes.basisEligibleSequence !== null
+      ) {
+        missed.push(`${streamKind}/${crashCut}/premature-advancement`);
+      }
+      try {
+        transition(restarted, staleReceipt);
+        missed.push(`${streamKind}/${crashCut}/stale-binding`);
+      } catch (error) {
+        assert.match(String(error), /\[receipt-binding\]/u);
+      }
+
+      for (const diskOutcome of expectedOutcomes[streamKind][crashCut]) {
+        let reconciled = transition(restarted, {
+          type: "ReconcileCrash",
+          lane: "Notes",
+          streamKind,
+          diskOutcome,
+          binding: makeReceiptBinding(restarted, "Notes"),
+        });
+        if (diskOutcome !== "DurableExact") {
+          if (
+            reconciled.lanes.Notes.admission.lastReceipt !== "Rejected" ||
+            reconciled.lanes.Notes.materializedSequence !== null ||
+            reconciled.lanes.Notes.basisEligibleSequence !== null
+          ) {
+            missed.push(`${streamKind}/${crashCut}/${diskOutcome}/unsafe-reject`);
+          }
+          reconciled = transition(reconciled, {
+            type: "Retry",
+            lane: "Notes",
+            eventId: reconciled.lanes.Notes.admission.eventId,
+            digest: reconciled.lanes.Notes.admission.digest,
+            streamKind,
+            binding: makeReceiptBinding(reconciled, "Notes"),
+          });
+        }
+        if (
+          !["Accepted", "AlreadyAccepted"].includes(
+            reconciled.lanes.Notes.admission.lastReceipt,
+          ) ||
+          reconciled.lanes.Notes.materializedSequence !== 1 ||
+          reconciled.lanes.Notes.basisEligibleSequence !== 1
+        ) {
+          missed.push(`${streamKind}/${crashCut}/${diskOutcome}/did-not-converge`);
+          continue;
+        }
+        const committedBefore = JSON.stringify(reconciled.lanes.Notes.admission.committed);
+        const retried = transition(reconciled, {
+          type: "Retry",
+          lane: "Notes",
+          eventId: reconciled.lanes.Notes.admission.eventId,
+          digest: reconciled.lanes.Notes.admission.digest,
+          streamKind,
+          binding: makeReceiptBinding(reconciled, "Notes"),
+        });
+        if (
+          retried.lanes.Notes.admission.lastReceipt !== "AlreadyAccepted" ||
+          JSON.stringify(retried.lanes.Notes.admission.committed) !== committedBefore ||
+          retried.lanes.Notes.materializedSequence !== 1 ||
+          retried.lanes.Notes.basisEligibleSequence !== 1
+        ) {
+          missed.push(`${streamKind}/${crashCut}/${diskOutcome}/duplicate-retry`);
+        }
+      }
+
+      for (const [fenceName, fenced] of [
+        ["rotation", transition(restarted, { type: "RotateSession" })],
+        ["deletion", transition(restarted, { type: "BeginDelete" })],
+      ]) {
+        try {
+          verifyState(
+            fenced,
+            `${streamKind}-${crashCut}-${fenceName}-fence`,
+          );
+        } catch (_error) {
+          missed.push(`${streamKind}/${crashCut}/${fenceName}-invariants`);
+        }
+        try {
+          transition(fenced, {
+            type: "ReconcileCrash",
+            lane: "Notes",
+            streamKind,
+            diskOutcome: expectedOutcomes[streamKind][crashCut][0],
+            binding: makeReceiptBinding(restarted, "Notes"),
+          });
+          missed.push(`${streamKind}/${crashCut}/fence`);
+        } catch (error) {
+          assert.match(String(error), /\[receipt-binding\]/u);
+        }
+      }
+    }
+  }
+
+  assert.deepEqual(missed, [], `Pending restart cut matrix failed: ${missed.join(", ")}`);
+  assertionCount += STREAM_KINDS.length * CUTS.length;
+  return STREAM_KINDS.length * CUTS.length;
 }
 
 function checkReceiptForgeryMatrix() {
@@ -1390,7 +1872,13 @@ function checkAdmissionCrashMatrix() {
               if (callerStatus !== "Pending") {
                 state = reduce(
                   state,
-                  boundReceiptAction(state, laneName, callerStatus, streamKind),
+                  boundReceiptAction(
+                    state,
+                    laneName,
+                    callerStatus,
+                    streamKind,
+                    cut,
+                  ),
                 );
               }
             }
@@ -1770,8 +2258,12 @@ function showRepresentativeTrace() {
   traceStep("3 remote result ready", state);
   state = reduce(state, { type: "BeginAdmission", lane: "Notes" });
   traceStep("4 canonical Pending", state);
-  state = reduce(state, boundReceiptAction(state, "Notes", "OutcomeUncertain"));
-  traceStep("5 crash after file sync but before new-file directory sync/ack", state);
+  state = reduce(state, {
+    type: "Restart",
+    crashCut: "AfterFileSync",
+    streamKind: "New",
+  });
+  traceStep("5 restart quarantines Pending binding and retains recovery evidence", state);
   state = reduce(state, {
     type: "ReconcileCrash",
     lane: "Notes",
@@ -1812,6 +2304,8 @@ console.log(
 
 const correctionRegressionCases =
   checkReceiptBindingRegressions() +
+  checkPendingRestartTracerRegression() +
+  checkPendingRestartCutMatrix() +
   checkReceiptForgeryMatrix() +
   checkWaitEffectIdentityRegressions() +
   checkStructuralDiagnosticRegression();

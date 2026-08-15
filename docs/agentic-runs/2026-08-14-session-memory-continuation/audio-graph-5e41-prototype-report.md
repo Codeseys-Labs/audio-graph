@@ -32,6 +32,10 @@ makes no operating-system durability claim.
   event id/digest, lifecycle, and prestate; fail closed on unknown stream kinds;
   track deletion waits by exact effect identity across multiple attempts; and
   emit only structurally typed, opaque diagnostics under malicious input.
+- Second review correction acceptance: actual restart from canonical `Pending`
+  at every crash cut must enter a recoverable state, quarantine the old receipt
+  binding, converge under current reconciliation/exact retry without duplicate
+  advancement, and remain fenced across rotation and deletion.
 - Worktree:
   `/home/codeseys/DevBox/audio-graph/.worktrees/5e41-admission-fencing-prototype-wave7a`
 - Branch: `work/5e41-admission-fencing-prototype-wave7a`
@@ -57,6 +61,10 @@ semantics:
   back logical state or frees the sequence;
 - restart replaces the process lease; rotation replaces Session epoch and
   lease; success, failure, and writer calls from a retired token are refused;
+- restart from canonical `Pending` rebases it to `OutcomeUncertain`, retains
+  durable pending evidence and its exact crash-cut observation domain,
+  quarantines the old binding by opaque reference, and issues a current-lease
+  recovery binding;
 - `DurableQueued` survives restart as never-dispatched work, while
   `RemoteInFlight` recovers as `ExternalEffectUnknown`;
 - each remote dispatch/reissue retains an exact
@@ -98,20 +106,20 @@ The successful run covered all eight combinations of Saved wording, remote
 reissue policy, and deletion policy. Its bounded dimensions were:
 
 ```text
-correction regression cases:  30
+correction regression cases:  51
 admission/crash cases:       368
 receipt cases:                80
 scheduler restart cases:      32
 lane independence cases:     200
 rotation/deletion cases:       64
-total cases:                  774
-reducer transitions:        7,472
-unique full states:           906
-invariant assertions:      92,110
-invariant families:            29
+total cases:                  795
+reducer transitions:        7,547
+unique full states:         1,273
+invariant assertions:     110,543
+invariant families:            30
 ```
 
-All five receipts were observed. The 29 passing invariant families were:
+All five receipts were observed. The 30 passing invariant families were:
 
 ```text
 accepted-only-advancement
@@ -136,6 +144,7 @@ lane-order-independence
 manual-remote-reconciliation
 outstanding-effect-identity
 pending-receipt-binding
+pending-restart-recovery
 receipt-binding-refusal
 receipt-domain
 rotation-fence
@@ -147,7 +156,7 @@ wait-effect-exactness
 
 The pure transition function also fails loudly on illegal admission, scheduler,
 snapshot, deletion, and detached-writer actions. Those reducer precondition
-guards are not included in the 29 reported invariant-family count.
+guards are not included in the 30 reported invariant-family count.
 
 The first executable pass correctly stopped on a prototype assertion bug: the
 Saved invariant used substring matching and therefore mistook `Not saved` for
@@ -184,8 +193,39 @@ one-command executable. No separate test framework or persistence was added.
    - Green: the diagnostic builder accepts only closed codes/reasons, validated
      lane/numeric fields, and `opaque:xxxxxxxx` identifier/effect hashes.
 
-The final executable run includes all 30 correction regressions in its passing
+The final executable run includes all 30 first-round correction regressions in its passing
 case count.
+
+### Pending-restart correction TDD evidence
+
+The second correction stayed on the same pure `transition(state, action)` seam
+and made a separate red/green pass inside the one-command executable.
+
+1. Minimal transition tracer:
+   - Red: actual `Restart` from `Pending` reported
+     `restart-state-invariants`, `pending-to-recoverable-uncertain`, and
+     `current-reconciliation-rejected`.
+   - Green: restart now produces `OutcomeUncertain` with durable event,
+     digest, attempted-sequence, prior-receipt, stream-kind, crash-cut, and
+     allowed-disk-outcome evidence. The old binding is retained only as an
+     `opaque:xxxxxxxx` quarantine reference; the new binding names the current
+     lease and recovery prestate.
+2. Every-cut matrix:
+   - Red: all 14 `Existing`/`New` by seven-crash-cut cases reported a missing
+     recovery domain.
+   - Green: every case invokes the real `Restart` action from `Pending`, rejects
+     the stale pre-restart receipt, checks no materialization/basis advancement,
+     explores every allowed disk observation, and proves current exact retry
+     converges once without changing sequence `1`.
+3. Lifecycle fences:
+   - Red: deletion of the recovered admission reported
+     `deletion-fence-state-invariants`.
+   - Green: rotation invalidates the recovery capability; deletion quarantines
+     it and leaves no current binding. Both refuse reconciliation through the
+     retired binding, and the full state invariants still hold.
+
+These 21 second-round regression cases bring the complete correction total to
+51 without adding a separate test framework.
 
 ## Human decisions still open
 
@@ -212,7 +252,8 @@ than hidden defaults:
   remote-reissue policy.
 - `audio-graph-90f3` owns the production `Pending` to receipt-bearing canonical
   commit boundary, stable sequence/idempotency, atomic post-accept materialized
-  advancement, exact receipt binding, and snapshot-cache authority.
+  advancement, exact receipt binding, restart rebase/reconciliation, and
+  snapshot-cache authority.
 - `audio-graph-8e73` owns new-file directory entry durability, typed quarantine
   registration, locked destructive recovery, subprocess cut points, and the
   rule that a weak platform level cannot claim Accepted/Saved.
@@ -233,6 +274,16 @@ later Seed was modified, unblocked, closed, dispatched, merged, or pushed here.
 
 ## Verification
 
+### Syntax check
+
+Command:
+
+```text
+node --check scripts/prototype-session-projection-admission.mjs
+```
+
+Output: none. Result: pass, exit 0.
+
 ### Executable invariant run
 
 Command:
@@ -244,11 +295,11 @@ bun scripts/prototype-session-projection-admission.mjs
 Final output summary:
 
 ```text
-cases explored: 774
-transitions evaluated: 7472
-unique full states observed: 906
-invariant assertions: 92110
-invariant families passed (29)
+cases explored: 795
+transitions evaluated: 7547
+unique full states observed: 1273
+invariant assertions: 110543
+invariant families passed (30)
 Policy decision table (all eight combinations passed safety invariants)
 PASS: finite model exhausted; every invariant held; diagnostics remained content-free.
 ```
@@ -314,7 +365,7 @@ M  scripts/prototype-session-projection-admission.mjs
 
 Result: pass, exit 0. The correction footprint is exactly the same three
 assigned paths. `HEAD` and its merge base with the reviewed correction base
-were both `e7ac2a7e321be999f3860ad9caad64aa2f8ab12f` before commit.
+were both `89a41b78a9bf23126ca987e95f6ada28442ab664` before commit.
 
 The repository Biome configuration intentionally ignores the new `.mjs`
 script (`Checked 0 files` / `No files were processed`), so that invocation was
