@@ -386,6 +386,13 @@ or reconciliation is required because no caller is active.
 
 Remaining ownership is explicit:
 
+- The pre-existing, non-c928
+  `windows_policy_path_allows_existing_append_and_refuses_namespace_mutation`
+  test still calls the Unix-identity qualification helper and may fail if a
+  native Windows probe runs the entire canonical-durability suite. This round
+  intentionally did not widen into that inherited fixture. The conductor can
+  run the exact corrected c928 Windows refusal test for c928 evidence and route
+  any inherited-fixture correction through Seeds separately.
 - `audio-graph-a596` must read and validate the current manifest generation
   through the same open `File` passed as `Existing`, choose a stable exact temp
   identity, and consume the typed durability result without relabeling an
