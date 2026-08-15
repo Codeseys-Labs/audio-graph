@@ -25,6 +25,11 @@ use super::canonical_durability::{
 
 pub const SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// Conservative cross-platform ceiling for the manifest-controlled relative
+/// identity itself. Individual platforms still validate the resolved root plus
+/// identity; V1 never persists an unbounded path-shaped value.
+pub const MAX_MANAGED_ARTIFACT_IDENTITY_BYTES: usize = 1023;
+
 const MANIFEST_FILE_NAME: &str = ".audio-graph-session-artifacts.v1.json";
 const MANIFEST_TEMP_FILE_NAME: &str = ".audio-graph-session-artifacts.v1.tmp";
 const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
@@ -462,11 +467,38 @@ impl ManifestWriteTransaction<'_> {
         }
 
         if let Some(head) = &self.head {
-            if head.transition.idempotency_id == candidate.transition.idempotency_id {
-                if head.transition.fingerprint != candidate.transition.fingerprint {
-                    return ManifestCasOutcome::Rejected(ManifestCasRejection::IdempotencyConflict);
+            if head.session_id != candidate.session_id {
+                return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
+            }
+            match head.transition.state {
+                ManifestTransitionState::Prepared => {
+                    if head.transition.idempotency_id != candidate.transition.idempotency_id {
+                        return ManifestCasOutcome::Rejected(
+                            ManifestCasRejection::PreparedTransitionReplacement,
+                        );
+                    }
+                    if head.transition.fingerprint != candidate.transition.fingerprint {
+                        return ManifestCasOutcome::Rejected(
+                            ManifestCasRejection::IdempotencyConflict,
+                        );
+                    }
+                    if candidate.transition.state != ManifestTransitionState::Completed
+                        || candidate.quarantine_transaction.is_none()
+                        || !prepared_completion_matches(head, &candidate)
+                    {
+                        return ManifestCasOutcome::Rejected(
+                            ManifestCasRejection::PreparedCompletionConflict,
+                        );
+                    }
                 }
-                if head.transition.state == ManifestTransitionState::Completed {
+                ManifestTransitionState::Completed
+                    if head.transition.idempotency_id == candidate.transition.idempotency_id =>
+                {
+                    if head.transition.fingerprint != candidate.transition.fingerprint {
+                        return ManifestCasOutcome::Rejected(
+                            ManifestCasRejection::IdempotencyConflict,
+                        );
+                    }
                     if candidate.transition.state == ManifestTransitionState::Prepared {
                         return ManifestCasOutcome::Rejected(
                             ManifestCasRejection::CompletedRegression,
@@ -480,32 +512,15 @@ impl ManifestWriteTransaction<'_> {
                     }
                     return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict);
                 }
-                if candidate.quarantine_transaction.is_some()
-                    && candidate.transition.state == ManifestTransitionState::Completed
+                ManifestTransitionState::Completed
+                    if candidate.quarantine_transaction.is_some()
+                        && candidate.transition.state == ManifestTransitionState::Completed =>
                 {
-                    if !prepared_completion_matches(head, &candidate) {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::PreparedCompletionConflict,
-                        );
-                    }
-                } else if candidate.transition.state == ManifestTransitionState::Prepared {
-                    return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict);
+                    return ManifestCasOutcome::Rejected(
+                        ManifestCasRejection::CompletionRequiresPrepared,
+                    );
                 }
-            } else if head.transition.state == ManifestTransitionState::Prepared {
-                return ManifestCasOutcome::Rejected(
-                    ManifestCasRejection::PreparedTransitionReplacement,
-                );
-            }
-            if head.session_id != candidate.session_id {
-                return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
-            }
-            if candidate.quarantine_transaction.is_some()
-                && candidate.transition.state == ManifestTransitionState::Completed
-                && head.transition.state != ManifestTransitionState::Prepared
-            {
-                return ManifestCasOutcome::Rejected(
-                    ManifestCasRejection::CompletionRequiresPrepared,
-                );
+                ManifestTransitionState::Completed => {}
             }
         } else if candidate.quarantine_transaction.is_some()
             && candidate.transition.state == ManifestTransitionState::Completed
@@ -982,6 +997,7 @@ fn validate_managed_identity(
 ) -> Result<(), ManifestValidationError> {
     let value = identity.as_str();
     if value.is_empty()
+        || value.len() > MAX_MANAGED_ARTIFACT_IDENTITY_BYTES
         || value.starts_with('/')
         || value.ends_with('/')
         || value.contains('\\')
@@ -1119,6 +1135,19 @@ mod tests {
 
     fn identity(value: &str) -> ManagedArtifactIdentity {
         ManagedArtifactIdentity::new(value).expect("managed identity")
+    }
+
+    fn portable_identity_string(byte_length: usize) -> String {
+        let component_count = (byte_length + 256) / 256;
+        let mut remaining_characters = byte_length - component_count.saturating_sub(1);
+        let mut components = Vec::with_capacity(component_count);
+        for remaining_components in (1..=component_count).rev() {
+            let component_length = (remaining_characters - (remaining_components - 1)).min(255);
+            components.push("a".repeat(component_length));
+            remaining_characters -= component_length;
+        }
+        assert_eq!(remaining_characters, 0);
+        components.join("/")
     }
 
     fn transition(
@@ -1392,6 +1421,19 @@ mod tests {
             ManagedArtifactIdentity::new(overlong_component),
             Err(ManifestValidationError::InvalidManagedIdentity)
         );
+        assert_eq!(MAX_MANAGED_ARTIFACT_IDENTITY_BYTES, 1023);
+        assert!(
+            ManagedArtifactIdentity::new(portable_identity_string(
+                MAX_MANAGED_ARTIFACT_IDENTITY_BYTES
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            ManagedArtifactIdentity::new(portable_identity_string(
+                MAX_MANAGED_ARTIFACT_IDENTITY_BYTES + 1
+            )),
+            Err(ManifestValidationError::InvalidManagedIdentity)
+        );
 
         let duplicate = SessionArtifactManifestV1::candidate(
             "session-1",
@@ -1556,22 +1598,56 @@ mod tests {
 
     #[test]
     fn manifest_candidate_size_preflight_accepts_exact_boundary_and_rejects_oversize() {
-        fn identity_with_len(byte_length: usize) -> ManagedArtifactIdentity {
-            let mut bytes = vec![b'a'; byte_length];
-            let mut separator = 255;
-            while separator + 1 < bytes.len() {
-                bytes[separator] = b'/';
-                separator += 256;
+        const MIN_UNIQUE_IDENTITY_BYTES: usize = 10;
+
+        fn unique_bounded_identity(index: usize, byte_length: usize) -> ManagedArtifactIdentity {
+            assert!(
+                (MIN_UNIQUE_IDENTITY_BYTES..=MAX_MANAGED_ARTIFACT_IDENTITY_BYTES)
+                    .contains(&byte_length)
+            );
+            let prefix = format!("{index:08x}/");
+            let value = format!(
+                "{prefix}{}",
+                portable_identity_string(byte_length - prefix.len())
+            );
+            assert_eq!(value.len(), byte_length);
+            ManagedArtifactIdentity::new(value).expect("bounded unique identity")
+        }
+
+        fn bulk_entry(index: usize, identity_length: usize) -> SessionArtifactEntry {
+            SessionArtifactEntry {
+                kind: SessionArtifactKind::MaterializedNotes,
+                privacy_class: ArtifactPrivacyClass::DerivedSessionMemory,
+                managed_identity: unique_bounded_identity(index, identity_length),
+                availability: ArtifactAvailability::Present {
+                    content: content('f', 1),
+                },
             }
-            ManagedArtifactIdentity(String::from_utf8(bytes).expect("ASCII identity"))
         }
 
         fn candidate_with_wire_size(byte_length: usize) -> SessionArtifactManifestV1 {
             let mut candidate = basic_candidate("tx-size", 'a');
             let baseline = serde_json::to_vec(&candidate).expect("baseline").len();
-            let current_identity_length = candidate.artifacts[0].managed_identity.as_str().len();
-            let target_identity_length = current_identity_length + byte_length - baseline;
-            candidate.artifacts[0].managed_identity = identity_with_len(target_identity_length);
+            let sample = bulk_entry(0, MIN_UNIQUE_IDENTITY_BYTES);
+            let entry_fixed_bytes = serde_json::to_vec(&sample).expect("sample entry").len()
+                - MIN_UNIQUE_IDENTITY_BYTES
+                + 1;
+            let additional_bytes = byte_length - baseline;
+            let entry_count =
+                additional_bytes.div_ceil(entry_fixed_bytes + MAX_MANAGED_ARTIFACT_IDENTITY_BYTES);
+            let mut remaining_identity_bytes = additional_bytes - entry_count * entry_fixed_bytes;
+            assert!(remaining_identity_bytes >= entry_count * MIN_UNIQUE_IDENTITY_BYTES);
+            assert!(remaining_identity_bytes <= entry_count * MAX_MANAGED_ARTIFACT_IDENTITY_BYTES);
+
+            for index in 0..entry_count {
+                let remaining_entries = entry_count - index - 1;
+                let minimum_for_remaining = remaining_entries * MIN_UNIQUE_IDENTITY_BYTES;
+                let identity_length = (remaining_identity_bytes - minimum_for_remaining)
+                    .min(MAX_MANAGED_ARTIFACT_IDENTITY_BYTES);
+                candidate.artifacts.push(bulk_entry(index, identity_length));
+                remaining_identity_bytes -= identity_length;
+            }
+            assert_eq!(remaining_identity_bytes, 0);
             assert_eq!(
                 serde_json::to_vec(&candidate)
                     .expect("sized candidate")
@@ -1831,6 +1907,50 @@ mod tests {
                 },
             });
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_head_rejects_quarantine_transaction_removal_without_durability_mutation() {
+        let root = root("prepared-removal-bypass");
+        let store = SessionArtifactManifestStore::qualified_for_test(&root).expect("qualified");
+        let mut transaction = store.begin_write().expect("transaction");
+        assert!(matches!(
+            transaction.compare_and_swap(
+                0,
+                quarantine_candidate(
+                    ManifestTransitionState::Prepared,
+                    QuarantineResidualState::SourceFull,
+                )
+            ),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 { generation: 1, .. },
+                ..
+            }
+        ));
+
+        let mut removed = basic_candidate("recover-1", 'e');
+        removed.transition.state = ManifestTransitionState::Completed;
+        assert!(matches!(
+            transaction.compare_and_swap(1, removed),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::PreparedCompletionConflict)
+        ));
+        let mut removed_prepared = basic_candidate("recover-1", 'e');
+        removed_prepared.transition.state = ManifestTransitionState::Prepared;
+        assert!(matches!(
+            transaction.compare_and_swap(1, removed_prepared),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::PreparedWithoutQuarantine
+            ))
+        ));
+        assert!(matches!(
+            transaction.head(),
+            ManifestLoadOutcome::Present(head)
+                if head.generation == 1
+                    && head.transition.state == ManifestTransitionState::Prepared
+                    && head.quarantine_transaction.is_some()
+        ));
+        assert!(!store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
 
     #[test]
