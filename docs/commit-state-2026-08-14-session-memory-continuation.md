@@ -301,3 +301,31 @@ all five contracts, repo-authoritative pinned `verify:fast`, Betterleaks,
 docs/Seeds secret, and range-diff gates passed. No product suite was run because
 no product file changed. No Seed was closed, no workflow was dispatched, and no
 branch was pushed.
+
+## Wave 7A integrated status
+
+Reviewed ab64 tip `74924bc` and reviewed 5e41 tip `faefece` were integrated
+without conflict or history rewrite at `de62315` and `7a8c80c`, respectively.
+Both Standards and Spec reviews returned **SHIP**. The assembled pre-report tip
+is `7a8c80c36105f8509c9904a798ece2f5eb32c9aa`.
+
+The normalized projection-semantic/hash-v2 kernel is dormant: all four design
+goldens and strict semantic failure classes are implemented, but no production
+caller, Session-floor transition, ledger, basis, prompt, scheduler, writer, or
+adapter activation exists. The 5e41 model imports no production code and makes
+no runtime or operating-system durability claim.
+
+Focused hash-v2 6, IPC 19 plus the compile-fail doctest, application
+normalization 12, frozen hash-v1 1, canonical reader 8, all four independent
+goldens, and the finite model's 814 cases / 7,671 transitions / 111,905
+assertions / 31 families passed. Locked check, the serialized full cloud suite
+with 1,580 passed/0 failed/8 ignored, strict Clippy, rustfmt, all five
+contracts, typecheck, Biome, pinned `verify:fast`, Seeds, Betterleaks, secret,
+and range gates also passed.
+
+`audio-graph-ab64` and `audio-graph-5e41` are eligible for conductor closure.
+`audio-graph-4249` remains open and dependency-blocked; no policy default was
+selected. Human decisions remain for durable Saved wording, remote reissue
+under externally uncertain effects, and immediate-discard versus fenced-wait
+deletion behavior. Exact evidence is in
+[`integration-wave7a-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave7a-report.md).
