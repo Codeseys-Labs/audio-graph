@@ -737,3 +737,33 @@ issues, and Doctor has 0 failures. Output stress, all five contracts, pinned
 `verify:fast`, Betterleaks, secret, and range gates passed. Product suites
 were not rerun; no extra Seed edit, workflow, push, Blacksmith, Docker, guest,
 or platform action occurred.
+
+### Wave 7B Wave5 reviewed native-Windows fixture successor fan-in
+
+Six linear Seed-only custody commits through `0e3be40` were merged at
+`a8bb189`, followed by reviewed five-commit candidate `ba1d9bc` at `9853caa`.
+The integrated 646-row queue is byte-identical to custody. The exact candidate
+footprint is canonical durability, canonical log, session artifact manifest,
+and report.
+
+Preliminary run `31901995995` finished with 30 of 33 jobs successful. Cargo
+audit is routed to 942a; two native Windows recovery-fixture failures are
+routed to 836b. macOS live audio enumerated and negotiated but capture start
+failed with OSStatus 2003332927, so f166 remains open and no PCM claim is made.
+
+Initial Standards and Spec review blocked four proof gaps. Correction round
+one added one opaque root-bound cfg-only algorithm environment, executable
+Windows algorithm CAS/recovery, real-Windows `None` qualification/refusal,
+and cross-root/same-path replacement guards. Final Standards and Spec reviews
+returned **SHIP**; final hygiene was report-only.
+
+Focused 47/19/42/11, locked check, full serialized cloud 1,675/0/8, strict
+Clippy, fmt, pinned Windows production/test-object symbols, frontend 968, all
+five contracts, pinned `verify:fast`, Seeds 92 ready/97 blocked with Doctor 0
+failures, Betterleaks, secret, runtime, footprint, prototype, and diff gates
+passed. The initial Windows wrapper path miss was an ignored harness issue;
+the corrected direct probe passed without tracked-source changes.
+
+Seed 836b remains open pending native NTFS rerun; 52b9 and 2df3 remain
+dependent on it. No extra Seed edit, push, workflow or platform action,
+Blacksmith, Testbox, Docker, or guest run occurred.

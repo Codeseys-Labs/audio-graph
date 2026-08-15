@@ -738,3 +738,63 @@ Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no extra Seed
 edit, workflow, push, Blacksmith, Docker, guest, or platform action occurred.
+
+## Wave5 reviewed native-Windows fixture successor fan-in
+
+Custody `0e3be4061ad340a803d47712cad8200ff095f1be` was merged
+history-preservingly without conflict at
+`a8bb1890464128d086b5422826be5fb318bedf85`. Its six linear commits after
+custody `ff1f01e` change only `.seeds/issues.jsonl`; the integrated 646-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Custody classifies preliminary run `31901995995` as a terminal failure: 30 of
+33 jobs succeeded, while cargo audit belongs to 942a and the two Windows
+recovery-fixture failures belong to 836b. Linux native Rust, cloud, storage,
+and live-audio lanes passed. macOS native Rust, cloud, and storage passed, but
+live-audio job `95054075192` proved only enumeration and negotiation: capture
+start failed with CoreAudio OSStatus 2003332927, and no PCM, timestamp,
+discontinuity, or bounded-stop evidence was asserted. Seed f166 remains open
+for that limitation. The run is not durability closure evidence.
+
+Reviewed candidate `ba1d9bc32b771a1ff1c12c05efc8de697bdde3b2`
+was merged history-preservingly without conflict at
+`9853caa1b3f43b0a1170c5c3407d0577ec09d9c7`. Its five linear commits from
+exact merge-base `cffb0c5` change exactly canonical durability, canonical log,
+the session artifact manifest, and the 836b report. Initial Standards and Spec
+reviews blocked four proof gaps. Correction round one introduced one opaque,
+root-bound `AlgorithmTestEnvironment`, routed snapshot revalidation through
+the guard identity seam, modeled the algorithm-only Windows parent barrier,
+and added cross-root and same-path root-replacement refusals. Final Standards
+and Spec reviews returned **SHIP**; the final commit corrects report counts
+only and leaves all code blobs unchanged.
+
+Every synthetic identity, platform override, constructor, and lock oracle is
+`cfg(test)` only. Executable Windows-platform algorithm tests cover manifest
+CAS and recovery, while real Windows stores retain `None` qualification and
+pre-mutation `NamespaceDurabilityUnsupported`. No production runtime caller,
+qualification constructor, dependency, unsafe block, workflow, or platform
+dispatch landed.
+
+| Gate | Result |
+| --- | --- |
+| canonical log / manifest / durability / Linux harness | 47/0, 19/0, 42/0, 11/0 |
+| pinned Windows module proof | production rlib and full test object passed; 15 original fixtures and 7 policy/mutation symbols present; synthetic production symbols absent |
+| locked cloud lib/tests check | passed in 28.75 seconds |
+| full direct locked cloud library, serialized | 1,675 passed, 0 failed, 8 ignored in 68.74 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings` in 43.73 seconds; formatting current |
+| exact frontend `test:local` | 70 files and 968 tests passed in 176.84 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 92 ready; 97 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 97, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, secret, runtime, footprint, prototype, and diff hygiene | approximately 2.96 MB, no leaks; 0 secret findings; passed |
+
+The first integration Windows wrapper attempt omitted the ignored
+`persistence/` path component required by nested `#[path]` resolution and
+failed before compiling product modules. Adding that ignored proof-harness
+directory made the direct pinned production/test-object command pass; no
+tracked source changed for this correction.
+
+Seed 836b remains `in_progress` pending a root-owned native Windows/NTFS rerun
+of the integrated snapshot and was not closed. Seeds 52b9 and 2df3 remain
+dependent on it. No extra Seed edit, push, workflow mutation or dispatch,
+Blacksmith, Testbox, Docker, guest, or platform action occurred.
