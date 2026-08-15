@@ -406,3 +406,60 @@ Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
 Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
 Product files did not change, so product suites were not rerun; no product,
 workflow, push, extra Seed edit, Blacksmith, or Docker action occurred.
+
+## Wave3 reviewed locked-recovery fan-in
+
+Custody `ffb86b04148c5f8227814b218a823cdb269263dc` was merged
+history-preservingly without conflict at
+`c40e7d127163136f0f75942b2e52db03b4521513`. Its four linear commits after
+custody `3bdc6e5` are exactly `a0989c2`, `833f763`, `d2b0f50`, and
+`ffb86b0`, change only `.seeds/issues.jsonl`, and preserve the byte-identical
+valid 642-row custody queue.
+
+Final-cap 3b8b tip `987dff4e475ea118b1cfa926e3e9314d64176870`
+was merged history-preservingly without conflict at
+`f521c911e4a116b543ea7e08c828f649f4bacb1a`. Its six linear commits from
+exact merge-base `183f78a` change only `canonical_log.rs`,
+`canonical_durability.rs`, `session_artifact_manifest.rs`, and the 3b8b
+report. Standards and Spec final-cap re-reviews returned **SHIP** with no
+findings.
+
+The dormant recovery transaction retains one manifest-owned exclusive guard
+and one exact open source handle. Strict free reads and public appender open
+remain non-mutating. Recovery orders quarantine publication and namespace
+durability before manifest Prepared, same-handle truncate and source sync,
+manifest Completed, and acknowledgement. Portable ASCII-case inventory
+reservation, distinct managed source/quarantine directories, exact
+quarantine-parent and qualified-root volume binding, partial quarantine and
+Prepared/Completed inner-temp convergence, and typed post-mutation residuals
+all passed assembled tests. Public collision behavior is unchanged. No
+non-test caller, dependency, unsafe block, workflow, runtime activation, or
+prototype ancestry landed.
+
+| Gate | Result |
+| --- | --- |
+| focused serialized canonical log | 46 passed, 0 failed in 1.32 seconds |
+| focused serialized manifest | 18 passed, 0 failed in 8.49 seconds |
+| focused serialized canonical durability | 40 passed, 0 failed in 3.62 seconds |
+| locked cloud lib/tests check | passed in 26.58 seconds |
+| full direct locked cloud library, serialized | 1,660 passed, 0 failed, 8 ignored in 52.26 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| pinned Windows production and actual-module test-object probes | passed; 5,538,566-byte test object |
+| exact frontend `test:local` | 70 files and 968 tests passed in 107.15 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 91 ready; 97 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 97, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, secret, footprint, placeholder, prototype, and diff hygiene | approximately 2.82 MB, no leaks; 0 secret findings; passed |
+
+The first Windows Cargo test-object wrapper selected metadata-form externs,
+and the first direct invocation omitted the host proc-macro search path. Both
+stopped in probe construction. The production Windows check was already
+green; direct pinned `rustc` with the complete Windows rlib and host
+proc-macro paths compiled the actual three-module `cfg(test)` object. This is
+cross-compilation evidence, not native filesystem proof.
+
+Seed 3b8b is eligible for root closure after the reviewed landing. Seed b77b
+remains blocked until custody reconciliation, then owns subprocess/crash-cut
+proof; native Windows, macOS/APFS, and Linux qualification remains 2df3. No
+Seed was closed or additionally edited, and no push, workflow, Blacksmith,
+Docker, guest, or runtime activation occurred.

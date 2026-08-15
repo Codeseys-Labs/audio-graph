@@ -562,3 +562,31 @@ The queue has 91 ready and 97 blocked issues, and doctor has 0 failures.
 Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
 and range gates passed. Product suites were not rerun; no product, workflow,
 push, extra Seed edit, Blacksmith, or Docker action occurred.
+
+### Wave 7B Wave3 reviewed locked-recovery fan-in
+
+Four linear Seed-only custody commits through `ffb86b0` were merged at
+`c40e7d1`, followed by reviewed six-commit 3b8b tip `987dff4` at `f521c91`.
+The integrated 642-row queue is byte-identical to custody. The candidate's
+exact footprint is the three owned persistence files plus its report;
+Standards and Spec final-cap re-reviews returned **SHIP** with no findings.
+
+The dormant transaction retains one manifest-owned guard and exact source
+handle, keeps free reads and appender open strict, orders quarantine through
+Prepared, same-handle truncate, Completed, and acknowledgement, and converges
+the reviewed partial and inner-manifest fault cuts. Case-equivalent inventory
+reservation, cross-directory same-volume qualification, nested-volume
+refusal, post-mutation residuals, and public collision behavior are covered.
+There is no production caller, unsafe/dependency/workflow/runtime activation,
+or prototype landing.
+
+Focused log 46, manifest 18, durability 40, locked check, full serialized
+1,660/0/8, strict Clippy, fmt, Windows production/test-object probes,
+frontend 968, all contracts, pinned `verify:fast`, Seeds 91 ready/97 blocked
+with doctor 0 failures, Betterleaks, secret, footprint, placeholder,
+prototype, and diff gates passed. The initial Windows metadata and proc-macro
+probe misses were harness-only; the direct assembled object compile passed.
+
+Seed 3b8b is root-closure eligible; b77b follows after reconciliation, then
+2df3 owns native platform proof. No Seed closure, push, workflow, Blacksmith,
+Docker, guest, or runtime activation occurred.
