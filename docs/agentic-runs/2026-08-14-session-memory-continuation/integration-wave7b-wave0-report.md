@@ -798,3 +798,39 @@ Seed 836b remains `in_progress` pending a root-owned native Windows/NTFS rerun
 of the integrated snapshot and was not closed. Seeds 52b9 and 2df3 remain
 dependent on it. No extra Seed edit, push, workflow mutation or dispatch,
 Blacksmith, Testbox, Docker, guest, or platform action occurred.
+
+## Wave5 native-Windows closure reconciliation
+
+Custody `d092375d4d31d075aae68222ce0402e19a6552aa` was merged
+history-preservingly without conflict at
+`462452512030e5e330dc68d6eed70025eacd27da`. Its three linear commits after
+custody `0e3be40` change only `.seeds/issues.jsonl`; the integrated 646-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Existing `ci.yml` rerun `31907261142` finished with 32 of 33 jobs successful.
+Native Windows cloud job `95066924158` passed 1,637 tests with 0 failures and
+8 ignored; native Windows Rust job `95066924217` passed 1,653 with 0 failures
+and 8 ignored. Linux, macOS, and Windows durability and storage lanes were
+green. The sole failed job was the independent cargo audit owned by 942a.
+Seed 836b is closed with this native evidence and is absent from the open
+ready and blocked queues; all open dependency edges to it are removed.
+
+Seed 2df3 remains `in_progress` and is blocked only by 52b9. Seed 52b9 remains
+`in_progress`, unblocked, assigned to `product-owner`, and explicitly
+`AWAITING_HUMAN_DECISION` for the separate workflow-dispatch-only evidence
+workflow. Seed f166 remains open because macOS job `95066924240` again
+enumerated and negotiated BlackHole but capture start failed with CoreAudio
+OSStatus 2003332927; no PCM, timestamp, discontinuity, or bounded-stop claim
+is made. Seed 942a remains open as the independent audit workstream. The
+terminal custody evidence records zero active Testboxes.
+
+The queue contains 92 ready and 96 blocked issues. Seeds output stress parsed
+ready 50, blocked 96, and list 50. All five contracts and pinned
+`verify:fast` passed, including Biome over 174 files, typecheck, Seeds output,
+docs/Seeds secret hygiene, and diff hygiene. Seeds Doctor reported 10 passed,
+2 custody-carried warning groups, and 0 failures. Betterleaks and the final
+range check passed after the report/checkpoint update. Product files did not
+change, so the assembled product-suite evidence at `dc4f5cf` remains
+applicable and was not rerun. No extra Seed edit or closure, workflow change
+or dispatch, push, Blacksmith, Testbox, Docker, guest, or platform action
+occurred.

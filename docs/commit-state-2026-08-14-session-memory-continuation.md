@@ -767,3 +767,27 @@ the corrected direct probe passed without tracked-source changes.
 Seed 836b remains open pending native NTFS rerun; 52b9 and 2df3 remain
 dependent on it. No extra Seed edit, push, workflow or platform action,
 Blacksmith, Testbox, Docker, or guest run occurred.
+
+### Wave 7B Wave5 native-Windows closure reconciliation
+
+Three linear Seed-only custody commits through `d092375` were merged
+history-preservingly at `4624525`. The integrated 646-row queue is
+byte-identical to custody and valid JSONL.
+
+Existing `ci.yml` rerun `31907261142` supplied the native acceptance evidence:
+Windows cloud job `95066924158` passed 1,637/0/8 and Windows Rust job
+`95066924217` passed 1,653/0/8. Seed 836b is closed and absent from the open
+queues, and its resolved dependency edges are removed. Seed 2df3 remains
+`in_progress`, blocked only by 52b9. Seed 52b9 remains `in_progress`,
+unblocked, assigned to `product-owner`, and `AWAITING_HUMAN_DECISION` for the
+separate workflow-dispatch-only evidence workflow. Seed f166 remains open for
+the repeated CoreAudio OSStatus 2003332927 capture gap, and 942a remains the
+independent audit workstream. The recorded Testbox active count is zero.
+
+The queue has 92 ready and 96 blocked issues. Doctor reports 10 passed, 2
+carried warning groups, and 0 failures. Output stress, all five contracts,
+pinned `verify:fast`, Betterleaks, docs/Seeds secret, and range gates passed.
+Product files did not change, so the assembled `dc4f5cf` product-suite
+evidence remains applicable and was not rerun. No extra Seed closure/edit,
+workflow change or dispatch, push, Blacksmith, Testbox, Docker, guest, or
+platform action occurred.
