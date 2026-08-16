@@ -917,3 +917,59 @@ hygiene passed after the report/checkpoint update. Product and audit suites
 were not rerun because the assembled evidence at `f311a83` and terminal
 remote run remain applicable. No extra Seed edit or closure, workflow change,
 push or dispatch, Testbox, Docker, guest, or platform action occurred.
+
+## Wave5 reviewed storage-probe audit fan-in
+
+Custody `6e148e8ff0fd40e61b07603baba529bbd0126a6f` was merged
+history-preservingly without conflict at
+`c771a07b8a3f2eadf0d40130202f9fa681afb3f2`. Its five named linear commits
+after custody `7bbe5b9` change only `.seeds/issues.jsonl`; the integrated
+648-row queue is byte-identical to custody and remains valid JSONL.
+
+Reviewed candidate `06372aa265bb997c3e909b48b88ab8dd0609336f` was merged
+history-preservingly without conflict at
+`d698c1827fda6e02cc5e10abe74d3bb23d25efd1`. Its two linear commits from
+exact merge-base `3606b09` change exactly `ci/storage-probe/Cargo.lock`, the
+workspace-local `.cargo/audit.toml`, and the c65d report. Standards and Spec
+both returned **SHIP** with zero P0, P1, or P2 findings and no correction
+round. The three assembled blobs are byte-identical to the reviewed candidate.
+
+The assembled storage-probe lock has 483 packages with ammonia 4.1.4 and
+crossbeam-epoch 0.9.20. The configured live audit reports 0 unignored
+vulnerabilities, exactly two ignored advisories (`RUSTSEC-2026-0235` and
+`RUSTSEC-2023-0071`), and three visible allowed warnings. A safe config-free
+audit against the same lock independently returns exactly the two advisories
+and three warnings. Locked metadata keeps rust_decimal 1.42.1 on its expected
+active features without rkyv. The all-target/all-feature rkyv inverse tree and
+native Linux, macOS, and Windows RSA inverse trees are empty; wasm resolves
+the documented `surrealdb-core -> jsonwebtoken[rust_crypto] -> rsa 0.9.10`
+path and remains outside the accepted native-probe exception.
+
+The reviewed candidate's locked SurrealKV and RocksDB checks passed, and its
+fresh separate-process writer/reader probes recovered 5/5 rows for both
+engines. Those exact engine runs were not recompiled: the accepted candidate
+had deliberately removed its 4.8 GiB target, the integration target was also
+absent, and recreating both checks plus four release-process runs would repeat
+roughly 20 minutes of reviewed evidence without changing the byte-identical
+lock, policy, manifest, or source. The assembled lock, policy, metadata,
+configured audit, config-free audit, and every reachability boundary were
+independently reproduced instead.
+
+| Gate | Result |
+| --- | --- |
+| configured / config-free storage audits | 483 dependencies; GREEN 0 unignored/2 exact ignored/3 warnings; config-free 2 advisories/3 warnings |
+| locked metadata and reachability | ammonia 4.1.4; crossbeam-epoch 0.9.20; rkyv native inactive; RSA native empty and wasm path present |
+| reviewed locked engine checks | SurrealKV and RocksDB passed |
+| reviewed fresh separate-process durability | SurrealKV 5/5; RocksDB 5/5 |
+| all contracts and pinned `verify:fast` | all five current; Biome 174, typecheck, output, secret, and diff green |
+| Seeds ready-all / blocked | 92 ready; 96 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 96, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, docs/Seeds secret, footprint, and range diff | no leaks or secret findings; exact scope and diff checks passed |
+
+No product source, product or probe `Cargo.toml`, workflow, generated file,
+persisted-format contract, or unrelated dependency changed. Full application
+Rust and frontend suites were not required or rerun because no product source,
+manifest, or workflow changed. Seed c65d remains `in_progress` and was not
+closed; its reviewed acceptance plus this fan-in make it eligible for root
+closure. No extra Seed edit, `sd sync`, push, workflow change or dispatch,
+52b9/2df3 start, Testbox, Docker, guest, or platform action occurred.

@@ -843,3 +843,33 @@ Product and audit suites were not rerun because the assembled `f311a83` and
 terminal remote evidence remain applicable. No extra Seed closure/edit,
 workflow change, push or dispatch, Testbox, Docker, guest, or platform action
 occurred.
+
+### Wave 7B Wave5 reviewed storage-probe audit fan-in
+
+Five linear Seed-only custody commits through `6e148e8` were merged at
+`c771a07`, followed by reviewed two-commit candidate `06372aa` at `d698c18`.
+The 648-row queue is byte-identical to custody. The candidate's exact
+three-file footprint is the storage-probe lock, local audit policy, and c65d
+report; Standards and Spec returned **SHIP** with zero findings.
+
+The assembled independent lock has 483 packages with ammonia 4.1.4 and
+crossbeam-epoch 0.9.20. The configured audit is GREEN at 0 unignored, exactly
+two ignored advisories, and three allowed warnings; the safe config-free audit
+reproduces the two advisories. rkyv and RSA inverse trees are empty for the
+accepted native graphs, while wasm retains the documented
+`jsonwebtoken[rust_crypto] -> rsa` boundary.
+
+The reviewed locked SurrealKV/RocksDB checks and fresh separate-process 5/5
+writer/readers are reused because both accepted and integration targets are
+absent and rebuilding would recreate about 4.8 GiB and 20 minutes of
+byte-identical evidence. The assembled lock, policy, metadata, live/config-free
+audits, and reachability were independently reproduced. All five contracts,
+pinned `verify:fast`, Seeds 92 ready/96 blocked with Doctor 0 failures,
+Betterleaks, secret, footprint, and range gates passed.
+
+No product source, product/probe manifest, workflow, generated, or
+persisted-format contract changed, so full application Rust/frontend suites
+were not required or rerun. Seed c65d remains `in_progress` and is eligible
+for root closure after this reviewed fan-in. No extra Seed edit or closure,
+`sd sync`, push, workflow or platform action, 52b9/2df3 start, Testbox, Docker,
+or guest run occurred.
