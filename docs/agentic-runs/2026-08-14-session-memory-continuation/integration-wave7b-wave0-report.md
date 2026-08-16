@@ -1129,3 +1129,39 @@ evidence at `dcee4ad` remains applicable and those suites were not rerun. No
 external run or workflow dispatch occurred, and no extra Seed edit or closure,
 workflow/settings mutation, push, secret, Blacksmith/Testbox, Docker, guest,
 or platform action occurred.
+
+## Wave5 default-branch registration backflow
+
+Custody `5798a1cfee5439927ffb9f1bfc02eba8c3db5778` was merged
+history-preservingly without conflict at
+`4d41f9280f3c8feb62028f51fe70b2603505a173`. Its one linear commit after
+custody `3cf7383d67e0399ee79b34ab67b3c398880fa70f` changes only
+`.seeds/issues.jsonl`; the integrated 648-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Live GitHub evidence found that the default branch `master` registers only
+`ci.yml` and `release.yml`; the workflow path API returns 404 for
+`2df3-native-durability.yml`. Seed 52b9 is therefore reopened as
+`in_progress`, assigned to `codex-52b9-publish-wave7b`, and records
+`ACTIVE_REGISTRATION_REQUIRED`. It again blocks 2df3. The required next action
+is to publish the reviewed
+`evidence/audio-graph-2df3-native-durability-wave7b` branch and open a narrow
+draft PR that registers the already-reviewed manual-only workflow on `master`.
+Dispatch remains forbidden until that registration lands. The paid-license
+chat attestation remains recorded and satisfied; this backflow is solely the
+default-branch workflow-registry boundary.
+
+Seed 2df3 remains `in_progress` and blocked only by 52b9. Parent 8e73 remains
+blocked only by 2df3. The complete open-ready queue contains 91 issues and the
+blocked queue contains 96. Seeds output stress parsed ready 50, blocked 96,
+and list 50. All five contracts and pinned `verify:fast` passed, including
+Biome over 174 files, typecheck, Seeds output, docs/Seeds secret hygiene, and
+diff hygiene. Seeds Doctor reported 10 passed, 2 custody-carried warning
+groups, and 0 failures. Betterleaks, exact queue identity, and range hygiene
+passed.
+
+No product, Cargo, frontend, or workflow file changed, so the assembled
+evidence at `dcee4ad` remains applicable and those suites were not rerun. No
+branch was published, draft PR opened, workflow dispatched, or master merged;
+no extra Seed edit or closure, workflow/settings mutation, push, secret,
+Blacksmith/Testbox, Docker, guest, or platform action occurred.

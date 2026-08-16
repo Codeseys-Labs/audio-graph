@@ -960,3 +960,25 @@ No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
 remains applicable and product/workflow suites were not rerun. No external run,
 dispatch, extra Seed edit or closure, workflow/settings mutation, push, secret,
 Blacksmith/Testbox, Docker, guest, or platform action occurred.
+
+### Wave 7B Wave5 default-branch registration backflow
+
+One linear Seed-only custody commit `5798a1c` was merged
+history-preservingly at `4d41f92`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+Live GitHub evidence records a 404 for `2df3-native-durability.yml` because
+default branch `master` registers only `ci.yml` and `release.yml`. Seed 52b9
+is reopened `in_progress`, assigned to `codex-52b9-publish-wave7b`, and again
+blocks 2df3. The reviewed evidence branch must be published and a narrow draft
+PR must register the manual-only workflow on `master` before dispatch. The paid
+license attestation remains satisfied; registration is the only new backflow.
+Seed 8e73 remains blocked only by 2df3.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/96 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
+remains applicable and product/workflow suites were not rerun. No branch
+publication, draft PR, dispatch, master merge, extra Seed edit or closure,
+workflow/settings mutation, push, secret, Blacksmith/Testbox, Docker, guest,
+or platform action occurred.
