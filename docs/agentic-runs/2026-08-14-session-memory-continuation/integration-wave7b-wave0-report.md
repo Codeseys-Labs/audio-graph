@@ -1246,3 +1246,61 @@ reconciliation did not push, mutate or merge PR 99, dispatch, merge `master`,
 close a Seed, edit a workflow/product/settings file, or start a platform job;
 no extra Seed edit, secret, Blacksmith/Testbox, Docker, guest, or platform
 action occurred.
+
+## Wave5 PR-review correction fan-in
+
+Integration started clean at exact `7027adc532a7e300402ebba50df013fc1c4b67e8`.
+Custody `c62eff4aab0b93ab25b7407c868c0b7e1f0df2a6` was merged
+history-preservingly without conflict at
+`1d0493543a3a6a5bc2b2afd98c49ab61546f5626`. Its range after prior custody
+`ae69e166b8bebebbc2cde1b83dd7cf1ae8fc9ef3` is exactly two linear, non-merge
+commits (`487edc4`, `c62eff4`) and changes only `.seeds/issues.jsonl`. The
+integrated 648-row queue is byte-identical to custody and remains valid JSONL.
+
+The reviewed PR 99 correction at
+`d15640e3fae56e61e2c671ca981dd83b9b7edb1b` has a one-file footprint. Its
+branch history was deliberately not merged because it is based on the
+default-branch registration line. Instead, its exact reviewed workflow blob
+`c059b080b1d3c06bb6c55cdba71ea79b569d422b` was applied to
+`.github/workflows/2df3-native-durability.yml`; the assembled file has required
+SHA-256 `f174a1024c6754602f4bd9190605b0e0e4273427e4bcccb4f573c6e1726f3eb7`.
+The resulting non-document integration footprint is exactly the custody queue
+plus that one workflow.
+
+The assembled workflow preserves the manual-only trigger, no-secret boundary,
+exact Linux/macOS Blacksmith and Windows 2025 runners, license refusal before
+checkout or platform work, pinned action revisions, and always-upload,
+nonempty, 14-day artifacts. The Windows path verifies the project-controlled
+VB-CABLE archive pin, pinned LABSN certificate and DevCon bytes, catalog
+kernel-policy signature, Vincent Burel signer, INF/SYS catalog membership, and
+Microsoft DevCon Authenticode in that order before importing the publisher
+certificate or installing. Its `finally` path verifies that TrustedPublisher
+state is restored. Unix captures both cargo and `tee` exits; Unix and Windows
+summaries require full logs and the exact test counts Linux `42/11`, macOS
+`13/11`, and Windows `12/9`, rejecting zero or drifted counts.
+
+Actionlint with the repository config, yq, Ruby YAML, and every extracted Bash
+block passed. Local `pwsh` was unavailable; accepted exact-blob evidence from a
+disposable PowerShell 7.5 Ubuntu container reports `Language.Parser` PASS,
+Windows `12/9` PASS, and zero-test `0/9` rejection, with zero containers left
+active and the parser image removed. Independent assembled checks passed the
+trust-chain/order contract, rejected 12/12 clause-removal mutations, exercised
+seven Unix summary cases against the extracted Bash, and exercised seven
+Windows summary-state mutations in a platform-independent contract model.
+
+All five generated contracts and repo-authoritative pinned `verify:fast`
+passed. The latter included Biome over 174 files, typecheck, all contracts,
+Seeds output stress (`ready` 50, `blocked` 96, `list` 50), docs/Seeds secret
+hygiene, and diff hygiene. The complete queue contains 91 open-ready and 96
+blocked issues. Seeds Doctor reported 10 passed checks, 2 custody-carried
+warning groups, and 0 failures. Betterleaks, final docs/Seeds secret hygiene,
+exact workflow/queue identity, and range-diff hygiene passed.
+
+The `src-tauri` and frontend `src` trees are unchanged from `7027adc`, so the
+reviewed local Linux `42/42` durability and `11/11` crash-harness evidence
+remains applicable and no Rust or frontend suite was rerun. Seed 52b9 remains
+`in_progress` with the three review threads recorded; 2df3 remains
+`in_progress` and blocked only by 52b9, while 8e73 remains blocked only by
+2df3. Dispatch is false. This fan-in did not push, edit/reply to/resolve PR 99,
+merge `master`, close a Seed, dispatch a workflow, run LABSN/driver/platform
+jobs, handle license material, or touch the main worktree.

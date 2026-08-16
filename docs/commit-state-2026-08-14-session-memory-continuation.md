@@ -1030,3 +1030,31 @@ remains applicable and product/workflow suites were not rerun. No push, PR
 mutation or merge, dispatch, master merge, Seed closure,
 workflow/product/settings edit, platform job, secret, Blacksmith/Testbox,
 Docker, guest, or platform action occurred.
+
+### Wave 7B Wave5 PR-review correction fan-in
+
+Exact clean base `7027adc` received two linear Seed-only custody commits at
+no-ff merge `1d04935`. The reviewed PR 99 correction history was not merged;
+only exact workflow blob `c059b08` from `d15640e` was applied. The assembled
+workflow SHA-256 is `f174a1024c6754602f4bd9190605b0e0e4273427e4bcccb4f573c6e1726f3eb7`,
+and its non-document footprint is one workflow plus the byte-identical
+648-row custody queue.
+
+The reviewed correction pins the project VB-CABLE archive and LABSN helper
+assets, enforces the catalog, signer, member, Microsoft DevCon, and
+TrustedPublisher cleanup chain, and requires cargo plus `tee` success, full
+logs, and exact per-OS counts (`42/11`, `13/11`, `12/9`). Actionlint, yq, Ruby
+YAML, extracted Bash syntax, trust-chain/static assertions, 12/12 mutation
+rejections, Unix summary cases, and a platform-independent Windows summary
+model passed. Accepted PowerShell 7.5 exact-blob evidence separately reports
+parser PASS, exact `12/9` PASS, and zero-test rejection; local `pwsh` was not
+installed.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/96 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, footprint, and range
+gates passed. `src-tauri` and frontend `src` are unchanged, so reviewed Linux
+`42/42` and `11/11` evidence remains applicable without rerunning product
+suites. Seed 52b9 remains `in_progress`; 2df3 is blocked only by 52b9, and
+8e73 only by 2df3. No push, PR mutation/reply/resolution, master merge,
+dispatch, Seed closure, license-material handling, LABSN/driver/platform job,
+or main-worktree change occurred.
