@@ -179,8 +179,8 @@ mod tests {
     };
     use crate::persistence::session_artifact_manifest::{
         ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass,
-        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestCasOutcome, ManifestTransition,
-        ManifestTransitionState, SessionArtifactEntry, SessionArtifactKind,
+        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestCasOutcome, ManifestStoreError,
+        ManifestTransition, ManifestTransitionState, SessionArtifactEntry, SessionArtifactKind,
         SessionArtifactManifestStore, SessionArtifactManifestV1, Sha256Digest,
         V2SessionProvenanceError,
     };
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_manifest_refusal_cannot_advance_the_logical_floor() {
+    fn unqualified_manifest_begin_refuses_before_floor_evidence_exists() {
         let root = std::env::temp_dir().join(format!(
             "audio-graph-b887-unqualified-floor-{}-{}",
             std::process::id(),
@@ -419,17 +419,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("root");
         let store = SessionArtifactManifestStore::new(&root);
-        let mut transaction = store.begin_write().expect("transaction");
-        let outcome = transaction.compare_and_swap(0, v2_candidate());
-        assert!(!matches!(outcome, ManifestCasOutcome::Accepted { .. }));
-
+        assert!(matches!(
+            store.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
+        ));
         assert_eq!(
-            admitted_session_semantics_floor(
-                "session-floor",
-                SessionSemanticsVersion::V1,
-                &outcome,
-            ),
-            Err(SessionSemanticsAdvanceError::ManifestCasNotAccepted)
+            std::fs::read_dir(root)
+                .expect("unqualified root remains readable")
+                .count(),
+            0
         );
     }
 

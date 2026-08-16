@@ -3735,20 +3735,16 @@ mod tests {
         let unqualified = SessionArtifactManifestStore::new(root);
         assert!(matches!(
             CanonicalRecoveryTransaction::begin::<TestPayload>(&unqualified, descriptor.clone()),
-            Err(CanonicalRecoveryBeginError::Rejected(
-                CanonicalRecoveryRejection::Durability(
-                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
-                )
+            Err(CanonicalRecoveryBeginError::Manifest(
+                ManifestStoreError::NamespaceQualificationRequired
             ))
         ));
         let windows =
             SessionArtifactManifestStore::for_test_platform(root, CanonicalPlatform::Windows);
         assert!(matches!(
             CanonicalRecoveryTransaction::begin::<TestPayload>(&windows, descriptor),
-            Err(CanonicalRecoveryBeginError::Rejected(
-                CanonicalRecoveryRejection::Durability(
-                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
-                )
+            Err(CanonicalRecoveryBeginError::Manifest(
+                ManifestStoreError::NamespaceQualificationRequired
             ))
         ));
         assert_eq!(fs::read(&path).expect("read unchanged source"), original);

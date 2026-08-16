@@ -9,14 +9,16 @@
 //! process can still replace roots or race pathname operations outside this
 //! contract.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::{Arc, Barrier};
 
@@ -72,6 +74,7 @@ impl fmt::Debug for CanonicalRecoveryKey {
 /// object identity; it cannot be reused for a different root or replacement.
 pub struct CanonicalFilesystemQualification {
     namespace: ManagedNamespace,
+    token: Option<CanonicalQualificationToken>,
 }
 
 impl fmt::Debug for CanonicalFilesystemQualification {
@@ -81,6 +84,39 @@ impl fmt::Debug for CanonicalFilesystemQualification {
 }
 
 impl CanonicalFilesystemQualification {
+    /// Qualify one existing managed root from a fresh live filesystem
+    /// inventory. The returned durability factory is the only production peer
+    /// that can consume this opaque qualification token.
+    pub fn for_existing_managed_root(
+        root: &Path,
+    ) -> Result<(Self, CanonicalDurability), CanonicalFilesystemQualificationError> {
+        let platform = current_platform();
+        if !namespace_supported_for(platform) {
+            return Err(
+                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { platform },
+            );
+        }
+        let namespace =
+            ManagedNamespace::load(root, CanonicalCoordinationError::ParentProvisioningRequired)
+                .map_err(qualification_coordination_error)?;
+        if !identity_is_available(&namespace.identity) {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        let observations = live_filesystem_inventory();
+        let filesystem =
+            assess_filesystem_policy(&namespace.canonical_root, platform, &observations)?;
+        validate_mount_volume(&filesystem, &namespace.identity)?;
+        let token = next_qualification_token()
+            .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
+        let qualification = Self {
+            namespace: namespace.clone(),
+            token: Some(token),
+        };
+        let durability =
+            CanonicalDurability::for_production_qualification(token, namespace, filesystem);
+        Ok((qualification, durability))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_root(root: &Path) -> Result<Self, CanonicalCoordinationError> {
         let namespace =
@@ -88,7 +124,10 @@ impl CanonicalFilesystemQualification {
         if namespace.identity.volume.is_none() || namespace.identity.object.is_none() {
             return Err(CanonicalCoordinationError::IdentityUnavailable);
         }
-        Ok(Self { namespace })
+        Ok(Self {
+            namespace,
+            token: None,
+        })
     }
 }
 
@@ -142,7 +181,10 @@ impl AlgorithmTestEnvironment {
             ..namespace
         };
         Ok(Self {
-            qualification: CanonicalFilesystemQualification { namespace },
+            qualification: CanonicalFilesystemQualification {
+                namespace,
+                token: None,
+            },
             durability: CanonicalDurability::for_algorithm_environment(platform, binding),
         })
     }
@@ -191,6 +233,88 @@ pub enum CanonicalPlatform {
     MacOs,
     Windows,
     Other,
+}
+
+/// Stable, content-free classification of a probed filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalFilesystemClass {
+    Ext4,
+    Apfs,
+    Remote,
+    Fuse,
+    Temporary,
+    Other,
+}
+
+/// Refusal to create production filesystem qualification authority.
+///
+/// Paths, mount sources, filesystem strings, object identifiers, and user
+/// bytes are deliberately absent from every variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalFilesystemQualificationError {
+    ParentProvisioningRequired,
+    ManagedRootNotDirectory,
+    IdentityUnavailable,
+    NamespaceDurabilityUnsupported {
+        platform: CanonicalPlatform,
+    },
+    NoMatchingMount,
+    FilesystemUnsupported {
+        platform: CanonicalPlatform,
+        class: CanonicalFilesystemClass,
+    },
+    ReadOnlyFilesystem {
+        class: CanonicalFilesystemClass,
+    },
+    RemovableFilesystem {
+        class: CanonicalFilesystemClass,
+    },
+    Io {
+        stage: CanonicalCoordinationStage,
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalQualificationToken(u64);
+
+#[derive(Clone)]
+struct ProductionQualificationBinding {
+    token: CanonicalQualificationToken,
+    namespace: ManagedNamespace,
+    filesystem: QualifiedFilesystemMount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QualifiedFilesystemMount {
+    mount_point: PathBuf,
+    class: CanonicalFilesystemClass,
+}
+
+#[derive(Clone)]
+struct FilesystemObservation {
+    mount_point: PathBuf,
+    file_system: OsString,
+    removable: bool,
+    read_only: bool,
+}
+
+impl FilesystemObservation {
+    #[cfg(test)]
+    fn for_test(
+        mount_point: impl Into<PathBuf>,
+        file_system: impl Into<OsString>,
+        removable: bool,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            mount_point: mount_point.into(),
+            file_system: file_system.into(),
+            removable,
+            read_only,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +444,8 @@ pub enum CanonicalCoordinationError {
     Contended,
     ManagedRootNotDirectory,
     IdentityUnavailable,
+    QualificationBindingMismatch,
+    QualificationRefused(CanonicalFilesystemQualificationError),
     NonRegularLockFile,
     Io {
         stage: CanonicalCoordinationStage,
@@ -565,6 +691,7 @@ fn open_parent_directory(
 /// a caller cannot pair an arbitrary lock with an unrelated mutation target.
 pub struct CanonicalExclusiveGuard {
     namespace: ManagedNamespace,
+    qualification_token: Option<CanonicalQualificationToken>,
     platform: CanonicalPlatform,
     reserved_internal_names: ReservedInternalNameEquivalence,
     _lock_file: File,
@@ -616,6 +743,7 @@ struct InjectedRenameFaultState {
 /// Factory for namespace-bound cooperative guards.
 pub struct CanonicalDurability {
     platform: CanonicalPlatform,
+    production_binding: Option<ProductionQualificationBinding>,
     reserved_internal_names: ReservedInternalNameEquivalence,
     #[cfg(test)]
     injected_failure: Option<InjectedFailure>,
@@ -635,6 +763,7 @@ impl Default for CanonicalDurability {
     fn default() -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             #[cfg(test)]
             injected_failure: None,
@@ -657,11 +786,44 @@ impl CanonicalDurability {
         Self::default()
     }
 
+    fn for_production_qualification(
+        token: CanonicalQualificationToken,
+        namespace: ManagedNamespace,
+        filesystem: QualifiedFilesystemMount,
+    ) -> Self {
+        Self {
+            production_binding: Some(ProductionQualificationBinding {
+                token,
+                namespace,
+                filesystem,
+            }),
+            ..Self::default()
+        }
+    }
+
     /// Acquire the deterministic writer coordination file inside an existing
     /// exact target parent. The directory itself is never provisioned.
     pub fn try_lock_exclusive(
         &self,
         managed_root: &Path,
+    ) -> Result<CanonicalExclusiveGuard, CanonicalCoordinationError> {
+        self.try_lock_exclusive_inner(managed_root, None)
+    }
+
+    /// Acquire the writer coordination entry only after the production pair's
+    /// opaque token, exact root identity, and live filesystem binding match.
+    pub fn try_lock_exclusive_qualified(
+        &self,
+        managed_root: &Path,
+        qualification: &CanonicalFilesystemQualification,
+    ) -> Result<CanonicalExclusiveGuard, CanonicalCoordinationError> {
+        self.try_lock_exclusive_inner(managed_root, Some(qualification))
+    }
+
+    fn try_lock_exclusive_inner(
+        &self,
+        managed_root: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
     ) -> Result<CanonicalExclusiveGuard, CanonicalCoordinationError> {
         let namespace = ManagedNamespace::load(
             managed_root,
@@ -672,11 +834,16 @@ impl CanonicalDurability {
             Some(binding) => binding.bind_namespace(namespace)?,
             None => namespace,
         };
+        self.validate_guard_binding(&namespace, qualification)?;
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         let file = open_writer_coordination(&lock_path)?;
         let file = try_lock_exclusive(file)?;
         Ok(CanonicalExclusiveGuard {
             namespace,
+            qualification_token: self
+                .production_binding
+                .as_ref()
+                .map(|binding| binding.token),
             platform: self.platform,
             reserved_internal_names: self.reserved_internal_names,
             _lock_file: file,
@@ -696,10 +863,60 @@ impl CanonicalDurability {
         })
     }
 
+    fn validate_guard_binding(
+        &self,
+        namespace: &ManagedNamespace,
+        qualification: Option<&CanonicalFilesystemQualification>,
+    ) -> Result<(), CanonicalCoordinationError> {
+        let Some(binding) = &self.production_binding else {
+            if qualification.is_some_and(|qualification| qualification.token.is_some()) {
+                return Err(CanonicalCoordinationError::QualificationBindingMismatch);
+            }
+            return Ok(());
+        };
+        let Some(qualification) = qualification else {
+            return Err(CanonicalCoordinationError::QualificationBindingMismatch);
+        };
+        if qualification.token != Some(binding.token)
+            || qualification.namespace != binding.namespace
+            || *namespace != binding.namespace
+        {
+            return Err(CanonicalCoordinationError::QualificationBindingMismatch);
+        }
+        let observations = live_filesystem_inventory();
+        let filesystem =
+            assess_filesystem_policy(&namespace.canonical_root, self.platform, &observations)
+                .map_err(CanonicalCoordinationError::QualificationRefused)?;
+        validate_mount_volume(&filesystem, &namespace.identity)
+            .map_err(CanonicalCoordinationError::QualificationRefused)?;
+        if filesystem != binding.filesystem {
+            return Err(CanonicalCoordinationError::QualificationBindingMismatch);
+        }
+        Ok(())
+    }
+
     /// Acquire a shared strict-reader lock without creating missing state.
     pub fn try_lock_shared(
         &self,
         managed_root: &Path,
+    ) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+        self.try_lock_shared_inner(managed_root, None)
+    }
+
+    /// Acquire the reader coordination entry only after revalidating the
+    /// production qualification pair. Missing state is never created.
+    pub fn try_lock_shared_qualified(
+        &self,
+        managed_root: &Path,
+        qualification: &CanonicalFilesystemQualification,
+    ) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+        self.try_lock_shared_inner(managed_root, Some(qualification))
+    }
+
+    fn try_lock_shared_inner(
+        &self,
+        managed_root: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
     ) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
         let namespace = ManagedNamespace::load(managed_root, CanonicalCoordinationError::Missing)?;
         #[cfg(test)]
@@ -707,6 +924,7 @@ impl CanonicalDurability {
             Some(binding) => binding.bind_namespace(namespace)?,
             None => namespace,
         };
+        self.validate_guard_binding(&namespace, qualification)?;
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         ensure_regular_lock_entry(&lock_path)?;
         let file = OpenOptions::new()
@@ -724,6 +942,7 @@ impl CanonicalDurability {
     fn failing_at(stage: CanonicalDurabilityStage) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: Some(InjectedFailure {
                 stage,
@@ -741,6 +960,7 @@ impl CanonicalDurability {
     fn failing_at_with_raw_os_error(stage: CanonicalDurabilityStage, raw_os_error: i32) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: Some(InjectedFailure {
                 stage,
@@ -758,6 +978,7 @@ impl CanonicalDurability {
     fn with_before_atomic_create(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: Some(barrier),
@@ -772,6 +993,7 @@ impl CanonicalDurability {
     pub(crate) fn for_test_platform(platform: CanonicalPlatform) -> Self {
         Self {
             platform,
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
@@ -789,6 +1011,7 @@ impl CanonicalDurability {
     ) -> Self {
         Self {
             platform,
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
@@ -803,6 +1026,7 @@ impl CanonicalDurability {
     fn with_before_existing_open(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
@@ -817,6 +1041,7 @@ impl CanonicalDurability {
     fn with_before_snapshot_revalidation(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
@@ -831,6 +1056,7 @@ impl CanonicalDurability {
     fn for_test_name_equivalence(reserved_internal_names: ReservedInternalNameEquivalence) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names,
             injected_failure: None,
             before_atomic_create: None,
@@ -845,6 +1071,7 @@ impl CanonicalDurability {
     fn with_rename_fault(fault: InjectedRenameFault, rename_invoked: Arc<AtomicBool>) -> Self {
         Self {
             platform: current_platform(),
+            production_binding: None,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
@@ -1543,7 +1770,9 @@ impl CanonicalExclusiveGuard {
         let Some(qualification) = qualification else {
             return Ok(false);
         };
-        if qualification.namespace != self.namespace {
+        if qualification.namespace != self.namespace
+            || qualification.token != self.qualification_token
+        {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
         Ok(self.namespace_is_supported())
@@ -2145,6 +2374,136 @@ fn parent_directory(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+fn next_qualification_token() -> Option<CanonicalQualificationToken> {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    NEXT_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .map(CanonicalQualificationToken)
+}
+
+fn live_filesystem_inventory() -> Vec<FilesystemObservation> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .map(|disk| FilesystemObservation {
+            mount_point: disk.mount_point().to_path_buf(),
+            file_system: disk.file_system().to_os_string(),
+            removable: disk.is_removable(),
+            read_only: disk.is_read_only(),
+        })
+        .collect()
+}
+
+fn assess_filesystem_policy(
+    canonical_root: &Path,
+    platform: CanonicalPlatform,
+    observations: &[FilesystemObservation],
+) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+    if !namespace_supported_for(platform) {
+        return Err(
+            CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { platform },
+        );
+    }
+    let observation = observations
+        .iter()
+        .filter(|observation| canonical_root.starts_with(&observation.mount_point))
+        .max_by_key(|observation| observation.mount_point.components().count())
+        .ok_or(CanonicalFilesystemQualificationError::NoMatchingMount)?;
+    let class = classify_filesystem(&observation.file_system);
+    if observation.read_only {
+        return Err(CanonicalFilesystemQualificationError::ReadOnlyFilesystem { class });
+    }
+    if observation.removable {
+        return Err(CanonicalFilesystemQualificationError::RemovableFilesystem { class });
+    }
+    let allowed = matches!(
+        (platform, class),
+        (CanonicalPlatform::Linux, CanonicalFilesystemClass::Ext4)
+            | (CanonicalPlatform::MacOs, CanonicalFilesystemClass::Apfs)
+    );
+    if !allowed {
+        return Err(
+            CanonicalFilesystemQualificationError::FilesystemUnsupported { platform, class },
+        );
+    }
+    Ok(QualifiedFilesystemMount {
+        mount_point: observation.mount_point.clone(),
+        class,
+    })
+}
+
+fn classify_filesystem(file_system: &OsStr) -> CanonicalFilesystemClass {
+    let Some(file_system) = file_system.to_str() else {
+        return CanonicalFilesystemClass::Other;
+    };
+    let normalized = file_system.to_ascii_lowercase();
+    match normalized.as_str() {
+        "ext4" => CanonicalFilesystemClass::Ext4,
+        "apfs" => CanonicalFilesystemClass::Apfs,
+        "tmpfs" | "devtmpfs" | "ramfs" => CanonicalFilesystemClass::Temporary,
+        "nfs" | "nfs4" | "cifs" | "smbfs" | "9p" | "afs" | "ceph" => {
+            CanonicalFilesystemClass::Remote
+        }
+        other if other == "fuse" || other.starts_with("fuse.") => CanonicalFilesystemClass::Fuse,
+        _ => CanonicalFilesystemClass::Other,
+    }
+}
+
+fn validate_mount_volume(
+    filesystem: &QualifiedFilesystemMount,
+    root_identity: &FilesystemIdentity,
+) -> Result<(), CanonicalFilesystemQualificationError> {
+    let metadata = std::fs::metadata(&filesystem.mount_point).map_err(|error| {
+        CanonicalFilesystemQualificationError::Io {
+            stage: CanonicalCoordinationStage::ResolveRoot,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    })?;
+    let mount_identity = filesystem_identity(&metadata);
+    match (
+        root_identity.volume.as_ref(),
+        mount_identity.volume.as_ref(),
+    ) {
+        (Some(root), Some(mount)) if root == mount => Ok(()),
+        _ => Err(CanonicalFilesystemQualificationError::IdentityUnavailable),
+    }
+}
+
+fn qualification_coordination_error(
+    error: CanonicalCoordinationError,
+) -> CanonicalFilesystemQualificationError {
+    match error {
+        CanonicalCoordinationError::ParentProvisioningRequired
+        | CanonicalCoordinationError::Missing => {
+            CanonicalFilesystemQualificationError::ParentProvisioningRequired
+        }
+        CanonicalCoordinationError::ManagedRootNotDirectory => {
+            CanonicalFilesystemQualificationError::ManagedRootNotDirectory
+        }
+        CanonicalCoordinationError::IdentityUnavailable
+        | CanonicalCoordinationError::Contended
+        | CanonicalCoordinationError::NonRegularLockFile
+        | CanonicalCoordinationError::QualificationBindingMismatch => {
+            CanonicalFilesystemQualificationError::IdentityUnavailable
+        }
+        CanonicalCoordinationError::QualificationRefused(error) => error,
+        CanonicalCoordinationError::Io {
+            stage,
+            kind,
+            raw_os_error,
+        } => CanonicalFilesystemQualificationError::Io {
+            stage,
+            kind,
+            raw_os_error,
+        },
+    }
+}
+
 const fn current_platform() -> CanonicalPlatform {
     if cfg!(target_os = "linux") {
         CanonicalPlatform::Linux
@@ -2285,6 +2644,317 @@ mod tests {
     fn qualification(root: &Path) -> CanonicalFilesystemQualification {
         CanonicalFilesystemQualification::for_test_root(root)
             .expect("bind test qualification to root identity")
+    }
+
+    #[test]
+    fn production_filesystem_policy_is_longest_mount_and_fail_closed() {
+        let root = Path::new("/managed/session");
+        let ext4 = FilesystemObservation::for_test("/", "ext4", false, false);
+        let nested_ext4 = FilesystemObservation::for_test("/managed", "ext4", false, false);
+        let nested_apfs = FilesystemObservation::for_test("/managed", "apfs", false, false);
+
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                CanonicalPlatform::Linux,
+                &[ext4.clone(), nested_ext4.clone()],
+            ),
+            Ok(QualifiedFilesystemMount {
+                mount_point: PathBuf::from("/managed"),
+                class: CanonicalFilesystemClass::Ext4,
+            })
+        );
+        assert_eq!(
+            assess_filesystem_policy(root, CanonicalPlatform::MacOs, &[nested_apfs]),
+            Ok(QualifiedFilesystemMount {
+                mount_point: PathBuf::from("/managed"),
+                class: CanonicalFilesystemClass::Apfs,
+            })
+        );
+
+        for (label, platform, observations, expected) in [
+            (
+                "windows",
+                CanonicalPlatform::Windows,
+                vec![nested_ext4.clone()],
+                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                },
+            ),
+            (
+                "other-platform",
+                CanonicalPlatform::Other,
+                vec![nested_ext4.clone()],
+                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Other,
+                },
+            ),
+            (
+                "no-mount",
+                CanonicalPlatform::Linux,
+                Vec::new(),
+                CanonicalFilesystemQualificationError::NoMatchingMount,
+            ),
+            (
+                "apfs-on-linux",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed", "apfs", false, false,
+                )],
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Linux,
+                    class: CanonicalFilesystemClass::Apfs,
+                },
+            ),
+            (
+                "remote",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed", "nfs4", false, false,
+                )],
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Linux,
+                    class: CanonicalFilesystemClass::Remote,
+                },
+            ),
+            (
+                "fuse",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed",
+                    "fuse.portal",
+                    false,
+                    false,
+                )],
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Linux,
+                    class: CanonicalFilesystemClass::Fuse,
+                },
+            ),
+            (
+                "temporary",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed", "tmpfs", false, false,
+                )],
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Linux,
+                    class: CanonicalFilesystemClass::Temporary,
+                },
+            ),
+            (
+                "read-only",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed", "ext4", false, true,
+                )],
+                CanonicalFilesystemQualificationError::ReadOnlyFilesystem {
+                    class: CanonicalFilesystemClass::Ext4,
+                },
+            ),
+            (
+                "removable",
+                CanonicalPlatform::Linux,
+                vec![FilesystemObservation::for_test(
+                    "/managed", "ext4", true, false,
+                )],
+                CanonicalFilesystemQualificationError::RemovableFilesystem {
+                    class: CanonicalFilesystemClass::Ext4,
+                },
+            ),
+        ] {
+            assert_eq!(
+                assess_filesystem_policy(root, platform, &observations),
+                Err(expected),
+                "policy case {label}",
+            );
+        }
+    }
+
+    #[test]
+    fn production_qualification_errors_and_debug_are_content_free() {
+        let sensitive_root = Path::new("/managed/private-user-root");
+        let error = assess_filesystem_policy(
+            sensitive_root,
+            CanonicalPlatform::Linux,
+            &[FilesystemObservation::for_test(
+                "/managed",
+                "private-remote-filesystem-source",
+                false,
+                false,
+            )],
+        )
+        .expect_err("unknown filesystem must refuse");
+        let rendered = format!("{error:?}");
+        for sensitive in [
+            "private-user-root",
+            "private-remote-filesystem-source",
+            "/managed",
+        ] {
+            assert!(!rendered.contains(sensitive));
+        }
+        assert_eq!(
+            error,
+            CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                platform: CanonicalPlatform::Linux,
+                class: CanonicalFilesystemClass::Other,
+            }
+        );
+
+        let unavailable_identity = FilesystemIdentity {
+            volume: None,
+            object: None,
+        };
+        assert_eq!(
+            validate_mount_volume(
+                &QualifiedFilesystemMount {
+                    mount_point: PathBuf::from("/"),
+                    class: CanonicalFilesystemClass::Ext4,
+                },
+                &unavailable_identity,
+            ),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let root = temp_root("private-debug-root");
+            fs::create_dir_all(&root).expect("create qualification debug fixture");
+            let (qualification, _) =
+                CanonicalFilesystemQualification::for_existing_managed_root(&root)
+                    .expect("qualify live ext4 debug fixture");
+            assert_eq!(
+                format!("{qualification:?}"),
+                "CanonicalFilesystemQualification([BOUND])"
+            );
+            assert!(!format!("{qualification:?}").contains("private-debug-root"));
+            fs::remove_dir_all(root).expect("clean qualification debug fixture");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_linux_existing_root_qualification_is_ext4_or_typed_refusal() {
+        let root = temp_root("live-production-qualification");
+        fs::create_dir_all(&root).expect("create live qualification root");
+        let lock_path = root.join(COORDINATION_FILE_NAME);
+
+        match CanonicalFilesystemQualification::for_existing_managed_root(&root) {
+            Ok((qualification, durability)) => {
+                let guard = durability
+                    .try_lock_exclusive_qualified(&root, &qualification)
+                    .expect("qualified live ext4 root acquires guard");
+                eprintln!("live Linux ext4 qualification admitted");
+                let target = root.join("first-created.bin");
+                assert_eq!(
+                    guard.append(
+                        &target,
+                        b"qualified bytes",
+                        Some(&qualification),
+                        CanonicalRecoveryKey::from_opaque_bytes([91; 16]),
+                    ),
+                    CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                        mutation: CanonicalMutation::FirstCreate,
+                        barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                    })
+                );
+                assert!(lock_path.exists());
+                drop(guard);
+            }
+            Err(error @ CanonicalFilesystemQualificationError::FilesystemUnsupported { .. })
+            | Err(error @ CanonicalFilesystemQualificationError::NoMatchingMount)
+            | Err(error @ CanonicalFilesystemQualificationError::ReadOnlyFilesystem { .. })
+            | Err(error @ CanonicalFilesystemQualificationError::RemovableFilesystem { .. }) => {
+                assert!(
+                    !lock_path.exists(),
+                    "typed refusal must not create lock state"
+                );
+                eprintln!("live Linux qualification explicitly refused: {error:?}");
+            }
+            Err(other) => panic!("unexpected live Linux qualification result: {other:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("clean live qualification root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn qualified_guard_refuses_foreign_or_changed_binding_before_coordination_mutation() {
+        let first_root = temp_root("production-binding-first");
+        let second_root = temp_root("production-binding-second");
+        let ancestor_root = temp_root("production-binding-ancestor");
+        let nested_root = ancestor_root.join("nested");
+        let moved_root = temp_root("production-binding-moved");
+        let displaced_root = temp_root("production-binding-displaced");
+        for root in [&first_root, &second_root, &nested_root, &moved_root] {
+            fs::create_dir_all(root).expect("create production binding fixture");
+        }
+        let assert_binding_refusal =
+            |result: Result<CanonicalExclusiveGuard, CanonicalCoordinationError>| match result {
+                Err(actual) => assert_eq!(
+                    actual,
+                    CanonicalCoordinationError::QualificationBindingMismatch
+                ),
+                Ok(_) => panic!("mismatched qualification unexpectedly acquired guard"),
+            };
+
+        let (first_qualification, first_durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&first_root)
+                .expect("qualify first root");
+        assert_binding_refusal(
+            first_durability.try_lock_exclusive_qualified(&second_root, &first_qualification),
+        );
+        assert!(!second_root.join(COORDINATION_FILE_NAME).exists());
+
+        let (foreign_qualification, _) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&first_root)
+                .expect("create foreign token for same root");
+        assert_binding_refusal(
+            first_durability.try_lock_exclusive_qualified(&first_root, &foreign_qualification),
+        );
+        assert!(!first_root.join(COORDINATION_FILE_NAME).exists());
+
+        let (ancestor_qualification, ancestor_durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&ancestor_root)
+                .expect("qualify ancestor root");
+        assert_binding_refusal(
+            ancestor_durability.try_lock_exclusive_qualified(&nested_root, &ancestor_qualification),
+        );
+        assert!(!nested_root.join(COORDINATION_FILE_NAME).exists());
+
+        let (nested_qualification, nested_durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&nested_root)
+                .expect("qualify nested root");
+        assert_binding_refusal(
+            nested_durability.try_lock_exclusive_qualified(&ancestor_root, &nested_qualification),
+        );
+        assert!(!ancestor_root.join(COORDINATION_FILE_NAME).exists());
+
+        let (moved_qualification, moved_durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&moved_root)
+                .expect("qualify root before replacement");
+        fs::rename(&moved_root, &displaced_root).expect("displace qualified root");
+        fs::create_dir_all(&moved_root).expect("recreate qualified pathname");
+        assert_binding_refusal(
+            moved_durability.try_lock_exclusive_qualified(&moved_root, &moved_qualification),
+        );
+        assert!(!moved_root.join(COORDINATION_FILE_NAME).exists());
+
+        let exact_guard = first_durability
+            .try_lock_exclusive_qualified(&first_root, &first_qualification)
+            .expect("exact qualification pair acquires guard");
+        assert!(first_root.join(COORDINATION_FILE_NAME).exists());
+        drop(exact_guard);
+
+        for root in [
+            first_root,
+            second_root,
+            ancestor_root,
+            moved_root,
+            displaced_root,
+        ] {
+            fs::remove_dir_all(root).expect("clean production binding fixture");
+        }
     }
 
     #[test]

@@ -18,13 +18,13 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::canonical_durability::{
-    AlgorithmTestEnvironment, CanonicalNamespaceOperation, CanonicalPlatform,
+    AlgorithmTestEnvironment, CanonicalDurabilityBarrier, CanonicalMutation, CanonicalPlatform,
 };
 use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
-    CanonicalExclusiveGuard, CanonicalFilesystemQualification, CanonicalRecoveryKey,
-    CanonicalSnapshotExpectation,
+    CanonicalExclusiveGuard, CanonicalFilesystemQualification,
+    CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSnapshotExpectation,
 };
 use super::session_semantics::SessionSemanticsVersion;
 
@@ -332,6 +332,8 @@ pub enum ManifestLoadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestStoreError {
+    NamespaceQualificationRequired,
+    Qualification(CanonicalFilesystemQualificationError),
     Coordination(CanonicalCoordinationError),
     Load(ManifestLoadError),
 }
@@ -399,6 +401,19 @@ impl SessionArtifactManifestStore {
         }
     }
 
+    /// Bind one existing managed root to live production filesystem evidence.
+    pub fn qualified_existing_root(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
+        let root = root.into();
+        let (qualification, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&root)
+                .map_err(ManifestStoreError::Qualification)?;
+        Ok(Self {
+            root,
+            durability,
+            qualification: Some(qualification),
+        })
+    }
+
     pub fn internal_identities(&self) -> ManifestInternalIdentities {
         ManifestInternalIdentities {
             manifest: ManagedArtifactIdentity::internal(MANIFEST_FILE_NAME),
@@ -418,10 +433,13 @@ impl SessionArtifactManifestStore {
         if !manifest_exists && !coordination_exists {
             return Ok(ManifestLoadOutcome::Absent);
         }
-        let _guard = self
-            .durability
-            .try_lock_shared(&self.root)
-            .map_err(ManifestLoadError::Coordination)?;
+        let guard = match self.qualification.as_ref() {
+            Some(qualification) => self
+                .durability
+                .try_lock_shared_qualified(&self.root, qualification),
+            None => self.durability.try_lock_shared(&self.root),
+        };
+        let _guard = guard.map_err(ManifestLoadError::Coordination)?;
         if !entry_exists(&manifest_path)? {
             return Ok(ManifestLoadOutcome::Absent);
         }
@@ -432,9 +450,13 @@ impl SessionArtifactManifestStore {
     /// Begin one guard-owning write transaction. The root must already exist;
     /// only the canonical coordination entry may be created by acquisition.
     pub fn begin_write(&self) -> Result<ManifestWriteTransaction<'_>, ManifestStoreError> {
+        let qualification = self
+            .qualification
+            .as_ref()
+            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
         let guard = self
             .durability
-            .try_lock_exclusive(&self.root)
+            .try_lock_exclusive_qualified(&self.root, qualification)
             .map_err(ManifestStoreError::Coordination)?;
         let manifest_path = self.manifest_path();
         let (head, head_file) = if entry_exists(&manifest_path).map_err(ManifestStoreError::Load)? {
@@ -1471,7 +1493,14 @@ mod tests {
     }
 
     fn create_coordination_entry(store: &SessionArtifactManifestStore) {
-        drop(store.begin_write().expect("create coordination entry"));
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(store.root.join(COORDINATION_FILE_NAME))
+                .expect("create strict-load coordination fixture"),
+        );
     }
 
     fn write_manifest_bytes(store: &SessionArtifactManifestStore, bytes: &[u8]) {
@@ -1486,6 +1515,35 @@ mod tests {
 
         assert_eq!(store.load(), Ok(ManifestLoadOutcome::Absent));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn unqualified_begin_write_refuses_before_coordination_mutation() {
+        let root = root("unqualified-begin-refusal-private-root");
+        let store = SessionArtifactManifestStore::new(&root);
+        let before = std::fs::read_dir(&root)
+            .expect("read empty root before")
+            .map(|entry| entry.expect("read before entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(before.is_empty());
+
+        let error = match store.begin_write() {
+            Err(error) => error,
+            Ok(_) => panic!("unqualified begin_write unexpectedly acquired a writer guard"),
+        };
+
+        assert_eq!(error, ManifestStoreError::NamespaceQualificationRequired);
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .expect("read empty root after")
+                .map(|entry| entry.expect("read after entry").file_name())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(!root.join(COORDINATION_FILE_NAME).exists());
+        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
+        assert!(!root.join(MANIFEST_FILE_NAME).exists());
+        assert!(!format!("{error:?}").contains("private-root"));
     }
 
     #[test]
@@ -1729,7 +1787,8 @@ mod tests {
             expected: V2SessionProvenanceError,
         ) {
             let root = root(label);
-            let store = SessionArtifactManifestStore::new(&root);
+            let store = SessionArtifactManifestStore::qualified_for_test(&root)
+                .expect("qualified validation fixture");
             let mut transaction = store.begin_write().expect("transaction");
             assert_eq!(
                 transaction.compare_and_swap(0, candidate),
@@ -1964,6 +2023,76 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_qualified_existing_root_initial_cas_has_parent_barrier() {
+        let root = root("production-qualified-initial");
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root)
+            .expect("qualify existing live ext4 manifest root");
+        let mut transaction = store.begin_write().expect("qualified transaction");
+
+        assert!(matches!(
+            transaction.compare_and_swap(0, basic_candidate("production-tx-1", 'a')),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 { generation: 1, .. },
+                durability: CanonicalDurabilityReceipt {
+                    mutation: CanonicalMutation::InitialSnapshotInstall,
+                    barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                },
+            }
+        ));
+        drop(transaction);
+        assert!(matches!(
+            store.load().expect("load qualified manifest"),
+            ManifestLoadOutcome::Present(manifest) if manifest.generation == 1
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_qualified_replacement_retains_exact_open_head() {
+        let root = root("production-qualified-replacement");
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root)
+            .expect("qualify existing live ext4 manifest root");
+        {
+            let mut transaction = store.begin_write().expect("initial transaction");
+            assert!(matches!(
+                transaction.compare_and_swap(0, basic_candidate("production-tx-1", 'a')),
+                ManifestCasOutcome::Accepted { .. }
+            ));
+            assert!(matches!(
+                transaction.compare_and_swap(1, basic_candidate("production-tx-2", 'b')),
+                ManifestCasOutcome::Accepted {
+                    manifest: SessionArtifactManifestV1 { generation: 2, .. },
+                    durability: CanonicalDurabilityReceipt {
+                        mutation: CanonicalMutation::SnapshotReplacement,
+                        barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                    },
+                }
+            ));
+        }
+
+        let mut raced = store.begin_write().expect("open exact generation-two head");
+        let manifest_path = store.manifest_path();
+        let displaced_path = root.join("manifest.displaced");
+        let validated_bytes = std::fs::read(&manifest_path).expect("read validated head bytes");
+        std::fs::rename(&manifest_path, &displaced_path).expect("displace validated head object");
+        std::fs::write(&manifest_path, &validated_bytes)
+            .expect("install byte-identical foreign head object");
+
+        assert_eq!(
+            raced.compare_and_swap(2, basic_candidate("production-tx-3", 'c')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged,
+            ))
+        );
+        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
+        assert_eq!(
+            std::fs::read(manifest_path).expect("foreign head retained"),
+            validated_bytes
+        );
+    }
+
     #[test]
     fn algorithm_qualification_and_windows_policy_refusal_are_explicitly_separate() {
         let algorithm_root = root("algorithm-qualified");
@@ -1995,16 +2124,11 @@ mod tests {
             CanonicalPlatform::Windows,
         );
         assert!(windows_store.qualification.is_none());
-        let mut windows_write = windows_store.begin_write().expect("Windows policy write");
         assert!(matches!(
-            windows_write.compare_and_swap(0, basic_candidate("windows-tx", 'c')),
-            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
-                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                    platform: CanonicalPlatform::Windows,
-                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
-                }
-            ))
+            windows_store.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
         ));
+        assert!(!windows_root.join(COORDINATION_FILE_NAME).exists());
         assert!(!windows_store.manifest_path().exists());
         assert!(!windows_root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
@@ -2012,7 +2136,8 @@ mod tests {
     #[test]
     fn stale_and_overflow_generations_refuse_without_snapshot_mutation() {
         let root = root("generation-refusal");
-        let store = SessionArtifactManifestStore::new(&root);
+        let store =
+            SessionArtifactManifestStore::qualified_for_test(&root).expect("qualified fixture");
         let mut head = basic_candidate("tx-head", 'a');
         head.generation = u64::MAX;
         write_manifest_bytes(&store, &serde_json::to_vec(&head).expect("serialize head"));
@@ -2040,15 +2165,12 @@ mod tests {
     fn unqualified_namespace_never_reports_manifest_acceptance() {
         let root = root("unsupported");
         let store = SessionArtifactManifestStore::new(&root);
-        let mut transaction = store.begin_write().expect("transaction");
-        let outcome = transaction.compare_and_swap(0, basic_candidate("tx-1", 'a'));
 
         assert!(matches!(
-            outcome,
-            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
-                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
-            ))
+            store.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
         ));
+        assert!(!store.root.join(COORDINATION_FILE_NAME).exists());
         assert!(!store.manifest_path().exists());
         assert!(!store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
@@ -2115,20 +2237,20 @@ mod tests {
         }
 
         let exact_root = root("size-exact");
-        let exact_store = SessionArtifactManifestStore::new(&exact_root);
+        let exact_store = SessionArtifactManifestStore::qualified_for_test(&exact_root)
+            .expect("qualified exact-size fixture");
         let mut exact_transaction = exact_store.begin_write().expect("exact transaction");
         assert!(matches!(
             exact_transaction
                 .compare_and_swap(0, candidate_with_wire_size(MAX_MANIFEST_BYTES as usize)),
-            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
-                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. }
-            ))
+            ManifestCasOutcome::Accepted { .. }
         ));
-        assert!(!exact_store.manifest_path().exists());
+        assert!(exact_store.manifest_path().exists());
         assert!(!exact_store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
 
         let oversized_root = root("size-oversized");
-        let oversized_store = SessionArtifactManifestStore::new(&oversized_root);
+        let oversized_store = SessionArtifactManifestStore::qualified_for_test(&oversized_root)
+            .expect("qualified oversized fixture");
         let mut oversized_transaction = oversized_store
             .begin_write()
             .expect("oversized transaction");
