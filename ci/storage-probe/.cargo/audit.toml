@@ -1,0 +1,29 @@
+# cargo-audit policy for the independent storage-probe workspace.
+# Every ignore is an exact, reviewed exception for the locked version below.
+# A new advisory remains a hard failure.
+
+[advisories]
+ignore = [
+    # rkyv 0.7.46 — RUSTSEC-2026-0235
+    # Reachability: Cargo retains rust_decimal 1.42.1's optional `rkyv =
+    # "^0.7.46"` edge, but rust_decimal's active features exclude `rkyv` and
+    # all-target/all-feature inverse trees print no path to rkyv 0.7.46.
+    # Scope: lockfile-only while the edge is inactive; do not deserialize
+    # untrusted archives through rkyv 0.7.
+    # Remove immediately if an inverse path activates, the rust_decimal/rkyv
+    # feature is enabled, untrusted archives enter scope, or upstream removes
+    # or migrates the optional 0.7 edge.
+    "RUSTSEC-2026-0235",
+
+    # rsa 0.9.10 — RUSTSEC-2023-0071
+    # Reachability: all-feature inverse trees are empty for native Linux,
+    # macOS, and Windows probe targets. The wasm32 graph is different:
+    # surrealdb-core -> jsonwebtoken[rust_crypto] -> rsa 0.9.10.
+    # Scope: native storage-probe builds and fresh-process durability checks
+    # only. This exception does not claim SurrealDB never uses RSA and does not
+    # accept the wasm path.
+    # Remove immediately for a wasm probe, any native inverse path, RSA/JWT
+    # issuance or decryption, attacker-observable network timing, or an
+    # upstream fix/elimination of the dependency.
+    "RUSTSEC-2023-0071",
+]
