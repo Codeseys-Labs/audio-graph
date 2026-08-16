@@ -44,12 +44,9 @@ jobs:
       EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
       EXPECTED_DURABILITY_TESTS: ${{ matrix.expected_durability_tests }}
       EXPECTED_CRASH_HARNESS_TESTS: ${{ matrix.expected_crash_harness_tests }}
-      # Project-controlled pin adoption and review triggers are recorded under
-      # audio-graph-52b9:vbcable_archive_pin_adoption_2026_08_15.
-      VBCABLE_ARCHIVE_URL: https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip
-      VBCABLE_ARCHIVE_SHA256: 66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd
+      # Used only to restore the exact TrustedPublisher target changed by the
+      # pinned LABSN action. It is not an archive or installer provenance claim.
       LABSN_VBCABLE_CERT_SHA256: db9f6f54a13ef2ede5a8a7ba69dc841dc0711ba77ae7b173dd093e8455a4ed7e
-      LABSN_DEVCON_SHA256: 97cff42f8c0fe4fbdf991273159516bf78090625a933c3983ebd6f62284e329a
     steps:
       - name: Initialize Unix evidence preflight
         if: matrix.os != 'windows'
@@ -105,15 +102,6 @@ jobs:
       - name: Install Rust 1.95.0
         if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-
-      - name: Check out pinned LABSN Windows helper assets
-        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: LABSN/sound-ci-helpers
-          ref: d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
-          path: sound-ci-helpers
-          persist-credentials: false
 
       - name: Restore Rust cache
         if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
@@ -263,156 +251,157 @@ jobs:
             Out-File -FilePath "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8 -Append
           Remove-Item -Path $probe -Force
 
-      # The upstream LABSN action downloads a mutable URL directly. Keep using
-      # its commit-pinned certificate and devcon helper, but install only the
-      # exact project-pinned VB-Audio archive after verifying its SHA-256,
-      # catalog signature, signer, and selected catalog members. VB-Audio does
-      # not publish an upstream checksum, so any byte change requires review.
-      - name: Install verified Windows virtual-device enumeration baseline
+      - name: Record LABSN Windows prestate
+        id: labsn_prestate
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $archive = Join-Path $env:RUNNER_TEMP 'VBCABLE_Driver_Pack43.zip'
-          $extractRoot = Join-Path $env:RUNNER_TEMP 'VBCABLE_Driver_Pack43'
-          $helperRoot = Join-Path $env:GITHUB_WORKSPACE 'sound-ci-helpers\windows'
-
-          Invoke-WebRequest `
-            -Uri $env:VBCABLE_ARCHIVE_URL `
-            -OutFile $archive `
-            -MaximumRetryCount 2 `
-            -RetryIntervalSec 1
-          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $env:VBCABLE_ARCHIVE_SHA256) {
-            Remove-Item -Path $archive -Force -ErrorAction SilentlyContinue
-            throw "VB-CABLE archive SHA-256 mismatch; refusing certificate import and driver installation."
-          }
-
-          Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
-          $certificate = Join-Path $helperRoot 'vbcable.cer'
-          $devcon = Join-Path $helperRoot 'devcon.exe'
-          $driverInf = Join-Path $extractRoot 'vbMmeCable64_win7.inf'
-          $driverCatalog = Join-Path $extractRoot 'vbaudio_cable64_win7.cat'
-          $driverSys = Join-Path $extractRoot 'vbaudio_cable64_win7.sys'
-          foreach ($requiredPath in @($certificate, $devcon, $driverInf, $driverCatalog, $driverSys)) {
-            if (-not (Test-Path $requiredPath -PathType Leaf)) {
-              throw "Required verified VB-CABLE installation input is absent."
-            }
-          }
-          $actualCertificateSha256 = (Get-FileHash -Path $certificate -Algorithm SHA256).Hash.ToLowerInvariant()
-          $actualDevconSha256 = (Get-FileHash -Path $devcon -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualCertificateSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256 -or
-            $actualDevconSha256 -ne $env:LABSN_DEVCON_SHA256) {
-            throw "Pinned LABSN Windows helper asset digest mismatch; refusing privileged installation."
-          }
-
-          $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
-          if (-not $signTool) {
-            $windowsKits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-            $signTool = Get-ChildItem -Path $windowsKits -Filter signtool.exe -Recurse -ErrorAction Stop |
-              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $signTool) {
-            throw "Windows SDK SignTool is unavailable; refusing certificate import and installation."
-          }
-
-          & $signTool verify /kp /v $driverCatalog
-          if ($LASTEXITCODE -ne 0) {
-            throw "VB-CABLE catalog kernel-policy signature verification failed."
-          }
-          $catalogSignature = Get-AuthenticodeSignature -FilePath $driverCatalog
-          if (-not $catalogSignature.SignerCertificate) {
-            throw "VB-CABLE catalog signer certificate is unavailable."
-          }
-          $catalogSignerSha256 = [System.Convert]::ToHexString(
-            [System.Security.Cryptography.SHA256]::HashData($catalogSignature.SignerCertificate.RawData)
-          ).ToLowerInvariant()
-          if ($catalogSignerSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256) {
-            throw "VB-CABLE catalog signer does not match the pinned Vincent Burel certificate."
-          }
-          foreach ($catalogMember in @($driverInf, $driverSys)) {
-            & $signTool verify /kp /v /c $driverCatalog $catalogMember
-            if ($LASTEXITCODE -ne 0) {
-              throw "VB-CABLE catalog membership verification failed."
-            }
-          }
-
-          $devconSignature = Get-AuthenticodeSignature -FilePath $devcon
-          if ($devconSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
-            $devconSignature.SignerCertificate.Subject -notmatch 'Microsoft') {
-            throw "Pinned LABSN DevCon helper lacks a valid Microsoft Authenticode signature."
-          }
-
-          $publisherCertificate = Get-PfxCertificate -FilePath $certificate
-          $publisherStorePath = "Cert:\LocalMachine\TrustedPublisher\$($publisherCertificate.Thumbprint)"
-          $publisherWasPresent = Test-Path $publisherStorePath
-          $publisherNeedsCleanup = -not $publisherWasPresent
-          $trustedPublisherAdded = $false
-          $trustedPublisherCleanupExit = 'not_required'
-          $publisherStateRestored = $false
-          try {
-            if (-not $publisherWasPresent) {
-              & certutil.exe -addstore 'TrustedPublisher' $certificate
-              if ($LASTEXITCODE -ne 0) {
-                throw "VB-CABLE publisher certificate import failed."
+          $targetSha256 = $env:LABSN_VBCABLE_CERT_SHA256.ToLowerInvariant()
+          $publisherMatches = @(
+            Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+              Where-Object {
+                [System.Convert]::ToHexString(
+                  [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                ).ToLowerInvariant() -eq $targetSha256
               }
-              $trustedPublisherAdded = $true
-            }
-            & $devcon install $driverInf 'VBAudioVACWDM'
-            if ($LASTEXITCODE -ne 0) {
-              throw "VB-CABLE device installation failed or requires a reboot."
-            }
-          } finally {
-            if ($publisherNeedsCleanup) {
-              & certutil.exe -delstore 'TrustedPublisher' $publisherCertificate.Thumbprint
-              $trustedPublisherCleanupExit = $LASTEXITCODE
-            }
-            $publisherPresentAfterCleanup = Test-Path $publisherStorePath
-            $publisherStateRestored = $publisherPresentAfterCleanup -eq $publisherWasPresent
-            if (-not $publisherStateRestored) {
-              throw "VB-CABLE publisher certificate cleanup did not restore the original store state."
-            }
+          )
+          if ($publisherMatches.Count -gt 1) {
+            throw "Pinned LABSN publisher certificate has an ambiguous pre-action store state."
           }
 
+          $endpoints = @(
+            Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |
+              Where-Object FriendlyName -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
+          )
+          $cableEndpoints = @($endpoints)
           @(
-            'status=VERIFIED_INSTALL_COMPLETE'
-            "archive_sha256=$actualSha256"
-            'upstream_digest_published=false'
-            'archive_hash_provenance=project_pin_plus_preinstall_catalog_validation'
-            "catalog_signer_certificate_sha256=$catalogSignerSha256"
-            "labsn_certificate_sha256=$actualCertificateSha256"
-            "labsn_devcon_sha256=$actualDevconSha256"
-            'catalog_signature_verified=true'
-            'catalog_members_verified=vbMmeCable64_win7.inf,vbaudio_cable64_win7.sys'
-            "trusted_publisher_certificate_preexisting=$($publisherWasPresent.ToString().ToLowerInvariant())"
-            "trusted_publisher_certificate_added=$($trustedPublisherAdded.ToString().ToLowerInvariant())"
-            "trusted_publisher_cleanup_exit=$trustedPublisherCleanupExit"
-            "trusted_publisher_state_restored=$($publisherStateRestored.ToString().ToLowerInvariant())"
-            'devcon_exit=0'
-          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-driver-verification.txt" -Encoding utf8
+            'setup_action=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf'
+            'action_inputs=none'
+            'action_outputs=none'
+            "publisher_match_count=$($publisherMatches.Count)"
+            "preexisting_cable_endpoint_count=$($cableEndpoints.Count)"
+            'license_material=not_requested_or_logged'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-labsn-prestate.txt" -Encoding utf8
+          "publisher_match_count=$($publisherMatches.Count)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "preexisting_cable_endpoint_count=$($cableEndpoints.Count)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($cableEndpoints.Count -ne 0) {
+            throw "VB-CABLE endpoints predate LABSN; refusing a non-causal installation canary."
+          }
+
+      - name: Install Windows virtual audio baseline with pinned LABSN action
+        id: labsn_virtual_audio
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        continue-on-error: true
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
+
+      - name: Restore LABSN TrustedPublisher state
+        if: ${{ always() && matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        env:
+          LABSN_ACTION_OUTCOME: ${{ steps.labsn_virtual_audio.outcome }}
+          PUBLISHER_MATCH_COUNT_BEFORE: ${{ steps.labsn_prestate.outputs.publisher_match_count }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $targetSha256 = $env:LABSN_VBCABLE_CERT_SHA256.ToLowerInvariant()
+          $before = $env:PUBLISHER_MATCH_COUNT_BEFORE
+          $removalExits = @()
+          $cleanupError = $false
+          $cleanupStage = 'enumerate_before'
+          $cleanupErrorStage = 'none'
+          $matchesBeforeCleanup = @()
+          $matchesAfterCleanup = @()
+          try {
+            $matchesBeforeCleanup = @(
+              Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+                Where-Object {
+                  [System.Convert]::ToHexString(
+                    [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                  ).ToLowerInvariant() -eq $targetSha256
+                }
+            )
+            if ($before -eq '0') {
+              $cleanupStage = 'remove_target'
+              foreach ($certificate in $matchesBeforeCleanup) {
+                & certutil.exe -delstore 'TrustedPublisher' $certificate.Thumbprint | Out-Null
+                $removalExits += $LASTEXITCODE
+              }
+            }
+            $cleanupStage = 'enumerate_after'
+            $matchesAfterCleanup = @(
+              Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+                Where-Object {
+                  [System.Convert]::ToHexString(
+                    [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                  ).ToLowerInvariant() -eq $targetSha256
+                }
+            )
+          } catch {
+            $cleanupError = $true
+            $cleanupErrorStage = $cleanupStage
+          }
+          $removalsSucceeded = @($removalExits | Where-Object { $_ -ne 0 }).Count -eq 0
+          $publisherStateRestored =
+            (-not $cleanupError) -and
+            ($before -in @('0', '1')) -and
+            ($matchesAfterCleanup.Count.ToString() -eq $before) -and
+            $removalsSucceeded
+          $restored = $publisherStateRestored.ToString().ToLowerInvariant()
+          @(
+            "action_outcome=$env:LABSN_ACTION_OUTCOME"
+            "publisher_match_count_before=$before"
+            "publisher_match_count_before_cleanup=$($matchesBeforeCleanup.Count)"
+            "publisher_match_count_after_cleanup=$($matchesAfterCleanup.Count)"
+            "publisher_removal_exit_count=$($removalExits.Count)"
+            "publisher_removal_exits=$(@($removalExits) -join ',')"
+            "publisher_cleanup_error=$($cleanupError.ToString().ToLowerInvariant())"
+            "publisher_cleanup_error_stage=$cleanupErrorStage"
+            "publisher_state_restored=$restored"
+            'cleanup_scope=pinned_certificate_target_only'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-labsn-cleanup.txt" -Encoding utf8
+          if (-not $publisherStateRestored) {
+            throw "LABSN TrustedPublisher target state was not restored."
+          }
+          if ($env:LABSN_ACTION_OUTCOME -ne 'success') {
+            throw "Pinned LABSN action did not report success after certificate restoration."
+          }
 
       - name: Record bounded allowlisted Windows endpoint inventory
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         shell: pwsh
+        env:
+          LABSN_ACTION_OUTCOME: ${{ steps.labsn_virtual_audio.outcome }}
         run: |
           @(
-            "helper_source=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf"
-            "archive_url=$env:VBCABLE_ARCHIVE_URL"
-            "archive_sha256=$env:VBCABLE_ARCHIVE_SHA256"
-            "upstream_digest_published=false"
-            "archive_hash_provenance=project_pin_plus_preinstall_catalog_validation"
-            "archive_hash_verified_before_certificate_import=true"
-            "labsn_certificate_sha256=$env:LABSN_VBCABLE_CERT_SHA256"
-            "labsn_devcon_sha256=$env:LABSN_DEVCON_SHA256"
-            "runner_lifetime=ephemeral_job_only"
-            "persistent_runner=false"
-            "license_material=not_requested_or_logged"
-            "purpose=bounded_endpoint_enumeration_only"
-            "excluded_claims=capture,playback,default_device,roundtrip,rsac"
+            'setup_action=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf'
+            'action_inputs=none'
+            'action_outputs=none'
+            "action_outcome=$env:LABSN_ACTION_OUTCOME"
+            'action_archive_url_is_mutable=true'
+            'archive_integrity_verified_by_caller=false'
+            'catalog_signature_verified_by_caller=false'
+            'catalog_members_verified_by_caller=false'
+            'devcon_signature_verified_by_caller=false'
+            'action_success_alone_is_installation_proof=false'
+            'setup_proof_claimed=false'
+            'setup_proof_artifact=windows-installation-canary.txt'
+            'runner_lifetime=ephemeral_job_only'
+            'persistent_runner=false'
+            'license_material=not_requested_or_logged'
+            'purpose=bounded_endpoint_enumeration_only'
+            'excluded_claims=capture,playback,default_device,roundtrip,rsac'
           ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-supply-chain-boundary.txt" -Encoding utf8
+          if ($env:LABSN_ACTION_OUTCOME -ne 'success') {
+            throw "LABSN action outcome is not success."
+          }
+          Start-Service -Name Audiosrv -ErrorAction Stop
+          (Get-Service -Name Audiosrv).WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(20)
+          )
           $endpoints = @(
             Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |
               Sort-Object FriendlyName, InstanceId |
@@ -422,24 +411,66 @@ jobs:
                 @{Name = 'friendly_name'; Expression = { $_.FriendlyName }}, `
                 @{Name = 'instance_id'; Expression = { $_.InstanceId }}
           )
-          if ($endpoints.Count -eq 0) {
-            throw "No present AudioEndpoint records found after the enumeration baseline."
-          }
           $cableEndpoints = @(
             $endpoints | Where-Object friendly_name -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
           )
-          if ($cableEndpoints.Count -eq 0) {
-            throw "No expected VB-CABLE endpoint is present after verified installation."
-          }
+          $cableInput = @(
+            $endpoints | Where-Object {
+              $_.status -eq 'OK' -and $_.friendly_name -match '^CABLE Input'
+            }
+          )
+          $cableOutput = @(
+            $endpoints | Where-Object {
+              $_.status -eq 'OK' -and $_.friendly_name -match '^CABLE Output'
+            }
+          )
+          $vbCableDevices = @(
+            foreach ($device in @(Get-PnpDevice -PresentOnly -ErrorAction Stop)) {
+              $hardwareIds = @(
+                Get-PnpDeviceProperty `
+                  -InstanceId $device.InstanceId `
+                  -KeyName 'DEVPKEY_Device_HardwareIds' `
+                  -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty Data
+              ) -join ';'
+              if ($device.Status -eq 'OK' -and $hardwareIds -match 'VBAudioVACWDM') {
+                $device
+              }
+            }
+          )
+          $audioService = Get-Service -Name Audiosrv -ErrorAction Stop
           [ordered]@{
             schema = 'audio-graph-2df3-endpoint-inventory-v1'
             allowlisted_fields = @('status', 'class', 'friendly_name', 'instance_id')
             max_records = 64
             record_count = $endpoints.Count
             vb_cable_record_count = $cableEndpoints.Count
+            vb_cable_device_count = $vbCableDevices.Count
+            audiosrv_status = $audioService.Status.ToString()
             records = $endpoints
           } | ConvertTo-Json -Depth 5 |
             Set-Content -Path "$env:EVIDENCE_DIR/windows-endpoints.json" -Encoding utf8
+          if ($endpoints.Count -eq 0) {
+            throw "No present AudioEndpoint records found after the enumeration baseline."
+          }
+          if ($cableEndpoints.Count -lt 2 -or $cableInput.Count -eq 0 -or $cableOutput.Count -eq 0) {
+            throw "Both expected CABLE Input and CABLE Output endpoints must be present after LABSN."
+          }
+          if ($vbCableDevices.Count -eq 0) {
+            throw "No present and healthy VBAudioVACWDM device is available after LABSN."
+          }
+          if ($audioService.Status -ne 'Running') {
+            throw "Audiosrv must be running after the LABSN action."
+          }
+          @(
+            'status=PASS'
+            'proof=post_action_vb_cable_device_and_endpoint_presence'
+            "vb_cable_device_count=$($vbCableDevices.Count)"
+            "ready_cable_input_count=$($cableInput.Count)"
+            "ready_cable_output_count=$($cableOutput.Count)"
+            "audiosrv_status=$($audioService.Status)"
+            'evidence_class=device_and_endpoint_enumeration_only_no_pcm'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-installation-canary.txt" -Encoding utf8
 
       - name: Run canonical durability filter (Unix)
         if: matrix.os != 'windows'
