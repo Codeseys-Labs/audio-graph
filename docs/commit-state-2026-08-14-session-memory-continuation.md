@@ -941,3 +941,22 @@ No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
 remains applicable and product/workflow suites were not rerun. No extra Seed
 edit or closure, dispatch, workflow/settings mutation, push, secret,
 Blacksmith/Testbox, Docker, guest, or platform action occurred.
+
+### Wave 7B Wave5 license attestation reconciliation
+
+One linear Seed-only custody commit `3cf7383` was merged
+history-preservingly at `321491f`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+Seed d3d3 is closed from the product-owner chat attestation for paid VB-CABLE
+professional/server use on ephemeral GitHub-hosted Windows CI; no license
+material was requested, received, stored, uploaded, or logged. Seed 2df3
+remains `in_progress`, unblocked, and `CONFIRMED_READY_FOR_DISPATCH`. The d3d3
+edge is retired from c395, while parent 8e73 remains blocked only by 2df3.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/95 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
+remains applicable and product/workflow suites were not rerun. No external run,
+dispatch, extra Seed edit or closure, workflow/settings mutation, push, secret,
+Blacksmith/Testbox, Docker, guest, or platform action occurred.

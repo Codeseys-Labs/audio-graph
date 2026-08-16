@@ -1098,3 +1098,34 @@ workflow and product evidence at `dcee4ad` remains applicable and those suites
 were not rerun. No extra Seed edit or closure, workflow dispatch or mutation,
 settings change, push, secret, Blacksmith/Testbox, Docker, guest, or platform
 action occurred.
+
+## Wave5 license attestation reconciliation
+
+Custody `3cf7383d67e0399ee79b34ab67b3c398880fa70f` was merged
+history-preservingly without conflict at
+`321491ff9db945483d26694eba3296f6f2235a4f`. Its one linear commit after
+custody `5aaf406a6f441e2486f1347230d281adc75246ae` changes only
+`.seeds/issues.jsonl`; the integrated 648-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seed d3d3 is closed from the product-owner chat attestation that the paid
+VB-CABLE professional/server license covers the ephemeral GitHub-hosted
+Windows CI use through the pinned LABSN action. The record explicitly confirms
+that no license material was requested, received, stored, uploaded, or logged.
+Seed 2df3 remains `in_progress`, has no blocker, and records
+`CONFIRMED_READY_FOR_DISPATCH`; the open-only `ready-all` view does not list
+in-progress rows. The resolved d3d3 edge is absent from c395. Parent 8e73
+remains blocked only by 2df3.
+
+The complete open-ready queue contains 91 issues and the blocked queue contains
+95. Seeds output stress parsed ready 50, blocked 95, and list 50. All five
+contracts and pinned `verify:fast` passed, including Biome over 174 files,
+typecheck, Seeds output, docs/Seeds secret hygiene, and diff hygiene. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Betterleaks, exact queue identity, and range hygiene passed.
+
+No product, Cargo, frontend, or workflow file changed, so the assembled
+evidence at `dcee4ad` remains applicable and those suites were not rerun. No
+external run or workflow dispatch occurred, and no extra Seed edit or closure,
+workflow/settings mutation, push, secret, Blacksmith/Testbox, Docker, guest,
+or platform action occurred.
