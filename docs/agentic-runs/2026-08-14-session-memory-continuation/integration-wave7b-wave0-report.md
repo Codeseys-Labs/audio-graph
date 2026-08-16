@@ -1385,3 +1385,54 @@ No product or workflow file changed, so assembled evidence at `fd6d360`
 remains applicable and no product/workflow suite was rerun. This reconciliation
 did not push, mutate PR 99, dispatch, edit a workflow/product file, perform an
 extra Seed closure, run a platform job, or touch the main worktree.
+
+## Wave5 terminal native durability reconciliation
+
+The final reviewed 4b07 stack was merged history-preservingly at
+`7d8a8e6f81532d884293400820cd1761a7feee4d`. Its exact evidence parent is
+`5f34a8656db4f1da59e9ba367b401bb81045d653`, the immutable remote evidence
+head used by workflow run `31967064623`; its report parent is
+`b3628049266b59a59ae5024226d8f157965fb725`. The workflow continues to use
+GitHub-hosted `windows-2025` for the direct commit-pinned LABSN action, while
+Linux and macOS remain on Blacksmith runners.
+
+Run `31967064623` completed successfully on all three platforms. Windows job
+`95213738611` proved a writable NTFS fixture, a zero-certificate/zero-endpoint
+prestate, direct LABSN action success, exact targeted TrustedPublisher state
+restoration from `0 -> 1 -> 0`, one healthy `VBAudioVACWDM` device, running
+`Audiosrv`, and the Pack43 endpoint pair `Speakers (VB-Audio Virtual Cable)`
+plus `CABLE Output (VB-Audio Virtual Cable)`. It then passed `12/12`
+durability and `9/9` subprocess crash tests with native and tee exits zero.
+Linux job `95213738702` passed ext4 `42/42` plus `11/11`; macOS job
+`95213738599` passed APFS `13/13` plus `11/11`. All three uploaded complete,
+nonempty evidence artifacts. No license material was requested, received,
+stored, or logged, and the post-run Testbox inventory was empty.
+
+The evidence remains intentionally narrow. The Windows canary proves device,
+endpoint, service, and durability-test availability; it does not prove PCM
+capture, playback, default routing, round trip, or rsac behavior. The crash
+harness proves process-crash recovery and completed filesystem barriers, not
+power-loss durability. The pinned LABSN source does not turn the action's
+mutable Pack43 download into caller-verified archive provenance.
+
+Seed-only reconciliation then recorded the exact-alias rerun, closed 4b07,
+2df3, and parent 8e73, and activated P0 7e81 as the next Wayfinder milestone.
+The final `sd close` pass added real `closedAt` and `closeReason` fields and
+removed resolved blocker edges without editing unrelated queue state. The
+assembled pre-documentation tip is
+`86e5838ffb8b24ad613324610528e7447e1c3590`.
+
+Final bounded gates passed: the direct LABSN contract rejected all `18`
+mutations; actionlint passed with the repository configuration; pinned
+`verify:fast` passed Biome over 174 files, typecheck, all five generated
+contracts, Seeds output stress, docs/Seeds secret hygiene, and diff hygiene.
+The final queue has 92 open-ready and 92 blocked issues. Seeds Doctor reports
+10 passed, 2 carried warning groups, and 0 failures. Betterleaks scanned
+2.70 MB across the final workflow, script, queue, report, and commit-state
+surface with no leaks.
+
+No broad integration or default branch was pushed. The remote evidence ref
+remains fixed at the exact successful run head `5f34a865`; later changes are
+Seed and documentation custody only. Product and frontend suites were not
+rerun after the terminal platform evidence because the accepted workflow and
+product blobs did not change.

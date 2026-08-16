@@ -1171,3 +1171,37 @@ actionlint/YAML checks, Betterleaks, docs/Seeds secret hygiene, exact footprint,
 and diff checks passed for the integrated custody slice. Main and integration
 are clean. The corrected evidence ref was pushed only to run the manual
 workflow; the broad integration branch was not pushed.
+
+### Wave 7B Wave5 terminal LABSN native durability evidence
+
+The reviewed 4b07 corrections converged on the user-selected platform split:
+GitHub-hosted `windows-2025` invokes the exact commit-pinned LABSN action,
+while Linux and macOS use Blacksmith. Attempts 1 through 3 failed closed on,
+respectively, empty Windows endpoint prestate handling, missing PnP property
+data, and the Pack43 render alias. Each correction was isolated, mutation
+tested, reviewed, merged, published only to the evidence ref, and rerun.
+
+Attempt 4, run `31967064623` at exact evidence head `5f34a865`, passed all
+three jobs. Windows passed the NTFS probe, direct LABSN install, exact
+certificate restoration, healthy virtual device and endpoint canary, then
+`12/12` durability and `9/9` crash tests. Linux passed ext4 `42/42` and
+`11/11`; macOS passed APFS `13/13` and `11/11`. Evidence artifacts were
+complete, no license material was handled, and no Testboxes remained active.
+
+The 4b07 report was merged at `7d8a8e6`. Seed custody recorded the exact
+successful run, closed 4b07, 2df3, and 8e73, added their closure timestamps and
+reason, and removed resolved dependency edges. P0 7e81 is now the active,
+unblocked Wayfinder milestone on integration tip `86e5838`; later order
+remains 7e81 -> 0baf -> 4c82 -> 6b9d -> e969 -> ddb3 -> 48de.
+
+Final bounded gates passed: the LABSN workflow contract rejected 18/18
+mutations, actionlint passed, pinned `verify:fast` passed, the queue reports
+92 open-ready and 92 blocked issues, Doctor reports 10 passed checks, 2
+carried warning groups, and 0 failures, and Betterleaks found no leaks in
+2.70 MB of final custody inputs.
+
+The evidence boundary remains device/enumeration plus native durability and
+process-crash recovery. It is not a PCM capture/playback/default-routing/
+round-trip/rsac claim and is not power-loss evidence. The broad integration
+branch was not pushed; the remote evidence ref remains the immutable successful
+run head.
