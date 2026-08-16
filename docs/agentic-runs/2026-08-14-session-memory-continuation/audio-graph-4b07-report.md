@@ -108,7 +108,7 @@ After implementation:
 
 ```text
 $ bun scripts/check-2df3-labsn-action.mjs
-PASS: direct LABSN action contract and 15 mutations
+PASS: direct LABSN action contract and 16 mutations
 ```
 
 The check rejects all of these in-memory mutations:
@@ -122,6 +122,7 @@ The check rejects all of these in-memory mutations:
 - making an empty Windows endpoint class a fatal prestate query;
 - accepting only one VB-CABLE endpoint;
 - omitting the `VBAudioVACWDM` hardware identity;
+- making an absent PnP hardware-ID property fatal;
 - omitting the `Audiosrv` readiness requirement;
 - admitting a failed LABSN action outcome;
 - overclaiming caller archive verification;
@@ -149,7 +150,7 @@ git diff --check
 Observed results:
 
 ```text
-direct LABSN contract: PASS, 15/15 mutations rejected
+direct LABSN contract: PASS, 16/16 mutations rejected
 actionlint: PASS
 yq parse: PASS
 Ruby YAML parse: PASS
@@ -208,6 +209,27 @@ result by class, so an empty endpoint class becomes `Count = 0` while genuine
 enumeration failures still fail closed. The direct-action check now rejects
 15/15 mutations. This correction does not weaken the zero-preexisting-endpoint
 gate or alter LABSN, cleanup, canary, test, runner, or Unix behavior.
+
+## Second native rerun correction
+
+Run `31966148208` proved the empty-endpoint prestate correction and the direct
+LABSN path on GitHub-hosted `windows-2025`: prestate recorded zero endpoints and
+zero target certificates; the pinned action reported success; it added one
+target certificate; caller cleanup removed it with native exit `0`; and the
+target count returned to zero. Linux Blacksmith ext4 and macOS Blacksmith APFS
+again passed.
+
+The Windows presence canary then failed while scanning unrelated present PnP
+devices. `Get-PnpDeviceProperty` can return an object without a `Data` property,
+and `Select-Object -ExpandProperty Data` made that normal absence fatal before
+the VB-CABLE device could be selected. Windows tests therefore remained not run.
+
+A new RED requires absent hardware-ID properties to be safe empty observations.
+The corrected canary inspects the returned object's property names before
+reading `Data`; the exact `VBAudioVACWDM` match remains mandatory for PASS. The
+direct-action check now rejects 16/16 mutations. This does not weaken action
+outcome, device status, endpoint, service, certificate-restoration, or native
+test gates.
 
 ## Native acceptance still required
 

@@ -123,6 +123,13 @@ function validate(source) {
         "endpoint canary must prove the expected device, both endpoints, and audio service",
     );
     invariant(
+        canary.includes("$property = Get-PnpDeviceProperty") &&
+            canary.includes("$property.PSObject.Properties.Name -contains 'Data'") &&
+            canary.includes("$hardwareIds = @($property.Data) -join ';'") &&
+            !canary.includes("Select-Object -ExpandProperty Data"),
+        "missing PnP hardware-ID properties must be a safe empty observation",
+    );
+    invariant(
         canary.includes("archive_integrity_verified_by_caller=false") &&
             canary.includes("catalog_signature_verified_by_caller=false") &&
             canary.includes("catalog_members_verified_by_caller=false") &&
@@ -230,6 +237,13 @@ const mutations = [
     [
         "hardware identity omitted",
         (source) => source.replace("$hardwareIds -match 'VBAudioVACWDM'", "$true"),
+    ],
+    [
+        "missing hardware-ID property made fatal",
+        (source) => source.replace(
+            "$property.PSObject.Properties.Name -contains 'Data'",
+            "$true",
+        ),
     ],
     [
         "audio service not required",
