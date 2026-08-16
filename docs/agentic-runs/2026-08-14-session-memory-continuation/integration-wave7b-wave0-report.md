@@ -1165,3 +1165,41 @@ evidence at `dcee4ad` remains applicable and those suites were not rerun. No
 branch was published, draft PR opened, workflow dispatched, or master merged;
 no extra Seed edit or closure, workflow/settings mutation, push, secret,
 Blacksmith/Testbox, Docker, guest, or platform action occurred.
+
+## Wave5 publication-state reconciliation
+
+Custody `3aac0f07bc3eef553eb27a543e818f9a71ce5127` was merged
+history-preservingly without conflict at
+`7556b6e0a7cb9c41fdf6035b37290c2d9168d1db`. Its one linear commit after
+custody `5798a1cfee5439927ffb9f1bfc02eba8c3db5778` changes only
+`.seeds/issues.jsonl`; the integrated 648-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Custody records the published evidence branch
+`evidence/audio-graph-2df3-native-durability-wave7b` at exact SHA
+`b46ed422e5879d9f400ebe236af68ed68372f93e`, with remote workflow blob
+`1674d11274b1d48fddebfefc1409484cdd365ca1`. Registration branch
+`agent/register-2df3-native-durability` contains exact commit
+`c17f12a71f5c6b5bcd6f86b607c1b6e19cd352dd`; draft PR 99 changes only
+`.github/workflows/2df3-native-durability.yml`. PR checks remain under
+monitoring, the default-branch workflow registry still returns 404, dispatch
+is false, and the recorded active Testbox count is zero. The next boundary is
+to wait for checks and the product-owner/default-branch merge, then verify
+registry activation before any dispatch.
+
+Seed 52b9 remains `in_progress` with
+`DRAFT_PR_OPEN_REGISTRATION_PENDING`. Seed 2df3 remains `in_progress` and
+blocked only by 52b9; parent 8e73 remains blocked only by 2df3. The complete
+open-ready queue contains 91 issues and the blocked queue contains 96. Seeds
+output stress parsed ready 50, blocked 96, and list 50. All five contracts and
+pinned `verify:fast` passed, including Biome over 174 files, typecheck, Seeds
+output, docs/Seeds secret hygiene, and diff hygiene. Seeds Doctor reported 10
+passed, 2 custody-carried warning groups, and 0 failures. Betterleaks, exact
+queue identity, and range hygiene passed.
+
+No product, Cargo, frontend, or workflow file changed, so the assembled
+evidence at `dcee4ad` remains applicable and those suites were not rerun. This
+reconciliation did not push, modify PR 99, dispatch, merge `master`, close a
+Seed, edit a workflow/product/settings file, or start a platform job; no extra
+Seed edit, secret, Blacksmith/Testbox, Docker, guest, or platform action
+occurred.

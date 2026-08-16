@@ -982,3 +982,24 @@ remains applicable and product/workflow suites were not rerun. No branch
 publication, draft PR, dispatch, master merge, extra Seed edit or closure,
 workflow/settings mutation, push, secret, Blacksmith/Testbox, Docker, guest,
 or platform action occurred.
+
+### Wave 7B Wave5 publication-state reconciliation
+
+One linear Seed-only custody commit `3aac0f0` was merged
+history-preservingly at `7556b6e`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+Custody records evidence branch `evidence/audio-graph-2df3-native-durability-wave7b`
+at `b46ed42`, exact remote workflow blob `1674d112`, and registration branch
+`agent/register-2df3-native-durability` at `c17f12a`. Draft PR 99 has the exact
+one-workflow footprint. Checks remain under monitoring, the registry still
+returns 404, dispatch is false, and active Testboxes are zero. Seed 52b9
+remains `in_progress`; 2df3 is blocked only by 52b9, and 8e73 only by 2df3.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/96 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
+remains applicable and product/workflow suites were not rerun. No push, PR
+mutation, dispatch, master merge, Seed closure, workflow/product/settings
+edit, platform job, secret, Blacksmith/Testbox, Docker, guest, or platform
+action occurred.
