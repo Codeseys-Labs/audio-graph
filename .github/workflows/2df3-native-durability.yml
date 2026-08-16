@@ -271,7 +271,8 @@ jobs:
           }
 
           $endpoints = @(
-            Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |
+            Get-PnpDevice -PresentOnly -ErrorAction Stop |
+              Where-Object Class -eq 'AudioEndpoint' |
               Where-Object FriendlyName -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
           )
           $cableEndpoints = @($endpoints)

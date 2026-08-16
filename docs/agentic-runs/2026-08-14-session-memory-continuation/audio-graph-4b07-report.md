@@ -108,7 +108,7 @@ After implementation:
 
 ```text
 $ bun scripts/check-2df3-labsn-action.mjs
-PASS: direct LABSN action contract and 14 mutations
+PASS: direct LABSN action contract and 15 mutations
 ```
 
 The check rejects all of these in-memory mutations:
@@ -119,6 +119,7 @@ The check rejects all of these in-memory mutations:
 - omitting targeted certificate removal;
 - making the targeted certificate-removal branch unreachable;
 - admitting a pre-existing endpoint;
+- making an empty Windows endpoint class a fatal prestate query;
 - accepting only one VB-CABLE endpoint;
 - omitting the `VBAudioVACWDM` hardware identity;
 - omitting the `Audiosrv` readiness requirement;
@@ -148,7 +149,7 @@ git diff --check
 Observed results:
 
 ```text
-direct LABSN contract: PASS, 14/14 mutations rejected
+direct LABSN contract: PASS, 15/15 mutations rejected
 actionlint: PASS
 yq parse: PASS
 Ruby YAML parse: PASS
@@ -191,6 +192,22 @@ Both final-cap re-reviews returned `SHIP` with no P0, P1, or P2 findings. Final
 local gates remained green at the reviewed snapshot: 14/14 mutations,
 `verify:fast`, actionlint, yq, Ruby YAML parsing, Betterleaks, docs/Seeds secret
 hygiene, and `git diff --check`.
+
+## First native rerun correction
+
+Run `31965666406` exercised the reviewed snapshot. Linux Blacksmith ext4 and
+macOS Blacksmith APFS passed, but Windows failed in prestate before LABSN ran.
+On an audio-empty `windows-2025` runner, `Get-PnpDevice -Class AudioEndpoint
+-PresentOnly -ErrorAction Stop` raises `No matching Win32_PnPEntity objects`
+instead of returning an empty collection. LABSN was skipped; Windows durability
+and crash tests were not run.
+
+A new RED required empty AudioEndpoint prestate to be a valid zero-result
+observation. The corrected query enumerates present PnP devices and filters the
+result by class, so an empty endpoint class becomes `Count = 0` while genuine
+enumeration failures still fail closed. The direct-action check now rejects
+15/15 mutations. This correction does not weaken the zero-preexisting-endpoint
+gate or alter LABSN, cleanup, canary, test, runner, or Unix behavior.
 
 ## Native acceptance still required
 

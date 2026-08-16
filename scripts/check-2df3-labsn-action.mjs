@@ -60,6 +60,12 @@ function validate(source) {
         "prestate must refuse a pre-existing VB-CABLE endpoint",
     );
     invariant(
+        prestate.includes("Get-PnpDevice -PresentOnly -ErrorAction Stop") &&
+            prestate.includes("Where-Object Class -eq 'AudioEndpoint'") &&
+            !prestate.includes("Get-PnpDevice -Class AudioEndpoint"),
+        "empty AudioEndpoint prestate must be a valid zero-result observation",
+    );
+    invariant(
         prestate.includes("windows-labsn-prestate.txt"),
         "prestate evidence file is required",
     );
@@ -213,6 +219,13 @@ const mutations = [
         (source) => source.replace("if ($before -eq '0')", "if ($false)"),
     ],
     ["pre-existing endpoint admitted", (source) => source.replace("if ($cableEndpoints.Count -ne 0)", "if ($false)")],
+    [
+        "empty endpoint class made fatal",
+        (source) => source.replace(
+            "Get-PnpDevice -PresentOnly -ErrorAction Stop |\n              Where-Object Class -eq 'AudioEndpoint' |",
+            "Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |",
+        ),
+    ],
     ["one endpoint admitted", (source) => source.replace("$cableEndpoints.Count -lt 2", "$cableEndpoints.Count -lt 1")],
     [
         "hardware identity omitted",
