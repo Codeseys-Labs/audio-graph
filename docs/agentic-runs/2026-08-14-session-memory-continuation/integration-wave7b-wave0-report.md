@@ -973,3 +973,36 @@ manifest, or workflow changed. Seed c65d remains `in_progress` and was not
 closed; its reviewed acceptance plus this fan-in make it eligible for root
 closure. No extra Seed edit, `sd sync`, push, workflow change or dispatch,
 52b9/2df3 start, Testbox, Docker, guest, or platform action occurred.
+
+## Wave5 storage-probe audit closure reconciliation
+
+Corrected custody tip `2a3cb5b44dcc33c5f57793de9d0ee65b5c99a7d1`
+was merged history-preservingly without conflict at
+`9360367c525d82f1694e987b62910a33fa6a5d20`. Its two linear commits after
+custody `6e148e8` change only `.seeds/issues.jsonl`: `e45724a` closes c65d,
+and `2a3cb5b` removes its resolved c395 edge while retaining 25ec as the
+remaining storage-probe blocker. The integrated 648-row queue is
+byte-identical to custody and remains valid JSONL.
+
+Seed c65d is closed with exact `INTEGRATED_REVIEWED_SHIP` evidence for
+integration tip `dc9eb78` and is absent from ready and blocked queues. Seed
+c395 remains open; its current open blockers are 8eeb, b521, fd9f, d3d3, and
+25ec, and its outgoing `blocks` relation still names 4673. The c65d edge is
+absent. Seed 25ec remains open, ready, and unblocked. Seed 52b9 remains
+`in_progress`, assigned to `product-owner`, and `AWAITING_HUMAN_DECISION`;
+2df3 remains blocked only by 52b9. None of those Seeds was started or edited.
+
+The queue contains 92 ready and 96 blocked issues. Seeds output stress parsed
+ready 50, blocked 96, and list 50. All five contracts and pinned
+`verify:fast` passed, including Biome over 174 files, typecheck, Seeds output,
+docs/Seeds secret hygiene, and diff hygiene. Seeds Doctor reported 10 passed,
+2 warning groups, and 0 failures; custody now includes c65d among the four
+closed records missing `closedAt`, and no repair was authorized or applied.
+Betterleaks and exact final range hygiene passed after the report/checkpoint
+update.
+
+No product or storage-probe files changed, so the assembled evidence at
+`dc9eb78` remains applicable and product/storage suites were not rerun. No
+extra Seed edit or closure, `sd sync`, push, workflow change or dispatch,
+25ec/52b9/2df3 start, Testbox, Docker, guest, platform action, or main
+worktree change occurred.

@@ -873,3 +873,27 @@ were not required or rerun. Seed c65d remains `in_progress` and is eligible
 for root closure after this reviewed fan-in. No extra Seed edit or closure,
 `sd sync`, push, workflow or platform action, 52b9/2df3 start, Testbox, Docker,
 or guest run occurred.
+
+### Wave 7B Wave5 storage-probe audit closure reconciliation
+
+Corrected two-commit Seed-only custody tip `2a3cb5b` was merged
+history-preservingly at `9360367`. The 648-row queue is byte-identical to
+custody and valid JSONL. Commit `e45724a` closes c65d, while `2a3cb5b` retires
+its c395 edge and retains 25ec as the independent storage-probe blocker.
+
+Seed c65d is closed with `INTEGRATED_REVIEWED_SHIP` evidence and absent from
+ready/blocked views. Seed c395 remains open with blockers 8eeb, b521, fd9f,
+d3d3, and 25ec; its outgoing `blocks` relation still names 4673. Seed 25ec is
+open, ready, and unblocked. Seed 52b9 remains product-owner approval-gated,
+and 2df3 remains blocked only by 52b9.
+
+The queue has 92 ready and 96 blocked issues. Output stress, all five
+contracts, pinned `verify:fast`, Betterleaks, docs/Seeds secret, and exact
+range gates passed. Doctor reports 10 passed, 2 warning groups, and 0
+failures; custody carries c65d among four closed records missing `closedAt`,
+which was not repaired in this reconciliation.
+
+No product or storage-probe files changed, so the assembled `dc9eb78`
+evidence remains applicable and those suites were not rerun. No extra Seed
+edit or closure, `sd sync`, push, workflow action, 25ec/52b9/2df3 start,
+Testbox, Docker, guest, platform action, or main-worktree change occurred.
