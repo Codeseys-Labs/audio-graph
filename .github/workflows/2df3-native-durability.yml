@@ -250,7 +250,16 @@ jobs:
             "fixture_parent=$probe"
             "fixture_volume=$volume"
           ) | Set-Content -Path "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8
-          fsutil fsinfo volumeinfo $volume |
+          if ([string]::IsNullOrWhiteSpace($volume) -or
+            -not [System.IO.Path]::IsPathFullyQualified($probe) -or
+            $volume -notmatch '^[A-Za-z]:\\$') {
+            throw "Windows filesystem probe did not resolve to an absolute drive root."
+          }
+          $volumeToken = $volume.TrimEnd('\')
+          if ($volumeToken -notmatch '^[A-Za-z]:$') {
+            throw "Windows filesystem probe did not resolve to an fsutil volume token."
+          }
+          fsutil fsinfo volumeinfo $volumeToken |
             Out-File -FilePath "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8 -Append
           Remove-Item -Path $probe -Force
 
