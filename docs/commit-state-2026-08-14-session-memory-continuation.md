@@ -1101,3 +1101,73 @@ No product or workflow file changed, so `fd6d360` evidence remains applicable
 without rerunning those suites. No push, PR mutation, dispatch, workflow or
 product edit, extra Seed closure, platform job, license-material handling, or
 main-worktree change occurred.
+
+### Wave 7B Wave5 native dispatch, custody cleanup, and Wayfinder continuation
+
+Manual native evidence run `31930286136` used the licensed Windows path and
+completed Linux/ext4 (`42/42` durability, `11/11` crash) and macOS/APFS
+(`13/13`, `11/11`) successfully. Windows refused before tests because the
+filesystem probe passed the rooted `C:\` value directly to `fsutil`, which
+returned Error 3. Seed ccf0 corrected only that probe, was integrated at
+`8c1402e`, and was remotely validated by rerun `31931161010`: the live fixture
+was recorded as writable NTFS and the normalized `C:` token passed `fsutil`.
+Seed ccf0 is closed with reviewed integration evidence.
+
+Run `31931161010` then failed closed at the next independent Windows trust
+boundary. The exact LABSN `devcon.exe` digest matched, and the project-pinned
+VB-CABLE archive, catalog signature, signer, INF, and SYS membership checks
+passed, but the helper did not satisfy the required Microsoft Authenticode
+predicate. No certificate import, helper execution, device installation,
+endpoint canary, TrustedPublisher mutation, or Windows durability test ran.
+Direct PE inspection of the exact helper shows a zero-sized certificate table,
+so the trust check must not be weakened. Seed 4b07 owns a no-mutation
+Windows-2025 inventory canary for an official Microsoft-signed WDK/Visual
+Studio DevCon (or another primary-source-supported root-device installer).
+Seed 2df3 is blocked only by 4b07; no further Windows dispatch is allowed until
+that successor is reviewed.
+
+Repository custody is now bounded and reversible. The dirty main checkout was
+made clean: five unique backlog-zero planning artifacts were preserved in
+`a9fd37c`, while duplicate global skills, the generated preview harness, and
+four invalid/superseded scripts were quarantined behind archive SHA-256
+`de80301a...d3f75`. Draft PR 21 was audited as obsolete, closed without merge,
+and its remote branch removed after a clean external-reference probe; recovery
+bundle SHA-256 is `72d63c86...13525`. Its still-valid release and CI intent is
+routed to fd9f, b521, 8eeb, c395, and new fail-closed release child 2610.
+
+Six duplicate external Claude worktrees were clean, fully integrated or
+superseded, and double-registered across the `/mnt` and `/home` Git databases.
+They were removed through the owning registry first, then pruned from the
+authority registry; both ref sets were deleted after six verified bundles.
+Credential custody removed 23 carried inactive refs after bundle SHA-256
+`19cfcdbf...b00b3b0`. A separate audit removed 37 additional historical refs
+after per-ref verified bundles whose SHA256SUMS digest is
+`8b0e472c...910bcfd`. `git worktree prune --dry-run` is empty.
+
+The repository is reduced from 75 registered worktrees, 146 local branches,
+and 50 remote-tracking refs to 9 worktrees, 12 local branches, and 11
+remote-tracking refs. Retained custody is intentional: main; this integration;
+the 79e7 build-throughput worktree; six credential worktrees; the 661f
+prototype ref; the 8e73 research ref; and unattached ad42. The credential-v2
+carrier `927dbc2` remains `+39/-0` against current integration and holds core
+blobs absent elsewhere. Seed ddc4 owns its review together with the unique 34c9
+runtime and ad42 file-replace corrections; none may be deleted or merged
+monolithically.
+
+The next Wayfinder order is:
+
+1. advance P0 4b07 with a read-only Windows-2025 WDK DevCon inventory and
+   signature canary, then implement the smallest reviewed installer change;
+2. rerun exact 2df3 evidence and, only on Linux/ext4, macOS/APFS, and
+   Windows/NTFS acceptance, reconcile 2df3 and parent 8e73;
+3. review and semantically fan in the credential-v2 carrier under ddc4,
+   preserving the unique 34c9 and ad42 changes as explicit workstreams;
+4. advance deadline-bound b521 plus release children 2610/fd9f and PPA child
+   8eeb without mixing them into the native-durability workflow.
+
+The current queue has 653 valid rows, 93 open-ready issues, 96 blocked issues,
+and Doctor reports zero failures. Pinned `verify:fast`, all five contracts,
+actionlint/YAML checks, Betterleaks, docs/Seeds secret hygiene, exact footprint,
+and diff checks passed for the integrated custody slice. Main and integration
+are clean. The corrected evidence ref was pushed only to run the manual
+workflow; the broad integration branch was not pushed.
