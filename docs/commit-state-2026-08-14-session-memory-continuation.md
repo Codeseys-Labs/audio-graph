@@ -922,3 +922,22 @@ fan-in. Seed 2df3 remains blocked only by 52b9; later native dispatch and
 terminal evidence remain license-attestation gated. No Seed closure, workflow
 dispatch, push, settings/secret change, product suite, Blacksmith/Testbox,
 Docker, guest, or platform action occurred.
+
+### Wave 7B Wave5 native workflow closure reconciliation
+
+One linear Seed-only custody commit `5aaf406` was merged
+history-preservingly at `3d87651`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+Seed 52b9 is closed with `INTEGRATED_REVIEWED_SHIP` evidence and absent from
+ready/blocked views. Seed 2df3 remains `in_progress`, blocked only by open
+d3d3; d3d3 blocks c395 plus 2df3 and preserves the no-license-material
+professional/server attestation before any Windows LABSN dispatch. Parent 8e73
+remains blocked by 2df3.
+
+All five contracts, pinned `verify:fast`, Seeds 92 ready/96 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
+remains applicable and product/workflow suites were not rerun. No extra Seed
+edit or closure, dispatch, workflow/settings mutation, push, secret,
+Blacksmith/Testbox, Docker, guest, or platform action occurred.
