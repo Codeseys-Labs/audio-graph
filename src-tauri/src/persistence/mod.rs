@@ -38,6 +38,7 @@ pub(crate) mod canonical_reader;
 pub mod data_movement;
 pub mod io;
 pub mod session_artifact_manifest;
+pub mod session_semantics;
 #[cfg(feature = "surrealdb-embedded")]
 pub mod surreal;
 pub use data_movement::{DataMovementLedgerBuilder, hash_artifact_path};

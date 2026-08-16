@@ -26,6 +26,7 @@ use super::canonical_durability::{
     CanonicalExclusiveGuard, CanonicalFilesystemQualification, CanonicalRecoveryKey,
     CanonicalSnapshotExpectation,
 };
+use super::session_semantics::SessionSemanticsVersion;
 
 pub const SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -226,6 +227,8 @@ pub struct QuarantineTransaction {
 pub struct SessionArtifactManifestV1 {
     pub schema_version: u32,
     pub session_id: String,
+    #[serde(default = "SessionSemanticsVersion::historical_default")]
+    pub session_semantics_version: SessionSemanticsVersion,
     pub generation: u64,
     pub transition: ManifestTransition,
     pub artifacts: Vec<SessionArtifactEntry>,
@@ -244,6 +247,7 @@ impl SessionArtifactManifestV1 {
         let mut candidate = Self {
             schema_version: SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION,
             session_id: session_id.into(),
+            session_semantics_version: SessionSemanticsVersion::V1,
             generation: 0,
             transition,
             artifacts,
@@ -270,9 +274,21 @@ pub struct ManifestInternalIdentities {
     pub coordination: ManagedArtifactIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2SessionProvenanceError {
+    Missing,
+    Duplicate,
+    PrivacyMismatch,
+    Unavailable,
+    Residual,
+    TransitionNotCompleted,
+    TransitionFingerprintMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
     UnsupportedSchema { actual: u32 },
+    UnsupportedSessionSemanticsVersion { actual: u32 },
     InvalidGeneration { actual: u64 },
     EmptySessionId,
     InvalidSessionId,
@@ -286,6 +302,7 @@ pub enum ManifestValidationError {
     CaseEquivalentManagedIdentity,
     MissingOriginalSessionAudio,
     DuplicateOriginalSessionAudio,
+    InvalidV2SessionProvenance(V2SessionProvenanceError),
     OriginalAudioPrivacyMismatch,
     QuarantinePrivacyMismatch,
     TransitionMismatch,
@@ -328,9 +345,16 @@ pub enum ManifestLoadOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestCasRejection {
     Validation(ManifestValidationError),
-    GenerationConflict { expected: u64, actual: u64 },
+    GenerationConflict {
+        expected: u64,
+        actual: u64,
+    },
     GenerationOverflow,
     SessionMismatch,
+    SessionSemanticsFloorRegression {
+        current: SessionSemanticsVersion,
+        candidate: SessionSemanticsVersion,
+    },
     IdempotencyConflict,
     CompletionRequiresPrepared,
     PreparedCompletionConflict,
@@ -338,7 +362,9 @@ pub enum ManifestCasRejection {
     PreparedTransitionReplacement,
     TransitionConflict,
     Serialization,
-    ManifestTooLarge { byte_length: u64 },
+    ManifestTooLarge {
+        byte_length: u64,
+    },
     Durability(CanonicalDurabilityRejection),
 }
 
@@ -561,6 +587,14 @@ impl ManifestWriteTransaction<'_> {
         if let Some(head) = &self.head {
             if head.session_id != candidate.session_id {
                 return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
+            }
+            if candidate.session_semantics_version < head.session_semantics_version {
+                return ManifestCasOutcome::Rejected(
+                    ManifestCasRejection::SessionSemanticsFloorRegression {
+                        current: head.session_semantics_version,
+                        candidate: candidate.session_semantics_version,
+                    },
+                );
             }
             match head.transition.state {
                 ManifestTransitionState::Prepared => {
@@ -928,6 +962,13 @@ fn validate_and_normalize(
             actual: manifest.schema_version,
         });
     }
+    if !manifest.session_semantics_version.is_supported() {
+        return Err(
+            ManifestValidationError::UnsupportedSessionSemanticsVersion {
+                actual: manifest.session_semantics_version.as_u32(),
+            },
+        );
+    }
     if matches!(context, ManifestValidationContext::Persisted) && manifest.generation == 0 {
         return Err(ManifestValidationError::InvalidGeneration {
             actual: manifest.generation,
@@ -938,6 +979,10 @@ fn validate_and_normalize(
     validate_sha256(&manifest.transition.fingerprint)?;
     if manifest.artifacts.is_empty() {
         return Err(ManifestValidationError::EmptyArtifactInventory);
+    }
+    if manifest.session_semantics_version == SessionSemanticsVersion::V2 {
+        validate_v2_session_provenance(manifest)
+            .map_err(ManifestValidationError::InvalidV2SessionProvenance)?;
     }
     if manifest.transition.state == ManifestTransitionState::Prepared
         && manifest.quarantine_transaction.is_none()
@@ -973,7 +1018,6 @@ fn validate_and_normalize(
         1 => {}
         _ => return Err(ManifestValidationError::DuplicateOriginalSessionAudio),
     }
-
     if let Some(transaction) = &manifest.quarantine_transaction {
         validate_quarantine_transaction(manifest, transaction)?;
     }
@@ -982,6 +1026,40 @@ fn validate_and_normalize(
             .cmp(&right.managed_identity)
             .then_with(|| left.kind.cmp(&right.kind))
     });
+    Ok(())
+}
+
+pub(crate) fn validate_v2_session_provenance(
+    manifest: &SessionArtifactManifestV1,
+) -> Result<(), V2SessionProvenanceError> {
+    let mut proofs = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents);
+    let Some(proof) = proofs.next() else {
+        return Err(V2SessionProvenanceError::Missing);
+    };
+    if proofs.next().is_some() {
+        return Err(V2SessionProvenanceError::Duplicate);
+    }
+    if proof.privacy_class != ArtifactPrivacyClass::CanonicalSessionMemory {
+        return Err(V2SessionProvenanceError::PrivacyMismatch);
+    }
+    let content = match &proof.availability {
+        ArtifactAvailability::Present { content } => content,
+        ArtifactAvailability::Unavailable { .. } => {
+            return Err(V2SessionProvenanceError::Unavailable);
+        }
+        ArtifactAvailability::Residual { .. } => {
+            return Err(V2SessionProvenanceError::Residual);
+        }
+    };
+    if manifest.transition.state != ManifestTransitionState::Completed {
+        return Err(V2SessionProvenanceError::TransitionNotCompleted);
+    }
+    if manifest.transition.fingerprint != content.sha256 {
+        return Err(V2SessionProvenanceError::TransitionFingerprintMismatch);
+    }
     Ok(())
 }
 
@@ -1296,6 +1374,25 @@ mod tests {
         }
     }
 
+    fn session_provenance() -> SessionArtifactEntry {
+        SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionProvenanceEvents,
+            privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+            managed_identity: identity("streams/session-provenance.jsonl"),
+            availability: ArtifactAvailability::Present {
+                content: content('e', 48),
+            },
+        }
+    }
+
+    fn v2_candidate(id: &str) -> SessionArtifactManifestV1 {
+        let mut candidate = basic_candidate(id, 'e');
+        candidate.session_semantics_version =
+            super::super::session_semantics::SessionSemanticsVersion::V2;
+        candidate.artifacts.push(session_provenance());
+        candidate
+    }
+
     fn basic_candidate(id: &str, fingerprint: char) -> SessionArtifactManifestV1 {
         SessionArtifactManifestV1::candidate(
             "session-1",
@@ -1592,7 +1689,7 @@ mod tests {
         assert_eq!(
             wire,
             format!(
-                "{{\"schema_version\":1,\"session_id\":\"session-1\",\"generation\":1,\"transition\":{{\"idempotency_id\":\"tx-1\",\"fingerprint\":\"sha256:{}\",\"state\":\"completed\"}},\"artifacts\":[{{\"kind\":\"original_session_audio\",\"privacy_class\":\"original_evidence\",\"managed_identity\":\"audio/original.wav\",\"availability\":{{\"unavailable\":{{\"reason\":\"retention_disabled\"}}}}}}],\"quarantine_transaction\":null}}",
+                "{{\"schema_version\":1,\"session_id\":\"session-1\",\"session_semantics_version\":1,\"generation\":1,\"transition\":{{\"idempotency_id\":\"tx-1\",\"fingerprint\":\"sha256:{}\",\"state\":\"completed\"}},\"artifacts\":[{{\"kind\":\"original_session_audio\",\"privacy_class\":\"original_evidence\",\"managed_identity\":\"audio/original.wav\",\"availability\":{{\"unavailable\":{{\"reason\":\"retention_disabled\"}}}}}}],\"quarantine_transaction\":null}}",
                 "a".repeat(64)
             )
         );
@@ -1600,6 +1697,196 @@ mod tests {
             serde_json::from_str(&wire).expect("decode golden");
         validate_persisted_and_normalize(&mut decoded).expect("validate golden");
         assert_eq!(decoded, candidate);
+    }
+
+    #[test]
+    fn historical_wire_defaults_floor_to_v1_and_new_candidate_wire_is_explicit() {
+        let candidate = basic_candidate("tx-floor", 'f');
+        let mut historical = serde_json::to_value(&candidate).expect("candidate value");
+        historical
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("session_semantics_version");
+
+        let decoded: SessionArtifactManifestV1 =
+            serde_json::from_value(historical).expect("historical manifest");
+        assert_eq!(
+            decoded.session_semantics_version,
+            super::super::session_semantics::SessionSemanticsVersion::V1
+        );
+
+        let explicit = serde_json::to_value(candidate).expect("candidate wire");
+        assert_eq!(explicit["session_semantics_version"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn v2_candidate_requires_exact_bound_session_provenance_proof() {
+        use super::V2SessionProvenanceError;
+
+        fn assert_rejected(
+            label: &str,
+            candidate: SessionArtifactManifestV1,
+            expected: V2SessionProvenanceError,
+        ) {
+            let root = root(label);
+            let store = SessionArtifactManifestStore::new(&root);
+            let mut transaction = store.begin_write().expect("transaction");
+            assert_eq!(
+                transaction.compare_and_swap(0, candidate),
+                ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                    ManifestValidationError::InvalidV2SessionProvenance(expected)
+                )),
+                "v2 proof case {label}"
+            );
+        }
+
+        let missing = {
+            let mut candidate = v2_candidate("v2-missing-provenance");
+            candidate
+                .artifacts
+                .retain(|artifact| artifact.kind != SessionArtifactKind::SessionProvenanceEvents);
+            candidate
+        };
+        assert_rejected(
+            "v2-missing-provenance",
+            missing,
+            V2SessionProvenanceError::Missing,
+        );
+
+        let duplicate = {
+            let mut candidate = v2_candidate("v2-duplicate-provenance");
+            candidate.artifacts.push(session_provenance());
+            candidate
+        };
+        assert_rejected(
+            "v2-duplicate-provenance",
+            duplicate,
+            V2SessionProvenanceError::Duplicate,
+        );
+
+        let wrong_privacy = {
+            let mut candidate = v2_candidate("v2-wrong-provenance-privacy");
+            candidate
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+                .expect("provenance")
+                .privacy_class = ArtifactPrivacyClass::AuditRecord;
+            candidate
+        };
+        assert_rejected(
+            "v2-wrong-provenance-privacy",
+            wrong_privacy,
+            V2SessionProvenanceError::PrivacyMismatch,
+        );
+
+        let unavailable = {
+            let mut candidate = v2_candidate("v2-unavailable-provenance");
+            candidate
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+                .expect("provenance")
+                .availability = ArtifactAvailability::Unavailable {
+                reason: ArtifactUnavailableReason::NeverCaptured,
+            };
+            candidate
+        };
+        assert_rejected(
+            "v2-unavailable-provenance",
+            unavailable,
+            V2SessionProvenanceError::Unavailable,
+        );
+
+        let residual = {
+            let mut candidate = v2_candidate("v2-residual-provenance");
+            candidate
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+                .expect("provenance")
+                .availability = ArtifactAvailability::Residual {
+                content: content('e', 48),
+                reason: ArtifactResidualReason::DeletionFailed,
+            };
+            candidate
+        };
+        assert_rejected(
+            "v2-residual-provenance",
+            residual,
+            V2SessionProvenanceError::Residual,
+        );
+
+        let noncompleted = {
+            let mut candidate = v2_candidate("v2-noncompleted-transition");
+            candidate.transition.state = ManifestTransitionState::Prepared;
+            candidate
+        };
+        assert_rejected(
+            "v2-noncompleted-transition",
+            noncompleted,
+            V2SessionProvenanceError::TransitionNotCompleted,
+        );
+
+        let mismatched = {
+            let mut candidate = v2_candidate("v2-mismatched-transition");
+            candidate.transition.fingerprint = digest('f');
+            candidate
+        };
+        assert_rejected(
+            "v2-mismatched-transition",
+            mismatched,
+            V2SessionProvenanceError::TransitionFingerprintMismatch,
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_session_semantics_floor() {
+        let root = root("unsupported-session-floor");
+        let store = SessionArtifactManifestStore::new(&root);
+        let mut persisted = basic_candidate("tx-unsupported-floor", 'f');
+        persisted.generation = 1;
+        let mut wire = serde_json::to_value(persisted).expect("manifest value");
+        wire["session_semantics_version"] = serde_json::json!(3);
+        write_manifest_bytes(
+            &store,
+            &serde_json::to_vec(&wire).expect("unsupported floor wire"),
+        );
+
+        assert_eq!(
+            store.load(),
+            Err(ManifestLoadError::Validation(
+                ManifestValidationError::UnsupportedSessionSemanticsVersion { actual: 3 }
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_v2_manifest_cannot_regress_to_v1() {
+        let root = root("session-floor-regression");
+        let store = SessionArtifactManifestStore::qualified_for_test(&root).expect("qualified");
+        let mut transaction = store.begin_write().expect("transaction");
+        let v2 = v2_candidate("tx-floor-v2");
+        assert!(matches!(
+            transaction.compare_and_swap(0, v2),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 {
+                    session_semantics_version:
+                        super::super::session_semantics::SessionSemanticsVersion::V2,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert_eq!(
+            transaction.compare_and_swap(1, basic_candidate("tx-regression", 'd')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::SessionSemanticsFloorRegression {
+                current: super::super::session_semantics::SessionSemanticsVersion::V2,
+                candidate: super::super::session_semantics::SessionSemanticsVersion::V1,
+            })
+        );
     }
 
     #[test]
