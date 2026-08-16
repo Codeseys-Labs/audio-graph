@@ -72,7 +72,9 @@ preflight:
    evidence file exists. It makes no whole-store-equivalence claim.
 4. `Record bounded allowlisted Windows endpoint inventory` starts and bounds a
    wait for `Audiosrv`, then requires a present/healthy `VBAudioVACWDM` device
-   plus present/healthy `CABLE Input` and `CABLE Output` endpoints. It writes the
+   plus a present/healthy render endpoint (`CABLE Input` or Pack43's exact
+   `Speakers (VB-Audio Virtual Cable)` alias) and `CABLE Output` capture
+   endpoint. It writes the
    observed bounded inventory before any validation throw. Only after every
    check passes does it create the separate
    `windows-installation-canary.txt` PASS artifact. The supply-boundary artifact
@@ -108,7 +110,7 @@ After implementation:
 
 ```text
 $ bun scripts/check-2df3-labsn-action.mjs
-PASS: direct LABSN action contract and 16 mutations
+PASS: direct LABSN action contract and 18 mutations
 ```
 
 The check rejects all of these in-memory mutations:
@@ -121,6 +123,8 @@ The check rejects all of these in-memory mutations:
 - admitting a pre-existing endpoint;
 - making an empty Windows endpoint class a fatal prestate query;
 - accepting only one VB-CABLE endpoint;
+- omitting Pack43's exact render-endpoint alias;
+- widening the exact capture-endpoint alias;
 - omitting the `VBAudioVACWDM` hardware identity;
 - making an absent PnP hardware-ID property fatal;
 - omitting the `Audiosrv` readiness requirement;
@@ -150,7 +154,7 @@ git diff --check
 Observed results:
 
 ```text
-direct LABSN contract: PASS, 16/16 mutations rejected
+direct LABSN contract: PASS, 18/18 mutations rejected
 actionlint: PASS
 yq parse: PASS
 Ruby YAML parse: PASS
@@ -230,6 +234,34 @@ reading `Data`; the exact `VBAudioVACWDM` match remains mandatory for PASS. The
 direct-action check now rejects 16/16 mutations. This does not weaken action
 outcome, device status, endpoint, service, certificate-restoration, or native
 test gates.
+
+## Third native rerun correction
+
+Run `31966577145` proved the guarded hardware-ID enumeration and preserved a
+complete failed-canary inventory. Windows again passed zero/zero prestate,
+direct pinned LABSN, targeted certificate restoration, NTFS, one healthy
+`VBAudioVACWDM` device, two healthy VB-CABLE endpoint records, and running
+`Audiosrv`. Linux Blacksmith ext4 and macOS Blacksmith APFS again passed.
+
+The recorded Windows endpoints were `CABLE Output (VB-Audio Virtual Cable)` and
+`Speakers (VB-Audio Virtual Cable)`. The Pack43 archive used by the pinned LABSN
+action names its render endpoint `Speakers`, while the initial canary required
+the alternative `CABLE Input` name. That name mismatch prevented the PASS
+artifact and left Windows tests not run.
+
+A new RED requires both exact render aliases to remain recognized. The canary
+now accepts only `CABLE Input (VB-Audio Virtual Cable)` or the observed exact
+Pack43 `Speakers (VB-Audio Virtual Cable)` name for render, while continuing to
+require exact `CABLE Output` capture, healthy status, two VB-CABLE records, the
+healthy hardware ID, and `Audiosrv`. The direct-action check now rejects 18/18
+mutations; this is an evidence-backed alias correction, not a broad friendly-name
+match or relaxed virtual-audio gate.
+
+Standards review found that the first correction anchored only the capture
+prefix while this report described the full alias as exact. The final capture
+predicate is now exactly anchored to
+`CABLE Output (VB-Audio Virtual Cable)`, and an 18th mutation prevents that
+predicate from widening back to a prefix match.
 
 ## Native acceptance still required
 

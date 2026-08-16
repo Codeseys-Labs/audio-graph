@@ -415,14 +415,16 @@ jobs:
           $cableEndpoints = @(
             $endpoints | Where-Object friendly_name -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
           )
-          $cableInput = @(
+          $cableRender = @(
             $endpoints | Where-Object {
-              $_.status -eq 'OK' -and $_.friendly_name -match '^CABLE Input'
+              $_.status -eq 'OK' -and
+                $_.friendly_name -match '^(CABLE Input|Speakers) \(VB-Audio Virtual Cable\)$'
             }
           )
-          $cableOutput = @(
+          $cableCapture = @(
             $endpoints | Where-Object {
-              $_.status -eq 'OK' -and $_.friendly_name -match '^CABLE Output'
+              $_.status -eq 'OK' -and
+                $_.friendly_name -match '^CABLE Output \(VB-Audio Virtual Cable\)$'
             }
           )
           $vbCableDevices = @(
@@ -456,8 +458,8 @@ jobs:
           if ($endpoints.Count -eq 0) {
             throw "No present AudioEndpoint records found after the enumeration baseline."
           }
-          if ($cableEndpoints.Count -lt 2 -or $cableInput.Count -eq 0 -or $cableOutput.Count -eq 0) {
-            throw "Both expected CABLE Input and CABLE Output endpoints must be present after LABSN."
+          if ($cableEndpoints.Count -lt 2 -or $cableRender.Count -eq 0 -or $cableCapture.Count -eq 0) {
+            throw "Expected VB-CABLE render and capture endpoints must both be present after LABSN."
           }
           if ($vbCableDevices.Count -eq 0) {
             throw "No present and healthy VBAudioVACWDM device is available after LABSN."
@@ -469,8 +471,8 @@ jobs:
             'status=PASS'
             'proof=post_action_vb_cable_device_and_endpoint_presence'
             "vb_cable_device_count=$($vbCableDevices.Count)"
-            "ready_cable_input_count=$($cableInput.Count)"
-            "ready_cable_output_count=$($cableOutput.Count)"
+            "ready_render_endpoint_count=$($cableRender.Count)"
+            "ready_capture_endpoint_count=$($cableCapture.Count)"
             "audiosrv_status=$($audioService.Status)"
             'evidence_class=device_and_endpoint_enumeration_only_no_pcm'
           ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-installation-canary.txt" -Encoding utf8

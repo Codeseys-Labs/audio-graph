@@ -114,7 +114,8 @@ function validate(source) {
     invariant(
         canary.includes("$cableEndpoints.Count -lt 2") &&
             canary.includes("CABLE Input") &&
-            canary.includes("CABLE Output") &&
+            canary.includes("'^(CABLE Input|Speakers) \\(VB-Audio Virtual Cable\\)$'") &&
+            canary.includes("'^CABLE Output \\(VB-Audio Virtual Cable\\)$'") &&
             canary.includes("$hardwareIds -match 'VBAudioVACWDM'") &&
             canary.includes("Start-Service -Name Audiosrv") &&
             canary.includes("[TimeSpan]::FromSeconds(20)") &&
@@ -234,6 +235,17 @@ const mutations = [
         ),
     ],
     ["one endpoint admitted", (source) => source.replace("$cableEndpoints.Count -lt 2", "$cableEndpoints.Count -lt 1")],
+    [
+        "Pack43 render alias omitted",
+        (source) => source.replace("|Speakers", ""),
+    ],
+    [
+        "capture alias widened",
+        (source) => source.replace(
+            "'^CABLE Output \\(VB-Audio Virtual Cable\\)$'",
+            "'^CABLE Output'",
+        ),
+    ],
     [
         "hardware identity omitted",
         (source) => source.replace("$hardwareIds -match 'VBAudioVACWDM'", "$true"),
