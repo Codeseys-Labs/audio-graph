@@ -427,13 +427,15 @@ jobs:
           )
           $vbCableDevices = @(
             foreach ($device in @(Get-PnpDevice -PresentOnly -ErrorAction Stop)) {
-              $hardwareIds = @(
-                Get-PnpDeviceProperty `
-                  -InstanceId $device.InstanceId `
-                  -KeyName 'DEVPKEY_Device_HardwareIds' `
-                  -ErrorAction SilentlyContinue |
-                  Select-Object -ExpandProperty Data
-              ) -join ';'
+              $property = Get-PnpDeviceProperty `
+                -InstanceId $device.InstanceId `
+                -KeyName 'DEVPKEY_Device_HardwareIds' `
+                -ErrorAction SilentlyContinue
+              $hardwareIds = ''
+              if ($null -ne $property -and
+                $property.PSObject.Properties.Name -contains 'Data') {
+                $hardwareIds = @($property.Data) -join ';'
+              }
               if ($device.Status -eq 'OK' -and $hardwareIds -match 'VBAudioVACWDM') {
                 $device
               }
