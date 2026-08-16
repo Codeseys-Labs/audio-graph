@@ -5,8 +5,15 @@
 Implemented the approved, opt-in native durability evidence workflow at
 `.github/workflows/2df3-native-durability.yml`. The workflow is manual-only,
 has read-only repository permission, runs the two accepted focused filters on
-Linux, macOS, and Windows, and uploads a bounded evidence artifact for every
-matrix cell even when the job fails.
+Linux, macOS, and Windows, and now creates a nonempty evidence preflight before
+checkout or other fallible platform work so every matrix cell has an uploadable
+artifact when a later step fails.
+
+The initial candidate incorrectly claimed that the always-upload guarantee
+covered every failure. Review found that checkout, Rust, cache, or dependency
+setup could fail before the evidence directory existed, after which the
+summary and upload could also fail without an artifact. Correction round 1
+closes that gap and qualifies the original claim to the corrected workflow.
 
 No workflow was dispatched. No branch was pushed. No Blacksmith Testbox,
 Docker guest, release, repository setting, secret, or Seed was created,
@@ -93,7 +100,10 @@ after writing the native Cargo exit so that the second filter runs even when
 the first returns nonzero. A later `always()` summary reads both native exits
 and supplies the final platform verdict. A step timeout or shell failure also
 continues to the second filter; the missing native exit becomes `not_run` and
-the summary fails the platform honestly.
+the summary fails the platform honestly. Before checkout, the first applicable
+Unix or Windows step creates `EVIDENCE_DIR` and a nonempty `preflight.txt`.
+Both always-summaries also recreate the parent directory defensively before
+writing `summary.txt`.
 
 ### Exact Cargo execution
 
@@ -108,12 +118,15 @@ Windows uses `shell: pwsh` for both commands and sets
 `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1`, avoiding the Git-Bash `link.exe`
 resolution path. Linux and macOS use Bash. Rust is fixed to the repository pin
 for 1.95.0. Checkout, Rust, cache, MSVC, LABSN, and upload actions are full-SHA
-pinned to existing repository pins.
+pinned to existing repository pins. The checkout SHA
+`11bd71901bbe5b1630ceea73d27597364c9af683` is accurately annotated as
+`v4.2.2`, not `v5`.
 
 ### Evidence contract
 
 Each admitted platform records:
 
+- a nonempty `preflight.txt` before checkout or platform setup;
 - checked-out Git SHA, with equality enforced against `GITHUB_SHA`;
 - selected runner OS, architecture, name, image identifiers when available,
   and live OS version output;
@@ -130,17 +143,19 @@ The crash harness itself emits its filesystem observation from the live
 fixture parent and content-free length/digest/stage evidence. The workflow does
 not dump the process environment.
 
-The upload step is full-SHA pinned, uses `if: always()`, treats a missing path
-as an error, retains evidence for 14 days, and gives every platform/run/attempt
-a distinct artifact name.
+In the corrected workflow, the upload step is full-SHA pinned, uses
+`if: always()`, treats a missing path as an error, retains evidence for 14 days,
+and gives every platform/run/attempt a distinct artifact name. Preflight
+initialization makes that path nonempty before the first later fallible action.
 
 ### Windows legal and audio boundary
 
 `confirm_vb_cable_professional_license` is a required boolean input whose
-default is `false`. The first Windows step refuses before checkout, LABSN, or
-platform probing unless the value is exactly true. The refusal writes only a
-reason/status artifact. The workflow never asks for, accepts, stores, or logs
-license keys, files, or other license material.
+default is `false`. The first applicable Windows step creates the evidence
+preflight; the immediately following license gate overwrites it and the summary
+with `REFUSED`, then fails before checkout, LABSN, or platform probing unless
+the value is exactly true. The workflow never asks for, accepts, stores, or
+logs license keys, files, or other license material.
 
 When confirmed, the Windows cell uses exactly:
 
@@ -219,13 +234,16 @@ with `rg`. Assertions covered:
 - exact permissions and runners;
 - 120-minute job timeout, 45-minute test timeouts, and `fail-fast: false`;
 - the exact ordered action set and 40-hex pins;
-- the first-step Windows refusal and Windows-only confirmed LABSN condition;
+- Unix and Windows nonempty preflight initialization before checkout;
+- the pre-checkout Windows refusal overwrite and Windows-only confirmed LABSN
+  condition;
 - four continuable Cargo steps with the exact filters, flags, and working
   directory;
 - PowerShell and the Windows manifest environment on both Windows tests;
 - native exit files, full logs, platform/toolchain/filesystem evidence, and
   proof-boundary text;
 - bounded endpoint inventory;
+- parent creation in both always-summaries;
 - `always()` upload, missing-file error, and 14-day retention;
 - no secret context, forbidden trigger, or whole-environment dump.
 
@@ -235,6 +253,58 @@ Real result:
 static_contracts=PASS
 static_text_guards=PASS
 ```
+
+## Review correction round 1
+
+### Artifact-ordering RED
+
+Standards and Spec review both blocked the initial candidate on one P1: the
+first admitted fallible step was checkout, while evidence initialization lived
+after checkout/Rust/cache/dependency setup. The always-summary also assumed its
+parent already existed. The unmodified candidate was parsed and checked for
+both platform initializers and both summary defenses.
+
+Real result:
+
+```text
+REVIEW RED: unix preflight initializer absent before checkout index=1; windows preflight initializer absent before checkout index=1; unix always-summary does not create EVIDENCE_DIR; windows always-summary does not create EVIDENCE_DIR
+review_red_exit=1
+```
+
+This reproduced the review finding without dispatching the workflow or writing
+a test fixture.
+
+### Ordering GREEN and mutation sensitivity
+
+Correction round 1 adds separate Unix and Windows initializers as the first two
+matrix steps. Each applicable initializer creates `EVIDENCE_DIR`, writes a
+nonempty `preflight.txt`, and validates the file. The false-license Windows
+path then overwrites both preflight and summary with `REFUSED` before checkout.
+Both always-summaries independently create the parent directory before reading
+native exits or writing their verdict.
+
+The parsed static validator was rerun on the corrected document and against
+five in-memory mutations. Real result:
+
+```text
+ruby_yaml_parse=PASS
+static_preflight_contract=PASS
+mutation_remove_unix_initializer=REJECTED
+mutation_checkout_before_initializers=REJECTED
+mutation_remove_windows_preflight=REJECTED
+mutation_remove_unix_summary_parent=REJECTED
+mutation_remove_windows_summary_parent=REJECTED
+checkout_annotation=PASS
+```
+
+Removal and reordering therefore fail the test rather than merely matching a
+step name. The checkout comment was corrected from an inaccurate `v5`
+annotation to `v4.2.2` without changing the action SHA.
+
+Rust product inputs and both Cargo command strings are byte-identical to the
+reviewed candidate. Per the correction assignment, the 42-test durability and
+11-test crash-harness baselines below were not rerun; repository/static gates
+were rerun after the workflow-only command-order correction.
 
 ### Local Linux focused filters
 
@@ -299,6 +369,25 @@ docs/Seeds secret hygiene scan passed: 0 findings
 
 Both commands exited 0. No generated contract changed.
 
+Correction round 1 reran the same pinned commands after the workflow/report
+edit. Real result remained:
+
+```text
+audio source contract is current
+provider registry is current
+session data movement contract is current
+endpoint credential routing contract is current
+speech span revision contract is current
+Checked 174 files. No fixes applied.
+TypeScript: PASS
+sd ready --format json: parsed (50)
+sd blocked --format json: parsed (96)
+sd list --format json: parsed (50)
+docs/Seeds secret hygiene scan passed: 0 findings
+verify:contracts: exit 0
+verify:fast: exit 0
+```
+
 ### Secret, diff, and footprint hygiene
 
 Commands:
@@ -338,8 +427,7 @@ An earlier root-directory `cargo clean --target-dir ...` attempt refused with
 `could not find Cargo.toml`; it removed nothing. The corrected explicit command
 above performed the cleanup.
 
-After adding this report, the final owned-file gates were repeated. Real
-result:
+For the initial candidate, owned-file gates were then repeated. Real result:
 
 ```text
 actionlint: exit 0, no findings
@@ -354,14 +442,48 @@ worktree-local target absent: PASS
 The exact base-to-worktree footprint assertion reported only the two assigned
 paths.
 
-## Commits and footprint
-
-Workflow implementation commit:
+Correction round 1 final owned-file gates reported:
 
 ```text
-340859e40ea784e4b93f6803a0bb45723fc72f2b
+actionlint: exit 0, no findings
+yq: exit 0
+ruby_yaml_parse=PASS
+docs/Seeds secret hygiene scan passed: 0 findings
+Betterleaks scanned approximately 40 KB; no leaks found
+git diff --check: PASS
+base footprint: workflow and report only
+correction footprint: workflow and report only
+```
+
+The correction gate regenerated only the ignored worktree-local Cargo target.
+Explicit cleanup removed 1,319 files / 632.9 MiB, and `src-tauri/target` was
+absent afterward.
+
+## Commits and footprint
+
+The two existing unpushed commits were reworded with multiline why/gate bodies
+using a controlled rebase. The old and new tips had the identical tree
+`e5f9f0446abd43625d6b6a686528477b3c3e9471`; the reword introduced no file
+change and preserved two linear commits before this correction.
+
+Reworded workflow implementation commit:
+
+```text
+2a9645beea4376933ab332209aa4327016ab174e
 audio-graph-52b9: add native durability workflow
 ```
+
+Reworded initial report commit:
+
+```text
+1cc5b163507728ca4ff621ae004a40cb382397e7
+audio-graph-52b9: record workflow evidence
+```
+
+The workflow and this report correction are committed together as the third
+linear commit. Its hash is necessarily reported outside the commit because the
+hash covers these report bytes. Final topology is three commits and zero
+merges from the exact base.
 
 Pre-report range footprint:
 
@@ -369,15 +491,15 @@ Pre-report range footprint:
 .github/workflows/2df3-native-durability.yml | 353 insertions
 ```
 
-This report is committed separately so the workflow implementation remains a
-single-file logical change. The final two-file range is the workflow plus this
-report only.
+The final base-to-tip file range remains the workflow plus this report only.
 
 ## Findings and open questions
 
 - The workflow is statically and locally verified but not remotely executed.
   Linux, APFS, and NTFS claims still require a reviewed manual run.
 - Independent review is pending and is a hard pre-dispatch gate.
+- Review round 1's single P1 has a mutation-tested correction; rereview of the
+  corrected stable tip remains pending.
 - The mutable unhashed VB-CABLE archive remains a supply-chain limitation. A
   future upstream content hash or internally mirrored verified archive would
   materially improve provenance, but is outside this Seed.
@@ -389,10 +511,11 @@ No unrelated implementation issue was found or fixed.
 
 ## Rollback
 
-Before dispatch, rollback is a normal revert of the workflow implementation
-commit, followed by a separate revert of this report commit if the report
-should also be removed. Because this workstream did not push or dispatch,
-rollback currently has no remote job, runner, artifact, or credential cleanup.
+Before dispatch, rollback is a normal revert of the out-of-band correction
+commit, then `1cc5b163507728ca4ff621ae004a40cb382397e7` and
+`2a9645beea4376933ab332209aa4327016ab174e` if the whole workstream should be
+removed. Because this workstream did not push or dispatch, rollback currently
+has no remote job, runner, artifact, or credential cleanup.
 
 After a future dispatch, reverting the workflow prevents new runs but does not
 delete prior Actions artifacts. Those artifacts expire after 14 days unless an
@@ -408,7 +531,8 @@ authorized repository operator removes them sooner.
    select the exact reviewed ref. Record the expected SHA before pressing Run.
 4. Leave `confirm_vb_cable_professional_license=false` unless the operator has
    professional-use authorization for the Windows VB-CABLE CI baseline. Never
-   paste or upload license material. False intentionally refuses the Windows
+   paste or upload license material. False initializes the Windows evidence
+   path, overwrites its preflight/summary with `REFUSED`, and then refuses the
    cell before checkout/LABSN/platform work while Linux and macOS remain
    independent because matrix fail-fast is false.
 5. For the intended three-platform evidence run, set the boolean true only

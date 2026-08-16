@@ -37,23 +37,54 @@ jobs:
     env:
       EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
     steps:
+      - name: Initialize Unix evidence preflight
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            printf 'status=PREPARED\n'
+            printf 'platform=%s\n' "${{ matrix.os }}"
+            printf 'next=checkout\n'
+            printf 'artifact_contract=nonempty_before_fallible_platform_work\n'
+          } > "$EVIDENCE_DIR/preflight.txt"
+          test -s "$EVIDENCE_DIR/preflight.txt"
+
+      - name: Initialize Windows evidence preflight
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          @(
+            "status=PREPARED"
+            "platform=windows"
+            "next=license_gate"
+            "artifact_contract=nonempty_before_fallible_platform_work"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/preflight.txt" -Encoding utf8
+          if ((Get-Item "$env:EVIDENCE_DIR/preflight.txt").Length -eq 0) {
+            throw "Windows evidence preflight must be nonempty."
+          }
+
       - name: Refuse unconfirmed Windows professional-use run
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license != true }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
-          @(
+          $refusal = @(
             "status=REFUSED"
             "reason=confirm_vb_cable_professional_license must be true before Windows platform work"
             "license_material=not_requested_or_logged"
             "platform_work=not_started"
-          ) | Set-Content -Path "$env:EVIDENCE_DIR/summary.txt" -Encoding utf8
+          )
+          $refusal | Set-Content -Path "$env:EVIDENCE_DIR/preflight.txt" -Encoding utf8
+          $refusal | Set-Content -Path "$env:EVIDENCE_DIR/summary.txt" -Encoding utf8
           Write-Error "Windows native evidence refused before checkout, LABSN, or platform work."
           exit 1
 
       - name: Check out requested revision
         if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: audio-graph
 
@@ -305,6 +336,7 @@ jobs:
         if: ${{ always() && matrix.os != 'windows' }}
         shell: bash
         run: |
+          mkdir -p "$EVIDENCE_DIR"
           first="$(cat "$EVIDENCE_DIR/canonical_durability.exit" 2>/dev/null || printf 'not_run')"
           second="$(cat "$EVIDENCE_DIR/canonical_crash_harness.exit" 2>/dev/null || printf 'not_run')"
           status=PASS
@@ -325,6 +357,7 @@ jobs:
         if: ${{ always() && matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
           $first = if (Test-Path "$env:EVIDENCE_DIR/canonical_durability.exit") {
             (Get-Content "$env:EVIDENCE_DIR/canonical_durability.exit" -Raw).Trim()
           } else { 'not_run' }
