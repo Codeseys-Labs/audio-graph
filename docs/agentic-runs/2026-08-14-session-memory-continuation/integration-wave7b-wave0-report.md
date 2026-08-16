@@ -1346,3 +1346,42 @@ remains applicable and no product/workflow suite was rerun. This reconciliation
 did not push, mutate/reply to/resolve/merge PR 99, dispatch, merge `master`,
 close a Seed, run a platform job, handle license material, or touch the main
 worktree.
+
+## Wave5 registered-workflow closure reconciliation
+
+Custody `4d3d7dcc52339ebe72cc6559f9203d41bc4b525c` was merged
+history-preservingly without conflict at
+`0f6d2a473453feed0a5cba33f90765b3a1086dbf`. Its range after prior custody
+`d8002b48e826c98b67145c91427081cc26b8c302` is exactly two linear,
+non-merge, Seed-only commits: product-owner squash-merge authorization
+`957f406`, then registered-workflow closure `4d3d7dc`. The integrated 648-row
+queue is byte-identical to custody and valid JSONL.
+
+Custody records PR 99 squash-merged at
+`bd58cecc7b30ccaea1249d5a6dc491c6ccab19b9` from exact head `d15640e`, with
+workflow ID `335389980` active on `master` and workflow SHA-256
+`f174a1024c6754602f4bd9190605b0e0e4273427e4bcccb4f573c6e1726f3eb7`.
+The final audit covers all three review threads: two resolved and the
+zero-test thread addressed with exact-count evidence and no objection, leaving
+zero unaddressed actionable threads. The known old-`master` cargo-audit
+failure remains outside the one-workflow PR footprint.
+
+Seed 52b9 is closed with `closedAt` and is absent from ready and blocked
+queues. Its resolved dependency edge is removed from 2df3. Seed 2df3 remains
+`in_progress`, unblocked, assigned to `codex-2df3-wave7b`, and records
+`READY_FOR_NATIVE_DISPATCH` on exact evidence SHA `fd6d360`, while dispatch
+remains false. Parent 8e73 remains blocked only by 2df3. Active Testboxes are
+zero, and no license material was requested, received, stored, or logged.
+
+The complete queue contains 91 open-ready and 95 blocked issues. Seeds output
+stress parsed ready 50, blocked 95, and list 50. All five contracts and pinned
+`verify:fast` passed, including Biome over 174 files, typecheck, contract
+drift, Seeds output, docs/Seeds secret hygiene, and diff hygiene. Seeds Doctor
+reported 10 passed checks, 2 custody-carried warning groups, and 0 failures.
+Betterleaks, final docs/Seeds secret hygiene, queue identity, and range-diff
+hygiene passed.
+
+No product or workflow file changed, so assembled evidence at `fd6d360`
+remains applicable and no product/workflow suite was rerun. This reconciliation
+did not push, mutate PR 99, dispatch, edit a workflow/product file, perform an
+extra Seed closure, run a platform job, or touch the main worktree.

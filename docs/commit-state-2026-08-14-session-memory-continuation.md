@@ -1080,3 +1080,24 @@ by 2df3. No product or workflow file changed, so `fd6d360` evidence remains
 applicable without rerunning those suites. No push, PR mutation/reply/
 resolution/merge, master merge, dispatch, Seed closure, platform job,
 license-material handling, or main-worktree change occurred.
+
+### Wave 7B Wave5 registered-workflow closure reconciliation
+
+Two linear Seed-only custody commits (`957f406`, `4d3d7dc`) were merged
+history-preservingly at `0f6d2a4`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+PR 99 was squash-merged on `master` at `bd58cec` from exact reviewed head
+`d15640e`. Workflow ID `335389980` is active with exact SHA-256 `f174a102`;
+the final three-thread audit has zero unaddressed actionable items. Seed 52b9
+is closed with `closedAt` and absent from open queues. Seed 2df3 is
+`in_progress`, unblocked, and `READY_FOR_NATIVE_DISPATCH` on evidence
+`fd6d360`, but dispatch remains false. Parent 8e73 remains blocked only by
+2df3, and active Testboxes are zero.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/95 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product or workflow file changed, so `fd6d360` evidence remains applicable
+without rerunning those suites. No push, PR mutation, dispatch, workflow or
+product edit, extra Seed closure, platform job, license-material handling, or
+main-worktree change occurred.
