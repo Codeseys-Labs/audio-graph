@@ -1203,3 +1203,46 @@ reconciliation did not push, modify PR 99, dispatch, merge `master`, close a
 Seed, edit a workflow/product/settings file, or start a platform job; no extra
 Seed edit, secret, Blacksmith/Testbox, Docker, guest, or platform action
 occurred.
+
+## Wave5 registration PR terminal reconciliation
+
+Custody `ae69e166b8bebebbc2cde1b83dd7cf1ae8fc9ef3` was merged
+history-preservingly without conflict at
+`965509d377f08333a901986f80ad8bed22b3e3b5`. Its one linear commit after
+custody `3aac0f07bc3eef553eb27a543e818f9a71ce5127` changes only
+`.seeds/issues.jsonl`; the integrated 648-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Draft PR 99 completed run `31924378400` on exact one-file head
+`c17f12a71f5c6b5bcd6f86b607c1b6e19cd352dd`. Lints, Frontend, Rust and
+Cloud-only Linux/macOS/Windows, CodeRabbit, and GitGuardian all passed;
+configured optional jobs were skipped. The sole failure was cargo-audit job
+`95109507217`, classified as pre-existing old-`master` dependency state
+outside the workflow-only PR footprint: `RUSTSEC-2026-0213` for ammonia 4.1.3
+and `RUSTSEC-2026-0235` for rkyv 0.7.46. The separately reviewed remediation
+already exists on the evidence branch.
+
+PR 99 remains open, ready for review, and mergeable. The default-branch
+workflow registry still returns 404, dispatch is false, no license material
+was requested, received, stored, or logged, and the recorded active Testbox
+count remains zero. The next boundary is a product-owner/default-branch merge
+of PR 99, followed by a registry-active poll; only then may the exact evidence
+SHA `b46ed42` be dispatched with the license Boolean true and monitored through
+terminal artifacts and Testbox cleanup.
+
+Seed 52b9 remains `in_progress` with `READY_FOR_DEFAULT_BRANCH_MERGE`. Seed
+2df3 remains `in_progress` and blocked only by 52b9; parent 8e73 remains
+blocked only by 2df3. The complete open-ready queue contains 91 issues and the
+blocked queue contains 96. Seeds output stress parsed ready 50, blocked 96,
+and list 50. All five contracts and pinned `verify:fast` passed, including
+Biome over 174 files, typecheck, Seeds output, docs/Seeds secret hygiene, and
+diff hygiene. Seeds Doctor reported 10 passed, 2 custody-carried warning
+groups, and 0 failures. Betterleaks, exact queue identity, and range hygiene
+passed.
+
+No product, Cargo, frontend, or workflow file changed, so the assembled
+evidence at `dcee4ad` remains applicable and those suites were not rerun. This
+reconciliation did not push, mutate or merge PR 99, dispatch, merge `master`,
+close a Seed, edit a workflow/product/settings file, or start a platform job;
+no extra Seed edit, secret, Blacksmith/Testbox, Docker, guest, or platform
+action occurred.

@@ -1003,3 +1003,30 @@ remains applicable and product/workflow suites were not rerun. No push, PR
 mutation, dispatch, master merge, Seed closure, workflow/product/settings
 edit, platform job, secret, Blacksmith/Testbox, Docker, guest, or platform
 action occurred.
+
+### Wave 7B Wave5 registration PR terminal reconciliation
+
+One linear Seed-only custody commit `ae69e16` was merged
+history-preservingly at `965509d`. The 648-row queue is byte-identical to
+custody and valid JSONL.
+
+Draft PR 99 run `31924378400` completed on exact one-workflow head `c17f12a`.
+All in-scope Linux/macOS/Windows Rust and Cloud-only jobs, Lints, Frontend,
+CodeRabbit, and GitGuardian passed; configured optional jobs were skipped. The
+sole failure was old-`master` cargo-audit job `95109507217` for ammonia 4.1.3
+and rkyv 0.7.46, outside the one-file registration scope with reviewed
+remediation already on the evidence branch.
+
+PR 99 is open, ready for review, and mergeable. Registry status remains 404,
+dispatch is false, no license material was handled, and active Testboxes are
+zero. Seed 52b9 remains `in_progress`; 2df3 is blocked only by 52b9, and 8e73
+only by 2df3. The next boundary is default-branch merge, registry activation,
+then the separately authorized evidence dispatch and terminal monitoring.
+
+All five contracts, pinned `verify:fast`, Seeds 91 open-ready/96 blocked with
+Doctor 0 failures, Betterleaks, docs-secret, identity, and range gates passed.
+No product, Cargo, frontend, or workflow file changed, so `dcee4ad` evidence
+remains applicable and product/workflow suites were not rerun. No push, PR
+mutation or merge, dispatch, master merge, Seed closure,
+workflow/product/settings edit, platform job, secret, Blacksmith/Testbox,
+Docker, guest, or platform action occurred.
