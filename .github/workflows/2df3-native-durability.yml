@@ -339,6 +339,19 @@ jobs:
           mkdir -p "$EVIDENCE_DIR"
           first="$(cat "$EVIDENCE_DIR/canonical_durability.exit" 2>/dev/null || printf 'not_run')"
           second="$(cat "$EVIDENCE_DIR/canonical_crash_harness.exit" 2>/dev/null || printf 'not_run')"
+          durability_log=false
+          crash_harness_log=false
+          if [ -s "$EVIDENCE_DIR/canonical_durability.log" ]; then
+            durability_log=true
+          fi
+          if [ -s "$EVIDENCE_DIR/canonical_crash_harness.log" ]; then
+            crash_harness_log=true
+          fi
+          case "$durability_log:$crash_harness_log" in
+            true:true) test_logs=full ;;
+            false:false) test_logs=not_run ;;
+            *) test_logs=partial ;;
+          esac
           status=PASS
           if [ "$first" != 0 ] || [ "$second" != 0 ]; then
             status=FAIL
@@ -349,7 +362,7 @@ jobs:
             printf 'canonical_crash_harness_exit=%s\n' "$second"
             printf 'claim=process-crash recovery and completed OS-barrier outcomes only\n'
             printf 'power_loss_claim=false\n'
-            printf 'logs=full content-free test output\n'
+            printf 'test_logs=%s\n' "$test_logs"
           } > "$EVIDENCE_DIR/summary.txt"
           test "$status" = PASS
 
@@ -364,6 +377,17 @@ jobs:
           $second = if (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.exit") {
             (Get-Content "$env:EVIDENCE_DIR/canonical_crash_harness.exit" -Raw).Trim()
           } else { 'not_run' }
+          $durabilityLog = (Test-Path "$env:EVIDENCE_DIR/canonical_durability.log" -PathType Leaf) -and
+            ((Get-Item "$env:EVIDENCE_DIR/canonical_durability.log").Length -gt 0)
+          $crashHarnessLog = (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.log" -PathType Leaf) -and
+            ((Get-Item "$env:EVIDENCE_DIR/canonical_crash_harness.log").Length -gt 0)
+          $testLogs = if ($durabilityLog -and $crashHarnessLog) {
+            'full'
+          } elseif ($durabilityLog -or $crashHarnessLog) {
+            'partial'
+          } else {
+            'not_run'
+          }
           $status = if ($first -eq '0' -and $second -eq '0') { 'PASS' } else { 'FAIL' }
           @(
             "status=$status"
@@ -371,7 +395,7 @@ jobs:
             "canonical_crash_harness_exit=$second"
             "claim=process-crash recovery and completed OS-barrier outcomes only"
             "power_loss_claim=false"
-            "logs=full content-free test output"
+            "test_logs=$testLogs"
             "audio_claim=endpoint enumeration only"
           ) | Set-Content -Path "$env:EVIDENCE_DIR/summary.txt" -Encoding utf8
           if ($status -ne 'PASS') { exit 1 }

@@ -134,10 +134,12 @@ Each admitted platform records:
 - the two exact commands;
 - a live filesystem probe rooted under the same OS temporary directory family
   used by the crash harness;
-- complete content-free stdout/stderr for each filter;
+- content-free stdout/stderr for each filter that actually starts, stored in a
+  nonempty per-filter log;
 - separate `canonical_durability.exit` and
   `canonical_crash_harness.exit` files; and
-- a summary with both exits, final status, and the proof boundary.
+- a summary with both exits, final status, proof boundary, and a derived
+  `test_logs=not_run|partial|full` evidence state.
 
 The crash harness itself emits its filesystem observation from the live
 fixture parent and content-free length/digest/stage evidence. The workflow does
@@ -241,7 +243,7 @@ with `rg`. Assertions covered:
   directory;
 - PowerShell and the Windows manifest environment on both Windows tests;
 - native exit files, full logs, platform/toolchain/filesystem evidence, and
-  proof-boundary text;
+  proof-boundary text, with truthful missing/partial/full log-state reporting;
 - bounded endpoint inventory;
 - parent creation in both always-summaries;
 - `always()` upload, missing-file error, and 14-day retention;
@@ -305,6 +307,65 @@ Rust product inputs and both Cargo command strings are byte-identical to the
 reviewed candidate. Per the correction assignment, the 42-test durability and
 11-test crash-harness baselines below were not rerun; repository/static gates
 were rerun after the workflow-only command-order correction.
+
+## Review correction round 2
+
+### Log-truthfulness RED
+
+Standards review shipped correction round 1. Spec review found one final P2:
+both always-summaries still emitted `logs=full content-free test output`
+unconditionally. An early checkout, toolchain, cache, or dependency failure can
+correctly leave both native exits `not_run` and create no test log; a failure
+between the filters can leave exactly one log. The unmodified round-1 tip was
+parsed and evaluated for neither-log, one-log, and two-log behavior.
+
+Real result:
+
+```text
+REVIEW P2 RED: unix has no test_logs derivation; unix neither expected=not_run observed=full; unix one expected=partial observed=full; windows has no test_logs derivation; windows neither expected=not_run observed=full; windows one expected=partial observed=full
+review_p2_red_exit=1
+```
+
+### Log-truthfulness GREEN
+
+Both summaries now inspect the actual
+`canonical_durability.log` and `canonical_crash_harness.log` files. A file
+counts only when it exists and is nonempty. The emitted state is:
+
+```text
+test_logs=not_run  # neither nonempty log exists
+test_logs=partial  # exactly one nonempty log exists
+test_logs=full     # both nonempty logs exist
+```
+
+The previous unconditional full-output line was removed. Status derivation,
+native exits, summary failure, legal gating, LABSN use, runners, artifacts, and
+Cargo command bodies are unchanged.
+
+The parsed Bash and PowerShell shapes were checked against all four boolean
+orientations and against mutations that falsified the partial branch or
+weakened either nonempty-file probe. The actual Bash summary was also executed
+in isolated, cleaned fixture directories for all four cases. Real result:
+
+```text
+ruby_yaml_parse=PASS
+static_log_state_contract=PASS
+mutation_unix_partial_to_full=REJECTED
+mutation_windows_partial_to_full=REJECTED
+mutation_unix_remove_nonempty_probe=REJECTED
+mutation_windows_remove_nonempty_probe=REJECTED
+unix_behavior_neither=not_run
+unix_behavior_durability_only=partial
+unix_behavior_harness_only=partial
+unix_behavior_both=full
+```
+
+PowerShell was not installed on the local Linux host, so the Windows branch was
+validated through actionlint, YAML parsing, exact branch-shape parsing, and its
+four-case truth table rather than local PowerShell execution. Native Windows
+behavior remains a later reviewed dispatch concern. Rust product inputs and all
+four Cargo step bodies remain byte-identical, so focused/full Rust tests were
+not rerun in correction round 2.
 
 ### Local Linux focused filters
 
@@ -388,6 +449,11 @@ verify:contracts: exit 0
 verify:fast: exit 0
 ```
 
+Correction round 2 reran both pinned commands after the log-state change. All
+five contracts remained current; Biome checked 174 files, TypeScript passed,
+Seeds output parsed `50/96/50`, docs-secret hygiene found zero issues, and both
+`verify:contracts` and `verify:fast` exited 0.
+
 ### Secret, diff, and footprint hygiene
 
 Commands:
@@ -459,6 +525,12 @@ The correction gate regenerated only the ignored worktree-local Cargo target.
 Explicit cleanup removed 1,319 files / 632.9 MiB, and `src-tauri/target` was
 absent afterward.
 
+Correction round 2 final owned-file gates also passed actionlint, yq/Ruby,
+docs-secret hygiene, diff checks, and exact base/round-2 two-path footprint
+assertions. Betterleaks scanned approximately 45 KB with no findings. Its
+contract rerun regenerated 1,319 target files / 632.9 MiB; the explicit cleanup
+again left `src-tauri/target` absent.
+
 ## Commits and footprint
 
 The two existing unpushed commits were reworded with multiline why/gate bodies
@@ -480,9 +552,16 @@ Reworded initial report commit:
 audio-graph-52b9: record workflow evidence
 ```
 
-The workflow and this report correction are committed together as the third
-linear commit. Its hash is necessarily reported outside the commit because the
-hash covers these report bytes. Final topology is three commits and zero
+Correction round 1 workflow/report commit:
+
+```text
+787cd56b0d61e0df33f8a82199b53d3abc22906d
+audio-graph-52b9: preserve failure artifacts
+```
+
+Correction round 2 is committed as the fourth linear commit without rewriting
+the prior three. Its hash is necessarily reported outside the commit because
+the hash covers these report bytes. Final topology is four commits and zero
 merges from the exact base.
 
 Pre-report range footprint:
@@ -497,9 +576,11 @@ The final base-to-tip file range remains the workflow plus this report only.
 
 - The workflow is statically and locally verified but not remotely executed.
   Linux, APFS, and NTFS claims still require a reviewed manual run.
-- Independent review is pending and is a hard pre-dispatch gate.
+- Final corrected-tip review is pending and is a hard pre-dispatch gate.
 - Review round 1's single P1 has a mutation-tested correction; rereview of the
-  corrected stable tip remains pending.
+  stable tip produced Standards SHIP.
+- Review round 2's single Spec P2 has static, behavioral, and mutation-tested
+  correction evidence; corrected-tip Spec rereview remains pending.
 - The mutable unhashed VB-CABLE archive remains a supply-chain limitation. A
   future upstream content hash or internally mirrored verified archive would
   materially improve provenance, but is outside this Seed.
@@ -511,8 +592,9 @@ No unrelated implementation issue was found or fixed.
 
 ## Rollback
 
-Before dispatch, rollback is a normal revert of the out-of-band correction
-commit, then `1cc5b163507728ca4ff621ae004a40cb382397e7` and
+Before dispatch, rollback is a normal revert of the out-of-band round-2
+correction commit, then `787cd56b0d61e0df33f8a82199b53d3abc22906d`,
+`1cc5b163507728ca4ff621ae004a40cb382397e7`, and
 `2a9645beea4376933ab332209aa4327016ab174e` if the whole workstream should be
 removed. Because this workstream did not push or dispatch, rollback currently
 has no remote job, runner, artifact, or credential cleanup.
@@ -539,9 +621,10 @@ authorized repository operator removes them sooner.
    after that authorization is confirmed, then dispatch once.
 6. Monitor every Linux, macOS, and Windows job to terminal. Record the run ID,
    job IDs, checked-out SHA, runners, conclusions, and start/end times.
-7. Download all three uniquely named artifacts. Verify that each contains
-   runner/toolchain, command, fixture-filesystem, both full logs, both native
-   exits, and the final summary.
+7. Download all three uniquely named artifacts. Verify runner/toolchain,
+   command, fixture-filesystem, native-exit, and summary evidence. Require the
+   files to agree with `test_logs`: neither log for `not_run`, exactly one
+   nonempty log for `partial`, and both nonempty logs for `full`.
 8. Require both native exits to be zero for a PASS. Classify a macOS non-APFS
    typed refusal or Windows namespace-durability refusal according to the
    harness contract rather than converting refusal into acceptance.
