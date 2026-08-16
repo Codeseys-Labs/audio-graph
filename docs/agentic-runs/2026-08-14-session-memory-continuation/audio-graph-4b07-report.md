@@ -5,9 +5,9 @@
 Seed `audio-graph-4b07` is implemented on its dedicated worktree branch. The
 workflow now invokes the exact pinned LABSN composite action on GitHub-hosted
 `windows-2025`; Linux and macOS remain on Blacksmith. Local workflow, contract,
-mutation, typecheck, and frontend gates pass. Native Windows acceptance remains
-pending until the reviewed change is published and the manual evidence workflow
-is dispatched.
+mutation, typecheck, and frontend gates pass. Terminal native run `31967064623`
+passes all three platforms and satisfies the bounded 4b07/2df3 acceptance
+criteria.
 
 ## Assignment and scope
 
@@ -263,20 +263,49 @@ predicate is now exactly anchored to
 `CABLE Output (VB-Audio Virtual Cable)`, and an 18th mutation prevents that
 predicate from widening back to a prefix match.
 
-## Native acceptance still required
+## Terminal native acceptance
 
-Local checks cannot close `audio-graph-4b07` or `audio-graph-2df3`. The published
-evidence ref must be dispatched with the already-recorded professional-use
-attestation. Closure requires:
+Manual workflow run `31967064623` completed `success` at exact evidence head
+`5f34a8656db4f1da59e9ba367b401bb81045d653`.
 
-- Windows prestate reports zero pre-existing VB-CABLE endpoints;
-- the exact pinned LABSN action runs on `windows-2025`;
-- the targeted TrustedPublisher certificate state is restored;
-- the post-action device and both endpoint canaries pass;
-- Windows NTFS runs `12/12` durability and `9/9` crash tests with full logs;
-- Linux Blacksmith ext4 remains `42/11`;
-- macOS Blacksmith APFS remains `13/11`;
-- each platform summary is `PASS` and all three artifacts upload; and
-- Blacksmith Testbox inventory is empty after the run.
+| Platform | Job | Runner | Result |
+|---|---:|---|---|
+| Windows | `95213738611` | GitHub-hosted `windows-2025` | PASS |
+| Linux | `95213738702` | `blacksmith-4vcpu-ubuntu-2404` | PASS |
+| macOS | `95213738599` | `blacksmith-6vcpu-macos-15` | PASS |
 
-No workflow was dispatched while producing this implementation report.
+Windows evidence:
+
+- exact head and NTFS fixture evidence passed;
+- prestate was zero target certificates and zero VB-CABLE endpoints;
+- the exact pinned LABSN action executed successfully;
+- targeted certificate state was `0 -> 1 -> removal exit 0 -> 0`, with
+  `publisher_state_restored=true`;
+- one healthy `VBAudioVACWDM` device, one ready Pack43 render alias, one ready
+  exact capture alias, and running `Audiosrv` produced a PASS presence canary;
+- canonical durability passed `12/12` and the crash harness passed `9/9`, with
+  native and tee exits zero and full nonempty logs; and
+- the Windows summary was `PASS` with `test_logs=full`.
+
+Linux ext4 passed `42/42` durability and `11/11` crash tests. macOS APFS passed
+`13/13` durability and `11/11` crash tests. Every platform uploaded a nonempty
+artifact:
+
+- Windows artifact `9268887195`, archive SHA-256
+  `051454680a5b3b123d025014ab466b8ce791ab2a216c0b31a0ecbd584be76ac2`;
+- Linux artifact `9268793546`, archive SHA-256
+  `3e86aa85d37f42c0c4367970a3f28b8088c98af333d63e33db6e96593fdc9f06`;
+- macOS artifact `9268790371`, archive SHA-256
+  `0ca62140abca19cec4f8938a5997a620bccb564c475eb60860f7631a941c4705`.
+
+The audited evidence bundle is under
+`/tmp/audio-graph-run-31967064623.kMyPkZ`. Betterleaks-style review found no
+license material; only the fixed `license_material=not_requested_or_logged`
+marker appeared. `blacksmith testbox list --all` reported zero active
+Testboxes.
+
+The accepted evidence remains intentionally bounded: endpoint/device/service
+presence only, not PCM capture, playback, default selection, roundtrip, or rsac;
+process-crash recovery and completed OS-barrier outcomes only, not power loss;
+and a SHA-pinned action source whose mutable Pack43 download is explicitly not
+caller-verified for archive, catalog, or DevCon provenance.
