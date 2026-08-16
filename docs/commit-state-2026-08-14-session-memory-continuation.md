@@ -897,3 +897,28 @@ No product or storage-probe files changed, so the assembled `dc9eb78`
 evidence remains applicable and those suites were not rerun. No extra Seed
 edit or closure, `sd sync`, push, workflow action, 25ec/52b9/2df3 start,
 Testbox, Docker, guest, platform action, or main-worktree change occurred.
+
+### Wave 7B Wave5 reviewed native durability workflow fan-in
+
+Nine linear Seed-only custody commits through `7132d80` were merged at
+`312c74d`, followed by reviewed four-commit candidate `49fbb6f` at `0b98011`.
+The 648-row queue is byte-identical to custody. The candidate's exact footprint
+is the new `2df3-native-durability.yml` workflow and its 52b9 report; final
+Standards and Spec reviews returned **SHIP** with zero findings after two
+correction rounds, and both assembled blobs are exact.
+
+Repo-configured actionlint, yq/Ruby parsing, independent static assertions,
+and 10/10 mutation rejection prove manual-only triggering, exact runners and
+full-SHA pins, no secrets, the fail-closed d3d3 license boundary before Windows
+platform work, exact serial Rust filters, truthful native exits/log states,
+always-upload nonempty artifacts, 14-day retention, and narrow claims. The
+reviewed Linux 42/42 durability and 11/11 crash-harness results remain
+applicable because no source or Cargo input changed. All five contracts,
+pinned `verify:fast`, Seeds 92 ready/96 blocked with Doctor 0 failures,
+Betterleaks, docs-secret, footprint, and range gates passed.
+
+Seed 52b9 remains `in_progress` and is eligible for root closure after this
+fan-in. Seed 2df3 remains blocked only by 52b9; later native dispatch and
+terminal evidence remain license-attestation gated. No Seed closure, workflow
+dispatch, push, settings/secret change, product suite, Blacksmith/Testbox,
+Docker, guest, or platform action occurred.

@@ -1006,3 +1006,64 @@ No product or storage-probe files changed, so the assembled evidence at
 extra Seed edit or closure, `sd sync`, push, workflow change or dispatch,
 25ec/52b9/2df3 start, Testbox, Docker, guest, platform action, or main
 worktree change occurred.
+
+## Wave5 reviewed native durability workflow fan-in
+
+Custody `7132d8032fdc5a13b578ed033ccbb79703513531` was merged
+history-preservingly without conflict at
+`312c74d6cf92fd2cf03caa973ff2cab2d4f5a778`. Its nine named linear commits
+after custody `2a3cb5b44dcc33c5f57793de9d0ee65b5c99a7d1` change only
+`.seeds/issues.jsonl`; the integrated 648-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Reviewed candidate `49fbb6f6e5111da719081b0e43eace611a7631c2` was merged
+history-preservingly without conflict at
+`0b98011b9ded9dbfc833882407eb0463caf273dd`. Its four linear commits from
+exact merge-base `c69face8155322414eba791cee345ada3209a78a` change exactly
+the new manual workflow and the 52b9 implementation report. Standards and
+Spec both returned **SHIP** with zero P0, P1, or P2 findings after two bounded
+correction rounds. The assembled workflow blob
+`1674d11274b1d48fddebfefc1409484cdd365ca1` and report blob
+`26492a640062aa4aa52d153e7fad64797d5364cc` are byte-identical to the reviewed
+candidate; the two exact Cargo commands have bundle SHA-256
+`0918af61773cb1f674682badfaef753e4f5037ee1795a1936369a4a6b2cc716f`.
+
+The assembled workflow is manual `workflow_dispatch` only with `contents: read`,
+no secret context or automatic trigger, and bounded timeouts. Its exact
+matrix uses Blacksmith Linux and macOS runners plus built-in `windows-2025`.
+All six actions are full-SHA pinned. The Windows-only LABSN action remains at
+`d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf`; the required Boolean license
+attestation defaults false and refuses before checkout, LABSN, or platform
+work. Preflight artifacts precede fallible actions, native exits are preserved,
+`test_logs` truthfully distinguishes `not_run`, `partial`, and `full`, and the
+always-run upload requires nonempty evidence with 14-day retention. Claims
+remain limited to process-crash recovery, completed OS barriers, and bounded
+Windows endpoint enumeration; no power-loss, capture, playback, roundtrip, or
+rsac claim was introduced. Seed d3d3 remains open and its license-attestation
+gate remains authoritative for any later Windows dispatch.
+
+| Gate | Result |
+| --- | --- |
+| actionlint and YAML | repo-configured actionlint, yq, Ruby parse, and parsed trigger/runner matrix passed |
+| independent workflow assertions | exact triggers, permissions, runners, pins, licensing, ordering, filters, exits, log states, artifacts, timeouts, and narrow claims passed |
+| mutation sensitivity | 10/10 trigger, runner, pin, license, preflight, filter, log-state, upload, retention, and secret mutations rejected |
+| reviewed local Linux evidence | canonical durability 42/42 and crash harness 11/11 remain applicable; no source or Cargo input changed |
+| all contracts and pinned `verify:fast` | all five current; Biome 174, typecheck, output, secret, and diff green |
+| Seeds ready-all / blocked | 92 ready; 96 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 96, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, docs/Seeds secret, footprint, and range diff | no leaks or secret findings; exact scope, blob identity, and diff checks passed |
+
+The first local invariant-checker attempt expected three copies of each exact
+test command, while the workflow correctly contains four: two evidence-file
+records plus Unix and Windows executions. Correcting that verifier-only count
+made the unchanged accepted blobs pass; it was not a workflow or product
+failure.
+
+Seed 52b9 remains `in_progress` and assigned to `codex-52b9-wave7b`; this
+reviewed fan-in makes it eligible for root closure after reconciliation. Seed
+2df3 remains `in_progress` and blocked only by 52b9; actual native dispatch,
+monitoring, terminal artifacts, and qualification belong to 2df3 after the
+license attestation. No workflow was dispatched, no Seed was closed or edited
+beyond custody, and no push, settings change, secret, Blacksmith/Testbox,
+Docker, guest, or platform action occurred. Product Rust and frontend suites
+were not rerun because no product source or Cargo input changed.
