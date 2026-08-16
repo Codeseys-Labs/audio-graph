@@ -1,0 +1,636 @@
+# Seed audio-graph-52b9: manual, native evidence for audio-graph-2df3.
+# This workflow proves only process-crash recovery and outcomes after returned OS
+# barriers on the named live filesystems. It is not power-loss proof.
+name: 2df3 Native Durability Evidence (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_vb_cable_professional_license:
+        description: Confirm professional-use authorization for the Windows VB-CABLE CI baseline
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  native-durability:
+    name: Native durability evidence (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+            expected_durability_tests: 42
+            expected_crash_harness_tests: 11
+          - os: macos
+            runner: blacksmith-6vcpu-macos-15
+            expected_durability_tests: 13
+            expected_crash_harness_tests: 11
+          - os: windows
+            runner: windows-2025
+            expected_durability_tests: 12
+            expected_crash_harness_tests: 9
+    env:
+      EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
+      EXPECTED_DURABILITY_TESTS: ${{ matrix.expected_durability_tests }}
+      EXPECTED_CRASH_HARNESS_TESTS: ${{ matrix.expected_crash_harness_tests }}
+      # Project-controlled pin adoption and review triggers are recorded under
+      # audio-graph-52b9:vbcable_archive_pin_adoption_2026_08_15.
+      VBCABLE_ARCHIVE_URL: https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip
+      VBCABLE_ARCHIVE_SHA256: 66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd
+      LABSN_VBCABLE_CERT_SHA256: db9f6f54a13ef2ede5a8a7ba69dc841dc0711ba77ae7b173dd093e8455a4ed7e
+      LABSN_DEVCON_SHA256: 97cff42f8c0fe4fbdf991273159516bf78090625a933c3983ebd6f62284e329a
+    steps:
+      - name: Initialize Unix evidence preflight
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            printf 'status=PREPARED\n'
+            printf 'platform=%s\n' "${{ matrix.os }}"
+            printf 'next=checkout\n'
+            printf 'artifact_contract=nonempty_before_fallible_platform_work\n'
+          } > "$EVIDENCE_DIR/preflight.txt"
+          test -s "$EVIDENCE_DIR/preflight.txt"
+
+      - name: Initialize Windows evidence preflight
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          @(
+            "status=PREPARED"
+            "platform=windows"
+            "next=license_gate"
+            "artifact_contract=nonempty_before_fallible_platform_work"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/preflight.txt" -Encoding utf8
+          if ((Get-Item "$env:EVIDENCE_DIR/preflight.txt").Length -eq 0) {
+            throw "Windows evidence preflight must be nonempty."
+          }
+
+      - name: Refuse unconfirmed Windows professional-use run
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license != true }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          $refusal = @(
+            "status=REFUSED"
+            "reason=confirm_vb_cable_professional_license must be true before Windows platform work"
+            "license_material=not_requested_or_logged"
+            "platform_work=not_started"
+          )
+          $refusal | Set-Content -Path "$env:EVIDENCE_DIR/preflight.txt" -Encoding utf8
+          $refusal | Set-Content -Path "$env:EVIDENCE_DIR/summary.txt" -Encoding utf8
+          Write-Error "Windows native evidence refused before checkout, LABSN, or platform work."
+          exit 1
+
+      - name: Check out requested revision
+        if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: audio-graph
+
+      - name: Install Rust 1.95.0
+        if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Check out pinned LABSN Windows helper assets
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: LABSN/sound-ci-helpers
+          ref: d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
+          path: sound-ci-helpers
+          persist-credentials: false
+
+      - name: Restore Rust cache
+        if: ${{ matrix.os != 'windows' || inputs.confirm_vb_cable_professional_license == true }}
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config
+
+      - name: Install macOS system dependencies
+        if: matrix.os == 'macos'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      - name: Configure MSVC environment
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Probe or install Windows system dependencies
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake --version=3.31.0 -y --no-progress
+          }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            choco install llvm --version=19.1.5 -y --no-progress
+            "C:\Program Files\LLVM\bin" |
+              Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path "C:\Program Files\CMake\bin") {
+            "C:\Program Files\CMake\bin" |
+              Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Record Unix runner, toolchain, command, and fixture-filesystem evidence
+        if: matrix.os != 'windows'
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$GITHUB_SHA"
+          {
+            printf 'checked_out_sha=%s\n' "$checked_out_sha"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_image_os=%s\n' "${ImageOS:-unavailable}"
+            printf 'runner_image_version=%s\n' "${ImageVersion:-unavailable}"
+            uname -a
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              sw_vers
+            else
+              sed -n -e 's/^PRETTY_NAME=/os_pretty_name=/p' \
+                -e 's/^VERSION_ID=/os_version_id=/p' /etc/os-release
+            fi
+            rustc --version --verbose
+            cargo --version --verbose
+          } > "$EVIDENCE_DIR/runner-and-toolchain.txt"
+          {
+            printf '%s\n' \
+              'cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1'
+            printf '%s\n' \
+              'cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1'
+          } > "$EVIDENCE_DIR/commands.txt"
+          probe="$RUNNER_TEMP/audio-graph-2df3-filesystem-probe"
+          mkdir -p "$probe"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            {
+              printf 'fixture_parent=%s\n' "$probe"
+              df -P "$probe"
+              mount_point="$(df -P "$probe" | awk 'END { print $NF }')"
+              /usr/sbin/diskutil info "$mount_point" | awk -F: '
+                /File System Personality|Type \(Bundle\)|Device Node|Protocol/ {
+                  key=$1; value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
+                  print key "=" value
+                }'
+            } > "$EVIDENCE_DIR/fixture-filesystem.txt"
+          else
+            {
+              printf 'fixture_parent=%s\n' "$probe"
+              findmnt -T "$probe" -o TARGET,SOURCE,FSTYPE,OPTIONS -n
+              stat -f -c \
+                'filesystem_type=%T block_size=%S blocks=%b free_blocks=%f name_max=%l' \
+                "$probe"
+            } > "$EVIDENCE_DIR/fixture-filesystem.txt"
+          fi
+          rmdir "$probe"
+
+      - name: Record Windows runner, toolchain, command, and fixture-filesystem evidence
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        working-directory: audio-graph/src-tauri
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          $checkedOutSha = (& git rev-parse HEAD).Trim()
+          if ($checkedOutSha -ne $env:GITHUB_SHA) {
+            throw "Checked-out SHA does not match GITHUB_SHA."
+          }
+          @(
+            "checked_out_sha=$checkedOutSha"
+            "runner_os=$env:RUNNER_OS"
+            "runner_arch=$env:RUNNER_ARCH"
+            "runner_name=$env:RUNNER_NAME"
+            "runner_image_os=$(if ($env:ImageOS) { $env:ImageOS } else { 'unavailable' })"
+            "runner_image_version=$(if ($env:ImageVersion) { $env:ImageVersion } else { 'unavailable' })"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/runner-and-toolchain.txt" -Encoding utf8
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            ConvertTo-Json -Compress |
+            Out-File -FilePath "$env:EVIDENCE_DIR/runner-and-toolchain.txt" -Encoding utf8 -Append
+          rustc --version --verbose |
+            Out-File -FilePath "$env:EVIDENCE_DIR/runner-and-toolchain.txt" -Encoding utf8 -Append
+          cargo --version --verbose |
+            Out-File -FilePath "$env:EVIDENCE_DIR/runner-and-toolchain.txt" -Encoding utf8 -Append
+          @(
+            'AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1'
+            'cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1'
+            'cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/commands.txt" -Encoding utf8
+          $probe = Join-Path $env:TEMP 'audio-graph-2df3-filesystem-probe'
+          New-Item -ItemType Directory -Force -Path $probe | Out-Null
+          $volume = [System.IO.Path]::GetPathRoot($probe)
+          @(
+            "fixture_parent=$probe"
+            "fixture_volume=$volume"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8
+          fsutil fsinfo volumeinfo $volume |
+            Out-File -FilePath "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8 -Append
+          Remove-Item -Path $probe -Force
+
+      # The upstream LABSN action downloads a mutable URL directly. Keep using
+      # its commit-pinned certificate and devcon helper, but install only the
+      # exact project-pinned VB-Audio archive after verifying its SHA-256,
+      # catalog signature, signer, and selected catalog members. VB-Audio does
+      # not publish an upstream checksum, so any byte change requires review.
+      - name: Install verified Windows virtual-device enumeration baseline
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'VBCABLE_Driver_Pack43.zip'
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'VBCABLE_Driver_Pack43'
+          $helperRoot = Join-Path $env:GITHUB_WORKSPACE 'sound-ci-helpers\windows'
+
+          Invoke-WebRequest `
+            -Uri $env:VBCABLE_ARCHIVE_URL `
+            -OutFile $archive `
+            -MaximumRetryCount 2 `
+            -RetryIntervalSec 1
+          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $env:VBCABLE_ARCHIVE_SHA256) {
+            Remove-Item -Path $archive -Force -ErrorAction SilentlyContinue
+            throw "VB-CABLE archive SHA-256 mismatch; refusing certificate import and driver installation."
+          }
+
+          Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+          $certificate = Join-Path $helperRoot 'vbcable.cer'
+          $devcon = Join-Path $helperRoot 'devcon.exe'
+          $driverInf = Join-Path $extractRoot 'vbMmeCable64_win7.inf'
+          $driverCatalog = Join-Path $extractRoot 'vbaudio_cable64_win7.cat'
+          $driverSys = Join-Path $extractRoot 'vbaudio_cable64_win7.sys'
+          foreach ($requiredPath in @($certificate, $devcon, $driverInf, $driverCatalog, $driverSys)) {
+            if (-not (Test-Path $requiredPath -PathType Leaf)) {
+              throw "Required verified VB-CABLE installation input is absent."
+            }
+          }
+          $actualCertificateSha256 = (Get-FileHash -Path $certificate -Algorithm SHA256).Hash.ToLowerInvariant()
+          $actualDevconSha256 = (Get-FileHash -Path $devcon -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualCertificateSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256 -or
+            $actualDevconSha256 -ne $env:LABSN_DEVCON_SHA256) {
+            throw "Pinned LABSN Windows helper asset digest mismatch; refusing privileged installation."
+          }
+
+          $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signTool) {
+            $windowsKits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signTool = Get-ChildItem -Path $windowsKits -Filter signtool.exe -Recurse -ErrorAction Stop |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $signTool) {
+            throw "Windows SDK SignTool is unavailable; refusing certificate import and installation."
+          }
+
+          & $signTool verify /kp /v $driverCatalog
+          if ($LASTEXITCODE -ne 0) {
+            throw "VB-CABLE catalog kernel-policy signature verification failed."
+          }
+          $catalogSignature = Get-AuthenticodeSignature -FilePath $driverCatalog
+          if (-not $catalogSignature.SignerCertificate) {
+            throw "VB-CABLE catalog signer certificate is unavailable."
+          }
+          $catalogSignerSha256 = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($catalogSignature.SignerCertificate.RawData)
+          ).ToLowerInvariant()
+          if ($catalogSignerSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256) {
+            throw "VB-CABLE catalog signer does not match the pinned Vincent Burel certificate."
+          }
+          foreach ($catalogMember in @($driverInf, $driverSys)) {
+            & $signTool verify /kp /v /c $driverCatalog $catalogMember
+            if ($LASTEXITCODE -ne 0) {
+              throw "VB-CABLE catalog membership verification failed."
+            }
+          }
+
+          $devconSignature = Get-AuthenticodeSignature -FilePath $devcon
+          if ($devconSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            $devconSignature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw "Pinned LABSN DevCon helper lacks a valid Microsoft Authenticode signature."
+          }
+
+          $publisherCertificate = Get-PfxCertificate -FilePath $certificate
+          $publisherStorePath = "Cert:\LocalMachine\TrustedPublisher\$($publisherCertificate.Thumbprint)"
+          $publisherWasPresent = Test-Path $publisherStorePath
+          $publisherNeedsCleanup = -not $publisherWasPresent
+          $trustedPublisherAdded = $false
+          $trustedPublisherCleanupExit = 'not_required'
+          $publisherStateRestored = $false
+          try {
+            if (-not $publisherWasPresent) {
+              & certutil.exe -addstore 'TrustedPublisher' $certificate
+              if ($LASTEXITCODE -ne 0) {
+                throw "VB-CABLE publisher certificate import failed."
+              }
+              $trustedPublisherAdded = $true
+            }
+            & $devcon install $driverInf 'VBAudioVACWDM'
+            if ($LASTEXITCODE -ne 0) {
+              throw "VB-CABLE device installation failed or requires a reboot."
+            }
+          } finally {
+            if ($publisherNeedsCleanup) {
+              & certutil.exe -delstore 'TrustedPublisher' $publisherCertificate.Thumbprint
+              $trustedPublisherCleanupExit = $LASTEXITCODE
+            }
+            $publisherPresentAfterCleanup = Test-Path $publisherStorePath
+            $publisherStateRestored = $publisherPresentAfterCleanup -eq $publisherWasPresent
+            if (-not $publisherStateRestored) {
+              throw "VB-CABLE publisher certificate cleanup did not restore the original store state."
+            }
+          }
+
+          @(
+            'status=VERIFIED_INSTALL_COMPLETE'
+            "archive_sha256=$actualSha256"
+            'upstream_digest_published=false'
+            'archive_hash_provenance=project_pin_plus_preinstall_catalog_validation'
+            "catalog_signer_certificate_sha256=$catalogSignerSha256"
+            "labsn_certificate_sha256=$actualCertificateSha256"
+            "labsn_devcon_sha256=$actualDevconSha256"
+            'catalog_signature_verified=true'
+            'catalog_members_verified=vbMmeCable64_win7.inf,vbaudio_cable64_win7.sys'
+            "trusted_publisher_certificate_preexisting=$($publisherWasPresent.ToString().ToLowerInvariant())"
+            "trusted_publisher_certificate_added=$($trustedPublisherAdded.ToString().ToLowerInvariant())"
+            "trusted_publisher_cleanup_exit=$trustedPublisherCleanupExit"
+            "trusted_publisher_state_restored=$($publisherStateRestored.ToString().ToLowerInvariant())"
+            'devcon_exit=0'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-driver-verification.txt" -Encoding utf8
+
+      - name: Record bounded allowlisted Windows endpoint inventory
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        run: |
+          @(
+            "helper_source=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf"
+            "archive_url=$env:VBCABLE_ARCHIVE_URL"
+            "archive_sha256=$env:VBCABLE_ARCHIVE_SHA256"
+            "upstream_digest_published=false"
+            "archive_hash_provenance=project_pin_plus_preinstall_catalog_validation"
+            "archive_hash_verified_before_certificate_import=true"
+            "labsn_certificate_sha256=$env:LABSN_VBCABLE_CERT_SHA256"
+            "labsn_devcon_sha256=$env:LABSN_DEVCON_SHA256"
+            "runner_lifetime=ephemeral_job_only"
+            "persistent_runner=false"
+            "license_material=not_requested_or_logged"
+            "purpose=bounded_endpoint_enumeration_only"
+            "excluded_claims=capture,playback,default_device,roundtrip,rsac"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-supply-chain-boundary.txt" -Encoding utf8
+          $endpoints = @(
+            Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |
+              Sort-Object FriendlyName, InstanceId |
+              Select-Object -First 64 `
+                @{Name = 'status'; Expression = { $_.Status }}, `
+                @{Name = 'class'; Expression = { $_.Class }}, `
+                @{Name = 'friendly_name'; Expression = { $_.FriendlyName }}, `
+                @{Name = 'instance_id'; Expression = { $_.InstanceId }}
+          )
+          if ($endpoints.Count -eq 0) {
+            throw "No present AudioEndpoint records found after the enumeration baseline."
+          }
+          $cableEndpoints = @(
+            $endpoints | Where-Object friendly_name -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
+          )
+          if ($cableEndpoints.Count -eq 0) {
+            throw "No expected VB-CABLE endpoint is present after verified installation."
+          }
+          [ordered]@{
+            schema = 'audio-graph-2df3-endpoint-inventory-v1'
+            allowlisted_fields = @('status', 'class', 'friendly_name', 'instance_id')
+            max_records = 64
+            record_count = $endpoints.Count
+            vb_cable_record_count = $cableEndpoints.Count
+            records = $endpoints
+          } | ConvertTo-Json -Depth 5 |
+            Set-Content -Path "$env:EVIDENCE_DIR/windows-endpoints.json" -Encoding utf8
+
+      - name: Run canonical durability filter (Unix)
+        if: matrix.os != 'windows'
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        timeout-minutes: 45
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1 \
+            2>&1 | tee "$EVIDENCE_DIR/canonical_durability.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          native_exit="${pipeline_status[0]}"
+          tee_exit="${pipeline_status[1]}"
+          test_count="$(awk '$1 == "running" && $2 ~ /^[0-9]+$/ && ($3 == "test" || $3 == "tests") { print $2; exit }' \
+            "$EVIDENCE_DIR/canonical_durability.log")"
+          printf '%s\n' "$native_exit" > "$EVIDENCE_DIR/canonical_durability.exit"
+          printf '%s\n' "$tee_exit" > "$EVIDENCE_DIR/canonical_durability.tee.exit"
+          printf '%s\n' "${test_count:-0}" > "$EVIDENCE_DIR/canonical_durability.tests"
+          exit 0
+
+      - name: Run canonical durability filter (Windows)
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        working-directory: audio-graph/src-tauri
+        shell: pwsh
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1 2>&1 |
+            Tee-Object -FilePath "$env:EVIDENCE_DIR/canonical_durability.log" -ErrorAction Stop
+          $nativeExit = $LASTEXITCODE
+          $match = Select-String `
+            -Path "$env:EVIDENCE_DIR/canonical_durability.log" `
+            -Pattern '^running ([0-9]+) tests?$' |
+            Select-Object -First 1
+          $testCount = if ($match) { $match.Matches[0].Groups[1].Value } else { '0' }
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_durability.exit" -Value $nativeExit -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_durability.tee.exit" -Value 0 -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_durability.tests" -Value $testCount -Encoding ascii
+          exit 0
+
+      - name: Run canonical crash-harness filter (Unix)
+        if: matrix.os != 'windows'
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        timeout-minutes: 45
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1 \
+            2>&1 | tee "$EVIDENCE_DIR/canonical_crash_harness.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          native_exit="${pipeline_status[0]}"
+          tee_exit="${pipeline_status[1]}"
+          test_count="$(awk '$1 == "running" && $2 ~ /^[0-9]+$/ && ($3 == "test" || $3 == "tests") { print $2; exit }' \
+            "$EVIDENCE_DIR/canonical_crash_harness.log")"
+          printf '%s\n' "$native_exit" > "$EVIDENCE_DIR/canonical_crash_harness.exit"
+          printf '%s\n' "$tee_exit" > "$EVIDENCE_DIR/canonical_crash_harness.tee.exit"
+          printf '%s\n' "${test_count:-0}" > "$EVIDENCE_DIR/canonical_crash_harness.tests"
+          exit 0
+
+      - name: Run canonical crash-harness filter (Windows)
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        working-directory: audio-graph/src-tauri
+        shell: pwsh
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1 2>&1 |
+            Tee-Object -FilePath "$env:EVIDENCE_DIR/canonical_crash_harness.log" -ErrorAction Stop
+          $nativeExit = $LASTEXITCODE
+          $match = Select-String `
+            -Path "$env:EVIDENCE_DIR/canonical_crash_harness.log" `
+            -Pattern '^running ([0-9]+) tests?$' |
+            Select-Object -First 1
+          $testCount = if ($match) { $match.Matches[0].Groups[1].Value } else { '0' }
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_crash_harness.exit" -Value $nativeExit -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_crash_harness.tee.exit" -Value 0 -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/canonical_crash_harness.tests" -Value $testCount -Encoding ascii
+          exit 0
+
+      - name: Summarize and enforce native exits (Unix)
+        if: ${{ always() && matrix.os != 'windows' }}
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          first="$(cat "$EVIDENCE_DIR/canonical_durability.exit" 2>/dev/null || printf 'not_run')"
+          first_tee="$(cat "$EVIDENCE_DIR/canonical_durability.tee.exit" 2>/dev/null || printf 'not_run')"
+          first_tests="$(cat "$EVIDENCE_DIR/canonical_durability.tests" 2>/dev/null || printf '0')"
+          second="$(cat "$EVIDENCE_DIR/canonical_crash_harness.exit" 2>/dev/null || printf 'not_run')"
+          second_tee="$(cat "$EVIDENCE_DIR/canonical_crash_harness.tee.exit" 2>/dev/null || printf 'not_run')"
+          second_tests="$(cat "$EVIDENCE_DIR/canonical_crash_harness.tests" 2>/dev/null || printf '0')"
+          durability_log=false
+          crash_harness_log=false
+          if [ -s "$EVIDENCE_DIR/canonical_durability.log" ]; then
+            durability_log=true
+          fi
+          if [ -s "$EVIDENCE_DIR/canonical_crash_harness.log" ]; then
+            crash_harness_log=true
+          fi
+          case "$durability_log:$crash_harness_log" in
+            true:true) test_logs=full ;;
+            false:false) test_logs=not_run ;;
+            *) test_logs=partial ;;
+          esac
+          status=PASS
+          if [ "$first" != 0 ] || [ "$first_tee" != 0 ] ||
+            [ "$second" != 0 ] || [ "$second_tee" != 0 ] ||
+            [ "$test_logs" != full ] ||
+            [ "$first_tests" != "$EXPECTED_DURABILITY_TESTS" ] ||
+            [ "$second_tests" != "$EXPECTED_CRASH_HARNESS_TESTS" ]; then
+            status=FAIL
+          fi
+          {
+            printf 'status=%s\n' "$status"
+            printf 'canonical_durability_exit=%s\n' "$first"
+            printf 'canonical_durability_tee_exit=%s\n' "$first_tee"
+            printf 'canonical_durability_tests=%s\n' "$first_tests"
+            printf 'canonical_durability_expected_tests=%s\n' "$EXPECTED_DURABILITY_TESTS"
+            printf 'canonical_crash_harness_exit=%s\n' "$second"
+            printf 'canonical_crash_harness_tee_exit=%s\n' "$second_tee"
+            printf 'canonical_crash_harness_tests=%s\n' "$second_tests"
+            printf 'canonical_crash_harness_expected_tests=%s\n' "$EXPECTED_CRASH_HARNESS_TESTS"
+            printf 'claim=process-crash recovery and completed OS-barrier outcomes only\n'
+            printf 'power_loss_claim=false\n'
+            printf 'test_logs=%s\n' "$test_logs"
+          } > "$EVIDENCE_DIR/summary.txt"
+          test "$status" = PASS
+
+      - name: Summarize and enforce native exits (Windows)
+        if: ${{ always() && matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          $first = if (Test-Path "$env:EVIDENCE_DIR/canonical_durability.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_durability.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $firstTee = if (Test-Path "$env:EVIDENCE_DIR/canonical_durability.tee.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_durability.tee.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $firstTests = if (Test-Path "$env:EVIDENCE_DIR/canonical_durability.tests") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_durability.tests" -Raw).Trim()
+          } else { '0' }
+          $second = if (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_crash_harness.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $secondTee = if (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.tee.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_crash_harness.tee.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $secondTests = if (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.tests") {
+            (Get-Content "$env:EVIDENCE_DIR/canonical_crash_harness.tests" -Raw).Trim()
+          } else { '0' }
+          $durabilityLog = (Test-Path "$env:EVIDENCE_DIR/canonical_durability.log" -PathType Leaf) -and
+            ((Get-Item "$env:EVIDENCE_DIR/canonical_durability.log").Length -gt 0)
+          $crashHarnessLog = (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.log" -PathType Leaf) -and
+            ((Get-Item "$env:EVIDENCE_DIR/canonical_crash_harness.log").Length -gt 0)
+          $testLogs = if ($durabilityLog -and $crashHarnessLog) {
+            'full'
+          } elseif ($durabilityLog -or $crashHarnessLog) {
+            'partial'
+          } else {
+            'not_run'
+          }
+          $status = if (
+            $first -eq '0' -and $firstTee -eq '0' -and
+            $firstTests -eq $env:EXPECTED_DURABILITY_TESTS -and
+            $second -eq '0' -and $secondTee -eq '0' -and
+            $secondTests -eq $env:EXPECTED_CRASH_HARNESS_TESTS -and
+            $testLogs -eq 'full'
+          ) { 'PASS' } else { 'FAIL' }
+          @(
+            "status=$status"
+            "canonical_durability_exit=$first"
+            "canonical_durability_tee_exit=$firstTee"
+            "canonical_durability_tests=$firstTests"
+            "canonical_durability_expected_tests=$env:EXPECTED_DURABILITY_TESTS"
+            "canonical_crash_harness_exit=$second"
+            "canonical_crash_harness_tee_exit=$secondTee"
+            "canonical_crash_harness_tests=$secondTests"
+            "canonical_crash_harness_expected_tests=$env:EXPECTED_CRASH_HARNESS_TESTS"
+            "claim=process-crash recovery and completed OS-barrier outcomes only"
+            "power_loss_claim=false"
+            "test_logs=$testLogs"
+            "audio_claim=endpoint enumeration only"
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/summary.txt" -Encoding utf8
+          if ($status -ne 'PASS') { exit 1 }
+
+      - name: Upload per-platform native durability evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: 2df3-native-durability-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
