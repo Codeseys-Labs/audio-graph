@@ -1,260 +1,189 @@
-# audio-graph-cc9a native evidence closure report
+# audio-graph-cc9a native evidence correction report
 
 ## Assignment and custody
 
 - Seed: `audio-graph-cc9a`.
-- Acceptance: expose the production qualification proof under one stable
-  `cc9a_native_` filter, execute and preserve exact platform-specific test-name
-  and count evidence in the native durability matrix, and fail closed on any
-  command, artifact, summary, or proof-contract drift.
+- Acceptance for this correction: bind macOS APFS selection to the managed
+  root's native volume identity, retain all existing policy and mount-volume
+  checks, correct the Windows broad-test expectation, strengthen its checker,
+  and preserve an honest terminal-run record pending a native rerun.
 - Exact base and merge-base:
-  `2212354c0dddd25f837eec408474b95fc9be9e29`.
+  `3afe56c52e74804372cb752e418b4004b1e24694`.
 - Worktree:
-  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-native-evidence-wave7c`.
-- Branch: `work/audio-graph-cc9a-native-evidence-wave7c`.
-- Initial and pre-report state: clean at implementation tip
-  `28cab92d89c6f0ffca05f6ac8fb7f537b3fd8aa1`.
-- Plan commit: `d54fd46095de99a812ea71b89ba9ca9801504392`.
-- Implementation commit: `28cab92d89c6f0ffca05f6ac8fb7f537b3fd8aa1`.
+  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-native-correction-wave7c`.
+- Branch: `work/audio-graph-cc9a-native-correction-wave7c`.
+- Implementation commit:
+  `9ba603eaff57bf502a547d87941e6a98da7e6367`.
 - Report commit: this artifact's containing commit. Its exact SHA cannot be
   embedded in its own Git object and is recorded in the final handoff.
 
-No Seed, dependency, frontend, generated file, other workflow, dispatch,
-GitHub state, or runtime consumer was changed. The conductor retains
-integration, Seed reconciliation, push, dispatch, merge, and cleanup authority.
+The correction changes exactly the assigned source, workflow, checker, and
+this report. It does not change Seeds, dependencies, frontend or generated
+files, other workflows, runtime consumers, GitHub state, or remote refs. The
+conductor retains Seed reconciliation, native rerun, integration, push, merge,
+and cleanup authority.
 
-## Outcome
+## Terminal run 31981177828
 
-The production qualification proof now has one stable native filter:
+The terminal native run executed exact head
+`02a09282b56427bc39088bc126968aa68190f90f`. Downloaded logs and artifacts are
+retained at `/tmp/audio-graph-cc9a-native-31981177828.LspXQy`.
 
-- Linux and macOS expose exactly three `cc9a_native_` tests. They cover a
-  recreated-root refusal before coordination mutation, a qualified initial
-  manifest CAS with the file-and-parent durability receipt, and a qualified
-  replacement refusal when the open manifest head is replaced before temp
-  creation.
-- Windows exposes exactly one `cc9a_native_` test. It calls
-  `SessionArtifactManifestStore::qualified_existing_root`, requires the typed
-  `NamespaceDurabilityUnsupported { platform: Windows }` refusal, and proves
-  the existing root remains entry-identical with no coordination, temp, or
-  manifest-head mutation.
-- The native workflow runs the filter on every matrix member and records the
-  native process exit, tee exit, test count, exact sorted name markers, and
-  complete log/artifact set. Unix and Windows summaries fail closed unless
-  every platform-specific name, count, exit, and artifact is exact.
-- Broad matrix expectations advance to Linux 46, macOS 16, and Windows 15;
-  crash-harness expectations remain Unix 11 and Windows 9.
-- The checker loads both Rust proof sources and rejects the original 18 LABSN
-  regressions plus 14 cc9a proof/workflow regressions, for 32 mutations total.
+The upload logs record these SHA-256 digests for the finalized artifact zips:
 
-The pinned direct LABSN action, license gate, cleanup, and shared Windows job
-remain intact. LABSN is retained for that shared Windows job but is unrelated
-to the cc9a namespace proof.
+| Platform | Artifact SHA-256 |
+| --- | --- |
+| Linux | `3c91bd25dd7ecba60205142dbbb18940a910b217903d83f9ac4861b67458b053` |
+| macOS | `30018aaefa880b29bbafad8f242d27326d029efd525d24655435953201a88b7c` |
+| Windows | `abcde903b9e53d81536bb7d00f204755bbdc9af11d7a26c1647a7925833c0ff6` |
+
+The platform evidence is intentionally separated from the correction status:
+
+- Linux Blacksmith Ubuntu 24.04 on ext4 passed `cc9a_native_` 3/3,
+  `canonical_durability` 46/46, and crash harness 11/11.
+- macOS Blacksmith macOS 15 on APFS failed all three `cc9a_native_` tests and
+  the canonical qualification guard test; the broad suite was 15 passed and
+  1 failed, while crash harness 11/11 passed. Each failed qualification
+  returned `ReadOnlyFilesystem { class: Apfs }`.
+- Windows GitHub `windows-2025` on NTFS passed the exact production typed
+  refusal proof 1/1 and crash harness 9/9. Its broad canonical suite actually
+  passed 14 tests and exited 0, but the workflow expected 15, so the summary
+  correctly failed the harness count gate.
+
+The macOS fixture evidence identifies `/dev/disk2s5` mounted at
+`/System/Volumes/Data`, reports APFS, and shows the fixture under logical
+`/Users`. The former lexical longest-prefix selection attributed logical
+`/Users` and `/var` roots to the read-only APFS System `/` observation even
+though root metadata belongs to the writable Data device. LABSN completed on
+Windows but is unrelated to the namespace qualification result. No active
+Blacksmith Testboxes remained after the terminal run.
+
+## Correction
+
+Live filesystem observations now derive an optional, content-free
+`VolumeIdentity` from safe `std::fs::metadata` and the existing
+`filesystem_identity` seam. On macOS, qualification selects exactly one mount
+observation whose native volume identity equals the canonical root's volume
+identity before applying the existing policy gates. It refuses closed when
+the root or mount identity is unavailable, no same-volume mount exists, or
+more than one observation claims the root volume.
+
+The selected mount must still be exactly APFS, writable, and non-removable.
+`validate_mount_volume` independently re-reads the selected mount metadata and
+compares its volume identity to the root. Initial qualification and guard
+revalidation both call the same selector and independent validator. Linux
+retains longest lexical-prefix selection and exact ext4 policy. No unsafe,
+libc/statfs call, dependency, firmlink allowlist, test write, caller authority,
+or arbitrary APFS acceptance was added.
+
+The deterministic macOS topology test models:
+
+- logical `/Users/...` root identity on the Data device;
+- read-only APFS `/` on a different System device; and
+- writable, non-removable APFS `/System/Volumes/Data` on the root's device.
+
+The same test covers read-only and removable matched Data mounts, missing root
+identity, missing mount identity, no same-volume match, and ambiguous duplicate
+same-volume observations. It is compiled for Linux and macOS, so broad native
+expectations are now Linux 47, macOS 17, and Windows 14.
+
+The checker now extracts the Windows matrix row and jointly requires
+`cc9a_native_` 1, broad canonical 14, and crash harness 9 in that row. A new
+mutation changes only the Windows canonical count from 14 to 13 and is
+rejected. The checker total is 33 mutations. Summary equality gates, the
+focused Windows `cc9a_native_` proof, and LABSN license, certificate cleanup,
+and evidence boundaries remain unchanged.
 
 ## TDD evidence
 
-### Workflow-contract RED
+### Deterministic RED
 
-After the source/checker slice existed but before the workflow step was added,
-the real checker command was:
-
-```text
-bun run check:2df3-labsn-action
-```
-
-It exited nonzero with the exact load-bearing error:
-
-```text
-Error: missing workflow step: Run cc9a native qualification filter (Unix)
-```
-
-This proved the checker would not accept source-only qualification claims
-without executable matrix evidence.
-
-### Final checker GREEN
-
-The same command on implementation tip
-`28cab92d89c6f0ffca05f6ac8fb7f537b3fd8aa1` exited 0:
-
-```text
-PASS: direct LABSN and cc9a native evidence contract with 32 mutations
-```
-
-### Local Linux production-filter GREEN
-
-Command:
+After adding observation identity and the desired firmlink topology test but
+before changing selection, this command exited 101:
 
 ```text
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked \
   --manifest-path src-tauri/Cargo.toml --lib --no-default-features \
-  --features cloud cc9a_native_ -- --nocapture --test-threads=1
+  --features cloud \
+  macos_volume_group_selection_binds_logical_root_to_unique_data_volume -- \
+  --nocapture --test-threads=1
 ```
 
-Result: exit 0 in 2.33s; 3 passed, 0 failed, 1,701 filtered out.
+The exact assertion mismatch was:
 
 ```text
-cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation
-cc9a_native_qualified_initial_cas_has_parent_barrier
-cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation
+left: Err(ReadOnlyFilesystem { class: Apfs })
+right: Ok(QualifiedFilesystemMount { mount_point: "/System/Volumes/Data", class: Apfs })
 ```
 
-This is local Linux/ext4 production evidence only. Native macOS/APFS and
-Windows evidence are **not claimed** until the authorized remote matrix runs.
-The Windows production-refusal test is present and statically guarded, but it
-was not executed on this Linux host.
+This reproduces the native failure without requiring a macOS host.
 
-## Final gates and exact results
+### GREEN
+
+The same focused command passed 1/1 after the identity-bound selector was
+implemented. The companion fail-closed cases execute inside that same test.
+The full focused module then passed 47/47 on Linux, including the live ext4
+production qualification.
+
+## Final local gates on implementation commit
 
 All Rust commands used Rust/Cargo 1.95.0 and the worktree-local
 `src-tauri/target`.
 
-### Focused and broad Rust
+- Focused macOS policy topology: 1 passed, 0 failed.
+- `cc9a_native_`: 3 passed, 0 failed, 1,702 filtered out.
+- `canonical_durability`: 47 passed, 0 failed, 1,658 filtered out; live Linux
+  ext4 qualification admitted.
+- `session_artifact_manifest`: 26 passed, 0 failed, 1,679 filtered out.
+- Locked cloud `cargo check --lib --tests`: exit 0.
+- Strict cloud Clippy with `-D warnings`: exit 0 with no warnings.
+- `cargo fmt --all -- --check`: exit 0 with no diff.
+- The single final serialized full cloud library suite: 1,697 passed, 0
+  failed, 8 ignored in 64.67 seconds. Expected PipeWire/ALSA diagnostics on
+  the audio-less Linux host did not fail a test.
+- `bun run typecheck`: exit 0 with no diagnostics.
+- `bun run verify:contracts`: exit 0; all five generated contracts were
+  current: audio source, provider registry, session data movement, endpoint
+  credential routing, and speech span revision.
+- Repo-pinned `SEEDS_CLI_ROOT=... bun run verify:fast`: exit 0. Biome checked
+  174 files; TypeScript and all five contracts passed; all 33 checker
+  mutations were rejected; Seeds JSON stress parsed ready 50, blocked 94, and
+  list 50; docs/Seeds hygiene reported 0 findings; diff hygiene passed.
+- Direct `bun run check:2df3-labsn-action`: exit 0 with
+  `PASS: direct LABSN and cc9a native evidence contract with 33 mutations`.
 
-```text
-cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib \
-  --no-default-features --features cloud canonical_durability -- \
-  --nocapture --test-threads=1
-```
+The repository-configured actionlint, `yq eval '.'`, Ruby
+`YAML.safe_load_file`, and Node syntax checks passed. All six workflow steps
+declaring `shell: bash` were extracted independently with `yq` and passed
+`bash -n`. Neither `pwsh` nor `powershell.exe` is installed on this Linux host,
+so the PowerShell AST parser is recorded as unavailable; no tool was installed.
 
-Result: exit 0 in 4.50s; 46 passed, 0 failed, 1,658 filtered out. The live
-probe printed `live Linux ext4 qualification admitted`.
+## Security, footprint, and runtime-dark checks
 
-```text
-cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib \
-  --no-default-features --features cloud session_artifact_manifest -- \
-  --nocapture --test-threads=1
-```
-
-Result: exit 0 in 10.39s; 26 passed, 0 failed, 1,678 filtered out.
-
-### Locked compile, lint, formatting, and full library
-
-```text
-cargo +1.95.0 check --locked --manifest-path src-tauri/Cargo.toml --lib \
-  --tests --no-default-features --features cloud
-cargo +1.95.0 clippy --locked --manifest-path src-tauri/Cargo.toml --lib \
-  --tests --no-default-features --features cloud -- -D warnings
-cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-```
-
-Final independent reruns: locked cloud check exit 0 in 0.63s; strict Clippy
-exit 0 in 16.53s with no warnings; rustfmt exit 0 in 1.17s with no diff.
-
-The one final serialized full cloud-library run used:
-
-```text
-cargo +1.95.0 test --quiet --locked --manifest-path src-tauri/Cargo.toml \
-  --lib --no-default-features --features cloud -- --test-threads=1
-```
-
-Result: exit 0 in 57.11s; 1,696 passed, 0 failed, 8 ignored, finished in
-56.41s. PipeWire and ALSA emitted expected diagnostics because this host has no
-audio device; they did not fail a test.
-
-### Frontend, contracts, and repo-pinned aggregate gate
-
-`bun run typecheck` exited 0 in 6.49s with no TypeScript diagnostics.
-
-`bun run verify:contracts` exited 0 in 19.18s. All five generated artifacts
-were current: audio source, provider registry, session data movement, endpoint
-credential routing, and speech span revision.
-
-The authoritative aggregate command was:
-
-```text
-SEEDS_CLI_ROOT=/home/codeseys/DevBox/audio-graph/node_modules/@os-eco/seeds-cli \
-  bun run verify:fast
-```
-
-Result: exit 0 in 9.07s. Biome checked 174 files; TypeScript passed; all five
-contracts were current; the checker rejected all 32 mutations; Seeds JSON
-stress parsed ready 50, blocked 94, and list 50; docs/Seeds secret hygiene
-reported 0 findings; and diff hygiene passed.
-
-### Workflow syntax and parser gates
-
-The repository-configured actionlint command, `yq eval '.'`, Ruby
-`YAML.safe_load_file`, and `node --check scripts/check-2df3-labsn-action.mjs`
-all exited 0. Each of the six workflow steps declaring `shell: bash` was
-extracted with `yq` and passed `bash -n` independently.
-
-Neither `pwsh` nor `powershell.exe` is installed on this Linux host. The
-PowerShell AST-parser gate was therefore recorded as unavailable and no tool
-was installed. The Windows bodies still passed actionlint and both YAML
-parsers; their executable parser/runtime evidence remains part of the remote
-Windows matrix boundary.
-
-### Security, custody, and runtime-dark checks
-
-The report-inclusive Betterleaks scan covered all six authorized paths:
-approximately 371,947 bytes scanned with no leaks. The report-inclusive
-docs/Seeds secret-hygiene scan reported 0 findings. `git diff --check` is
-clean.
-
-A bounded production-source call-site search inspected `src-tauri/src` outside
-the two owned persistence modules for
-`SessionArtifactManifestStore::qualified_existing_root` and
-`try_lock_exclusive_qualified`; it found no external production runtime caller.
-This bounded conclusion excludes the workflow, checker, docs/report text, and
-the test bodies inside the owned modules, where cc9a evidence references are
-expected. The new qualification evidence remains runtime-dark: no production
-Session consumer was activated.
-
-The cumulative branch footprint from exact base through this report is
-exactly these six authorized paths:
+The report-inclusive Betterleaks scan covered all four authorized paths and
+reported `no leaks found`. The report-inclusive docs/Seeds secret-hygiene scan
+reported `0 findings`, and `git diff --check` passed. The exact cumulative
+correction footprint from the assigned base is:
 
 ```text
 .github/workflows/2df3-native-durability.yml
-docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-cc9a-native-evidence-plan.md
 docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-cc9a-native-evidence-report.md
 scripts/check-2df3-labsn-action.mjs
 src-tauri/src/persistence/canonical_durability.rs
-src-tauri/src/persistence/session_artifact_manifest.rs
 ```
 
-## Terminal Standards review correction
+A bounded call-site search over `src-tauri/src` outside
+`canonical_durability.rs` and `session_artifact_manifest.rs` found no production
+caller of `SessionArtifactManifestStore::qualified_existing_root` or
+`try_lock_exclusive_qualified`. The correction remains runtime-dark; it does
+not activate a Session writer or consumer. The bounded gate reported
+`runtime_dark_external_hits=0`.
 
-The terminal Standards review raised two documentation-accuracy nits, both
-accepted without behavioral or cfg change:
+## Outcome and open question
 
-- The macOS-enabled live initial-CAS test now uses platform-neutral panic text
-  (`qualify existing live manifest root`) rather than describing every admitted
-  platform as ext4.
-- The runtime-dark statement now names its bounded production-source scope and
-  exclusions. Workflow/checker/docs references and in-module test evidence are
-  expected; the verified conclusion is only that no external production
-  runtime consumer was activated.
-
-Proportional correction gates on the two-file candidate passed:
-
-- `cc9a_native_`: exit 0 in 17.26s; 3 passed, 0 failed, 1,701 filtered out;
-- checker: exit 0 in 0.04s; all 32 mutations rejected;
-- repository-configured actionlint: exit 0, no findings;
-- rustfmt: exit 0 in 1.33s, no diff;
-- checker Node syntax: exit 0;
-- `git diff --check`: exit 0;
-- final report-inclusive Betterleaks: no leaks; and
-- final report-inclusive docs/Seeds secret hygiene: 0 findings.
-
-### Standards re-review BLOCK(P3)
-
-Standards re-review found that the second macOS-enabled cc9a manifest test
-still described its live root as ext4. The replacement test now uses the same
-platform-neutral `qualify existing live manifest root` panic text as the
-initial-CAS test. No behavior or cfg changed. A bounded `rg` proof over the two
-broadened cc9a native manifest test bodies confirms two matching neutral
-strings and no remaining `ext4` text. The proportional correction gates
-passed: bounded `rg` proof (`neutral_count=2`, `ext4_count=0`), `cc9a_native_`
-3/3 in 12.50s, checker with all 32 mutations rejected in 0.03s, rustfmt in
-1.18s, `git diff --check`, report-inclusive Betterleaks with no leaks, and
-report-inclusive docs/Seeds secret hygiene with 0 findings.
-
-## Findings and open questions
-
-- No implementation blocker remains.
-- Local Linux/ext4 qualification is proven. Native macOS/APFS and Windows are
-  deliberately unclaimed until the remote matrix runs and preserves the new
-  name/count/exit/artifact evidence.
-- LABSN remains necessary to the shared Windows durability job, but it does
-  not establish or weaken the cc9a namespace proof.
-- No follow-up was discovered inside this bounded worker scope. Seed closure,
-  remote dispatch, and integration remain conductor decisions.
+The reviewed local correction is implemented and locally verified. It does
+**not** establish corrected native macOS or Windows success. Seed closure is
+not allowed from this local evidence. The remaining work is a conductor-
+authorized native matrix rerun on the correction tip, capture and hash of the
+new artifacts, and reconciliation of the resulting Linux, macOS, and Windows
+evidence before any closure claim.

@@ -34,6 +34,18 @@ function stepBody(source, name) {
     return source.slice(start, next < 0 ? source.length : next);
 }
 
+function matrixRow(source, os) {
+    const marker = `          - os: ${os}\n`;
+    const start = source.indexOf(marker);
+    invariant(start >= 0, `missing matrix row: ${os}`);
+    const bodyStart = start + marker.length;
+    const nextRow = source.indexOf("          - os: ", bodyStart);
+    const env = source.indexOf("    env:\n", bodyStart);
+    const end = nextRow >= 0 ? nextRow : env;
+    invariant(end > bodyStart, `unterminated matrix row: ${os}`);
+    return source.slice(start, end);
+}
+
 function mutateStep(source, name, search, replacement) {
     const body = stepBody(source, name);
     const mutated = body.replace(search, replacement);
@@ -77,6 +89,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     const durability = stepBody(source, durabilityName);
     const cc9aUnix = stepBody(source, cc9aUnixName);
     const cc9aWindows = stepBody(source, cc9aWindowsName);
+    const windowsMatrix = matrixRow(source, "windows");
     const unixSummary = stepBody(source, "Summarize and enforce native exits (Unix)");
     const windowsSummary = stepBody(source, "Summarize and enforce native exits (Windows)");
 
@@ -235,9 +248,14 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         durability.includes("canonical_durability"),
         "Windows durability command contract drift",
     );
-    invariant(source.includes("expected_durability_tests: 46"), "Linux durability count drift");
-    invariant(source.includes("expected_durability_tests: 16"), "macOS durability count drift");
-    invariant(source.includes("expected_durability_tests: 15"), "Windows durability count drift");
+    invariant(source.includes("expected_durability_tests: 47"), "Linux durability count drift");
+    invariant(source.includes("expected_durability_tests: 17"), "macOS durability count drift");
+    invariant(
+        windowsMatrix.includes("expected_cc9a_native_tests: 1") &&
+            windowsMatrix.includes("expected_durability_tests: 14") &&
+            windowsMatrix.includes("expected_crash_harness_tests: 9"),
+        "Windows cc9a/canonical/crash matrix row drift",
+    );
     invariant(source.includes("expected_crash_harness_tests: 11"), "Unix crash count drift");
     invariant(source.includes("expected_crash_harness_tests: 9"), "Windows crash count drift");
 
@@ -588,7 +606,25 @@ const cc9aMutations = [
         "broad canonical platform count drift",
         ({ workflow: source, ...rest }) => ({
             ...rest,
-            workflow: source.replace("expected_durability_tests: 46", "expected_durability_tests: 45"),
+            workflow: source.replace("expected_durability_tests: 47", "expected_durability_tests: 46"),
+        }),
+    ],
+    [
+        "Windows broad canonical count drift",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: source.replace(
+                `          - os: windows
+            runner: windows-2025
+            expected_cc9a_native_tests: 1
+            expected_durability_tests: 14
+            expected_crash_harness_tests: 9`,
+                `          - os: windows
+            runner: windows-2025
+            expected_cc9a_native_tests: 1
+            expected_durability_tests: 13
+            expected_crash_harness_tests: 9`,
+            ),
         }),
     ],
 ];

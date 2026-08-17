@@ -103,8 +103,12 @@ impl CanonicalFilesystemQualification {
             return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
         }
         let observations = live_filesystem_inventory();
-        let filesystem =
-            assess_filesystem_policy(&namespace.canonical_root, platform, &observations)?;
+        let filesystem = assess_filesystem_policy(
+            &namespace.canonical_root,
+            &namespace.identity,
+            platform,
+            &observations,
+        )?;
         validate_mount_volume(&filesystem, &namespace.identity)?;
         let token = next_qualification_token()
             .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
@@ -296,6 +300,7 @@ struct QualifiedFilesystemMount {
 struct FilesystemObservation {
     mount_point: PathBuf,
     file_system: OsString,
+    volume: Option<VolumeIdentity>,
     removable: bool,
     read_only: bool,
 }
@@ -311,6 +316,24 @@ impl FilesystemObservation {
         Self {
             mount_point: mount_point.into(),
             file_system: file_system.into(),
+            volume: None,
+            removable,
+            read_only,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_volume(
+        mount_point: impl Into<PathBuf>,
+        file_system: impl Into<OsString>,
+        volume: Option<u64>,
+        removable: bool,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            mount_point: mount_point.into(),
+            file_system: file_system.into(),
+            volume: volume.map(VolumeIdentity::SyntheticAlgorithmNamespace),
             removable,
             read_only,
         }
@@ -884,9 +907,13 @@ impl CanonicalDurability {
             return Err(CanonicalCoordinationError::QualificationBindingMismatch);
         }
         let observations = live_filesystem_inventory();
-        let filesystem =
-            assess_filesystem_policy(&namespace.canonical_root, self.platform, &observations)
-                .map_err(CanonicalCoordinationError::QualificationRefused)?;
+        let filesystem = assess_filesystem_policy(
+            &namespace.canonical_root,
+            &namespace.identity,
+            self.platform,
+            &observations,
+        )
+        .map_err(CanonicalCoordinationError::QualificationRefused)?;
         validate_mount_volume(&filesystem, &namespace.identity)
             .map_err(CanonicalCoordinationError::QualificationRefused)?;
         if filesystem != binding.filesystem {
@@ -2389,17 +2416,24 @@ fn live_filesystem_inventory() -> Vec<FilesystemObservation> {
     disks
         .list()
         .iter()
-        .map(|disk| FilesystemObservation {
-            mount_point: disk.mount_point().to_path_buf(),
-            file_system: disk.file_system().to_os_string(),
-            removable: disk.is_removable(),
-            read_only: disk.is_read_only(),
+        .map(|disk| {
+            let volume = std::fs::metadata(disk.mount_point())
+                .ok()
+                .and_then(|metadata| filesystem_identity(&metadata).volume);
+            FilesystemObservation {
+                mount_point: disk.mount_point().to_path_buf(),
+                file_system: disk.file_system().to_os_string(),
+                volume,
+                removable: disk.is_removable(),
+                read_only: disk.is_read_only(),
+            }
         })
         .collect()
 }
 
 fn assess_filesystem_policy(
     canonical_root: &Path,
+    root_identity: &FilesystemIdentity,
     platform: CanonicalPlatform,
     observations: &[FilesystemObservation],
 ) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
@@ -2408,11 +2442,38 @@ fn assess_filesystem_policy(
             CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { platform },
         );
     }
-    let observation = observations
-        .iter()
-        .filter(|observation| canonical_root.starts_with(&observation.mount_point))
-        .max_by_key(|observation| observation.mount_point.components().count())
-        .ok_or(CanonicalFilesystemQualificationError::NoMatchingMount)?;
+    let observation = match platform {
+        CanonicalPlatform::Linux => observations
+            .iter()
+            .filter(|observation| canonical_root.starts_with(&observation.mount_point))
+            .max_by_key(|observation| observation.mount_point.components().count())
+            .ok_or(CanonicalFilesystemQualificationError::NoMatchingMount)?,
+        CanonicalPlatform::MacOs => {
+            let root_volume = root_identity
+                .volume
+                .as_ref()
+                .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
+            let mut matching = observations
+                .iter()
+                .filter(|observation| observation.volume.as_ref() == Some(root_volume));
+            let Some(observation) = matching.next() else {
+                if observations
+                    .iter()
+                    .any(|observation| observation.volume.is_none())
+                {
+                    return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+                }
+                return Err(CanonicalFilesystemQualificationError::NoMatchingMount);
+            };
+            if matching.next().is_some() {
+                return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+            }
+            observation
+        }
+        CanonicalPlatform::Windows | CanonicalPlatform::Other => {
+            unreachable!("unsupported platforms return before filesystem observation selection")
+        }
+    };
     let class = classify_filesystem(&observation.file_system);
     if observation.read_only {
         return Err(CanonicalFilesystemQualificationError::ReadOnlyFilesystem { class });
@@ -2646,16 +2707,25 @@ mod tests {
             .expect("bind test qualification to root identity")
     }
 
+    fn policy_identity(volume: Option<u64>) -> FilesystemIdentity {
+        FilesystemIdentity {
+            volume: volume.map(VolumeIdentity::SyntheticAlgorithmNamespace),
+            object: Some(ObjectIdentity::SyntheticAlgorithmObject(1)),
+        }
+    }
+
     #[test]
     fn production_filesystem_policy_is_longest_mount_and_fail_closed() {
         let root = Path::new("/managed/session");
         let ext4 = FilesystemObservation::for_test("/", "ext4", false, false);
         let nested_ext4 = FilesystemObservation::for_test("/managed", "ext4", false, false);
-        let nested_apfs = FilesystemObservation::for_test("/managed", "apfs", false, false);
+        let nested_apfs =
+            FilesystemObservation::for_test_volume("/managed", "apfs", Some(1), false, false);
 
         assert_eq!(
             assess_filesystem_policy(
                 root,
+                &policy_identity(Some(1)),
                 CanonicalPlatform::Linux,
                 &[ext4.clone(), nested_ext4.clone()],
             ),
@@ -2665,7 +2735,12 @@ mod tests {
             })
         );
         assert_eq!(
-            assess_filesystem_policy(root, CanonicalPlatform::MacOs, &[nested_apfs]),
+            assess_filesystem_policy(
+                root,
+                &policy_identity(Some(1)),
+                CanonicalPlatform::MacOs,
+                &[nested_apfs],
+            ),
             Ok(QualifiedFilesystemMount {
                 mount_point: PathBuf::from("/managed"),
                 class: CanonicalFilesystemClass::Apfs,
@@ -2764,7 +2839,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                assess_filesystem_policy(root, platform, &observations),
+                assess_filesystem_policy(root, &policy_identity(Some(1)), platform, &observations,),
                 Err(expected),
                 "policy case {label}",
             );
@@ -2776,6 +2851,7 @@ mod tests {
         let sensitive_root = Path::new("/managed/private-user-root");
         let error = assess_filesystem_policy(
             sensitive_root,
+            &policy_identity(Some(1)),
             CanonicalPlatform::Linux,
             &[FilesystemObservation::for_test(
                 "/managed",
@@ -2830,6 +2906,125 @@ mod tests {
             assert!(!format!("{qualification:?}").contains("private-debug-root"));
             fs::remove_dir_all(root).expect("clean qualification debug fixture");
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn macos_volume_group_selection_binds_logical_root_to_unique_data_volume() {
+        let root = Path::new("/Users/example/Library/Application Support/AudioGraph");
+        let root_identity = policy_identity(Some(42));
+        let system = FilesystemObservation::for_test_volume("/", "apfs", Some(7), false, true);
+        let data = FilesystemObservation::for_test_volume(
+            "/System/Volumes/Data",
+            "apfs",
+            Some(42),
+            false,
+            false,
+        );
+
+        let qualified = QualifiedFilesystemMount {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            class: CanonicalFilesystemClass::Apfs,
+        };
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system.clone(), data.clone()],
+            ),
+            Ok(qualified)
+        );
+
+        let read_only_data = FilesystemObservation {
+            read_only: true,
+            ..data.clone()
+        };
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system.clone(), read_only_data],
+            ),
+            Err(CanonicalFilesystemQualificationError::ReadOnlyFilesystem {
+                class: CanonicalFilesystemClass::Apfs,
+            })
+        );
+
+        let removable_data = FilesystemObservation {
+            removable: true,
+            ..data.clone()
+        };
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system.clone(), removable_data],
+            ),
+            Err(CanonicalFilesystemQualificationError::RemovableFilesystem {
+                class: CanonicalFilesystemClass::Apfs,
+            })
+        );
+
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &policy_identity(None),
+                CanonicalPlatform::MacOs,
+                &[system.clone(), data.clone()],
+            ),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
+
+        let unidentified_data = FilesystemObservation {
+            volume: None,
+            ..data.clone()
+        };
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system.clone(), unidentified_data],
+            ),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
+
+        let foreign_data = FilesystemObservation::for_test_volume(
+            "/System/Volumes/Data",
+            "apfs",
+            Some(99),
+            false,
+            false,
+        );
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system.clone(), foreign_data],
+            ),
+            Err(CanonicalFilesystemQualificationError::NoMatchingMount)
+        );
+
+        let duplicate_data = FilesystemObservation::for_test_volume(
+            "/Volumes/DataAlias",
+            "apfs",
+            Some(42),
+            false,
+            false,
+        );
+        assert_eq!(
+            assess_filesystem_policy(
+                root,
+                &root_identity,
+                CanonicalPlatform::MacOs,
+                &[system, data, duplicate_data],
+            ),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
     }
 
     #[test]

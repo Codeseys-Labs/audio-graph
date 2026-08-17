@@ -31,17 +31,17 @@ jobs:
           - os: linux
             runner: blacksmith-4vcpu-ubuntu-2404
             expected_cc9a_native_tests: 3
-            expected_durability_tests: 46
+            expected_durability_tests: 47
             expected_crash_harness_tests: 11
           - os: macos
             runner: blacksmith-6vcpu-macos-15
             expected_cc9a_native_tests: 3
-            expected_durability_tests: 16
+            expected_durability_tests: 17
             expected_crash_harness_tests: 11
           - os: windows
             runner: windows-2025
             expected_cc9a_native_tests: 1
-            expected_durability_tests: 15
+            expected_durability_tests: 14
             expected_crash_harness_tests: 9
     env:
       EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
