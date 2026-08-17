@@ -263,3 +263,79 @@ rerun and artifact/hash review is required.
 **There is no native macOS acceptance claim in this report.** Until that rerun
 passes the new exact relationship/cardinality gate, cc9a remains open for
 native evidence. No remote run was dispatched from this workstream.
+
+## 2026-08-16 macOS test-initializer correction
+
+### Custody and bounded scope
+
+- Seed: `audio-graph-cc9a`.
+- Worktree: `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-macos-test-initializer-wave7c`.
+- Branch: `work/audio-graph-cc9a-macos-test-initializer-wave7c`.
+- Exact base and merge-base: `dca04b322912a95e815b381a45641aaa9d319196`.
+- Source/checker commit: `f63f43e82be82fa1b8e77e97b677b7d3a8469900`
+  (`fix(audio-graph-cc9a): initialize macOS test volume`).
+
+The native macOS job in GitHub run `31991181344`, job `95274932231`, stopped
+at the compiler before any cc9a, canonical-durability, or crash tests could
+run. Its retained RED is:
+
+```text
+error[E0063]: missing field `volume` in initializer of `FilesystemObservation`
+  --> src-tauri/src/persistence/canonical_durability.rs:2551
+```
+
+The macOS-only exact-mount resolver was constructing a test-build
+`FilesystemObservation` without its test-only `volume` field. The correction
+derives `volume` from the already-opened mount metadata with
+`filesystem_identity(&metadata).volume` and supplies it under `#[cfg(test)]`.
+It changes no production field layout or resolver behavior.
+
+### Test-first checker proof
+
+The checker guard was added first. Against the untouched Rust source it failed
+with the following deterministic RED:
+
+```text
+error: cc9a macOS filesystem observations must retain test-only volume identity
+```
+
+The guard locates `resolve_exact_macos_mount`, requires every contained
+`FilesystemObservation` initializer to retain the cfg(test) `volume` field,
+and requires the value to derive from `filesystem_identity(&metadata).volume`.
+Its mutation removes that field from the macOS observation and is rejected.
+
+After the source correction:
+
+```text
+PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
+PASS: direct LABSN and cc9a native evidence contract with 57 mutations
+```
+
+### Local gates
+
+All Rust commands below used locked dependencies and the cloud feature set:
+
+```text
+cargo test ... cc9a_native_:              3 passed, 0 failed
+cargo test ... canonical_durability:      47 passed, 0 failed
+cargo test ... session_artifact_manifest: 26 passed, 0 failed
+cargo check --locked --lib --tests:        exit 0
+cargo clippy --locked --lib --tests -- -D warnings: exit 0
+cargo fmt --all -- --check:                exit 0
+bun run verify:contracts:                  exit 0
+```
+
+`bun run verify:fast` reached and passed Biome (174 files), TypeScript,
+all five generated-contract checks, and the 57-mutation checker. It then
+failed at the Seeds JSON stress check because the global package outside this
+worktree lacks the required stdout patch:
+
+```text
+Seeds CLI outputJson does not have the pipe-safe stdout retry patch:
+/home/codeseys/.bun/install/global/node_modules/@os-eco/seeds-cli/src/output.ts
+```
+
+No global package, workflow, dependency, Seed, or other-worktree file was
+modified to work around that environmental gate. This correction has no new
+native macOS acceptance claim; the conductor must rerun and inspect the
+authorized native job before cc9a is considered accepted.

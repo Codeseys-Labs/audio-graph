@@ -135,6 +135,18 @@ function mutateRustTest(source, name, search, replacement) {
     return source.replace(test, mutated);
 }
 
+function rustFunction(source, name) {
+    const marker = `fn ${name}`;
+    const functionStart = source.indexOf(marker);
+    invariant(functionStart >= 0, `missing Rust function: ${name}`);
+    invariant(
+        source.indexOf(marker, functionStart + marker.length) < 0,
+        `duplicate Rust function: ${name}`,
+    );
+    const nextItem = source.indexOf("\n#[", functionStart + marker.length);
+    return source.slice(functionStart, nextItem < 0 ? source.length : nextItem);
+}
+
 function validate(source, canonicalSource = canonicalDurability, manifestSource = sessionArtifactManifest) {
     const prestateName = "Record LABSN Windows prestate";
     const actionName = "Install Windows virtual audio baseline with pinned LABSN action";
@@ -559,6 +571,20 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             canonicalSource.includes("require_macos_handle_identity(&refreshed_dir, &namespace.identity)?"),
         "cc9a shared safe exact-mount production resolver drift",
     );
+    const macosResolver = rustFunction(canonicalSource, "resolve_exact_macos_mount");
+    const macosObservationInitializers = [
+        ...macosResolver.matchAll(/FilesystemObservation \{([\s\S]*?)\n        \}/g),
+    ].map((match) => match[1]);
+    invariant(
+        macosObservationInitializers.length > 0 &&
+            macosObservationInitializers.every((initializer) =>
+                initializer.includes("#[cfg(test)]\n            volume,"),
+            ) &&
+            macosResolver.includes(
+                "#[cfg(test)]\n        let volume = filesystem_identity(&metadata).volume;",
+            ),
+        "cc9a macOS filesystem observations must retain test-only volume identity",
+    );
     invariant(
         cargoManifest.includes('[target.\'cfg(target_os = "macos")\'.dependencies]') &&
             cargoManifest.includes('nix = { version = "0.31.3", features = ["fs"] }'),
@@ -954,6 +980,16 @@ const cc9aMutations = [
             canonical: canonical.replace(
                 "nix::sys::statfs::fstatfs(directory)",
                 "nix::sys::statfs::statfs(Path::new(\"/\"))",
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS filesystem observation volume identity removed",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace(
+                "            #[cfg(test)]\n            volume,\n            live_mount: Some(macos_live_mount_identity(&mount_dir)?),",
+                "            live_mount: Some(macos_live_mount_identity(&mount_dir)?),",
             ),
         }),
     ],

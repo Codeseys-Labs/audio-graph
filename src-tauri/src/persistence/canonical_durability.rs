@@ -2548,9 +2548,13 @@ fn resolve_exact_macos_mount(
         if !metadata.is_dir() {
             return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
         }
+        #[cfg(test)]
+        let volume = filesystem_identity(&metadata).volume;
         observations.push(FilesystemObservation {
             mount_point: disk.mount_point().to_path_buf(),
             file_system: disk.file_system().to_os_string(),
+            #[cfg(test)]
+            volume,
             live_mount: Some(macos_live_mount_identity(&mount_dir)?),
             removable: disk.is_removable(),
             read_only: disk.is_read_only(),
