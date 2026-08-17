@@ -2023,12 +2023,12 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn production_qualified_existing_root_initial_cas_has_parent_barrier() {
+    fn cc9a_native_qualified_initial_cas_has_parent_barrier() {
         let root = root("production-qualified-initial");
         let store = SessionArtifactManifestStore::qualified_existing_root(&root)
-            .expect("qualify existing live ext4 manifest root");
+            .expect("qualify existing live manifest root");
         let mut transaction = store.begin_write().expect("qualified transaction");
 
         assert!(matches!(
@@ -2048,12 +2048,12 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn production_qualified_replacement_retains_exact_open_head() {
+    fn cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation() {
         let root = root("production-qualified-replacement");
         let store = SessionArtifactManifestStore::qualified_existing_root(&root)
-            .expect("qualify existing live ext4 manifest root");
+            .expect("qualify existing live manifest root");
         {
             let mut transaction = store.begin_write().expect("initial transaction");
             assert!(matches!(
@@ -2091,6 +2091,49 @@ mod tests {
             std::fs::read(manifest_path).expect("foreign head retained"),
             validated_bytes
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cc9a_native_windows_qualified_existing_root_refuses_before_manifest_coordination_or_temp_mutation()
+     {
+        fn root_entries(root: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+            let mut entries = std::fs::read_dir(root)
+                .expect("read fixture root")
+                .map(|entry| {
+                    let entry = entry.expect("read fixture entry");
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).expect("read fixture entry bytes"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        }
+
+        let root = root("cc9a-native-windows-production-refusal");
+        std::fs::write(root.join("sentinel.bin"), b"entry-identical").expect("write root sentinel");
+        let before_entries = root_entries(&root);
+        let error = match SessionArtifactManifestStore::qualified_existing_root(&root) {
+            Err(error) => error,
+            Ok(_) => panic!("Windows production qualification unexpectedly succeeded"),
+        };
+
+        assert_eq!(
+            error,
+            ManifestStoreError::Qualification(
+                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                },
+            )
+        );
+        let after_entries = root_entries(&root);
+        assert_eq!(after_entries, before_entries);
+        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        assert!(!root.join(COORDINATION_FILE_NAME).exists());
+        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
+        assert!(!manifest_path.exists());
     }
 
     #[test]

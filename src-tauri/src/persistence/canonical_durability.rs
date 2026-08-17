@@ -2878,8 +2878,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn qualified_guard_refuses_foreign_or_changed_binding_before_coordination_mutation() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation() {
         let first_root = temp_root("production-binding-first");
         let second_root = temp_root("production-binding-second");
         let ancestor_root = temp_root("production-binding-ancestor");
