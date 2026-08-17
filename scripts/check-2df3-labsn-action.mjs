@@ -81,6 +81,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     const durabilityName = "Run canonical durability filter (Windows)";
     const cc9aUnixName = "Run cc9a native qualification filter (Unix)";
     const cc9aWindowsName = "Run cc9a native qualification filter (Windows)";
+    const macosDiagnosticsName = "Record macOS mount diagnostics";
 
     const prestate = stepBody(source, prestateName);
     const action = stepBody(source, actionName);
@@ -89,6 +90,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     const durability = stepBody(source, durabilityName);
     const cc9aUnix = stepBody(source, cc9aUnixName);
     const cc9aWindows = stepBody(source, cc9aWindowsName);
+    const macosDiagnostics = stepBody(source, macosDiagnosticsName);
     const windowsMatrix = matrixRow(source, "windows");
     const unixSummary = stepBody(source, "Summarize and enforce native exits (Unix)");
     const windowsSummary = stepBody(source, "Summarize and enforce native exits (Windows)");
@@ -286,6 +288,54 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             cc9aWindows.includes("cc9a_native_[^ ]+"),
         "Windows cc9a exit or exact-name marker capture drift",
     );
+    invariant(
+        macosDiagnostics.includes("if: ${{ always() && matrix.os == 'macos' }}") &&
+            macosDiagnostics.includes("macos-mount-diagnostics.txt") &&
+            macosDiagnostics.includes("diagnostics_complete=true"),
+        "macOS mount diagnostics must remain always-safe and artifact-backed",
+    );
+    invariant(
+        macosDiagnostics.includes("stat -f 'device=%d inode=%i flags=%f'") &&
+            macosDiagnostics.includes('for target in "$probe" / /System/Volumes/Data'),
+        "macOS stat device/inode/flags evidence drift",
+    );
+    invariant(
+        macosDiagnostics.includes("mount | awk") &&
+            macosDiagnostics.includes('$3 == "/"') &&
+            macosDiagnostics.includes('$3 == "/System/Volumes/Data"') &&
+            macosDiagnostics.includes("mount_record="),
+        "macOS relevant mount-record evidence drift",
+    );
+    invariant(
+        macosDiagnostics.includes('/usr/sbin/diskutil info "$target"') &&
+            macosDiagnostics.includes("Device Node") &&
+            macosDiagnostics.includes("Volume UUID") &&
+            macosDiagnostics.includes("Volume Roles") &&
+            macosDiagnostics.includes("File System Personality") &&
+            macosDiagnostics.includes("Read-Only Volume") &&
+            macosDiagnostics.includes("Internal") &&
+            macosDiagnostics.includes("Removable Media"),
+        "macOS bounded diskutil identity/policy evidence drift",
+    );
+    invariant(
+        cc9aUnix.includes("grep '^CC9A_MACOS_DIAGNOSTIC '") &&
+            cc9aUnix.includes("cc9a_macos_diagnostics.txt") &&
+            cc9aUnix.includes('if [ "$RUNNER_OS" = "macOS" ]'),
+        "macOS Rust diagnostic extraction artifact drift",
+    );
+    invariant(
+        unixSummary.includes("cc9a_macos_diagnostics_present") &&
+            unixSummary.includes("cc9a_macos_diagnostics_complete") &&
+            unixSummary.includes("macos_mount_diagnostics_complete") &&
+            unixSummary.includes("cc9a_macos_diagnostics_complete=true") &&
+            unixSummary.includes("macos_mount_diagnostics_complete=true") &&
+            unixSummary.includes("diagnostic_observation_count") &&
+            unixSummary.includes("diagnostic_observation_schema_count") &&
+            unixSummary.includes("diagnostic_inventory_count") &&
+            unixSummary.includes('if [ "$RUNNER_OS" = "macOS" ]') &&
+            unixSummary.includes("status=FAIL"),
+        "macOS summary diagnostic completeness/fail-closed gate drift",
+    );
 
     const expectedNames = [
         "cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation",
@@ -324,6 +374,48 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             guardTest.includes("fs::create_dir_all") &&
             guardTest.includes("COORDINATION_FILE_NAME"),
         "cc9a recreated-root guard proof weakened",
+    );
+    invariant(
+        guardTest.includes('#[cfg(target_os = "macos")]') &&
+            guardTest.includes("emit_cc9a_macos_mount_diagnostics(&first_root);"),
+        "cc9a macOS live diagnostic call missing from counted guard test",
+    );
+    invariant(
+        canonicalSource.includes('#[cfg(all(test, target_os = "macos"))]\nfn emit_cc9a_macos_mount_diagnostics') &&
+            canonicalSource.includes('const MARKER: &str = "CC9A_MACOS_DIAGNOSTIC";'),
+        "cc9a macOS diagnostics must remain test-only with a stable marker",
+    );
+    invariant(
+        canonicalSource.includes("root canonical_root={} root_dev={} inventory_count={}") &&
+            canonicalSource.includes("canonical_root") &&
+            canonicalSource.includes("root_dev"),
+        "cc9a macOS diagnostic root identity fields drift",
+    );
+    invariant(
+        canonicalSource.includes("inventory_count={}") &&
+            canonicalSource.includes("observation index={index}") &&
+            canonicalSource.includes("mount_path={}") &&
+            canonicalSource.includes("filesystem_class={:?}") &&
+            canonicalSource.includes("filesystem_string={}") &&
+            canonicalSource.includes("metadata_result={}") &&
+            canonicalSource.includes("dev={}") &&
+            canonicalSource.includes("same_root_dev={}") &&
+            canonicalSource.includes("read_only={}") &&
+            canonicalSource.includes("removable={}"),
+        "cc9a macOS diagnostic inventory fields drift",
+    );
+    invariant(
+        canonicalSource.includes("metadata_unavailable_count={metadata_unavailable_count}") &&
+            canonicalSource.includes("same_root_dev_count={same_root_dev_count}") &&
+            [
+                "root_missing",
+                "zero_match_clean",
+                "zero_match_with_unavailable",
+                "unique",
+                "ambiguous",
+                "unique_then_validate_mismatch",
+            ].every((branch) => canonicalSource.includes(`"${branch}"`)),
+        "cc9a macOS diagnostic cardinality branches drift",
     );
 
     const initialTest = rustTest(manifestSource, expectedNames[1]);
@@ -624,6 +716,97 @@ const cc9aMutations = [
             expected_cc9a_native_tests: 1
             expected_durability_tests: 13
             expected_crash_harness_tests: 9`,
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS diagnostic call removed",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: mutateRustTest(
+                canonical,
+                "cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation",
+                "emit_cc9a_macos_mount_diagnostics(&first_root);",
+                "let _ = &first_root;",
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS root identity field drift",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace("root_dev={}", "root_device={}"),
+        }),
+    ],
+    [
+        "cc9a macOS inventory field drift",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replaceAll("inventory_count", "inventory_total"),
+        }),
+    ],
+    [
+        "cc9a macOS cardinality branch drift",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace('"ambiguous"', '"multiple"'),
+        }),
+    ],
+    [
+        "macOS stat evidence removed",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                "stat -f 'device=%d inode=%i flags=%f'",
+                "printf 'stat unavailable'",
+            ),
+        }),
+    ],
+    [
+        "macOS mount evidence removed",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                "mount | awk",
+                "printf 'mount unavailable' | awk",
+            ),
+        }),
+    ],
+    [
+        "macOS diskutil evidence removed",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                '/usr/sbin/diskutil info "$target"',
+                "printf 'diskutil unavailable'",
+            ),
+        }),
+    ],
+    [
+        "macOS Rust diagnostic extraction artifact drift",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: source.replaceAll(
+                "cc9a_macos_diagnostics.txt",
+                "cc9a_macos_diagnostics-missing.txt",
+            ),
+        }),
+    ],
+    [
+        "macOS summary completeness weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                "cc9a_macos_diagnostics_complete=true",
+                "cc9a_macos_diagnostics_complete=unchecked",
             ),
         }),
     ],

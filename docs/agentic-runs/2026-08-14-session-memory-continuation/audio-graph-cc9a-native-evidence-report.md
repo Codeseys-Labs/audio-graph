@@ -1,169 +1,173 @@
-# audio-graph-cc9a native evidence correction report
+# audio-graph-cc9a macOS diagnostic evidence report
 
 ## Assignment and custody
 
 - Seed: `audio-graph-cc9a`.
-- Acceptance for this correction: bind macOS APFS selection to the managed
-  root's native volume identity, retain all existing policy and mount-volume
-  checks, correct the Windows broad-test expectation, strengthen its checker,
-  and preserve an honest terminal-run record pending a native rerun.
+- Acceptance for this bounded workstream: add test-only macOS mount-selection
+  diagnostics to the existing counted native test, collect matching read-only
+  workflow evidence, extract and fail-closed-check the artifact, preserve the
+  original 33 checker mutations, and record the terminal native evidence
+  without claiming corrected macOS acceptance.
 - Exact base and merge-base:
-  `3afe56c52e74804372cb752e418b4004b1e24694`.
+  `01426350bc94e6d8723465f1cb46af67b3381b7a`.
 - Worktree:
-  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-native-correction-wave7c`.
-- Branch: `work/audio-graph-cc9a-native-correction-wave7c`.
-- Implementation commit:
-  `9ba603eaff57bf502a547d87941e6a98da7e6367`.
-- Report commit: this artifact's containing commit. Its exact SHA cannot be
-  embedded in its own Git object and is recorded in the final handoff.
+  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-macos-diagnostics-wave7c`.
+- Branch: `work/audio-graph-cc9a-macos-diagnostics-wave7c`.
+- Diagnostic implementation commit:
+  `1dc71a6cd76570971e748e312b506654ccf0ba6f`.
+- Report commit: this artifact's containing commit. Its SHA cannot be embedded
+  in its own Git object and is recorded in the final handoff.
 
-The correction changes exactly the assigned source, workflow, checker, and
-this report. It does not change Seeds, dependencies, frontend or generated
-files, other workflows, runtime consumers, GitHub state, or remote refs. The
-conductor retains Seed reconciliation, native rerun, integration, push, merge,
-and cleanup authority.
+The implementation commit changes only the assigned Rust source, native
+workflow, and source-aware checker. This report is the only fourth path. No
+Seeds, dependency, frontend, generated-file, other-workflow, GitHub, remote-ref,
+or production selection change was made. The conductor retains native rerun,
+review, integration, push, merge, Seed reconciliation, and cleanup authority.
 
-## Terminal run 31981177828
+## Terminal run 31983646869
 
-The terminal native run executed exact head
-`02a09282b56427bc39088bc126968aa68190f90f`. Downloaded logs and artifacts are
-retained at `/tmp/audio-graph-cc9a-native-31981177828.LspXQy`.
+Run `31983646869` executed exact SHA
+`31e9994` (`31e9994...` as recorded by the supplied evidence). Its downloaded
+bundle is retained at `/tmp/audio-graph-cc9a-native-31983646869.mOJT3O`.
 
-The upload logs record these SHA-256 digests for the finalized artifact zips:
+The supplied artifact hashes are:
 
-| Platform | Artifact SHA-256 |
+| Evidence | SHA-256 |
 | --- | --- |
-| Linux | `3c91bd25dd7ecba60205142dbbb18940a910b217903d83f9ac4861b67458b053` |
-| macOS | `30018aaefa880b29bbafad8f242d27326d029efd525d24655435953201a88b7c` |
-| Windows | `abcde903b9e53d81536bb7d00f204755bbdc9af11d7a26c1647a7925833c0ff6` |
+| Manifest | `88d674d6a704422f3fdd6800d05f63d6eb33cb9fefee824cad7f4b3ad28c7974` |
+| Linux tree | `7323709c7c1b21ab568628f777060d59efc8acdbc7e42a7b4cf331584c1e7e0b` |
+| macOS tree | `1875459bb438cfb6db3066a104ca27db730675c4d0a2e66a57c3c51c2e0e0a25` |
+| Windows tree | `f961c269cc0fb5e8f50bf3f45147113491595a15b1f5a69449a688a240f484bb` |
 
-The platform evidence is intentionally separated from the correction status:
+Platform conclusions are deliberately separated:
 
-- Linux Blacksmith Ubuntu 24.04 on ext4 passed `cc9a_native_` 3/3,
-  `canonical_durability` 46/46, and crash harness 11/11.
-- macOS Blacksmith macOS 15 on APFS failed all three `cc9a_native_` tests and
-  the canonical qualification guard test; the broad suite was 15 passed and
-  1 failed, while crash harness 11/11 passed. Each failed qualification
-  returned `ReadOnlyFilesystem { class: Apfs }`.
-- Windows GitHub `windows-2025` on NTFS passed the exact production typed
-  refusal proof 1/1 and crash harness 9/9. Its broad canonical suite actually
-  passed 14 tests and exited 0, but the workflow expected 15, so the summary
-  correctly failed the harness count gate.
+- Linux Blacksmith Ubuntu 24.04 on ext4 is accepted for this run:
+  `cc9a_native_` 3/3 PASS, `canonical_durability` 47/47 PASS, and crash
+  harness 11/11 PASS.
+- Windows GitHub `windows-2025` on NTFS is accepted for this run:
+  `cc9a_native_` 1/1 PASS, `canonical_durability` 14/14 PASS, and crash
+  harness 9/9 PASS.
+- macOS Blacksmith macOS 15 on the APFS Data volume is not accepted:
+  `cc9a_native_` 0/3 with `IdentityUnavailable`, broad canonical durability
+  16/17, and crash harness 11/11 PASS.
 
-The macOS fixture evidence identifies `/dev/disk2s5` mounted at
-`/System/Volumes/Data`, reports APFS, and shows the fixture under logical
-`/Users`. The former lexical longest-prefix selection attributed logical
-`/Users` and `/var` roots to the read-only APFS System `/` observation even
-though root metadata belongs to the writable Data device. LABSN completed on
-Windows but is unrelated to the namespace qualification result. No active
-Blacksmith Testboxes remained after the terminal run.
+The generic `IdentityUnavailable` result does not distinguish two
+load-bearing live branches: multiple sysinfo observations can match the same
+`st_dev`, or zero observations can match while at least one observation has
+unavailable mount metadata. There is therefore a hard stop on any further
+production mount-selection change until reviewed live evidence distinguishes
+the branch. This patch makes no corrected macOS acceptance claim.
 
-## Correction
+## Diagnostic change
 
-Live filesystem observations now derive an optional, content-free
-`VolumeIdentity` from safe `std::fs::metadata` and the existing
-`filesystem_identity` seam. On macOS, qualification selects exactly one mount
-observation whose native volume identity equals the canonical root's volume
-identity before applying the existing policy gates. It refuses closed when
-the root or mount identity is unavailable, no same-volume mount exists, or
-more than one observation claims the root volume.
+The Rust source adds one function compiled only under
+`cfg(all(test, target_os = "macos"))`. The existing counted test
+`cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation`
+calls it once, before its first live production qualification. It emits the
+stable `CC9A_MACOS_DIAGNOSTIC` marker with:
 
-The selected mount must still be exactly APFS, writable, and non-removable.
-`validate_mount_volume` independently re-reads the selected mount metadata and
-compares its volume identity to the root. Initial qualification and guard
-revalidation both call the same selector and independent validator. Linux
-retains longest lexical-prefix selection and exact ext4 policy. No unsafe,
-libc/statfs call, dependency, firmlink allowlist, test write, caller authority,
-or arbitrary APFS acceptance was added.
+- canonical root, numeric root device when available, and sysinfo inventory
+  count;
+- one observation row per sysinfo disk with mount path, filesystem class and
+  string, metadata availability, numeric device when available,
+  `same_root_dev`, read-only, and removable state; and
+- metadata-unavailable and same-root-device cardinalities plus exactly one
+  branch: `root_missing`, `zero_match_clean`,
+  `zero_match_with_unavailable`, `unique`, `ambiguous`, or
+  `unique_then_validate_mismatch`.
 
-The deterministic macOS topology test models:
+The helper reuses the private live inventory, filesystem classification,
+identity, and independent mount validation seams. It does not change a
+production API, production selection, production error, or test count.
 
-- logical `/Users/...` root identity on the Data device;
-- read-only APFS `/` on a different System device; and
-- writable, non-removable APFS `/System/Volumes/Data` on the root's device.
+The macOS workflow now always attempts an artifact-backed, read-only
+diagnostic preflight. It retains the existing `df -P` probe and additionally
+records BSD `stat -f` device/inode/flags for the probe root, `/`, and
+`/System/Volumes/Data`; relevant `mount` records; and bounded `diskutil info`
+identity, role, filesystem, read-only, internal, and removable fields for all
+three paths. The cc9a Unix step extracts the stable Rust rows into
+`cc9a_macos_diagnostics.txt` even when cargo exits nonzero. The always-run Unix
+summary records marker presence, schema/cardinality completeness, and mount
+preflight completeness. These diagnostics can be complete while the job still
+correctly remains FAIL when the product test exit is nonzero.
 
-The same test covers read-only and removable matched Data mounts, missing root
-identity, missing mount identity, no same-volume match, and ambiguous duplicate
-same-volume observations. It is compiled for Linux and macOS, so broad native
-expectations are now Linux 47, macOS 17, and Windows 14.
-
-The checker now extracts the Windows matrix row and jointly requires
-`cc9a_native_` 1, broad canonical 14, and crash harness 9 in that row. A new
-mutation changes only the Windows canonical count from 14 to 13 and is
-rejected. The checker total is 33 mutations. Summary equality gates, the
-focused Windows `cc9a_native_` proof, and LABSN license, certificate cleanup,
-and evidence boundaries remain unchanged.
+Linux and Windows runners, counts, product commands, LABSN action/license
+boundary, and certificate cleanup are unchanged. Linux gains only
+`not_applicable` diagnostic summary fields; its pass/fail predicates are
+semantically unchanged.
 
 ## TDD evidence
 
-### Deterministic RED
-
-After adding observation identity and the desired firmlink topology test but
-before changing selection, this command exited 101:
-
-```text
-CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked \
-  --manifest-path src-tauri/Cargo.toml --lib --no-default-features \
-  --features cloud \
-  macos_volume_group_selection_binds_logical_root_to_unique_data_volume -- \
-  --nocapture --test-threads=1
-```
-
-The exact assertion mismatch was:
+The pre-agreed seam was the source-aware checker plus the existing counted
+Rust test. After adding only the checker requirement for the macOS call, before
+adding instrumentation, this command exited 1:
 
 ```text
-left: Err(ReadOnlyFilesystem { class: Apfs })
-right: Ok(QualifiedFilesystemMount { mount_point: "/System/Volumes/Data", class: Apfs })
+$ bun run check:2df3-labsn-action
+error: cc9a macOS live diagnostic call missing from counted guard test
+error: script "check:2df3-labsn-action" exited with code 1
 ```
 
-This reproduces the native failure without requiring a macOS host.
+After the cfg(test)-only helper, workflow evidence, extraction, summary gate,
+and mutations were implemented, the checker reported:
 
-### GREEN
+```text
+$ bun scripts/check-2df3-labsn-action.mjs
+PASS: direct LABSN and cc9a native evidence contract with 42 mutations
+```
 
-The same focused command passed 1/1 after the identity-bound selector was
-implemented. The companion fail-closed cases execute inside that same test.
-The full focused module then passed 47/47 on Linux, including the live ext4
-production qualification.
+The checker preserves all existing 33 mutations and adds exactly 9 for the
+macOS diagnostic call, root identity fields, inventory fields, cardinality
+branch, `stat`, `mount`, `diskutil`, extraction artifact, and summary
+completeness.
 
-## Final local gates on implementation commit
+## Local gates
 
-All Rust commands used Rust/Cargo 1.95.0 and the worktree-local
-`src-tauri/target`.
+All Rust commands used Rust/Cargo 1.95.0, locked dependencies, cloud features,
+and the worktree-local `src-tauri/target`.
 
-- Focused macOS policy topology: 1 passed, 0 failed.
-- `cc9a_native_`: 3 passed, 0 failed, 1,702 filtered out.
-- `canonical_durability`: 47 passed, 0 failed, 1,658 filtered out; live Linux
-  ext4 qualification admitted.
-- `session_artifact_manifest`: 26 passed, 0 failed, 1,679 filtered out.
+- `cc9a_native_`: `3 passed; 0 failed; 1702 filtered out`.
+- `canonical_durability`: `47 passed; 0 failed; 1658 filtered out`; the live
+  Linux ext4 qualification was admitted.
+- `session_artifact_manifest`: `26 passed; 0 failed; 1679 filtered out`.
 - Locked cloud `cargo check --lib --tests`: exit 0.
 - Strict cloud Clippy with `-D warnings`: exit 0 with no warnings.
 - `cargo fmt --all -- --check`: exit 0 with no diff.
-- The single final serialized full cloud library suite: 1,697 passed, 0
-  failed, 8 ignored in 64.67 seconds. Expected PipeWire/ALSA diagnostics on
-  the audio-less Linux host did not fail a test.
-- `bun run typecheck`: exit 0 with no diagnostics.
-- `bun run verify:contracts`: exit 0; all five generated contracts were
-  current: audio source, provider registry, session data movement, endpoint
-  credential routing, and speech span revision.
-- Repo-pinned `SEEDS_CLI_ROOT=... bun run verify:fast`: exit 0. Biome checked
-  174 files; TypeScript and all five contracts passed; all 33 checker
-  mutations were rejected; Seeds JSON stress parsed ready 50, blocked 94, and
-  list 50; docs/Seeds hygiene reported 0 findings; diff hygiene passed.
-- Direct `bun run check:2df3-labsn-action`: exit 0 with
-  `PASS: direct LABSN and cc9a native evidence contract with 33 mutations`.
+- The single final serialized full cloud library suite reported:
 
-The repository-configured actionlint, `yq eval '.'`, Ruby
-`YAML.safe_load_file`, and Node syntax checks passed. All six workflow steps
-declaring `shell: bash` were extracted independently with `yq` and passed
-`bash -n`. Neither `pwsh` nor `powershell.exe` is installed on this Linux host,
-so the PowerShell AST parser is recorded as unavailable; no tool was installed.
+  ```text
+  test result: ok. 1697 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 55.05s
+  ```
+
+- `bun run typecheck`: exit 0 with no diagnostics.
+- `bun run verify:contracts`: exit 0; audio source, provider registry, session
+  data movement, endpoint credential routing, and speech span revision were
+  current.
+- Repo-pinned `SEEDS_CLI_ROOT=... bun run verify:fast`: exit 0. Biome checked
+  174 files, typecheck and five contracts passed, all 42 mutations were
+  rejected, Seeds JSON stress parsed ready 50 / blocked 94 / list 50, docs and
+  Seeds secret hygiene reported 0 findings, and diff hygiene passed.
+- Repo-configured actionlint, `yq eval '.'`, Ruby `YAML.safe_load_file`, and
+  Node syntax checks passed. All 7 workflow steps declaring `shell: bash` were
+  extracted independently and passed `bash -n`.
+- A source-boundary assertion removed the new cfg(test)-only helper and the
+  macOS-only call from the current source and reproduced the exact base file:
+
+  ```text
+  PASS: no non-test canonical durability source delta
+  ```
+
+- Neither `pwsh`, `powershell`, nor `powershell.exe` is installed on this
+  Linux host, so a PowerShell AST parse is recorded as unavailable; no tool was
+  installed.
 
 ## Security, footprint, and runtime-dark checks
 
-The report-inclusive Betterleaks scan covered all four authorized paths and
+The report-inclusive Betterleaks scan over the exact four authorized paths
 reported `no leaks found`. The report-inclusive docs/Seeds secret-hygiene scan
-reported `0 findings`, and `git diff --check` passed. The exact cumulative
-correction footprint from the assigned base is:
+reported `0 findings`, and `git diff --check` passed.
+
+The exact cumulative footprint from the assigned base is:
 
 ```text
 .github/workflows/2df3-native-durability.yml
@@ -172,18 +176,25 @@ scripts/check-2df3-labsn-action.mjs
 src-tauri/src/persistence/canonical_durability.rs
 ```
 
-A bounded call-site search over `src-tauri/src` outside
-`canonical_durability.rs` and `session_artifact_manifest.rs` found no production
-caller of `SessionArtifactManifestStore::qualified_existing_root` or
-`try_lock_exclusive_qualified`. The correction remains runtime-dark; it does
-not activate a Session writer or consumer. The bounded gate reported
-`runtime_dark_external_hits=0`.
+A bounded call-site search outside `canonical_durability.rs` and
+`session_artifact_manifest.rs` reported:
 
-## Outcome and open question
+```text
+runtime_dark_external_hits=0
+```
 
-The reviewed local correction is implemented and locally verified. It does
-**not** establish corrected native macOS or Windows success. Seed closure is
-not allowed from this local evidence. The remaining work is a conductor-
-authorized native matrix rerun on the correction tip, capture and hash of the
-new artifacts, and reconciliation of the resulting Linux, macOS, and Windows
-evidence before any closure claim.
+The diagnostic patch remains runtime-dark and test-only. It does not activate
+a Session writer or consumer.
+
+## Findings and open questions
+
+No unrelated code finding was changed in this workstream. One initial
+runtime-dark probe used an exclusion glob that did not match nested paths; the
+corrected read-only probe excluded the two intended modules and returned zero
+external hits. This was a gate-command correction, not a product change.
+
+Native macOS diagnostics remain unclaimed until a conductor-authorized remote
+rerun on the reviewed diagnostic tip is downloaded, hashed, and reviewed. The
+next evidence decision is whether the stable branch marker reports
+`ambiguous`, `zero_match_with_unavailable`, or another branch. Production
+selection work must remain stopped until that evidence is reconciled.

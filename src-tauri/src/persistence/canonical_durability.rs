@@ -2431,6 +2431,89 @@ fn live_filesystem_inventory() -> Vec<FilesystemObservation> {
         .collect()
 }
 
+#[cfg(all(test, target_os = "macos"))]
+fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    const MARKER: &str = "CC9A_MACOS_DIAGNOSTIC";
+
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let root_metadata = canonical_root
+        .as_deref()
+        .and_then(|canonical_root| std::fs::metadata(canonical_root).ok());
+    let root_dev = root_metadata.as_ref().map(MetadataExt::dev);
+    let observations = live_filesystem_inventory();
+    eprintln!(
+        "{MARKER} root canonical_root={} root_dev={} inventory_count={}",
+        canonical_root
+            .as_deref()
+            .map_or_else(|| "unavailable".into(), |path| path.display().to_string()),
+        root_dev.map_or_else(|| "unavailable".into(), |dev| dev.to_string()),
+        observations.len(),
+    );
+
+    let mut metadata_unavailable_count = 0_u64;
+    let mut same_root_dev_count = 0_u64;
+    let mut unique_mount = None;
+    for (index, observation) in observations.iter().enumerate() {
+        let metadata = std::fs::metadata(&observation.mount_point).ok();
+        let observation_dev = metadata.as_ref().map(MetadataExt::dev);
+        if metadata.is_none() {
+            metadata_unavailable_count += 1;
+        }
+        let same_root_dev = match (root_dev, observation_dev) {
+            (Some(root_dev), Some(observation_dev)) => {
+                let same = root_dev == observation_dev;
+                if same {
+                    same_root_dev_count += 1;
+                    unique_mount = Some(observation.mount_point.clone());
+                }
+                same.to_string()
+            }
+            _ => "unavailable".into(),
+        };
+        eprintln!(
+            "{MARKER} observation index={index} mount_path={} filesystem_class={:?} filesystem_string={} metadata_result={} dev={} same_root_dev={} read_only={} removable={}",
+            observation.mount_point.display(),
+            classify_filesystem(&observation.file_system),
+            observation.file_system.to_string_lossy(),
+            if metadata.is_some() {
+                "available"
+            } else {
+                "unavailable"
+            },
+            observation_dev.map_or_else(|| "unavailable".into(), |dev| dev.to_string()),
+            same_root_dev,
+            observation.read_only,
+            observation.removable,
+        );
+    }
+
+    let branch = match root_metadata {
+        None => "root_missing",
+        Some(_) if same_root_dev_count == 0 && metadata_unavailable_count == 0 => {
+            "zero_match_clean"
+        }
+        Some(_) if same_root_dev_count == 0 => "zero_match_with_unavailable",
+        Some(_) if same_root_dev_count > 1 => "ambiguous",
+        Some(root_metadata) => {
+            let root_identity = filesystem_identity(&root_metadata);
+            let selected = QualifiedFilesystemMount {
+                mount_point: unique_mount.expect("one matching mount must be retained"),
+                class: CanonicalFilesystemClass::Apfs,
+            };
+            if validate_mount_volume(&selected, &root_identity).is_ok() {
+                "unique"
+            } else {
+                "unique_then_validate_mismatch"
+            }
+        }
+    };
+    eprintln!(
+        "{MARKER} summary metadata_unavailable_count={metadata_unavailable_count} same_root_dev_count={same_root_dev_count} branch={branch}",
+    );
+}
+
 fn assess_filesystem_policy(
     canonical_root: &Path,
     root_identity: &FilesystemIdentity,
@@ -3084,6 +3167,8 @@ mod tests {
         for root in [&first_root, &second_root, &nested_root, &moved_root] {
             fs::create_dir_all(root).expect("create production binding fixture");
         }
+        #[cfg(target_os = "macos")]
+        emit_cc9a_macos_mount_diagnostics(&first_root);
         let assert_binding_refusal =
             |result: Result<CanonicalExclusiveGuard, CanonicalCoordinationError>| match result {
                 Err(actual) => assert_eq!(

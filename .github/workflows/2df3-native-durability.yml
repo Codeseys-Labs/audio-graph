@@ -206,6 +206,38 @@ jobs:
           fi
           rmdir "$probe"
 
+      - name: Record macOS mount diagnostics
+        if: ${{ always() && matrix.os == 'macos' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          probe="$RUNNER_TEMP/audio-graph-2df3-filesystem-probe"
+          mkdir -p "$probe"
+          trap 'rmdir "$probe" 2>/dev/null || true' EXIT
+          {
+            printf 'probe_root=%s\n' "$probe"
+            for target in "$probe" / /System/Volumes/Data; do
+              printf 'stat_target=%s\n' "$target"
+              stat -f 'device=%d inode=%i flags=%f' "$target"
+            done
+            mount | awk '$2 == "on" && ($3 == "/" || $3 == "/System/Volumes/Data") {
+              print "mount_record=" $0
+            }'
+            for target in "$probe" / /System/Volumes/Data; do
+              printf 'diskutil_target=%s\n' "$target"
+              /usr/sbin/diskutil info "$target" | awk -F: '
+                /Device Node|Volume UUID|Volume Roles|APFS Volume Disk \(Role\)|File System Personality|Type \(Bundle\)|Read-Only Media|Read-Only Volume|Device Location|Internal|Removable Media/ {
+                  key=$1; value=substr($0, index($0, ":") + 1);
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
+                  print "diskutil_field=" key "=" value
+                }'
+            done
+            printf 'diagnostics_complete=true\n'
+          } > "$EVIDENCE_DIR/macos-mount-diagnostics.txt"
+          test -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt"
+
       - name: Record Windows runner, toolchain, command, and fixture-filesystem evidence
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         working-directory: audio-graph/src-tauri
@@ -501,6 +533,10 @@ jobs:
             "$EVIDENCE_DIR/cc9a_native.log")"
           awk '$1 == "test" && $2 ~ /cc9a_native_/ && $(NF) == "ok" { name=$2; sub(/:$/, "", name); sub(/^.*::/, "", name); print name }' \
             "$EVIDENCE_DIR/cc9a_native.log" | LC_ALL=C sort -u > "$EVIDENCE_DIR/cc9a_native.names"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            grep '^CC9A_MACOS_DIAGNOSTIC ' "$EVIDENCE_DIR/cc9a_native.log" \
+              > "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true
+          fi
           printf '%s\n' "$native_exit" > "$EVIDENCE_DIR/cc9a_native.exit"
           printf '%s\n' "$tee_exit" > "$EVIDENCE_DIR/cc9a_native.tee.exit"
           printf '%s\n' "${test_count:-0}" > "$EVIDENCE_DIR/cc9a_native.tests"
@@ -670,6 +706,40 @@ jobs:
               cc9a_artifacts=incomplete
             fi
           done
+          cc9a_macos_diagnostics_present=not_applicable
+          cc9a_macos_diagnostics_complete=not_applicable
+          macos_mount_diagnostics_complete=not_applicable
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cc9a_macos_diagnostics_present=false
+            cc9a_macos_diagnostics_complete=false
+            macos_mount_diagnostics_complete=false
+            if [ -s "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" ]; then
+              cc9a_macos_diagnostics_present=true
+              diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\)$/\1/p' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
+              diagnostic_observation_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC observation ' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_observation_schema_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC observation index=[0-9]+ mount_path=.* filesystem_class=[^ ]+ filesystem_string=.* metadata_result=(available|unavailable) dev=([0-9]+|unavailable) same_root_dev=(true|false|unavailable) read_only=(true|false) removable=(true|false)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_root_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=[0-9][0-9]*$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_summary_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=[0-9]+ same_root_dev_count=[0-9]+ branch=(root_missing|zero_match_clean|zero_match_with_unavailable|unique|ambiguous|unique_then_validate_mismatch)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              if [ "$diagnostic_root_count" = 1 ] && [ "$diagnostic_summary_count" = 1 ] &&
+                [ -n "$diagnostic_inventory_count" ] &&
+                [ "$diagnostic_observation_count" = "$diagnostic_inventory_count" ] &&
+                [ "$diagnostic_observation_schema_count" = "$diagnostic_inventory_count" ]; then
+                cc9a_macos_diagnostics_complete=true
+              fi
+            fi
+            if [ -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt" ] &&
+              [ "$(grep -c '^stat_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^diskutil_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              grep -q '^mount_record=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" &&
+              grep -q '^diagnostics_complete=true$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt"; then
+              macos_mount_diagnostics_complete=true
+            fi
+          fi
           status=PASS
           if [ "$cc9a" != 0 ] || [ "$cc9a_tee" != 0 ] ||
             [ "$cc9a_tests" != "$EXPECTED_CC9A_NATIVE_TESTS" ] ||
@@ -681,6 +751,12 @@ jobs:
             [ "$second_tests" != "$EXPECTED_CRASH_HARNESS_TESTS" ]; then
             status=FAIL
           fi
+          if [ "$RUNNER_OS" = "macOS" ] &&
+            { [ "$cc9a_macos_diagnostics_present" != true ] ||
+              [ "$cc9a_macos_diagnostics_complete" != true ] ||
+              [ "$macos_mount_diagnostics_complete" != true ]; }; then
+            status=FAIL
+          fi
           {
             printf 'status=%s\n' "$status"
             printf 'cc9a_native_exit=%s\n' "$cc9a"
@@ -689,6 +765,9 @@ jobs:
             printf 'cc9a_native_expected_tests=%s\n' "$EXPECTED_CC9A_NATIVE_TESTS"
             printf 'cc9a_native_name_markers=%s\n' "$cc9a_name_markers"
             printf 'cc9a_native_artifacts=%s\n' "$cc9a_artifacts"
+            printf 'cc9a_macos_diagnostics_present=%s\n' "$cc9a_macos_diagnostics_present"
+            printf 'cc9a_macos_diagnostics_complete=%s\n' "$cc9a_macos_diagnostics_complete"
+            printf 'macos_mount_diagnostics_complete=%s\n' "$macos_mount_diagnostics_complete"
             printf 'canonical_durability_exit=%s\n' "$first"
             printf 'canonical_durability_tee_exit=%s\n' "$first_tee"
             printf 'canonical_durability_tests=%s\n' "$first_tests"
