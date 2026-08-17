@@ -14,6 +14,8 @@ const sessionArtifactManifest = readFileSync(
     new URL("../src-tauri/src/persistence/session_artifact_manifest.rs", import.meta.url),
     "utf8",
 );
+const cargoManifest = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
+const cargoLock = readFileSync(new URL("../src-tauri/Cargo.lock", import.meta.url), "utf8");
 
 const ACTION_PIN =
     "LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf";
@@ -415,8 +417,10 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     invariant(
         unixSummary.includes("cc9a_macos_diagnostics_present") &&
             unixSummary.includes("cc9a_macos_diagnostics_complete") &&
+            unixSummary.includes("cc9a_macos_exact_mount_identity") &&
             unixSummary.includes("macos_mount_diagnostics_complete") &&
             unixSummary.includes("cc9a_macos_diagnostics_complete=true") &&
+            unixSummary.includes("cc9a_macos_exact_mount_identity=true") &&
             unixSummary.includes("macos_mount_diagnostics_complete=true") &&
             unixSummary.includes('mount_target_count="$(sed -n') &&
             unixSummary.includes('mount_resolved_count="$(sed -n') &&
@@ -432,6 +436,19 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             unixSummary.includes("diagnostic_observation_count") &&
             unixSummary.includes("diagnostic_observation_schema_count") &&
             unixSummary.includes("diagnostic_inventory_count") &&
+            unixSummary.includes("diagnostic_exact_count") &&
+            unixSummary.includes("root_equals_data=true") &&
+            unixSummary.includes("root_differs_system=true") &&
+            unixSummary.includes("same_root_fsid_count=1") &&
+            unixSummary.includes("probe_unavailable_count=0") &&
+            unixSummary.includes("root_before_after_stable=true") &&
+            unixSummary.includes("selection_authority=fsid") &&
+            unixSummary.includes("mounted_on_text_authority=false") &&
+            unixSummary.includes('[ "$diagnostic_exact_count" = 1 ]') &&
+            unixSummary.includes('[ "$cc9a_macos_exact_mount_identity" != true ]') &&
+            unixSummary.includes(
+                "printf 'cc9a_macos_exact_mount_identity=%s\\n' \"$cc9a_macos_exact_mount_identity\"",
+            ) &&
             unixSummary.includes('if [ "$RUNNER_OS" = "macOS" ]') &&
             unixSummary.includes("status=FAIL"),
         "macOS summary diagnostic completeness/fail-closed gate drift",
@@ -516,6 +533,67 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
                 "unique_then_validate_mismatch",
             ].every((branch) => canonicalSource.includes(`"${branch}"`)),
         "cc9a macOS diagnostic cardinality branches drift",
+    );
+    invariant(
+        canonicalSource.includes("root_fsid_result={}") &&
+            canonicalSource.includes("fsid_result={}") &&
+            canonicalSource.includes("same_root_fsid={}") &&
+            canonicalSource.includes("root_equals_data={}") &&
+            canonicalSource.includes("root_differs_system={}") &&
+            canonicalSource.includes("same_root_fsid_count={same_root_fsid_count}") &&
+            canonicalSource.includes("probe_unavailable_count={probe_unavailable_count}") &&
+            canonicalSource.includes("root_before_after_stable={}") &&
+            canonicalSource.includes("selection_authority=fsid") &&
+            canonicalSource.includes("mounted_on_text_authority=false"),
+        "cc9a macOS exact mount diagnostic relationship markers drift",
+    );
+    invariant(
+        (canonicalSource.match(/resolve_live_filesystem\(/g) ?? []).length === 3 &&
+            canonicalSource.includes("CanonicalPlatform::MacOs =>") &&
+            canonicalSource.includes("resolve_exact_macos_mount(namespace)") &&
+            canonicalSource.includes("nix::sys::statfs::fstatfs(directory)") &&
+            canonicalSource.includes("observation.live_mount.is_none()") &&
+            canonicalSource.includes("observation.live_mount.as_ref() == Some(root_mount)") &&
+            canonicalSource.includes("require_stable_live_mount(&before, &after)?") &&
+            canonicalSource.includes("require_macos_handle_identity(&root_dir, &namespace.identity)?") &&
+            canonicalSource.includes("require_macos_handle_identity(&refreshed_dir, &namespace.identity)?"),
+        "cc9a shared safe exact-mount production resolver drift",
+    );
+    invariant(
+        cargoManifest.includes('[target.\'cfg(target_os = "macos")\'.dependencies]') &&
+            cargoManifest.includes('nix = { version = "0.31.3", features = ["fs"] }'),
+        "cc9a macOS-target-only nix fs dependency drift",
+    );
+    const audioGraphLockPackage = cargoLock.slice(
+        cargoLock.indexOf('name = "audio-graph"'),
+        cargoLock.indexOf("\n[[package]]", cargoLock.indexOf('name = "audio-graph"')),
+    );
+    invariant(
+        audioGraphLockPackage.includes('"nix 0.31.3"') &&
+            (cargoLock.match(/name = "nix"\nversion = "0\.31\.3"/g) ?? []).length === 1 &&
+            cargoLock.includes(
+                'checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"',
+            ),
+        "cc9a locked nix root edge or package identity drift",
+    );
+
+    const exactMountTest = rustTest(
+        canonicalSource,
+        "macos_volume_group_selection_binds_logical_root_to_unique_data_volume",
+    );
+    invariant(
+        exactMountTest.includes("assert_eq!(system.volume, data.volume)") &&
+            exactMountTest.includes("Some(7)") &&
+            exactMountTest.includes("Some(42)") &&
+            exactMountTest.includes("select_exact_macos_mount") &&
+            exactMountTest.includes("live_mount: None") &&
+            exactMountTest.includes("read_only: true") &&
+            exactMountTest.includes("removable: true") &&
+            exactMountTest.includes('file_system: OsString::from("hfs")') &&
+            exactMountTest.includes("LiveMountIdentity::Synthetic(43)") &&
+            exactMountTest.includes("root.starts_with(&system.mount_point)") &&
+            exactMountTest.includes("!root.starts_with(&data.mount_point)"),
+        "cc9a pure exact-mount refusal/masking coverage drift",
     );
 
     const initialTest = rustTest(manifestSource, expectedNames[1]);
@@ -850,6 +928,91 @@ const cc9aMutations = [
         ({ canonical, ...rest }) => ({
             ...rest,
             canonical: canonical.replace('"ambiguous"', '"multiple"'),
+        }),
+    ],
+    [
+        "cc9a macOS exact relation marker drift",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace("root_equals_data={}", "root_matches_data={}"),
+        }),
+    ],
+    [
+        "cc9a candidate probe failure skipped",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace(
+                "observation.live_mount.is_none()",
+                "observation.live_mount.is_some()",
+            ),
+        }),
+    ],
+    [
+        "cc9a descriptor-bound fstatfs removed",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace(
+                "nix::sys::statfs::fstatfs(directory)",
+                "nix::sys::statfs::statfs(Path::new(\"/\"))",
+            ),
+        }),
+    ],
+    [
+        "cc9a before-after mount stability removed",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: canonical.replace(
+                "require_stable_live_mount(&before, &after)?;",
+                "let _ = (&before, &after);",
+            ),
+        }),
+    ],
+    [
+        "cc9a mounted-on masking coverage removed",
+        ({ canonical, ...rest }) => ({
+            ...rest,
+            canonical: mutateRustTest(
+                canonical,
+                "macos_volume_group_selection_binds_logical_root_to_unique_data_volume",
+                "assert!(!root.starts_with(&data.mount_point));",
+                "assert!(root.starts_with(&system.mount_point));",
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS exact PASS relation weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                "root_equals_data=true",
+                "root_equals_data=(true|false)",
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS exact count gate omitted",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_exact_count" = 1 ]',
+                '[ -n "$diagnostic_exact_count" ]',
+            ),
+        }),
+    ],
+    [
+        "cc9a macOS exact status gate omitted",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$cc9a_macos_exact_mount_identity" != true ]',
+                '[ "$cc9a_macos_exact_mount_identity" = missing ]',
+            ),
         }),
     ],
     [

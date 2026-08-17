@@ -598,6 +598,7 @@ dependencies = [
  "llama-cpp-2",
  "log",
  "mistralrs",
+ "nix 0.31.3",
  "parakeet-rs",
  "petgraph",
  "rayon",

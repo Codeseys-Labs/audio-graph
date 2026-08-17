@@ -753,6 +753,7 @@ jobs:
           done
           cc9a_macos_diagnostics_present=not_applicable
           cc9a_macos_diagnostics_complete=not_applicable
+          cc9a_macos_exact_mount_identity=not_applicable
           macos_mount_diagnostics_complete=not_applicable
           mount_target_count=not_applicable
           mount_resolved_count=not_applicable
@@ -761,6 +762,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             cc9a_macos_diagnostics_present=false
             cc9a_macos_diagnostics_complete=false
+            cc9a_macos_exact_mount_identity=false
             macos_mount_diagnostics_complete=false
             mount_target_count="$(sed -n 's/^target_count=//p' \
               "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
@@ -772,21 +774,25 @@ jobs:
               "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
             if [ -s "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" ]; then
               cc9a_macos_diagnostics_present=true
-              diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\)$/\1/p' \
+              diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=\(available\|unavailable\)$/\1/p' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
               diagnostic_observation_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC observation ' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
-              diagnostic_observation_schema_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC observation index=[0-9]+ mount_path=.* filesystem_class=[^ ]+ filesystem_string=.* metadata_result=(available|unavailable) dev=([0-9]+|unavailable) same_root_dev=(true|false|unavailable) read_only=(true|false) removable=(true|false)$' \
+              diagnostic_observation_schema_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC observation index=[0-9]+ mount_path=.* filesystem_class=[^ ]+ filesystem_string=.* metadata_result=(available|unavailable) dev=([0-9]+|unavailable) same_root_dev=(true|false|unavailable) fsid_result=(available|unavailable) same_root_fsid=(true|false|unavailable) read_only=(true|false) removable=(true|false)$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
-              diagnostic_root_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=[0-9][0-9]*$' \
+              diagnostic_root_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=[0-9]+ root_fsid_result=(available|unavailable)$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               diagnostic_summary_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=[0-9]+ same_root_dev_count=[0-9]+ branch=(root_missing|zero_match_clean|zero_match_with_unavailable|unique|ambiguous|unique_then_validate_mismatch)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_exact_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               if [ "$diagnostic_root_count" = 1 ] && [ "$diagnostic_summary_count" = 1 ] &&
                 [ -n "$diagnostic_inventory_count" ] &&
                 [ "$diagnostic_observation_count" = "$diagnostic_inventory_count" ] &&
-                [ "$diagnostic_observation_schema_count" = "$diagnostic_inventory_count" ]; then
+                [ "$diagnostic_observation_schema_count" = "$diagnostic_inventory_count" ] &&
+                [ "$diagnostic_exact_count" = 1 ]; then
                 cc9a_macos_diagnostics_complete=true
+                cc9a_macos_exact_mount_identity=true
               fi
             fi
             if [ -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt" ] &&
@@ -820,6 +826,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ] &&
             { [ "$cc9a_macos_diagnostics_present" != true ] ||
               [ "$cc9a_macos_diagnostics_complete" != true ] ||
+              [ "$cc9a_macos_exact_mount_identity" != true ] ||
               [ "$macos_mount_diagnostics_complete" != true ]; }; then
             status=FAIL
           fi
@@ -833,6 +840,7 @@ jobs:
             printf 'cc9a_native_artifacts=%s\n' "$cc9a_artifacts"
             printf 'cc9a_macos_diagnostics_present=%s\n' "$cc9a_macos_diagnostics_present"
             printf 'cc9a_macos_diagnostics_complete=%s\n' "$cc9a_macos_diagnostics_complete"
+            printf 'cc9a_macos_exact_mount_identity=%s\n' "$cc9a_macos_exact_mount_identity"
             printf 'macos_mount_diagnostics_complete=%s\n' "$macos_mount_diagnostics_complete"
             printf 'macos_mount_target_count=%s\n' "$mount_target_count"
             printf 'macos_mount_resolved_count=%s\n' "$mount_resolved_count"

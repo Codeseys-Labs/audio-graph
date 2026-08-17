@@ -102,14 +102,7 @@ impl CanonicalFilesystemQualification {
         if !identity_is_available(&namespace.identity) {
             return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
         }
-        let observations = live_filesystem_inventory();
-        let filesystem = assess_filesystem_policy(
-            &namespace.canonical_root,
-            &namespace.identity,
-            platform,
-            &observations,
-        )?;
-        validate_mount_volume(&filesystem, &namespace.identity)?;
+        let filesystem = resolve_live_filesystem(&namespace, platform)?;
         let token = next_qualification_token()
             .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
         let qualification = Self {
@@ -294,13 +287,27 @@ struct ProductionQualificationBinding {
 struct QualifiedFilesystemMount {
     mount_point: PathBuf,
     class: CanonicalFilesystemClass,
+    #[cfg(any(test, target_os = "macos"))]
+    live_mount: Option<LiveMountIdentity>,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveMountIdentity {
+    #[cfg(target_os = "macos")]
+    MacOs(nix::sys::statfs::fsid_t),
+    #[cfg(test)]
+    Synthetic(u64),
 }
 
 #[derive(Clone)]
 struct FilesystemObservation {
     mount_point: PathBuf,
     file_system: OsString,
+    #[cfg(test)]
     volume: Option<VolumeIdentity>,
+    #[cfg(any(test, target_os = "macos"))]
+    live_mount: Option<LiveMountIdentity>,
     removable: bool,
     read_only: bool,
 }
@@ -316,24 +323,30 @@ impl FilesystemObservation {
         Self {
             mount_point: mount_point.into(),
             file_system: file_system.into(),
+            #[cfg(test)]
             volume: None,
+            #[cfg(any(test, target_os = "macos"))]
+            live_mount: None,
             removable,
             read_only,
         }
     }
 
     #[cfg(test)]
-    fn for_test_volume(
+    fn for_test_exact_mount(
         mount_point: impl Into<PathBuf>,
         file_system: impl Into<OsString>,
         volume: Option<u64>,
+        live_mount: Option<u64>,
         removable: bool,
         read_only: bool,
     ) -> Self {
         Self {
             mount_point: mount_point.into(),
             file_system: file_system.into(),
+            #[cfg(test)]
             volume: volume.map(VolumeIdentity::SyntheticAlgorithmNamespace),
+            live_mount: live_mount.map(LiveMountIdentity::Synthetic),
             removable,
             read_only,
         }
@@ -906,15 +919,7 @@ impl CanonicalDurability {
         {
             return Err(CanonicalCoordinationError::QualificationBindingMismatch);
         }
-        let observations = live_filesystem_inventory();
-        let filesystem = assess_filesystem_policy(
-            &namespace.canonical_root,
-            &namespace.identity,
-            self.platform,
-            &observations,
-        )
-        .map_err(CanonicalCoordinationError::QualificationRefused)?;
-        validate_mount_volume(&filesystem, &namespace.identity)
+        let filesystem = resolve_live_filesystem(namespace, self.platform)
             .map_err(CanonicalCoordinationError::QualificationRefused)?;
         if filesystem != binding.filesystem {
             return Err(CanonicalCoordinationError::QualificationBindingMismatch);
@@ -2417,18 +2422,187 @@ fn live_filesystem_inventory() -> Vec<FilesystemObservation> {
         .list()
         .iter()
         .map(|disk| {
+            #[cfg(test)]
             let volume = std::fs::metadata(disk.mount_point())
                 .ok()
                 .and_then(|metadata| filesystem_identity(&metadata).volume);
             FilesystemObservation {
                 mount_point: disk.mount_point().to_path_buf(),
                 file_system: disk.file_system().to_os_string(),
+                #[cfg(test)]
                 volume,
+                #[cfg(any(test, target_os = "macos"))]
+                live_mount: None,
                 removable: disk.is_removable(),
                 read_only: disk.is_read_only(),
             }
         })
         .collect()
+}
+
+fn resolve_live_filesystem(
+    namespace: &ManagedNamespace,
+    platform: CanonicalPlatform,
+) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+    if !namespace_supported_for(platform) {
+        return Err(
+            CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { platform },
+        );
+    }
+    match platform {
+        CanonicalPlatform::Linux => {
+            let observations = live_filesystem_inventory();
+            let filesystem =
+                assess_filesystem_policy(&namespace.canonical_root, platform, &observations)?;
+            validate_mount_volume(&filesystem, &namespace.identity)?;
+            Ok(filesystem)
+        }
+        CanonicalPlatform::MacOs => {
+            #[cfg(target_os = "macos")]
+            {
+                resolve_exact_macos_mount(namespace)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+            }
+        }
+        CanonicalPlatform::Windows | CanonicalPlatform::Other => {
+            unreachable!("unsupported platforms return before filesystem inventory")
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn select_exact_macos_mount(
+    root_mount: &LiveMountIdentity,
+    observations: &[FilesystemObservation],
+) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+    if observations
+        .iter()
+        .any(|observation| observation.live_mount.is_none())
+    {
+        return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+    }
+    let mut matching = observations
+        .iter()
+        .filter(|observation| observation.live_mount.as_ref() == Some(root_mount));
+    let observation = matching
+        .next()
+        .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
+    if matching.next().is_some() {
+        return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+    }
+    let class = classify_filesystem(&observation.file_system);
+    if observation.read_only {
+        return Err(CanonicalFilesystemQualificationError::ReadOnlyFilesystem { class });
+    }
+    if observation.removable {
+        return Err(CanonicalFilesystemQualificationError::RemovableFilesystem { class });
+    }
+    if class != CanonicalFilesystemClass::Apfs {
+        return Err(
+            CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                platform: CanonicalPlatform::MacOs,
+                class,
+            },
+        );
+    }
+    Ok(QualifiedFilesystemMount {
+        mount_point: observation.mount_point.clone(),
+        class,
+        live_mount: Some(root_mount.clone()),
+    })
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn require_stable_live_mount(
+    before: &LiveMountIdentity,
+    after: &LiveMountIdentity,
+) -> Result<(), CanonicalFilesystemQualificationError> {
+    if before == after {
+        Ok(())
+    } else {
+        Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_exact_macos_mount(
+    namespace: &ManagedNamespace,
+) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+    let root_dir = File::open(&namespace.canonical_root)
+        .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
+    require_macos_handle_identity(&root_dir, &namespace.identity)?;
+    let before = macos_live_mount_identity(&root_dir)?;
+
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut observations = Vec::with_capacity(disks.list().len());
+    for disk in disks.list() {
+        let mount_dir = File::open(disk.mount_point()).map_err(|error| {
+            qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error)
+        })?;
+        let metadata = mount_dir.metadata().map_err(|error| {
+            qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error)
+        })?;
+        if !metadata.is_dir() {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        observations.push(FilesystemObservation {
+            mount_point: disk.mount_point().to_path_buf(),
+            file_system: disk.file_system().to_os_string(),
+            live_mount: Some(macos_live_mount_identity(&mount_dir)?),
+            removable: disk.is_removable(),
+            read_only: disk.is_read_only(),
+        });
+    }
+
+    let filesystem = select_exact_macos_mount(&before, &observations)?;
+    let after = macos_live_mount_identity(&root_dir)?;
+    require_stable_live_mount(&before, &after)?;
+    require_macos_handle_identity(&root_dir, &namespace.identity)?;
+
+    let refreshed = ManagedNamespace::load(
+        &namespace.canonical_root,
+        CanonicalCoordinationError::ParentProvisioningRequired,
+    )
+    .map_err(qualification_coordination_error)?;
+    if &refreshed != namespace {
+        return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+    }
+    let refreshed_dir = File::open(&refreshed.canonical_root)
+        .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
+    require_macos_handle_identity(&refreshed_dir, &namespace.identity)?;
+    let refreshed_mount = macos_live_mount_identity(&refreshed_dir)?;
+    require_stable_live_mount(&before, &refreshed_mount)?;
+    Ok(filesystem)
+}
+
+#[cfg(target_os = "macos")]
+fn require_macos_handle_identity(
+    directory: &File,
+    expected: &FilesystemIdentity,
+) -> Result<(), CanonicalFilesystemQualificationError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
+    if metadata.is_dir() && filesystem_identity(&metadata) == *expected {
+        Ok(())
+    } else {
+        Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_live_mount_identity(
+    directory: &File,
+) -> Result<LiveMountIdentity, CanonicalFilesystemQualificationError> {
+    nix::sys::statfs::fstatfs(directory)
+        .map(|statfs| LiveMountIdentity::MacOs(statfs.filesystem_id()))
+        .map_err(|error| {
+            let error: io::Error = error.into();
+            qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error)
+        })
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -2442,24 +2616,48 @@ fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
         .as_deref()
         .and_then(|canonical_root| std::fs::metadata(canonical_root).ok());
     let root_dev = root_metadata.as_ref().map(MetadataExt::dev);
+    let root_dir = canonical_root
+        .as_deref()
+        .and_then(|canonical_root| File::open(canonical_root).ok());
+    let root_mount_before = root_dir
+        .as_ref()
+        .and_then(|directory| macos_live_mount_identity(directory).ok());
     let observations = live_filesystem_inventory();
     eprintln!(
-        "{MARKER} root canonical_root={} root_dev={} inventory_count={}",
+        "{MARKER} root canonical_root={} root_dev={} inventory_count={} root_fsid_result={}",
         canonical_root
             .as_deref()
             .map_or_else(|| "unavailable".into(), |path| path.display().to_string()),
         root_dev.map_or_else(|| "unavailable".into(), |dev| dev.to_string()),
         observations.len(),
+        if root_mount_before.is_some() {
+            "available"
+        } else {
+            "unavailable"
+        },
     );
 
     let mut metadata_unavailable_count = 0_u64;
     let mut same_root_dev_count = 0_u64;
+    let mut probe_unavailable_count = 0_u64;
+    let mut same_root_fsid_count = 0_u64;
+    let mut root_equals_data = None;
+    let mut root_differs_system = None;
     let mut unique_mount = None;
     for (index, observation) in observations.iter().enumerate() {
-        let metadata = std::fs::metadata(&observation.mount_point).ok();
+        let mount_dir = File::open(&observation.mount_point).ok();
+        let metadata = mount_dir
+            .as_ref()
+            .and_then(|directory| directory.metadata().ok());
+        let observation_mount = mount_dir
+            .as_ref()
+            .and_then(|directory| macos_live_mount_identity(directory).ok());
         let observation_dev = metadata.as_ref().map(MetadataExt::dev);
         if metadata.is_none() {
             metadata_unavailable_count += 1;
+        }
+        if observation_mount.is_none() {
+            probe_unavailable_count += 1;
         }
         let same_root_dev = match (root_dev, observation_dev) {
             (Some(root_dev), Some(observation_dev)) => {
@@ -2472,8 +2670,24 @@ fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
             }
             _ => "unavailable".into(),
         };
+        let same_root_fsid = match (&root_mount_before, &observation_mount) {
+            (Some(root_mount), Some(observation_mount)) => {
+                let same = root_mount == observation_mount;
+                if same {
+                    same_root_fsid_count += 1;
+                }
+                if observation.mount_point == Path::new("/System/Volumes/Data") {
+                    root_equals_data = Some(same);
+                }
+                if observation.mount_point == Path::new("/") {
+                    root_differs_system = Some(!same);
+                }
+                same.to_string()
+            }
+            _ => "unavailable".into(),
+        };
         eprintln!(
-            "{MARKER} observation index={index} mount_path={} filesystem_class={:?} filesystem_string={} metadata_result={} dev={} same_root_dev={} read_only={} removable={}",
+            "{MARKER} observation index={index} mount_path={} filesystem_class={:?} filesystem_string={} metadata_result={} dev={} same_root_dev={} fsid_result={} same_root_fsid={} read_only={} removable={}",
             observation.mount_point.display(),
             classify_filesystem(&observation.file_system),
             observation.file_system.to_string_lossy(),
@@ -2484,6 +2698,12 @@ fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
             },
             observation_dev.map_or_else(|| "unavailable".into(), |dev| dev.to_string()),
             same_root_dev,
+            if observation_mount.is_some() {
+                "available"
+            } else {
+                "unavailable"
+            },
+            same_root_fsid,
             observation.read_only,
             observation.removable,
         );
@@ -2501,6 +2721,8 @@ fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
             let selected = QualifiedFilesystemMount {
                 mount_point: unique_mount.expect("one matching mount must be retained"),
                 class: CanonicalFilesystemClass::Apfs,
+                #[cfg(any(test, target_os = "macos"))]
+                live_mount: None,
             };
             if validate_mount_volume(&selected, &root_identity).is_ok() {
                 "unique"
@@ -2512,11 +2734,26 @@ fn emit_cc9a_macos_mount_diagnostics(root: &Path) {
     eprintln!(
         "{MARKER} summary metadata_unavailable_count={metadata_unavailable_count} same_root_dev_count={same_root_dev_count} branch={branch}",
     );
+    let root_mount_after = root_dir
+        .as_ref()
+        .and_then(|directory| macos_live_mount_identity(directory).ok());
+    let root_before_after_stable = match (&root_mount_before, &root_mount_after) {
+        (Some(before), Some(after)) => Some(before == after),
+        _ => None,
+    };
+    let relation = |value: Option<bool>| {
+        value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+    };
+    eprintln!(
+        "{MARKER} exact root_equals_data={} root_differs_system={} same_root_fsid_count={same_root_fsid_count} probe_unavailable_count={probe_unavailable_count} root_before_after_stable={} selection_authority=fsid mounted_on_text_authority=false",
+        relation(root_equals_data),
+        relation(root_differs_system),
+        relation(root_before_after_stable),
+    );
 }
 
 fn assess_filesystem_policy(
     canonical_root: &Path,
-    root_identity: &FilesystemIdentity,
     platform: CanonicalPlatform,
     observations: &[FilesystemObservation],
 ) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
@@ -2532,26 +2769,7 @@ fn assess_filesystem_policy(
             .max_by_key(|observation| observation.mount_point.components().count())
             .ok_or(CanonicalFilesystemQualificationError::NoMatchingMount)?,
         CanonicalPlatform::MacOs => {
-            let root_volume = root_identity
-                .volume
-                .as_ref()
-                .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
-            let mut matching = observations
-                .iter()
-                .filter(|observation| observation.volume.as_ref() == Some(root_volume));
-            let Some(observation) = matching.next() else {
-                if observations
-                    .iter()
-                    .any(|observation| observation.volume.is_none())
-                {
-                    return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
-                }
-                return Err(CanonicalFilesystemQualificationError::NoMatchingMount);
-            };
-            if matching.next().is_some() {
-                return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
-            }
-            observation
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
         }
         CanonicalPlatform::Windows | CanonicalPlatform::Other => {
             unreachable!("unsupported platforms return before filesystem observation selection")
@@ -2577,6 +2795,8 @@ fn assess_filesystem_policy(
     Ok(QualifiedFilesystemMount {
         mount_point: observation.mount_point.clone(),
         class,
+        #[cfg(any(test, target_os = "macos"))]
+        live_mount: None,
     })
 }
 
@@ -2601,13 +2821,8 @@ fn validate_mount_volume(
     filesystem: &QualifiedFilesystemMount,
     root_identity: &FilesystemIdentity,
 ) -> Result<(), CanonicalFilesystemQualificationError> {
-    let metadata = std::fs::metadata(&filesystem.mount_point).map_err(|error| {
-        CanonicalFilesystemQualificationError::Io {
-            stage: CanonicalCoordinationStage::ResolveRoot,
-            kind: error.kind(),
-            raw_os_error: error.raw_os_error(),
-        }
-    })?;
+    let metadata = std::fs::metadata(&filesystem.mount_point)
+        .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
     let mount_identity = filesystem_identity(&metadata);
     match (
         root_identity.volume.as_ref(),
@@ -2615,6 +2830,17 @@ fn validate_mount_volume(
     ) {
         (Some(root), Some(mount)) if root == mount => Ok(()),
         _ => Err(CanonicalFilesystemQualificationError::IdentityUnavailable),
+    }
+}
+
+fn qualification_io_error(
+    stage: CanonicalCoordinationStage,
+    error: &io::Error,
+) -> CanonicalFilesystemQualificationError {
+    CanonicalFilesystemQualificationError::Io {
+        stage,
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
     }
 }
 
@@ -2790,43 +3016,38 @@ mod tests {
             .expect("bind test qualification to root identity")
     }
 
-    fn policy_identity(volume: Option<u64>) -> FilesystemIdentity {
-        FilesystemIdentity {
-            volume: volume.map(VolumeIdentity::SyntheticAlgorithmNamespace),
-            object: Some(ObjectIdentity::SyntheticAlgorithmObject(1)),
-        }
-    }
-
     #[test]
     fn production_filesystem_policy_is_longest_mount_and_fail_closed() {
         let root = Path::new("/managed/session");
         let ext4 = FilesystemObservation::for_test("/", "ext4", false, false);
         let nested_ext4 = FilesystemObservation::for_test("/managed", "ext4", false, false);
-        let nested_apfs =
-            FilesystemObservation::for_test_volume("/managed", "apfs", Some(1), false, false);
+        let nested_apfs = FilesystemObservation::for_test_exact_mount(
+            "/managed",
+            "apfs",
+            Some(1),
+            Some(1),
+            false,
+            false,
+        );
 
         assert_eq!(
             assess_filesystem_policy(
                 root,
-                &policy_identity(Some(1)),
                 CanonicalPlatform::Linux,
                 &[ext4.clone(), nested_ext4.clone()],
             ),
             Ok(QualifiedFilesystemMount {
                 mount_point: PathBuf::from("/managed"),
                 class: CanonicalFilesystemClass::Ext4,
+                live_mount: None,
             })
         );
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &policy_identity(Some(1)),
-                CanonicalPlatform::MacOs,
-                &[nested_apfs],
-            ),
+            select_exact_macos_mount(&LiveMountIdentity::Synthetic(1), &[nested_apfs]),
             Ok(QualifiedFilesystemMount {
                 mount_point: PathBuf::from("/managed"),
                 class: CanonicalFilesystemClass::Apfs,
+                live_mount: Some(LiveMountIdentity::Synthetic(1)),
             })
         );
 
@@ -2922,7 +3143,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                assess_filesystem_policy(root, &policy_identity(Some(1)), platform, &observations,),
+                assess_filesystem_policy(root, platform, &observations),
                 Err(expected),
                 "policy case {label}",
             );
@@ -2934,7 +3155,6 @@ mod tests {
         let sensitive_root = Path::new("/managed/private-user-root");
         let error = assess_filesystem_policy(
             sensitive_root,
-            &policy_identity(Some(1)),
             CanonicalPlatform::Linux,
             &[FilesystemObservation::for_test(
                 "/managed",
@@ -2969,6 +3189,7 @@ mod tests {
                 &QualifiedFilesystemMount {
                     mount_point: PathBuf::from("/"),
                     class: CanonicalFilesystemClass::Ext4,
+                    live_mount: None,
                 },
                 &unavailable_identity,
             ),
@@ -2995,11 +3216,19 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn macos_volume_group_selection_binds_logical_root_to_unique_data_volume() {
         let root = Path::new("/Users/example/Library/Application Support/AudioGraph");
-        let root_identity = policy_identity(Some(42));
-        let system = FilesystemObservation::for_test_volume("/", "apfs", Some(7), false, true);
-        let data = FilesystemObservation::for_test_volume(
+        let root_mount = LiveMountIdentity::Synthetic(42);
+        let system = FilesystemObservation::for_test_exact_mount(
+            "/",
+            "apfs",
+            Some(42),
+            Some(7),
+            false,
+            true,
+        );
+        let data = FilesystemObservation::for_test_exact_mount(
             "/System/Volumes/Data",
             "apfs",
+            Some(42),
             Some(42),
             false,
             false,
@@ -3008,28 +3237,22 @@ mod tests {
         let qualified = QualifiedFilesystemMount {
             mount_point: PathBuf::from("/System/Volumes/Data"),
             class: CanonicalFilesystemClass::Apfs,
+            live_mount: Some(LiveMountIdentity::Synthetic(42)),
         };
+        assert_eq!(system.volume, data.volume);
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system.clone(), data.clone()],
-            ),
+            select_exact_macos_mount(&root_mount, &[system.clone(), data.clone()]),
             Ok(qualified)
         );
+        assert!(root.starts_with(&system.mount_point));
+        assert!(!root.starts_with(&data.mount_point));
 
         let read_only_data = FilesystemObservation {
             read_only: true,
             ..data.clone()
         };
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system.clone(), read_only_data],
-            ),
+            select_exact_macos_mount(&root_mount, &[system.clone(), read_only_data]),
             Err(CanonicalFilesystemQualificationError::ReadOnlyFilesystem {
                 class: CanonicalFilesystemClass::Apfs,
             })
@@ -3040,72 +3263,64 @@ mod tests {
             ..data.clone()
         };
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system.clone(), removable_data],
-            ),
+            select_exact_macos_mount(&root_mount, &[system.clone(), removable_data]),
             Err(CanonicalFilesystemQualificationError::RemovableFilesystem {
                 class: CanonicalFilesystemClass::Apfs,
             })
         );
 
-        assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &policy_identity(None),
-                CanonicalPlatform::MacOs,
-                &[system.clone(), data.clone()],
-            ),
-            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
-        );
-
-        let unidentified_data = FilesystemObservation {
-            volume: None,
+        let non_apfs_data = FilesystemObservation {
+            file_system: OsString::from("hfs"),
             ..data.clone()
         };
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system.clone(), unidentified_data],
-            ),
-            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+            select_exact_macos_mount(&root_mount, &[system.clone(), non_apfs_data]),
+            Err(
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::MacOs,
+                    class: CanonicalFilesystemClass::Other,
+                }
+            )
         );
 
-        let foreign_data = FilesystemObservation::for_test_volume(
+        let foreign_data = FilesystemObservation::for_test_exact_mount(
             "/System/Volumes/Data",
             "apfs",
+            Some(42),
             Some(99),
             false,
             false,
         );
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system.clone(), foreign_data],
-            ),
-            Err(CanonicalFilesystemQualificationError::NoMatchingMount)
+            select_exact_macos_mount(&root_mount, &[system.clone(), foreign_data]),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
         );
 
-        let duplicate_data = FilesystemObservation::for_test_volume(
+        let unavailable_system = FilesystemObservation {
+            live_mount: None,
+            ..system.clone()
+        };
+        assert_eq!(
+            select_exact_macos_mount(&root_mount, &[unavailable_system, data.clone()]),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
+
+        let duplicate_data = FilesystemObservation::for_test_exact_mount(
             "/Volumes/DataAlias",
             "apfs",
+            Some(42),
             Some(42),
             false,
             false,
         );
         assert_eq!(
-            assess_filesystem_policy(
-                root,
-                &root_identity,
-                CanonicalPlatform::MacOs,
-                &[system, data, duplicate_data],
-            ),
+            select_exact_macos_mount(&root_mount, &[system, data, duplicate_data]),
+            Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+        );
+
+        assert_eq!(require_stable_live_mount(&root_mount, &root_mount), Ok(()));
+        assert_eq!(
+            require_stable_live_mount(&root_mount, &LiveMountIdentity::Synthetic(43)),
             Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
         );
     }

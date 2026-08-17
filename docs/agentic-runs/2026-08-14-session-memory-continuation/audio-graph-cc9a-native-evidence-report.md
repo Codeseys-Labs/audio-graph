@@ -1,232 +1,265 @@
-# audio-graph-cc9a macOS diagnostic harness correction report
+# audio-graph-cc9a exact macOS mount resolver report
 
-## Assignment and custody
+Date: 2026-08-16 (America/Los_Angeles)
+
+## Custody and scope
 
 - Seed: `audio-graph-cc9a`.
-- Acceptance for this bounded correction: keep the macOS diagnostic collection
-  from preventing the cc9a, canonical-durability, and crash-harness tests; map
-  each diagnostic directory to its serving mount before `diskutil`; preserve
-  the prior diagnostic evidence; make the summary enforce exact counts; retain
-  all 42 checker mutations and add fail-closed coverage; make no product change.
-- Exact base and merge-base:
-  `86614dc44823ca61c09b6e137de3732331c98297`.
-- Worktree:
-  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-macos-diagnostics2-wave7c`.
-- Branch: `work/audio-graph-cc9a-macos-diagnostics2-wave7c`.
-- Workflow/checker correction commit:
-  `f02ab7a54546a54ec0da0ce240c93ff52893f2c9`.
-- Stat-success P1 correction: this artifact's containing commit. Its SHA
-  cannot be embedded in its own Git object and is recorded in the final
-  handoff.
-- Report commit: this artifact's containing commit. Its SHA cannot be embedded
-  in its own Git object and is recorded in the final handoff.
+- Worktree: `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-exact-mount-wave7c`.
+- Branch: `work/audio-graph-cc9a-exact-mount-wave7c`.
+- Exact base and merge-base: `dfd7ce0c5428c8eade75c2864efd1107d1b6ff05`.
+- Rust/Cargo: `1.95.0`; Bun: `1.3.14`.
+- No push, dispatch, merge, GitHub mutation, Seed mutation, frontend change,
+  generated-file change, other-workflow change, or ref deletion was performed.
 
-The correction changes only the assigned native workflow and its source-aware
-checker. This report is the only third path. No Seeds, Rust/product source,
-dependency, frontend, generated file, other workflow, GitHub state, or remote
-ref changed. The conductor retains remote rerun, integration, push, merge,
-Seed reconciliation, and cleanup authority.
+The bounded acceptance was to replace macOS `st_dev` mount selection with a
+safe fd-bound exact live-mount join, retain Linux and unsupported-platform
+behavior, preserve all native test names/counts, and strengthen the native
+evidence gate without claiming macOS acceptance before a new native run.
 
-## Diagnostic run 31985989709
+## Governing evidence and decision
 
-Run `31985989709` executed exact SHA
-`6d1e5ac76b4425a5de0b3975894ac0f107952c6e`. The supplied downloaded bundle
-is retained at:
+Native run `31987754437` at `ca356409a6ac756fb17fa1e98f2f63eb609e2fbd`
+proved that `/` and `/System/Volumes/Data` both had
+`st_dev/root_dev=16777227`; `same_root_dev_count=2`, so the old selector
+correctly refused as ambiguous.
 
-```text
-/tmp/audio-graph-cc9a-native-31985989709.wxoQUQ
-```
+The governing research artifact was
+`/tmp/audio-graph-artifacts/2026-08-16/cc9a-macos-exact-mount-api-research.md`,
+SHA-256
+`cd75aee3ba5f7126350d3904785a5366ac5a064299ecac321a946d5933edb84d`.
+Its selected boundary was implemented: macOS-target-only direct `nix 0.31.3`
+with feature `fs`, using safe `nix::sys::statfs::fstatfs` on retained directory
+handles and typed `filesystem_id()` equality. No Rustix mounted-on matching,
+mount text parsing, `st_dev` fallback, write probe, hardcoded firmlink, or
+application-level safety escape hatch was added.
 
-The bundle's `SHA256SUMS` file verifies as:
+## Implementation
 
-```text
-e64f2412258040d07c6c506d2869c98bd3624734e6d157b196ffd55873ee0b24  SHA256SUMS
-```
+`CanonicalFilesystemQualification::for_existing_managed_root` and
+`CanonicalDurability::validate_guard_binding` now call one shared private live
+resolver.
 
-Platform results are deliberately separated:
+On macOS the resolver:
 
-- Linux Blacksmith Ubuntu 24.04 on ext4: accepted. `cc9a_native_` 3/3,
-  `canonical_durability` 47/47, and crash harness 11/11 all passed.
-- Windows GitHub `windows-2025` on NTFS: accepted. `cc9a_native_` 1/1,
-  `canonical_durability` 14/14, and crash harness 9/9 all passed.
-- macOS Blacksmith macOS 15: not accepted and not diagnostic-complete. The
-  cc9a, canonical-durability, and crash-harness steps did not run; the summary
-  records `not_run` and counts 0/3, 0/17, and 0/11 respectively. No
-  `CC9A_MACOS_DIAGNOSTIC` Rust marker exists in the artifact.
+1. opens and retains the canonical managed-root directory;
+2. requires its handle metadata to match the loaded namespace directory
+   identity;
+3. captures the root's fd-bound live filesystem ID;
+4. refreshes `sysinfo::Disks`, opens every mountpoint, checks handle metadata,
+   and calls safe `fstatfs` for every candidate, refusing the whole inventory
+   on any probe error;
+5. requires exactly one candidate with the same live filesystem ID;
+6. applies the existing APFS, writable, and non-removable policy to that exact
+   record;
+7. rechecks the retained root ID, retained handle identity, freshly loaded
+   canonical pathname identity, freshly opened pathname handle identity, and
+   live filesystem ID; and
+8. stores the exact private live-mount identity in the qualification binding,
+   so every guard acquisition must rederive and equal it before coordination
+   open/create.
 
-The macOS shell step passed the probe directory itself to `diskutil info`:
+Linux retains longest lexical mount selection plus ext4 policy and volume
+validation. Windows and Other retain typed refusal before inventory or
+mutation.
 
-```text
-Could not find disk: /Users/runner/_work/_temp/audio-graph-2df3-filesystem-probe
-Process completed with exit code 1.
-```
+The lockfile changed only the root `audio-graph` dependency list. The existing
+single `nix 0.31.3` package node, version, and checksum are unchanged.
 
-Because the step used `set -euo pipefail`, that first `diskutil` failure
-aborted collection and caused the ordinary Rust test steps to be skipped.
-The always-run summary and artifact upload still ran, which preserved this
-partial evidence:
+## Commit series
 
-- the probe directory, `/`, and `/System/Volumes/Data` all had stat device
-  `16777226`;
-- `/` was `/dev/disk2s1s1`, APFS, sealed and read-only;
-- `/System/Volumes/Data` was `/dev/disk2s5`, APFS, writable Data; and
-- the earlier fixture preflight had already resolved the probe through
-  `df -P` to `/System/Volumes/Data` and recorded `/dev/disk2s5`.
-
-This is a diagnostic-harness defect, not evidence for changing production
-mount selection. The live Rust ambiguity remains unobserved because the test
-never ran.
-
-## Correction
-
-The macOS-only diagnostic step now uses one quoted Bash target array for the
-probe directory, `/`, and `/System/Volumes/Data`. For each target it:
-
-1. preserves BSD `stat -f` device/inode/flags output and relevant `mount`
-   records;
-2. captures `df -P` exit and output, parses the POSIX record's mounted-on field,
-   and records both the original target and resolved serving mount;
-3. calls `diskutil info` only with the resolved mount; and
-4. captures the per-target `diskutil` exit, complete command output, and the
-   existing bounded identity/policy fields without aborting on a failed target.
-
-The collection always emits `target_count`, `resolved_count`, `success_count`,
-`failure_count`, and one `diagnostics_complete=true` marker before exiting 0.
-This keeps the Rust tests runnable. It does not hide diagnostic failures: the
-Unix summary marks the macOS preflight complete only with exactly 3 targets,
-3 resolutions, 3 zero-exit `diskutil` observations, 3 successes, 0 failures,
-one completion marker, exactly 3 stat targets, exactly 3 `stat_exit=0`
-observations, and mount evidence. Any collection defect therefore leaves the
-job FAIL after all test and upload evidence has had a chance to run.
-
-The checker retains every previous mutation and adds five cases for:
-
-- directory-to-mount resolution;
-- nonfatal per-target collection;
-- exact count and completion output;
-- a collection exit that would skip the Rust tests; and
-- exact Unix-summary success enforcement.
-
-The Spec P1 follow-up adds a sixth case for exact stat-success enforcement.
-The exact current checker total is 48 mutations.
-
-## TDD evidence
-
-The unchanged baseline passed all 42 existing mutations:
+Commits were intentionally separate and were not amended:
 
 ```text
-PASS: direct LABSN and cc9a native evidence contract with 42 mutations
+fc87c4d1a8ef5440256f7b2c7ac9b0f1958c65c7 audio-graph-cc9a add macOS fs identity dependency
+2bba11cf1efd2ab26ddf961eb923dd4980ec03fc audio-graph-cc9a bind macOS qualification to exact mount
+f5e6eb77a036247f6901591023da4a865cf70ba4 audio-graph-cc9a gate macOS exact mount evidence
+cc25d85eb03947e5b689000c265e2e812bce9c2e audio-graph-cc9a harden exact mount evidence checker
+700556846617368a3494547f34184cb9d8d73f27 checker evidence follow-up
 ```
 
-After only the checker contract and new mutations were added, before the
-workflow correction, the checker exited 1:
+This report is the separate final commit after the report-inclusive gates.
+
+## TDD RED and GREEN
+
+The existing pure test
+`macos_volume_group_selection_binds_logical_root_to_unique_data_volume` was
+modified without adding or renaming a counted test. Its System and Data
+observations share synthetic `st_dev=42`, have distinct live IDs `7` and `42`,
+and the root live ID is `42`.
+
+RED against the old `st_dev` selector:
 
 ```text
-error: macOS directory-to-mount diskutil identity/policy evidence drift
+left: Err(IdentityUnavailable)
+right: Ok(QualifiedFilesystemMount { mount_point: "/System/Volumes/Data",
+class: Apfs, live_mount: Some(Synthetic(42)) })
+test result: FAILED. 0 passed; 1 failed
 ```
 
-After the workflow correction:
+GREEN after the exact selector:
 
 ```text
-PASS: direct LABSN and cc9a native evidence contract with 47 mutations
+running 1 test
+test ...macos_volume_group_selection_binds_logical_root_to_unique_data_volume ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 1704 filtered out
 ```
 
-The Spec P1 review found that the first correction counted three
-`stat_target` rows but did not require three successful stat exits. After only
-the P1 checker guard and mutation were added, the unchanged summary exited 1:
+That same pure test now refuses zero and duplicate ID matches, any unavailable
+candidate probe, read-only, removable, non-APFS, and before/after root-ID
+change. It also proves that the root's lexical `/` relationship cannot override
+the exact Data filesystem ID.
+
+## Native diagnostic and workflow contract
+
+The existing counted macOS diagnostic marker retains all prior fields and adds
+content-safe fields only:
+
+- per-root and per-observation probe availability;
+- root/candidate filesystem-ID equality booleans;
+- root equals Data;
+- root differs from System;
+- exact-match cardinality;
+- candidate probe-unavailable cardinality;
+- before/after root stability; and
+- `selection_authority=fsid mounted_on_text_authority=false`.
+
+The Unix summary permits macOS PASS only when the exact marker says:
 
 ```text
-error: macOS summary diagnostic completeness/fail-closed gate drift
+root_equals_data=true
+root_differs_system=true
+same_root_fsid_count=1
+probe_unavailable_count=0
+root_before_after_stable=true
+selection_authority=fsid
+mounted_on_text_authority=false
 ```
 
-The permanent deterministic simulation constructs an otherwise complete
-artifact with stat exits `0,1,0`. It proves the prior predicate accepted that
-artifact, the corrected predicate rejects it, and a `0,0,0` artifact passes:
+It still requires the prior diagnostic artifact, exact test names/counts, and
+all existing mount/diskutil evidence. Runner, LABSN pin, license gate,
+certificate restoration, and cleanup logic are unchanged.
+
+The source-aware checker retains its deterministic prior-false-PASS simulation
+and now guards the dependency boundary, shared fd resolver, candidate-probe
+failure, before/after stability, pure refusal/masking fixture, exact diagnostic
+schema, and exact Unix-summary PASS conditions:
 
 ```text
 PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
-PASS: direct LABSN and cc9a native evidence contract with 48 mutations
+PASS: direct LABSN and cc9a native evidence contract with 56 mutations
 ```
 
-## Local gates
+## Local Rust gates
 
-All successful Rust tests used locked dependencies, cloud features, Rust/Cargo
-1.95.0, and the worktree-local `src-tauri/target`.
+All commands used locked dependencies and cloud features where applicable.
 
-- `cc9a_native_` regression:
+Focused exact selector:
 
-  ```text
-  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1702 filtered out
-  ```
+```text
+test result: ok. 1 passed; 0 failed; 0 ignored; 1704 filtered out
+```
 
-- `canonical_durability` regression:
+Linux cc9a, canonical durability, and manifest filters:
 
-  ```text
-  test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 1658 filtered out
-  ```
+```text
+test result: ok. 3 passed; 0 failed; 0 ignored; 1702 filtered out
+test result: ok. 47 passed; 0 failed; 0 ignored; 1658 filtered out
+test result: ok. 26 passed; 0 failed; 0 ignored; 1679 filtered out
+```
 
-- One final serialized full cloud library suite:
+Locked cloud `cargo check --lib --tests`, strict Clippy with `-D warnings`, and
+`cargo fmt --all -- --check` all exited 0.
 
-  ```text
-  test result: ok. 1697 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 55.52s
-  ```
+The final serialized full cloud library suite was the last Rust test run:
 
-  An initial root-directory invocation selected system Rust 1.88 and was
-  refused before compilation because current locked dependencies require Rust
-  1.95. The recorded final suite ran from `src-tauri`, where the repository's
-  pinned Rust 1.95 toolchain is selected.
+```text
+running 1705 tests
+test result: ok. 1697 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 54.52s
+```
 
-- `bun run typecheck`: exit 0 with no diagnostics.
-- `bun run verify:contracts`: exit 0; all five generated contracts were
-  current: audio source, provider registry, session data movement, endpoint
-  credential routing, and speech span revision.
-- `bun run verify:fast`: exit 0. Biome checked 174 files, typecheck and all five
-  contracts passed, the checker rejected all 47 mutations, Seeds JSON stress
-  parsed ready 50 / blocked 94 / list 50, docs and Seeds secret hygiene found
-  0 issues, and diff hygiene passed.
-- Repo-configured actionlint, `yq eval '.'`, Ruby `YAML.safe_load_file`, Node
-  syntax, and all 7 independently extracted `shell: bash` bodies passed.
-- Neither `pwsh`, `powershell`, nor `powershell.exe` is installed on this Linux
-  host. PowerShell parser validation is recorded as unavailable; no tool was
-  installed.
+## Dependency and cross-target evidence
 
-The P1 follow-up reran the 48-mutation checker and deterministic simulation,
-repo-configured actionlint, yq and Ruby YAML parsing, all 7 independently
-extracted Bash bodies, Node syntax, Biome over 174 files, and diff hygiene.
-All passed. Focused Rust tests were not repeated because this follow-up changes
-only one shell-summary predicate and its JavaScript checker; no test command,
-Rust source, dependency, or product path changed.
+macOS target tree:
 
-## Security, footprint, and runtime-dark checks
+```text
+nix v0.31.3
+├── nix feature "default"
+│   └── audio-graph v0.1.0-rc.1
+└── nix feature "fs"
+    └── audio-graph v0.1.0-rc.1
+```
 
-The report-inclusive Betterleaks scan over the exact three authorized paths
-reported `no leaks found`. The report-inclusive docs/Seeds secret-hygiene scan
-reported `0 findings`, and `git diff --check` passed.
+The locked Linux and Windows inverse trees both reported `warning: nothing to
+print`; neither target has a direct or transitive `nix 0.31.3` edge.
 
-The exact cumulative footprint from the assigned base is:
+Installed pinned targets are:
+
+```text
+x86_64-pc-windows-msvc
+x86_64-unknown-linux-gnu
+```
+
+A worktree-local ignored minimal Cargo probe imported the actual
+`canonical_durability.rs`. Both pinned Windows commands passed:
+
+```text
+cargo +1.95.0 check --locked --offline ... --target x86_64-pc-windows-msvc --lib
+Finished `dev` profile ...
+cargo +1.95.0 check --locked --offline ... --target x86_64-pc-windows-msvc --tests
+Finished `dev` profile ...
+```
+
+Expected dead-code/unused warnings in the isolated module probe were nonfatal;
+the repository strict Clippy gate is clean. A raw `rustc` attempt stopped on
+the module's external `sysinfo` dependency and was not counted as evidence.
+
+No Apple standard-library target is installed. Per instruction, none was
+installed. `rustc --print cfg --target aarch64-apple-darwin` confirmed
+`target_os="macos"`, but no Apple actual-module compile is claimed.
+
+## Repository, workflow, and security gates
+
+- `bun run typecheck`: exit 0.
+- `bun run verify:contracts`: exit 0; all five generated contracts are current:
+  audio source, provider registry, session data movement, endpoint credential
+  routing, and speech span revision.
+- `bun run verify:fast`: exit 0; Biome checked 174 files, the 56-mutation
+  checker passed, Seeds JSON stress parsed ready 50 / blocked 94 / list 50,
+  docs/Seeds secret hygiene found 0 findings, and diff hygiene passed.
+- Repo-configured actionlint, `yq eval '.'`, Ruby safe YAML load, Node syntax,
+  and all 7 independently extracted `shell: bash` bodies passed.
+- Report-inclusive Betterleaks scanned 649.61 KB across the exact six paths and
+  reported `no leaks found`; docs/Seeds secret hygiene reported 0 findings.
+
+The exact final tracked footprint is six authorized paths:
 
 ```text
 .github/workflows/2df3-native-durability.yml
 docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-cc9a-native-evidence-report.md
 scripts/check-2df3-labsn-action.mjs
+src-tauri/Cargo.lock
+src-tauri/Cargo.toml
+src-tauri/src/persistence/canonical_durability.rs
 ```
 
-An exact semantic assertion confirms that every Rust/product/dependency,
-frontend, generated, Seeds, and other-workflow path is byte-identical to the
-assigned base. With no product path changed and no runtime call site added,
-the correction is runtime-dark outside the diagnostic workflow.
+There are no added Rust safety-escape tokens anywhere in the repository delta.
+No call site outside the existing dormant canonical qualification module
+changed, so the resolver is runtime-dark outside that already-defined
+production seam.
 
 ## Findings and open questions
 
-The Spec review's P1 finding was valid: a partial `stat` failure could leave
-three target rows and still satisfy the first correction's summary. The Unix
-summary now requires exactly three `stat_exit=0` rows before PASS. Collection
-remains nonfatal, so this fail-closed check still occurs only after the Rust
-test steps and artifact collection can run. No unrelated finding was changed
-in this workstream.
+No unrelated repository issue was changed. The raw standalone Windows `rustc`
+probe cannot resolve external crates; the accepted dependency-minimal Cargo
+probe is the real production/test module compile evidence.
 
-The next evidence action is a conductor-authorized remote rerun at the reviewed
-correction tip, followed by download, hashing, and artifact review. Until that
-rerun produces the Rust marker and exact 3/3, 17/17, and 11/11 macOS results,
-there is no corrected macOS acceptance claim and no diagnostic-complete claim.
-Production mount-selection work remains stopped pending that live evidence.
+The only remaining acceptance question is native and intentionally unresolved:
+does the implementation SHA produce a unique fd-derived Data match on the
+Blacksmith macOS 15 runner while retaining exact macOS counts 3/3 cc9a, 17/17
+canonical durability, and 11/11 crash harness? A conductor-authorized native
+rerun and artifact/hash review is required.
+
+**There is no native macOS acceptance claim in this report.** Until that rerun
+passes the new exact relationship/cardinality gate, cc9a remains open for
+native evidence. No remote run was dispatched from this workstream.
