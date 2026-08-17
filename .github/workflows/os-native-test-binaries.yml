@@ -1,0 +1,248 @@
+# OS-native test binaries — manual, cost-gated evidence job.
+#
+# Why this exists: two credential tests are `#[ignore]`d AND env-gated, and the
+# regular CI matrix never passes `-- --ignored` nor sets their env vars, so they
+# have never executed anywhere:
+#
+#   credentials::tests::os_keychain_smoke_save_import_delete_tombstone_and_redaction
+#     gate: AUDIO_GRAPH_RUN_OS_KEYCHAIN_SMOKE=1        (needs a real OS keychain)
+#   credentials::filesystem_policy::windows::tests::native_metadata_smoke_uses_only_closed_observations
+#     gate: AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR   (needs real Win32 + NTFS)
+#
+# This builds the `--lib` test binary for ONE OS, uploads it as an artifact, and
+# also attempts the test on the runner. Two independent signals per run:
+#
+#   1. The runner attempt shows how the test behaves on virtualized CI storage /
+#      a CI keychain. Non-blocking — a failure here is data, not a defect.
+#   2. The downloaded binary re-runs unlimited times on real hardware (real
+#      internal fixed NTFS, a real login keychain) at zero further cost.
+#
+# (2) matters for the Windows test specifically: it asserts `internal_fixed`,
+# `identity_stable`, and `access_controls_enforced` — storage-CLASS properties.
+# A runner's virtual disk may legitimately classify differently from a real
+# internal SSD, so green on CI is not the same claim as green on hardware.
+#
+# One OS per dispatch, deliberately: you pay for exactly the platform you asked
+# for, and the two tests currently live on different refs (see the `ref` input).
+# Dispatch twice to cover both.
+#
+# NEVER a PR gate. `workflow_dispatch` only, so it costs money only when asked.
+#
+# Third-party actions are SHA-pinned with a trailing `# vN` comment, matching
+# ci.yml, so Dependabot can bump them without losing reproducibility.
+
+name: OS-native test binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Which OS to build the test binary for
+        type: choice
+        options: [windows, macos]
+        required: true
+      ref:
+        description: >-
+          Ref to build. NOTE: the Windows filesystem test lives only on the
+          credential-v2 branches (work/audio-graph-cred-v2-integration,
+          work/audio-graph-12c4-windows-credential-manager, ...). master has the
+          keychain test but NOT filesystem_policy/windows.rs.
+        type: string
+        default: master
+      test_filter:
+        description: >-
+          Override the ignored-test filter. Blank uses the per-OS default
+          (native_metadata_smoke on Windows, os_keychain_smoke on macOS).
+        type: string
+        default: ""
+      run_on_runner:
+        description: Also attempt the test on the CI runner (non-blocking)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-binary:
+    name: Test binary (${{ inputs.os }} @ ${{ inputs.ref }})
+    runs-on: >-
+      ${{ inputs.os == 'windows'
+          && 'blacksmith-4vcpu-windows-2025'
+          || 'blacksmith-6vcpu-macos-15' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      # rsac is a SHA-pinned git dependency on every current branch, so unlike
+      # ci.yml's older jobs this needs no sibling checkout.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install macOS system dependencies
+        if: inputs.os == 'macos'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        if: inputs.os == 'windows'
+
+      # Inputs reach `run:` through env, never `${{ }}` interpolation, so a
+      # crafted filter cannot inject shell. See
+      # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+      - name: Resolve per-OS gates and filter
+        shell: bash
+        env:
+          TARGET_OS: ${{ inputs.os }}
+          INPUT_FILTER: ${{ inputs.test_filter }}
+        run: |
+          case "$TARGET_OS" in
+            windows)
+              default_filter=native_metadata_smoke
+              smoke_dir='C:\ag-smoke'
+              keychain_gate=""
+              run_env="AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR='C:\\ag-smoke'"
+              run_note="Create the directory first (mkdir C:\\ag-smoke) on an internal fixed NTFS volume. Never inside a OneDrive-synced tree - the detector then reports os_managed_cloud_root and the test correctly fails."
+              ;;
+            macos)
+              default_filter=os_keychain_smoke
+              smoke_dir=""
+              keychain_gate=1
+              run_env="AUDIO_GRAPH_RUN_OS_KEYCHAIN_SMOKE=1"
+              run_note="Artifact upload drops the exec bit and browser downloads are quarantined, so first run chmod +x and xattr -d com.apple.quarantine. Needs a real unlocked login keychain (a GUI session, not SSH). The test scopes itself to a UUID service name and cleans up via ScopedOsKeychainCleanup."
+              ;;
+            *)
+              echo "::error::unsupported os: $TARGET_OS"; exit 1 ;;
+          esac
+
+          filter="$INPUT_FILTER"
+          [ -n "$filter" ] || filter="$default_filter"
+          # A cargo test filter never needs more than a test-path token.
+          case "$filter" in
+            *[!A-Za-z0-9_:-]*)
+              echo "::error::test_filter must match [A-Za-z0-9_:-]+ (got: $filter)"
+              exit 1 ;;
+          esac
+
+          {
+            echo "TEST_FILTER=$filter"
+            echo "SMOKE_DIR=$smoke_dir"
+            echo "KEYCHAIN_GATE=$keychain_gate"
+            echo "RUN_ENV=$run_env"
+            echo "RUN_NOTE=$run_note"
+          } >> "$GITHUB_ENV"
+          echo "Using ignored-test filter: $filter"
+
+      - name: Build lib test binary
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --no-default-features --features cloud \
+            --lib --no-run --message-format=json > cargo-test-build.json
+
+          # The unittest binary is the lib-kind artifact built in test profile.
+          bin=$(jq -r 'select(.reason=="compiler-artifact")
+                       | select(.profile.test==true)
+                       | select(.target.kind[]=="lib")
+                       | .executable' cargo-test-build.json | tail -1)
+          [ -n "$bin" ] && [ "$bin" != "null" ] \
+            || { echo "::error::could not resolve the lib test binary from cargo JSON"; exit 1; }
+
+          # cargo emits native paths; git bash needs forward slashes on Windows.
+          bin="${bin//\\//}"
+          [ -f "$bin" ] || { echo "::error::resolved binary does not exist: $bin"; exit 1; }
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+          echo "Built: $bin"
+
+      # The whole point of this job is that these tests run nowhere today. A
+      # filter matching zero tests would reproduce that silence while reporting
+      # green, so fail loudly instead.
+      - name: Assert the filter matches an ignored test
+        shell: bash
+        working-directory: src-tauri
+        env:
+          BUILD_REF: ${{ inputs.ref }}
+          TARGET_OS: ${{ inputs.os }}
+        run: |
+          "$TEST_BIN" --ignored --list > ignored-tests.txt 2>&1 || true
+          if grep -F "$TEST_FILTER" ignored-tests.txt; then
+            echo "--- all ignored tests on this ref/OS ---"
+            cat ignored-tests.txt
+          else
+            echo "::error::no ignored test matches '$TEST_FILTER' on ref '$BUILD_REF' ($TARGET_OS)."
+            echo "::error::the Windows filesystem test exists only on the credential-v2 branches."
+            echo "--- ignored tests actually present ---"
+            cat ignored-tests.txt
+            exit 1
+          fi
+
+      - name: Stage binary, sidecar libraries, and run instructions
+        shell: bash
+        working-directory: src-tauri
+        env:
+          BUILD_REF: ${{ inputs.ref }}
+          TARGET_OS: ${{ inputs.os }}
+        run: |
+          mkdir -p dist
+          cp "$TEST_BIN" dist/
+          # A bare test exe can fail to load if the crate links sidecar libs
+          # (WebView2Loader.dll and friends). Ship them alongside it.
+          for f in target/debug/*.dll target/debug/*.dylib \
+                   target/debug/deps/*.dll target/debug/deps/*.dylib; do
+            [ -e "$f" ] && cp "$f" dist/
+          done
+          cp ignored-tests.txt dist/
+
+          binname=$(basename "$TEST_BIN")
+          {
+            echo "# $binname"
+            echo
+            echo "ref \`$BUILD_REF\` | os \`$TARGET_OS\` | filter \`$TEST_FILTER\`"
+            echo
+            echo "Keep the sidecar libraries in this directory next to the binary."
+            echo "\`ignored-tests.txt\` lists every ignored test this binary contains."
+            echo
+            echo '## Run'
+            echo
+            echo '```bash'
+            echo "$RUN_ENV \\"
+            echo "  ./$binname --ignored --nocapture --test-threads=1 $TEST_FILTER"
+            echo '```'
+            echo
+            echo "$RUN_NOTE"
+          } > dist/RUN.md
+
+          cat dist/RUN.md
+          ls -la dist/
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: os-native-test-binary-${{ inputs.os }}
+          if-no-files-found: error
+          retention-days: 14
+          path: src-tauri/dist/
+
+      # Non-blocking. On Windows this runs against the runner's VIRTUAL disk, so
+      # a storage-class assertion failure is expected-and-informative rather than
+      # a defect: it is exactly why the artifact above exists.
+      - name: Attempt the test on the runner (non-blocking)
+        if: inputs.run_on_runner
+        continue-on-error: true
+        shell: bash
+        working-directory: src-tauri
+        env:
+          AUDIO_GRAPH_RUN_OS_KEYCHAIN_SMOKE: ${{ env.KEYCHAIN_GATE }}
+          AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR: ${{ env.SMOKE_DIR }}
+        run: |
+          if [ -n "$AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR" ]; then
+            mkdir -p "$(cygpath -u "$AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR")"
+            echo "Runner smoke dir: $AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR (virtualized CI storage)"
+          fi
+          "$TEST_BIN" --ignored --nocapture --test-threads=1 "$TEST_FILTER"
