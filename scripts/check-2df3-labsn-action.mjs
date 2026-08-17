@@ -26,6 +26,66 @@ function invariant(condition, message) {
     }
 }
 
+function countArtifactLines(artifact, expected) {
+    return artifact.split("\n").filter((line) => line === expected).length;
+}
+
+function priorMacosMountSummaryAccepts(artifact) {
+    return (
+        countArtifactLines(artifact, "stat_target=probe") === 1 &&
+        countArtifactLines(artifact, "stat_target=/") === 1 &&
+        countArtifactLines(artifact, "stat_target=/System/Volumes/Data") === 1 &&
+        countArtifactLines(artifact, "diskutil_target=probe") === 1 &&
+        countArtifactLines(artifact, "diskutil_target=/") === 1 &&
+        countArtifactLines(artifact, "diskutil_target=/System/Volumes/Data") === 1 &&
+        countArtifactLines(artifact, "target=probe") === 1 &&
+        countArtifactLines(artifact, "target=/") === 1 &&
+        countArtifactLines(artifact, "target=/System/Volumes/Data") === 1 &&
+        countArtifactLines(artifact, "resolved_mount=/System/Volumes/Data") === 2 &&
+        countArtifactLines(artifact, "resolved_mount=/") === 1 &&
+        countArtifactLines(artifact, "diskutil_exit=0") === 3 &&
+        countArtifactLines(artifact, "target_count=3") === 1 &&
+        countArtifactLines(artifact, "resolved_count=3") === 1 &&
+        countArtifactLines(artifact, "success_count=3") === 1 &&
+        countArtifactLines(artifact, "failure_count=0") === 1 &&
+        countArtifactLines(artifact, "mount_record=present") === 1 &&
+        countArtifactLines(artifact, "diagnostics_complete=true") === 1
+    );
+}
+
+function correctedMacosMountSummaryAccepts(artifact) {
+    return priorMacosMountSummaryAccepts(artifact) && countArtifactLines(artifact, "stat_exit=0") === 3;
+}
+
+function macosMountSummarySimulation(statExits) {
+    return [
+        "stat_target=probe",
+        `stat_exit=${statExits[0]}`,
+        "stat_target=/",
+        `stat_exit=${statExits[1]}`,
+        "stat_target=/System/Volumes/Data",
+        `stat_exit=${statExits[2]}`,
+        "target=probe",
+        "target=/",
+        "target=/System/Volumes/Data",
+        "diskutil_target=probe",
+        "diskutil_target=/",
+        "diskutil_target=/System/Volumes/Data",
+        "resolved_mount=/System/Volumes/Data",
+        "resolved_mount=/",
+        "resolved_mount=/System/Volumes/Data",
+        "diskutil_exit=0",
+        "diskutil_exit=0",
+        "diskutil_exit=0",
+        "target_count=3",
+        "resolved_count=3",
+        "success_count=3",
+        "failure_count=0",
+        "mount_record=present",
+        "diagnostics_complete=true",
+    ].join("\n");
+}
+
 function stepBody(source, name) {
     const marker = `      - name: ${name}\n`;
     const start = source.indexOf(marker);
@@ -296,7 +356,8 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     );
     invariant(
         macosDiagnostics.includes("stat -f 'device=%d inode=%i flags=%f'") &&
-            macosDiagnostics.includes('for target in "$probe" / /System/Volumes/Data'),
+            macosDiagnostics.includes('targets=("$probe" "/" "/System/Volumes/Data")') &&
+            macosDiagnostics.includes('for target in "${targets[@]}"'),
         "macOS stat device/inode/flags evidence drift",
     );
     invariant(
@@ -307,7 +368,12 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "macOS relevant mount-record evidence drift",
     );
     invariant(
-        macosDiagnostics.includes('/usr/sbin/diskutil info "$target"') &&
+        macosDiagnostics.includes('targets=("$probe" "/" "/System/Volumes/Data")') &&
+            macosDiagnostics.includes('for target in "${targets[@]}"') &&
+            macosDiagnostics.includes('df_output="$(df -P "$target" 2>&1)"') &&
+            macosDiagnostics.includes("awk 'NR == 2 { print $NF }'") &&
+            macosDiagnostics.includes("resolved_mount=") &&
+            macosDiagnostics.includes('/usr/sbin/diskutil info "$resolved_mount"') &&
             macosDiagnostics.includes("Device Node") &&
             macosDiagnostics.includes("Volume UUID") &&
             macosDiagnostics.includes("Volume Roles") &&
@@ -315,7 +381,30 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             macosDiagnostics.includes("Read-Only Volume") &&
             macosDiagnostics.includes("Internal") &&
             macosDiagnostics.includes("Removable Media"),
-        "macOS bounded diskutil identity/policy evidence drift",
+        "macOS directory-to-mount diskutil identity/policy evidence drift",
+    );
+    invariant(
+        macosDiagnostics.includes("set -uo pipefail") &&
+            !macosDiagnostics.includes("set -euo pipefail") &&
+            macosDiagnostics.includes('diskutil_exit="$?"') &&
+            macosDiagnostics.includes("diskutil_output=") &&
+            macosDiagnostics.includes('failure_count="$((failure_count + 1))"'),
+        "macOS per-target diagnostic collection must remain nonfatal and observable",
+    );
+    invariant(
+        macosDiagnostics.includes("printf 'target_count=%s\\n'") &&
+            macosDiagnostics.includes("printf 'resolved_count=%s\\n'") &&
+            macosDiagnostics.includes("printf 'success_count=%s\\n'") &&
+            macosDiagnostics.includes("printf 'failure_count=%s\\n'") &&
+            macosDiagnostics.includes("printf 'diagnostics_complete=true\\n'"),
+        "macOS diagnostic exact-count/completion artifact contract drift",
+    );
+    invariant(
+        macosDiagnostics.indexOf("exit 0") >
+            macosDiagnostics.indexOf("printf 'diagnostics_complete=true\\n'") &&
+            source.indexOf(`      - name: ${macosDiagnosticsName}\n`) <
+                source.indexOf(`      - name: ${cc9aUnixName}\n`),
+        "macOS diagnostic collection must not skip the Rust qualification steps",
     );
     invariant(
         cc9aUnix.includes("grep '^CC9A_MACOS_DIAGNOSTIC '") &&
@@ -329,6 +418,17 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             unixSummary.includes("macos_mount_diagnostics_complete") &&
             unixSummary.includes("cc9a_macos_diagnostics_complete=true") &&
             unixSummary.includes("macos_mount_diagnostics_complete=true") &&
+            unixSummary.includes('mount_target_count="$(sed -n') &&
+            unixSummary.includes('mount_resolved_count="$(sed -n') &&
+            unixSummary.includes('mount_success_count="$(sed -n') &&
+            unixSummary.includes('mount_failure_count="$(sed -n') &&
+            unixSummary.includes('[ "$mount_target_count" = 3 ]') &&
+            unixSummary.includes('[ "$mount_resolved_count" = 3 ]') &&
+            unixSummary.includes('[ "$mount_success_count" = 3 ]') &&
+            unixSummary.includes('[ "$mount_failure_count" = 0 ]') &&
+            unixSummary.includes(
+                '[ "$(grep -c \'^stat_exit=0$\' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ]',
+            ) &&
             unixSummary.includes("diagnostic_observation_count") &&
             unixSummary.includes("diagnostic_observation_schema_count") &&
             unixSummary.includes("diagnostic_inventory_count") &&
@@ -783,7 +883,7 @@ const cc9aMutations = [
             workflow: mutateStep(
                 source,
                 "Record macOS mount diagnostics",
-                '/usr/sbin/diskutil info "$target"',
+                '/usr/sbin/diskutil info "$resolved_mount"',
                 "printf 'diskutil unavailable'",
             ),
         }),
@@ -810,6 +910,78 @@ const cc9aMutations = [
             ),
         }),
     ],
+    [
+        "macOS directory-to-mount resolution removed",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                'df_output="$(df -P "$target" 2>&1)"',
+                'df_output="$target"',
+            ),
+        }),
+    ],
+    [
+        "macOS diskutil handling made fail-fast",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                "set -uo pipefail",
+                "set -euo pipefail",
+            ),
+        }),
+    ],
+    [
+        "macOS exact diagnostic count omitted",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                "printf 'resolved_count=%s\\n'",
+                "printf 'resolved_total=%s\\n'",
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic step can skip Rust tests",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Record macOS mount diagnostics",
+                "exit 0",
+                "exit 1",
+            ),
+        }),
+    ],
+    [
+        "macOS summary success count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$mount_success_count" = 3 ]',
+                '[ "$mount_success_count" = 2 ]',
+            ),
+        }),
+    ],
+    [
+        "macOS summary stat success count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$(grep -c \'^stat_exit=0$\' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ]',
+                '[ "$(grep -c \'^stat_exit=0$\' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 2 ]',
+            ),
+        }),
+    ],
 ];
 
 for (const [label, mutate] of cc9aMutations) {
@@ -828,4 +1000,21 @@ for (const [label, mutate] of cc9aMutations) {
 }
 
 const mutationCount = mutations.length + cc9aMutations.length;
+const statFailureArtifact = macosMountSummarySimulation([0, 1, 0]);
+const fullGoodArtifact = macosMountSummarySimulation([0, 0, 0]);
+invariant(
+    priorMacosMountSummaryAccepts(statFailureArtifact),
+    "summary simulation RED fixture no longer reproduces the prior false PASS",
+);
+invariant(
+    !correctedMacosMountSummaryAccepts(statFailureArtifact),
+    "summary simulation GREEN must reject one failed stat observation",
+);
+invariant(
+    correctedMacosMountSummaryAccepts(fullGoodArtifact),
+    "summary simulation full-good artifact must PASS",
+);
+console.log(
+    "PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true",
+);
 console.log(`PASS: direct LABSN and cc9a native evidence contract with ${mutationCount} mutations`);

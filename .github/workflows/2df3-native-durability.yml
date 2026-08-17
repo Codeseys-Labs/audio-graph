@@ -210,33 +210,78 @@ jobs:
         if: ${{ always() && matrix.os == 'macos' }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p "$EVIDENCE_DIR"
           probe="$RUNNER_TEMP/audio-graph-2df3-filesystem-probe"
           mkdir -p "$probe"
           trap 'rmdir "$probe" 2>/dev/null || true' EXIT
+          targets=("$probe" "/" "/System/Volumes/Data")
+          target_count="${#targets[@]}"
+          resolved_count=0
+          success_count=0
+          failure_count=0
           {
             printf 'probe_root=%s\n' "$probe"
-            for target in "$probe" / /System/Volumes/Data; do
+            for target in "${targets[@]}"; do
+              printf 'target=%s\n' "$target"
               printf 'stat_target=%s\n' "$target"
-              stat -f 'device=%d inode=%i flags=%f' "$target"
+              stat_output="$(stat -f 'device=%d inode=%i flags=%f' "$target" 2>&1)"
+              stat_exit="$?"
+              printf 'stat_exit=%s\n' "$stat_exit"
+              while IFS= read -r line; do
+                printf 'stat_output=%s\n' "$line"
+              done <<< "$stat_output"
             done
             mount | awk '$2 == "on" && ($3 == "/" || $3 == "/System/Volumes/Data") {
               print "mount_record=" $0
             }'
-            for target in "$probe" / /System/Volumes/Data; do
+            for target in "${targets[@]}"; do
               printf 'diskutil_target=%s\n' "$target"
-              /usr/sbin/diskutil info "$target" | awk -F: '
-                /Device Node|Volume UUID|Volume Roles|APFS Volume Disk \(Role\)|File System Personality|Type \(Bundle\)|Read-Only Media|Read-Only Volume|Device Location|Internal|Removable Media/ {
-                  key=$1; value=substr($0, index($0, ":") + 1);
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
-                  print "diskutil_field=" key "=" value
-                }'
+              df_output="$(df -P "$target" 2>&1)"
+              df_exit="$?"
+              printf 'df_exit=%s\n' "$df_exit"
+              while IFS= read -r line; do
+                printf 'df_output=%s\n' "$line"
+              done <<< "$df_output"
+              resolved_mount=""
+              if [ "$df_exit" = 0 ]; then
+                resolved_mount="$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $NF }')"
+              fi
+              if [ -n "$resolved_mount" ]; then
+                resolved_count="$((resolved_count + 1))"
+                printf 'resolved_mount=%s\n' "$resolved_mount"
+                diskutil_output="$(/usr/sbin/diskutil info "$resolved_mount" 2>&1)"
+                diskutil_exit="$?"
+                printf 'diskutil_exit=%s\n' "$diskutil_exit"
+                while IFS= read -r line; do
+                  printf 'diskutil_output=%s\n' "$line"
+                done <<< "$diskutil_output"
+                printf '%s\n' "$diskutil_output" | awk -F: '
+                  /Device Node|Volume UUID|Volume Roles|APFS Volume Disk \(Role\)|File System Personality|Type \(Bundle\)|Read-Only Media|Read-Only Volume|Device Location|Internal|Removable Media/ {
+                    key=$1; value=substr($0, index($0, ":") + 1);
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
+                    print "diskutil_field=" key "=" value
+                  }'
+                if [ "$diskutil_exit" = 0 ]; then
+                  success_count="$((success_count + 1))"
+                else
+                  failure_count="$((failure_count + 1))"
+                fi
+              else
+                printf 'resolved_mount=unavailable\n'
+                printf 'diskutil_exit=not_run\n'
+                printf 'diskutil_output=mount_resolution_failed\n'
+                failure_count="$((failure_count + 1))"
+              fi
             done
+            printf 'target_count=%s\n' "$target_count"
+            printf 'resolved_count=%s\n' "$resolved_count"
+            printf 'success_count=%s\n' "$success_count"
+            printf 'failure_count=%s\n' "$failure_count"
             printf 'diagnostics_complete=true\n'
           } > "$EVIDENCE_DIR/macos-mount-diagnostics.txt"
-          test -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt"
+          exit 0
 
       - name: Record Windows runner, toolchain, command, and fixture-filesystem evidence
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
@@ -709,10 +754,22 @@ jobs:
           cc9a_macos_diagnostics_present=not_applicable
           cc9a_macos_diagnostics_complete=not_applicable
           macos_mount_diagnostics_complete=not_applicable
+          mount_target_count=not_applicable
+          mount_resolved_count=not_applicable
+          mount_success_count=not_applicable
+          mount_failure_count=not_applicable
           if [ "$RUNNER_OS" = "macOS" ]; then
             cc9a_macos_diagnostics_present=false
             cc9a_macos_diagnostics_complete=false
             macos_mount_diagnostics_complete=false
+            mount_target_count="$(sed -n 's/^target_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_resolved_count="$(sed -n 's/^resolved_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_success_count="$(sed -n 's/^success_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_failure_count="$(sed -n 's/^failure_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
             if [ -s "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" ]; then
               cc9a_macos_diagnostics_present=true
               diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\)$/\1/p' \
@@ -734,9 +791,18 @@ jobs:
             fi
             if [ -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt" ] &&
               [ "$(grep -c '^stat_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^stat_exit=0$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
               [ "$(grep -c '^diskutil_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^resolved_mount=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^diskutil_exit=0$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$mount_target_count" = 3 ] &&
+              [ "$mount_resolved_count" = 3 ] &&
+              [ "$mount_success_count" = 3 ] &&
+              [ "$mount_failure_count" = 0 ] &&
               grep -q '^mount_record=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" &&
-              grep -q '^diagnostics_complete=true$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt"; then
+              [ "$(grep -c '^diagnostics_complete=true$' \
+                "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 1 ]; then
               macos_mount_diagnostics_complete=true
             fi
           fi
@@ -768,6 +834,10 @@ jobs:
             printf 'cc9a_macos_diagnostics_present=%s\n' "$cc9a_macos_diagnostics_present"
             printf 'cc9a_macos_diagnostics_complete=%s\n' "$cc9a_macos_diagnostics_complete"
             printf 'macos_mount_diagnostics_complete=%s\n' "$macos_mount_diagnostics_complete"
+            printf 'macos_mount_target_count=%s\n' "$mount_target_count"
+            printf 'macos_mount_resolved_count=%s\n' "$mount_resolved_count"
+            printf 'macos_mount_success_count=%s\n' "$mount_success_count"
+            printf 'macos_mount_failure_count=%s\n' "$mount_failure_count"
             printf 'canonical_durability_exit=%s\n' "$first"
             printf 'canonical_durability_tee_exit=%s\n' "$first_tee"
             printf 'canonical_durability_tests=%s\n' "$first_tests"
