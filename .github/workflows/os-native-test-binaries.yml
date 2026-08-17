@@ -63,6 +63,13 @@ on:
 permissions:
   contents: read
 
+# Serialize dispatches per OS so two runs cannot race the same cache, and let
+# the two OSes proceed independently. Never cancel: a run in flight is spending
+# paid runner minutes to produce evidence.
+concurrency:
+  group: os-native-test-binaries-${{ inputs.os }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -70,6 +77,9 @@ env:
 jobs:
   test-binary:
     name: Test binary (${{ inputs.os }} @ ${{ inputs.ref }})
+    # Paid runners: a hung cargo build or a hung ignored test would otherwise
+    # burn to the 6-hour default. 90m leaves room for a cold Windows build.
+    timeout-minutes: 90
     runs-on: >-
       ${{ inputs.os == 'windows'
           && 'blacksmith-4vcpu-windows-2025'
@@ -78,6 +88,21 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           ref: ${{ inputs.ref }}
+          # No step here pushes, and later steps run build output from an
+          # arbitrary ref, so do not leave GITHUB_TOKEN in .git/config.
+          persist-credentials: false
+
+      # `ref` may be a mutable branch, so pin the exact commit into the
+      # artifact. Otherwise a downloaded binary cannot be tied to the
+      # implementation it tested once the branch advances.
+      - name: Record resolved source commit
+        shell: bash
+        env:
+          BUILD_REF: ${{ inputs.ref }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "SOURCE_SHA=$sha" >> "$GITHUB_ENV"
+          echo "Resolved $BUILD_REF -> $sha"
 
       # rsac is a SHA-pinned git dependency on every current branch, so unlike
       # ci.yml's older jobs this needs no sibling checkout.
@@ -142,9 +167,20 @@ jobs:
       - name: Build lib test binary
         shell: bash
         working-directory: src-tauri
+        env:
+          # build.rs reads this at BUILD time and emits /MANIFEST:EMBED plus
+          # /MANIFESTINPUT link args (src-tauri/build.rs:64). Without it an
+          # unmanifested debug MSVC test harness can abort during process
+          # loading, so the binary would fail to list its tests and never get
+          # staged. It is debug-profile-only and build.rs panics on release,
+          # which is why it can be set unconditionally for the windows build.
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ inputs.os == 'windows' && '1' || '' }}
         run: |
+          # json-render-diagnostics keeps compiler errors readable on stderr
+          # while the JSON artifact records still land on stdout.
           cargo test --locked --no-default-features --features cloud \
-            --lib --no-run --message-format=json > cargo-test-build.json
+            --lib --no-run --message-format=json-render-diagnostics \
+            > cargo-test-build.json
 
           # The unittest binary is the lib-kind artifact built in test profile.
           bin=$(jq -r 'select(.reason=="compiler-artifact")
@@ -170,7 +206,16 @@ jobs:
           BUILD_REF: ${{ inputs.ref }}
           TARGET_OS: ${{ inputs.os }}
         run: |
-          "$TEST_BIN" --ignored --list > ignored-tests.txt 2>&1 || true
+          # Do not mask the exit status: if the binary cannot start (a missing
+          # sidecar library, for instance) grep would find nothing and the
+          # message below would blame the ref and OS for the wrong reason.
+          list_status=0
+          "$TEST_BIN" --ignored --list > ignored-tests.txt 2>&1 || list_status=$?
+          if [ "$list_status" -ne 0 ]; then
+            echo "::error::the test binary failed to list its tests (exit $list_status) — it likely could not start"
+            cat ignored-tests.txt
+            exit 1
+          fi
           if grep -F "$TEST_FILTER" ignored-tests.txt; then
             echo "--- all ignored tests on this ref/OS ---"
             cat ignored-tests.txt
@@ -205,6 +250,9 @@ jobs:
             echo
             echo "ref \`$BUILD_REF\` | os \`$TARGET_OS\` | filter \`$TEST_FILTER\`"
             echo
+            echo "Built from commit \`$SOURCE_SHA\`. Cite that SHA, not the branch"
+            echo "name, when recording this run as evidence — the branch moves."
+            echo
             echo "Keep the sidecar libraries in this directory next to the binary."
             echo "\`ignored-tests.txt\` lists every ignored test this binary contains."
             echo
@@ -224,7 +272,7 @@ jobs:
       - name: Upload test binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: os-native-test-binary-${{ inputs.os }}
+          name: os-native-test-binary-${{ inputs.os }}-${{ env.SOURCE_SHA }}
           if-no-files-found: error
           retention-days: 14
           path: src-tauri/dist/
