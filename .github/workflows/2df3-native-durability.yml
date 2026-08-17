@@ -576,11 +576,37 @@ jobs:
           tee_exit="${pipeline_status[1]}"
           test_count="$(awk '$1 == "running" && $2 ~ /^[0-9]+$/ && ($3 == "test" || $3 == "tests") { print $2; exit }' \
             "$EVIDENCE_DIR/cc9a_native.log")"
-          awk '$1 == "test" && $2 ~ /cc9a_native_/ && $(NF) == "ok" { name=$2; sub(/:$/, "", name); sub(/^.*::/, "", name); print name }' \
-            "$EVIDENCE_DIR/cc9a_native.log" | LC_ALL=C sort -u > "$EVIDENCE_DIR/cc9a_native.names"
+          awk '
+            $1 == "test" && $2 ~ /cc9a_native_/ && $3 == "..." {
+              name=$2
+              sub(/:$/, "", name)
+              sub(/^.*::/, "", name)
+              pending_name=""
+              if ($4 == "ok" && NF == 4) {
+                print name
+              } else if ($4 == "CC9A_MACOS_DIAGNOSTIC") {
+                pending_name=name
+              }
+              next
+            }
+            pending_name != "" && $0 ~ /^CC9A_MACOS_DIAGNOSTIC / { next }
+            pending_name != "" && $0 == "ok" {
+              print pending_name
+              pending_name=""
+              next
+            }
+            pending_name != "" { pending_name="" }
+          ' "$EVIDENCE_DIR/cc9a_native.log" | LC_ALL=C sort -u > "$EVIDENCE_DIR/cc9a_native.names"
           if [ "$RUNNER_OS" = "macOS" ]; then
-            grep '^CC9A_MACOS_DIAGNOSTIC ' "$EVIDENCE_DIR/cc9a_native.log" \
-              > "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true
+            awk '
+              {
+                marker=index($0, "CC9A_MACOS_DIAGNOSTIC ")
+                if (marker == 1 ||
+                  ($1 == "test" && $2 ~ /cc9a_native_/ && $3 == "..." && $4 == "CC9A_MACOS_DIAGNOSTIC")) {
+                  print substr($0, marker)
+                }
+              }
+            ' "$EVIDENCE_DIR/cc9a_native.log" > "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt"
           fi
           printf '%s\n' "$native_exit" > "$EVIDENCE_DIR/cc9a_native.exit"
           printf '%s\n' "$tee_exit" > "$EVIDENCE_DIR/cc9a_native.tee.exit"
@@ -774,6 +800,8 @@ jobs:
               "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
             if [ -s "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" ]; then
               cc9a_macos_diagnostics_present=true
+              diagnostic_total_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC ' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=\(available\|unavailable\)$/\1/p' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
               diagnostic_observation_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC observation ' \
@@ -786,10 +814,12 @@ jobs:
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               diagnostic_exact_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
-              if [ "$diagnostic_root_count" = 1 ] && [ "$diagnostic_summary_count" = 1 ] &&
-                [ -n "$diagnostic_inventory_count" ] &&
-                [ "$diagnostic_observation_count" = "$diagnostic_inventory_count" ] &&
-                [ "$diagnostic_observation_schema_count" = "$diagnostic_inventory_count" ] &&
+              if [ "$diagnostic_total_count" = 5 ] &&
+                [ "$diagnostic_inventory_count" = 2 ] &&
+                [ "$diagnostic_observation_count" = 2 ] &&
+                [ "$diagnostic_observation_schema_count" = 2 ] &&
+                [ "$diagnostic_root_count" = 1 ] &&
+                [ "$diagnostic_summary_count" = 1 ] &&
                 [ "$diagnostic_exact_count" = 1 ]; then
                 cc9a_macos_diagnostics_complete=true
                 cc9a_macos_exact_mount_identity=true

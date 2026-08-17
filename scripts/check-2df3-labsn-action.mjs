@@ -32,6 +32,132 @@ function countArtifactLines(artifact, expected) {
     return artifact.split("\n").filter((line) => line === expected).length;
 }
 
+const CC9A_MACOS_DIAGNOSTIC_MARKER = "CC9A_MACOS_DIAGNOSTIC ";
+const CC9A_LIVE_INLINE_LOG = [
+    "running 3 tests",
+    "test persistence::canonical_durability::tests::cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation ... CC9A_MACOS_DIAGNOSTIC root canonical_root=/private/var/folders/pm/cmklcsfj60nd7nfc79g8xmbc0000gn/T/ag-canonical-production-binding-first-12495-0 root_dev=16777229 inventory_count=2 root_fsid_result=available",
+    "CC9A_MACOS_DIAGNOSTIC observation index=0 mount_path=/ filesystem_class=Apfs filesystem_string=apfs metadata_result=available dev=16777229 same_root_dev=true fsid_result=available same_root_fsid=false read_only=true removable=false",
+    "CC9A_MACOS_DIAGNOSTIC observation index=1 mount_path=/System/Volumes/Data filesystem_class=Apfs filesystem_string=apfs metadata_result=available dev=16777229 same_root_dev=true fsid_result=available same_root_fsid=true read_only=false removable=false",
+    "CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=0 same_root_dev_count=2 branch=ambiguous",
+    "CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false",
+    "ok",
+    "test persistence::session_artifact_manifest::tests::cc9a_native_qualified_initial_cas_has_parent_barrier ... ok",
+    "test persistence::session_artifact_manifest::tests::cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation ... ok",
+    "",
+    "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1672 filtered out; finished in 0.11s",
+].join("\n");
+
+function priorCc9aMacosDiagnostics(log) {
+    return log.split("\n").filter((line) => line.startsWith(CC9A_MACOS_DIAGNOSTIC_MARKER));
+}
+
+function correctedCc9aMacosDiagnostics(log) {
+    return log.split("\n").flatMap((line) => {
+        const marker = line.indexOf(CC9A_MACOS_DIAGNOSTIC_MARKER);
+        const inlineTestDiagnostic =
+            /^test [^ ]*cc9a_native_[^ ]* \.\.\. CC9A_MACOS_DIAGNOSTIC /.test(line);
+        if (marker === 0 || inlineTestDiagnostic) {
+            return [line.slice(marker)];
+        }
+        return [];
+    });
+}
+
+function cc9aMacosDiagnosticCounts(artifact) {
+    const lines = artifact.split("\n").filter(Boolean);
+    const rootPattern =
+        /^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=([0-9]+) root_fsid_result=(available|unavailable)$/;
+    const observationPattern = /^CC9A_MACOS_DIAGNOSTIC observation /;
+    const observationSchemaPattern =
+        /^CC9A_MACOS_DIAGNOSTIC observation index=[0-9]+ mount_path=.* filesystem_class=[^ ]+ filesystem_string=.* metadata_result=(available|unavailable) dev=([0-9]+|unavailable) same_root_dev=(true|false|unavailable) fsid_result=(available|unavailable) same_root_fsid=(true|false|unavailable) read_only=(true|false) removable=(true|false)$/;
+    const summaryPattern =
+        /^CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=[0-9]+ same_root_dev_count=[0-9]+ branch=(root_missing|zero_match_clean|zero_match_with_unavailable|unique|ambiguous|unique_then_validate_mismatch)$/;
+    const exactLine =
+        "CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false";
+    const inventory = lines.flatMap((line) => {
+        const match = line.match(rootPattern);
+        return match ? [Number(match[1])] : [];
+    });
+    return {
+        total: lines.filter((line) => line.startsWith(CC9A_MACOS_DIAGNOSTIC_MARKER)).length,
+        inventory: inventory.length === 1 ? inventory[0] : Number.NaN,
+        observations: lines.filter((line) => observationPattern.test(line)).length,
+        observationSchemas: lines.filter((line) => observationSchemaPattern.test(line)).length,
+        roots: lines.filter((line) => rootPattern.test(line)).length,
+        summaries: lines.filter((line) => summaryPattern.test(line)).length,
+        exact: lines.filter((line) => line === exactLine).length,
+    };
+}
+
+function priorCc9aMacosDiagnosticSummaryAccepts(artifact) {
+    const counts = cc9aMacosDiagnosticCounts(artifact);
+    return (
+        counts.roots === 1 &&
+        counts.summaries === 1 &&
+        Number.isInteger(counts.inventory) &&
+        counts.observations === counts.inventory &&
+        counts.observationSchemas === counts.inventory &&
+        counts.exact === 1
+    );
+}
+
+function correctedCc9aMacosDiagnosticSummaryAccepts(artifact) {
+    const counts = cc9aMacosDiagnosticCounts(artifact);
+    return (
+        counts.total === 5 &&
+        counts.inventory === 2 &&
+        counts.observations === 2 &&
+        counts.observationSchemas === 2 &&
+        counts.roots === 1 &&
+        counts.summaries === 1 &&
+        counts.exact === 1
+    );
+}
+
+function priorCc9aNativeNames(log) {
+    return log
+        .split("\n")
+        .flatMap((line) => {
+            const fields = line.trim().split(/\s+/);
+            if (
+                fields[0] === "test" &&
+                fields[1]?.includes("cc9a_native_") &&
+                fields.at(-1) === "ok"
+            ) {
+                return [fields[1].replace(/:$/, "").replace(/^.*::/, "")];
+            }
+            return [];
+        })
+        .sort();
+}
+
+function correctedCc9aNativeNames(log) {
+    const names = [];
+    let pendingName = "";
+    for (const line of log.split("\n")) {
+        const testStart = line.match(/^test ([^ ]*::(cc9a_native_[^ ]+)) \.\.\. (.*)$/);
+        if (testStart) {
+            pendingName = "";
+            if (testStart[3] === "ok") {
+                names.push(testStart[2]);
+            } else if (testStart[3].startsWith(CC9A_MACOS_DIAGNOSTIC_MARKER)) {
+                pendingName = testStart[2];
+            }
+            continue;
+        }
+        if (pendingName && line.startsWith(CC9A_MACOS_DIAGNOSTIC_MARKER)) {
+            continue;
+        }
+        if (pendingName && line === "ok") {
+            names.push(pendingName);
+            pendingName = "";
+            continue;
+        }
+        pendingName = "";
+    }
+    return [...new Set(names)].sort();
+}
+
 function priorMacosMountSummaryAccepts(artifact) {
     return (
         countArtifactLines(artifact, "stat_target=probe") === 1 &&
@@ -353,8 +479,12 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         );
     }
     invariant(
-        cc9aUnix.includes("pipeline_status") && cc9aUnix.includes('$(NF) == "ok"'),
-        "Unix cc9a exit or exact-name marker capture drift",
+        cc9aUnix.includes("pipeline_status") &&
+            cc9aUnix.includes('pending_name=""') &&
+            cc9aUnix.includes('$4 == "ok" && NF == 4') &&
+            cc9aUnix.includes('$4 == "CC9A_MACOS_DIAGNOSTIC"') &&
+            cc9aUnix.includes('pending_name != "" && $0 == "ok"'),
+        "Unix cc9a exit or split-diagnostic exact-name capture drift",
     );
     invariant(
         cc9aWindows.includes("$LASTEXITCODE") &&
@@ -421,10 +551,13 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "macOS diagnostic collection must not skip the Rust qualification steps",
     );
     invariant(
-        cc9aUnix.includes("grep '^CC9A_MACOS_DIAGNOSTIC '") &&
+        cc9aUnix.includes('marker=index($0, "CC9A_MACOS_DIAGNOSTIC ")') &&
+            cc9aUnix.includes('marker == 1 ||') &&
+            cc9aUnix.includes('$4 == "CC9A_MACOS_DIAGNOSTIC"') &&
+            cc9aUnix.includes("print substr($0, marker)") &&
             cc9aUnix.includes("cc9a_macos_diagnostics.txt") &&
             cc9aUnix.includes('if [ "$RUNNER_OS" = "macOS" ]'),
-        "macOS Rust diagnostic extraction artifact drift",
+        "macOS Rust diagnostic substring extraction artifact drift",
     );
     invariant(
         unixSummary.includes("cc9a_macos_diagnostics_present") &&
@@ -448,6 +581,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             unixSummary.includes("diagnostic_observation_count") &&
             unixSummary.includes("diagnostic_observation_schema_count") &&
             unixSummary.includes("diagnostic_inventory_count") &&
+            unixSummary.includes("diagnostic_total_count") &&
             unixSummary.includes("diagnostic_exact_count") &&
             unixSummary.includes("root_equals_data=true") &&
             unixSummary.includes("root_differs_system=true") &&
@@ -456,6 +590,12 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             unixSummary.includes("root_before_after_stable=true") &&
             unixSummary.includes("selection_authority=fsid") &&
             unixSummary.includes("mounted_on_text_authority=false") &&
+            unixSummary.includes('[ "$diagnostic_total_count" = 5 ]') &&
+            unixSummary.includes('[ "$diagnostic_inventory_count" = 2 ]') &&
+            unixSummary.includes('[ "$diagnostic_observation_count" = 2 ]') &&
+            unixSummary.includes('[ "$diagnostic_observation_schema_count" = 2 ]') &&
+            unixSummary.includes('[ "$diagnostic_root_count" = 1 ]') &&
+            unixSummary.includes('[ "$diagnostic_summary_count" = 1 ]') &&
             unixSummary.includes('[ "$diagnostic_exact_count" = 1 ]') &&
             unixSummary.includes('[ "$cc9a_macos_exact_mount_identity" != true ]') &&
             unixSummary.includes(
@@ -1098,6 +1238,30 @@ const cc9aMutations = [
         }),
     ],
     [
+        "macOS inline Rust diagnostic context omitted",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Run cc9a native qualification filter (Unix)",
+                "marker == 1 ||",
+                "marker == 1 &&",
+            ),
+        }),
+    ],
+    [
+        "cc9a split diagnostic failure admitted as a passed name",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Run cc9a native qualification filter (Unix)",
+                'pending_name != "" && $0 == "ok"',
+                'pending_name != "" && $0 != "ok"',
+            ),
+        }),
+    ],
+    [
         "macOS summary completeness weakened",
         ({ workflow: source, ...rest }) => ({
             ...rest,
@@ -1106,6 +1270,78 @@ const cc9aMutations = [
                 "Summarize and enforce native exits (Unix)",
                 "cc9a_macos_diagnostics_complete=true",
                 "cc9a_macos_diagnostics_complete=unchecked",
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic total count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_total_count" = 5 ]',
+                '[ -n "$diagnostic_total_count" ]',
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic inventory count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_inventory_count" = 2 ]',
+                '[ -n "$diagnostic_inventory_count" ]',
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic observation count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_observation_count" = 2 ]',
+                '[ "$diagnostic_observation_count" = "$diagnostic_inventory_count" ]',
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic observation schema count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_observation_schema_count" = 2 ]',
+                '[ "$diagnostic_observation_schema_count" = "$diagnostic_inventory_count" ]',
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic root count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_root_count" = 1 ]',
+                '[ -n "$diagnostic_root_count" ]',
+            ),
+        }),
+    ],
+    [
+        "macOS diagnostic summary count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_summary_count" = 1 ]',
+                '[ -n "$diagnostic_summary_count" ]',
             ),
         }),
     ],
@@ -1201,6 +1437,64 @@ for (const [label, mutate] of cc9aMutations) {
 const mutationCount = mutations.length + cc9aMutations.length;
 const statFailureArtifact = macosMountSummarySimulation([0, 1, 0]);
 const fullGoodArtifact = macosMountSummarySimulation([0, 0, 0]);
+const expectedLiveNames = [
+    "cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation",
+    "cc9a_native_qualified_initial_cas_has_parent_barrier",
+    "cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation",
+].sort();
+const priorLiveDiagnostics = priorCc9aMacosDiagnostics(CC9A_LIVE_INLINE_LOG);
+const correctedLiveDiagnostics = correctedCc9aMacosDiagnostics(CC9A_LIVE_INLINE_LOG);
+const priorLiveNames = priorCc9aNativeNames(CC9A_LIVE_INLINE_LOG);
+const correctedLiveNames = correctedCc9aNativeNames(CC9A_LIVE_INLINE_LOG);
+const failedSplitLog = CC9A_LIVE_INLINE_LOG.replace("\nok\n", "\nFAILED\n");
+const noisyLiveLog = `${CC9A_LIVE_INLINE_LOG}\nerror: ${CC9A_MACOS_DIAGNOSTIC_MARKER}not-test-output`;
+const liveDiagnosticArtifact = correctedLiveDiagnostics.join("\n");
+const sixthDiagnosticArtifact = `${liveDiagnosticArtifact}\n${CC9A_MACOS_DIAGNOSTIC_MARKER}unexpected valid_prefix=true`;
+const thirdObservation =
+    "CC9A_MACOS_DIAGNOSTIC observation index=2 mount_path=/Volumes/Other filesystem_class=Apfs filesystem_string=apfs metadata_result=available dev=16777230 same_root_dev=false fsid_result=available same_root_fsid=false read_only=false removable=false";
+const inventoryThreeArtifact = liveDiagnosticArtifact
+    .replace("inventory_count=2", "inventory_count=3")
+    .replace(
+        `${CC9A_MACOS_DIAGNOSTIC_MARKER}summary`,
+        `${thirdObservation}\n${CC9A_MACOS_DIAGNOSTIC_MARKER}summary`,
+    );
+invariant(
+    priorLiveDiagnostics.length === 4 &&
+        !priorLiveDiagnostics.some((line) => line.startsWith(`${CC9A_MACOS_DIAGNOSTIC_MARKER}root `)),
+    "inline diagnostic RED fixture no longer reproduces the anchored root omission",
+);
+invariant(
+    correctedLiveDiagnostics.length === 5 &&
+        correctedLiveDiagnostics[0].startsWith(`${CC9A_MACOS_DIAGNOSTIC_MARKER}root `) &&
+        correctedCc9aMacosDiagnostics(noisyLiveLog).length === 5,
+    "inline diagnostic GREEN must extract the valid substring without admitting unrelated text",
+);
+invariant(
+    priorLiveNames.length === 2 && !priorLiveNames.includes(expectedLiveNames[0]),
+    "split test-name RED fixture no longer reproduces the canonical-name omission",
+);
+invariant(
+    JSON.stringify(correctedLiveNames) === JSON.stringify(expectedLiveNames),
+    "split test-name GREEN must recover the exact three live names",
+);
+invariant(
+    !correctedCc9aNativeNames(failedSplitLog).includes(expectedLiveNames[0]),
+    "split test-name GREEN must not admit a standalone FAILED result",
+);
+invariant(
+    priorCc9aMacosDiagnosticSummaryAccepts(sixthDiagnosticArtifact),
+    "diagnostic-cardinality RED fixture no longer admits a sixth valid-prefix marker",
+);
+invariant(
+    priorCc9aMacosDiagnosticSummaryAccepts(inventoryThreeArtifact),
+    "diagnostic-cardinality RED fixture no longer admits inventory=3 with three observations",
+);
+invariant(
+    correctedCc9aMacosDiagnosticSummaryAccepts(liveDiagnosticArtifact) &&
+        !correctedCc9aMacosDiagnosticSummaryAccepts(sixthDiagnosticArtifact) &&
+        !correctedCc9aMacosDiagnosticSummaryAccepts(inventoryThreeArtifact),
+    "diagnostic-cardinality GREEN must accept exact 5/2/2/2/1/1/1 and reject both false passes",
+);
 invariant(
     priorMacosMountSummaryAccepts(statFailureArtifact),
     "summary simulation RED fixture no longer reproduces the prior false PASS",
@@ -1215,5 +1509,11 @@ invariant(
 );
 console.log(
     "PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true",
+);
+console.log(
+    "PASS: cc9a live inline simulation anchored_root_omitted=true split_name_omitted=true corrected_exact=true failed_rejected=true",
+);
+console.log(
+    "PASS: cc9a diagnostic cardinality prior_sixth_pass=true prior_inventory3_pass=true exact_5_2_2_2_1_1_1=true extras_rejected=true",
 );
 console.log(`PASS: direct LABSN and cc9a native evidence contract with ${mutationCount} mutations`);

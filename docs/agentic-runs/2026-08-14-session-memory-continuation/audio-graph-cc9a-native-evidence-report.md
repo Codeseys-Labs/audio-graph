@@ -339,3 +339,232 @@ No global package, workflow, dependency, Seed, or other-worktree file was
 modified to work around that environmental gate. This correction has no new
 native macOS acceptance claim; the conductor must rerun and inspect the
 authorized native job before cc9a is considered accepted.
+
+## 2026-08-16 archived macOS evidence parser correction
+
+### Custody and bounded scope
+
+- Seed: `audio-graph-cc9a`.
+- Worktree:
+  `/home/codeseys/DevBox/audio-graph/.worktrees/cc9a-macos-evidence-parser-wave7c`.
+- Branch: `work/audio-graph-cc9a-macos-evidence-parser-wave7c`.
+- Exact base and merge-base: `b906ab9a2b13e82142188223ee0cf95b6c985fe7`.
+- Workflow/checker commit: `d412f225b30a5f4afdcaffe493333d94c12c9cb2`
+  (`fix(audio-graph-cc9a): parse inline macOS evidence`).
+
+The authorized scope was only the Unix cc9a evidence parser, its source-aware
+checker, and this report. No Rust product source, dependency, Seed, GitHub
+state, other workflow, or other worktree was changed. No push, dispatch,
+merge, PR mutation, or cleanup was performed.
+
+### Archived native evidence and cause
+
+GitHub run `31992425071`, macOS job `95278220020`, is terminal and archived at
+`/tmp/audio-graph-cc9a-macos-31992425071/files`. The native commands all
+exited 0 and retained exact counts:
+
+```text
+cc9a native:              3/3
+canonical durability:   17/17
+canonical crash harness: 11/11
+```
+
+The exact fsid relationship marker is present and says
+`root_equals_data=true`, `root_differs_system=true`,
+`same_root_fsid_count=1`, `probe_unavailable_count=0`,
+`root_before_after_stable=true`, `selection_authority=fsid`, and
+`mounted_on_text_authority=false`.
+
+The job summary nevertheless failed closed. Rust printed the first diagnostic
+inline after the counted canonical test name, then printed the test's result
+as a standalone line after the diagnostic sequence:
+
+```text
+test persistence::canonical_durability::tests::cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation ... CC9A_MACOS_DIAGNOSTIC root ...
+CC9A_MACOS_DIAGNOSTIC observation ...
+CC9A_MACOS_DIAGNOSTIC observation ...
+CC9A_MACOS_DIAGNOSTIC summary ...
+CC9A_MACOS_DIAGNOSTIC exact ...
+ok
+```
+
+The old anchored grep retained only the four column-1 diagnostic lines and
+omitted the root line. The old name awk required `ok` on the test-name line,
+so it retained only two of the three canonical names. The resulting archived
+summary correctly remained `status=FAIL`, with
+`cc9a_native_name_markers=FAIL`,
+`cc9a_macos_diagnostics_complete=false`, and
+`cc9a_macos_exact_mount_identity=false`.
+
+### Test-first correction
+
+The checker received the exact live inline/split log shape before the workflow
+changed. Against the old parser it produced the required RED:
+
+```text
+Error: Unix cc9a exit or split-diagnostic exact-name capture drift
+```
+
+The Unix parser now uses a bounded awk state machine. Ordinary tests are
+accepted only from an exact `test ... ... ok` line. A diagnostic-bearing test
+name remains pending only across `CC9A_MACOS_DIAGNOSTIC` lines and is emitted
+only when the sequence terminates in a standalone `ok`; `FAILED` and unrelated
+lines clear the pending name. Diagnostic extraction admits a marker only at
+column 1 or immediately after a valid cc9a test prefix, and writes only the
+marker substring. The existing exact name list, diagnostic schemas/counts,
+exit checks, and fail-closed summary are unchanged.
+
+The checker also mutates away inline-marker acceptance and mutates standalone
+`ok` into a non-`ok` predicate. Both mutations are rejected. Its live-log
+simulation proves the old 2-name/4-diagnostic failure, the corrected exact
+3-name/5-diagnostic extraction, unrelated-marker rejection, and failure-result
+rejection:
+
+```text
+PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
+PASS: cc9a live inline simulation anchored_root_omitted=true split_name_omitted=true corrected_exact=true failed_rejected=true
+PASS: direct LABSN and cc9a native evidence contract with 59 mutations
+```
+
+### Gates and results
+
+The corrected workflow parser was also run directly against the archived
+`cc9a_native.log`:
+
+```text
+PASS: live run 31992425071 parser names=3 diagnostics=5 root=1 observations=2 summary=1 exact=1 failed_split_rejected=true
+```
+
+The remaining workflow/checker gates all exited 0:
+
+```text
+PASS: checker and mutations
+PASS: actionlint
+PASS: yq YAML parse
+PASS: Ruby YAML safe_load
+PASS: Node syntax
+PASS: extracted 7 bash bodies
+PASS: git diff --check
+PASS: Betterleaks exact three-path scan (129.07 KB, no leaks found)
+docs/Seeds secret hygiene scan passed: 0 findings
+PASS: exact base-relative footprint (3 paths)
+```
+
+The final base-relative footprint is exactly the three authorized paths:
+
+```text
+.github/workflows/2df3-native-durability.yml
+docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-cc9a-native-evidence-report.md
+scripts/check-2df3-labsn-action.mjs
+```
+
+### Findings and open questions
+
+No unrelated issue was changed. The absent worktree-local Biome binary was not
+installed or worked around; repository Biome configuration includes TypeScript
+sources only and excludes this checker, so Node syntax and the 59-mutation
+checker are its applicable local gates.
+
+This workstream validates the corrected parser against the terminal archived
+native log but does not rewrite that immutable artifact or claim a new remote
+workflow PASS. Integration and any conductor-authorized native rerun remain
+outside this workstream.
+
+## 2026-08-16 correction round 1: exact diagnostic cardinality
+
+### Independent review BLOCKs
+
+Both Spec and Standards review independently blocked the prior worktree tip
+`e9163031017a0e25fbbf53b5bdcfa9b2edc01344`. The summary required one root,
+one summary, one exact marker, and observation/schema counts equal to the
+root-declared inventory, but it did not require exactly five extracted
+diagnostic lines or exactly two inventory observations.
+
+That left two fail-open shapes:
+
+1. a sixth anchored `CC9A_MACOS_DIAGNOSTIC` line that matched no counted
+   schema did not affect any comparison; and
+2. `inventory_count=3` plus a third schema-valid observation satisfied both
+   dynamic inventory comparisons.
+
+Both artifacts therefore passed the prior completeness predicate even though
+neither was the exact native evidence shape.
+
+### RED and GREEN
+
+The checker added executable forms of both reviewer findings before the YAML
+changed. The first appends a sixth valid-prefix diagnostic. The second changes
+the live root to `inventory_count=3` and inserts a third schema-valid APFS
+observation while retaining a self-consistent summary and exact marker. Both
+were accepted by the prior predicate. The checker-first RED against the
+reviewed tip was:
+
+```text
+Error: macOS summary diagnostic completeness/fail-closed gate drift
+```
+
+The Unix summary now requires this complete exact tuple:
+
+```text
+diagnostic_total_count=5
+diagnostic_inventory_count=2
+diagnostic_observation_count=2
+diagnostic_observation_schema_count=2
+diagnostic_root_count=1
+diagnostic_summary_count=1
+diagnostic_exact_count=1
+```
+
+The source/checker correction is commit
+`0324dd11554571091332798e7e500deffc373d0a`
+(`fix(audio-graph-cc9a): enforce exact evidence counts`). Six new mutations
+weaken the total, inventory, observation, observation-schema, root, and
+summary comparisons; the existing exact-count mutation continues to protect
+the seventh comparison. All are rejected.
+
+GREEN checker output:
+
+```text
+PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
+PASS: cc9a live inline simulation anchored_root_omitted=true split_name_omitted=true corrected_exact=true failed_rejected=true
+PASS: cc9a diagnostic cardinality prior_sixth_pass=true prior_inventory3_pass=true exact_5_2_2_2_1_1_1=true extras_rejected=true
+PASS: direct LABSN and cc9a native evidence contract with 65 mutations
+```
+
+The archived run log was also exercised through the shell parsers and both old
+and corrected summary predicates without rewriting its artifacts:
+
+```text
+PASS: archived live parser names=3 diagnostics=5 failed_split_rejected=true exact_5_2_2_2_1_1_1=true prior_sixth_pass=true prior_inventory3_pass=true extras_rejected=true
+```
+
+This preserves the exact three native test names, the five live diagnostics,
+and standalone `FAILED` rejection while rejecting both review fixtures.
+
+### Focused gates
+
+The correction snapshot passed:
+
+```text
+PASS: checker and 65 mutations
+PASS: actionlint
+PASS: yq YAML parse
+PASS: Ruby YAML safe_load
+PASS: Node syntax
+PASS: extracted 7 bash bodies
+PASS: git diff --check
+PASS: Betterleaks exact three-path scan (no leaks found)
+docs/Seeds secret hygiene scan passed: 0 findings
+PASS: exact base-relative footprint (3 paths)
+```
+
+### Scope, findings, and open questions
+
+The base-relative footprint remains exactly the same three authorized paths.
+No Rust product source, dependency, Seed, GitHub state, other workflow, or
+other worktree changed. No push, dispatch, merge, PR mutation, or cleanup was
+performed.
+
+No additional issue was found. This correction hardens local evidence
+acceptance only; integration and any conductor-authorized native rerun remain
+outside this workstream.
