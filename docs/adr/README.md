@@ -44,6 +44,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0035] | Keep Versioned Speech Revisions in One Canonical Transcript Stream | accepted | Refines ADR-0024 and ADR-0027; relates to ADR-0031 and ADR-0036 | 2026-08-14 |
 | [0036] | Version Projection Basis Hashes by Speech-Revision Semantics | accepted | Refines ADR-0031; depends on ADR-0024, ADR-0027, and accepted ADR-0035 | 2026-08-14 |
 | [0037] | Freeze the Canonical Event Stream Registry | accepted | Refines ADR-0027; freezes canonical event-domain IDs and outer schema v1 | 2026-07-10 |
+| [0038] | Keep the Session Control Plane in the Flat Artifact Root | proposed | Refines ADR-0027 and ADR-0035; relates to ADR-0037; supersedes none | 2026-08-16 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -82,6 +83,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0035]: 0035-keep-versioned-speech-revisions-in-one-canonical-stream.md
 [0036]: 0036-version-projection-basis-hashes-by-speech-semantics.md
 [0037]: 0037-freeze-canonical-event-stream-registry.md
+[0038]: 0038-keep-session-control-plane-in-the-flat-artifact-root.md
 
 > **ADR-0037 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
