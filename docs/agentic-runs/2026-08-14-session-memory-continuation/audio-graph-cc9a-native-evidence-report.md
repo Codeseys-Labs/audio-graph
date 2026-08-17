@@ -568,3 +568,201 @@ performed.
 No additional issue was found. This correction hardens local evidence
 acceptance only; integration and any conductor-authorized native rerun remain
 outside this workstream.
+
+## 2026-08-16 correction round 2: BSD sed portability
+
+### Trigger, custody, and cause
+
+Terminal run `31994090474`, macOS job `95282609840`, passed the native Rust
+test groups at 3/17/11. Its artifact contains the exact three cc9a names and
+five diagnostics, but the workflow summary reported `status=FAIL`. The
+inventory extractor used `available\|unavailable` inside a basic regular
+expression. That alternation is a GNU sed extension; BSD/macOS sed produced no
+inventory value even though the archived root diagnostic declares
+`inventory_count=2`.
+
+This correction remained limited to Seed `audio-graph-cc9a`, exact base
+`836df7f63ebd64da6d23e7a128fa7c2adf630b86`, the workflow, its checker, and
+this report. No Rust source, dependency, Seed record, GitHub state, or other
+worktree changed.
+
+### Checker-first RED and GREEN
+
+The checker first required separate POSIX basic-regex expressions for the two
+accepted `root_fsid_result` values and explicitly rejected the old GNU
+alternation. Against the unmodified workflow, the checker produced the
+expected RED:
+
+```text
+error: macOS inventory extraction must use portable BRE expressions without GNU alternation
+```
+
+The checker also embeds the exact root diagnostic archived from run
+`31994090474`. Its extraction simulation requires the sole output to equal
+`2`; a malformed inventory field produces no value, while duplicate valid
+root values produce multiple lines and fail the same exact comparison.
+
+The workflow now invokes POSIX sed with two `-e` expressions, one ending in
+`root_fsid_result=available` and one ending in
+`root_fsid_result=unavailable`. The independent total, schema, root, and exact
+cardinality gates remain unchanged, including the strict
+5/2/2/2/1/1/1 tuple. Source and checker are committed as `facccd5`
+(`fix(audio-graph-cc9a): make inventory parsing portable`).
+
+GREEN checker output:
+
+```text
+PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
+PASS: cc9a live inline simulation anchored_root_omitted=true split_name_omitted=true corrected_exact=true failed_rejected=true
+PASS: cc9a diagnostic cardinality prior_sixth_pass=true prior_inventory3_pass=true exact_5_2_2_2_1_1_1=true extras_rejected=true
+PASS: cc9a POSIX inventory extraction archived_31994090474=2 malformed_rejected=true multiple_rejected=true gnu_bre_alternation_rejected=true
+PASS: direct LABSN and cc9a native evidence contract with 66 mutations
+```
+
+The extra mutation converts the portable pair back to the GNU-only basic
+regular expression, and validation rejects it. Existing mutations and
+simulations continue to reject extra diagnostics, `inventory_count=3`, and a
+standalone `FAILED` result while preserving exact three-name extraction.
+
+### Archived artifact replay
+
+The exact shell expressions were replayed read-only against the terminal
+artifact without rewriting it:
+
+```text
+archived_shell_replay=PASS run=31994090474 inventory=2 malformed_rejected=true multiple_rejected=true diagnostics=5 observations=2 schemas=2 roots=1 summaries=1 exact=1 names=3
+```
+
+The artifact's native, canonical-durability, and crash-harness command and tee
+exits are all zero, with test counts 3, 17, and 11 respectively. This is a
+parser correction over terminal archived evidence, not a new remote dispatch
+or a new native run claim.
+
+### Gates and results
+
+Workflow/parser gates:
+
+```text
+ruby_yaml_parse=PASS
+actionlint=PASS
+yq_yaml_parse=PASS
+node_syntax=PASS
+extracted_bash_syntax=PASS count=7
+```
+
+Pre-report security, hygiene, and source-footprint gates:
+
+```text
+scanned ~143590 bytes (143.59 KB)
+no leaks found
+docs/Seeds secret hygiene scan passed: 0 findings
+diff_hygiene=PASS
+base_relative_source_footprint=PASS paths=2
+```
+
+### Findings and open questions
+
+No additional issue was found. The final branch footprint is intended to be
+exactly the workflow, checker, and this report. Integration, Seed mutation,
+push, dispatch, merge, PR mutation, and worktree cleanup remain conductor
+owned and were not performed here.
+
+## 2026-08-16 BSD correction review round 1: duplicate root fields
+
+### Review disposition
+
+Immutable review of exact tip `8b457160fa0b42b9969454edc07e59cd8e4ffa15`
+returned Standards `BLOCK` at P1 and Spec `SHIP`. The Standards finding showed
+that both the inventory extractor and root schema used greedy matching. A
+single root diagnostic containing this suffix therefore false-passed the
+otherwise exact 5/2/2/2/1/1/1 tuple:
+
+```text
+inventory_count=999 root_fsid_result=unavailable inventory_count=2 root_fsid_result=available
+```
+
+The greedy extractor selected the final inventory value `2`, and the root
+schema counted the line as one valid root. Spec acceptance required no other
+change.
+
+### Checker-first RED and GREEN
+
+The checker added that exact duplicate-field line as an executable fixture.
+It first proves the reviewed predicate accepts the fixture, then requires the
+workflow source to enforce exactly one occurrence of each root label. Against
+the reviewed tip, the source guard produced the expected RED:
+
+```text
+error: macOS root diagnostic field labels must each occur exactly once
+```
+
+The workflow now adds a separate POSIX awk gate that counts
+`canonical_root=`, `root_dev=`, `inventory_count=`, and
+`root_fsid_result=` occurrences on every root diagnostic. Exactly one root
+line must have each label exactly once. The archived root remains accepted;
+the duplicate-field fixture produces a uniqueness count of zero. The
+POSIX/BSD-safe two-expression sed parser, root schema, and all independent
+cardinality comparisons remain in place.
+
+Four mutations weaken one field-label comparison from exact-one to
+at-least-one, and a fifth weakens the aggregate uniqueness gate. All are
+rejected. Source and checker are committed as `43eedcf`
+(`fix(audio-graph-cc9a): reject duplicate root fields`).
+
+GREEN checker output:
+
+```text
+PASS: macOS summary simulation prior_false_pass=true corrected_failure_rejected=true full_good_pass=true
+PASS: cc9a live inline simulation anchored_root_omitted=true split_name_omitted=true corrected_exact=true failed_rejected=true
+PASS: cc9a diagnostic cardinality prior_sixth_pass=true prior_inventory3_pass=true exact_5_2_2_2_1_1_1=true extras_rejected=true
+PASS: cc9a POSIX inventory extraction archived_31994090474=2 malformed_rejected=true multiple_rejected=true gnu_bre_alternation_rejected=true
+PASS: cc9a root-field uniqueness prior_duplicate_fields_pass=true exact_once_required=true duplicate_fields_rejected=true
+PASS: direct LABSN and cc9a native evidence contract with 71 mutations
+```
+
+Existing simulations still reject malformed inventory, duplicate root lines,
+extra diagnostics, `inventory_count=3`, and standalone `FAILED`, while exact
+three-name extraction remains unchanged.
+
+### Archived and adversarial shell replay
+
+The workflow's sed and awk expressions were replayed read-only against the
+terminal artifact and the exact malicious root fixture:
+
+```text
+archived_and_adversarial_shell_replay=PASS run=31994090474 inventory=2 root_fields_exact_once=1 duplicate_field_prior_inventory=2 duplicate_field_prior_schema=1 duplicate_field_unique=0 malformed_rejected=true duplicate_lines_rejected=true diagnostics=5 names=3
+```
+
+This confirms the old two parser components both admitted the malicious line
+while the exact-once gate rejects it. The terminal artifact retains exact
+inventory `2`, five diagnostics, three names, and native Rust counts 3/17/11.
+No remote workflow was dispatched.
+
+### Gates and results
+
+Workflow/parser gates:
+
+```text
+ruby_yaml_parse=PASS
+actionlint=PASS
+yq_yaml_parse=PASS
+node_syntax=PASS
+extracted_bash_syntax=PASS count=7
+```
+
+Pre-report security, hygiene, and correction-footprint gates:
+
+```text
+scanned ~150979 bytes (150.98 KB)
+no leaks found
+docs/Seeds secret hygiene scan passed: 0 findings
+diff_hygiene=PASS
+correction_source_footprint=PASS paths=2
+```
+
+### Findings and open questions
+
+No additional issue was found. This correction remains limited to the same
+workflow, checker, and report. Rust source, dependencies, Seeds, GitHub state,
+other worktrees, push, dispatch, merge, PR mutation, and cleanup remain
+unchanged or unperformed.

@@ -802,7 +802,9 @@ jobs:
               cc9a_macos_diagnostics_present=true
               diagnostic_total_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC ' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
-              diagnostic_inventory_count="$(sed -n 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=\(available\|unavailable\)$/\1/p' \
+              diagnostic_inventory_count="$(sed -n \
+                -e 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=available$/\1/p' \
+                -e 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=unavailable$/\1/p' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
               diagnostic_observation_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC observation ' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
@@ -810,6 +812,17 @@ jobs:
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               diagnostic_root_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=[0-9]+ root_fsid_result=(available|unavailable)$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_root_field_uniqueness_count="$(awk '
+                /^CC9A_MACOS_DIAGNOSTIC root / {
+                  if (gsub(/canonical_root=/, "&") == 1 &&
+                    gsub(/root_dev=/, "&") == 1 &&
+                    gsub(/inventory_count=/, "&") == 1 &&
+                    gsub(/root_fsid_result=/, "&") == 1) {
+                    valid += 1
+                  }
+                }
+                END { print valid + 0 }
+              ' "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
               diagnostic_summary_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=[0-9]+ same_root_dev_count=[0-9]+ branch=(root_missing|zero_match_clean|zero_match_with_unavailable|unique|ambiguous|unique_then_validate_mismatch)$' \
                 "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
               diagnostic_exact_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false$' \
@@ -819,6 +832,7 @@ jobs:
                 [ "$diagnostic_observation_count" = 2 ] &&
                 [ "$diagnostic_observation_schema_count" = 2 ] &&
                 [ "$diagnostic_root_count" = 1 ] &&
+                [ "$diagnostic_root_field_uniqueness_count" = 1 ] &&
                 [ "$diagnostic_summary_count" = 1 ] &&
                 [ "$diagnostic_exact_count" = 1 ]; then
                 cc9a_macos_diagnostics_complete=true

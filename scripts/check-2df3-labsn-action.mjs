@@ -33,6 +33,12 @@ function countArtifactLines(artifact, expected) {
 }
 
 const CC9A_MACOS_DIAGNOSTIC_MARKER = "CC9A_MACOS_DIAGNOSTIC ";
+const CC9A_INVENTORY_SED_PREFIX =
+    "s/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\\([0-9][0-9]*\\) root_fsid_result=";
+const POSIX_CC9A_INVENTORY_AVAILABLE_SED = `${CC9A_INVENTORY_SED_PREFIX}available$/\\1/p`;
+const POSIX_CC9A_INVENTORY_UNAVAILABLE_SED = `${CC9A_INVENTORY_SED_PREFIX}unavailable$/\\1/p`;
+const GNU_CC9A_INVENTORY_ALTERNATION_SED =
+    `${CC9A_INVENTORY_SED_PREFIX}\\(available\\|unavailable\\)$/\\1/p`;
 const CC9A_LIVE_INLINE_LOG = [
     "running 3 tests",
     "test persistence::canonical_durability::tests::cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation ... CC9A_MACOS_DIAGNOSTIC root canonical_root=/private/var/folders/pm/cmklcsfj60nd7nfc79g8xmbc0000gn/T/ag-canonical-production-binding-first-12495-0 root_dev=16777229 inventory_count=2 root_fsid_result=available",
@@ -78,12 +84,18 @@ function cc9aMacosDiagnosticCounts(artifact) {
         const match = line.match(rootPattern);
         return match ? [Number(match[1])] : [];
     });
+    const rootFieldLabels = ["canonical_root=", "root_dev=", "inventory_count=", "root_fsid_result="];
     return {
         total: lines.filter((line) => line.startsWith(CC9A_MACOS_DIAGNOSTIC_MARKER)).length,
         inventory: inventory.length === 1 ? inventory[0] : Number.NaN,
         observations: lines.filter((line) => observationPattern.test(line)).length,
         observationSchemas: lines.filter((line) => observationSchemaPattern.test(line)).length,
         roots: lines.filter((line) => rootPattern.test(line)).length,
+        rootFieldUniqueness: lines.filter(
+            (line) =>
+                rootPattern.test(line) &&
+                rootFieldLabels.every((label) => line.split(label).length - 1 === 1),
+        ).length,
         summaries: lines.filter((line) => summaryPattern.test(line)).length,
         exact: lines.filter((line) => line === exactLine).length,
     };
@@ -112,6 +124,31 @@ function correctedCc9aMacosDiagnosticSummaryAccepts(artifact) {
         counts.summaries === 1 &&
         counts.exact === 1
     );
+}
+
+function fieldUniqueCc9aMacosDiagnosticSummaryAccepts(artifact) {
+    const counts = cc9aMacosDiagnosticCounts(artifact);
+    return correctedCc9aMacosDiagnosticSummaryAccepts(artifact) && counts.rootFieldUniqueness === 1;
+}
+
+function posixCc9aInventoryValues(artifact) {
+    const patterns = [
+        /^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=([0-9]+) root_fsid_result=available$/,
+        /^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=([0-9]+) root_fsid_result=unavailable$/,
+    ];
+    return artifact.split("\n").flatMap((line) => {
+        for (const pattern of patterns) {
+            const match = line.match(pattern);
+            if (match) {
+                return [match[1]];
+            }
+        }
+        return [];
+    });
+}
+
+function posixCc9aInventorySummaryAccepts(artifact) {
+    return posixCc9aInventoryValues(artifact).join("\n") === "2";
 }
 
 function priorCc9aNativeNames(log) {
@@ -558,6 +595,21 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
             cc9aUnix.includes("cc9a_macos_diagnostics.txt") &&
             cc9aUnix.includes('if [ "$RUNNER_OS" = "macOS" ]'),
         "macOS Rust diagnostic substring extraction artifact drift",
+    );
+    invariant(
+        unixSummary.includes(`-e '${POSIX_CC9A_INVENTORY_AVAILABLE_SED}'`) &&
+            unixSummary.includes(`-e '${POSIX_CC9A_INVENTORY_UNAVAILABLE_SED}'`) &&
+            !unixSummary.includes(GNU_CC9A_INVENTORY_ALTERNATION_SED),
+        "macOS inventory extraction must use portable BRE expressions without GNU alternation",
+    );
+    invariant(
+        unixSummary.includes("diagnostic_root_field_uniqueness_count") &&
+            unixSummary.includes('gsub(/canonical_root=/, "&") == 1') &&
+            unixSummary.includes('gsub(/root_dev=/, "&") == 1') &&
+            unixSummary.includes('gsub(/inventory_count=/, "&") == 1') &&
+            unixSummary.includes('gsub(/root_fsid_result=/, "&") == 1') &&
+            unixSummary.includes('[ "$diagnostic_root_field_uniqueness_count" = 1 ]'),
+        "macOS root diagnostic field labels must each occur exactly once",
     );
     invariant(
         unixSummary.includes("cc9a_macos_diagnostics_present") &&
@@ -1286,6 +1338,18 @@ const cc9aMutations = [
         }),
     ],
     [
+        "macOS inventory parser regressed to GNU BRE alternation",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                `-e '${POSIX_CC9A_INVENTORY_AVAILABLE_SED}' \\\n                -e '${POSIX_CC9A_INVENTORY_UNAVAILABLE_SED}'`,
+                `'${GNU_CC9A_INVENTORY_ALTERNATION_SED}'`,
+            ),
+        }),
+    ],
+    [
         "macOS diagnostic inventory count weakened",
         ({ workflow: source, ...rest }) => ({
             ...rest,
@@ -1330,6 +1394,30 @@ const cc9aMutations = [
                 "Summarize and enforce native exits (Unix)",
                 '[ "$diagnostic_root_count" = 1 ]',
                 '[ -n "$diagnostic_root_count" ]',
+            ),
+        }),
+    ],
+    ...["canonical_root", "root_dev", "inventory_count", "root_fsid_result"].map((field) => [
+        `macOS root ${field} uniqueness check removed`,
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                `gsub(/${field}=/, "&") == 1`,
+                `gsub(/${field}=/, "&") >= 1`,
+            ),
+        }),
+    ]),
+    [
+        "macOS root field uniqueness count weakened",
+        ({ workflow: source, ...rest }) => ({
+            ...rest,
+            workflow: mutateStep(
+                source,
+                "Summarize and enforce native exits (Unix)",
+                '[ "$diagnostic_root_field_uniqueness_count" = 1 ]',
+                '[ -n "$diagnostic_root_field_uniqueness_count" ]',
             ),
         }),
     ],
@@ -1458,6 +1546,23 @@ const inventoryThreeArtifact = liveDiagnosticArtifact
         `${CC9A_MACOS_DIAGNOSTIC_MARKER}summary`,
         `${thirdObservation}\n${CC9A_MACOS_DIAGNOSTIC_MARKER}summary`,
     );
+const archived31994090474RootDiagnostic =
+    "CC9A_MACOS_DIAGNOSTIC root canonical_root=/private/var/folders/pm/cmklcsfj60nd7nfc79g8xmbc0000gn/T/ag-canonical-production-binding-first-12520-0 root_dev=16777227 inventory_count=2 root_fsid_result=available";
+const malformedArchivedRootDiagnostic = archived31994090474RootDiagnostic.replace(
+    "inventory_count=2",
+    "inventory_count=two",
+);
+const duplicateArchivedRootDiagnostics = [
+    archived31994090474RootDiagnostic,
+    archived31994090474RootDiagnostic.replace(
+        "root_fsid_result=available",
+        "root_fsid_result=unavailable",
+    ),
+].join("\n");
+const duplicateFieldRootArtifact = liveDiagnosticArtifact.replace(
+    "inventory_count=2 root_fsid_result=available",
+    "inventory_count=999 root_fsid_result=unavailable inventory_count=2 root_fsid_result=available",
+);
 invariant(
     priorLiveDiagnostics.length === 4 &&
         !priorLiveDiagnostics.some((line) => line.startsWith(`${CC9A_MACOS_DIAGNOSTIC_MARKER}root `)),
@@ -1496,6 +1601,22 @@ invariant(
     "diagnostic-cardinality GREEN must accept exact 5/2/2/2/1/1/1 and reject both false passes",
 );
 invariant(
+    correctedCc9aMacosDiagnosticSummaryAccepts(duplicateFieldRootArtifact),
+    "duplicate-field RED fixture no longer reproduces the current exact-count false pass",
+);
+invariant(
+    fieldUniqueCc9aMacosDiagnosticSummaryAccepts(liveDiagnosticArtifact) &&
+        !fieldUniqueCc9aMacosDiagnosticSummaryAccepts(duplicateFieldRootArtifact),
+    "root-field uniqueness GREEN must accept the archive shape and reject duplicate labels",
+);
+invariant(
+    posixCc9aInventoryValues(archived31994090474RootDiagnostic).join("\n") === "2" &&
+        posixCc9aInventorySummaryAccepts(archived31994090474RootDiagnostic) &&
+        !posixCc9aInventorySummaryAccepts(malformedArchivedRootDiagnostic) &&
+        !posixCc9aInventorySummaryAccepts(duplicateArchivedRootDiagnostics),
+    "POSIX inventory extraction must return exact archived value 2 and reject malformed or multiple values",
+);
+invariant(
     priorMacosMountSummaryAccepts(statFailureArtifact),
     "summary simulation RED fixture no longer reproduces the prior false PASS",
 );
@@ -1515,5 +1636,11 @@ console.log(
 );
 console.log(
     "PASS: cc9a diagnostic cardinality prior_sixth_pass=true prior_inventory3_pass=true exact_5_2_2_2_1_1_1=true extras_rejected=true",
+);
+console.log(
+    "PASS: cc9a POSIX inventory extraction archived_31994090474=2 malformed_rejected=true multiple_rejected=true gnu_bre_alternation_rejected=true",
+);
+console.log(
+    "PASS: cc9a root-field uniqueness prior_duplicate_fields_pass=true exact_once_required=true duplicate_fields_rejected=true",
 );
 console.log(`PASS: direct LABSN and cc9a native evidence contract with ${mutationCount} mutations`);
