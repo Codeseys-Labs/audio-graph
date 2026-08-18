@@ -136,22 +136,35 @@ jobs:
       # as its own remediation trigger, so assert it here rather than trusting a
       # reader to re-run it by hand.
       #
-      # `cargo tree -i` prints the reverse-dependency tree on stdout and only a
-      # "nothing to print" warning on stderr, so stdout mentioning the crate IS
-      # the reachability signal. Verified in both directions: this prints 0
-      # matching lines for rkyv today and 119 for a reachable crate.
-      - name: Assert the rkyv 0.7 audit ignore is still unreachable
+      # Matched against the advisory's AFFECTED RANGE (patched is ">= 0.8.17"),
+      # not a pinned version: a check keyed on rkyv@0.7.46 alone would pass
+      # silently if the lockfile later resolved 0.7.47 or 0.8.10, both still
+      # vulnerable and both still suppressed by the ID-level ignore.
+      #
+      # Version logic unit-checked against synthetic input before landing:
+      # 0.7.46 and 0.8.16 flag; 0.8.17, 0.9.0, and 1.0.0 do not.
+      - name: Assert no affected rkyv is reachable
         working-directory: audio-graph/src-tauri
         run: |
-          if cargo tree --locked -i rkyv@0.7.46 \
-               --target all --all-features --edges all 2>/dev/null \
-               | grep -q '^rkyv v0\.7\.'; then
-            echo "::error::RUSTSEC-2026-0235's ignore in .cargo/audit.toml is justified only while rkyv 0.7 is an inactive resolver-retained edge, but it is now reachable."
-            echo "::error::Remove that ignore and resolve the advisory, or replace its justification. Reverse-dependency tree follows."
-            cargo tree --locked -i rkyv@0.7.46 --target all --all-features --edges all || true
+          affected="$(
+            cargo tree --locked --target all --all-features --edges all \
+              --format '{p}' --prefix none 2>/dev/null \
+            | awk '
+                $1 == "rkyv" {
+                  v = $2; sub(/^v/, "", v);
+                  split(v, p, ".");
+                  if ((p[1]+0) == 0 && ((p[2]+0) < 8 || ((p[2]+0) == 8 && (p[3]+0) < 17)))
+                    print $1 " " $2;
+                }' \
+            | sort -u
+          )"
+          if [ -n "$affected" ]; then
+            echo "::error::RUSTSEC-2026-0235's ignore in .cargo/audit.toml is justified only while no affected rkyv (< 0.8.17) is reachable, but one now is:"
+            printf '%s\n' "$affected"
+            echo "::error::Remove that ignore and resolve the advisory, or replace its justification with one that matches reality."
             exit 1
           fi
-          echo "rkyv 0.7 remains unreachable; the RUSTSEC-2026-0235 ignore stays justified."
+          echo "No affected rkyv (< 0.8.17) is reachable; the RUSTSEC-2026-0235 ignore stays justified."
 
   # ── Rust backend — Linux ───────────────────────────────────────────
   # Tests use `tauri::test::mock_context` + `noop_assets` + `any_thread()`
