@@ -65,6 +65,28 @@ ignore = [
     "RUSTSEC-2025-0100",
     "RUSTSEC-2025-0119",
 
+    # ── Resolver-retained rust_decimal rkyv 0.7 edge (inactive) ─────
+    # Source: Cargo.lock retains rust_decimal 1.42.1's optional
+    # `rkyv = "^0.7.46"` dependency even though no AudioGraph feature enables it.
+    # Blocker: rust_decimal 1.42.1 requires optional rkyv ^0.7.46; patched rkyv
+    # 0.8.17 is semver-incompatible with that requirement. Manual lock-stanza
+    # pruning is resolver-unstable because Cargo retains/re-adds the declared
+    # optional edge. Seed audio-graph-c65d separately owns the independent
+    # ci/storage-probe lock graph; its resolution is not covered by this ignore.
+    # Crate: rkyv  Title: Insufficient archive validation can cause out-of-bounds
+    # reads in archives containing Rc/Arc.
+    # Reachability: `cargo tree --locked --offline -i rkyv@0.7.46 --target all
+    # --all-features --edges all` prints no reverse dependency; default and
+    # cloud-only resolution do not contain the package at all. Therefore the
+    # affected checked archive-access/deserialization APIs are not compiled into
+    # any current AudioGraph feature set.
+    # Risk acceptance: lockfile-scanner finding only while that edge stays
+    # inactive. Do not use this exception if a feature activates rkyv 0.7.
+    # Remediation: remove immediately if any default/cloud/all-features tree makes
+    # the command above non-empty. Otherwise remove when rust_decimal drops or
+    # raises the optional 0.7 requirement so a targeted lock update prunes it.
+    "RUSTSEC-2026-0235", # rkyv 0.7.46: inactive resolver-retained optional edge
+
     # ── SurrealDB embedded adapter (gated, non-default, conformance-only) ──
     # Source: transitive via the optional `surrealdb-embedded` feature →
     # surrealdb 3.1.x → rsa 0.9.10 (pulled by surrealdb's RPC/auth stack).
