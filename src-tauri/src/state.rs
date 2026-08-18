@@ -2034,7 +2034,7 @@ mod rotation_tests {
     }
 
     #[test]
-    #[ignore = "mutates HOME; conflicts with sessions::usage::tests — run with --test-threads=1"]
+    #[ignore = "mutates AUDIOGRAPH_DATA_DIR; conflicts with sessions::usage::tests — run with --test-threads=1"]
     fn rotate_session_respawns_transcript_writer_to_new_file() {
         // SAFETY invariant for HomeGuard requires the shared test-env lock;
         // acquire it before constructing the guard so HOME / USERPROFILE /
@@ -2088,10 +2088,15 @@ mod rotation_tests {
         drain_writers(&app);
         std::thread::sleep(std::time::Duration::from_millis(150));
 
-        let new_file = dir
-            .join(".audiograph")
-            .join("transcripts")
-            .join(format!("{}.jsonl", new_id));
+        // Resolve expected paths the same way production code does — via
+        // `user_data::transcript_path`, which honors `AUDIOGRAPH_DATA_DIR`
+        // — rather than hand-assembling a `HOME`-relative `.audiograph`
+        // path. Windows known-folder home resolution ignores the `HOME` /
+        // `USERPROFILE` env overrides `HomeGuard` sets, so a manually
+        // reconstructed path drifts from the writer's actual target; the
+        // canonical resolver stays correct because `AUDIOGRAPH_DATA_DIR`
+        // takes priority over home-dir lookup on every platform.
+        let new_file = crate::user_data::transcript_path(new_id).expect("resolve new session id");
         assert!(
             new_file.exists(),
             "rotated writer must have opened {:?}",
@@ -2104,10 +2109,8 @@ mod rotation_tests {
             contents
         );
 
-        let original_file = dir
-            .join(".audiograph")
-            .join("transcripts")
-            .join(format!("{}.jsonl", original));
+        let original_file =
+            crate::user_data::transcript_path(&original).expect("resolve original session id");
         if original_file.exists() {
             let original_contents = std::fs::read_to_string(&original_file).unwrap();
             assert!(
