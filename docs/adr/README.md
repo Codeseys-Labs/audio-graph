@@ -34,13 +34,14 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0025] | STT→LLM context efficiency + diff-based note/graph retroactive updates | proposed | Extends ADR-0024; relates to ADR-0023 and ADR-0017; epic `d7bb` | 2026-07-04 |
 | [0026] | Session timeline — who said what when, in relation to what | proposed | Extends ADR-0024; relates to ADR-0025 and ADR-0017; epic `0d72` | 2026-07-04 |
 | [0027] | Adopt File-Canonical Durable Session Storage | accepted | Supersedes ADR-0021 | 2026-07-09 |
-| [0028] | Separate Capture Lifecycle from Foreground Workspace | accepted | — | 2026-07-09 |
+| [0028] | Separate Capture Lifecycle from Foreground Workspace | accepted | Finalization arm narrowed by ADR-0035 | 2026-07-09 |
 | [0029] | Gate Rebuildable Query Indexes on Measured Demand | accepted | — | 2026-07-09 |
 | [0030] | Organize the MVP Shell Around Ready, LiveNow, Review, and Inspect | accepted | — | 2026-07-09 |
 | [0031] | Classify Projection Bases as Current, Append-Only, or Revised | accepted | — | 2026-07-09 |
 | [0032] | Layer Validation Evidence by Claim | accepted | — | 2026-07-09 |
 | [0033] | Enforce MVP Provider Enablement at Every Content-Bearing Start | accepted | — | 2026-07-09 |
 | [0034] | Require Exhaustive Evidence for Negative Data-Egress Claims | accepted | — | 2026-07-10 |
+| [0035] | Record Post-Stop Finalization Failure as Per-Session Finalization Blocked | accepted | Narrows ADR-0028; decided under maintainer delegation | 2026-08-17 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -76,6 +77,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0032]: 0032-layer-validation-evidence-by-claim.md
 [0033]: 0033-enforce-mvp-provider-enablement-at-content-start.md
 [0034]: 0034-require-exhaustive-evidence-for-negative-data-egress-claims.md
+[0035]: 0035-record-post-stop-finalization-failure-as-per-session-finalization-blocked.md
 
 ## Status legend
 

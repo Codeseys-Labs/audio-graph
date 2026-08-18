@@ -6,6 +6,16 @@ deciders: [AudioGraph maintainers]
 
 # ADR-0028: Separate Capture Lifecycle from Foreground Workspace
 
+> **Note (2026-08-17):** The finalization arm of this record is **narrowed by
+> [ADR-0035](0035-record-post-stop-finalization-failure-as-per-session-finalization-blocked.md)**.
+> Post-stop finalization failure now records a per-Session `Finalization Blocked`
+> state instead of entering app-modal `RecoveryRequired`. Read ADR-0035 as the
+> current rule wherever this record says an incomplete drain "or finalization"
+> enters `RecoveryRequired`. Everything else below — capture lifecycle, foreground
+> workspace independence, passive readiness, egress scoping — remains in force,
+> and `RecoveryRequired` retains its full undismissable strength for canonical
+> writer and local drain failure.
+
 ## Context and Problem Statement
 
 AudioGraph currently lets frontend view selection stand in for backend capture
