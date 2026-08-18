@@ -129,6 +129,43 @@ jobs:
         working-directory: audio-graph/src-tauri
         run: cargo audit
 
+      # `ignore` in audit.toml is an unconditional advisory-ID suppression, so a
+      # stanza whose justification is "this package is unreachable" would keep
+      # passing after the package became reachable. The RUSTSEC-2026-0235
+      # (rkyv 0.7.46) stanza states exactly that condition and names this command
+      # as its own remediation trigger, so assert it here rather than trusting a
+      # reader to re-run it by hand.
+      #
+      # Matched against the advisory's AFFECTED RANGE (patched is ">= 0.8.17"),
+      # not a pinned version: a check keyed on rkyv@0.7.46 alone would pass
+      # silently if the lockfile later resolved 0.7.47 or 0.8.10, both still
+      # vulnerable and both still suppressed by the ID-level ignore.
+      #
+      # Version logic unit-checked against synthetic input before landing:
+      # 0.7.46 and 0.8.16 flag; 0.8.17, 0.9.0, and 1.0.0 do not.
+      - name: Assert no affected rkyv is reachable
+        working-directory: audio-graph/src-tauri
+        run: |
+          affected="$(
+            cargo tree --locked --target all --all-features --edges all \
+              --format '{p}' --prefix none 2>/dev/null \
+            | awk '
+                $1 == "rkyv" {
+                  v = $2; sub(/^v/, "", v);
+                  split(v, p, ".");
+                  if ((p[1]+0) == 0 && ((p[2]+0) < 8 || ((p[2]+0) == 8 && (p[3]+0) < 17)))
+                    print $1 " " $2;
+                }' \
+            | sort -u
+          )"
+          if [ -n "$affected" ]; then
+            echo "::error::RUSTSEC-2026-0235's ignore in .cargo/audit.toml is justified only while no affected rkyv (< 0.8.17) is reachable, but one now is:"
+            printf '%s\n' "$affected"
+            echo "::error::Remove that ignore and resolve the advisory, or replace its justification with one that matches reality."
+            exit 1
+          fi
+          echo "No affected rkyv (< 0.8.17) is reachable; the RUSTSEC-2026-0235 ignore stays justified."
+
   # ── Rust backend — Linux ───────────────────────────────────────────
   # Tests use `tauri::test::mock_context` + `noop_assets` + `any_thread()`
   # in src/speech/tests_integration.rs. Even with MockRuntime, tao's Linux
