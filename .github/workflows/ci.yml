@@ -129,6 +129,30 @@ jobs:
         working-directory: audio-graph/src-tauri
         run: cargo audit
 
+      # `ignore` in audit.toml is an unconditional advisory-ID suppression, so a
+      # stanza whose justification is "this package is unreachable" would keep
+      # passing after the package became reachable. The RUSTSEC-2026-0235
+      # (rkyv 0.7.46) stanza states exactly that condition and names this command
+      # as its own remediation trigger, so assert it here rather than trusting a
+      # reader to re-run it by hand.
+      #
+      # `cargo tree -i` prints the reverse-dependency tree on stdout and only a
+      # "nothing to print" warning on stderr, so stdout mentioning the crate IS
+      # the reachability signal. Verified in both directions: this prints 0
+      # matching lines for rkyv today and 119 for a reachable crate.
+      - name: Assert the rkyv 0.7 audit ignore is still unreachable
+        working-directory: audio-graph/src-tauri
+        run: |
+          if cargo tree --locked -i rkyv@0.7.46 \
+               --target all --all-features --edges all 2>/dev/null \
+               | grep -q '^rkyv v0\.7\.'; then
+            echo "::error::RUSTSEC-2026-0235's ignore in .cargo/audit.toml is justified only while rkyv 0.7 is an inactive resolver-retained edge, but it is now reachable."
+            echo "::error::Remove that ignore and resolve the advisory, or replace its justification. Reverse-dependency tree follows."
+            cargo tree --locked -i rkyv@0.7.46 --target all --all-features --edges all || true
+            exit 1
+          fi
+          echo "rkyv 0.7 remains unreachable; the RUSTSEC-2026-0235 ignore stays justified."
+
   # ── Rust backend — Linux ───────────────────────────────────────────
   # Tests use `tauri::test::mock_context` + `noop_assets` + `any_thread()`
   # in src/speech/tests_integration.rs. Even with MockRuntime, tao's Linux
