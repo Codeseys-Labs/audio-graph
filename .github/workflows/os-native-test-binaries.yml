@@ -164,8 +164,13 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Using ignored-test filter: $filter"
 
+      # Deliberately NOT `shell: bash`: on Windows, Git Bash resolves GNU
+      # coreutils' link.exe (/usr/bin/link) ahead of the MSVC linker, so every
+      # build-script link dies with "/usr/bin/link: extra operand". The default
+      # shell (pwsh on Windows, bash elsewhere) keeps rustc's MSVC linker
+      # resolution intact — ci.yml's green Windows cargo steps rely on the same
+      # default. The command is a single line so it parses in both shells.
       - name: Build lib test binary
-        shell: bash
         working-directory: src-tauri
         env:
           # build.rs reads this at BUILD time and emits /MANIFEST:EMBED plus
@@ -175,13 +180,15 @@ jobs:
           # staged. It is debug-profile-only and build.rs panics on release,
           # which is why it can be set unconditionally for the windows build.
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ inputs.os == 'windows' && '1' || '' }}
-        run: |
-          # json-render-diagnostics keeps compiler errors readable on stderr
-          # while the JSON artifact records still land on stdout.
-          cargo test --locked --no-default-features --features cloud \
-            --lib --no-run --message-format=json-render-diagnostics \
-            > cargo-test-build.json
+        # json-render-diagnostics keeps compiler errors readable on stderr
+        # while the JSON artifact records still land on stdout.
+        run: cargo test --locked --no-default-features --features cloud --lib --no-run --message-format=json-render-diagnostics > cargo-test-build.json
 
+      # Safe under bash: this step only parses JSON and links nothing.
+      - name: Resolve built test binary
+        shell: bash
+        working-directory: src-tauri
+        run: |
           # The unittest binary is the lib-kind artifact built in test profile.
           bin=$(jq -r 'select(.reason=="compiler-artifact")
                        | select(.profile.test==true)
