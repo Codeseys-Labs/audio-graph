@@ -378,3 +378,72 @@ Seed `audio-graph-3cf2` landed on `work/audio-graph-3cf2-refused-install-survivo
 Every line anchor in the sections above predates this wave and its diff moved
 lines in both persistence sources; prefer the symbol names. This section cites no
 line numbers.
+
+## Update after audio-graph-68a1 (2026-08-18, `work/audio-graph-68a1-proof-binding`)
+
+<!-- audio-graph-68a1 anchors: begin -->
+
+This section supersedes the round-4 block above, which is retained as history and
+must no longer be read as current state. Specifically, these round-4 statements
+are now FALSE:
+
+- "So B4 is OPEN BY CHOICE." B4 is CLOSED. An addressed Session with a committed
+  V2 head records later generations.
+- "The transition-proof gate in `prepare_compare_and_swap` is still keyed on the
+  candidate's floor rather than on whether the call performs the advance." It is
+  now keyed on whether this call performs the transition, in
+  `refuse_unproven_v2_candidate`
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:1530`).
+- "do not re-attempt the re-key before it lands" and "The wedge is pinned
+  deliberately by `committed_v2_head_refuses_later_generations_until_proof_binding_exists`".
+  The binding landed first, in the same commit as the re-key, and the pinning test
+  was INVERTED, not deleted, into
+  `committed_v2_head_records_later_generations_only_against_the_durable_proof`
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:3712`).
+
+What replaced the wedge: `bind_v2_provenance_to_durable_proof`
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2164`) reads the durable
+v1-to-v2 proof record at the DERIVED control provenance identity, under the
+exclusive guard, before anything is staged, and refuses a V2 candidate whose
+`SessionProvenanceEvents` entry is not exactly that record — absent, non-regular,
+over-bound, unreadable, non-canonical, foreign Session, wrong identity, or wrong
+digest/length, each its own classified refusal. `proof_owned` calls skip it,
+because the advance runs preparation before the record exists and binds by
+full-byte equality afterwards.
+
+The round-4 four-closed-paths list is now conditional, and reads as follows on a
+committed V2 head:
+
+1. a V1 candidate is still `SessionSemanticsFloorRegression`;
+2. a V2 candidate without owned proof bytes is `TransitionProofRequired` ONLY
+   while the head is absent or below V2 — against an already-V2 head it is
+   admitted if, and only if, its provenance entry binds to the durable record,
+   and otherwise refused `V2ProvenanceProofBinding(..)`;
+3. a fresh-id `advance_session_semantics_v1_to_v2` is still
+   `Durability(ImmutableExactConflict)` on the existing proof, unchanged, because
+   the binding deliberately does not run on the proof-owning path;
+4. the same idempotency id with changed artifacts is `TransitionConflict` —
+   *newly* reachable, not "still": before the re-key that path was refused
+   `TransitionProofRequired` like every other V2 candidate, so round 4's
+   four-path list was internally inconsistent in claiming both. The branch's RED
+   transcript records the pre-change behaviour.
+
+Quarantine recovery on an advanced Session is still fully closed for every
+candidate shape, and now has executable evidence in
+`quarantine_recovery_remains_closed_on_a_v2_session`
+(`src-tauri/src/persistence/session_artifact_manifest.rs:3830`); the
+`SessionArtifactManifestV1::candidate` V1 hardcode remains the named cause and is
+deliberately not fixed.
+
+Gates on this state: strict Clippy exit 0, serial `--lib persistence` 240 passed
+and 0 failed (236 at base `27be43a`; net plus four tests), `cargo fmt --all --
+--check` clean, `git diff --check` clean. Every line anchor in this section is
+machine-checked by
+`docs/agentic-runs/2026-08-18-audio-graph-68a1/check-anchors.py`, which fails on
+any anchor it does not enumerate. Full detail, verbatim RED and gate output, and
+ten recorded residuals with owners are in
+`docs/agentic-runs/2026-08-18-audio-graph-68a1/report.md`. The install-stage
+`Durability` classification and the missing abandon primitive remain
+audio-graph-3cf2's, untouched here; this branch rebases onto that result.
+
+<!-- audio-graph-68a1 anchors: end -->

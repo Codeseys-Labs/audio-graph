@@ -836,3 +836,46 @@ Rollback reverts, in order, constructor hardening, proof-before-CAS, immutable
 proof, checked-read, addressing, and finally the planning/report commits. For
 round 2 specifically, revert `3ddeb0a` and its following docs-only handoff
 commit.
+
+## Superseding note from audio-graph-68a1 (2026-08-18)
+
+<!-- audio-graph-68a1 anchors: begin -->
+
+The correction round 4 section above is history and is NOT rewritten. Two of its
+forward-looking statements are now discharged, and one is now false:
+
+- "Re-keying is therefore blocked on a binding that does not exist yet, owned by
+  seed `audio-graph-68a1`" — the binding exists. It is
+  `bind_v2_provenance_to_durable_proof`
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:2164`), which reads the
+  durable v1-to-v2 proof record at the derived control provenance identity under
+  the exclusive guard and refuses a V2 candidate whose provenance entry is not
+  exactly that record. The re-key landed with it, in one commit, so no committed
+  state has the re-key without the binding.
+- "When the binding exists, that test should be inverted rather than deleted" —
+  discharged. `committed_v2_head_refuses_later_generations_until_proof_binding_exists`
+  is now
+  `committed_v2_head_records_later_generations_only_against_the_durable_proof`
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:3712`), in the same
+  position, with its rustdoc rewritten to describe shipped behaviour plus one
+  paragraph of this history, and with its V1-floor-regression assertion kept
+  verbatim.
+- "The wedge stays" is false as of that commit. B4 is closed.
+
+Round 4's diagnosis is confirmed, not revised. The self-consistency comparison it
+identified — `manifest.transition.fingerprint != content.sha256`
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2129`) — is still exactly
+that, still load-bearing on the load path, and deliberately unchanged; what was
+missing was a second, independent binding against the durable record. Round 4's
+forgery probe was also reproduced against the re-keyed gate with the binding
+disabled, as an uncommitted local probe: generation 2 installed with
+`managed_identity = "attacker/not-the-proof.jsonl"`, exactly as round 4 reported.
+That transcript is in
+`docs/agentic-runs/2026-08-18-audio-graph-68a1/report.md`, which also records the
+quarantine-recovery closure as executable evidence rather than prose.
+
+Anchors in this note are machine-checked by
+`docs/agentic-runs/2026-08-18-audio-graph-68a1/check-anchors.py`; anchors in the
+sections above date from their own rounds and are covered by their own tables.
+
+<!-- audio-graph-68a1 anchors: end -->

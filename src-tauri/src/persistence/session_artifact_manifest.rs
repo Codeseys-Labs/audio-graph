@@ -419,6 +419,57 @@ pub enum V2SessionProvenanceError {
     TransitionFingerprintMismatch,
 }
 
+/// Why a V2 candidate's `SessionProvenanceEvents` entry could not be tied to
+/// this Session's durable v1-to-v2 transition-proof record.
+///
+/// Every variant is raised by `refuse_unproven_v2_candidate` during
+/// `prepare_compare_and_swap`, before this transaction stages or mutates
+/// anything, so no refused candidate can leave a survivor. The binding proves that the
+/// Session's floor is backed by a real, canonical, session-matching proof
+/// record and that the candidate's inventory describes that exact record. It
+/// proves nothing about the candidate's own transition, and it deliberately
+/// does not compare the record's `idempotency_id` to the candidate's, because
+/// every generation after the advance legitimately carries a different one.
+///
+/// The guarantee is scoped to callers that cooperate with the canonical
+/// exclusive guard this transaction holds. It closes the API-level forgery — a
+/// caller that controls the candidate's own fields — not an adversary with raw
+/// write access to the managed root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2ProvenanceProofBindingError {
+    /// Nothing exists at the derived provenance identity. A V2 head with no
+    /// durable proof record is refused, never repaired, never treated as V1.
+    DurableProofAbsent,
+    /// The derived provenance identity resolves to a non-regular entry
+    /// (directory, symlink, device), either before or after this call opened it.
+    NonRegularDurableProof,
+    /// The record is longer than any canonical v1-to-v2 proof can be, so it is
+    /// refused without classifying a truncated view of it: this kernel does not
+    /// report a "malformed proof" it only partially read.
+    DurableProofExceedsCanonicalBound,
+    /// Any other I/O failure classifying, opening, or reading the record,
+    /// reported verbatim and never widened into `DurableProofAbsent`.
+    DurableProofUnreadable {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+    /// The bytes are not exactly one canonical proof. The inner error is
+    /// forwarded verbatim from `SessionSemanticsTransitionProofV1::from_canonical_bytes`,
+    /// which re-serializes and byte-compares, so a re-ordered or padded record
+    /// is `NonCanonical` rather than accepted.
+    NotCanonicalDurableProof(SessionSemanticsTransitionProofError),
+    /// The record is a canonical proof for a different `session_id` than this
+    /// store's address.
+    DurableProofSessionMismatch,
+    /// The candidate's entry names something other than the derived control
+    /// provenance identity. Equality is exact and case-sensitive, which is
+    /// stricter than a case-insensitive volume and is the fail-closed direction.
+    ProvenanceIdentityMismatch,
+    /// The entry's `sha256` or `byte_length` is not the digest or length of the
+    /// record's actual bytes.
+    ProvenanceContentMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
     UnsupportedSchema { actual: u32 },
@@ -583,6 +634,10 @@ pub enum ManifestCasRejection {
         rejection: CanonicalDurabilityRejection,
         recovery_key: CanonicalRecoveryKey,
     },
+    /// A V2 candidate that this call does not advance carries a provenance entry
+    /// that is not this Session's durable proof record. Nothing was staged: this
+    /// is raised during preparation, before any durability mutation.
+    V2ProvenanceProofBinding(V2ProvenanceProofBindingError),
 }
 
 #[must_use = "manifest CAS outcomes must be reconciled before state advances"]
@@ -1455,6 +1510,68 @@ impl ManifestWriteTransaction<'_> {
         )
     }
 
+    /// Refuse a V2 candidate this call does not prove.
+    ///
+    /// Only `advance_session_semantics_v1_to_v2` may raise a Session's floor: it
+    /// owns the proof bytes and makes them durable, and it overwrites the
+    /// candidate's provenance entry from exactly those bytes, so a `proof_owned`
+    /// call is bound by full-byte equality against the durable record and is
+    /// deliberately skipped here. It must be skipped: the advance calls
+    /// `prepare_compare_and_swap` BEFORE the durable proof exists, so binding it
+    /// would refuse the very first advance for want of the record it is about to
+    /// create.
+    ///
+    /// A call that owns no proof bytes and does not raise the floor is an
+    /// ordinary generation on an already-advanced Session. It is admissible only
+    /// once the candidate's provenance entry is tied to the durable proof record:
+    /// the entry's own `transition.fingerprint == content.sha256` is internal
+    /// self-consistency that a caller controlling both fields satisfies
+    /// trivially.
+    fn refuse_unproven_v2_candidate(
+        &self,
+        candidate: &SessionArtifactManifestV1,
+        proof_owned: bool,
+    ) -> Result<(), ManifestCasRejection> {
+        if proof_owned || candidate.session_semantics_version != SessionSemanticsVersion::V2 {
+            return Ok(());
+        }
+        // Unaddressed stores skip gate and binding, exactly as before. Every
+        // unaddressed constructor is `#[cfg(test)]`; the only non-test
+        // constructors, `for_session` and `qualified_existing_session`, both
+        // derive a Session address.
+        let Some(expected_session_id) = self.expected_session_id else {
+            return Ok(());
+        };
+        if self
+            .head
+            .as_ref()
+            .is_none_or(|head| head.session_semantics_version < SessionSemanticsVersion::V2)
+        {
+            return Err(ManifestCasRejection::TransitionProofRequired);
+        }
+        let (Some(provenance_path), Some(provenance_identity)) = (
+            self.provenance_path.as_ref(),
+            self.provenance_identity.as_ref(),
+        ) else {
+            return Err(ManifestCasRejection::SessionAddressRequired);
+        };
+        // An accessor call: `validate_candidate_and_normalize` already ran this
+        // validator, so this arm reproduces the classification it would have
+        // produced rather than introducing a new one.
+        let entry = validate_v2_session_provenance(candidate).map_err(|error| {
+            ManifestCasRejection::Validation(ManifestValidationError::InvalidV2SessionProvenance(
+                error,
+            ))
+        })?;
+        bind_v2_provenance_to_durable_proof(
+            provenance_path,
+            provenance_identity,
+            expected_session_id,
+            &entry,
+        )
+        .map_err(ManifestCasRejection::V2ProvenanceProofBinding)
+    }
+
     fn prepare_compare_and_swap(
         &self,
         expected_generation: u64,
@@ -1471,31 +1588,13 @@ impl ManifestWriteTransaction<'_> {
         if let Err(error) = validate_candidate_and_normalize(&mut candidate) {
             return reject(ManifestCasRejection::Validation(error));
         }
-        // audio-graph-3b53 B4 is KNOWN OPEN here, deliberately: an addressed
-        // Session that reaches V2 cannot record a later generation, because this
-        // gate keys on the candidate's floor rather than on whether this call
-        // performs the transition.
-        //
-        // Re-keying it on "this call advances the head" was implemented and
-        // REVERTED. Relaxing the gate for an already-advanced head lets the
-        // generic `compare_and_swap` install a V2 candidate carrying a FORGED
-        // provenance entry: `validate_v2_session_provenance` only checks that
-        // `manifest.transition.fingerprint == content.sha256` for the candidate's
-        // own entry (:1868), which is internal self-consistency with no
-        // reference to the durable proof record, so a caller that controls both
-        // fields satisfies it while the real proof sits untouched at the control
-        // identity. Pre-fix that path was unreachable because every V2 candidate
-        // through the generic CAS was refused here.
-        //
-        // Re-keying is therefore blocked on a binding that does not exist yet:
-        // the candidate's provenance entry must be proven to reference the
-        // durable proof record. Until that lands, this gate trades a liveness
-        // wedge for a forgery hole, so the wedge stays.
-        if self.expected_session_id.is_some()
-            && candidate.session_semantics_version == SessionSemanticsVersion::V2
-            && !proof_owned
-        {
-            return reject(ManifestCasRejection::TransitionProofRequired);
+        // Keyed on whether this call performs the transition, not on the
+        // candidate's floor. The candidate is already normalized and its V2
+        // structure already proved; every check below keeps its current order and
+        // classification, and nothing has been staged yet, so every refusal this
+        // gate raises leaves the store byte-identical.
+        if let Err(rejection) = self.refuse_unproven_v2_candidate(&candidate, proof_owned) {
+            return reject(rejection);
         }
 
         if let Some(head) = &self.head {
@@ -1987,9 +2086,21 @@ fn validate_and_normalize(
     Ok(())
 }
 
+/// The exact pieces of a validated V2 provenance entry that
+/// `bind_v2_provenance_to_durable_proof` needs.
+///
+/// Carrying the extracted identity and content, rather than the entry, keeps
+/// the unrepresentable state unrepresentable: an entry that reached the binding
+/// has already been proved unique, `Present`, and correctly classified, so the
+/// binding has no impossible "no content" arm to misclassify.
+pub(crate) struct V2SessionProvenanceEntry<'manifest> {
+    managed_identity: &'manifest ManagedArtifactIdentity,
+    content: &'manifest ArtifactContentIdentity,
+}
+
 pub(crate) fn validate_v2_session_provenance(
     manifest: &SessionArtifactManifestV1,
-) -> Result<(), V2SessionProvenanceError> {
+) -> Result<V2SessionProvenanceEntry<'_>, V2SessionProvenanceError> {
     let mut proofs = manifest
         .artifacts
         .iter()
@@ -2018,7 +2129,98 @@ pub(crate) fn validate_v2_session_provenance(
     if manifest.transition.fingerprint != content.sha256 {
         return Err(V2SessionProvenanceError::TransitionFingerprintMismatch);
     }
+    Ok(V2SessionProvenanceEntry {
+        managed_identity: &proof.managed_identity,
+        content,
+    })
+}
+
+/// Ceiling on a durable v1-to-v2 transition-proof record, used to refuse an
+/// over-long record instead of classifying a truncated view of it.
+///
+/// The golden canonical wire is 143 bytes for a 9-byte Session id and a 16-byte
+/// idempotency id, so the template around those ids is 118 bytes. Both ids are
+/// capped at 255 bytes and, because their validators refuse control characters
+/// and `\`, JSON escaping can at most double them (`"` to `\"`): 118 + 2 * 2 *
+/// 255 = 1138 bytes is the true ceiling. 4096 is the rounded bound.
+const MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES: u64 = 4096;
+
+/// Tie a V2 candidate's validated `SessionProvenanceEvents` entry to this
+/// Session's durable v1-to-v2 transition-proof record.
+///
+/// This is the binding that `validate_v2_session_provenance` cannot perform:
+/// that function is also the load-path and floor-admission validator and has no
+/// root, no guard, and no Session address, so everything it can compare lives
+/// inside the candidate. Here the provenance identity is DERIVED from the
+/// store's address and is never caller-supplied, and the caller holds the
+/// canonical exclusive guard for the whole transaction.
+///
+/// Reading the record with plain `std::fs` rather than
+/// `preflight_immutable_exact` is deliberate: that primitive needs the expected
+/// bytes this call is trying to discover, is not a read-only open, and would
+/// import namespace-mutation refusals into a validation check. `load_manifest_file`
+/// reads this module's own authoritative head the same way, including the
+/// re-check of the opened handle that closes the metadata-then-open window.
+fn bind_v2_provenance_to_durable_proof(
+    provenance_path: &Path,
+    provenance_identity: &ManagedArtifactIdentity,
+    expected_session_id: &str,
+    entry: &V2SessionProvenanceEntry<'_>,
+) -> Result<(), V2ProvenanceProofBindingError> {
+    if *entry.managed_identity != *provenance_identity {
+        return Err(V2ProvenanceProofBindingError::ProvenanceIdentityMismatch);
+    }
+    let path_metadata = std::fs::symlink_metadata(provenance_path).map_err(binding_io)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(V2ProvenanceProofBindingError::NonRegularDurableProof);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(provenance_path)
+        .map_err(binding_io)?;
+    let opened_metadata = file.metadata().map_err(binding_io)?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(V2ProvenanceProofBindingError::NonRegularDurableProof);
+    }
+    if opened_metadata.len() > MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES {
+        return Err(V2ProvenanceProofBindingError::DurableProofExceedsCanonicalBound);
+    }
+    let mut observed = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
+    (&mut file)
+        .take(MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES + 1)
+        .read_to_end(&mut observed)
+        .map_err(binding_io)?;
+    if u64::try_from(observed.len()).unwrap_or(u64::MAX)
+        > MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES
+    {
+        return Err(V2ProvenanceProofBindingError::DurableProofExceedsCanonicalBound);
+    }
+    let proof = SessionSemanticsTransitionProofV1::from_canonical_bytes(&observed)
+        .map_err(V2ProvenanceProofBindingError::NotCanonicalDurableProof)?;
+    if proof.session_id() != expected_session_id {
+        return Err(V2ProvenanceProofBindingError::DurableProofSessionMismatch);
+    }
+    let (bytes, digest) = proof
+        .canonical_bytes_and_digest()
+        .map_err(V2ProvenanceProofBindingError::NotCanonicalDurableProof)?;
+    if entry.content.sha256 != digest
+        || entry.content.byte_length != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(V2ProvenanceProofBindingError::ProvenanceContentMismatch);
+    }
     Ok(())
+}
+
+/// `NotFound` is the only I/O condition that means "no durable proof record".
+/// Everything else is reported verbatim and is never widened into absence.
+fn binding_io(error: io::Error) -> V2ProvenanceProofBindingError {
+    if error.kind() == io::ErrorKind::NotFound {
+        return V2ProvenanceProofBindingError::DurableProofAbsent;
+    }
+    V2ProvenanceProofBindingError::DurableProofUnreadable {
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+    }
 }
 
 fn validate_quarantine_transaction(
@@ -3361,30 +3563,43 @@ mod tests {
             ),
             ManifestCasOutcome::Accepted { .. }
         ));
+
+        // The gate keys on the HEAD's floor, not on the head's absence: a
+        // committed V1 head is not a transition proof either.
+        // `self::root` because this test shadows the fixture-root helper's name.
+        let v1_head_root = self::root("addressed-generic-v2-over-v1-head");
+        let v1_head_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&v1_head_root, "session-1")
+                .expect("qualified addressed store");
+        let mut v1_head_transaction = v1_head_store.begin_write().expect("addressed transaction");
+        assert!(matches!(
+            v1_head_transaction.compare_and_swap(0, basic_candidate("v1-head-1", 'd')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            v1_head_transaction.compare_and_swap(1, v2_candidate("advance-only-with-proof")),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProofRequired)
+        );
+        assert!(!v1_head_store.temporary_path().exists());
+        assert!(
+            !v1_head_root
+                .join(v1_head_store.control_identities().provenance.as_str())
+                .exists()
+        );
     }
 
-    /// audio-graph-3b53 B4 is KNOWN OPEN and this test pins it as a REFUSAL, not
-    /// as working behaviour.
-    ///
-    /// Once an addressed Session has a committed V2 head it cannot record a later
-    /// generation: the transition-proof gate keys on the candidate's floor rather
-    /// than on whether this call performs the advance. That is a liveness wedge.
-    ///
-    /// Re-keying the gate on "this call advances the head" was implemented and
-    /// reverted, because relaxing it for an already-advanced head lets the generic
-    /// CAS install a V2 candidate carrying a FORGED provenance entry:
-    /// `validate_v2_session_provenance` only compares the candidate's own
-    /// `transition.fingerprint` against its own provenance entry's `content.sha256`,
-    /// which never references the durable proof record. A caller controlling both
-    /// fields satisfies it while the real proof sits untouched.
-    ///
-    /// So this asserts the wedge deliberately. Re-keying is blocked until the
-    /// candidate's provenance entry can be proven to reference the durable proof;
-    /// when that binding exists, this test should be inverted, not deleted.
-    #[cfg(unix)]
-    #[test]
-    fn committed_v2_head_refuses_later_generations_until_proof_binding_exists() {
-        let root = root("committed-v2-second-generation");
+    /// One addressed Session advanced to a committed V2 head at generation 1,
+    /// returned with its managed root, its accepted manifest, and the exact
+    /// durable transition-proof bytes that advance made durable.
+    fn advanced_v2_session(
+        name: &str,
+    ) -> (
+        PathBuf,
+        SessionArtifactManifestStore,
+        SessionArtifactManifestV1,
+        Vec<u8>,
+    ) {
+        let root = root(name);
         let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
             .expect("qualified addressed store");
         let transition_id = "advance-then-export";
@@ -3399,31 +3614,122 @@ mod tests {
             other => panic!("expected the advance to be accepted, got {other:?}"),
         };
         assert_eq!(advanced.generation, 1);
+        drop(transaction);
+        let proof_bytes = std::fs::read(root.join(store.control_identities().provenance.as_str()))
+            .expect("durable transition proof");
+        (root, store, advanced, proof_bytes)
+    }
 
-        let export = SessionArtifactEntry {
+    fn export_notes() -> SessionArtifactEntry {
+        SessionArtifactEntry {
             kind: SessionArtifactKind::MaterializedNotes,
             privacy_class: ArtifactPrivacyClass::DerivedSessionMemory,
             managed_identity: identity("exports/notes.md"),
             availability: ArtifactAvailability::Present {
                 content: content('c', 64),
             },
-        };
-        let mut second = advanced.clone();
-        second.generation = 0;
-        second.transition.idempotency_id = "export-notes-1".to_owned();
-        second.artifacts.push(export);
+        }
+    }
 
-        // The wedge: a same-floor generation that transitions nothing is still
-        // refused for want of proof bytes this call does not own.
+    /// A genuine later generation of an advanced Session: same durable proof,
+    /// same provenance entry, one new artifact, a new transition id.
+    fn later_generation(
+        advanced: &SessionArtifactManifestV1,
+        idempotency_id: &str,
+    ) -> SessionArtifactManifestV1 {
+        let mut later = advanced.clone();
+        later.generation = 0;
+        later.transition.idempotency_id = idempotency_id.to_owned();
+        later.artifacts.push(export_notes());
+        later
+    }
+
+    fn provenance_entry_mut(manifest: &mut SessionArtifactManifestV1) -> &mut SessionArtifactEntry {
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+            .expect("Session provenance entry")
+    }
+
+    fn provenance_entry(manifest: &SessionArtifactManifestV1) -> &SessionArtifactEntry {
+        manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+            .expect("Session provenance entry")
+    }
+
+    /// A V2 quarantine candidate whose provenance entry is genuine: it names the
+    /// control provenance identity and carries the durable proof's own digest
+    /// and length, so nothing about the provenance binding can be the cause of
+    /// the refusals `quarantine_recovery_remains_closed_on_a_v2_session` asserts.
+    fn v2_quarantine_candidate(
+        state: ManifestTransitionState,
+        residual_state: QuarantineResidualState,
+        advanced: &SessionArtifactManifestV1,
+        provenance_identity: &ManagedArtifactIdentity,
+        proof_length: u64,
+    ) -> SessionArtifactManifestV1 {
+        let mut candidate = quarantine_candidate(state, residual_state);
+        candidate.session_semantics_version = SessionSemanticsVersion::V2;
+        candidate.transition.fingerprint = advanced.transition.fingerprint.clone();
+        let transaction = candidate
+            .quarantine_transaction
+            .as_mut()
+            .expect("quarantine transaction");
+        transaction.fingerprint = advanced.transition.fingerprint.clone();
+        candidate.artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionProvenanceEvents,
+            privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+            managed_identity: provenance_identity.clone(),
+            availability: ArtifactAvailability::Present {
+                content: ArtifactContentIdentity {
+                    sha256: advanced.transition.fingerprint.clone(),
+                    byte_length: proof_length,
+                },
+            },
+        });
+        candidate
+    }
+
+    /// A committed V2 head records later generations, and records them only
+    /// against the durable transition-proof record.
+    ///
+    /// History: this is the inversion of
+    /// `committed_v2_head_refuses_later_generations_until_proof_binding_exists`,
+    /// which pinned audio-graph-3b53 B4's liveness wedge as a deliberate refusal
+    /// for as long as no binding existed between a candidate's
+    /// `SessionProvenanceEvents` entry and the durable proof record; that binding
+    /// is now `bind_v2_provenance_to_durable_proof`, so the transition-proof gate
+    /// keys on whether this call performs the transition.
+    ///
+    /// The refusal half of the same contract is
+    /// `forged_v2_provenance_is_refused_on_an_advanced_head` and
+    /// `advanced_head_refuses_later_generations_when_the_durable_proof_is_not_intact`.
+    #[cfg(unix)]
+    #[test]
+    fn committed_v2_head_records_later_generations_only_against_the_durable_proof() {
+        let (root, store, advanced, proof_bytes) =
+            advanced_v2_session("committed-v2-second-generation");
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let mut transaction = store.begin_write().expect("addressed transaction");
+
+        let accepted = match transaction
+            .compare_and_swap(1, later_generation(&advanced, "export-notes-1"))
+        {
+            ManifestCasOutcome::Accepted { manifest, .. } => manifest,
+            other => panic!("expected a genuine later generation to be accepted, got {other:?}"),
+        };
+        assert_eq!(accepted.generation, 2);
         assert_eq!(
-            transaction.compare_and_swap(1, second),
-            ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProofRequired),
-            "B4 is open: an advanced Session still cannot record a later generation"
+            accepted.session_semantics_version,
+            SessionSemanticsVersion::V2
         );
 
-        // The property the wedge is protecting, and the reason it cannot simply be
-        // relaxed: nothing here binds a candidate's provenance entry to the
-        // durable proof record.
+        // Kept verbatim from the pinning test this one inverts, including its
+        // stale expected generation: floor regression is classified before the
+        // generation comparison, so the refusal is the floor, not the generation.
         assert_eq!(
             transaction.compare_and_swap(1, basic_candidate("tx-post-v2-regression", 'd')),
             ManifestCasOutcome::Rejected(ManifestCasRejection::SessionSemanticsFloorRegression {
@@ -3432,6 +3738,380 @@ mod tests {
             }),
             "a V1 candidate against a V2 head is still a floor regression"
         );
+        drop(transaction);
+
+        let reopened = match store.load().expect("reopen the recorded generation") {
+            ManifestLoadOutcome::Present(manifest) => manifest,
+            ManifestLoadOutcome::Absent => panic!("the accepted generation disappeared"),
+        };
+        assert_eq!(reopened.generation, 2);
+        let provenance = provenance_entry(&reopened);
+        assert_eq!(
+            provenance.managed_identity,
+            store.control_identities().provenance,
+            "a recorded later generation still names the durable proof record"
+        );
+        assert_eq!(
+            provenance.availability,
+            ArtifactAvailability::Present {
+                content: ArtifactContentIdentity {
+                    sha256: reopened.transition.fingerprint.clone(),
+                    byte_length: u64::try_from(proof_bytes.len()).expect("proof length"),
+                }
+            }
+        );
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("durable proof after the later generation"),
+            proof_bytes,
+            "recording a later generation must not touch the durable proof record"
+        );
+    }
+
+    /// The same idempotency id with changed artifacts still conflicts, and the
+    /// byte-identical replay is still the idempotent `AlreadyCompleted`.
+    ///
+    /// `IdempotencyConflict` is deliberately NOT the reachable
+    /// classification for a bound V2 candidate: the binding forces
+    /// `content.sha256 == digest(durable proof)` and `validate_v2_session_provenance`
+    /// forces `transition.fingerprint == content.sha256`, so every admissible V2
+    /// generation of one Session carries the same fingerprint as its head. The
+    /// same-id divergence is therefore caught by the byte-equality fallthrough as
+    /// `TransitionConflict`.
+    #[cfg(unix)]
+    #[test]
+    fn advanced_head_conflicts_on_the_same_idempotency_id_with_changed_artifacts() {
+        let (root, store, advanced, proof_bytes) = advanced_v2_session("advanced-head-idempotency");
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let manifest_bytes = std::fs::read(store.manifest_path()).expect("committed head bytes");
+        let mut transaction = store.begin_write().expect("addressed transaction");
+
+        let mut changed = advanced.clone();
+        changed.generation = 0;
+        changed.artifacts.push(export_notes());
+        assert_eq!(
+            transaction.compare_and_swap(1, changed),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict),
+            "the same transition id with changed artifacts conflicts"
+        );
+
+        assert_eq!(
+            transaction.compare_and_swap(1, advanced.clone()),
+            ManifestCasOutcome::AlreadyCompleted {
+                manifest: advanced.clone(),
+            },
+            "the byte-identical replay is idempotent"
+        );
+        drop(transaction);
+
+        assert_eq!(
+            std::fs::read(store.manifest_path()).expect("head bytes after both outcomes"),
+            manifest_bytes
+        );
+        assert!(!store.temporary_path().exists());
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("durable proof after both outcomes"),
+            proof_bytes
+        );
+    }
+
+    /// Quarantine recovery is unreachable on a V2 Session for every candidate
+    /// shape, and re-keying the transition-proof gate did not open it.
+    ///
+    /// The named cause is `SessionArtifactManifestV1::candidate`, which
+    /// hardcodes `session_semantics_version: SessionSemanticsVersion::V1`; the
+    /// production quarantine candidate is built through exactly that constructor
+    /// (`canonical_log.rs` `manifest_candidate`) and reaches this CAS through
+    /// `compare_and_swap_recovery` with `proof_owned = false`. So a V1 candidate
+    /// is a floor regression, while V2 validation demands `Completed` and
+    /// quarantine prepare demands `Prepared` — the closure below. Every candidate
+    /// here carries genuine provenance, so the binding is never the cause.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_recovery_remains_closed_on_a_v2_session() {
+        let (root, store, advanced, proof_bytes) = advanced_v2_session("quarantine-closed-on-v2");
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let manifest_bytes = std::fs::read(store.manifest_path()).expect("committed head bytes");
+        let provenance_identity = store.control_identities().provenance.clone();
+        let proof_length = u64::try_from(proof_bytes.len()).expect("proof length");
+        let mut transaction = store.begin_write().expect("addressed transaction");
+
+        for state in [
+            ManifestTransitionState::Prepared,
+            ManifestTransitionState::Completed,
+        ] {
+            let residual_state = match state {
+                ManifestTransitionState::Prepared => QuarantineResidualState::SourceFull,
+                ManifestTransitionState::Completed => QuarantineResidualState::SourceTruncated,
+            };
+            assert_eq!(
+                transaction
+                    .compare_and_swap_recovery(1, quarantine_candidate(state, residual_state)),
+                ManifestCasOutcome::Rejected(
+                    ManifestCasRejection::SessionSemanticsFloorRegression {
+                        current: SessionSemanticsVersion::V2,
+                        candidate: SessionSemanticsVersion::V1,
+                    }
+                ),
+                "the V1-hardcoded quarantine candidate is a floor regression on a V2 Session"
+            );
+        }
+
+        assert_eq!(
+            transaction.compare_and_swap_recovery(
+                1,
+                v2_quarantine_candidate(
+                    ManifestTransitionState::Prepared,
+                    QuarantineResidualState::SourceFull,
+                    &advanced,
+                    &provenance_identity,
+                    proof_length,
+                ),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::InvalidV2SessionProvenance(
+                    V2SessionProvenanceError::TransitionNotCompleted
+                )
+            )),
+            "a V2 quarantine prepare is refused by V2 validation, before gate and binding"
+        );
+
+        assert_eq!(
+            transaction.compare_and_swap_recovery(
+                1,
+                v2_quarantine_candidate(
+                    ManifestTransitionState::Completed,
+                    QuarantineResidualState::SourceTruncated,
+                    &advanced,
+                    &provenance_identity,
+                    proof_length,
+                ),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::CompletionRequiresPrepared),
+            "a V2 quarantine completion has no prepared head to complete"
+        );
+        drop(transaction);
+
+        assert_eq!(
+            std::fs::read(store.manifest_path()).expect("head bytes after every refusal"),
+            manifest_bytes
+        );
+        assert!(!store.temporary_path().exists());
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("durable proof after every refusal"),
+            proof_bytes
+        );
+    }
+
+    /// A forged provenance entry is refused even though the head has already
+    /// advanced, and every refusal leaves the store byte-identical.
+    ///
+    /// Case 4 is the reason `validate_v2_session_provenance`'s self-consistency
+    /// check was not relaxed: it still fires first, from
+    /// `validate_candidate_and_normalize`, before this gate runs.
+    #[cfg(unix)]
+    #[test]
+    fn forged_v2_provenance_is_refused_on_an_advanced_head() {
+        let (root, store, advanced, proof_bytes) = advanced_v2_session("forged-v2-provenance");
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let manifest_bytes = std::fs::read(store.manifest_path()).expect("committed head bytes");
+        let proof_length = u64::try_from(proof_bytes.len()).expect("proof length");
+
+        // 1. The audio-graph-3b53 probe's shape: the entry names something that is
+        //    not the proof record, and its content stays genuine so only the
+        //    identity check can refuse it.
+        let mut foreign_identity = later_generation(&advanced, "forge-identity-1");
+        provenance_entry_mut(&mut foreign_identity).managed_identity =
+            identity("attacker/not-the-proof.jsonl");
+
+        // 2. The seed's `sha256:ffff...` forgery: the fabricated digest is carried
+        //    by BOTH the entry and the transition, so self-consistency passes.
+        let mut fabricated_digest = later_generation(&advanced, "forge-digest-1");
+        fabricated_digest.transition.fingerprint = digest('f');
+        provenance_entry_mut(&mut fabricated_digest).availability = ArtifactAvailability::Present {
+            content: ArtifactContentIdentity {
+                sha256: digest('f'),
+                byte_length: proof_length,
+            },
+        };
+
+        // 3. Genuine identity and digest, forged length: the exact byte length is
+        //    bound too, not just the digest.
+        let mut fabricated_length = later_generation(&advanced, "forge-length-1");
+        provenance_entry_mut(&mut fabricated_length).availability = ArtifactAvailability::Present {
+            content: ArtifactContentIdentity {
+                sha256: advanced.transition.fingerprint.clone(),
+                byte_length: proof_length + 1,
+            },
+        };
+
+        // 4. Only the transition fingerprint forged.
+        let mut fabricated_transition = later_generation(&advanced, "forge-transition-1");
+        fabricated_transition.transition.fingerprint = digest('f');
+
+        let mut transaction = store.begin_write().expect("addressed transaction");
+        for (candidate, expected) in [
+            (
+                foreign_identity,
+                ManifestCasRejection::V2ProvenanceProofBinding(
+                    V2ProvenanceProofBindingError::ProvenanceIdentityMismatch,
+                ),
+            ),
+            (
+                fabricated_digest,
+                ManifestCasRejection::V2ProvenanceProofBinding(
+                    V2ProvenanceProofBindingError::ProvenanceContentMismatch,
+                ),
+            ),
+            (
+                fabricated_length,
+                ManifestCasRejection::V2ProvenanceProofBinding(
+                    V2ProvenanceProofBindingError::ProvenanceContentMismatch,
+                ),
+            ),
+            (
+                fabricated_transition,
+                ManifestCasRejection::Validation(
+                    ManifestValidationError::InvalidV2SessionProvenance(
+                        V2SessionProvenanceError::TransitionFingerprintMismatch,
+                    ),
+                ),
+            ),
+        ] {
+            let shape = candidate.transition.idempotency_id.clone();
+            assert_eq!(
+                transaction.compare_and_swap(1, candidate),
+                ManifestCasOutcome::Rejected(expected),
+                "forged shape {shape} must be refused on an advanced head"
+            );
+            assert_eq!(
+                std::fs::read(store.manifest_path()).expect("head bytes after a forged shape"),
+                manifest_bytes,
+                "forged shape {shape} must not move a manifest byte"
+            );
+            assert!(!store.temporary_path().exists(), "forged shape {shape}");
+            assert_eq!(
+                std::fs::read(&provenance_path).expect("durable proof after a forged shape"),
+                proof_bytes,
+                "forged shape {shape} must not touch the durable proof"
+            );
+        }
+        drop(transaction);
+
+        match store.load().expect("reopen after every forged shape") {
+            ManifestLoadOutcome::Present(manifest) => {
+                assert_eq!(manifest.generation, 1);
+                assert_eq!(
+                    provenance_entry(&manifest).managed_identity,
+                    store.control_identities().provenance
+                );
+            }
+            ManifestLoadOutcome::Absent => panic!("the advanced head disappeared"),
+        }
+    }
+
+    /// A genuine later generation is refused when the durable proof record is not
+    /// intact, one refusal shape per record defect. Every candidate here is
+    /// genuine, so the refusal can only come from the record.
+    ///
+    /// `DurableProofUnreadable` gets no automated test: forcing a read error at
+    /// that exact path needs root-fragile permission manipulation or a fault seam
+    /// this module does not have. The precedent is `ManifestLoadError::Io`, which
+    /// only `load_io` constructs and which no test in this module asserts either.
+    #[cfg(unix)]
+    #[test]
+    fn advanced_head_refuses_later_generations_when_the_durable_proof_is_not_intact() {
+        /// One durable-record defect: a fixture-root slug, the corruption applied
+        /// to the record, and the exact refusal it must produce.
+        type DurableProofShape = (
+            &'static str,
+            fn(&Path, &[u8]),
+            V2ProvenanceProofBindingError,
+        );
+
+        let shapes: [DurableProofShape; 6] = [
+            (
+                "absent",
+                |path, _| std::fs::remove_file(path).expect("remove the durable proof"),
+                V2ProvenanceProofBindingError::DurableProofAbsent,
+            ),
+            (
+                "truncated",
+                |path, bytes| std::fs::write(path, &bytes[..100]).expect("truncate the proof"),
+                V2ProvenanceProofBindingError::NotCanonicalDurableProof(
+                    SessionSemanticsTransitionProofError::Malformed,
+                ),
+            ),
+            (
+                "oversized",
+                |path, _| {
+                    let length = usize::try_from(MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES + 1)
+                        .expect("bound");
+                    std::fs::write(path, vec![b'{'; length]).expect("oversize the proof");
+                },
+                V2ProvenanceProofBindingError::DurableProofExceedsCanonicalBound,
+            ),
+            (
+                "foreign-session",
+                |path, _| {
+                    let (bytes, _) = SessionSemanticsTransitionProofV1::v1_to_v2(
+                        "session-2",
+                        "advance-then-export",
+                    )
+                    .expect("foreign Session proof")
+                    .canonical_bytes_and_digest()
+                    .expect("canonical proof bytes");
+                    std::fs::write(path, bytes).expect("install a foreign Session proof");
+                },
+                V2ProvenanceProofBindingError::DurableProofSessionMismatch,
+            ),
+            (
+                "other-transition",
+                |path, _| {
+                    let (bytes, _) = SessionSemanticsTransitionProofV1::v1_to_v2(
+                        "session-1",
+                        "some-other-advance",
+                    )
+                    .expect("other transition proof")
+                    .canonical_bytes_and_digest()
+                    .expect("canonical proof bytes");
+                    std::fs::write(path, bytes).expect("install another canonical proof");
+                },
+                V2ProvenanceProofBindingError::ProvenanceContentMismatch,
+            ),
+            (
+                "non-regular",
+                |path, _| {
+                    std::fs::remove_file(path).expect("remove the durable proof");
+                    std::fs::create_dir(path).expect("replace it with a directory");
+                },
+                V2ProvenanceProofBindingError::NonRegularDurableProof,
+            ),
+        ];
+
+        for (shape, corrupt, expected) in shapes {
+            let (root, store, advanced, proof_bytes) =
+                advanced_v2_session(&format!("durable-proof-{shape}"));
+            let manifest_bytes =
+                std::fs::read(store.manifest_path()).expect("committed head bytes");
+            corrupt(
+                &root.join(store.control_identities().provenance.as_str()),
+                &proof_bytes,
+            );
+            let mut transaction = store.begin_write().expect("addressed transaction");
+            assert_eq!(
+                transaction.compare_and_swap(1, later_generation(&advanced, "export-notes-1")),
+                ManifestCasOutcome::Rejected(ManifestCasRejection::V2ProvenanceProofBinding(
+                    expected
+                )),
+                "durable proof shape {shape} must refuse a genuine later generation"
+            );
+            assert_eq!(
+                std::fs::read(store.manifest_path()).expect("head bytes after the refusal"),
+                manifest_bytes,
+                "durable proof shape {shape} must not move a manifest byte"
+            );
+            assert!(!store.temporary_path().exists(), "shape {shape}");
+        }
     }
 
     #[cfg(unix)]
