@@ -305,3 +305,45 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-
 
 This is a no-SHIP, no-integration, runtime-dark handoff. Do not merge, push,
 dispatch, update Seeds, or enable any consumer from this checkpoint.
+
+## Update after integration (2026-08-18, integration branch)
+
+The paragraph above is the checkpoint-era constraint and is superseded: round-6
+fresh reviews of candidate `8dd3d35` returned SHIP on both required axes plus
+the B4-revert audit (zero blocking findings, residuals recorded honestly), and
+the maintainer's standing landing instruction applied. The candidate was
+squash-integrated onto `integration/session-memory-wave-20260814` as `f27e322`,
+re-gated there (strict Clippy exit 0, serial persistence 236 passed and 0
+failed, fmt and diff checks clean), and the Seeds tracker closed
+`audio-graph-3b53` and `audio-graph-7e18` with reasons. `bun run verify:fast`
+now completes (exit 0) using the repo-pinned pipe-safe Seeds CLI — the B6
+environment gap is closed — and Betterleaks over the footprint reported no
+leaks.
+
+OS probes, previously "not cleared", now have first real evidence
+(os-native-test-binaries runs 32174122813 macOS and 32174795688 Windows, both
+building integration tip `3ab13fe`):
+
+- macOS 15: full compile, the binary starts and lists its tests, and the
+  keychain smoke `os_keychain_smoke_save_import_delete_tombstone_and_redaction`
+  passed on the runner.
+- Windows Server 2025 (MSVC): full compile and binary start — after fixing the
+  dispatch workflow's Git Bash/MSVC linker collision on master (`10c4f44`).
+  Rotation probes on the runner:
+  `rotate_session_writer_open_failure_preserves_current_session` passed;
+  `rotate_session_respawns_transcript_writer_to_new_file` failed because
+  HomeGuard's HOME/USERPROFILE override cannot redirect Windows known-folder
+  resolution — test infrastructure only, production resolution is correct
+  (seed `audio-graph-0641`).
+- Real Windows 11 NTFS host (the CI-built binary executed via WSL interop,
+  cwd `C:\Temp`): persistence suite 163 passed, 6 failed. All six are test
+  cfg-gating defects against a substrate that is Linux/macOS-only by design
+  (`namespace_supported_for` excludes Windows and `filesystem_identity`
+  carries no identity under `cfg(not(unix))`): four real-filesystem manifest
+  fixtures panic `Coordination(IdentityUnavailable)`, and the two
+  crash-harness tests additionally require fsutil elevation. Production
+  Windows correctly reports `NamespaceDurabilityUnsupported` at the platform
+  gate. Seed `audio-graph-a58b` owns the test gating.
+
+Line anchors and gate outputs in earlier sections describe their own rounds'
+commits; this section is the current state record.
