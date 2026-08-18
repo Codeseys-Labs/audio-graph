@@ -358,6 +358,7 @@ pub enum CanonicalNamespaceOperation {
     FirstCreate,
     Rename,
     AtomicSnapshotInstall,
+    Unlink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,12 +371,16 @@ pub enum CanonicalMutation {
     Rename,
     InitialSnapshotInstall,
     SnapshotReplacement,
+    Unlink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityBarrier {
     FileDataAndMetadata,
     FileAndParentNamespace,
+    /// Only the qualified parent-directory namespace barrier was crossed. A
+    /// removal claims no file barrier: the object is gone.
+    ParentNamespace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +403,9 @@ pub enum CanonicalDurabilityStage {
     ProtectTemp,
     FileSync,
     Rename,
+    /// Removal of one existing namespace entry, named for what it is: a stage
+    /// called `Rename` inside a removal would be a doc/code disagreement.
+    Unlink,
     ParentSync,
 }
 
@@ -452,6 +460,28 @@ pub struct CanonicalDurabilityIndeterminate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityOutcome {
     Accepted(CanonicalDurabilityReceipt),
+    Rejected(CanonicalDurabilityRejection),
+    DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
+}
+
+/// Outcome of one durable removal.
+///
+/// Deliberately a separate type rather than a fourth `CanonicalDurabilityOutcome`
+/// variant: a removal has an absence assessment that no other mutation has, and
+/// the existing outcome is matched exhaustively across the crate.
+#[must_use = "durable unlink outcomes must be reconciled before state advances"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalUnlinkOutcome {
+    /// One regular entry was unlinked and the qualified parent namespace
+    /// barrier was crossed.
+    Unlinked(CanonicalDurabilityReceipt),
+    /// The pathname had no entry when the guard inspected it under the
+    /// operation lock, so this call unlinked nothing. The parent barrier was
+    /// still crossed, which is what makes an exact rerun the reconciliation for
+    /// an unlink whose own barrier result was lost rather than a claim that an
+    /// unpublished removal is durable. It asserts nothing about state the caller
+    /// mutated through other operations before this call.
+    AlreadyAbsent(CanonicalDurabilityBarrier),
     Rejected(CanonicalDurabilityRejection),
     DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
 }
@@ -1308,6 +1338,193 @@ impl CanonicalExclusiveGuard {
         })
     }
 
+    /// Durably unlink one regular entry that is an immediate child of this
+    /// guard's managed root.
+    ///
+    /// TRUST BOUNDARY. This substrate refuses only what it can prove wrong
+    /// without knowing the caller's intent: the store-owned coordination entry
+    /// under every ASCII-case spelling, a non-regular entry, a target whose
+    /// canonical parent is not exactly the managed root, and a pathname that no
+    /// longer names the object this guard opened. It does NOT know which of the
+    /// caller's records are meant to be immutable — keeping a canonical
+    /// manifest head or an immutable proof record out of `path` is the caller's
+    /// obligation. Its only production caller is
+    /// `ManifestWriteTransaction::abandon_staged_transition`, which passes the
+    /// Session's own derived manifest temporary.
+    ///
+    /// `Unlinked` follows the qualified parent-namespace barrier. No file
+    /// barrier is claimed: the object is gone. `AlreadyAbsent` crosses the same
+    /// barrier, which is what makes an exact rerun the reconciliation for an
+    /// unlink whose own barrier result was lost. `recovery_key` names THIS
+    /// unlink of THIS pathname, not whatever the removed entry contained; the
+    /// caller must supply the same value when it reruns.
+    pub(crate) fn unlink_canonical_entry(
+        &self,
+        path: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalUnlinkOutcome {
+        self.unlink_canonical_entry_inner(path, qualification, recovery_key, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unlink_canonical_entry_with_fault(
+        &self,
+        path: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalUnlinkOutcome {
+        self.unlink_canonical_entry_inner(path, qualification, recovery_key, Some(injected_fault))
+    }
+
+    fn unlink_canonical_entry_inner(
+        &self,
+        path: &Path,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: Option<CanonicalDurabilityStage>,
+    ) -> CanonicalUnlinkOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([path]) {
+            return CanonicalUnlinkOutcome::Rejected(rejection);
+        }
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        if !self.namespace_is_supported() {
+            return unlink_namespace_unsupported(self.platform);
+        }
+        match self.qualification_status(qualification) {
+            Ok(true) => {}
+            Ok(false) => return unlink_namespace_unsupported(self.platform),
+            Err(rejection) => return CanonicalUnlinkOutcome::Rejected(rejection),
+        }
+        // `bind_parent`, never `bind_descendant_parent`: this primitive can only
+        // reach immediate children of the managed root, so it can never become a
+        // subtree purge.
+        let parent = match self.namespace.bind_parent(path, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalUnlinkOutcome::Rejected(rejection),
+        };
+        if !parent.barrier.is_available() {
+            return unlink_namespace_unsupported(self.platform);
+        }
+
+        if injected_fault == Some(CanonicalDurabilityStage::InspectEntry) {
+            return CanonicalUnlinkOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::InspectEntry,
+                &io::Error::other("injected unlink inspect cut"),
+            ));
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return self.publish_unlink_absence(&parent, recovery_key, injected_fault);
+            }
+            Err(error) => {
+                return CanonicalUnlinkOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::InspectEntry,
+                    &error,
+                ));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::NonRegularCanonicalEntry,
+                );
+            }
+            Ok(_) => {}
+        }
+
+        if injected_fault == Some(CanonicalDurabilityStage::OpenExisting) {
+            return CanonicalUnlinkOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::OpenExisting,
+                &io::Error::other("injected unlink open cut"),
+            ));
+        }
+        let file = match self.open_existing_regular(path) {
+            Ok(file) => file,
+            Err(rejection) => return CanonicalUnlinkOutcome::Rejected(rejection),
+        };
+        if let Err(rejection) =
+            self.validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(&file))
+        {
+            return CanonicalUnlinkOutcome::Rejected(rejection);
+        }
+
+        if injected_fault == Some(CanonicalDurabilityStage::Unlink) {
+            return CanonicalUnlinkOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::Unlink,
+                &io::Error::other("injected unlink cut"),
+            ));
+        }
+        if let Some(error) = self.injected_error(CanonicalDurabilityStage::Unlink) {
+            return CanonicalUnlinkOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::Unlink,
+                &error,
+            ));
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            // Includes a raced `NotFound`: the parent barrier has not been
+            // crossed, so absence is not durable yet and the exact rerun is what
+            // resolves it.
+            return unlink_indeterminate(CanonicalDurabilityStage::Unlink, &error, recovery_key);
+        }
+        if let Err(error) =
+            self.checked_unlink(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                parent.barrier.sync_all()
+            })
+        {
+            return unlink_indeterminate(
+                CanonicalDurabilityStage::ParentSync,
+                &error,
+                recovery_key,
+            );
+        }
+        CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+            mutation: CanonicalMutation::Unlink,
+            barrier: CanonicalDurabilityBarrier::ParentNamespace,
+        })
+    }
+
+    /// The absent arm still crosses the qualified parent barrier, so an exact
+    /// rerun reconciles an unlink whose own barrier result was lost instead of
+    /// calling an unpublished removal durable.
+    fn publish_unlink_absence(
+        &self,
+        parent: &BoundParent,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: Option<CanonicalDurabilityStage>,
+    ) -> CanonicalUnlinkOutcome {
+        if let Err(error) =
+            self.checked_unlink(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                parent.barrier.sync_all()
+            })
+        {
+            return unlink_indeterminate(
+                CanonicalDurabilityStage::ParentSync,
+                &error,
+                recovery_key,
+            );
+        }
+        CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+    }
+
+    fn checked_unlink(
+        &self,
+        stage: CanonicalDurabilityStage,
+        injected_fault: Option<CanonicalDurabilityStage>,
+        operation: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if injected_fault == Some(stage) {
+            return Err(io::Error::other("injected unlink cut"));
+        }
+        self.checked(stage, operation)
+    }
+
     /// Classify one immutable exact target under this exclusive guard without
     /// mutating it.
     ///
@@ -2041,6 +2258,15 @@ impl CanonicalExclusiveGuard {
         )
     }
 
+    /// Install a snapshot that may resume an already-existing exact temporary.
+    ///
+    /// `Rejected` means THIS operation mutated nothing — every refusal is proven
+    /// before a byte or namespace entry moved. It is NOT a claim that the
+    /// temporary pathname is empty: the resumed temporary may pre-date this call
+    /// and outlives every refusal, so the caller owns classifying that survivor
+    /// in its own vocabulary.
+    /// `ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable`
+    /// is the worked example.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_snapshot_recovery(
         &self,
@@ -3596,6 +3822,28 @@ fn immutable_namespace_unsupported(platform: CanonicalPlatform) -> CanonicalDura
             operation: CanonicalNamespaceOperation::FirstCreate,
         },
     )
+}
+
+fn unlink_namespace_unsupported(platform: CanonicalPlatform) -> CanonicalUnlinkOutcome {
+    CanonicalUnlinkOutcome::Rejected(
+        CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+            platform,
+            operation: CanonicalNamespaceOperation::Unlink,
+        },
+    )
+}
+
+fn unlink_indeterminate(
+    stage: CanonicalDurabilityStage,
+    error: &io::Error,
+    recovery_key: CanonicalRecoveryKey,
+) -> CanonicalUnlinkOutcome {
+    CanonicalUnlinkOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+        stage,
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+        recovery_key,
+    })
 }
 
 #[cfg(test)]
@@ -6192,5 +6440,291 @@ mod tests {
         assert!(diagnostic.contains("[REDACTED]"));
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    // audio-graph-3cf2 — the durable-unlink primitive: guard preflight,
+    // namespace qualification, parent barrier, and its own fault table.
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unlink_refuses_reserved_windows_unqualified_and_non_regular_entries_before_mutation() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let root = temp_root("unlink-reserved-and-unsupported");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let target = root.join("session-artifacts.tmp");
+        fs::write(&target, b"staged intent").expect("seed staged intent");
+        let lock_path = root.join(COORDINATION_FILE_NAME);
+        let mixed_case_alias = root.join(".AuDiO-gRaPh-CaNoNiCaL.LoCk");
+        let proof = qualification(&root);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([70; 16]);
+
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+
+        // The store-owned coordination entry is unremovable under every
+        // ASCII-case spelling, before any filesystem access.
+        for reserved in [&lock_path, &mixed_case_alias] {
+            assert_eq!(
+                guard.unlink_canonical_entry(reserved, Some(&proof), key),
+                CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::ReservedCoordinationEntry
+                )
+            );
+        }
+        assert_eq!(fs::metadata(&lock_path).expect("lock retained").len(), 0);
+
+        // No qualification evidence: the parent barrier cannot be claimed.
+        assert_eq!(
+            guard.unlink_canonical_entry(&target, None, key),
+            CanonicalUnlinkOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: current_platform(),
+                    operation: CanonicalNamespaceOperation::Unlink,
+                }
+            )
+        );
+
+        // Qualification bound to a different root.
+        let foreign_root = temp_root("unlink-foreign-qualification");
+        fs::create_dir_all(&foreign_root).expect("create foreign root");
+        let foreign_proof = qualification(&foreign_root);
+        assert_eq!(
+            guard.unlink_canonical_entry(&target, Some(&foreign_proof), key),
+            CanonicalUnlinkOutcome::Rejected(
+                CanonicalDurabilityRejection::QualificationBindingMismatch
+            )
+        );
+
+        // A target outside the managed namespace, and a nested descendant: this
+        // primitive reaches immediate children of the managed root only.
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested directory");
+        let nested_target = nested.join("session-artifacts.tmp");
+        fs::write(&nested_target, b"nested intent").expect("seed nested intent");
+        for outside in [foreign_root.join("stray.tmp"), nested_target.clone()] {
+            assert_eq!(
+                guard.unlink_canonical_entry(&outside, Some(&proof), key),
+                CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::TargetOutsideManagedNamespace
+                )
+            );
+        }
+        assert_eq!(
+            fs::read(&nested_target).expect("nested entry retained"),
+            b"nested intent"
+        );
+
+        // Non-regular entries are refused and survive.
+        for entry_kind in ["symlink", "directory", "fifo", "socket"] {
+            let non_regular = root.join(format!("non-regular-{entry_kind}"));
+            match entry_kind {
+                "symlink" => symlink(root.join("missing"), &non_regular).expect("seed symlink"),
+                "directory" => fs::create_dir(&non_regular).expect("seed directory"),
+                "fifo" => {
+                    let status = Command::new("mkfifo")
+                        .arg(&non_regular)
+                        .status()
+                        .expect("run mkfifo");
+                    assert!(status.success());
+                }
+                "socket" => {
+                    std::os::unix::net::UnixListener::bind(&non_regular).expect("seed socket");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                guard.unlink_canonical_entry(&non_regular, Some(&proof), key),
+                CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::NonRegularCanonicalEntry
+                )
+            );
+            assert!(fs::symlink_metadata(&non_regular).is_ok());
+        }
+        assert_eq!(
+            fs::read(&target).expect("staged intent retained"),
+            b"staged intent"
+        );
+        drop(guard);
+
+        // Windows and Other refuse before inspecting or removing anything.
+        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+            let platform_guard = CanonicalDurability::for_test_platform(platform)
+                .try_lock_exclusive(&root)
+                .expect("acquire simulated platform guard");
+            assert_eq!(
+                platform_guard.unlink_canonical_entry(&target, Some(&proof), key),
+                CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                        platform,
+                        operation: CanonicalNamespaceOperation::Unlink,
+                    }
+                )
+            );
+            assert_eq!(
+                fs::read(&target).expect("staged intent retained"),
+                b"staged intent"
+            );
+            drop(platform_guard);
+        }
+
+        fs::remove_dir_all(root).expect("clean fixture root");
+        fs::remove_dir_all(foreign_root).expect("clean foreign root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unlink_refuses_a_replaced_managed_root_before_mutation() {
+        let root = temp_root("unlink-replaced-root");
+        let displaced = temp_root("unlink-replaced-root-displaced");
+        fs::create_dir_all(&root).expect("create managed root");
+        let target = root.join("session-artifacts.tmp");
+        fs::write(&target, b"staged intent").expect("seed staged intent");
+        let proof = qualification(&root);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire exact-root guard");
+        fs::rename(&root, &displaced).expect("displace managed root");
+        fs::create_dir_all(&root).expect("replace managed root path");
+
+        assert_eq!(
+            guard.unlink_canonical_entry(
+                &target,
+                Some(&proof),
+                CanonicalRecoveryKey::from_opaque_bytes([71; 16]),
+            ),
+            CanonicalUnlinkOutcome::Rejected(CanonicalDurabilityRejection::IdentityChanged)
+        );
+        assert_eq!(
+            fs::read(displaced.join("session-artifacts.tmp")).expect("displaced entry retained"),
+            b"staged intent"
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean replacement root");
+        fs::remove_dir_all(displaced).expect("clean displaced root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unlink_fault_cuts_are_honest_and_exact_rerun_is_a_no_effect_assessment() {
+        let key = CanonicalRecoveryKey::from_opaque_bytes([72; 16]);
+
+        // Every injectable cut before the removal call is a refusal, and the
+        // entry is provably intact.
+        for stage in [
+            CanonicalDurabilityStage::InspectEntry,
+            CanonicalDurabilityStage::OpenExisting,
+            CanonicalDurabilityStage::Unlink,
+        ] {
+            let root = temp_root(&format!("unlink-cut-{stage:?}"));
+            fs::create_dir_all(&root).expect("create fixture root");
+            let target = root.join("session-artifacts.tmp");
+            fs::write(&target, b"staged intent").expect("seed staged intent");
+            let proof = qualification(&root);
+            let guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire namespace-bound guard");
+
+            assert_eq!(
+                guard.unlink_canonical_entry_with_fault(&target, Some(&proof), key, stage),
+                CanonicalUnlinkOutcome::Rejected(
+                    CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                        stage,
+                        kind: io::ErrorKind::Other,
+                        raw_os_error: None,
+                    }
+                )
+            );
+            assert_eq!(
+                fs::read(&target).expect("entry retained after refused cut"),
+                b"staged intent"
+            );
+            drop(guard);
+            fs::remove_dir_all(root).expect("clean fixture root");
+        }
+
+        // The guard-level failure injection lands on the same pre-invocation arm.
+        let injected_root = temp_root("unlink-injected-failure");
+        fs::create_dir_all(&injected_root).expect("create fixture root");
+        let injected_target = injected_root.join("session-artifacts.tmp");
+        fs::write(&injected_target, b"staged intent").expect("seed staged intent");
+        let injected_proof = qualification(&injected_root);
+        let injected_guard = CanonicalDurability::failing_at(CanonicalDurabilityStage::Unlink)
+            .try_lock_exclusive(&injected_root)
+            .expect("acquire failing guard");
+        assert_eq!(
+            injected_guard.unlink_canonical_entry(&injected_target, Some(&injected_proof), key),
+            CanonicalUnlinkOutcome::Rejected(
+                CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                    stage: CanonicalDurabilityStage::Unlink,
+                    kind: io::ErrorKind::Other,
+                    raw_os_error: None,
+                }
+            )
+        );
+        assert_eq!(
+            fs::read(&injected_target).expect("entry retained after injected failure"),
+            b"staged intent"
+        );
+        drop(injected_guard);
+        fs::remove_dir_all(injected_root).expect("clean fixture root");
+
+        // A lost parent barrier after a real removal is indeterminate, and the
+        // exact rerun publishes the absence.
+        let barrier_root = temp_root("unlink-parent-sync-cut");
+        fs::create_dir_all(&barrier_root).expect("create fixture root");
+        let barrier_target = barrier_root.join("session-artifacts.tmp");
+        fs::write(&barrier_target, b"staged intent").expect("seed staged intent");
+        let barrier_proof = qualification(&barrier_root);
+        let barrier_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&barrier_root)
+            .expect("acquire namespace-bound guard");
+        assert!(matches!(
+            barrier_guard.unlink_canonical_entry_with_fault(
+                &barrier_target,
+                Some(&barrier_proof),
+                key,
+                CanonicalDurabilityStage::ParentSync,
+            ),
+            CanonicalUnlinkOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::ParentSync,
+                ..
+            })
+        ));
+        assert!(!barrier_target.exists());
+        assert_eq!(
+            barrier_guard.unlink_canonical_entry(&barrier_target, Some(&barrier_proof), key),
+            CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        );
+        drop(barrier_guard);
+        fs::remove_dir_all(barrier_root).expect("clean fixture root");
+
+        // A clean removal crosses the parent barrier only, and its exact rerun
+        // is a no-effect assessment.
+        let clean_root = temp_root("unlink-clean");
+        fs::create_dir_all(&clean_root).expect("create fixture root");
+        let clean_target = clean_root.join("session-artifacts.tmp");
+        fs::write(&clean_target, b"staged intent").expect("seed staged intent");
+        let clean_proof = qualification(&clean_root);
+        let clean_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&clean_root)
+            .expect("acquire namespace-bound guard");
+        assert_eq!(
+            clean_guard.unlink_canonical_entry(&clean_target, Some(&clean_proof), key),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        assert!(!clean_target.exists());
+        assert_eq!(
+            clean_guard.unlink_canonical_entry(&clean_target, Some(&clean_proof), key),
+            CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        );
+        assert!(!clean_target.exists());
+        drop(clean_guard);
+        fs::remove_dir_all(clean_root).expect("clean fixture root");
     }
 }

@@ -350,3 +350,31 @@ building integration tip `3ab13fe`):
 
 Line anchors and gate outputs in earlier sections describe their own rounds'
 commits; this section is the current state record.
+
+## Continuation 2026-08-18 — audio-graph-3cf2 closes the install-stage residual
+
+Seed `audio-graph-3cf2` landed on `work/audio-graph-3cf2-refused-install-survivors`
+(base `27be43a`) and changes two statements this document makes above.
+
+- The install-stage misclassification that the round-4 section left open is
+  fixed. `commit_prepared_compare_and_swap` no longer widens an install refusal
+  into `ManifestCasRejection::Durability` when this transaction had already made
+  its intent temporary and immutable proof durable; that case is
+  `ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable` and
+  carries the intent temporary's recovery key.
+- The wedge described in the round-3 section — a surviving intent temporary
+  refusing every later `compare_and_swap` with `SnapshotTempAlreadyExists` — now
+  has a second escape besides a byte-exact replay:
+  `ManifestWriteTransaction::abandon_staged_transition` durably unlinks the
+  Session's own temporary. Any earlier sentence in this document describing the
+  replay as the only way out is a record of its own round, not current state.
+- Still open, unchanged, and not owned by `audio-graph-3cf2`: the B4 proof-binding
+  gate in `prepare_compare_and_swap` (`audio-graph-68a1`), the Windows test
+  cfg-gating defects (`audio-graph-a58b`), the rotation HomeGuard gap
+  (`audio-graph-0641`), and consumer activation of the dormant kernel. Abandon
+  does not remove or re-key the immutable proof, so a durable v2 proof still
+  refuses a different transition id with `ImmutableExactConflict`.
+
+Every line anchor in the sections above predates this wave and its diff moved
+lines in both persistence sources; prefer the symbol names. This section cites no
+line numbers.

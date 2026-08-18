@@ -482,9 +482,11 @@ Two tests were added. `refused_proof_create_after_durable_intent_is_never_report
 (`:3640`) pins the truthful variant, asserts the carried key equals
 `recovery_key(&proof_digest)`, then proves the consequence end to end: the
 temporary survives, a plain `compare_and_swap` of an unrelated v1 candidate is
-refused with `SnapshotTempAlreadyExists`, and the one reachable escape — a
-byte-exact replay of the named candidate and proof through the public
+refused with `SnapshotTempAlreadyExists`, and the one reachable escape as of this
+commit — a byte-exact replay of the named candidate and proof through the public
 `advance_session_semantics_v1_to_v2` — installs and clears the temporary.
+(`audio-graph-3cf2` later added `ManifestWriteTransaction::abandon_staged_transition`
+as a second escape; the uniqueness claim is a record of this round only.)
 `transition_proof_stage_faults_are_honest_and_exact_retry_converges` (`:3721`)
 adds the previously empty proof-stage fault table: `CreateNew` is the new
 post-staging refusal with the proof absent, and `Flush`, `ProtectTemp`,
@@ -598,12 +600,24 @@ that the table does not enumerate. Excluded: the two panic locations disclaimed
 inline in round 3, and the stale values this section quotes while correcting
 them.
 
-The table also enumerates, marked `bd54`, the four anchors the later docs-only
-Seed `audio-graph-bd54` re-derived from sections the paragraph above does not
-cover — the round-2 `AlreadyCompleted` production branch (also cited by the 3b53
-plan and this wave's commit-state) and the three `Open cross-file gap` B2
-anchors. Those four carry the same machine-checked expectation; the rest of this
-report still does not.
+The table also enumerates, marked `bd54`, the anchors the later docs-only Seed
+`audio-graph-bd54` re-derived from sections the paragraph above does not cover —
+the round-2 `AlreadyCompleted` production branch (also cited by the 3b53 plan and
+this wave's commit-state) and the three `Open cross-file gap` B2 anchors. Those
+carry the same machine-checked expectation; the rest of this report still does
+not.
+
+**This table is now a historical record of `f27e322`, not of the current tree.**
+Every row was re-checked by script against `f27e322` and held there. The seeds
+that landed after it — `audio-graph-3cf2` (new enum variants, rustdoc, and
+functions in both persistence files) and `audio-graph-68a1` (the provenance
+binding, roughly +119 lines) — each shifted lines below their insertion points,
+so rows below those points no longer resolve against the current tree. Read the
+table as evidence about `f27e322` and prefer the symbol name in every row. The
+two landed seeds carry their own current-tree anchor checks in
+`docs/agentic-runs/2026-08-18-audio-graph-3cf2/` and
+`docs/agentic-runs/2026-08-18-audio-graph-68a1/`, and both persistence source
+files now carry zero line anchors by an enforced invariant.
 
 | anchor | expected at that line |
 | --- | --- |

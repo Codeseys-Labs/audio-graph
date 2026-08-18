@@ -25,6 +25,7 @@ use super::canonical_durability::{
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
     CanonicalExclusiveGuard, CanonicalFilesystemQualification,
     CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSnapshotExpectation,
+    CanonicalUnlinkOutcome,
 };
 use super::session_semantics::SessionSemanticsVersion;
 
@@ -513,29 +514,72 @@ pub enum ManifestCasRejection {
     ManifestTooLarge {
         byte_length: u64,
     },
-    /// A durability refusal forwarded verbatim from the substrate.
+    /// A durability refusal forwarded verbatim from the substrate, raised
+    /// before the refused call staged, proved, or installed anything of its
+    /// own.
     ///
-    /// For every refusal raised BEFORE this transaction staged anything, nothing
-    /// survives the outcome. That is NOT true of the install stage:
-    /// `commit_prepared_compare_and_swap` (:1544) also returns this variant, and
-    /// on the transition path it runs with `resume_temporary = true`, so a staged
-    /// intent temporary and a durable immutable proof can both outlive an
-    /// install-stage `Durability` refusal. Classifying that survivor is
-    /// audio-graph-3b53 B3's residual, tracked in audio-graph-3cf2 — do not read
-    /// this variant as proof that the store is unchanged without checking which
-    /// stage raised it.
+    /// The no-survivor claim is scoped to the ONE refused call, exactly like
+    /// the substrate's `CanonicalDurabilityRejection` it forwards — never to
+    /// the transaction. Nothing that call made durable outlives this variant,
+    /// because every refusal routed here is proven before that call mutated a
+    /// canonical byte or namespace entry, and the two states a transition CAN
+    /// leave behind carry their own variants:
+    /// `TransitionProofRefusedAfterIntentStaged` and
+    /// `ManifestInstallRefusedAfterProofAndIntentDurable`.
+    ///
+    /// It is NOT a claim that the store holds nothing, and NOT a claim about
+    /// earlier calls on the same `ManifestWriteTransaction`: a transaction that
+    /// already installed a head or made a transition proof durable keeps both
+    /// when a later call returns this variant, so a caller must not read it as
+    /// "nothing I wrote survives". A temporary the refused call did not stage
+    /// likewise outlives the refusal, and this variant carries no key for it
+    /// because that call never owned one: on the fresh path such an orphan is
+    /// *evidenced* here — a plain `compare_and_swap` refused
+    /// `SnapshotTempAlreadyExists` is exactly that evidence — and on the
+    /// lock-owned recovery path (`compare_and_swap_recovery`) an adopted orphan
+    /// is likewise not the refused call's.
+    /// `ManifestWriteTransaction::abandon_staged_transition` is the escape that
+    /// needs no key.
     Durability(CanonicalDurabilityRejection),
     /// The immutable transition proof was refused after this transaction had
     /// already durably staged its manifest intent temporary. No canonical
     /// manifest byte moved and the proof record is absent, but the staged
-    /// temporary outlives this outcome: the exact `candidate` and `proof` must
-    /// be retained, because only their byte-exact replay through
-    /// `advance_session_semantics_v1_to_v2` retires that temporary, and until
-    /// it is retired every `compare_and_swap` refuses with
-    /// `SnapshotTempAlreadyExists`. `recovery_key` names the staged intent.
-    /// The inner refusal is reported verbatim and is never widened into
-    /// `Durability`, whose contract is that nothing was staged.
+    /// temporary outlives this outcome, and until it is retired every
+    /// `compare_and_swap` refuses with `SnapshotTempAlreadyExists`.
+    /// `recovery_key` names the staged intent. Two escapes exist: retain the
+    /// exact `candidate` and `proof` and replay them byte-exactly through
+    /// `advance_session_semantics_v1_to_v2`, or call
+    /// `ManifestWriteTransaction::abandon_staged_transition`, which durably
+    /// unlinks the temporary and needs no candidate. The inner refusal is
+    /// reported verbatim and is never widened into `Durability`, whose contract
+    /// is that the refused call staged nothing that survives.
     TransitionProofRefusedAfterIntentStaged {
+        rejection: CanonicalDurabilityRejection,
+        recovery_key: CanonicalRecoveryKey,
+    },
+    /// The manifest install was refused after this transaction had already made
+    /// BOTH its intent temporary and the immutable transition proof durable.
+    ///
+    /// The canonical manifest and its generation are unchanged: every
+    /// install-stage refusal is proven before the install mutated a byte or a
+    /// namespace entry. What this variant asserts about the survivors is that
+    /// THIS transaction made them durable and this refusal did not consume
+    /// them — the intent temporary named by `recovery_key`, and the proof at
+    /// the Session's provenance control identity. It deliberately does NOT
+    /// re-verify their current pathnames: for an `IdentityChanged`-class
+    /// rejection the refusal itself reports that the namespace moved, so the
+    /// records may no longer be reachable under the paths this transaction
+    /// wrote them to.
+    ///
+    /// `recovery_key` is `recovery_key(&candidate.transition.fingerprint)`,
+    /// which after fingerprint assignment equals `recovery_key(&proof_digest)`
+    /// — the same key `TransitionProofRefusedAfterIntentStaged` reports for the
+    /// same temporary. Two escapes exist: a byte-exact replay of the same
+    /// candidate and proof through `advance_session_semantics_v1_to_v2`, or
+    /// `ManifestWriteTransaction::abandon_staged_transition`, which unlinks the
+    /// temporary and leaves the immutable proof in place. The inner refusal is
+    /// reported verbatim and is never widened into `Durability`.
+    ManifestInstallRefusedAfterProofAndIntentDurable {
         rejection: CanonicalDurabilityRejection,
         recovery_key: CanonicalRecoveryKey,
     },
@@ -960,6 +1004,24 @@ enum ManifestCasPreparationResult {
     Rejected(ManifestCasRejection),
 }
 
+/// What this transaction has already made durable when the manifest install
+/// runs. It decides how an install-stage refusal must be classified, and it is
+/// keyed on the proven staged key rather than on whether the install resumes a
+/// temporary: a resumed temporary that pre-dates the transaction has no key
+/// this transaction can hand back.
+enum ManifestInstallDisposition {
+    /// Fresh install; this transaction staged nothing and owns no proof.
+    Fresh,
+    /// Lock-owned recovery resume. Any temporary this install adopts pre-dates
+    /// the transaction, so this transaction has no key that names it.
+    ResumeUnstaged,
+    /// Transition install. The intent temporary named by this key and the
+    /// immutable proof are both already durable before the install runs.
+    ResumeStagedTransition {
+        intent_recovery_key: CanonicalRecoveryKey,
+    },
+}
+
 impl ManifestWriteTransaction<'_> {
     /// Narrow handoff for the lock-owned recovery transaction. The guard and
     /// qualification remain borrowed from this manifest transaction; callers
@@ -986,7 +1048,13 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         candidate: SessionArtifactManifestV1,
     ) -> ManifestCasOutcome {
-        self.compare_and_swap_inner(expected_generation, candidate, false, false, None)
+        self.compare_and_swap_inner(
+            expected_generation,
+            candidate,
+            false,
+            ManifestInstallDisposition::Fresh,
+            None,
+        )
     }
 
     /// Durably establish the exact immutable v1-to-v2 proof before attempting
@@ -1292,11 +1360,69 @@ impl ManifestWriteTransaction<'_> {
             }
         }
 
+        // The install runs with both this transaction's intent temporary and its
+        // immutable proof already durable, so an install refusal cannot borrow
+        // the pre-mutation `Durability` vocabulary. `AlreadyCompleted`
+        // preparations return before the install and never reach that arm.
+        let disposition = match staged_intent_recovery_key {
+            Some(intent_recovery_key) => ManifestInstallDisposition::ResumeStagedTransition {
+                intent_recovery_key,
+            },
+            None => ManifestInstallDisposition::ResumeUnstaged,
+        };
+
         #[cfg(test)]
         if let Some(manifest_fault) = _manifest_fault {
-            return self.commit_prepared_compare_and_swap(preparation, true, Some(manifest_fault));
+            return self.commit_prepared_compare_and_swap(
+                preparation,
+                disposition,
+                Some(manifest_fault),
+            );
         }
-        self.commit_prepared_compare_and_swap(preparation, true, None)
+        self.commit_prepared_compare_and_swap(preparation, disposition, None)
+    }
+
+    /// Abandon this Session's staged manifest-intent temporary.
+    ///
+    /// This is the reachable escape for the survivors named by
+    /// `ManifestCasRejection::TransitionProofRefusedAfterIntentStaged` and
+    /// `ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable`:
+    /// it durably unlinks the Session's own manifest temporary, so a later
+    /// `compare_and_swap` is no longer refused `SnapshotTempAlreadyExists` and a
+    /// different candidate can install.
+    ///
+    /// It removes ONLY the temporary. This transaction's cached head is not
+    /// re-read, and neither the canonical manifest, its generation, nor the
+    /// immutable transition proof is written or removed: a durable v2 proof
+    /// therefore still refuses a DIFFERENT transition id with
+    /// `ImmutableExactConflict`. Removing or re-keying that proof is out of
+    /// scope — audio-graph-68a1 owns the missing proof binding.
+    ///
+    /// It is NOT the reconciliation for a `DurabilityIndeterminate` outcome.
+    /// After any indeterminate the reconciliation is the exact rerun keyed by
+    /// that outcome's recovery key. An indeterminate install whose rename was
+    /// invoked but unacknowledged may already have consumed the temporary, so
+    /// abandon would find it absent and its parent barrier could itself become
+    /// the durability point of that unacknowledged install. `AlreadyAbsent`
+    /// therefore asserts only that this call removed nothing; it does not assert
+    /// that the manifest head is unchanged.
+    ///
+    /// The temporary's content is deliberately NOT authenticated. Abandon exists
+    /// for a caller that no longer holds the candidate; requiring its bytes
+    /// would reinstate the wedge it removes. Authorization is the exclusive
+    /// guard, the derived Session-owned temporary identity — never
+    /// caller-supplied, and never equal to the manifest identity — and the
+    /// substrate's reserved-name, regular-file, and open-handle identity fences.
+    ///
+    /// The recovery key names THIS unlink of THIS temporary pathname, not the
+    /// abandoned candidate: abandon needs no candidate. `AlreadyAbsent` is the
+    /// no-effect assessment of an exact rerun.
+    pub fn abandon_staged_transition(&self) -> CanonicalUnlinkOutcome {
+        self.guard.unlink_canonical_entry(
+            &self.temporary_path,
+            self.qualification,
+            temporary_abandon_recovery_key(&self.temporary_path),
+        )
     }
 
     pub(crate) fn compare_and_swap_recovery(
@@ -1304,7 +1430,13 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         candidate: SessionArtifactManifestV1,
     ) -> ManifestCasOutcome {
-        self.compare_and_swap_inner(expected_generation, candidate, false, true, None)
+        self.compare_and_swap_inner(
+            expected_generation,
+            candidate,
+            false,
+            ManifestInstallDisposition::ResumeUnstaged,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -1318,7 +1450,7 @@ impl ManifestWriteTransaction<'_> {
             expected_generation,
             candidate,
             false,
-            true,
+            ManifestInstallDisposition::ResumeUnstaged,
             Some(injected_fault),
         )
     }
@@ -1457,9 +1589,10 @@ impl ManifestWriteTransaction<'_> {
     fn commit_prepared_compare_and_swap(
         &mut self,
         preparation: ManifestCasPreparation,
-        resume_temporary: bool,
+        disposition: ManifestInstallDisposition,
         _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
     ) -> ManifestCasOutcome {
+        let resume_temporary = !matches!(disposition, ManifestInstallDisposition::Fresh);
         let (candidate, bytes, recovery_key) = match preparation {
             ManifestCasPreparation::Install {
                 candidate,
@@ -1540,8 +1673,25 @@ impl ManifestWriteTransaction<'_> {
                     ),
                 }
             }
+            // An install-stage refusal may be forwarded as a plain
+            // `Durability` only when this call had made nothing of its own
+            // durable. On the transition path the intent temporary and the
+            // immutable proof are both already durable here, so the outcome
+            // must name them and hand back the key that identifies the
+            // temporary.
             CanonicalDurabilityOutcome::Rejected(rejection) => {
-                ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(rejection))
+                ManifestCasOutcome::Rejected(match disposition {
+                    ManifestInstallDisposition::ResumeStagedTransition {
+                        intent_recovery_key,
+                    } => ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable {
+                        rejection,
+                        recovery_key: intent_recovery_key,
+                    },
+                    ManifestInstallDisposition::Fresh
+                    | ManifestInstallDisposition::ResumeUnstaged => {
+                        ManifestCasRejection::Durability(rejection)
+                    }
+                })
             }
             CanonicalDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
                 ManifestCasOutcome::DurabilityIndeterminate(indeterminate)
@@ -1554,7 +1704,7 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         candidate: SessionArtifactManifestV1,
         proof_owned: bool,
-        resume_temporary: bool,
+        disposition: ManifestInstallDisposition,
         _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
     ) -> ManifestCasOutcome {
         let preparation =
@@ -1564,7 +1714,7 @@ impl ManifestWriteTransaction<'_> {
                     return ManifestCasOutcome::Rejected(rejection);
                 }
             };
-        self.commit_prepared_compare_and_swap(preparation, resume_temporary, _injected_fault)
+        self.commit_prepared_compare_and_swap(preparation, disposition, _injected_fault)
     }
 }
 
@@ -2105,6 +2255,33 @@ fn is_internal_identity(identity: &str) -> bool {
 
 fn recovery_key(fingerprint: &Sha256Digest) -> CanonicalRecoveryKey {
     let digest = Sha256::digest(fingerprint.as_str().as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    CanonicalRecoveryKey::from_opaque_bytes(bytes)
+}
+
+/// Domain separator so an abandon key can never equal a candidate-fingerprint
+/// key for any input.
+const TEMPORARY_ABANDON_KEY_DOMAIN: &[u8] = b"audio-graph/session-manifest-temporary-abandon/v1\0";
+
+/// Recovery key for one abandon of one derived Session temporary.
+///
+/// Keyed on the temporary's own pathname, which is derived from the store root
+/// and the validated Session id: distinct across Sessions and roots, and
+/// identical on every rerun by any transaction of a store built from the same
+/// root SPELLING. The root is taken verbatim from the caller and is not
+/// canonicalized here, so two equivalent spellings of one root (a trailing
+/// separator, a `..` segment, a symlinked data dir) derive DIFFERENT keys for
+/// the same logical unlink of the same inode. A caller that matches outcome keys
+/// across a restart must therefore reconcile through a store built from the same
+/// spelling it used originally. It is deliberately independent of the manifest
+/// head and of any candidate, because abandon reconciles its own unlink and
+/// holds no candidate.
+fn temporary_abandon_recovery_key(temporary_path: &Path) -> CanonicalRecoveryKey {
+    let mut hasher = Sha256::new();
+    hasher.update(TEMPORARY_ABANDON_KEY_DOMAIN);
+    hasher.update(temporary_path.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     CanonicalRecoveryKey::from_opaque_bytes(bytes)
@@ -3705,8 +3882,10 @@ mod tests {
         assert!(!manifest_path.exists());
         drop(wedged);
 
-        // The one reachable escape is a byte-exact replay of the candidate and
-        // proof the refusal named, through the public transition entry point.
+        // One of the two reachable escapes is a byte-exact replay of the
+        // candidate and proof the refusal named, through the public transition
+        // entry point. The other is `abandon_staged_transition`, pinned by
+        // `abandoned_transition_unwedges_a_different_candidate`.
         let mut resumed = store.begin_write().expect("resumed transaction");
         assert!(matches!(
             resumed.advance_session_semantics_v1_to_v2(0, candidate, proof),
@@ -3904,7 +4083,13 @@ mod tests {
     fn manifest_cas_consumes_staged_intent_and_restarts_every_install_cut() {
         use super::super::canonical_durability::CanonicalDurabilityStage;
 
+        // `Write` is deliberately absent: the install resumes a complete
+        // temporary, so `already_written == bytes.len()` leaves no remaining
+        // byte for the injected write cut to sever.
         for stage in [
+            CanonicalDurabilityStage::CreateNew,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
             CanonicalDurabilityStage::FileSync,
             CanonicalDurabilityStage::Rename,
             CanonicalDurabilityStage::ParentSync,
@@ -3934,15 +4119,30 @@ mod tests {
                 None,
                 Some(stage),
             );
-            assert!(matches!(
-                first_outcome,
-                ManifestCasOutcome::DurabilityIndeterminate(
-                    CanonicalDurabilityIndeterminate {
-                        stage: actual_stage,
-                        ..
-                    }
-                ) if actual_stage == stage
-            ));
+            if stage == CanonicalDurabilityStage::CreateNew {
+                assert!(matches!(
+                    first_outcome,
+                    ManifestCasOutcome::Rejected(
+                        ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable {
+                            rejection: CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                                stage: CanonicalDurabilityStage::CreateNew,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                ));
+            } else {
+                assert!(matches!(
+                    first_outcome,
+                    ManifestCasOutcome::DurabilityIndeterminate(
+                        CanonicalDurabilityIndeterminate {
+                            stage: actual_stage,
+                            ..
+                        }
+                    ) if actual_stage == stage
+                ));
+            }
             assert_eq!(
                 std::fs::read(&provenance_path).expect("durable proof before manifest cut"),
                 expected_proof
@@ -4793,5 +4993,373 @@ mod tests {
             assert!(!manifest.managed_inventory().contains(identity));
             assert!(ManagedArtifactIdentity::new(identity.as_str()).is_err());
         }
+    }
+
+    // audio-graph-3cf2 — install-stage refusal survivors and the abandon path.
+    // Grouped as one contiguous trailing block so a later rebase of
+    // audio-graph-68a1 (which owns `prepare_compare_and_swap`'s proof gate and
+    // `validate_v2_session_provenance`) stays clean.
+
+    /// A refused manifest install leaves BOTH the staged intent temporary and
+    /// the durable immutable transition proof behind. The outcome must never
+    /// borrow the pre-mutation durability vocabulary for that state, and it
+    /// must name the staged intent the caller still owns.
+    #[cfg(unix)]
+    #[test]
+    fn refused_manifest_install_after_durable_proof_is_never_reported_as_unstaged() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let root = root("manifest-install-refusal-after-durable-proof");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let transition_id = "advance-refused-manifest-install";
+        let candidate = v2_candidate(transition_id);
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+            .expect("transition proof");
+        let (expected_proof, proof_digest) = proof
+            .canonical_bytes_and_digest()
+            .expect("canonical proof bytes");
+        let staged_intent_key = recovery_key(&proof_digest);
+
+        let mut first = store.begin_write().expect("first transition transaction");
+        let outcome = first.advance_session_semantics_v1_to_v2_with_faults(
+            0,
+            candidate.clone(),
+            proof.clone(),
+            None,
+            None,
+            Some(CanonicalDurabilityStage::CreateNew),
+        );
+
+        // Which files survive: the intent temporary is file- and parent-synced,
+        // the immutable proof is complete and durable, and the install
+        // definitively never happened.
+        assert!(temporary_path.exists());
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("durable proof survives the install refusal"),
+            expected_proof
+        );
+        assert!(!manifest_path.exists());
+
+        match &outcome {
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable {
+                    rejection,
+                    recovery_key: staged_key,
+                },
+            ) => {
+                assert!(matches!(
+                    rejection,
+                    CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                        stage: CanonicalDurabilityStage::CreateNew,
+                        ..
+                    }
+                ));
+                assert_eq!(*staged_key, staged_intent_key);
+            }
+            other => panic!("install refusal after durable proof misclassified as {other:?}"),
+        }
+        drop(first);
+
+        // The staged temporary is real: the public generation CAS cannot get
+        // past it for any other candidate.
+        let mut wedged = store.begin_write().expect("wedged transaction");
+        assert_eq!(
+            wedged.compare_and_swap(0, basic_candidate("wedged-v1", 'a')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+            ))
+        );
+        assert!(temporary_path.exists());
+        assert!(!manifest_path.exists());
+        drop(wedged);
+
+        let mut resumed = store.begin_write().expect("resumed transaction");
+        assert!(matches!(
+            resumed.advance_session_semantics_v1_to_v2(0, candidate, proof),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(manifest_path.exists());
+        assert!(!temporary_path.exists());
+    }
+
+    /// Criterion 3: a caller that gives up on a transition can abandon it and
+    /// install a different candidate. Both arms are in one test so the boundary
+    /// of abandon is pinned rather than implied: it retires the temporary and
+    /// never the immutable proof.
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_transition_unwedges_a_different_candidate() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        // Arm 1: the proof create was refused, so no proof record exists.
+        let absent_root = root("abandon-unwedges-proof-absent");
+        let absent_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&absent_root, "session-1")
+                .expect("qualified Session store");
+        let absent_manifest_path = absent_store.manifest_path();
+        let absent_temporary_path = absent_store.temporary_path();
+        let absent_provenance_path =
+            absent_root.join(absent_store.control_identities().provenance.as_str());
+        let mut absent = absent_store
+            .begin_write()
+            .expect("proof-absent transaction");
+        assert!(matches!(
+            absent.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                v2_candidate("advance-abandon-absent"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-abandon-absent")
+                    .expect("abandoned proof"),
+                None,
+                Some(CanonicalDurabilityStage::CreateNew),
+                None,
+            ),
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::TransitionProofRefusedAfterIntentStaged { .. }
+            )
+        ));
+        assert!(absent_temporary_path.exists());
+        assert!(!absent_provenance_path.exists());
+        assert_eq!(
+            absent.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        assert!(!absent_temporary_path.exists());
+        assert!(!absent_manifest_path.exists());
+
+        // A DIFFERENT transition now installs through the public entry point.
+        assert!(matches!(
+            absent.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate("advance-abandon-replacement"),
+                SessionSemanticsTransitionProofV1::v1_to_v2(
+                    "session-1",
+                    "advance-abandon-replacement",
+                )
+                .expect("replacement proof"),
+            ),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(absent_manifest_path.exists());
+        assert!(!absent_temporary_path.exists());
+        drop(absent);
+
+        // Arm 2: the manifest install was refused after the proof went durable.
+        let durable_root = root("abandon-unwedges-proof-durable");
+        let durable_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&durable_root, "session-1")
+                .expect("qualified Session store");
+        let durable_manifest_path = durable_store.manifest_path();
+        let durable_temporary_path = durable_store.temporary_path();
+        let durable_provenance_path =
+            durable_root.join(durable_store.control_identities().provenance.as_str());
+        let abandoned_proof =
+            SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-abandon-durable")
+                .expect("abandoned durable proof");
+        let abandoned_proof_bytes = abandoned_proof
+            .canonical_bytes_and_digest()
+            .expect("canonical proof bytes")
+            .0;
+        let mut durable = durable_store
+            .begin_write()
+            .expect("proof-durable transaction");
+        assert!(matches!(
+            durable.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                v2_candidate("advance-abandon-durable"),
+                abandoned_proof,
+                None,
+                None,
+                Some(CanonicalDurabilityStage::CreateNew),
+            ),
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable { .. }
+            )
+        ));
+        assert!(durable_temporary_path.exists());
+        assert_eq!(
+            std::fs::read(&durable_provenance_path).expect("durable proof before abandon"),
+            abandoned_proof_bytes
+        );
+        assert_eq!(
+            durable.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        assert!(!durable_temporary_path.exists());
+        assert!(!durable_manifest_path.exists());
+
+        // The wedge is gone: a different v1 candidate installs through the
+        // public generation CAS.
+        assert!(matches!(
+            durable.compare_and_swap(0, basic_candidate("abandoned-then-v1", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(durable_manifest_path.exists());
+
+        // Abandon did NOT remove the immutable proof, so a DIFFERENT transition
+        // id is still refused at the proof identity. Re-keying that gate is
+        // audio-graph-68a1's territory.
+        assert_eq!(
+            durable.advance_session_semantics_v1_to_v2(
+                1,
+                v2_candidate("advance-abandon-other"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-abandon-other")
+                    .expect("other proof"),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::ImmutableExactConflict,
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&durable_provenance_path).expect("abandoned proof survives abandon"),
+            abandoned_proof_bytes
+        );
+        assert!(!durable_temporary_path.exists());
+    }
+
+    /// Criterion 4: an exact rerun of an abandon is a no-effect assessment, and
+    /// no abandon touches the manifest, its generation, or the proof.
+    #[cfg(unix)]
+    #[test]
+    fn exact_rerun_of_abandon_is_a_no_effect_assessment() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let root = root("abandon-exact-rerun");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let coordination_path = root.join(store.control_identities().coordination.as_str());
+        let mut transaction = store.begin_write().expect("abandon transaction");
+
+        // Nothing staged: the assessment creates nothing. "Nothing" excludes the
+        // coordination entry, which `begin_write` establishes before this call.
+        assert_eq!(
+            transaction.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        );
+        assert!(!temporary_path.exists());
+        assert!(!manifest_path.exists());
+        assert!(!provenance_path.exists());
+        assert!(coordination_path.exists());
+
+        // Establish a v1 head, then wedge a v2 transition with a durable proof.
+        assert!(matches!(
+            transaction.compare_and_swap(0, basic_candidate("abandon-rerun-v1", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            transaction.advance_session_semantics_v1_to_v2_with_faults(
+                1,
+                v2_candidate("advance-abandon-rerun"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-abandon-rerun")
+                    .expect("rerun proof"),
+                None,
+                None,
+                Some(CanonicalDurabilityStage::CreateNew),
+            ),
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable { .. }
+            )
+        ));
+        let head_bytes = std::fs::read(&manifest_path).expect("v1 head before abandon");
+        let proof_bytes = std::fs::read(&provenance_path).expect("durable proof before abandon");
+        let head_generation = match transaction.head() {
+            ManifestLoadOutcome::Present(manifest) => manifest.generation,
+            ManifestLoadOutcome::Absent => panic!("v1 head must be present"),
+        };
+        assert_eq!(head_generation, 1);
+
+        assert_eq!(
+            transaction.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                transaction.abandon_staged_transition(),
+                CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+            );
+        }
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("head after three abandons"),
+            head_bytes
+        );
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("proof after three abandons"),
+            proof_bytes
+        );
+        assert!(matches!(
+            transaction.head(),
+            ManifestLoadOutcome::Present(manifest) if manifest.generation == head_generation
+        ));
+    }
+
+    /// Abandon is NOT the reconciliation for a `DurabilityIndeterminate`: an
+    /// install that renamed but lost its barrier already consumed the temporary,
+    /// so the abandon finds it absent and its own parent barrier can be what
+    /// makes that install durable. `AlreadyAbsent` must therefore not be read as
+    /// "the head is unchanged" — the documented caveat, pinned.
+    #[cfg(unix)]
+    #[test]
+    fn abandon_after_an_indeterminate_install_publishes_rather_than_retracts() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let root = root("abandon-after-indeterminate-install");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let transition_id = "advance-abandon-indeterminate";
+        let mut first = store.begin_write().expect("indeterminate transaction");
+
+        assert!(matches!(
+            first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                v2_candidate(transition_id),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+                    .expect("indeterminate proof"),
+                None,
+                None,
+                Some(CanonicalDurabilityStage::ParentSync),
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::ParentSync,
+                ..
+            })
+        ));
+        // The rename ran; only its namespace barrier was lost.
+        assert!(manifest_path.exists());
+        assert!(!temporary_path.exists());
+
+        assert_eq!(
+            first.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        );
+        assert!(manifest_path.exists());
+        drop(first);
+
+        // The head advanced to the candidate the caller tried to abandon.
+        let next = store.begin_write().expect("post-abandon transaction");
+        assert!(matches!(
+            next.head(),
+            ManifestLoadOutcome::Present(manifest)
+                if manifest.generation == 1
+                    && manifest.transition.idempotency_id == transition_id
+                    && manifest.session_semantics_version == SessionSemanticsVersion::V2
+        ));
     }
 }
