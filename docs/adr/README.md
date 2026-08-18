@@ -42,6 +42,9 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0033] | Enforce MVP Provider Enablement at Every Content-Bearing Start | accepted | — | 2026-07-09 |
 | [0034] | Require Exhaustive Evidence for Negative Data-Egress Claims | accepted | — | 2026-07-10 |
 | [0035] | Record Post-Stop Finalization Failure as Per-Session Finalization Blocked | accepted | Narrows ADR-0028; decided under maintainer delegation | 2026-08-17 |
+| [0036] | Derive Session Finalization State from Durable Barriers | accepted | Implementation blocked on 90f3/8e73; maintainer-decided via wayfinder grilling | 2026-08-18 |
+| [0037] | Admit Session Memory Items Through a Layered Claim-Class Evidence Table | accepted | Extends ADR-0034 discipline to knowledge claims; validator ships after ADR-0038's fallback removal | 2026-08-18 |
+| [0038] | Route LLM Operations Through a Single-Skin Named Route Table | accepted | Fallback removal precedes ADR-0037's validator | 2026-08-18 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -78,6 +81,9 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0033]: 0033-enforce-mvp-provider-enablement-at-content-start.md
 [0034]: 0034-require-exhaustive-evidence-for-negative-data-egress-claims.md
 [0035]: 0035-record-post-stop-finalization-failure-as-per-session-finalization-blocked.md
+[0036]: 0036-derive-session-finalization-state-from-durable-barriers.md
+[0037]: 0037-admit-session-memory-items-through-a-layered-claim-class-evidence-table.md
+[0038]: 0038-route-llm-operations-through-a-single-skin-named-route-table.md
 
 ## Status legend
 
