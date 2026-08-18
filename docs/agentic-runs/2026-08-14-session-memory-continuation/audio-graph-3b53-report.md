@@ -102,18 +102,28 @@ round-2 contract:
 - `create_or_reconcile_immutable_exact_with_identity_prefix` remains a second
   recovery entry point and is still reached in production, not only in tests, on
   the `AlreadyCompleted` retry branch of
-  `advance_session_semantics_v1_to_v2` (`session_artifact_manifest.rs:1233-1241`).
+  `advance_session_semantics_v1_to_v2` — the `cfg(not(test))` copy at
+  `session_artifact_manifest.rs:1262-1270`, not the `cfg(test)` twin above it.
   That branch still passes
   `SessionSemanticsTransitionProofV1::recovery_identity_prefix_len` (`:379`),
   which is a byte-offset search for the `,"transition_kind":` marker — the
-  round-1 prefix-length heuristic. The 3b53 plan's round-2 section states that
-  the manifest temporary is "the durable authentication record, not a
-  prefix-length heuristic", and this wave's commit-state states the same
-  replacement; both are accurate for the install path only and overstate the
-  replacement for the retry path. That second entry point carries a two-line
-  rustdoc contract (`canonical_durability.rs:1398-1399`) but appears in no
-  round-2 contract prose, so it is disclosed
-  here rather than left implicit.
+  round-1 prefix-length heuristic. The 3b53 plan's round-2 section previously
+  stated that the manifest temporary is "the durable authentication record, not
+  a prefix-length heuristic", which was accurate for the install path only and
+  overstated the replacement for the retry path. The plan's wording has since
+  been corrected under Seed `audio-graph-bd54` (docs-only) to scope the
+  replacement to the `Install` path and to name the heuristic that survives on
+  the retry path. This wave's commit-state stated the same replacement, but it
+  had already been scoped to the `Install` path — and already named the surviving
+  threshold, recording that it "previously implied the threshold was gone
+  everywhere" — before bd54, whose only edit to that document re-derived the
+  anchor. So the overstatement is closed as prose in both documents; the Spec
+  decision on the second entry point itself remains open. That second entry
+  point carries a two-line rustdoc contract
+  (`canonical_durability.rs:1398-1399`) and is now named in the round-2 prose of
+  both the plan (`:215`) and this wave's commit-state (`:113`) as the call the
+  retry path still makes, so what remains open is the Spec decision itself, not
+  its disclosure.
 
 The cross-proof fixtures below enter at generation 0, so the preparation is
 always `Install` and they exercise only the authenticated path. No fixture drives
@@ -588,14 +598,25 @@ that the table does not enumerate. Excluded: the two panic locations disclaimed
 inline in round 3, and the stale values this section quotes while correcting
 them.
 
+The table also enumerates, marked `bd54`, the four anchors the later docs-only
+Seed `audio-graph-bd54` re-derived from sections the paragraph above does not
+cover — the round-2 `AlreadyCompleted` production branch (also cited by the 3b53
+plan and this wave's commit-state) and the three `Open cross-file gap` B2
+anchors. Those four carry the same machine-checked expectation; the rest of this
+report still does not.
+
 | anchor | expected at that line |
 | --- | --- |
 | `session_artifact_manifest.rs:252` | `session_semantics_version: SessionSemanticsVersion::V1,` |
 | `session_artifact_manifest.rs:518` | `Durability` rustdoc: `For every refusal raised BEFORE this transaction staged anything, nothing` |
 | `session_artifact_manifest.rs:538` | `TransitionProofRefusedAfterIntentStaged {` |
+| `session_artifact_manifest.rs:639` (bd54) | `pub(crate) fn internal_identities(&self) -> ManifestInternalIdentities {` |
+| `session_artifact_manifest.rs:810` (bd54) | `fn manifest_path(&self) -> PathBuf {` |
+| `session_artifact_manifest.rs:817` (bd54) | `fn temporary_path(&self) -> PathBuf {` |
 | `session_artifact_manifest.rs:984` | `pub fn compare_and_swap(` |
 | `session_artifact_manifest.rs:1175` | `self.guard.stage_snapshot_temporary(` under `#[cfg(not(test))]` |
 | `session_artifact_manifest.rs:1185` | `CanonicalDurabilityOutcome::Accepted(_) => Some(*recovery_key),` |
+| `session_artifact_manifest.rs:1262-1270` (bd54) | `ManifestCasPreparation::AlreadyCompleted { .. } => self` calling `create_or_reconcile_immutable_exact_with_identity_prefix` with `proof_recovery_prefix_len`, under the `#[cfg(not(test))]` at `:1250` |
 | `session_artifact_manifest.rs:1287` | `None => ManifestCasRejection::Durability(rejection),` |
 | `session_artifact_manifest.rs:1302` | `pub(crate) fn compare_and_swap_recovery(` |
 | `session_artifact_manifest.rs:1544` | `ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(rejection))` |
@@ -705,10 +726,10 @@ This gap is real at this source checkpoint, is outside this wave's authorized
 footprint, and is deliberately not fixed here. Its fix seam is
 `canonical_log.rs`, which this wave does not own.
 
-`manifest_path` and `temporary_path` (`session_artifact_manifest.rs:785,792`)
+`manifest_path` and `temporary_path` (`session_artifact_manifest.rs:810,817`)
 became address-aware in this diff: an addressed store reads and writes
 `.audio-graph-session-<key>-artifacts.v1.json` and its `.tmp` sibling.
-`internal_identities` (`:614`) did not. It still returns the three root-wide
+`internal_identities` (`:639`) did not. It still returns the three root-wide
 legacy constants `MANIFEST_FILE_NAME`, `MANIFEST_TEMP_FILE_NAME`, and
 `COORDINATION_FILE_NAME` regardless of the bound address, and the module-level
 `is_internal_identity` (`:2096`) compares candidate managed identities against
@@ -777,9 +798,11 @@ substituted — close the addressed-identity reservation gap above, and settle t
 same-length zero-filled proof residue question with a crash or block-device
 fixture. The `AlreadyCompleted` retry path's surviving prefix-length threshold
 also needs a Spec decision: either remove that second entry point or document it
-as contract. The 3b53 plan's round-2 wording that denies a prefix-length heuristic
-was left unedited in this pass by instruction; it still overstates the
-replacement and needs a correction of its own.
+as contract; that decision is still open. The 3b53 plan's round-2 wording that
+denied a prefix-length heuristic was left unedited in this pass by instruction
+and has since been corrected under Seed `audio-graph-bd54`: the plan now scopes
+the replacement to the `Install` path and names the heuristic surviving on the
+`AlreadyCompleted` retry path, so no plan-wording correction is outstanding.
 
 Exact next command. The previously recorded strict-Clippy command has run and is
 green, so the next outstanding broad gate is the full serialized cloud library

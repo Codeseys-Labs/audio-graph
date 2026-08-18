@@ -107,13 +107,16 @@ proof-internal identity boundary. Round 2 uses the already-owned per-Session
 manifest temporary as the durable authentication record and adds no path.
 
 That replacement is complete only on the `Install` preparation path, which is the
-one this order describes. The `AlreadyCompleted` retry branch
-(`session_artifact_manifest.rs:1233-1241`) still calls
+one this order describes. The `AlreadyCompleted` retry branch — the
+`cfg(not(test))` copy at `session_artifact_manifest.rs:1262-1270`, not the
+`cfg(test)` twin above it — still calls
 `create_or_reconcile_immutable_exact_with_identity_prefix` with
 `recovery_identity_prefix_len`, so the round-1 prefix-length threshold still runs
 in production there. This document previously implied the threshold was gone
-everywhere; it is not. The 3b53 report names that second entry point and leaves
-its disposition to Spec review.
+everywhere; it is not. The 3b53 plan's round-2 section, which previously denied
+a prefix-length heuristic outright, now carries the same `Install`-scoped
+wording after the docs-only correction under Seed `audio-graph-bd54`. The 3b53
+report names that second entry point and leaves its disposition to Spec review.
 
 The exact order at the public transition transaction is:
 

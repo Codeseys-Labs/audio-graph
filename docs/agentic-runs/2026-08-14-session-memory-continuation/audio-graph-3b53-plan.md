@@ -208,7 +208,14 @@ schema/session prefix. The returned value is the existing actual
 The fixed proof final can be empty after create-before-write or shorter than
 any proof-internal identity boundary after a real short write. Proof bytes alone
 cannot distinguish their intended completion. The manifest temporary is
-therefore the durable authentication record, not a prefix-length heuristic.
+therefore the durable authentication record on the `Install` preparation path,
+which is where the prefix-length heuristic is replaced. The replacement is
+scoped to that path: the `AlreadyCompleted` retry branch
+(`session_artifact_manifest.rs:1262-1270`, the `cfg(not(test))` copy) still
+calls `create_or_reconcile_immutable_exact_with_identity_prefix` with
+`recovery_identity_prefix_len`, so the prefix-length heuristic survives in
+production there. Whether that second entry point is removed or documented as
+contract is a Spec decision this plan does not settle.
 
 The exact order is: pure transition/CAS preparation; read-only proof collision
 preflight; durable exact manifest-temporary stage; exact intent validation;
