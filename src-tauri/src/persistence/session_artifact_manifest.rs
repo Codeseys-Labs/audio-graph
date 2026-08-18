@@ -29,6 +29,7 @@ use super::canonical_durability::{
 use super::session_semantics::SessionSemanticsVersion;
 
 pub const SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_SEMANTICS_TRANSITION_PROOF_SCHEMA_VERSION: u32 = 1;
 
 /// Conservative cross-platform ceiling for the manifest-controlled relative
 /// identity itself. Individual platforms still validate the resolved root plus
@@ -39,6 +40,7 @@ const MANIFEST_FILE_NAME: &str = ".audio-graph-session-artifacts.v1.json";
 const MANIFEST_TEMP_FILE_NAME: &str = ".audio-graph-session-artifacts.v1.tmp";
 const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const SESSION_CONTROL_PREFIX: &str = ".audio-graph-session-";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -274,6 +276,137 @@ pub struct ManifestInternalIdentities {
     pub coordination: ManagedArtifactIdentity,
 }
 
+/// Portable Session-owned control identities plus the store-owned lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionControlIdentities {
+    pub manifest: ManagedArtifactIdentity,
+    pub temporary: ManagedArtifactIdentity,
+    pub provenance: ManagedArtifactIdentity,
+    pub coordination: ManagedArtifactIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionControlAddress {
+    session_id: String,
+    identities: SessionControlIdentities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionSemanticsTransitionKind {
+    SessionSemanticsAdvance,
+}
+
+/// Immutable, digest-free evidence for exactly the v1-to-v2 semantics advance.
+///
+/// Field declaration order is the canonical compact JSON order. A digest is
+/// derived only after these complete bytes exist and is never embedded in the
+/// proof itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSemanticsTransitionProofV1 {
+    schema_version: u32,
+    session_id: String,
+    from: u32,
+    to: u32,
+    idempotency_id: String,
+    transition_kind: SessionSemanticsTransitionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSemanticsTransitionProofError {
+    Malformed,
+    NonCanonical,
+    UnsupportedSchema { actual: u32 },
+    InvalidTransition,
+    InvalidSessionId,
+    InvalidIdempotencyId,
+}
+
+impl SessionSemanticsTransitionProofV1 {
+    pub fn v1_to_v2(
+        session_id: impl Into<String>,
+        idempotency_id: impl Into<String>,
+    ) -> Result<Self, SessionSemanticsTransitionProofError> {
+        let proof = Self {
+            schema_version: SESSION_SEMANTICS_TRANSITION_PROOF_SCHEMA_VERSION,
+            session_id: session_id.into(),
+            from: SessionSemanticsVersion::V1.as_u32(),
+            to: SessionSemanticsVersion::V2.as_u32(),
+            idempotency_id: idempotency_id.into(),
+            transition_kind: SessionSemanticsTransitionKind::SessionSemanticsAdvance,
+        };
+        proof.validate()?;
+        Ok(proof)
+    }
+
+    pub fn from_canonical_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, SessionSemanticsTransitionProofError> {
+        let proof: Self = serde_json::from_slice(bytes)
+            .map_err(|_| SessionSemanticsTransitionProofError::Malformed)?;
+        proof.validate()?;
+        let canonical = proof.canonical_bytes()?;
+        if canonical != bytes {
+            return Err(SessionSemanticsTransitionProofError::NonCanonical);
+        }
+        Ok(proof)
+    }
+
+    pub fn canonical_bytes_and_digest(
+        &self,
+    ) -> Result<(Vec<u8>, Sha256Digest), SessionSemanticsTransitionProofError> {
+        self.validate()?;
+        let bytes = self.canonical_bytes()?;
+        let digest = Sha256::digest(&bytes);
+        let digest = Sha256Digest::new(format!("sha256:{digest:x}"))
+            .map_err(|_| SessionSemanticsTransitionProofError::Malformed)?;
+        Ok((bytes, digest))
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn idempotency_id(&self) -> &str {
+        &self.idempotency_id
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, SessionSemanticsTransitionProofError> {
+        serde_json::to_vec(self).map_err(|_| SessionSemanticsTransitionProofError::Malformed)
+    }
+
+    fn recovery_identity_prefix_len(
+        canonical_bytes: &[u8],
+    ) -> Result<usize, SessionSemanticsTransitionProofError> {
+        const NEXT_FIELD: &[u8] = b",\"transition_kind\":";
+        canonical_bytes
+            .windows(NEXT_FIELD.len())
+            .position(|window| window == NEXT_FIELD)
+            .map(|position| position + 1)
+            .ok_or(SessionSemanticsTransitionProofError::Malformed)
+    }
+
+    fn validate(&self) -> Result<(), SessionSemanticsTransitionProofError> {
+        if self.schema_version != SESSION_SEMANTICS_TRANSITION_PROOF_SCHEMA_VERSION {
+            return Err(SessionSemanticsTransitionProofError::UnsupportedSchema {
+                actual: self.schema_version,
+            });
+        }
+        if self.from != SessionSemanticsVersion::V1.as_u32()
+            || self.to != SessionSemanticsVersion::V2.as_u32()
+            || self.transition_kind != SessionSemanticsTransitionKind::SessionSemanticsAdvance
+        {
+            return Err(SessionSemanticsTransitionProofError::InvalidTransition);
+        }
+        validate_session_id(&self.session_id)
+            .map_err(|_| SessionSemanticsTransitionProofError::InvalidSessionId)?;
+        validate_idempotency_id(&self.idempotency_id)
+            .map_err(|_| SessionSemanticsTransitionProofError::InvalidIdempotencyId)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V2SessionProvenanceError {
     Missing,
@@ -317,6 +450,7 @@ pub enum ManifestValidationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestLoadError {
     Coordination(CanonicalCoordinationError),
+    SessionMismatch,
     NonRegularManifest,
     TooLarge {
         byte_length: u64,
@@ -332,6 +466,7 @@ pub enum ManifestLoadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestStoreError {
+    InvalidSessionAddress,
     NamespaceQualificationRequired,
     Qualification(CanonicalFilesystemQualificationError),
     Coordination(CanonicalCoordinationError),
@@ -345,7 +480,18 @@ pub enum ManifestLoadOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedManifestReadError<E> {
+    Load(ManifestLoadError),
+    NamespaceQualificationRequired,
+    UncoordinatedAbsence,
+    Reader(E),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestCasRejection {
+    SessionAddressRequired,
+    TransitionProof(SessionSemanticsTransitionProofError),
+    TransitionProofRequired,
     Validation(ManifestValidationError),
     GenerationConflict {
         expected: u64,
@@ -367,7 +513,32 @@ pub enum ManifestCasRejection {
     ManifestTooLarge {
         byte_length: u64,
     },
+    /// A durability refusal forwarded verbatim from the substrate.
+    ///
+    /// For every refusal raised BEFORE this transaction staged anything, nothing
+    /// survives the outcome. That is NOT true of the install stage:
+    /// `commit_prepared_compare_and_swap` (:1544) also returns this variant, and
+    /// on the transition path it runs with `resume_temporary = true`, so a staged
+    /// intent temporary and a durable immutable proof can both outlive an
+    /// install-stage `Durability` refusal. Classifying that survivor is
+    /// audio-graph-3b53 B3's residual, tracked in audio-graph-3cf2 — do not read
+    /// this variant as proof that the store is unchanged without checking which
+    /// stage raised it.
     Durability(CanonicalDurabilityRejection),
+    /// The immutable transition proof was refused after this transaction had
+    /// already durably staged its manifest intent temporary. No canonical
+    /// manifest byte moved and the proof record is absent, but the staged
+    /// temporary outlives this outcome: the exact `candidate` and `proof` must
+    /// be retained, because only their byte-exact replay through
+    /// `advance_session_semantics_v1_to_v2` retires that temporary, and until
+    /// it is retired every `compare_and_swap` refuses with
+    /// `SnapshotTempAlreadyExists`. `recovery_key` names the staged intent.
+    /// The inner refusal is reported verbatim and is never widened into
+    /// `Durability`, whose contract is that nothing was staged.
+    TransitionProofRefusedAfterIntentStaged {
+        rejection: CanonicalDurabilityRejection,
+        recovery_key: CanonicalRecoveryKey,
+    },
 }
 
 #[must_use = "manifest CAS outcomes must be reconciled before state advances"]
@@ -388,33 +559,84 @@ pub enum ManifestCasOutcome {
 /// default application path.
 pub struct SessionArtifactManifestStore {
     root: PathBuf,
+    address: Option<SessionControlAddress>,
     durability: CanonicalDurability,
     qualification: Option<CanonicalFilesystemQualification>,
 }
 
 impl SessionArtifactManifestStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            address: None,
             durability: CanonicalDurability::new(),
             qualification: None,
         }
     }
 
+    /// Construct a production-addressable, non-mutating Session store.
+    ///
+    /// Session validation deliberately precedes root conversion, path
+    /// derivation, qualification, and filesystem access.
+    pub fn for_session(
+        root: impl Into<PathBuf>,
+        session_id: &str,
+    ) -> Result<Self, ManifestStoreError> {
+        let address = session_control_address(session_id)?;
+        Ok(Self {
+            root: root.into(),
+            address: Some(address),
+            durability: CanonicalDurability::new(),
+            qualification: None,
+        })
+    }
+
     /// Bind one existing managed root to live production filesystem evidence.
-    pub fn qualified_existing_root(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
+    #[cfg(test)]
+    pub(crate) fn qualified_existing_root(
+        root: impl Into<PathBuf>,
+    ) -> Result<Self, ManifestStoreError> {
         let root = root.into();
         let (qualification, durability) =
             CanonicalFilesystemQualification::for_existing_managed_root(&root)
                 .map_err(ManifestStoreError::Qualification)?;
         Ok(Self {
             root,
+            address: None,
             durability,
             qualification: Some(qualification),
         })
     }
 
-    pub fn internal_identities(&self) -> ManifestInternalIdentities {
+    /// Bind one production-addressable Session at an existing managed root to
+    /// live filesystem qualification.
+    pub fn qualified_existing_session(
+        root: impl Into<PathBuf>,
+        session_id: &str,
+    ) -> Result<Self, ManifestStoreError> {
+        let address = session_control_address(session_id)?;
+        let root = root.into();
+        let (qualification, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&root)
+                .map_err(ManifestStoreError::Qualification)?;
+        Ok(Self {
+            root,
+            address: Some(address),
+            durability,
+            qualification: Some(qualification),
+        })
+    }
+
+    pub fn control_identities(&self) -> &SessionControlIdentities {
+        &self
+            .address
+            .as_ref()
+            .expect("production Session store has a control address")
+            .identities
+    }
+
+    pub(crate) fn internal_identities(&self) -> ManifestInternalIdentities {
         ManifestInternalIdentities {
             manifest: ManagedArtifactIdentity::internal(MANIFEST_FILE_NAME),
             temporary: ManagedArtifactIdentity::internal(MANIFEST_TEMP_FILE_NAME),
@@ -444,6 +666,101 @@ impl SessionArtifactManifestStore {
             return Ok(ManifestLoadOutcome::Absent);
         }
         let (manifest, _) = load_manifest_file(&manifest_path)?;
+        self.validate_requested_session(&manifest)?;
+        Ok(ManifestLoadOutcome::Present(Box::new(manifest)))
+    }
+
+    /// Read one complete Session snapshot while the store's coordination
+    /// boundary remains owned by this call.
+    pub fn checked_read<T, E>(
+        &self,
+        reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
+    ) -> Result<T, CheckedManifestReadError<E>> {
+        self.checked_read_inner(reader, || {})
+    }
+
+    fn checked_read_inner<T, E>(
+        &self,
+        reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
+        after_establishment: impl FnOnce(),
+    ) -> Result<T, CheckedManifestReadError<E>> {
+        let Some(qualification) = self.qualification.as_ref() else {
+            if self.durability.namespace_mutation_supported() {
+                return Err(CheckedManifestReadError::NamespaceQualificationRequired);
+            }
+            let manifest_before =
+                entry_exists(&self.manifest_path()).map_err(CheckedManifestReadError::Load)?;
+            let coordination_path = self.root.join(COORDINATION_FILE_NAME);
+            let coordination_before =
+                entry_exists(&coordination_path).map_err(CheckedManifestReadError::Load)?;
+            if coordination_before {
+                let _guard = self
+                    .durability
+                    .try_lock_shared(&self.root)
+                    .map_err(|error| {
+                        CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
+                    })?;
+                let head = self
+                    .load_selected_manifest()
+                    .map_err(CheckedManifestReadError::Load)?;
+                return reader(head).map_err(CheckedManifestReadError::Reader);
+            }
+            if manifest_before {
+                return Err(CheckedManifestReadError::Load(
+                    ManifestLoadError::Coordination(CanonicalCoordinationError::Missing),
+                ));
+            }
+            return Err(CheckedManifestReadError::UncoordinatedAbsence);
+        };
+        let guard = match self
+            .durability
+            .try_lock_shared_qualified(&self.root, qualification)
+        {
+            Ok(guard) => guard,
+            Err(CanonicalCoordinationError::Missing) => {
+                drop(
+                    self.durability
+                        .try_lock_exclusive_qualified(&self.root, qualification)
+                        .map_err(|error| {
+                            CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
+                        })?,
+                );
+                after_establishment();
+                self.durability
+                    .try_lock_shared_qualified(&self.root, qualification)
+                    .map_err(|error| {
+                        CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
+                    })?
+            }
+            Err(error) => {
+                return Err(CheckedManifestReadError::Load(
+                    ManifestLoadError::Coordination(error),
+                ));
+            }
+        };
+        let _guard = guard;
+        let head = self
+            .load_selected_manifest()
+            .map_err(CheckedManifestReadError::Load)?;
+        reader(head).map_err(CheckedManifestReadError::Reader)
+    }
+
+    #[cfg(test)]
+    fn checked_read_with_after_establishment<T, E>(
+        &self,
+        reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
+        after_establishment: impl FnOnce(),
+    ) -> Result<T, CheckedManifestReadError<E>> {
+        self.checked_read_inner(reader, after_establishment)
+    }
+
+    fn load_selected_manifest(&self) -> Result<ManifestLoadOutcome, ManifestLoadError> {
+        let manifest_path = self.manifest_path();
+        if !entry_exists(&manifest_path)? {
+            return Ok(ManifestLoadOutcome::Absent);
+        }
+        let (manifest, _) = load_manifest_file(&manifest_path)?;
+        self.validate_requested_session(&manifest)?;
         Ok(ManifestLoadOutcome::Present(Box::new(manifest)))
     }
 
@@ -462,6 +779,8 @@ impl SessionArtifactManifestStore {
         let (head, head_file) = if entry_exists(&manifest_path).map_err(ManifestStoreError::Load)? {
             let (head, file) =
                 load_manifest_file(&manifest_path).map_err(ManifestStoreError::Load)?;
+            self.validate_requested_session(&head)
+                .map_err(ManifestStoreError::Load)?;
             (Some(head), Some(file))
         } else {
             (None, None)
@@ -469,15 +788,54 @@ impl SessionArtifactManifestStore {
         Ok(ManifestWriteTransaction {
             guard,
             qualification: self.qualification.as_ref(),
+            expected_session_id: self
+                .address
+                .as_ref()
+                .map(|address| address.session_id.as_str()),
             manifest_path,
-            temporary_path: self.root.join(MANIFEST_TEMP_FILE_NAME),
+            temporary_path: self.temporary_path(),
+            provenance_path: self
+                .address
+                .as_ref()
+                .map(|address| self.root.join(address.identities.provenance.as_str())),
+            provenance_identity: self
+                .address
+                .as_ref()
+                .map(|address| address.identities.provenance.clone()),
             head,
             head_file,
         })
     }
 
     fn manifest_path(&self) -> PathBuf {
-        self.root.join(MANIFEST_FILE_NAME)
+        self.root
+            .join(self.address.as_ref().map_or(MANIFEST_FILE_NAME, |address| {
+                address.identities.manifest.as_str()
+            }))
+    }
+
+    fn temporary_path(&self) -> PathBuf {
+        self.root.join(
+            self.address
+                .as_ref()
+                .map_or(MANIFEST_TEMP_FILE_NAME, |address| {
+                    address.identities.temporary.as_str()
+                }),
+        )
+    }
+
+    fn validate_requested_session(
+        &self,
+        manifest: &SessionArtifactManifestV1,
+    ) -> Result<(), ManifestLoadError> {
+        if self
+            .address
+            .as_ref()
+            .is_some_and(|address| address.session_id != manifest.session_id)
+        {
+            return Err(ManifestLoadError::SessionMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn managed_root(&self) -> &Path {
@@ -491,6 +849,24 @@ impl SessionArtifactManifestStore {
             .map_err(ManifestStoreError::Coordination)?;
         Ok(Self {
             root,
+            address: None,
+            durability: CanonicalDurability::new(),
+            qualification: Some(qualification),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualified_for_test_session(
+        root: impl Into<PathBuf>,
+        session_id: &str,
+    ) -> Result<Self, ManifestStoreError> {
+        let address = session_control_address(session_id)?;
+        let root = root.into();
+        let qualification = CanonicalFilesystemQualification::for_test_root(&root)
+            .map_err(ManifestStoreError::Coordination)?;
+        Ok(Self {
+            root,
+            address: Some(address),
             durability: CanonicalDurability::new(),
             qualification: Some(qualification),
         })
@@ -506,6 +882,7 @@ impl SessionArtifactManifestStore {
         let (qualification, durability) = environment.into_parts();
         Ok(Self {
             root,
+            address: None,
             durability,
             qualification: Some(qualification),
         })
@@ -522,6 +899,7 @@ impl SessionArtifactManifestStore {
         let (qualification, durability) = environment.into_parts();
         Ok(Self {
             root,
+            address: None,
             durability,
             qualification: Some(qualification),
         })
@@ -531,9 +909,24 @@ impl SessionArtifactManifestStore {
     pub(crate) fn for_test_platform(root: impl Into<PathBuf>, platform: CanonicalPlatform) -> Self {
         Self {
             root: root.into(),
+            address: None,
             durability: CanonicalDurability::for_test_platform(platform),
             qualification: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_session_platform(
+        root: impl Into<PathBuf>,
+        session_id: &str,
+        platform: CanonicalPlatform,
+    ) -> Result<Self, ManifestStoreError> {
+        Ok(Self {
+            root: root.into(),
+            address: Some(session_control_address(session_id)?),
+            durability: CanonicalDurability::for_test_platform(platform),
+            qualification: None,
+        })
     }
 }
 
@@ -542,10 +935,29 @@ impl SessionArtifactManifestStore {
 pub struct ManifestWriteTransaction<'store> {
     guard: CanonicalExclusiveGuard,
     qualification: Option<&'store CanonicalFilesystemQualification>,
+    expected_session_id: Option<&'store str>,
     manifest_path: PathBuf,
     temporary_path: PathBuf,
+    provenance_path: Option<PathBuf>,
+    provenance_identity: Option<ManagedArtifactIdentity>,
     head: Option<SessionArtifactManifestV1>,
     head_file: Option<File>,
+}
+
+enum ManifestCasPreparation {
+    Install {
+        candidate: SessionArtifactManifestV1,
+        bytes: Vec<u8>,
+        recovery_key: CanonicalRecoveryKey,
+    },
+    AlreadyCompleted {
+        manifest: SessionArtifactManifestV1,
+    },
+}
+
+enum ManifestCasPreparationResult {
+    Prepared(Box<ManifestCasPreparation>),
+    Rejected(ManifestCasRejection),
 }
 
 impl ManifestWriteTransaction<'_> {
@@ -574,7 +986,317 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         candidate: SessionArtifactManifestV1,
     ) -> ManifestCasOutcome {
-        self.compare_and_swap_inner(expected_generation, candidate, false, None)
+        self.compare_and_swap_inner(expected_generation, candidate, false, false, None)
+    }
+
+    /// Durably establish the exact immutable v1-to-v2 proof before attempting
+    /// the manifest generation CAS. The returned value is the authoritative
+    /// manifest outcome; proof success alone is never reported as admission.
+    pub fn advance_session_semantics_v1_to_v2(
+        &mut self,
+        expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+        proof: SessionSemanticsTransitionProofV1,
+    ) -> ManifestCasOutcome {
+        self.advance_session_semantics_v1_to_v2_inner(
+            expected_generation,
+            candidate,
+            proof,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn advance_session_semantics_v1_to_v2_with_faults(
+        &mut self,
+        expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+        proof: SessionSemanticsTransitionProofV1,
+        intent_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        proof_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        manifest_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+    ) -> ManifestCasOutcome {
+        self.advance_session_semantics_v1_to_v2_inner(
+            expected_generation,
+            candidate,
+            proof,
+            intent_fault,
+            proof_fault,
+            manifest_fault,
+        )
+    }
+
+    fn advance_session_semantics_v1_to_v2_inner(
+        &mut self,
+        expected_generation: u64,
+        mut candidate: SessionArtifactManifestV1,
+        proof: SessionSemanticsTransitionProofV1,
+        _intent_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        _proof_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        _manifest_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+    ) -> ManifestCasOutcome {
+        let (Some(expected_session_id), Some(provenance_path), Some(provenance_identity)) = (
+            self.expected_session_id,
+            self.provenance_path.as_ref(),
+            self.provenance_identity.as_ref(),
+        ) else {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionAddressRequired);
+        };
+        if proof.session_id() != expected_session_id || candidate.session_id != expected_session_id
+        {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
+        }
+        if proof.idempotency_id() != candidate.transition.idempotency_id {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::IdempotencyConflict);
+        }
+        if candidate.session_semantics_version != SessionSemanticsVersion::V2
+            || candidate.transition.state != ManifestTransitionState::Completed
+        {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProof(
+                SessionSemanticsTransitionProofError::InvalidTransition,
+            ));
+        }
+        let (proof_bytes, proof_digest) = match proof.canonical_bytes_and_digest() {
+            Ok(proof) => proof,
+            Err(error) => {
+                return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProof(error));
+            }
+        };
+        let proof_length = u64::try_from(proof_bytes.len()).unwrap_or(u64::MAX);
+        let proof_recovery_prefix_len =
+            match SessionSemanticsTransitionProofV1::recovery_identity_prefix_len(&proof_bytes) {
+                Ok(prefix_len) => prefix_len,
+                Err(error) => {
+                    return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProof(
+                        error,
+                    ));
+                }
+            };
+        candidate.transition.fingerprint = proof_digest.clone();
+        let mut provenance_entries = candidate
+            .artifacts
+            .iter_mut()
+            .filter(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents);
+        let Some(provenance) = provenance_entries.next() else {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::InvalidV2SessionProvenance(
+                    V2SessionProvenanceError::Missing,
+                ),
+            ));
+        };
+        if provenance_entries.next().is_some() {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::InvalidV2SessionProvenance(
+                    V2SessionProvenanceError::Duplicate,
+                ),
+            ));
+        }
+        provenance.managed_identity = provenance_identity.clone();
+        match &mut provenance.availability {
+            ArtifactAvailability::Present { content } => {
+                *content = ArtifactContentIdentity {
+                    sha256: proof_digest.clone(),
+                    byte_length: proof_length,
+                };
+            }
+            ArtifactAvailability::Unavailable { .. } => {
+                return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                    ManifestValidationError::InvalidV2SessionProvenance(
+                        V2SessionProvenanceError::Unavailable,
+                    ),
+                ));
+            }
+            ArtifactAvailability::Residual { .. } => {
+                return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                    ManifestValidationError::InvalidV2SessionProvenance(
+                        V2SessionProvenanceError::Residual,
+                    ),
+                ));
+            }
+        }
+        if let Err(error) = validate_candidate_and_normalize(&mut candidate) {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
+        }
+        let preparation = match self.prepare_compare_and_swap(expected_generation, candidate, true)
+        {
+            ManifestCasPreparationResult::Prepared(preparation) => *preparation,
+            ManifestCasPreparationResult::Rejected(rejection) => {
+                return ManifestCasOutcome::Rejected(rejection);
+            }
+        };
+
+        if let Err(rejection) =
+            self.guard
+                .preflight_immutable_exact(provenance_path, &proof_bytes, self.qualification)
+        {
+            return ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(rejection));
+        }
+
+        // `Some(key)` from here on means this transaction owns a durable intent
+        // temporary that outlives any later refusal.
+        let staged_intent_recovery_key = if let ManifestCasPreparation::Install {
+            bytes,
+            recovery_key,
+            ..
+        } = &preparation
+        {
+            let expectation = self
+                .head_file
+                .as_ref()
+                .map_or(CanonicalSnapshotExpectation::Absent, |file| {
+                    CanonicalSnapshotExpectation::Existing(file)
+                });
+            let intent_outcome = {
+                #[cfg(test)]
+                if let Some(intent_fault) = _intent_fault {
+                    self.guard.stage_snapshot_temporary_with_fault(
+                        &self.temporary_path,
+                        &self.manifest_path,
+                        bytes,
+                        expectation,
+                        self.qualification,
+                        *recovery_key,
+                        intent_fault,
+                    )
+                } else {
+                    self.guard.stage_snapshot_temporary(
+                        &self.temporary_path,
+                        &self.manifest_path,
+                        bytes,
+                        expectation,
+                        self.qualification,
+                        *recovery_key,
+                    )
+                }
+
+                #[cfg(not(test))]
+                self.guard.stage_snapshot_temporary(
+                    &self.temporary_path,
+                    &self.manifest_path,
+                    bytes,
+                    expectation,
+                    self.qualification,
+                    *recovery_key,
+                )
+            };
+            match intent_outcome {
+                CanonicalDurabilityOutcome::Accepted(_) => Some(*recovery_key),
+                CanonicalDurabilityOutcome::Rejected(rejection) => {
+                    return ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                        rejection,
+                    ));
+                }
+                CanonicalDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
+                    return ManifestCasOutcome::DurabilityIndeterminate(indeterminate);
+                }
+            }
+        } else {
+            None
+        };
+
+        let proof_recovery_key = recovery_key(&proof_digest);
+        let proof_outcome = {
+            #[cfg(test)]
+            if let Some(proof_fault) = _proof_fault {
+                match &preparation {
+                    ManifestCasPreparation::Install { bytes, .. } => self
+                        .guard
+                        .create_or_reconcile_immutable_exact_with_authentication_and_fault(
+                            provenance_path,
+                            &proof_bytes,
+                            &self.temporary_path,
+                            bytes,
+                            self.qualification,
+                            proof_recovery_key,
+                            proof_fault,
+                        ),
+                    ManifestCasPreparation::AlreadyCompleted { .. } => self
+                        .guard
+                        .create_or_reconcile_immutable_exact_with_identity_prefix_and_fault(
+                            provenance_path,
+                            &proof_bytes,
+                            proof_recovery_prefix_len,
+                            self.qualification,
+                            proof_recovery_key,
+                            proof_fault,
+                        ),
+                }
+            } else {
+                match &preparation {
+                    ManifestCasPreparation::Install { bytes, .. } => self
+                        .guard
+                        .create_or_reconcile_immutable_exact_with_authentication(
+                            provenance_path,
+                            &proof_bytes,
+                            &self.temporary_path,
+                            bytes,
+                            self.qualification,
+                            proof_recovery_key,
+                        ),
+                    ManifestCasPreparation::AlreadyCompleted { .. } => self
+                        .guard
+                        .create_or_reconcile_immutable_exact_with_identity_prefix(
+                            provenance_path,
+                            &proof_bytes,
+                            proof_recovery_prefix_len,
+                            self.qualification,
+                            proof_recovery_key,
+                        ),
+                }
+            }
+
+            #[cfg(not(test))]
+            match &preparation {
+                ManifestCasPreparation::Install { bytes, .. } => self
+                    .guard
+                    .create_or_reconcile_immutable_exact_with_authentication(
+                        provenance_path,
+                        &proof_bytes,
+                        &self.temporary_path,
+                        bytes,
+                        self.qualification,
+                        proof_recovery_key,
+                    ),
+                ManifestCasPreparation::AlreadyCompleted { .. } => self
+                    .guard
+                    .create_or_reconcile_immutable_exact_with_identity_prefix(
+                        provenance_path,
+                        &proof_bytes,
+                        proof_recovery_prefix_len,
+                        self.qualification,
+                        proof_recovery_key,
+                    ),
+            }
+        };
+        match proof_outcome {
+            CanonicalDurabilityOutcome::Accepted(_) => {}
+            // A proof refusal is only a refusal of the whole transaction when
+            // this transaction staged nothing of its own. Once the intent
+            // temporary is durable it survives the refusal, so the outcome must
+            // name it and hand back the key that identifies it.
+            CanonicalDurabilityOutcome::Rejected(rejection) => {
+                return ManifestCasOutcome::Rejected(match staged_intent_recovery_key {
+                    Some(recovery_key) => {
+                        ManifestCasRejection::TransitionProofRefusedAfterIntentStaged {
+                            rejection,
+                            recovery_key,
+                        }
+                    }
+                    None => ManifestCasRejection::Durability(rejection),
+                });
+            }
+            CanonicalDurabilityOutcome::DurabilityIndeterminate(indeterminate) => {
+                return ManifestCasOutcome::DurabilityIndeterminate(indeterminate);
+            }
+        }
+
+        #[cfg(test)]
+        if let Some(manifest_fault) = _manifest_fault {
+            return self.commit_prepared_compare_and_swap(preparation, true, Some(manifest_fault));
+        }
+        self.commit_prepared_compare_and_swap(preparation, true, None)
     }
 
     pub(crate) fn compare_and_swap_recovery(
@@ -582,7 +1304,7 @@ impl ManifestWriteTransaction<'_> {
         expected_generation: u64,
         candidate: SessionArtifactManifestV1,
     ) -> ManifestCasOutcome {
-        self.compare_and_swap_inner(expected_generation, candidate, true, None)
+        self.compare_and_swap_inner(expected_generation, candidate, false, true, None)
     }
 
     #[cfg(test)]
@@ -592,117 +1314,162 @@ impl ManifestWriteTransaction<'_> {
         candidate: SessionArtifactManifestV1,
         injected_fault: super::canonical_durability::CanonicalDurabilityStage,
     ) -> ManifestCasOutcome {
-        self.compare_and_swap_inner(expected_generation, candidate, true, Some(injected_fault))
+        self.compare_and_swap_inner(
+            expected_generation,
+            candidate,
+            false,
+            true,
+            Some(injected_fault),
+        )
     }
 
-    fn compare_and_swap_inner(
-        &mut self,
+    fn prepare_compare_and_swap(
+        &self,
         expected_generation: u64,
         mut candidate: SessionArtifactManifestV1,
-        resume_temporary: bool,
-        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
-    ) -> ManifestCasOutcome {
+        proof_owned: bool,
+    ) -> ManifestCasPreparationResult {
+        let reject = ManifestCasPreparationResult::Rejected;
+        if self
+            .expected_session_id
+            .is_some_and(|expected| expected != candidate.session_id)
+        {
+            return reject(ManifestCasRejection::SessionMismatch);
+        }
         if let Err(error) = validate_candidate_and_normalize(&mut candidate) {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
+            return reject(ManifestCasRejection::Validation(error));
+        }
+        // audio-graph-3b53 B4 is KNOWN OPEN here, deliberately: an addressed
+        // Session that reaches V2 cannot record a later generation, because this
+        // gate keys on the candidate's floor rather than on whether this call
+        // performs the transition.
+        //
+        // Re-keying it on "this call advances the head" was implemented and
+        // REVERTED. Relaxing the gate for an already-advanced head lets the
+        // generic `compare_and_swap` install a V2 candidate carrying a FORGED
+        // provenance entry: `validate_v2_session_provenance` only checks that
+        // `manifest.transition.fingerprint == content.sha256` for the candidate's
+        // own entry (:1868), which is internal self-consistency with no
+        // reference to the durable proof record, so a caller that controls both
+        // fields satisfies it while the real proof sits untouched at the control
+        // identity. Pre-fix that path was unreachable because every V2 candidate
+        // through the generic CAS was refused here.
+        //
+        // Re-keying is therefore blocked on a binding that does not exist yet:
+        // the candidate's provenance entry must be proven to reference the
+        // durable proof record. Until that lands, this gate trades a liveness
+        // wedge for a forgery hole, so the wedge stays.
+        if self.expected_session_id.is_some()
+            && candidate.session_semantics_version == SessionSemanticsVersion::V2
+            && !proof_owned
+        {
+            return reject(ManifestCasRejection::TransitionProofRequired);
         }
 
         if let Some(head) = &self.head {
             if head.session_id != candidate.session_id {
-                return ManifestCasOutcome::Rejected(ManifestCasRejection::SessionMismatch);
+                return reject(ManifestCasRejection::SessionMismatch);
             }
             if candidate.session_semantics_version < head.session_semantics_version {
-                return ManifestCasOutcome::Rejected(
-                    ManifestCasRejection::SessionSemanticsFloorRegression {
-                        current: head.session_semantics_version,
-                        candidate: candidate.session_semantics_version,
-                    },
-                );
+                return reject(ManifestCasRejection::SessionSemanticsFloorRegression {
+                    current: head.session_semantics_version,
+                    candidate: candidate.session_semantics_version,
+                });
             }
             match head.transition.state {
                 ManifestTransitionState::Prepared => {
                     if head.transition.idempotency_id != candidate.transition.idempotency_id {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::PreparedTransitionReplacement,
-                        );
+                        return reject(ManifestCasRejection::PreparedTransitionReplacement);
                     }
                     if head.transition.fingerprint != candidate.transition.fingerprint {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::IdempotencyConflict,
-                        );
+                        return reject(ManifestCasRejection::IdempotencyConflict);
                     }
                     if candidate.transition.state != ManifestTransitionState::Completed
                         || candidate.quarantine_transaction.is_none()
                         || !prepared_completion_matches(head, &candidate)
                     {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::PreparedCompletionConflict,
-                        );
+                        return reject(ManifestCasRejection::PreparedCompletionConflict);
                     }
                 }
                 ManifestTransitionState::Completed
                     if head.transition.idempotency_id == candidate.transition.idempotency_id =>
                 {
                     if head.transition.fingerprint != candidate.transition.fingerprint {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::IdempotencyConflict,
-                        );
+                        return reject(ManifestCasRejection::IdempotencyConflict);
                     }
                     if candidate.transition.state == ManifestTransitionState::Prepared {
-                        return ManifestCasOutcome::Rejected(
-                            ManifestCasRejection::CompletedRegression,
-                        );
+                        return reject(ManifestCasRejection::CompletedRegression);
                     }
                     candidate.generation = head.generation;
                     if candidate == *head {
-                        return ManifestCasOutcome::AlreadyCompleted {
-                            manifest: head.clone(),
-                        };
+                        return ManifestCasPreparationResult::Prepared(Box::new(
+                            ManifestCasPreparation::AlreadyCompleted {
+                                manifest: head.clone(),
+                            },
+                        ));
                     }
-                    return ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionConflict);
+                    return reject(ManifestCasRejection::TransitionConflict);
                 }
                 ManifestTransitionState::Completed
                     if candidate.quarantine_transaction.is_some()
                         && candidate.transition.state == ManifestTransitionState::Completed =>
                 {
-                    return ManifestCasOutcome::Rejected(
-                        ManifestCasRejection::CompletionRequiresPrepared,
-                    );
+                    return reject(ManifestCasRejection::CompletionRequiresPrepared);
                 }
                 ManifestTransitionState::Completed => {}
             }
         } else if candidate.quarantine_transaction.is_some()
             && candidate.transition.state == ManifestTransitionState::Completed
         {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::CompletionRequiresPrepared);
+            return reject(ManifestCasRejection::CompletionRequiresPrepared);
         }
 
         let actual_generation = self.head.as_ref().map_or(0, |head| head.generation);
         if expected_generation != actual_generation {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::GenerationConflict {
+            return reject(ManifestCasRejection::GenerationConflict {
                 expected: expected_generation,
                 actual: actual_generation,
             });
         }
         let Some(next_generation) = expected_generation.checked_add(1) else {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::GenerationOverflow);
+            return reject(ManifestCasRejection::GenerationOverflow);
         };
         candidate.generation = next_generation;
         if let Err(error) = validate_persisted_and_normalize(&mut candidate) {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(error));
+            return reject(ManifestCasRejection::Validation(error));
         }
         let bytes = match serde_json::to_vec(&candidate) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                return ManifestCasOutcome::Rejected(ManifestCasRejection::Serialization);
-            }
+            Err(_) => return reject(ManifestCasRejection::Serialization),
         };
         let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if byte_length > MAX_MANIFEST_BYTES {
-            return ManifestCasOutcome::Rejected(ManifestCasRejection::ManifestTooLarge {
-                byte_length,
-            });
+            return reject(ManifestCasRejection::ManifestTooLarge { byte_length });
         }
         let recovery_key = recovery_key(&candidate.transition.fingerprint);
+        ManifestCasPreparationResult::Prepared(Box::new(ManifestCasPreparation::Install {
+            candidate,
+            bytes,
+            recovery_key,
+        }))
+    }
+
+    fn commit_prepared_compare_and_swap(
+        &mut self,
+        preparation: ManifestCasPreparation,
+        resume_temporary: bool,
+        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+    ) -> ManifestCasOutcome {
+        let (candidate, bytes, recovery_key) = match preparation {
+            ManifestCasPreparation::Install {
+                candidate,
+                bytes,
+                recovery_key,
+            } => (candidate, bytes, recovery_key),
+            ManifestCasPreparation::AlreadyCompleted { manifest } => {
+                return ManifestCasOutcome::AlreadyCompleted { manifest };
+            }
+        };
         let expectation = self
             .head_file
             .as_ref()
@@ -731,6 +1498,7 @@ impl ManifestWriteTransaction<'_> {
                     recovery_key,
                 )
             }
+
             #[cfg(not(test))]
             self.guard.install_snapshot_recovery(
                 &self.temporary_path,
@@ -779,6 +1547,24 @@ impl ManifestWriteTransaction<'_> {
                 ManifestCasOutcome::DurabilityIndeterminate(indeterminate)
             }
         }
+    }
+
+    fn compare_and_swap_inner(
+        &mut self,
+        expected_generation: u64,
+        candidate: SessionArtifactManifestV1,
+        proof_owned: bool,
+        resume_temporary: bool,
+        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+    ) -> ManifestCasOutcome {
+        let preparation =
+            match self.prepare_compare_and_swap(expected_generation, candidate, proof_owned) {
+                ManifestCasPreparationResult::Prepared(preparation) => *preparation,
+                ManifestCasPreparationResult::Rejected(rejection) => {
+                    return ManifestCasOutcome::Rejected(rejection);
+                }
+            };
+        self.commit_prepared_compare_and_swap(preparation, resume_temporary, _injected_fault)
     }
 }
 
@@ -1324,6 +2110,46 @@ fn recovery_key(fingerprint: &Sha256Digest) -> CanonicalRecoveryKey {
     CanonicalRecoveryKey::from_opaque_bytes(bytes)
 }
 
+fn session_control_address(session_id: &str) -> Result<SessionControlAddress, ManifestStoreError> {
+    if !crate::sessions::session_id_is_valid(session_id) {
+        return Err(ManifestStoreError::InvalidSessionAddress);
+    }
+    let key = encode_lowercase_base32(session_id.as_bytes());
+    let identity =
+        |suffix: &str| ManagedArtifactIdentity(format!("{SESSION_CONTROL_PREFIX}{key}{suffix}"));
+    Ok(SessionControlAddress {
+        session_id: session_id.to_owned(),
+        identities: SessionControlIdentities {
+            manifest: identity("-artifacts.v1.json"),
+            temporary: identity("-artifacts.v1.tmp"),
+            provenance: identity("-v1-v2.provenance"),
+            coordination: ManagedArtifactIdentity::internal(COORDINATION_FILE_NAME),
+        },
+    })
+}
+
+fn encode_lowercase_base32(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut encoded = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let mut accumulator = 0_u16;
+    let mut available_bits = 0_u8;
+    for &byte in bytes {
+        accumulator = (accumulator << 8) | u16::from(byte);
+        available_bits += 8;
+        while available_bits >= 5 {
+            available_bits -= 5;
+            let index = usize::from((accumulator >> available_bits) & 0x1f);
+            encoded.push(char::from(ALPHABET[index]));
+            accumulator &= (1_u16 << available_bits).saturating_sub(1);
+        }
+    }
+    if available_bits != 0 {
+        let index = usize::from((accumulator << (5 - available_bits)) & 0x1f);
+        encoded.push(char::from(ALPHABET[index]));
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,6 +2332,281 @@ mod tests {
     fn write_manifest_bytes(store: &SessionArtifactManifestStore, bytes: &[u8]) {
         create_coordination_entry(store);
         std::fs::write(store.manifest_path(), bytes).expect("write manifest fixture");
+    }
+
+    #[test]
+    fn production_session_store_derives_exact_portable_control_identities_without_io() {
+        let root = missing_root("production-session-address");
+
+        let store = SessionArtifactManifestStore::for_session(&root, "A")
+            .expect("address one validated Session");
+        let identities = store.control_identities();
+
+        assert_eq!(
+            identities.manifest.as_str(),
+            ".audio-graph-session-ie-artifacts.v1.json"
+        );
+        assert_eq!(
+            identities.temporary.as_str(),
+            ".audio-graph-session-ie-artifacts.v1.tmp"
+        );
+        assert_eq!(
+            identities.provenance.as_str(),
+            ".audio-graph-session-ie-v1-v2.provenance"
+        );
+        assert_eq!(identities.coordination.as_str(), COORDINATION_FILE_NAME);
+        assert!(!root.exists(), "address derivation must not touch the root");
+    }
+
+    #[test]
+    fn production_session_address_uses_narrow_sessions_validation_without_narrowing_wire() {
+        let missing = missing_root("production-address-validation");
+        let max_addressable = "a".repeat(128);
+        let too_long = "a".repeat(129);
+        let broad_max = "b".repeat(255);
+
+        assert!(SessionArtifactManifestStore::for_session(&missing, &max_addressable).is_ok());
+        for ineligible in [&too_long, "session-é", &broad_max] {
+            assert!(matches!(
+                SessionArtifactManifestStore::for_session(&missing, ineligible),
+                Err(ManifestStoreError::InvalidSessionAddress)
+            ));
+        }
+        assert!(!missing.exists(), "address refusal must perform no I/O");
+
+        for wire_only in ["session-é", broad_max.as_str()] {
+            assert!(
+                SessionArtifactManifestV1::candidate(
+                    wire_only,
+                    transition("wire-only", 'a', ManifestTransitionState::Completed),
+                    vec![original_audio(ArtifactAvailability::Unavailable {
+                        reason: ArtifactUnavailableReason::NeverCaptured,
+                    })],
+                    None,
+                )
+                .is_ok(),
+                "dormant manifest wire remains broad for {wire_only:?}"
+            );
+        }
+
+        let upper = SessionArtifactManifestStore::for_session(&missing, "Session-A")
+            .expect("uppercase address");
+        let lower = SessionArtifactManifestStore::for_session(&missing, "session-a")
+            .expect("lowercase address");
+        assert_ne!(
+            upper.control_identities().manifest,
+            lower.control_identities().manifest
+        );
+    }
+
+    #[test]
+    fn two_session_addresses_share_only_the_store_coordination_identity() {
+        let root = missing_root("two-session-addresses");
+        let first = SessionArtifactManifestStore::for_session(&root, "session-1")
+            .expect("first Session address");
+        let second = SessionArtifactManifestStore::for_session(&root, "session-2")
+            .expect("second Session address");
+        let first = first.control_identities();
+        let second = second.control_identities();
+
+        assert_ne!(first.manifest, second.manifest);
+        assert_ne!(first.temporary, second.temporary);
+        assert_ne!(first.provenance, second.provenance);
+        assert_eq!(first.coordination, second.coordination);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn production_session_load_refuses_requested_manifest_mismatch() {
+        let root = root("production-session-mismatch");
+        let store = SessionArtifactManifestStore::for_session(&root, "session-1")
+            .expect("requested Session store");
+        let mut foreign = basic_candidate("foreign-head", 'a');
+        foreign.session_id = "session-2".to_owned();
+        foreign.generation = 1;
+        write_manifest_bytes(
+            &store,
+            &serde_json::to_vec(&foreign).expect("foreign manifest bytes"),
+        );
+
+        assert_eq!(store.load(), Err(ManifestLoadError::SessionMismatch));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_qualified_session_stores_persist_independent_manifest_heads() {
+        let root = root("two-qualified-session-heads");
+        let first = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("first qualified Session store");
+        let second = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-2")
+            .expect("second qualified Session store");
+
+        let mut first_write = first.begin_write().expect("first transaction");
+        assert!(matches!(
+            first_write.compare_and_swap(0, basic_candidate("first", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(first_write);
+
+        let mut second_candidate = basic_candidate("second", 'b');
+        second_candidate.session_id = "session-2".to_owned();
+        let mut second_write = second.begin_write().expect("second transaction");
+        assert!(matches!(
+            second_write.compare_and_swap(0, second_candidate),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(second_write);
+
+        assert!(matches!(
+            first.load().expect("first head"),
+            ManifestLoadOutcome::Present(manifest) if manifest.session_id == "session-1"
+        ));
+        assert!(matches!(
+            second.load().expect("second head"),
+            ManifestLoadOutcome::Present(manifest) if manifest.session_id == "session-2"
+        ));
+        assert_ne!(first.manifest_path(), second.manifest_path());
+        assert!(root.join(COORDINATION_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn qualified_checked_read_establishes_global_lock_and_revalidates_absent_session() {
+        let root = root("qualified-checked-read-absent");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        assert!(!root.join(COORDINATION_FILE_NAME).exists());
+
+        let observed = store
+            .checked_read(|head| {
+                assert!(root.join(COORDINATION_FILE_NAME).is_file());
+                Ok::<_, ()>(head)
+            })
+            .expect("checked absent Session read");
+
+        assert_eq!(observed, ManifestLoadOutcome::Absent);
+        assert!(root.join(COORDINATION_FILE_NAME).is_file());
+        assert!(!store.manifest_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_checked_read_holds_shared_guard_through_present_snapshot_closure() {
+        let root = root("qualified-checked-read-present");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let mut write = store.begin_write().expect("seed manifest head");
+        assert!(matches!(
+            write.compare_and_swap(0, basic_candidate("seed-head", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        drop(write);
+
+        store
+            .checked_read(|head| {
+                assert!(matches!(head, ManifestLoadOutcome::Present(_)));
+                assert!(matches!(
+                    store.begin_write(),
+                    Err(ManifestStoreError::Coordination(
+                        CanonicalCoordinationError::Contended
+                    ))
+                ));
+                Ok::<_, ()>(())
+            })
+            .expect("guard-owned present read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_checked_read_observes_writer_winning_after_lock_establishment() {
+        let root = root("qualified-checked-read-writer-win");
+        let reader = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified reader");
+        let writer = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified writer");
+
+        let observed = reader
+            .checked_read_with_after_establishment(Ok::<_, ()>, || {
+                let mut transaction = writer.begin_write().expect("winning writer");
+                assert!(matches!(
+                    transaction.compare_and_swap(0, basic_candidate("writer-win", 'a')),
+                    ManifestCasOutcome::Accepted { .. }
+                ));
+            })
+            .expect("checked reader observes winning writer");
+
+        assert!(matches!(
+            observed,
+            ManifestLoadOutcome::Present(manifest) if manifest.transition.idempotency_id == "writer-win"
+        ));
+    }
+
+    #[test]
+    fn unqualified_absent_checked_read_refuses_before_reader_when_aba_is_unobservable() {
+        use std::cell::Cell;
+
+        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+            for transient in ["manifest", "lock"] {
+                let root = root(&format!("unqualified-{platform:?}-{transient}-aba-refusal"));
+                let store = SessionArtifactManifestStore::for_test_session_platform(
+                    &root,
+                    "session-1",
+                    platform,
+                )
+                .expect("read-only Session store");
+                let transient_path = if transient == "manifest" {
+                    store.manifest_path()
+                } else {
+                    root.join(COORDINATION_FILE_NAME)
+                };
+                std::fs::write(&transient_path, b"transient appearance")
+                    .expect("seed transient identity");
+                std::fs::remove_file(&transient_path).expect("complete ABA disappearance");
+                let reader_invoked = Cell::new(false);
+
+                let outcome = store.checked_read(|_| {
+                    reader_invoked.set(true);
+                    Ok::<_, ()>("manifest-or-lock ABA must not escape")
+                });
+
+                assert_eq!(outcome, Err(CheckedManifestReadError::UncoordinatedAbsence));
+                assert!(!reader_invoked.get());
+                assert!(
+                    std::fs::read_dir(&root)
+                        .expect("read unchanged root")
+                        .next()
+                        .is_none(),
+                    "fail-closed absent read must create nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unqualified_windows_other_checked_read_uses_existing_global_shared_guard() {
+        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+            let root = root(&format!("unqualified-{platform:?}-present-read"));
+            let store = SessionArtifactManifestStore::for_test_session_platform(
+                &root,
+                "session-1",
+                platform,
+            )
+            .expect("read-only Session store");
+            let mut present = basic_candidate("present-head", 'a');
+            present.generation = 1;
+            write_manifest_bytes(
+                &store,
+                &serde_json::to_vec(&present).expect("present manifest bytes"),
+            );
+
+            let observed = store
+                .checked_read(Ok::<_, ()>)
+                .expect("guarded read-only present Session");
+            assert!(matches!(
+                observed,
+                ManifestLoadOutcome::Present(manifest)
+                    if manifest.transition.idempotency_id == "present-head"
+            ));
+        }
     }
 
     #[test]
@@ -1740,6 +2841,37 @@ mod tests {
     }
 
     #[test]
+    fn v1_to_v2_transition_proof_has_exact_digest_free_canonical_wire() {
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-floor-v2")
+            .expect("valid transition proof");
+        let (bytes, digest) = proof
+            .canonical_bytes_and_digest()
+            .expect("canonical proof bytes");
+        let expected = b"{\"schema_version\":1,\"session_id\":\"session-1\",\"from\":1,\"to\":2,\"idempotency_id\":\"advance-floor-v2\",\"transition_kind\":\"session_semantics_advance\"}";
+
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len(), 143);
+        assert_eq!(
+            digest.as_str(),
+            "sha256:1d796c12d556471fbfca4381957a80e82f3139259c6c974a190730fa69c6b0e6"
+        );
+        assert_eq!(
+            SessionSemanticsTransitionProofV1::from_canonical_bytes(&bytes),
+            Ok(proof)
+        );
+
+        for forbidden in [
+            b"{\"schema_version\":1,\"session_id\":\"session-1\",\"from\":1,\"to\":2,\"idempotency_id\":\"advance-floor-v2\",\"transition_kind\":\"session_semantics_advance\",\"proof_sha256\":\"self\"}".as_slice(),
+            b"{\"schema_version\":1,\"session_id\":\"session-1\",\"from\":1,\"to\":2,\"idempotency_id\":\"advance-floor-v2\",\"transition_kind\":\"session_semantics_advance\",\"content_digest\":\"self\"}".as_slice(),
+        ] {
+            assert_eq!(
+                SessionSemanticsTransitionProofV1::from_canonical_bytes(forbidden),
+                Err(SessionSemanticsTransitionProofError::Malformed)
+            );
+        }
+    }
+
+    #[test]
     fn v1_wire_is_a_deterministic_golden_roundtrip() {
         let mut candidate = basic_candidate("tx-1", 'a');
         candidate.generation = 1;
@@ -1946,6 +3078,976 @@ mod tests {
                 candidate: super::super::session_semantics::SessionSemanticsVersion::V1,
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proof_before_manifest_transition_returns_actual_accepted_and_already_completed() {
+        let root = root("proof-before-manifest-accepted-retry");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-floor-v2")
+            .expect("transition proof");
+        let candidate = v2_candidate("advance-floor-v2");
+        let expected_digest =
+            "sha256:1d796c12d556471fbfca4381957a80e82f3139259c6c974a190730fa69c6b0e6";
+        let proof_path = root.join(store.control_identities().provenance.as_str());
+        let mut transaction = store.begin_write().expect("transition transaction");
+
+        let accepted =
+            transaction.advance_session_semantics_v1_to_v2(0, candidate.clone(), proof.clone());
+        let accepted_manifest = match accepted {
+            ManifestCasOutcome::Accepted { manifest, .. } => manifest,
+            other => panic!("expected actual Accepted outcome, got {other:?}"),
+        };
+        assert_eq!(accepted_manifest.generation, 1);
+        assert_eq!(
+            accepted_manifest.transition.fingerprint.as_str(),
+            expected_digest
+        );
+        let provenance = accepted_manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+            .expect("Session provenance entry");
+        assert_eq!(
+            provenance.managed_identity,
+            store.control_identities().provenance,
+            "persisted provenance inventory must name the proof that was written"
+        );
+        assert_eq!(
+            provenance.availability,
+            ArtifactAvailability::Present {
+                content: ArtifactContentIdentity {
+                    sha256: Sha256Digest::new(expected_digest).expect("expected digest"),
+                    byte_length: 143,
+                }
+            }
+        );
+        let proof_bytes = std::fs::read(&proof_path).expect("durable proof precedes manifest");
+        assert_eq!(proof_bytes.len(), 143);
+
+        assert_eq!(
+            transaction.advance_session_semantics_v1_to_v2(1, candidate, proof),
+            ManifestCasOutcome::AlreadyCompleted {
+                manifest: accepted_manifest.clone(),
+            }
+        );
+        assert_eq!(
+            std::fs::read(&proof_path).expect("exact proof remains one record"),
+            proof_bytes
+        );
+        drop(transaction);
+        let reopened = match store.load().expect("reopen persisted manifest") {
+            ManifestLoadOutcome::Present(manifest) => manifest,
+            ManifestLoadOutcome::Absent => panic!("accepted manifest disappeared"),
+        };
+        let reopened_provenance = reopened
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+            .expect("reopened Session provenance entry");
+        assert_eq!(
+            reopened_provenance.managed_identity,
+            store.control_identities().provenance
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn addressed_generic_cas_cannot_install_v2_without_owning_proof_bytes() {
+        let root = root("addressed-generic-v2-bypass");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified addressed store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let mut transaction = store.begin_write().expect("addressed transaction");
+
+        assert_eq!(
+            transaction.compare_and_swap(0, v2_candidate("advance-only-with-proof")),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProofRequired)
+        );
+        assert!(!manifest_path.exists());
+        assert!(!temporary_path.exists());
+        assert!(!provenance_path.exists());
+
+        assert!(matches!(
+            transaction.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate("advance-only-with-proof"),
+                SessionSemanticsTransitionProofV1::v1_to_v2(
+                    "session-1",
+                    "advance-only-with-proof",
+                )
+                .expect("proof-owning transition"),
+            ),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+    }
+
+    /// audio-graph-3b53 B4 is KNOWN OPEN and this test pins it as a REFUSAL, not
+    /// as working behaviour.
+    ///
+    /// Once an addressed Session has a committed V2 head it cannot record a later
+    /// generation: the transition-proof gate keys on the candidate's floor rather
+    /// than on whether this call performs the advance. That is a liveness wedge.
+    ///
+    /// Re-keying the gate on "this call advances the head" was implemented and
+    /// reverted, because relaxing it for an already-advanced head lets the generic
+    /// CAS install a V2 candidate carrying a FORGED provenance entry:
+    /// `validate_v2_session_provenance` only compares the candidate's own
+    /// `transition.fingerprint` against its own provenance entry's `content.sha256`,
+    /// which never references the durable proof record. A caller controlling both
+    /// fields satisfies it while the real proof sits untouched.
+    ///
+    /// So this asserts the wedge deliberately. Re-keying is blocked until the
+    /// candidate's provenance entry can be proven to reference the durable proof;
+    /// when that binding exists, this test should be inverted, not deleted.
+    #[cfg(unix)]
+    #[test]
+    fn committed_v2_head_refuses_later_generations_until_proof_binding_exists() {
+        let root = root("committed-v2-second-generation");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified addressed store");
+        let transition_id = "advance-then-export";
+        let mut transaction = store.begin_write().expect("addressed transaction");
+        let advanced = match transaction.advance_session_semantics_v1_to_v2(
+            0,
+            v2_candidate(transition_id),
+            SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+                .expect("transition proof"),
+        ) {
+            ManifestCasOutcome::Accepted { manifest, .. } => manifest,
+            other => panic!("expected the advance to be accepted, got {other:?}"),
+        };
+        assert_eq!(advanced.generation, 1);
+
+        let export = SessionArtifactEntry {
+            kind: SessionArtifactKind::MaterializedNotes,
+            privacy_class: ArtifactPrivacyClass::DerivedSessionMemory,
+            managed_identity: identity("exports/notes.md"),
+            availability: ArtifactAvailability::Present {
+                content: content('c', 64),
+            },
+        };
+        let mut second = advanced.clone();
+        second.generation = 0;
+        second.transition.idempotency_id = "export-notes-1".to_owned();
+        second.artifacts.push(export);
+
+        // The wedge: a same-floor generation that transitions nothing is still
+        // refused for want of proof bytes this call does not own.
+        assert_eq!(
+            transaction.compare_and_swap(1, second),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::TransitionProofRequired),
+            "B4 is open: an advanced Session still cannot record a later generation"
+        );
+
+        // The property the wedge is protecting, and the reason it cannot simply be
+        // relaxed: nothing here binds a candidate's provenance entry to the
+        // durable proof record.
+        assert_eq!(
+            transaction.compare_and_swap(1, basic_candidate("tx-post-v2-regression", 'd')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::SessionSemanticsFloorRegression {
+                current: super::super::session_semantics::SessionSemanticsVersion::V2,
+                candidate: super::super::session_semantics::SessionSemanticsVersion::V1,
+            }),
+            "a V1 candidate against a V2 head is still a floor regression"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proof_conflict_and_indeterminate_prevent_manifest_mutation_then_retry_converges() {
+        let conflict_root = root("proof-conflict-before-manifest");
+        let conflict_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&conflict_root, "session-1")
+                .expect("qualified conflict store");
+        let conflict_proof_path =
+            conflict_root.join(conflict_store.control_identities().provenance.as_str());
+        let conflict_temp_path = conflict_store.temporary_path();
+        let conflict_manifest_path = conflict_store.manifest_path();
+        std::fs::write(&conflict_proof_path, b"foreign proof bytes")
+            .expect("seed conflicting proof");
+        let mut conflict_transaction = conflict_store.begin_write().expect("conflict transaction");
+        assert_eq!(
+            conflict_transaction.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate("advance-conflict"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-conflict",)
+                    .expect("conflict proof input"),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::ImmutableExactConflict,
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&conflict_proof_path).expect("conflict remains immutable"),
+            b"foreign proof bytes"
+        );
+        assert!(!conflict_manifest_path.exists());
+        assert!(!conflict_temp_path.exists());
+        drop(conflict_transaction);
+
+        let retry_root = root("proof-indeterminate-retry");
+        let retry_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&retry_root, "session-1")
+                .expect("qualified retry store");
+        let retry_proof_path =
+            retry_root.join(retry_store.control_identities().provenance.as_str());
+        let retry_temp_path = retry_store.temporary_path();
+        let retry_manifest_path = retry_store.manifest_path();
+        let retry_candidate = v2_candidate("advance-proof-retry");
+        let retry_proof =
+            SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-proof-retry")
+                .expect("retry proof");
+        let retry_proof_length = retry_proof
+            .canonical_bytes_and_digest()
+            .expect("retry proof bytes")
+            .0
+            .len();
+        let mut first_transaction = retry_store.begin_write().expect("first retry transaction");
+        assert!(matches!(
+            first_transaction.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                retry_candidate.clone(),
+                retry_proof.clone(),
+                None,
+                Some(super::super::canonical_durability::CanonicalDurabilityStage::Write),
+                None,
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: super::super::canonical_durability::CanonicalDurabilityStage::Write,
+                ..
+            })
+        ));
+        let partial = std::fs::read(&retry_proof_path).expect("partial proof remains");
+        assert!(!partial.is_empty());
+        assert!(partial.len() < retry_proof_length);
+        assert!(!retry_manifest_path.exists());
+        assert!(retry_temp_path.exists());
+        drop(first_transaction);
+
+        let mut restarted = retry_store.begin_write().expect("restarted transaction");
+        assert!(matches!(
+            restarted.advance_session_semantics_v1_to_v2(0, retry_candidate, retry_proof,),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            std::fs::read(retry_proof_path)
+                .expect("strict-prefix proof converges")
+                .len(),
+            retry_proof_length
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_existing_head_rejects_different_transition_before_proof_mutation() {
+        let root = root("stale-existing-head-preflight");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let mut transaction = store.begin_write().expect("existing-head transaction");
+        assert!(matches!(
+            transaction.compare_and_swap(0, basic_candidate("seed-v1", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        let head_before = std::fs::read(&manifest_path).expect("read existing v1 head");
+
+        assert_eq!(
+            transaction.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate("wrong-stale-transition"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "wrong-stale-transition",)
+                    .expect("different stale proof"),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::GenerationConflict {
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("existing head remains unchanged"),
+            head_before
+        );
+        assert!(!temporary_path.exists());
+        assert!(!provenance_path.exists());
+
+        assert!(matches!(
+            transaction.advance_session_semantics_v1_to_v2(
+                1,
+                v2_candidate("correct-transition"),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "correct-transition",)
+                    .expect("correct proof"),
+            ),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_proof_orphan_cannot_be_claimed_by_another_proof_with_common_prefix() {
+        let root = root("partial-proof-cross-claim");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let first_id = "advance-shared-a";
+        let other_id = "advance-shared-b";
+
+        let mut first = store.begin_write().expect("first proof transaction");
+        assert!(matches!(
+            first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                v2_candidate(first_id),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", first_id)
+                    .expect("first proof"),
+                None,
+                Some(super::super::canonical_durability::CanonicalDurabilityStage::Write),
+                None,
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: super::super::canonical_durability::CanonicalDurabilityStage::Write,
+                ..
+            })
+        ));
+        let first_partial = std::fs::read(&provenance_path).expect("partial first proof");
+        assert!(!first_partial.is_empty());
+        assert!(!manifest_path.exists());
+        let first_intent = std::fs::read(&temporary_path).expect("durable first transition intent");
+        drop(first);
+
+        let mut other = store.begin_write().expect("other proof transaction");
+        assert_eq!(
+            other.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate(other_id),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", other_id)
+                    .expect("other proof"),
+            ),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("first partial remains unchanged"),
+            first_partial
+        );
+        assert_eq!(
+            std::fs::read(&temporary_path).expect("first intent remains unchanged"),
+            first_intent
+        );
+        assert!(!manifest_path.exists());
+        drop(other);
+
+        let mut correct = store.begin_write().expect("correct proof transaction");
+        assert!(matches!(
+            correct.advance_session_semantics_v1_to_v2(
+                0,
+                v2_candidate(first_id),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", first_id)
+                    .expect("correct proof"),
+            ),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(!temporary_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_transition_restarts_after_post_create_empty_proof_final() {
+        let root = root("empty-proof-final-restart");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let transition_id = "advance-empty-proof";
+        let candidate = v2_candidate(transition_id);
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+            .expect("transition proof");
+
+        let mut first = store.begin_write().expect("first transition transaction");
+        assert!(matches!(
+            first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                candidate.clone(),
+                proof.clone(),
+                None,
+                Some(super::super::canonical_durability::CanonicalDurabilityStage::PostCreate),
+                None,
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: super::super::canonical_durability::CanonicalDurabilityStage::PostCreate,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("empty proof final remains"),
+            b""
+        );
+        assert!(!manifest_path.exists());
+        drop(first);
+
+        let mut restarted = store
+            .begin_write()
+            .expect("restarted transition transaction");
+        assert!(matches!(
+            restarted.advance_session_semantics_v1_to_v2(0, candidate, proof),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(manifest_path.exists());
+        assert!(!temporary_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_transition_restarts_after_one_byte_proof_final() {
+        let root = root("one-byte-proof-final-restart");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let transition_id = "advance-one-byte-proof";
+        let candidate = v2_candidate(transition_id);
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+            .expect("transition proof");
+        let expected_proof = proof
+            .canonical_bytes_and_digest()
+            .expect("canonical proof")
+            .0;
+
+        let mut first = store.begin_write().expect("first transition transaction");
+        assert!(matches!(
+            first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                candidate.clone(),
+                proof.clone(),
+                None,
+                Some(super::super::canonical_durability::CanonicalDurabilityStage::Write),
+                None,
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: super::super::canonical_durability::CanonicalDurabilityStage::Write,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("one-byte proof final remains"),
+            &expected_proof[..1]
+        );
+        assert!(temporary_path.exists());
+        drop(first);
+
+        let mut restarted = store
+            .begin_write()
+            .expect("restarted transition transaction");
+        assert!(matches!(
+            restarted.advance_session_semantics_v1_to_v2(0, candidate, proof),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("complete proof final"),
+            expected_proof
+        );
+        assert!(!temporary_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_intent_stage_faults_are_honest_and_exact_retry_converges() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        for stage in [
+            CanonicalDurabilityStage::CreateNew,
+            CanonicalDurabilityStage::PostCreate,
+            CanonicalDurabilityStage::Write,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = root(&format!("transition-intent-cut-{stage:?}"));
+            let store =
+                SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+                    .expect("qualified Session store");
+            let manifest_path = store.manifest_path();
+            let temporary_path = store.temporary_path();
+            let provenance_path = root.join(store.control_identities().provenance.as_str());
+            let transition_id = format!("advance-intent-{stage:?}");
+            let candidate = v2_candidate(&transition_id);
+            let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", &transition_id)
+                .expect("transition proof");
+
+            let mut first = store.begin_write().expect("first transition transaction");
+            let outcome = first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                candidate.clone(),
+                proof.clone(),
+                Some(stage),
+                None,
+                None,
+            );
+            if stage == CanonicalDurabilityStage::CreateNew {
+                assert!(matches!(
+                    outcome,
+                    ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                        CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                            stage: CanonicalDurabilityStage::CreateNew,
+                            ..
+                        }
+                    ))
+                ));
+                assert!(!temporary_path.exists());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    ManifestCasOutcome::DurabilityIndeterminate(
+                        CanonicalDurabilityIndeterminate {
+                            stage: actual_stage,
+                            ..
+                        }
+                    ) if actual_stage == stage
+                ));
+                assert!(temporary_path.exists());
+            }
+            assert!(!provenance_path.exists());
+            assert!(!manifest_path.exists());
+            drop(first);
+
+            let mut restarted = store
+                .begin_write()
+                .expect("restarted transition transaction");
+            assert!(matches!(
+                restarted.advance_session_semantics_v1_to_v2(0, candidate, proof),
+                ManifestCasOutcome::Accepted { .. }
+            ));
+            assert!(manifest_path.exists());
+            assert!(!temporary_path.exists());
+        }
+    }
+
+    /// A refused proof create leaves the intent temporary durably staged. The
+    /// outcome must never borrow the pre-mutation durability vocabulary for
+    /// that state, and it must name the staged intent the caller still owns.
+    #[cfg(unix)]
+    #[test]
+    fn refused_proof_create_after_durable_intent_is_never_reported_as_unstaged() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let root = root("proof-create-refusal-after-durable-intent");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified Session store");
+        let manifest_path = store.manifest_path();
+        let temporary_path = store.temporary_path();
+        let provenance_path = root.join(store.control_identities().provenance.as_str());
+        let transition_id = "advance-refused-proof-create";
+        let candidate = v2_candidate(transition_id);
+        let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+            .expect("transition proof");
+        let proof_digest = proof
+            .canonical_bytes_and_digest()
+            .expect("canonical proof")
+            .1;
+        let staged_intent_key = recovery_key(&proof_digest);
+
+        let mut first = store.begin_write().expect("first transition transaction");
+        let outcome = first.advance_session_semantics_v1_to_v2_with_faults(
+            0,
+            candidate.clone(),
+            proof.clone(),
+            None,
+            Some(CanonicalDurabilityStage::CreateNew),
+            None,
+        );
+
+        // The intent temporary is already file- and parent-synced here, and the
+        // proof create definitively never happened.
+        assert!(temporary_path.exists());
+        assert!(!provenance_path.exists());
+        assert!(!manifest_path.exists());
+
+        match &outcome {
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::TransitionProofRefusedAfterIntentStaged {
+                    rejection,
+                    recovery_key: staged_key,
+                },
+            ) => {
+                assert!(matches!(
+                    rejection,
+                    CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                        stage: CanonicalDurabilityStage::CreateNew,
+                        ..
+                    }
+                ));
+                assert_eq!(*staged_key, staged_intent_key);
+            }
+            other => panic!("post-staging proof refusal misclassified as {other:?}"),
+        }
+        drop(first);
+
+        // The staged temporary is real: the public generation CAS cannot get
+        // past it for any other candidate.
+        let mut wedged = store.begin_write().expect("wedged transaction");
+        assert_eq!(
+            wedged.compare_and_swap(0, basic_candidate("wedged-v1", 'a')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+            ))
+        );
+        assert!(temporary_path.exists());
+        assert!(!manifest_path.exists());
+        drop(wedged);
+
+        // The one reachable escape is a byte-exact replay of the candidate and
+        // proof the refusal named, through the public transition entry point.
+        let mut resumed = store.begin_write().expect("resumed transaction");
+        assert!(matches!(
+            resumed.advance_session_semantics_v1_to_v2(0, candidate, proof),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(manifest_path.exists());
+        assert!(!temporary_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_proof_stage_faults_are_honest_and_exact_retry_converges() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        for stage in [
+            CanonicalDurabilityStage::CreateNew,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = root(&format!("transition-proof-cut-{stage:?}"));
+            let store =
+                SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+                    .expect("qualified Session store");
+            let manifest_path = store.manifest_path();
+            let temporary_path = store.temporary_path();
+            let provenance_path = root.join(store.control_identities().provenance.as_str());
+            let transition_id = format!("advance-proof-{stage:?}");
+            let candidate = v2_candidate(&transition_id);
+            let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", &transition_id)
+                .expect("transition proof");
+            let (expected_proof, proof_digest) = proof
+                .canonical_bytes_and_digest()
+                .expect("canonical proof bytes");
+            let staged_intent_key = recovery_key(&proof_digest);
+
+            let mut first = store.begin_write().expect("first transition transaction");
+            let outcome = first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                candidate.clone(),
+                proof.clone(),
+                None,
+                Some(stage),
+                None,
+            );
+            if stage == CanonicalDurabilityStage::CreateNew {
+                match &outcome {
+                    ManifestCasOutcome::Rejected(
+                        ManifestCasRejection::TransitionProofRefusedAfterIntentStaged {
+                            rejection,
+                            recovery_key: staged_key,
+                        },
+                    ) => {
+                        assert!(matches!(
+                            rejection,
+                            CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                                stage: CanonicalDurabilityStage::CreateNew,
+                                ..
+                            }
+                        ));
+                        assert_eq!(*staged_key, staged_intent_key);
+                    }
+                    other => panic!("refused proof create misclassified as {other:?}"),
+                }
+                assert!(!provenance_path.exists());
+            } else {
+                assert!(matches!(
+                    &outcome,
+                    ManifestCasOutcome::DurabilityIndeterminate(
+                        CanonicalDurabilityIndeterminate {
+                            stage: actual_stage,
+                            recovery_key: actual_key,
+                            ..
+                        }
+                    ) if *actual_stage == stage && *actual_key == staged_intent_key
+                ));
+                assert_eq!(
+                    std::fs::read(&provenance_path).expect("unsynced proof bytes remain"),
+                    expected_proof
+                );
+            }
+            assert!(temporary_path.exists());
+            assert!(!manifest_path.exists());
+            drop(first);
+
+            let mut restarted = store
+                .begin_write()
+                .expect("restarted transition transaction");
+            assert!(matches!(
+                restarted.advance_session_semantics_v1_to_v2(0, candidate, proof),
+                ManifestCasOutcome::Accepted { .. }
+            ));
+            assert_eq!(
+                std::fs::read(&provenance_path).expect("converged exact proof"),
+                expected_proof
+            );
+            assert!(manifest_path.exists());
+            assert!(!temporary_path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_strict_proof_prefix_is_bound_to_its_exact_durable_intent() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let first_id = "advance-prefix-owner-a";
+        let other_id = "advance-prefix-owner-b";
+        let first_proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", first_id)
+            .expect("first proof");
+        let first_bytes = first_proof
+            .canonical_bytes_and_digest()
+            .expect("first proof bytes")
+            .0;
+        let identity_boundary =
+            SessionSemanticsTransitionProofV1::recovery_identity_prefix_len(&first_bytes)
+                .expect("proof identity boundary");
+
+        for prefix_length in [0, 1, identity_boundary - 1, first_bytes.len() - 1] {
+            let root = root(&format!("proof-prefix-intent-binding-{prefix_length}"));
+            let store =
+                SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+                    .expect("qualified Session store");
+            let manifest_path = store.manifest_path();
+            let temporary_path = store.temporary_path();
+            let provenance_path = root.join(store.control_identities().provenance.as_str());
+
+            let mut first = store.begin_write().expect("first transition transaction");
+            assert!(matches!(
+                first.advance_session_semantics_v1_to_v2_with_faults(
+                    0,
+                    v2_candidate(first_id),
+                    first_proof.clone(),
+                    None,
+                    Some(CanonicalDurabilityStage::PostCreate),
+                    None,
+                ),
+                ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                    stage: CanonicalDurabilityStage::PostCreate,
+                    ..
+                })
+            ));
+            std::fs::write(&provenance_path, &first_bytes[..prefix_length])
+                .expect("materialize exact crash prefix");
+            let first_intent = std::fs::read(&temporary_path).expect("read exact durable intent");
+            drop(first);
+
+            let mut other = store.begin_write().expect("different proof transaction");
+            assert!(matches!(
+                other.advance_session_semantics_v1_to_v2(
+                    0,
+                    v2_candidate(other_id),
+                    SessionSemanticsTransitionProofV1::v1_to_v2("session-1", other_id)
+                        .expect("different proof"),
+                ),
+                ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                    CanonicalDurabilityRejection::SnapshotTempAlreadyExists
+                        | CanonicalDurabilityRejection::ImmutableExactConflict
+                ))
+            ));
+            assert_eq!(
+                std::fs::read(&provenance_path).expect("owner proof prefix remains"),
+                &first_bytes[..prefix_length]
+            );
+            assert_eq!(
+                std::fs::read(&temporary_path).expect("owner intent remains"),
+                first_intent
+            );
+            assert!(!manifest_path.exists());
+            drop(other);
+
+            let mut exact = store
+                .begin_write()
+                .expect("exact proof restart transaction");
+            assert!(matches!(
+                exact.advance_session_semantics_v1_to_v2(
+                    0,
+                    v2_candidate(first_id),
+                    first_proof.clone(),
+                ),
+                ManifestCasOutcome::Accepted { .. }
+            ));
+            assert_eq!(
+                std::fs::read(&provenance_path).expect("complete exact proof"),
+                first_bytes
+            );
+            assert!(manifest_path.exists());
+            assert!(!temporary_path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_cas_consumes_staged_intent_and_restarts_every_install_cut() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        for stage in [
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::Rename,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = root(&format!("staged-intent-cas-cut-{stage:?}"));
+            let store =
+                SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+                    .expect("qualified Session store");
+            let manifest_path = store.manifest_path();
+            let temporary_path = store.temporary_path();
+            let provenance_path = root.join(store.control_identities().provenance.as_str());
+            let transition_id = format!("advance-cas-{stage:?}");
+            let candidate = v2_candidate(&transition_id);
+            let proof = SessionSemanticsTransitionProofV1::v1_to_v2("session-1", &transition_id)
+                .expect("transition proof");
+            let expected_proof = proof
+                .canonical_bytes_and_digest()
+                .expect("canonical proof")
+                .0;
+
+            let mut first = store.begin_write().expect("first transition transaction");
+            let first_outcome = first.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                candidate.clone(),
+                proof.clone(),
+                None,
+                None,
+                Some(stage),
+            );
+            assert!(matches!(
+                first_outcome,
+                ManifestCasOutcome::DurabilityIndeterminate(
+                    CanonicalDurabilityIndeterminate {
+                        stage: actual_stage,
+                        ..
+                    }
+                ) if actual_stage == stage
+            ));
+            assert_eq!(
+                std::fs::read(&provenance_path).expect("durable proof before manifest cut"),
+                expected_proof
+            );
+            if stage == CanonicalDurabilityStage::ParentSync {
+                assert!(manifest_path.exists());
+                assert!(!temporary_path.exists());
+            } else {
+                assert!(!manifest_path.exists());
+                assert!(temporary_path.exists());
+            }
+            drop(first);
+
+            let mut restarted = store
+                .begin_write()
+                .expect("restarted transition transaction");
+            let restart = restarted.advance_session_semantics_v1_to_v2(0, candidate, proof);
+            if stage == CanonicalDurabilityStage::ParentSync {
+                assert!(matches!(
+                    restart,
+                    ManifestCasOutcome::AlreadyCompleted { .. }
+                ));
+            } else {
+                assert!(matches!(restart, ManifestCasOutcome::Accepted { .. }));
+            }
+            assert!(manifest_path.exists());
+            assert!(!temporary_path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_indeterminate_preserves_preflighted_proof_and_retry() {
+        let cut_root = root("proof-orphan-manifest-indeterminate");
+        let cut_store =
+            SessionArtifactManifestStore::qualified_for_test_session(&cut_root, "session-1")
+                .expect("qualified cut store");
+        let cut_proof_path = cut_root.join(cut_store.control_identities().provenance.as_str());
+        let cut_temp_path = cut_store.temporary_path();
+        let cut_manifest_path = cut_store.manifest_path();
+        let cut_candidate = v2_candidate("advance-manifest-cut");
+        let cut_proof =
+            SessionSemanticsTransitionProofV1::v1_to_v2("session-1", "advance-manifest-cut")
+                .expect("manifest-cut proof");
+        let cut_proof_length = cut_proof
+            .canonical_bytes_and_digest()
+            .expect("manifest-cut proof bytes")
+            .0
+            .len();
+        let mut cut_transaction = cut_store.begin_write().expect("cut transaction");
+        assert!(matches!(
+            cut_transaction.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                cut_candidate.clone(),
+                cut_proof.clone(),
+                None,
+                None,
+                Some(super::super::canonical_durability::CanonicalDurabilityStage::FileSync),
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: super::super::canonical_durability::CanonicalDurabilityStage::FileSync,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&cut_proof_path)
+                .expect("durable proof remains after manifest cut")
+                .len(),
+            cut_proof_length
+        );
+        assert!(!cut_manifest_path.exists());
+        assert!(cut_temp_path.exists());
+        assert!(matches!(
+            cut_transaction.advance_session_semantics_v1_to_v2(0, cut_candidate, cut_proof,),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        assert!(cut_manifest_path.exists());
+        assert!(!cut_temp_path.exists());
+    }
+
+    #[test]
+    fn windows_other_session_transition_refuses_before_any_control_mutation() {
+        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+            let root = root(&format!("{platform:?}-transition-refusal"));
+            let store = SessionArtifactManifestStore::for_test_session_platform(
+                &root,
+                "session-1",
+                platform,
+            )
+            .expect("addressed read-only store");
+            let identities = store.control_identities().clone();
+
+            assert!(matches!(
+                store.begin_write(),
+                Err(ManifestStoreError::NamespaceQualificationRequired)
+            ));
+            for identity in [
+                identities.manifest,
+                identities.temporary,
+                identities.provenance,
+                identities.coordination,
+            ] {
+                assert!(!root.join(identity.as_str()).exists());
+            }
+        }
     }
 
     #[test]

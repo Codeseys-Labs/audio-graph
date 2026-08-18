@@ -364,6 +364,9 @@ pub enum CanonicalNamespaceOperation {
 pub enum CanonicalMutation {
     ExistingAppend,
     FirstCreate,
+    ImmutableExactCreate,
+    ImmutableExactReconcile,
+    SnapshotIntentStage,
     Rename,
     InitialSnapshotInstall,
     SnapshotReplacement,
@@ -388,6 +391,7 @@ pub enum CanonicalDurabilityStage {
     OpenExisting,
     OpenParent,
     CreateNew,
+    PostCreate,
     SeekEnd,
     Write,
     Flush,
@@ -397,7 +401,16 @@ pub enum CanonicalDurabilityStage {
     ParentSync,
 }
 
-/// A refusal proven before this module mutated canonical bytes or namespace.
+/// A refusal proven before the one requested operation mutated canonical bytes
+/// or namespace.
+///
+/// The claim is scoped to that single operation, never to the caller's
+/// transaction. A caller that composes several operations and has already
+/// accepted durable state of its own — a staged snapshot temporary, say — must
+/// classify that surviving state in its own vocabulary; forwarding this value
+/// unqualified would tell its own callers that nothing outlives the refusal.
+/// `ManifestCasRejection::TransitionProofRefusedAfterIntentStaged` is the
+/// worked example.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityRejection {
     ParentProvisioningRequired,
@@ -416,6 +429,7 @@ pub enum CanonicalDurabilityRejection {
     ReservedCoordinationEntry,
     NonRegularCanonicalEntry,
     DestinationAlreadyExists,
+    ImmutableExactConflict,
     SnapshotTempAlreadyExists,
     SnapshotPathOverlap,
     CoordinationPoisoned,
@@ -442,6 +456,13 @@ pub enum CanonicalDurabilityOutcome {
     DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalImmutableExactState {
+    Absent,
+    Exact,
+    StrictPrefix,
+}
+
 /// Expected snapshot-head identity at atomic installation time.
 ///
 /// An existing snapshot is represented by the exact open file from which the
@@ -451,6 +472,12 @@ pub enum CanonicalDurabilityOutcome {
 pub enum CanonicalSnapshotExpectation<'a> {
     Absent,
     Existing(&'a File),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDisposition {
+    StageTemporary,
+    Install,
 }
 
 impl fmt::Debug for CanonicalSnapshotExpectation<'_> {
@@ -820,6 +847,10 @@ impl Default for CanonicalDurability {
 impl CanonicalDurability {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn namespace_mutation_supported(&self) -> bool {
+        namespace_supported_for(self.platform)
     }
 
     fn for_production_qualification(
@@ -1277,6 +1308,466 @@ impl CanonicalExclusiveGuard {
         })
     }
 
+    /// Classify one immutable exact target under this exclusive guard without
+    /// mutating it.
+    ///
+    /// `Absent` is a missing entry, `Exact` is a regular file whose bytes
+    /// already equal `expected`, and `StrictPrefix` is a regular file whose
+    /// bytes are a shorter prefix of `expected`. A longer, non-prefix,
+    /// non-regular, or case-aliased entry is a typed conflict. This performs no
+    /// create, write, truncate, or barrier, but it is not a read-only open: the
+    /// existing entry is opened read/write for handle identity revalidation, so
+    /// a target that cannot be opened for writing is rejected here.
+    pub(crate) fn preflight_immutable_exact(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
+    ) -> Result<CanonicalImmutableExactState, CanonicalDurabilityRejection> {
+        self.preflight_mutation_targets([path])?;
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| CanonicalDurabilityRejection::CoordinationPoisoned)?;
+        if !self.namespace_is_supported() || !self.qualification_status(qualification)? {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                },
+            );
+        }
+        let parent = self.namespace.bind_parent(path, self.platform)?;
+        if !parent.barrier.is_available() {
+            return Err(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: self.platform,
+                    operation: CanonicalNamespaceOperation::AtomicSnapshotInstall,
+                },
+            );
+        }
+        ensure_no_ascii_case_alias(path)?;
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(CanonicalImmutableExactState::Absent);
+            }
+            Err(error) => {
+                return Err(durability_io(
+                    CanonicalDurabilityStage::InspectEntry,
+                    &error,
+                ));
+            }
+            Ok(_) => {}
+        }
+        let mut file = self.open_existing_regular(path)?;
+        let mut observed = Vec::new();
+        (&mut file)
+            .take(u64::try_from(expected.len()).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut observed)
+            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
+        if observed.len() > expected.len() || !expected.starts_with(&observed) {
+            return Err(CanonicalDurabilityRejection::ImmutableExactConflict);
+        }
+        self.validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(&file))?;
+        if observed.len() == expected.len() {
+            Ok(CanonicalImmutableExactState::Exact)
+        } else {
+            Ok(CanonicalImmutableExactState::StrictPrefix)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_or_reconcile_immutable_exact(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            0,
+            None,
+            qualification,
+            recovery_key,
+            None,
+        )
+    }
+
+    /// Require a strict-prefix recovery artifact to contain at least the
+    /// caller's complete immutable identity prefix before it can be completed.
+    pub(crate) fn create_or_reconcile_immutable_exact_with_identity_prefix(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        minimum_recoverable_prefix_len: usize,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            minimum_recoverable_prefix_len,
+            None,
+            qualification,
+            recovery_key,
+            None,
+        )
+    }
+
+    /// Complete an immutable exact record from any regular strict prefix only
+    /// after validating a separate, already-durable exact authentication
+    /// record under this same exclusive guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_or_reconcile_immutable_exact_with_authentication(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        authentication_path: &Path,
+        authentication_bytes: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            0,
+            Some((authentication_path, authentication_bytes)),
+            qualification,
+            recovery_key,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_or_reconcile_immutable_exact_with_fault(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            0,
+            None,
+            qualification,
+            recovery_key,
+            Some(injected_fault),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_or_reconcile_immutable_exact_with_identity_prefix_and_fault(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        minimum_recoverable_prefix_len: usize,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            minimum_recoverable_prefix_len,
+            None,
+            qualification,
+            recovery_key,
+            Some(injected_fault),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_or_reconcile_immutable_exact_with_authentication_and_fault(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        authentication_path: &Path,
+        authentication_bytes: &[u8],
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalDurabilityOutcome {
+        self.create_or_reconcile_immutable_exact_inner(
+            path,
+            expected,
+            0,
+            Some((authentication_path, authentication_bytes)),
+            qualification,
+            recovery_key,
+            Some(injected_fault),
+        )
+    }
+
+    /// Durably establish one immutable exact record at its final identity.
+    ///
+    /// A missing file is created exclusively. An exact regular file is
+    /// reconciled by re-establishing its protection, file, and parent barriers.
+    /// A regular strict prefix may be completed through its retained handle
+    /// after path/handle identity revalidation so a real partial-write restart
+    /// converges without introducing another namespace identity. Strict-prefix
+    /// recovery is additionally constrained by the caller: when
+    /// `authentication` is supplied, that separate record must already exist as
+    /// an exact regular file under the same bound parent, and an observed
+    /// prefix shorter than `expected` must still reach
+    /// `minimum_recoverable_prefix_len`. Every other existing entry is a typed
+    /// conflict.
+    #[allow(clippy::too_many_arguments)]
+    fn create_or_reconcile_immutable_exact_inner(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        minimum_recoverable_prefix_len: usize,
+        authentication: Option<(&Path, &[u8])>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: Option<CanonicalDurabilityStage>,
+    ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([path]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if let Some((authentication_path, _)) = authentication
+            && let Err(rejection) = self.preflight_mutation_targets([authentication_path])
+        {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if minimum_recoverable_prefix_len > expected.len() {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::ImmutableExactConflict,
+            );
+        }
+        let _operation = match self.operation_lock.lock() {
+            Ok(operation) => operation,
+            Err(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::CoordinationPoisoned,
+                );
+            }
+        };
+        if !self.namespace_is_supported() {
+            return immutable_namespace_unsupported(self.platform);
+        }
+        match self.qualification_status(qualification) {
+            Ok(true) => {}
+            Ok(false) => return immutable_namespace_unsupported(self.platform),
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        }
+        let parent = match self.namespace.bind_parent(path, self.platform) {
+            Ok(parent) => parent,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if !parent.barrier.is_available() {
+            return immutable_namespace_unsupported(self.platform);
+        }
+        if let Err(rejection) = ensure_no_ascii_case_alias(path) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
+        if let Some((authentication_path, authentication_bytes)) = authentication {
+            if snapshot_paths_overlap(path, authentication_path)
+                || ensure_no_ascii_case_alias(authentication_path).is_err()
+            {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::ImmutableExactConflict,
+                );
+            }
+            let authentication_parent = match self
+                .namespace
+                .bind_parent(authentication_path, self.platform)
+            {
+                Ok(parent) => parent,
+                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+            };
+            if authentication_parent.canonical_path != parent.canonical_path
+                || authentication_parent.identity != parent.identity
+            {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
+                );
+            }
+            let mut authentication_file = match self.open_existing_regular(authentication_path) {
+                Ok(file) => file,
+                Err(_) => {
+                    return CanonicalDurabilityOutcome::Rejected(
+                        CanonicalDurabilityRejection::ImmutableExactConflict,
+                    );
+                }
+            };
+            let mut observed = Vec::new();
+            if (&mut authentication_file)
+                .take(u64::try_from(authentication_bytes.len()).unwrap_or(u64::MAX) + 1)
+                .read_to_end(&mut observed)
+                .is_err()
+                || observed != authentication_bytes
+                || self
+                    .validate_snapshot_destination(
+                        authentication_path,
+                        CanonicalSnapshotExpectation::Existing(&authentication_file),
+                    )
+                    .is_err()
+            {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::ImmutableExactConflict,
+                );
+            }
+        }
+
+        if injected_fault == Some(CanonicalDurabilityStage::CreateNew) {
+            return CanonicalDurabilityOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::CreateNew,
+                &io::Error::other("injected immutable create cut"),
+            ));
+        }
+        if let Some(error) = self.injected_error(CanonicalDurabilityStage::CreateNew) {
+            return CanonicalDurabilityOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::CreateNew,
+                &error,
+            ));
+        }
+
+        self.wait_before_atomic_create();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        configure_owner_only_creation(&mut options);
+        let (mut file, observed_len, mutation) = match options.open(path) {
+            Ok(file) => (file, 0, CanonicalMutation::ImmutableExactCreate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut file = match self.open_existing_regular(path) {
+                    Ok(file) => file,
+                    Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+                };
+                let mut observed = Vec::new();
+                if let Err(error) = (&mut file)
+                    .take(u64::try_from(expected.len()).unwrap_or(u64::MAX) + 1)
+                    .read_to_end(&mut observed)
+                {
+                    return CanonicalDurabilityOutcome::Rejected(durability_io(
+                        CanonicalDurabilityStage::OpenExisting,
+                        &error,
+                    ));
+                }
+                if observed.len() > expected.len()
+                    || !expected.starts_with(&observed)
+                    || (observed.len() < expected.len()
+                        && observed.len() < minimum_recoverable_prefix_len)
+                {
+                    return CanonicalDurabilityOutcome::Rejected(
+                        CanonicalDurabilityRejection::ImmutableExactConflict,
+                    );
+                }
+                if let Err(rejection) = self.validate_snapshot_destination(
+                    path,
+                    CanonicalSnapshotExpectation::Existing(&file),
+                ) {
+                    return CanonicalDurabilityOutcome::Rejected(rejection);
+                }
+                if let Err(error) = file.seek(SeekFrom::Start(observed.len() as u64)) {
+                    return CanonicalDurabilityOutcome::Rejected(durability_io(
+                        CanonicalDurabilityStage::SeekEnd,
+                        &error,
+                    ));
+                }
+                (
+                    file,
+                    observed.len(),
+                    CanonicalMutation::ImmutableExactReconcile,
+                )
+            }
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::CreateNew,
+                    &error,
+                ));
+            }
+        };
+
+        let remaining = &expected[observed_len..];
+        if injected_fault == Some(CanonicalDurabilityStage::PostCreate) && observed_len == 0 {
+            return indeterminate(
+                CanonicalDurabilityStage::PostCreate,
+                &io::Error::other("injected immutable post-create cut"),
+                recovery_key,
+            );
+        }
+        if injected_fault == Some(CanonicalDurabilityStage::Write) && !remaining.is_empty() {
+            let partial = 1.min(remaining.len());
+            if let Err(error) = file.write_all(&remaining[..partial]) {
+                return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
+            }
+            return indeterminate(
+                CanonicalDurabilityStage::Write,
+                &io::Error::other("injected immutable partial write cut"),
+                recovery_key,
+            );
+        }
+        if let Err(error) =
+            self.checked_immutable(CanonicalDurabilityStage::Write, injected_fault, || {
+                file.write_all(remaining)
+            })
+        {
+            return indeterminate(CanonicalDurabilityStage::Write, &error, recovery_key);
+        }
+        if let Err(error) =
+            self.checked_immutable(CanonicalDurabilityStage::Flush, injected_fault, || {
+                file.flush()
+            })
+        {
+            return indeterminate(CanonicalDurabilityStage::Flush, &error, recovery_key);
+        }
+        if let Err(error) = self.checked_immutable(
+            CanonicalDurabilityStage::ProtectTemp,
+            injected_fault,
+            || apply_owner_only_protection(&file),
+        ) {
+            return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
+        }
+        if self
+            .validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(&file))
+            .is_err()
+        {
+            return indeterminate(
+                CanonicalDurabilityStage::InspectEntry,
+                &io::Error::other("immutable exact identity changed"),
+                recovery_key,
+            );
+        }
+        if let Err(error) =
+            self.checked_immutable(CanonicalDurabilityStage::FileSync, injected_fault, || {
+                file.sync_all()
+            })
+        {
+            return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
+        }
+        if let Err(error) =
+            self.checked_immutable(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                parent.barrier.sync_all()
+            })
+        {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation,
+            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+        })
+    }
+
+    fn checked_immutable(
+        &self,
+        stage: CanonicalDurabilityStage,
+        injected_fault: Option<CanonicalDurabilityStage>,
+        operation: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if injected_fault == Some(stage) {
+            return Err(io::Error::other("injected immutable exact cut"));
+        }
+        self.checked(stage, operation)
+    }
+
     /// Append bytes whose immediate canonical parent is the bound directory.
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
@@ -1545,6 +2036,7 @@ impl CanonicalExclusiveGuard {
             qualification,
             recovery_key,
             false,
+            SnapshotDisposition::Install,
             None,
         )
     }
@@ -1567,6 +2059,7 @@ impl CanonicalExclusiveGuard {
             qualification,
             recovery_key,
             true,
+            SnapshotDisposition::Install,
             None,
         )
     }
@@ -1591,6 +2084,58 @@ impl CanonicalExclusiveGuard {
             qualification,
             recovery_key,
             true,
+            SnapshotDisposition::Install,
+            Some(injected_fault),
+        )
+    }
+
+    /// Durably stage one exact snapshot temporary without installing it.
+    /// Exact recovery may resume an existing regular prefix; the destination
+    /// expectation remains validated under this guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_snapshot_temporary(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        self.install_snapshot_inner(
+            temporary,
+            destination,
+            bytes,
+            expectation,
+            qualification,
+            recovery_key,
+            true,
+            SnapshotDisposition::StageTemporary,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_snapshot_temporary_with_fault(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+        bytes: &[u8],
+        expectation: CanonicalSnapshotExpectation<'_>,
+        qualification: Option<&CanonicalFilesystemQualification>,
+        recovery_key: CanonicalRecoveryKey,
+        injected_fault: CanonicalDurabilityStage,
+    ) -> CanonicalDurabilityOutcome {
+        self.install_snapshot_inner(
+            temporary,
+            destination,
+            bytes,
+            expectation,
+            qualification,
+            recovery_key,
+            true,
+            SnapshotDisposition::StageTemporary,
             Some(injected_fault),
         )
     }
@@ -1605,6 +2150,7 @@ impl CanonicalExclusiveGuard {
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
         resume_temporary: bool,
+        disposition: SnapshotDisposition,
         injected_fault: Option<CanonicalDurabilityStage>,
     ) -> CanonicalDurabilityOutcome {
         if let Err(rejection) = self.preflight_mutation_targets([temporary, destination]) {
@@ -1672,6 +2218,12 @@ impl CanonicalExclusiveGuard {
             );
         }
 
+        if injected_fault == Some(CanonicalDurabilityStage::CreateNew) {
+            return CanonicalDurabilityOutcome::Rejected(durability_io(
+                CanonicalDurabilityStage::CreateNew,
+                &io::Error::other("injected snapshot create cut"),
+            ));
+        }
         if let Some(error) = self.injected_error(CanonicalDurabilityStage::CreateNew) {
             return CanonicalDurabilityOutcome::Rejected(durability_io(
                 CanonicalDurabilityStage::CreateNew,
@@ -1684,6 +2236,13 @@ impl CanonicalExclusiveGuard {
                 Ok(opened) => opened,
                 Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
             };
+        if injected_fault == Some(CanonicalDurabilityStage::PostCreate) && already_written == 0 {
+            return indeterminate(
+                CanonicalDurabilityStage::PostCreate,
+                &io::Error::other("injected snapshot post-create cut"),
+                recovery_key,
+            );
+        }
 
         let mut writer = BufWriter::new(&mut temporary_file);
         let remaining = &bytes[already_written..];
@@ -1743,6 +2302,19 @@ impl CanonicalExclusiveGuard {
         if let Err(error) = revalidate_snapshot_destination(destination, &validated_destination) {
             return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
         }
+        if disposition == SnapshotDisposition::StageTemporary {
+            if let Err(error) =
+                self.checked_snapshot(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                    temporary_parent.barrier.sync_all()
+                })
+            {
+                return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+            }
+            return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::SnapshotIntentStage,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            });
+        }
         if let Err(error) =
             self.checked_snapshot(CanonicalDurabilityStage::Rename, injected_fault, || {
                 self.rename_source(temporary, destination)
@@ -1750,9 +2322,11 @@ impl CanonicalExclusiveGuard {
         {
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
-        if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-            temporary_parent.barrier.sync_all()
-        }) {
+        if let Err(error) =
+            self.checked_snapshot(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                temporary_parent.barrier.sync_all()
+            })
+        {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
 
@@ -2229,6 +2803,26 @@ fn revalidate_snapshot_destination(
 fn configure_owner_only_creation(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     options.mode(0o600);
+}
+
+fn ensure_no_ascii_case_alias(path: &Path) -> Result<(), CanonicalDurabilityRejection> {
+    let parent = path
+        .parent()
+        .ok_or(CanonicalDurabilityRejection::TargetOutsideManagedNamespace)?;
+    let requested = path
+        .file_name()
+        .ok_or(CanonicalDurabilityRejection::TargetOutsideManagedNamespace)?;
+    let entries = std::fs::read_dir(parent)
+        .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+    for entry in entries {
+        let observed = entry
+            .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?
+            .file_name();
+        if observed != requested && observed.eq_ignore_ascii_case(requested) {
+            return Err(CanonicalDurabilityRejection::ImmutableExactConflict);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -2995,6 +3589,15 @@ fn snapshot_namespace_unsupported(platform: CanonicalPlatform) -> CanonicalDurab
     )
 }
 
+fn immutable_namespace_unsupported(platform: CanonicalPlatform) -> CanonicalDurabilityOutcome {
+    CanonicalDurabilityOutcome::Rejected(
+        CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+            platform,
+            operation: CanonicalNamespaceOperation::FirstCreate,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3488,6 +4091,250 @@ mod tests {
         assert_eq!(fs::read(newly_created).expect("read new"), b"first");
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn immutable_exact_create_recovers_a_true_partial_final_after_restart() {
+        let root = temp_root("immutable-exact-partial-restart");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let proof = root.join("session-proof.json");
+        let expected = b"one complete immutable proof record";
+        let qualification = qualification(&root);
+        let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([0x39; 16]);
+
+        let first_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire first namespace guard");
+        assert!(matches!(
+            first_guard.create_or_reconcile_immutable_exact_with_fault(
+                &proof,
+                expected,
+                Some(&qualification),
+                recovery_key,
+                CanonicalDurabilityStage::Write,
+            ),
+            CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::Write,
+                ..
+            })
+        ));
+        let partial = fs::read(&proof).expect("read real partial final proof");
+        assert!(!partial.is_empty());
+        assert!(partial.len() < expected.len());
+        assert!(expected.starts_with(&partial));
+        drop(first_guard);
+
+        let retry_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire restarted namespace guard");
+        assert!(matches!(
+            retry_guard.create_or_reconcile_immutable_exact(
+                &proof,
+                expected,
+                Some(&qualification),
+                recovery_key,
+            ),
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::ImmutableExactReconcile,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            })
+        ));
+        assert_eq!(fs::read(&proof).expect("read reconciled proof"), expected);
+
+        drop(retry_guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn immutable_exact_create_reconciles_without_append_and_refuses_collisions() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let root = temp_root("immutable-exact-collisions");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let qualification = qualification(&root);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([0x3a; 16]);
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace guard");
+        let exact = root.join("proof-exact.json");
+        let expected = b"exact immutable bytes";
+
+        assert_eq!(
+            guard.create_or_reconcile_immutable_exact(&exact, expected, Some(&qualification), key,),
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::ImmutableExactCreate,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            })
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                guard.create_or_reconcile_immutable_exact(
+                    &exact,
+                    expected,
+                    Some(&qualification),
+                    key,
+                ),
+                CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                    mutation: CanonicalMutation::ImmutableExactReconcile,
+                    barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                })
+            );
+            assert_eq!(fs::read(&exact).expect("read exact proof"), expected);
+        }
+
+        let mismatched = root.join("proof-mismatch.json");
+        fs::write(&mismatched, b"not a prefix").expect("seed mismatched regular file");
+        let longer = root.join("proof-longer.json");
+        fs::write(&longer, [expected.as_slice(), b"-extra"].concat())
+            .expect("seed longer regular file");
+        let directory = root.join("proof-directory.json");
+        fs::create_dir(&directory).expect("seed directory collision");
+        let dangling = root.join("proof-symlink.json");
+        symlink(root.join("missing-proof"), &dangling).expect("seed symlink collision");
+        let fifo = root.join("proof-fifo.json");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let alias = root.join("PROOF-ALIAS.JSON");
+        fs::write(&alias, expected).expect("seed case alias");
+
+        for path in [&mismatched, &longer] {
+            let before = fs::read(path).expect("read regular collision");
+            assert_eq!(
+                guard.create_or_reconcile_immutable_exact(
+                    path,
+                    expected,
+                    Some(&qualification),
+                    key,
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::ImmutableExactConflict
+                )
+            );
+            assert_eq!(fs::read(path).expect("collision remains unchanged"), before);
+        }
+        for path in [&directory, &dangling, &fifo] {
+            assert_eq!(
+                guard.create_or_reconcile_immutable_exact(
+                    path,
+                    expected,
+                    Some(&qualification),
+                    key,
+                ),
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::NonRegularCanonicalEntry
+                )
+            );
+        }
+        let requested_alias = root.join("proof-alias.json");
+        assert_eq!(
+            guard.create_or_reconcile_immutable_exact(
+                &requested_alias,
+                expected,
+                Some(&qualification),
+                key,
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::ImmutableExactConflict
+            )
+        );
+        assert!(!requested_alias.exists());
+        assert_eq!(fs::read(alias).expect("alias remains unchanged"), expected);
+
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn immutable_exact_create_fault_cuts_are_honest_and_restart_converges() {
+        let expected = b"one complete proof record";
+        let key = CanonicalRecoveryKey::from_opaque_bytes([0x3b; 16]);
+
+        let create_root = temp_root("immutable-exact-fault-CreateNew");
+        fs::create_dir_all(&create_root).expect("create fault root");
+        let create_path = create_root.join("proof.json");
+        let create_qualification = qualification(&create_root);
+        let create_guard = CanonicalDurability::new()
+            .try_lock_exclusive(&create_root)
+            .expect("acquire create fault guard");
+        assert!(matches!(
+            create_guard.create_or_reconcile_immutable_exact_with_fault(
+                &create_path,
+                expected,
+                Some(&create_qualification),
+                key,
+                CanonicalDurabilityStage::CreateNew,
+            ),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::IoFailedBeforeMutation {
+                    stage: CanonicalDurabilityStage::CreateNew,
+                    ..
+                }
+            )
+        ));
+        assert!(!create_path.exists());
+        drop(create_guard);
+        fs::remove_dir_all(create_root).expect("clean create fault root");
+
+        for stage in [
+            CanonicalDurabilityStage::Write,
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::ProtectTemp,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = temp_root(&format!("immutable-exact-fault-{stage:?}"));
+            fs::create_dir_all(&root).expect("create fault root");
+            let path = root.join("proof.json");
+            let qualification = qualification(&root);
+            let first_guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire fault guard");
+            assert!(matches!(
+                first_guard.create_or_reconcile_immutable_exact_with_fault(
+                    &path,
+                    expected,
+                    Some(&qualification),
+                    key,
+                    stage,
+                ),
+                CanonicalDurabilityOutcome::DurabilityIndeterminate(
+                    CanonicalDurabilityIndeterminate {
+                        stage: actual_stage,
+                        ..
+                    }
+                ) if actual_stage == stage
+            ));
+            let observed = fs::read(&path).expect("reopen indeterminate proof");
+            assert!(expected.starts_with(&observed));
+            assert!(!observed.is_empty());
+            drop(first_guard);
+
+            let retry_guard = CanonicalDurability::new()
+                .try_lock_exclusive(&root)
+                .expect("acquire restart guard");
+            assert!(matches!(
+                retry_guard.create_or_reconcile_immutable_exact(
+                    &path,
+                    expected,
+                    Some(&qualification),
+                    key,
+                ),
+                CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                    mutation: CanonicalMutation::ImmutableExactReconcile,
+                    barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                })
+            ));
+            assert_eq!(fs::read(&path).expect("read recovered proof"), expected);
+            drop(retry_guard);
+            fs::remove_dir_all(root).expect("clean fault root");
+        }
     }
 
     #[test]
