@@ -847,7 +847,7 @@ forward-looking statements are now discharged, and one is now false:
 - "Re-keying is therefore blocked on a binding that does not exist yet, owned by
   seed `audio-graph-68a1`" — the binding exists. It is
   `bind_v2_provenance_to_durable_proof`
-  (`src-tauri/src/persistence/session_artifact_manifest.rs:2164`), which reads the
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:2232`), which reads the
   durable v1-to-v2 proof record at the derived control provenance identity under
   the exclusive guard and refuses a V2 candidate whose provenance entry is not
   exactly that record. The re-key landed with it, in one commit, so no committed
@@ -856,7 +856,7 @@ forward-looking statements are now discharged, and one is now false:
   discharged. `committed_v2_head_refuses_later_generations_until_proof_binding_exists`
   is now
   `committed_v2_head_records_later_generations_only_against_the_durable_proof`
-  (`src-tauri/src/persistence/session_artifact_manifest.rs:3712`), in the same
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:3798`), in the same
   position, with its rustdoc rewritten to describe shipped behaviour plus one
   paragraph of this history, and with its V1-floor-regression assertion kept
   verbatim.
@@ -864,7 +864,7 @@ forward-looking statements are now discharged, and one is now false:
 
 Round 4's diagnosis is confirmed, not revised. The self-consistency comparison it
 identified — `manifest.transition.fingerprint != content.sha256`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2129`) — is still exactly
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2197`) — is still exactly
 that, still load-bearing on the load path, and deliberately unchanged; what was
 missing was a second, independent binding against the durable record. Round 4's
 forgery probe was also reproduced against the re-keyed gate with the binding

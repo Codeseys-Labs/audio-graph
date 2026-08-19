@@ -4,6 +4,16 @@
 //! versioned stage tokens and never include managed paths or fixture bytes.
 //! Linux and qualified macOS/APFS fixtures exercise the accepted namespace
 //! barriers. Windows/NTFS exercises the typed pre-mutation refusal boundary.
+//!
+//! Fixture filesystem evidence comes from a platform probe, and one of those
+//! probes needs a privilege the test process may not hold: Windows
+//! `fsutil fsinfo volumeinfo` requires an elevated process and answers
+//! "Access is denied." otherwise. Absent evidence is therefore reported as its
+//! own outcome — `ProbedFilesystem::Unavailable` with a reason token — and is
+//! never folded into "observed a filesystem that is not the required one".
+//! Where the proof under test does not depend on the filesystem name, the test
+//! continues and downgrades only its evidence claim; where it does, the caller
+//! reports the unavailable outcome instead of asserting.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -87,19 +97,91 @@ mod tests {
         CanonicalNamespaceOperation, CanonicalPlatform, CanonicalSnapshotExpectation,
     };
 
+    /// Reason tokens for a probe that produced no filesystem evidence. They are
+    /// content-free: no command line, no volume, no path.
+    const WINDOWS_PROBE_REQUIRES_ELEVATION: &str = "fsutil-access-denied-requires-elevation";
+    const WINDOWS_PROBE_EXIT_REFUSED: &str = "fsutil-exit-refused";
+    const WINDOWS_PROBE_UNPARSABLE: &str = "fsutil-named-no-filesystem";
+
+    /// What one fixture filesystem probe produced.
+    ///
+    /// The two variants are not interchangeable. `Observed` is a measurement of
+    /// the live fixture volume; `Unavailable` says the probe never got to
+    /// measure. Collapsing the second into a sentinel observation is what made
+    /// a non-elevated Windows run look like a fixture on the wrong filesystem.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ProbedFilesystem {
+        Observed(String),
+        Unavailable(&'static str),
+    }
+
     #[derive(Debug)]
     struct FixtureFilesystemEvidence {
         queried_path: PathBuf,
         platform: &'static str,
         expected_filesystem: &'static str,
-        observed_filesystem: String,
+        observed: ProbedFilesystem,
         detail: String,
     }
 
     impl FixtureFilesystemEvidence {
         fn is_qualified(&self) -> bool {
-            self.observed_filesystem
-                .eq_ignore_ascii_case(self.expected_filesystem)
+            match &self.observed {
+                ProbedFilesystem::Observed(filesystem) => {
+                    filesystem.eq_ignore_ascii_case(self.expected_filesystem)
+                }
+                ProbedFilesystem::Unavailable(_) => false,
+            }
+        }
+
+        fn unavailable_reason(&self) -> Option<&'static str> {
+            match self.observed {
+                ProbedFilesystem::Observed(_) => None,
+                ProbedFilesystem::Unavailable(reason) => Some(reason),
+            }
+        }
+
+        /// The `observed=` field of the evidence line: the measured filesystem,
+        /// or the literal `unavailable` when there was nothing to measure.
+        fn observed_report(&self) -> &str {
+            match &self.observed {
+                ProbedFilesystem::Observed(filesystem) => filesystem,
+                ProbedFilesystem::Unavailable(_) => "unavailable",
+            }
+        }
+    }
+
+    /// What the fixture filesystem contract concluded for one fixture root.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FixtureContract {
+        /// The probe ran and named the required filesystem.
+        Qualified,
+        /// The probe ran and named a filesystem the contract does not accept,
+        /// on a platform whose `ALLOW_EXPLICIT_FIXTURE_REFUSAL` permits saying so.
+        RefusedFilesystem,
+        /// The probe produced no evidence, on a platform where that is a
+        /// possible outcome of a correctly configured host — Windows `fsutil`
+        /// without elevation. The reason token says which case it was.
+        EvidenceUnavailable(&'static str),
+    }
+
+    /// Classify one completed `fsutil fsinfo volumeinfo` run.
+    ///
+    /// Kept out of the Windows-only `platform` module and free of process
+    /// spawning so every host compiles and tests it. A non-elevated `fsutil`
+    /// answers "Access is denied." and names no filesystem, which is absent
+    /// evidence and is classified as such before the exit status is consulted,
+    /// because that is the case whose reason a reader needs to see.
+    fn classify_windows_filesystem_probe(succeeded: bool, output: &str) -> ProbedFilesystem {
+        if output.to_ascii_lowercase().contains("access is denied") {
+            return ProbedFilesystem::Unavailable(WINDOWS_PROBE_REQUIRES_ELEVATION);
+        }
+        if !succeeded {
+            return ProbedFilesystem::Unavailable(WINDOWS_PROBE_EXIT_REFUSED);
+        }
+        match parse_windows_filesystem_output(output) {
+            Some(filesystem) => ProbedFilesystem::Observed(filesystem),
+            None => ProbedFilesystem::Unavailable(WINDOWS_PROBE_UNPARSABLE),
         }
     }
 
@@ -128,6 +210,12 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = false;
+        /// `findmnt` and `stat -f` are unprivileged, so absent evidence here is
+        /// a broken host rather than an expected outcome — no reason qualifies.
+        pub(super) fn unavailable_reason_is_expected(_reason: &str) -> bool {
+            false
+        }
+        const LINUX_PROBE_REFUSED: &str = "findmnt-refused";
 
         pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
             assert_eq!(status.signal(), Some(9), "{context}");
@@ -140,7 +228,6 @@ mod tests {
                 .args(["-o", "FSTYPE", "-n"])
                 .output()
                 .expect("run findmnt for live fixture parent");
-            assert!(findmnt.status.success(), "findmnt fixture query failed");
             let statfs = Command::new("stat")
                 .args([
                     "-f",
@@ -150,15 +237,28 @@ mod tests {
                 .arg(path)
                 .output()
                 .expect("run stat -f for live fixture parent");
-            assert!(statfs.status.success(), "stat -f fixture query failed");
+            let observed = if findmnt.status.success() {
+                ProbedFilesystem::Observed(
+                    String::from_utf8(findmnt.stdout)
+                        .expect("findmnt evidence is UTF-8")
+                        .trim()
+                        .to_owned(),
+                )
+            } else {
+                ProbedFilesystem::Unavailable(LINUX_PROBE_REFUSED)
+            };
+            // `stat -f` is unprivileged here, so its failure is a broken host,
+            // not an outcome. Reporting it as a detail sentinel would let half
+            // this evidence go missing under `outcome=qualified`.
+            assert!(
+                statfs.status.success(),
+                "stat -f fixture query failed on a platform where it needs no privilege"
+            );
             FixtureFilesystemEvidence {
                 queried_path: path.to_path_buf(),
                 platform: "linux",
                 expected_filesystem: "ext4",
-                observed_filesystem: String::from_utf8(findmnt.stdout)
-                    .expect("findmnt evidence is UTF-8")
-                    .trim()
-                    .to_owned(),
+                observed,
                 detail: String::from_utf8(statfs.stdout)
                     .expect("stat -f evidence is UTF-8")
                     .trim()
@@ -173,6 +273,12 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = true;
+        /// `df` and `diskutil info` are unprivileged; this platform already
+        /// tolerates an explicit refusal, so it needs no exemption of its own.
+        pub(super) fn unavailable_reason_is_expected(_reason: &str) -> bool {
+            false
+        }
+        const MACOS_PROBE_REFUSED: &str = "filesystem-probe-refused";
 
         pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
             assert_eq!(status.signal(), Some(9), "{context}");
@@ -196,21 +302,25 @@ mod tests {
                     .expect("run diskutil for live fixture mount");
                 output.status.success().then_some(output)
             });
-            let observed_filesystem = diskutil
+            let observed = diskutil
                 .as_ref()
                 .and_then(|output| {
                     parse_macos_filesystem_plist(&String::from_utf8_lossy(&output.stdout))
                 })
-                .unwrap_or_else(|| "unavailable".to_owned());
+                .map_or(
+                    ProbedFilesystem::Unavailable(MACOS_PROBE_REFUSED),
+                    ProbedFilesystem::Observed,
+                );
+            let probed = observed != ProbedFilesystem::Unavailable(MACOS_PROBE_REFUSED);
             FixtureFilesystemEvidence {
                 queried_path: path.to_path_buf(),
                 platform: "macos",
                 expected_filesystem: "apfs",
-                observed_filesystem,
-                detail: if df.status.success() && diskutil.is_some() {
+                observed,
+                detail: if df.status.success() && probed {
                     "df-and-diskutil-ok".to_owned()
                 } else {
-                    "filesystem-probe-refused".to_owned()
+                    MACOS_PROBE_REFUSED.to_owned()
                 },
             }
         }
@@ -222,6 +332,21 @@ mod tests {
         use std::path::{Component, Prefix};
 
         pub(super) const ALLOW_EXPLICIT_FIXTURE_REFUSAL: bool = false;
+        /// `fsutil fsinfo volumeinfo` requires an elevated process. A developer
+        /// running the suite from an ordinary shell gets "Access is denied." and
+        /// no filesystem name, so THAT absence is an expected outcome here and
+        /// must not be reported as a failed filesystem contract. CI runners are
+        /// administrative, which is why this only ever bit local runs.
+        ///
+        /// Only the elevation reason is exempt. A missing `fsutil`, a fixture
+        /// path with no volume prefix, or output this harness cannot parse are
+        /// all broken-probe conditions that no privilege explains, so they still
+        /// fail rather than degrading into silent unavailable evidence.
+        pub(super) fn unavailable_reason_is_expected(reason: &str) -> bool {
+            reason == WINDOWS_PROBE_REQUIRES_ELEVATION
+        }
+        const WINDOWS_PROBE_NO_VOLUME: &str = "fixture-path-has-no-volume-prefix";
+        const WINDOWS_PROBE_SPAWN_REFUSED: &str = "fsutil-spawn-refused";
 
         pub(super) fn assert_forced_termination(status: ExitStatus, context: &str) {
             assert!(
@@ -244,59 +369,103 @@ mod tests {
         }
 
         pub(super) fn fixture_filesystem_evidence(path: &Path) -> FixtureFilesystemEvidence {
-            let output = volume_argument(path).and_then(|volume| {
-                let output = Command::new("fsutil")
+            let observed = match volume_argument(path) {
+                None => ProbedFilesystem::Unavailable(WINDOWS_PROBE_NO_VOLUME),
+                Some(volume) => match Command::new("fsutil")
                     .args(["fsinfo", "volumeinfo", &volume])
                     .output()
-                    .expect("run fsutil for live fixture volume");
-                output.status.success().then_some(output)
-            });
-            let observed_filesystem = output
-                .as_ref()
-                .and_then(|output| {
-                    parse_windows_filesystem_output(&String::from_utf8_lossy(&output.stdout))
-                })
-                .unwrap_or_else(|| "unavailable".to_owned());
+                {
+                    // "Access is denied." reaches stdout on some builds and
+                    // stderr on others, so both streams are classified.
+                    Ok(output) => classify_windows_filesystem_probe(
+                        output.status.success(),
+                        &[
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr),
+                        ]
+                        .join("\n"),
+                    ),
+                    Err(_) => ProbedFilesystem::Unavailable(WINDOWS_PROBE_SPAWN_REFUSED),
+                },
+            };
+            let detail: &'static str = match &observed {
+                ProbedFilesystem::Observed(_) => "fsutil-ok",
+                ProbedFilesystem::Unavailable(reason) => *reason,
+            };
+            let detail = detail.to_owned();
             FixtureFilesystemEvidence {
                 queried_path: path.to_path_buf(),
                 platform: "windows",
                 expected_filesystem: "ntfs",
-                observed_filesystem,
-                detail: if output.is_some() {
-                    "fsutil-ok".to_owned()
-                } else {
-                    "filesystem-probe-refused".to_owned()
-                },
+                observed,
+                detail,
             }
         }
     }
 
-    fn fixture_contract_is_qualified(path: &Path, context: &str) -> bool {
+    /// Probe the fixture parent and report the contract outcome.
+    ///
+    /// Three outcomes, kept distinct on purpose. A probe that ran and named the
+    /// wrong filesystem still fails hard wherever the platform does not permit
+    /// an explicit refusal — that is a fixture on an unsupported volume. A probe
+    /// that produced no evidence fails hard unless that specific reason is one a
+    /// correctly configured host can produce (`unavailable_reason_is_expected`,
+    /// which on Windows admits only the missing-elevation reason); such a reason
+    /// is reported as `unavailable` and handed back to the caller to interpret,
+    /// while a broken probe on any platform still fails.
+    fn fixture_contract_is_qualified(path: &Path, context: &str) -> FixtureContract {
         let evidence = platform::fixture_filesystem_evidence(path);
         assert_eq!(evidence.queried_path, path);
         let qualified = evidence.is_qualified();
-        let outcome = if qualified { "qualified" } else { "refused" };
+        let unavailable = evidence.unavailable_reason();
+        let outcome = match (qualified, unavailable) {
+            (true, _) => "qualified",
+            (false, None) => "refused",
+            (false, Some(_)) => "unavailable",
+        };
         println!(
             "AUDIO_GRAPH_67D3_FIXTURE_FS_V1 platform={} expected={} observed={} outcome={} detail={} context={context}",
             evidence.platform,
             evidence.expected_filesystem,
-            evidence.observed_filesystem,
+            evidence.observed_report(),
             outcome,
             evidence.detail,
         );
-        assert!(
-            qualified || platform::ALLOW_EXPLICIT_FIXTURE_REFUSAL,
-            "{context}: required filesystem contract refused: platform={}, expected={}, observed={}",
-            evidence.platform,
-            evidence.expected_filesystem,
-            evidence.observed_filesystem,
-        );
-        qualified
+        if qualified {
+            return FixtureContract::Qualified;
+        }
+        if let Some(reason) = unavailable {
+            // Keyed on the specific reason, not on a per-platform boolean: only
+            // the reasons a correctly configured host can produce are tolerated,
+            // so a broken probe (missing binary, unexpected path shape) still
+            // fails even on the platform that has one expected absence.
+            if !platform::unavailable_reason_is_expected(reason)
+                && !platform::ALLOW_EXPLICIT_FIXTURE_REFUSAL
+            {
+                panic!(
+                    "{context}: the fixture filesystem probe produced no evidence for a reason no \
+                     correctly configured host explains, so this host is misconfigured: \
+                     platform={}, expected={}, detail={reason}",
+                    evidence.platform, evidence.expected_filesystem,
+                );
+            }
+            return FixtureContract::EvidenceUnavailable(reason);
+        }
+        if !platform::ALLOW_EXPLICIT_FIXTURE_REFUSAL {
+            panic!(
+                "{context}: required filesystem contract refused: platform={}, expected={}, \
+                 observed={}",
+                evidence.platform,
+                evidence.expected_filesystem,
+                evidence.observed_report(),
+            );
+        }
+        FixtureContract::RefusedFilesystem
     }
 
     #[cfg(target_os = "macos")]
     fn macos_fixture_is_qualified(path: &Path, context: &str) -> bool {
-        fixture_contract_is_qualified(path, context)
+        fixture_contract_is_qualified(path, context) == FixtureContract::Qualified
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1420,6 +1589,15 @@ mod tests {
         );
     }
 
+    /// Two claims, and both hold on every host without any privilege.
+    ///
+    /// First, the parsers and the Windows probe classifier map probe text to the
+    /// right outcome — in particular a non-elevated "Access is denied." is
+    /// absent evidence naming elevation, not an observation of a non-NTFS
+    /// volume. Second, the live probe of a real fixture parent is bound to the
+    /// path it was asked about, and its outcome is reported for what it is. Only
+    /// the second claim depends on the host, and it degrades to an explicit
+    /// unavailable-evidence line rather than to a bare failure.
     #[test]
     fn filesystem_evidence_is_bound_to_the_live_fixture_parent() {
         assert_eq!(
@@ -1435,11 +1613,43 @@ mod tests {
         );
         assert_eq!(parse_windows_filesystem_output("no filesystem token"), None);
 
-        let root = TempRoot::new("fixture-mount-evidence");
-        if !fixture_contract_is_qualified(root.path(), "filesystem-evidence") {
-            println!(
-                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 platform=macos outcome=refused_not_apfs"
+        assert_eq!(
+            classify_windows_filesystem_probe(true, "File System Name : NTFS"),
+            ProbedFilesystem::Observed("NTFS".to_owned())
+        );
+        for (succeeded, output) in [(false, "Access is denied."), (true, "Access is denied.")] {
+            assert_eq!(
+                classify_windows_filesystem_probe(succeeded, output),
+                ProbedFilesystem::Unavailable(WINDOWS_PROBE_REQUIRES_ELEVATION),
+                "a denied probe is absent evidence whatever the exit status"
             );
+        }
+        assert_eq!(
+            classify_windows_filesystem_probe(false, "some other refusal"),
+            ProbedFilesystem::Unavailable(WINDOWS_PROBE_EXIT_REFUSED)
+        );
+        assert_eq!(
+            classify_windows_filesystem_probe(true, "no filesystem token"),
+            ProbedFilesystem::Unavailable(WINDOWS_PROBE_UNPARSABLE)
+        );
+        assert_eq!(
+            classify_windows_filesystem_probe(true, "File System Name : exFAT"),
+            ProbedFilesystem::Observed("exFAT".to_owned()),
+            "a probe that names a non-required filesystem is an observation, not a gap"
+        );
+
+        // The preceding AUDIO_GRAPH_67D3_FIXTURE_FS_V1 line carries the platform,
+        // the expectation, and the observation for this same context, so the
+        // typed outcome line only has to name the conclusion.
+        let root = TempRoot::new("fixture-mount-evidence");
+        match fixture_contract_is_qualified(root.path(), "filesystem-evidence") {
+            FixtureContract::Qualified => {}
+            FixtureContract::RefusedFilesystem => println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 test=filesystem-evidence outcome=refused_wrong_filesystem"
+            ),
+            FixtureContract::EvidenceUnavailable(reason) => println!(
+                "AUDIO_GRAPH_67D3_TYPED_TEST_OUTCOME_V1 test=filesystem-evidence outcome=unavailable_evidence detail={reason}"
+            ),
         }
     }
 
@@ -1661,14 +1871,27 @@ mod tests {
         assert!(successor.wait().success());
     }
 
+    /// The refusals proven here come from platform policy, not from the volume:
+    /// `namespace_supported_for` excludes Windows for every filesystem, so every
+    /// assertion below holds on NTFS, ReFS, or exFAT alike. That is why a fixture
+    /// volume whose filesystem could not be probed — the ordinary non-elevated
+    /// case, since `fsutil` needs elevation — still runs the whole proof and
+    /// gives up only the `filesystem=ntfs` claim in its evidence line. A probe
+    /// that runs and names a non-NTFS volume is a different matter and still
+    /// fails, inside `fixture_contract_is_qualified`.
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_ntfs_namespace_paths_refuse_before_temp_head_or_source_mutation() {
         let root = TempRoot::new("windows-ntfs-refusal");
-        assert!(fixture_contract_is_qualified(
-            root.path(),
-            "windows-namespace-refusal"
-        ));
+        let filesystem_evidence =
+            match fixture_contract_is_qualified(root.path(), "windows-namespace-refusal") {
+                FixtureContract::Qualified => "ntfs",
+                FixtureContract::EvidenceUnavailable(reason) => reason,
+                FixtureContract::RefusedFilesystem => panic!(
+                    "this platform does not permit an explicit fixture refusal, so a probed \
+                     non-NTFS volume must already have failed the contract"
+                ),
+            };
         fs::create_dir_all(root.path().join("streams")).expect("create stream fixture directory");
         fs::create_dir_all(root.path().join("recovery"))
             .expect("create recovery fixture directory");
@@ -1768,7 +1991,7 @@ mod tests {
         successor.wait_for(&handshake("exclusive_acquired_ok"));
         assert!(successor.wait().success());
         println!(
-            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem=ntfs first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
+            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem={filesystem_evidence} first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
         );
     }
 }

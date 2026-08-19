@@ -1358,6 +1358,29 @@ impl CanonicalExclusiveGuard {
     /// unlink whose own barrier result was lost. `recovery_key` names THIS
     /// unlink of THIS pathname, not whatever the removed entry contained; the
     /// caller must supply the same value when it reruns.
+    ///
+    /// The boundary sits at the removal call. Every refusal proven before
+    /// `remove_file` is invoked — reserved name, poisoned lock, unsupported or
+    /// unqualified namespace, out-of-root or non-regular target, changed
+    /// identity, and each injectable pre-invocation cut — is `Rejected` with the
+    /// entry intact. From that invocation onwards every failure is
+    /// `DurabilityIndeterminate` carrying the failed stage and the caller's
+    /// recovery key: the removal itself as stage `Unlink`, and the
+    /// parent-namespace barrier that publishes either a removal or an observed
+    /// absence as stage `ParentSync`.
+    ///
+    /// At stage `Unlink` that classification is deliberately CONSERVATIVE — it
+    /// is drawn at the invocation, not at its effect, so it can report a
+    /// durability question where nothing was removed. A `remove_file` denied by
+    /// the parent directory's permission check (`EACCES` or `EPERM` under a
+    /// read-only parent) cannot have changed a directory entry, and is still
+    /// reported indeterminate rather than as a refusal; the honest cost is one
+    /// exact rerun, where deciding removal-took-effect from an errno would
+    /// eventually call an unpublished removal durable. A raced `NotFound` lands
+    /// on the same arm for the opposite reason: the entry is gone, but no
+    /// barrier has published its absence yet.
+    /// `unlink_indeterminate_at_the_removal_call_is_conservative_and_rerunnable`
+    /// pins both the classification and the exact rerun that resolves it.
     pub(crate) fn unlink_canonical_entry(
         &self,
         path: &Path,
@@ -6726,5 +6749,144 @@ mod tests {
         assert!(!clean_target.exists());
         drop(clean_guard);
         fs::remove_dir_all(clean_root).expect("clean fixture root");
+    }
+
+    // audio-graph-dbd4 — the one unlink arm that can leave a real durability
+    // question open in production: `remove_file` itself failing.
+
+    /// Measure whether a read-only parent directory actually denies removal on
+    /// this host, and report the exact error it denies with.
+    ///
+    /// This is a capability, never an assumption: an effective root uid keeps
+    /// write access to a `0o555` directory, so there is nothing to deny and no
+    /// `EACCES` for the primitive to classify. Returning the observed
+    /// `ErrorKind`/errno pair also keeps the test free of a hardcoded errno
+    /// constant — it asserts the error the host raised, not one this file
+    /// guessed.
+    #[cfg(target_os = "linux")]
+    /// The effective uid, without taking a `libc` dependency for one call: a
+    /// file this process just created is owned by exactly that uid.
+    fn effective_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt;
+
+        let probe_root = temp_root("euid-probe");
+        fs::create_dir_all(&probe_root).expect("create euid probe root");
+        let probe = probe_root.join("owner");
+        fs::write(&probe, b"owner").expect("seed euid probe");
+        let uid = fs::metadata(&probe)
+            .expect("read euid probe metadata")
+            .uid();
+        fs::remove_dir_all(probe_root).expect("clean euid probe root");
+        uid
+    }
+
+    fn read_only_parent_removal_denial() -> Option<(io::ErrorKind, Option<i32>)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let probe_root = temp_root("unlink-denial-probe");
+        fs::create_dir_all(&probe_root).expect("create probe root");
+        let probe = probe_root.join("probe");
+        fs::write(&probe, b"probe").expect("seed probe entry");
+        fs::set_permissions(&probe_root, fs::Permissions::from_mode(0o555))
+            .expect("make the probe parent read-only");
+        let denial = fs::remove_file(&probe)
+            .err()
+            .map(|error| (error.kind(), error.raw_os_error()));
+        fs::set_permissions(&probe_root, fs::Permissions::from_mode(0o755))
+            .expect("restore the probe parent");
+        fs::remove_dir_all(probe_root).expect("clean probe root");
+        denial
+    }
+
+    /// Both injectable `Unlink` cuts sit BEFORE the removal call, so the
+    /// `DurabilityIndeterminate { stage: Unlink }` arm shipped classified but
+    /// unexercised. This drives it from a real `EACCES` on a read-only parent
+    /// rather than from a new post-invocation seam, which also proves the
+    /// conservatism the rustdoc now states: the permission check refuses before
+    /// any directory entry can change, so the entry provably survives an outcome
+    /// that reports a durability question about it. The recovery key that
+    /// outcome hands back is then the only input the resolving rerun needs.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unlink_indeterminate_at_the_removal_call_is_conservative_and_rerunnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("unlink-denied-removal");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let target = root.join("session-artifacts.tmp");
+        fs::write(&target, b"staged intent").expect("seed staged intent");
+        let proof = qualification(&root);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([73; 16]);
+        // The guard's coordination entry must exist before the parent turns
+        // read-only, so the lock is taken first.
+        let guard = CanonicalDurability::new()
+            .try_lock_exclusive(&root)
+            .expect("acquire namespace-bound guard");
+        // Skipping is keyed on the PRIVILEGE that explains a missing denial, not
+        // on the missing denial itself. Root legitimately bypasses a read-only
+        // parent; a non-root uid that is not denied means this arm silently went
+        // untested, which must fail rather than print a reassuring skip line.
+        let denial = match read_only_parent_removal_denial() {
+            Some(denial) => denial,
+            None => {
+                let euid = effective_uid();
+                drop(guard);
+                fs::remove_dir_all(root).expect("clean fixture root");
+                assert_eq!(
+                    euid, 0,
+                    "a read-only parent did not deny removal for euid {euid}, which is not root: \
+                     the indeterminate-at-removal arm went untested and this host cannot prove it"
+                );
+                println!(
+                    "outcome=unavailable_evidence \
+                     detail=running-as-root-so-a-read-only-parent-cannot-deny-removal"
+                );
+                return;
+            }
+        };
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555))
+            .expect("make the managed root read-only");
+        let outcome = guard.unlink_canonical_entry(&target, Some(&proof), key);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+            .expect("restore the managed root");
+
+        // The classification: indeterminate at the removal call, reporting the
+        // error the host actually raised and the caller's own recovery key.
+        let CanonicalUnlinkOutcome::DurabilityIndeterminate(indeterminate) = outcome else {
+            panic!("a denied removal must be indeterminate, reported {outcome:?}");
+        };
+        assert_eq!(
+            (
+                indeterminate.stage,
+                indeterminate.kind,
+                indeterminate.raw_os_error
+            ),
+            (CanonicalDurabilityStage::Unlink, denial.0, denial.1),
+        );
+        assert_eq!(indeterminate.recovery_key, key);
+        // Conservative, and provably so: the refused permission check removed
+        // nothing, yet the outcome still names a durability question.
+        assert_eq!(
+            fs::read(&target).expect("entry survives a denied removal"),
+            b"staged intent"
+        );
+
+        // The key it handed back is exactly what the resolving rerun needs: the
+        // same key against the same pathname, which then publishes the removal.
+        assert_eq!(
+            guard.unlink_canonical_entry(&target, Some(&proof), indeterminate.recovery_key),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            guard.unlink_canonical_entry(&target, Some(&proof), indeterminate.recovery_key),
+            CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
     }
 }

@@ -941,6 +941,18 @@ impl SessionArtifactManifestStore {
         &self.root
     }
 
+    /// Qualify a live fixture root against real filesystem identity.
+    ///
+    /// This fixture demands the substrate the durability layer supports: it
+    /// forwards to `CanonicalFilesystemQualification::for_test_root`, which
+    /// requires both a volume and a directory-object identity. Those come from
+    /// `unix` metadata, so every call site must be gated on `cfg(unix)` —
+    /// elsewhere this returns `ManifestStoreError::Coordination(IdentityUnavailable)`
+    /// and an ungated caller panics on its `expect`. Use it only when the
+    /// behaviour under test is the real-substrate binding itself; reach for
+    /// `qualified_for_algorithm_test` for platform-independent algorithm
+    /// behaviour. `real_filesystem_qualified_fixtures_stay_platform_gated`
+    /// enforces the gate.
     #[cfg(test)]
     pub(crate) fn qualified_for_test(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
         let root = root.into();
@@ -954,6 +966,8 @@ impl SessionArtifactManifestStore {
         })
     }
 
+    /// Session-addressed peer of `qualified_for_test`, with the same
+    /// `cfg(unix)` call-site requirement and the same reason for it.
     #[cfg(test)]
     pub(crate) fn qualified_for_test_session(
         root: impl Into<PathBuf>,
@@ -971,6 +985,16 @@ impl SessionArtifactManifestStore {
         })
     }
 
+    /// Qualify a live fixture root against a synthetic namespace identity.
+    ///
+    /// The root, its coordination entry, its manifest head, and every
+    /// temporary are real files; only volume/object identity is synthetic, and
+    /// the durability layer substitutes an open-handle identity check for the
+    /// inode comparison it cannot make. That substitution is portable, so this
+    /// fixture constructs on every target — including Windows, where the
+    /// namespace durability policy is unsupported and `for_test_root` refuses.
+    /// It is the right fixture whenever the subject is platform-independent
+    /// store or CAS algorithm behaviour rather than the substrate binding.
     #[cfg(test)]
     pub(crate) fn qualified_for_algorithm_test(
         root: impl Into<PathBuf>,
@@ -987,6 +1011,32 @@ impl SessionArtifactManifestStore {
         })
     }
 
+    /// Session-addressed peer of `qualified_for_algorithm_test`.
+    ///
+    /// The synthetic namespace is per-root, not per-address, so two addressed
+    /// stores bound to one root share the single canonical coordination entry
+    /// exactly as the real-substrate fixture does.
+    #[cfg(test)]
+    pub(crate) fn qualified_for_algorithm_test_session(
+        root: impl Into<PathBuf>,
+        session_id: &str,
+    ) -> Result<Self, ManifestStoreError> {
+        let address = session_control_address(session_id)?;
+        let root = root.into();
+        let environment =
+            AlgorithmTestEnvironment::bind(&root).map_err(ManifestStoreError::Coordination)?;
+        let (qualification, durability) = environment.into_parts();
+        Ok(Self {
+            root,
+            address: Some(address),
+            durability,
+            qualification: Some(qualification),
+        })
+    }
+
+    /// `qualified_for_algorithm_test` with the platform policy injected, so a
+    /// test can separate synthetic namespace qualification from the
+    /// platform-policy refusal that production would raise on that platform.
     #[cfg(test)]
     pub(crate) fn qualified_for_algorithm_test_platform(
         root: impl Into<PathBuf>,
@@ -1067,8 +1117,26 @@ enum ManifestCasPreparationResult {
 enum ManifestInstallDisposition {
     /// Fresh install; this transaction staged nothing and owns no proof.
     Fresh,
-    /// Lock-owned recovery resume. Any temporary this install adopts pre-dates
-    /// the transaction, so this transaction has no key that names it.
+    /// This transaction owns no staged intent key to hand back. Two different
+    /// call sites construct it, and neither can name a temporary as its own.
+    ///
+    /// `compare_and_swap_recovery` (and its `cfg(test)` fault twin) passes it
+    /// for the lock-owned recovery resume: the install may adopt a temporary,
+    /// but that temporary pre-dates the transaction, so no key this transaction
+    /// derived names it.
+    ///
+    /// `advance_session_semantics_v1_to_v2_inner` passes it from the `None` arm
+    /// of `staged_intent_recovery_key`, which is neither a recovery resume nor
+    /// an install adopting a temporary. That arm is reached exactly when the
+    /// preparation is `ManifestCasPreparation::AlreadyCompleted`: the staging
+    /// block runs only for an `Install` preparation, and its two non-`Accepted`
+    /// outcomes both return before a key can exist. Nothing on that path ever
+    /// reads this value, because `commit_prepared_compare_and_swap` returns
+    /// `AlreadyCompleted` before it selects an install.
+    ///
+    /// Wherever it IS read, an install-stage refusal is forwarded as a plain
+    /// `Durability`, which is the honest classification for both sites: no
+    /// record this call made durable is at stake.
     ResumeUnstaged,
     /// Transition install. The intent temporary named by this key and the
     /// immutable proof are both already durable before the install runs.
@@ -2848,11 +2916,20 @@ mod tests {
         assert!(root.join(COORDINATION_FILE_NAME).is_file());
     }
 
+    /// The subject is the checked-read envelope on an addressed store: the
+    /// shared coordination entry is established before the reader observes
+    /// anything, an absent session stays absent, and no manifest is created.
+    /// None of that reads volume or object identity, so the synthetic
+    /// namespace is the honest substrate and this runs on every target.
+    /// `qualified_checked_read_holds_shared_guard_through_present_snapshot_closure`
+    /// and its writer-race peer keep the real-substrate guard semantics under
+    /// `cfg(unix)`, where advisory locks behave as those tests assert.
     #[test]
     fn qualified_checked_read_establishes_global_lock_and_revalidates_absent_session() {
         let root = root("qualified-checked-read-absent");
-        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
-            .expect("qualified Session store");
+        let store =
+            SessionArtifactManifestStore::qualified_for_algorithm_test_session(&root, "session-1")
+                .expect("synthetic-namespace Session store");
         assert!(!root.join(COORDINATION_FILE_NAME).exists());
 
         let observed = store
@@ -3288,6 +3365,11 @@ mod tests {
         assert_eq!(explicit["session_semantics_version"], serde_json::json!(1));
     }
 
+    /// Every case here is refused by candidate validation before the
+    /// transaction touches a byte, so the subject is the validation predicate
+    /// and not the substrate. A qualification is still required to open the
+    /// transaction at all, and the synthetic namespace supplies the cheapest
+    /// honest one on every target.
     #[test]
     fn v2_candidate_requires_exact_bound_session_provenance_proof() {
         use super::V2SessionProvenanceError;
@@ -3298,8 +3380,8 @@ mod tests {
             expected: V2SessionProvenanceError,
         ) {
             let root = root(label);
-            let store = SessionArtifactManifestStore::qualified_for_test(&root)
-                .expect("qualified validation fixture");
+            let store = SessionArtifactManifestStore::qualified_for_algorithm_test(&root)
+                .expect("synthetic-namespace validation fixture");
             let mut transaction = store.begin_write().expect("transaction");
             assert_eq!(
                 transaction.compare_and_swap(0, candidate),
@@ -3591,6 +3673,10 @@ mod tests {
     /// One addressed Session advanced to a committed V2 head at generation 1,
     /// returned with its managed root, its accepted manifest, and the exact
     /// durable transition-proof bytes that advance made durable.
+    ///
+    /// Real-substrate only, because it qualifies against real filesystem
+    /// identity; every caller is gated the same way.
+    #[cfg(unix)]
     fn advanced_v2_session(
         name: &str,
     ) -> (
@@ -5118,6 +5204,94 @@ mod tests {
         assert!(!manifest_path.exists());
     }
 
+    /// Keep the substrate contract that seed audio-graph-a58b closed.
+    ///
+    /// `qualified_for_test` and `qualified_for_test_session` demand real
+    /// volume and object identity, which `filesystem_identity` can only report
+    /// on `unix`. An ungated call site therefore compiles everywhere and
+    /// panics `Coordination(IdentityUnavailable)` on a host nobody ran here —
+    /// exactly how four tests reached a real Windows run before failing. This
+    /// converts that class back into a local failure by requiring an exact
+    /// platform gate on the enclosing test of every such call site.
+    #[test]
+    fn real_filesystem_qualified_fixtures_stay_platform_gated() {
+        // Built at runtime so this test does not match its own source.
+        let fixture = ["qualified", "for", "test"].join("_");
+        let accepted_gates = [
+            "#[cfg(unix)]",
+            "#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]",
+        ];
+
+        let source = include_str!("session_artifact_manifest.rs");
+        let (_, tests) = source
+            .split_once("\nmod tests {")
+            .expect("this module owns a tests module");
+        let lines = tests.lines().collect::<Vec<_>>();
+        // A helper that reaches a real-filesystem fixture inherits the same
+        // requirement, so callers are followed to a fixed point.
+        let mut needles = vec![fixture];
+        let mut examined = 0usize;
+        let mut gated = 0usize;
+        while examined < needles.len() {
+            let needle = needles[examined].clone();
+            examined += 1;
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if !line.contains(&needle)
+                    || trimmed.starts_with("//")
+                    || trimmed.starts_with("fn ")
+                {
+                    continue;
+                }
+                let declaration = lines[..index]
+                    .iter()
+                    .rposition(|candidate| candidate.starts_with("    fn "))
+                    .expect("every fixture call site sits inside a module-level test function");
+                let attributes = lines[..declaration]
+                    .iter()
+                    .rev()
+                    .take_while(|candidate| {
+                        let candidate = candidate.trim_start();
+                        candidate.starts_with("#[") || candidate.starts_with("///")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    attributes
+                        .iter()
+                        .any(|attribute| accepted_gates.contains(&attribute.trim())),
+                    "{} reaches the real-filesystem fixture through `{needle}` without one of \
+                     {accepted_gates:?}; gate it or move it to the synthetic namespace fixture",
+                    lines[declaration].trim(),
+                );
+                gated += 1;
+                if !attributes
+                    .iter()
+                    .any(|attribute| attribute.trim() == "#[test]")
+                {
+                    let helper = lines[declaration]
+                        .trim()
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .expect("declaration names a function")
+                        .to_owned();
+                    if !needles.contains(&helper) {
+                        needles.push(helper);
+                    }
+                }
+            }
+        }
+        assert!(
+            needles.len() > 1,
+            "expected at least one gated helper to reach the real-filesystem fixture",
+        );
+        assert!(
+            gated >= 20,
+            "expected the real-filesystem fixtures to remain widely exercised, found {gated} \
+             gated call sites",
+        );
+    }
+
     #[test]
     fn algorithm_qualification_and_windows_policy_refusal_are_explicitly_separate() {
         let algorithm_root = root("algorithm-qualified");
@@ -5158,11 +5332,165 @@ mod tests {
         assert!(!windows_root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
 
+    /// Snapshot-install cuts on a synthetic namespace, so the honesty of the
+    /// indeterminate classification is proven on every target rather than only
+    /// where a real qualified substrate exists.
+    /// `manifest_cas_consumes_staged_intent_and_restarts_every_install_cut`
+    /// covers the same seam for the proof-owning advance under `cfg(unix)`; this
+    /// covers the plain replacement CAS and adds what each cut cost. A cut
+    /// before the rename leaves the previous head and a staged temporary, and
+    /// that temporary is durable state: a fresh install refuses it with
+    /// `SnapshotTempAlreadyExists` rather than overwriting it, and only the exact
+    /// recovery retry resumes it. A cut at the parent-namespace barrier has
+    /// already installed the new head, so an ordinary replacement converges.
+    #[test]
+    fn synthetic_namespace_install_cuts_are_indeterminate_at_their_exact_stage() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        for stage in [
+            CanonicalDurabilityStage::Flush,
+            CanonicalDurabilityStage::FileSync,
+            CanonicalDurabilityStage::Rename,
+            CanonicalDurabilityStage::ParentSync,
+        ] {
+            let root = root(&format!("algorithm-install-cut-{stage:?}"));
+            let store = SessionArtifactManifestStore::qualified_for_algorithm_test(&root)
+                .expect("synthetic-namespace fixture");
+            let manifest_path = store.manifest_path();
+            let temporary_path = store.temporary_path();
+            {
+                let mut seed = store.begin_write().expect("seed transaction");
+                assert!(matches!(
+                    seed.compare_and_swap(0, basic_candidate("cut-head-1", 'a')),
+                    ManifestCasOutcome::Accepted { .. }
+                ));
+            }
+            let seeded_bytes = std::fs::read(&manifest_path).expect("seeded head bytes");
+
+            let mut cut = store.begin_write().expect("cut transaction");
+            let outcome = cut.compare_and_swap_recovery_with_fault(
+                1,
+                basic_candidate("cut-head-2", 'b'),
+                stage,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                        stage: reported,
+                        ..
+                    }) if reported == stage
+                ),
+                "install cut at {stage:?} reported {outcome:?}"
+            );
+            if stage == CanonicalDurabilityStage::ParentSync {
+                assert_ne!(
+                    std::fs::read(&manifest_path).expect("installed head"),
+                    seeded_bytes,
+                    "a cut after the rename leaves the new head in place"
+                );
+                assert!(!temporary_path.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(&manifest_path).expect("retained head"),
+                    seeded_bytes,
+                    "a cut before the rename leaves the previous head in place"
+                );
+            }
+            drop(cut);
+
+            let observed_generation = match store.load().expect("head after the cut") {
+                ManifestLoadOutcome::Present(manifest) => manifest.generation,
+                ManifestLoadOutcome::Absent => panic!("the cut must not remove the head"),
+            };
+            let mut restarted = store.begin_write().expect("restarted transaction");
+            if stage == CanonicalDurabilityStage::ParentSync {
+                assert!(matches!(
+                    restarted
+                        .compare_and_swap(observed_generation, basic_candidate("cut-head-3", 'c')),
+                    ManifestCasOutcome::Accepted { .. }
+                ));
+            } else {
+                // The staged temporary is the cut's surviving durable state, so a
+                // fresh install refuses it rather than overwriting it, and only
+                // the exact recovery retry may resume it.
+                assert_eq!(
+                    restarted
+                        .compare_and_swap(observed_generation, basic_candidate("cut-head-3", 'c')),
+                    ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                        CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+                    ))
+                );
+                assert!(matches!(
+                    restarted.compare_and_swap_recovery(
+                        observed_generation,
+                        basic_candidate("cut-head-2", 'b')
+                    ),
+                    ManifestCasOutcome::Accepted { .. }
+                ));
+            }
+            drop(restarted);
+            assert!(!temporary_path.exists());
+            assert_ne!(
+                std::fs::read(&manifest_path).expect("converged head"),
+                seeded_bytes
+            );
+        }
+    }
+
+    /// The synthetic namespace is what makes the ported algorithm tests
+    /// portable, so prove it is not a rubber stamp: it substitutes an
+    /// open-handle check for the inode comparison it cannot make, and that
+    /// substitute must still catch the substitution
+    /// `cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation`
+    /// catches with real identity — a byte-identical replacement of the
+    /// validated head object under the transaction's feet.
+    #[test]
+    fn synthetic_namespace_replacement_refuses_a_byte_identical_foreign_head() {
+        let root = root("algorithm-foreign-head");
+        let store = SessionArtifactManifestStore::qualified_for_algorithm_test(&root)
+            .expect("synthetic-namespace fixture");
+        {
+            let mut seed = store.begin_write().expect("seed transaction");
+            assert!(matches!(
+                seed.compare_and_swap(0, basic_candidate("algorithm-head-1", 'a')),
+                ManifestCasOutcome::Accepted {
+                    manifest: SessionArtifactManifestV1 { generation: 1, .. },
+                    ..
+                }
+            ));
+        }
+
+        let mut raced = store.begin_write().expect("open exact generation-one head");
+        let manifest_path = store.manifest_path();
+        let displaced_path = root.join("manifest.displaced");
+        let validated_bytes = std::fs::read(&manifest_path).expect("read validated head bytes");
+        std::fs::rename(&manifest_path, &displaced_path).expect("displace validated head object");
+        std::fs::write(&manifest_path, &validated_bytes)
+            .expect("install byte-identical foreign head object");
+
+        assert_eq!(
+            raced.compare_and_swap(1, basic_candidate("algorithm-head-2", 'b')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged,
+            ))
+        );
+        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("foreign head retained"),
+            validated_bytes
+        );
+    }
+
+    /// Generation comparison and overflow are integer algorithm, and both
+    /// refusals land before any temporary is created, so the synthetic
+    /// namespace is the honest substrate. The retained-head assertion still
+    /// reads the real planted bytes back off disk.
     #[test]
     fn stale_and_overflow_generations_refuse_without_snapshot_mutation() {
         let root = root("generation-refusal");
-        let store =
-            SessionArtifactManifestStore::qualified_for_test(&root).expect("qualified fixture");
+        let store = SessionArtifactManifestStore::qualified_for_algorithm_test(&root)
+            .expect("synthetic-namespace fixture");
         let mut head = basic_candidate("tx-head", 'a');
         head.generation = u64::MAX;
         write_manifest_bytes(&store, &serde_json::to_vec(&head).expect("serialize head"));
@@ -5200,6 +5528,11 @@ mod tests {
         assert!(!store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
     }
 
+    /// The subject is the wire-size bound: a candidate of exactly
+    /// `MAX_MANIFEST_BYTES` installs and one byte more is refused before the
+    /// temporary exists. Both outcomes are decided from the serialized length
+    /// alone, so the synthetic namespace is the honest substrate; the accepted
+    /// branch still writes and renames real bytes through the guard.
     #[test]
     fn manifest_candidate_size_preflight_accepts_exact_boundary_and_rejects_oversize() {
         const MIN_UNIQUE_IDENTITY_BYTES: usize = 10;
@@ -5262,8 +5595,8 @@ mod tests {
         }
 
         let exact_root = root("size-exact");
-        let exact_store = SessionArtifactManifestStore::qualified_for_test(&exact_root)
-            .expect("qualified exact-size fixture");
+        let exact_store = SessionArtifactManifestStore::qualified_for_algorithm_test(&exact_root)
+            .expect("synthetic-namespace exact-size fixture");
         let mut exact_transaction = exact_store.begin_write().expect("exact transaction");
         assert!(matches!(
             exact_transaction
@@ -5274,8 +5607,9 @@ mod tests {
         assert!(!exact_store.root.join(MANIFEST_TEMP_FILE_NAME).exists());
 
         let oversized_root = root("size-oversized");
-        let oversized_store = SessionArtifactManifestStore::qualified_for_test(&oversized_root)
-            .expect("qualified oversized fixture");
+        let oversized_store =
+            SessionArtifactManifestStore::qualified_for_algorithm_test(&oversized_root)
+                .expect("synthetic-namespace oversized fixture");
         let mut oversized_transaction = oversized_store
             .begin_write()
             .expect("oversized transaction");
@@ -6041,5 +6375,104 @@ mod tests {
                     && manifest.transition.idempotency_id == transition_id
                     && manifest.session_semantics_version == SessionSemanticsVersion::V2
         ));
+    }
+
+    /// audio-graph-dbd4: abandon an ORPHANED temporary — one staged by an
+    /// earlier transaction that is already dropped.
+    ///
+    /// Every other abandon call site abandons from the same transaction that
+    /// staged, which never exercises the caller this escape exists for: a
+    /// process that comes up onto a wedged store, holds no candidate, and did
+    /// not stage what it has to retire. The proof that abandon needs no stager
+    /// is that a fresh store over the same root spelling derives the same
+    /// temporary identity, and therefore the same abandon recovery key, from the
+    /// root and the Session id alone.
+    ///
+    /// That is store and CAS algorithm behaviour rather than a real-substrate
+    /// binding, so the synthetic namespace is the honest fixture and this runs
+    /// on every target. What it still reads off disk is real: the orphan's
+    /// bytes, the refused install's failure to touch them, and the durable proof
+    /// the abandon leaves alone.
+    #[test]
+    fn abandon_retires_a_temporary_orphaned_by_a_dropped_transaction() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+
+        let root = root("abandon-orphaned-temporary");
+        let staging_store =
+            SessionArtifactManifestStore::qualified_for_algorithm_test_session(&root, "session-1")
+                .expect("synthetic-namespace Session store");
+        let manifest_path = staging_store.manifest_path();
+        let temporary_path = staging_store.temporary_path();
+        let provenance_path = root.join(staging_store.control_identities().provenance.as_str());
+        let transition_id = "advance-abandon-orphan";
+
+        // Stage, then lose the stager: the refused install leaves this
+        // transaction's intent temporary and its immutable proof durable.
+        let mut staging = staging_store.begin_write().expect("staging transaction");
+        assert!(matches!(
+            staging.advance_session_semantics_v1_to_v2_with_faults(
+                0,
+                v2_candidate(transition_id),
+                SessionSemanticsTransitionProofV1::v1_to_v2("session-1", transition_id)
+                    .expect("orphaned transition proof"),
+                None,
+                None,
+                Some(CanonicalDurabilityStage::CreateNew),
+            ),
+            ManifestCasOutcome::Rejected(
+                ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable { .. }
+            )
+        ));
+        let orphan_bytes = std::fs::read(&temporary_path).expect("orphaned temporary bytes");
+        let proof_bytes = std::fs::read(&provenance_path).expect("durable proof bytes");
+        drop(staging);
+        drop(staging_store);
+
+        // The post-restart caller: a fresh store over the same root, wedged by a
+        // temporary it never staged and cannot reconstruct.
+        let store =
+            SessionArtifactManifestStore::qualified_for_algorithm_test_session(&root, "session-1")
+                .expect("restarted synthetic-namespace Session store");
+        assert_eq!(store.temporary_path(), temporary_path);
+        let mut wedged = store.begin_write().expect("wedged transaction");
+        assert_eq!(
+            wedged.compare_and_swap(0, basic_candidate("orphan-wedged-v1", 'a')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists,
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&temporary_path).expect("orphan survives the refused install"),
+            orphan_bytes
+        );
+        assert!(!manifest_path.exists());
+        drop(wedged);
+
+        // A NEW transaction retires it, with no candidate of its own.
+        let mut adopting = store.begin_write().expect("abandoning transaction");
+        assert_eq!(
+            adopting.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+            })
+        );
+        assert!(!temporary_path.exists());
+        assert!(!manifest_path.exists());
+
+        // The consequence: a DIFFERENT candidate now installs through the public
+        // generation CAS, and the abandon removed only the temporary.
+        assert!(matches!(
+            adopting.compare_and_swap(0, basic_candidate("orphan-replacement-v1", 'b')),
+            ManifestCasOutcome::Accepted {
+                manifest: SessionArtifactManifestV1 { generation: 1, .. },
+                ..
+            }
+        ));
+        assert!(manifest_path.exists());
+        assert_eq!(
+            std::fs::read(&provenance_path).expect("orphaned proof survives the abandon"),
+            proof_bytes
+        );
     }
 }

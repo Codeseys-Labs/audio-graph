@@ -63,7 +63,7 @@ All symbols in `src-tauri/src/persistence/session_artifact_manifest.rs`.
 ### 2.1 The binding
 
 `bind_v2_provenance_to_durable_proof`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2164`) proves that a V2
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2232`) proves that a V2
 candidate's `SessionProvenanceEvents` entry describes this Session's durable
 v1-to-v2 transition-proof record. The record's path and identity are DERIVED from
 the store's Session address and are never caller-supplied; the whole read happens
@@ -80,13 +80,13 @@ refusals separately and truthfully: `DurableProofAbsent`,
 `NotCanonicalDurableProof(SessionSemanticsTransitionProofError)`,
 `DurableProofSessionMismatch`, `ProvenanceIdentityMismatch`,
 `ProvenanceContentMismatch`. `binding_io`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2216`) is the single I/O
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2284`) is the single I/O
 classifier: `NotFound` is the only condition that becomes `DurableProofAbsent`,
 everything else is reported verbatim as `DurableProofUnreadable` and is never
 widened into absence. An over-long record is refused *without* being decoded, so
 this kernel never reports a "malformed proof" it only partially read. The bound
 itself is `MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2146`), whose rustdoc
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2214`), whose rustdoc
 carries the arithmetic: 143-byte golden wire, 118-byte template, 255-byte id caps,
 escaping at most doubling each id, 1138-byte true ceiling under a rounded 4096.
 
@@ -99,9 +99,9 @@ matches `ManifestCasRejection` exhaustively; the sole external use wraps it
 ### 2.2 The validator now hands over the validated pieces
 
 `validate_v2_session_provenance`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2101`) returns
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2169`) returns
 `V2SessionProvenanceEntry`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2096`) — the validated
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2164`) — the validated
 provenance identity and content by reference — instead of the unit type. This is
 the critique's required change: passing the whole entry would have forced the
 binding to read `availability.content()` and classify an impossible `None` as
@@ -111,7 +111,7 @@ unrepresentable and the binding has no such arm.
 
 Its two self-consistency checks are unchanged, including
 `manifest.transition.fingerprint != content.sha256`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2129`). They are the
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2197`). They are the
 load-path and floor-admission checks, they still fire first, and
 `session_semantics.rs`'s
 `forged_already_completed_manifest_proof_cannot_preserve_the_logical_floor` still
@@ -120,16 +120,16 @@ depends on `TransitionFingerprintMismatch`.
 ### 2.3 The re-key
 
 `refuse_unproven_v2_candidate`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:1530`), called from
+(`src-tauri/src/persistence/session_artifact_manifest.rs:1598`), called from
 `prepare_compare_and_swap` at
-`src-tauri/src/persistence/session_artifact_manifest.rs:1596`, replaces the
+`src-tauri/src/persistence/session_artifact_manifest.rs:1664`, replaces the
 floor-keyed gate. It is keyed on whether this call performs the transition:
 
 * `proof_owned` calls are skipped, and must be — the advance calls
   `prepare_compare_and_swap` at
-  `src-tauri/src/persistence/session_artifact_manifest.rs:1245`, BEFORE the record
+  `src-tauri/src/persistence/session_artifact_manifest.rs:1313`, BEFORE the record
   exists, and binds by full-byte equality afterwards at
-  `src-tauri/src/persistence/session_artifact_manifest.rs:1255`;
+  `src-tauri/src/persistence/session_artifact_manifest.rs:1323`;
 * non-V2 candidates and unaddressed stores are skipped, unchanged behaviour;
 * an absent head or a head below V2 is still `TransitionProofRequired`;
 * an addressed store without a derived provenance path/identity is
@@ -153,7 +153,7 @@ brief's version.
 
 `committed_v2_head_refuses_later_generations_until_proof_binding_exists` became
 `committed_v2_head_records_later_generations_only_against_the_durable_proof`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:3712`), same position in
+(`src-tauri/src/persistence/session_artifact_manifest.rs:3798`), same position in
 the file. The old name asserts "until proof binding exists", which became a false
 statement about shipped code, and a test name that misdescribes the code is the
 same defect class as a comment that does. The rustdoc now describes the shipped
@@ -380,21 +380,21 @@ authoritative set and all four are green.
 
 | Property | Where |
 | --- | --- |
-| A V1 candidate against a V2 head is a floor regression | `accepted_v2_manifest_cannot_regress_to_v1` (`src-tauri/src/persistence/session_artifact_manifest.rs:3436`), plus T1's third assertion kept verbatim |
-| A real transition still requires its proof | `addressed_generic_cas_cannot_install_v2_without_owning_proof_bytes` (`src-tauri/src/persistence/session_artifact_manifest.rs:3537`): absent head AND, new in this seed, a committed V1 head, both `TransitionProofRequired` |
-| Same idempotency id with changed artifacts conflicts | T5 (`src-tauri/src/persistence/session_artifact_manifest.rs:3782`) — `TransitionConflict`, and see R4 for why not `IdempotencyConflict` |
+| A V1 candidate against a V2 head is a floor regression | `accepted_v2_manifest_cannot_regress_to_v1` (`src-tauri/src/persistence/session_artifact_manifest.rs:3518`), plus T1's third assertion kept verbatim |
+| A real transition still requires its proof | `addressed_generic_cas_cannot_install_v2_without_owning_proof_bytes` (`src-tauri/src/persistence/session_artifact_manifest.rs:3619`): absent head AND, new in this seed, a committed V1 head, both `TransitionProofRequired` |
+| Same idempotency id with changed artifacts conflicts | T5 (`src-tauri/src/persistence/session_artifact_manifest.rs:3868`) — `TransitionConflict`, and see R4 for why not `IdempotencyConflict` |
 | Byte-identical replay is idempotent | T5 — `AlreadyCompleted` |
 | The advance path's refusal classifications are untouched | `proof_before_manifest_transition_returns_actual_accepted_and_already_completed`, `proof_conflict_and_indeterminate_prevent_manifest_mutation_then_retry_converges`, `stale_existing_head_rejects_different_transition_before_proof_mutation`, all green with no edits |
-| A forged provenance entry cannot install on an advanced head | T2 (`src-tauri/src/persistence/session_artifact_manifest.rs:3913`), four shapes, each mutating nothing |
-| A damaged durable record cannot admit a later generation | T3 (`src-tauri/src/persistence/session_artifact_manifest.rs:4022`), six record shapes |
-| Quarantine recovery is still closed on a V2 Session | T6 (`src-tauri/src/persistence/session_artifact_manifest.rs:3830`), four candidate shapes |
+| A forged provenance entry cannot install on an advanced head | T2 (`src-tauri/src/persistence/session_artifact_manifest.rs:3999`), four shapes, each mutating nothing |
+| A damaged durable record cannot admit a later generation | T3 (`src-tauri/src/persistence/session_artifact_manifest.rs:4108`), six record shapes |
+| Quarantine recovery is still closed on a V2 Session | T6 (`src-tauri/src/persistence/session_artifact_manifest.rs:3916`), four candidate shapes |
 
 The seed's "also record while here" closure, now executable: quarantine recovery
 is unreachable on a V2 Session for every candidate shape. V1 prepared and V1
 completed candidates are `SessionSemanticsFloorRegression`; a V2 prepared candidate
 is `InvalidV2SessionProvenance(TransitionNotCompleted)`; a V2 completed candidate
 is `CompletionRequiresPrepared`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:1648`). The named cause is
+(`src-tauri/src/persistence/session_artifact_manifest.rs:1716`). The named cause is
 `SessionArtifactManifestV1::candidate`
 (`src-tauri/src/persistence/session_artifact_manifest.rs:253`) hardcoding
 `SessionSemanticsVersion::V1`, and the production quarantine candidate is built
@@ -432,16 +432,16 @@ that produced the reverted round:
 
 | # | Residual | Owner |
 | --- | --- | --- |
-| R1 | Install-stage `Durability` classification in `commit_prepared_compare_and_swap` (`src-tauri/src/persistence/session_artifact_manifest.rs:1688`) and `install_snapshot_inner`, and the missing removal/abandon primitive for an orphaned intent temporary. Untouched here by scope fence. | audio-graph-3cf2 — lands first; this branch rebases onto it |
-| R2 | `load`, `load_selected_manifest`, and `load_manifest_file` (`src-tauri/src/persistence/session_artifact_manifest.rs:1888`) still accept a persisted V2 manifest whose durable proof is absent or altered: they run only the structural validator. Deliberate — a damaged Session must stay loadable for diagnosis, and floor admission is CAS-gated through `admitted_session_semantics_floor` (`src-tauri/src/persistence/session_semantics.rs:134`). | unowned; needs a seed |
+| R1 | Install-stage `Durability` classification in `commit_prepared_compare_and_swap` (`src-tauri/src/persistence/session_artifact_manifest.rs:1756`) and `install_snapshot_inner`, and the missing removal/abandon primitive for an orphaned intent temporary. Untouched here by scope fence. | audio-graph-3cf2 — lands first; this branch rebases onto it |
+| R2 | `load`, `load_selected_manifest`, and `load_manifest_file` (`src-tauri/src/persistence/session_artifact_manifest.rs:1956`) still accept a persisted V2 manifest whose durable proof is absent or altered: they run only the structural validator. Deliberate — a damaged Session must stay loadable for diagnosis, and floor admission is CAS-gated through `admitted_session_semantics_floor` (`src-tauri/src/persistence/session_semantics.rs:134`). | unowned; needs a seed |
 | R3 | `checked_session_open` (`src-tauri/src/persistence/session_semantics.rs:80`) admits a V2 floor from manifest bytes alone, with no reference to a durable record. | unowned; follow-up seed |
-| R4 | `IdempotencyConflict` (`src-tauri/src/persistence/session_artifact_manifest.rs:1629`) is now unreachable for a bound V2 candidate: head and candidate both carry the durable proof digest as their fingerprint, so the same-id arm's comparison cannot fire and the divergence falls through to `TransitionConflict` (`src-tauri/src/persistence/session_artifact_manifest.rs:1642`). The refusal holds; the classification shape differs from V1's. Recorded, not fixed. | unowned |
-| R5 | `recovery_key(&candidate.transition.fingerprint)` (`src-tauri/src/persistence/session_artifact_manifest.rs:1680`) is identical for every V2 generation of a Session, since all of them carry the proof digest. `CanonicalRecoveryKey` is an opaque correlation token, never a path component or comparison key, so this costs diagnosability, not correctness, and it was already the status quo on the transition path. | unowned |
+| R4 | `IdempotencyConflict` (`src-tauri/src/persistence/session_artifact_manifest.rs:1697`) is now unreachable for a bound V2 candidate: head and candidate both carry the durable proof digest as their fingerprint, so the same-id arm's comparison cannot fire and the divergence falls through to `TransitionConflict` (`src-tauri/src/persistence/session_artifact_manifest.rs:1710`). The refusal holds; the classification shape differs from V1's. Recorded, not fixed. | unowned |
+| R5 | `recovery_key(&candidate.transition.fingerprint)` (`src-tauri/src/persistence/session_artifact_manifest.rs:1748`) is identical for every V2 generation of a Session, since all of them carry the proof digest. `CanonicalRecoveryKey` is an opaque correlation token, never a path component or comparison key, so this costs diagnosability, not correctness, and it was already the status quo on the transition path. | unowned |
 | R6 | `SessionArtifactManifestV1::candidate`'s V1 hardcode (`src-tauri/src/persistence/session_artifact_manifest.rs:253`) and therefore the quarantine-recovery closure on a V2 Session. Fixing it means letting recovery build V2 candidates, which collides with `TransitionNotCompleted` versus `CompletionRequiresPrepared` — a design question about quarantine-under-V2, not a binding question. | unowned; design decision needed |
 | R7 | The binding, like the gate, applies only to addressed stores. Sound only because every unaddressed constructor is `#[cfg(test)]` while `for_session` and `qualified_existing_session` both derive an address. If a future production caller constructs an unaddressed store, the binding silently does not apply. Standing constraint. | whoever adds such a caller |
 | R8 | The kernel is still dormant: `grep` finds no caller of `SessionArtifactManifestStore::for_session` or `::qualified_existing_session` outside this module. Everything here is proved by tests, not by production traffic. | wave-level |
 | R9 | `DurableProofUnreadable` has no automated test. Forcing a read error at that exact path needs root-fragile permission manipulation or a fault seam this module does not have. Precedent: `ManifestLoadError::Io` is constructed only by `load_io` and is asserted by no test in this module either. Coverage was not faked. | unowned; would need a fault seam |
-| R10 | The binding does not re-check metadata *after* its read, unlike `load_manifest_file` (`src-tauri/src/persistence/session_artifact_manifest.rs:1904` is the pre-read re-check this binding does mirror). It does not need to: the record is accepted only if its bytes hash and measure to exactly what the candidate claims, so a torn or swapped read is refused as `ProvenanceContentMismatch` or `NotCanonicalDurableProof`. A `ChangedDuringRead` analogue would only rename an already-refused state. | closed by design; recorded |
+| R10 | The binding does not re-check metadata *after* its read, unlike `load_manifest_file` (`src-tauri/src/persistence/session_artifact_manifest.rs:1972` is the pre-read re-check this binding does mirror). It does not need to: the record is accepted only if its bytes hash and measure to exactly what the candidate claims, so a torn or swapped read is refused as `ProvenanceContentMismatch` or `NotCanonicalDurableProof`. A `ChangedDuringRead` analogue would only rename an already-refused state. | closed by design; recorded |
 
 ---
 

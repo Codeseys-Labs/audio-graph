@@ -1,8 +1,8 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-18
 deciders:
-  - "AudioGraph user and product owner (human acceptance required)"
+  - "AudioGraph maintainer (accepted 2026-08-18)"
 drafter: "Claude agent (non-decider)"
 ---
 
