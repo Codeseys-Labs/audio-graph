@@ -30,24 +30,30 @@ jobs:
         include:
           - os: linux
             runner: blacksmith-4vcpu-ubuntu-2404
-            expected_durability_tests: 42
+            expected_cc9a_native_tests: 3
+            expected_durability_tests: 47
             expected_crash_harness_tests: 11
           - os: macos
             runner: blacksmith-6vcpu-macos-15
-            expected_durability_tests: 13
+            expected_cc9a_native_tests: 3
+            expected_durability_tests: 17
             expected_crash_harness_tests: 11
           - os: windows
             runner: windows-2025
-            expected_durability_tests: 12
+            expected_cc9a_native_tests: 1
+            expected_durability_tests: 14
             expected_crash_harness_tests: 9
     env:
       EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
+      EXPECTED_CC9A_NATIVE_TESTS: ${{ matrix.expected_cc9a_native_tests }}
       EXPECTED_DURABILITY_TESTS: ${{ matrix.expected_durability_tests }}
       EXPECTED_CRASH_HARNESS_TESTS: ${{ matrix.expected_crash_harness_tests }}
       # Project-controlled pin adoption and review triggers are recorded under
       # audio-graph-52b9:vbcable_archive_pin_adoption_2026_08_15.
       VBCABLE_ARCHIVE_URL: https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip
       VBCABLE_ARCHIVE_SHA256: 66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd
+      # Anchors both the catalog-signer provenance check and the exact
+      # TrustedPublisher target restored after installation.
       LABSN_VBCABLE_CERT_SHA256: db9f6f54a13ef2ede5a8a7ba69dc841dc0711ba77ae7b173dd093e8455a4ed7e
       LABSN_DEVCON_SHA256: 97cff42f8c0fe4fbdf991273159516bf78090625a933c3983ebd6f62284e329a
     steps:
@@ -183,6 +189,8 @@ jobs:
           } > "$EVIDENCE_DIR/runner-and-toolchain.txt"
           {
             printf '%s\n' \
+              'cargo test --locked -p audio-graph --lib --no-default-features --features cloud cc9a_native_ -- --nocapture --test-threads=1'
+            printf '%s\n' \
               'cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1'
             printf '%s\n' \
               'cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1'
@@ -212,6 +220,83 @@ jobs:
           fi
           rmdir "$probe"
 
+      - name: Record macOS mount diagnostics
+        if: ${{ always() && matrix.os == 'macos' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          probe="$RUNNER_TEMP/audio-graph-2df3-filesystem-probe"
+          mkdir -p "$probe"
+          trap 'rmdir "$probe" 2>/dev/null || true' EXIT
+          targets=("$probe" "/" "/System/Volumes/Data")
+          target_count="${#targets[@]}"
+          resolved_count=0
+          success_count=0
+          failure_count=0
+          {
+            printf 'probe_root=%s\n' "$probe"
+            for target in "${targets[@]}"; do
+              printf 'target=%s\n' "$target"
+              printf 'stat_target=%s\n' "$target"
+              stat_output="$(stat -f 'device=%d inode=%i flags=%f' "$target" 2>&1)"
+              stat_exit="$?"
+              printf 'stat_exit=%s\n' "$stat_exit"
+              while IFS= read -r line; do
+                printf 'stat_output=%s\n' "$line"
+              done <<< "$stat_output"
+            done
+            mount | awk '$2 == "on" && ($3 == "/" || $3 == "/System/Volumes/Data") {
+              print "mount_record=" $0
+            }'
+            for target in "${targets[@]}"; do
+              printf 'diskutil_target=%s\n' "$target"
+              df_output="$(df -P "$target" 2>&1)"
+              df_exit="$?"
+              printf 'df_exit=%s\n' "$df_exit"
+              while IFS= read -r line; do
+                printf 'df_output=%s\n' "$line"
+              done <<< "$df_output"
+              resolved_mount=""
+              if [ "$df_exit" = 0 ]; then
+                resolved_mount="$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $NF }')"
+              fi
+              if [ -n "$resolved_mount" ]; then
+                resolved_count="$((resolved_count + 1))"
+                printf 'resolved_mount=%s\n' "$resolved_mount"
+                diskutil_output="$(/usr/sbin/diskutil info "$resolved_mount" 2>&1)"
+                diskutil_exit="$?"
+                printf 'diskutil_exit=%s\n' "$diskutil_exit"
+                while IFS= read -r line; do
+                  printf 'diskutil_output=%s\n' "$line"
+                done <<< "$diskutil_output"
+                printf '%s\n' "$diskutil_output" | awk -F: '
+                  /Device Node|Volume UUID|Volume Roles|APFS Volume Disk \(Role\)|File System Personality|Type \(Bundle\)|Read-Only Media|Read-Only Volume|Device Location|Internal|Removable Media/ {
+                    key=$1; value=substr($0, index($0, ":") + 1);
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value);
+                    print "diskutil_field=" key "=" value
+                  }'
+                if [ "$diskutil_exit" = 0 ]; then
+                  success_count="$((success_count + 1))"
+                else
+                  failure_count="$((failure_count + 1))"
+                fi
+              else
+                printf 'resolved_mount=unavailable\n'
+                printf 'diskutil_exit=not_run\n'
+                printf 'diskutil_output=mount_resolution_failed\n'
+                failure_count="$((failure_count + 1))"
+              fi
+            done
+            printf 'target_count=%s\n' "$target_count"
+            printf 'resolved_count=%s\n' "$resolved_count"
+            printf 'success_count=%s\n' "$success_count"
+            printf 'failure_count=%s\n' "$failure_count"
+            printf 'diagnostics_complete=true\n'
+          } > "$EVIDENCE_DIR/macos-mount-diagnostics.txt"
+          exit 0
+
       - name: Record Windows runner, toolchain, command, and fixture-filesystem evidence
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         working-directory: audio-graph/src-tauri
@@ -240,6 +325,7 @@ jobs:
             Out-File -FilePath "$env:EVIDENCE_DIR/runner-and-toolchain.txt" -Encoding utf8 -Append
           @(
             'AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1'
+            'cargo test --locked -p audio-graph --lib --no-default-features --features cloud cc9a_native_ -- --nocapture --test-threads=1'
             'cargo test --locked -p audio-graph --lib --no-default-features --features cloud canonical_durability -- --nocapture --test-threads=1'
             'cargo test --locked -p audio-graph --lib --no-default-features --features cloud persistence::canonical_crash_harness::tests -- --nocapture --test-threads=1'
           ) | Set-Content -Path "$env:EVIDENCE_DIR/commands.txt" -Encoding utf8
@@ -250,9 +336,58 @@ jobs:
             "fixture_parent=$probe"
             "fixture_volume=$volume"
           ) | Set-Content -Path "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8
-          fsutil fsinfo volumeinfo $volume |
+          if ([string]::IsNullOrWhiteSpace($volume) -or
+            -not [System.IO.Path]::IsPathFullyQualified($probe) -or
+            $volume -notmatch '^[A-Za-z]:\\$') {
+            throw "Windows filesystem probe did not resolve to an absolute drive root."
+          }
+          $volumeToken = $volume.TrimEnd('\')
+          if ($volumeToken -notmatch '^[A-Za-z]:$') {
+            throw "Windows filesystem probe did not resolve to an fsutil volume token."
+          }
+          fsutil fsinfo volumeinfo $volumeToken |
             Out-File -FilePath "$env:EVIDENCE_DIR/fixture-filesystem.txt" -Encoding utf8 -Append
           Remove-Item -Path $probe -Force
+
+      - name: Record LABSN Windows prestate
+        id: labsn_prestate
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetSha256 = $env:LABSN_VBCABLE_CERT_SHA256.ToLowerInvariant()
+          $publisherMatches = @(
+            Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+              Where-Object {
+                [System.Convert]::ToHexString(
+                  [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                ).ToLowerInvariant() -eq $targetSha256
+              }
+          )
+          if ($publisherMatches.Count -gt 1) {
+            throw "Pinned LABSN publisher certificate has an ambiguous pre-action store state."
+          }
+
+          $endpoints = @(
+            Get-PnpDevice -PresentOnly -ErrorAction Stop |
+              Where-Object Class -eq 'AudioEndpoint' |
+              Where-Object FriendlyName -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
+          )
+          $cableEndpoints = @($endpoints)
+          @(
+            'helper_source=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf'
+            'helper_use=pinned_checkout_assets_only'
+            "publisher_match_count=$($publisherMatches.Count)"
+            "preexisting_cable_endpoint_count=$($cableEndpoints.Count)"
+            'license_material=not_requested_or_logged'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-labsn-prestate.txt" -Encoding utf8
+          "publisher_match_count=$($publisherMatches.Count)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "preexisting_cable_endpoint_count=$($cableEndpoints.Count)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($cableEndpoints.Count -ne 0) {
+            throw "VB-CABLE endpoints predate LABSN; refusing a non-causal installation canary."
+          }
 
       # The upstream LABSN action downloads a mutable URL directly. Keep using
       # its commit-pinned certificate and devcon helper, but install only the
@@ -260,6 +395,7 @@ jobs:
       # catalog signature, signer, and selected catalog members. VB-Audio does
       # not publish an upstream checksum, so any byte change requires review.
       - name: Install verified Windows virtual-device enumeration baseline
+        id: verified_virtual_audio_install
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         shell: pwsh
         run: |
@@ -385,25 +521,117 @@ jobs:
             'devcon_exit=0'
           ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-driver-verification.txt" -Encoding utf8
 
+      - name: Restore LABSN TrustedPublisher state
+        if: ${{ always() && matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        shell: pwsh
+        env:
+          VERIFIED_INSTALL_OUTCOME: ${{ steps.verified_virtual_audio_install.outcome }}
+          PUBLISHER_MATCH_COUNT_BEFORE: ${{ steps.labsn_prestate.outputs.publisher_match_count }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $targetSha256 = $env:LABSN_VBCABLE_CERT_SHA256.ToLowerInvariant()
+          $before = $env:PUBLISHER_MATCH_COUNT_BEFORE
+          $removalExits = @()
+          $cleanupError = $false
+          $cleanupStage = 'enumerate_before'
+          $cleanupErrorStage = 'none'
+          $matchesBeforeCleanup = @()
+          $matchesAfterCleanup = @()
+          try {
+            $matchesBeforeCleanup = @(
+              Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+                Where-Object {
+                  [System.Convert]::ToHexString(
+                    [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                  ).ToLowerInvariant() -eq $targetSha256
+                }
+            )
+            if ($before -eq '0') {
+              $cleanupStage = 'remove_target'
+              foreach ($certificate in $matchesBeforeCleanup) {
+                & certutil.exe -delstore 'TrustedPublisher' $certificate.Thumbprint | Out-Null
+                $removalExits += $LASTEXITCODE
+              }
+            }
+            $cleanupStage = 'enumerate_after'
+            $matchesAfterCleanup = @(
+              Get-ChildItem 'Cert:\LocalMachine\TrustedPublisher' -ErrorAction Stop |
+                Where-Object {
+                  [System.Convert]::ToHexString(
+                    [System.Security.Cryptography.SHA256]::HashData($_.RawData)
+                  ).ToLowerInvariant() -eq $targetSha256
+                }
+            )
+          } catch {
+            $cleanupError = $true
+            $cleanupErrorStage = $cleanupStage
+          }
+          $removalsSucceeded = @($removalExits | Where-Object { $_ -ne 0 }).Count -eq 0
+          $publisherStateRestored =
+            (-not $cleanupError) -and
+            ($before -in @('0', '1')) -and
+            ($matchesAfterCleanup.Count.ToString() -eq $before) -and
+            $removalsSucceeded
+          $restored = $publisherStateRestored.ToString().ToLowerInvariant()
+          @(
+            "verified_install_outcome=$env:VERIFIED_INSTALL_OUTCOME"
+            "publisher_match_count_before=$before"
+            "publisher_match_count_before_cleanup=$($matchesBeforeCleanup.Count)"
+            "publisher_match_count_after_cleanup=$($matchesAfterCleanup.Count)"
+            "publisher_removal_exit_count=$($removalExits.Count)"
+            "publisher_removal_exits=$(@($removalExits) -join ',')"
+            "publisher_cleanup_error=$($cleanupError.ToString().ToLowerInvariant())"
+            "publisher_cleanup_error_stage=$cleanupErrorStage"
+            "publisher_state_restored=$restored"
+            'cleanup_scope=pinned_certificate_target_only'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-labsn-cleanup.txt" -Encoding utf8
+          if (-not $publisherStateRestored) {
+            throw "LABSN TrustedPublisher target state was not restored."
+          }
+          if ($env:VERIFIED_INSTALL_OUTCOME -ne 'success') {
+            throw "Verified VB-CABLE installation did not report success after certificate restoration."
+          }
+
       - name: Record bounded allowlisted Windows endpoint inventory
         if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
         shell: pwsh
+        env:
+          VERIFIED_INSTALL_OUTCOME: ${{ steps.verified_virtual_audio_install.outcome }}
         run: |
           @(
-            "helper_source=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf"
+            'helper_source=LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf'
+            'helper_use=pinned_checkout_assets_only'
+            "verified_install_outcome=$env:VERIFIED_INSTALL_OUTCOME"
             "archive_url=$env:VBCABLE_ARCHIVE_URL"
             "archive_sha256=$env:VBCABLE_ARCHIVE_SHA256"
-            "upstream_digest_published=false"
-            "archive_hash_provenance=project_pin_plus_preinstall_catalog_validation"
-            "archive_hash_verified_before_certificate_import=true"
+            'archive_url_is_mutable=true'
+            'upstream_digest_published=false'
+            'archive_hash_provenance=project_pin_plus_preinstall_catalog_validation'
+            'archive_hash_verified_before_certificate_import=true'
             "labsn_certificate_sha256=$env:LABSN_VBCABLE_CERT_SHA256"
             "labsn_devcon_sha256=$env:LABSN_DEVCON_SHA256"
-            "runner_lifetime=ephemeral_job_only"
-            "persistent_runner=false"
-            "license_material=not_requested_or_logged"
-            "purpose=bounded_endpoint_enumeration_only"
-            "excluded_claims=capture,playback,default_device,roundtrip,rsac"
+            'archive_integrity_verified_by_caller=true'
+            'catalog_signature_verified_by_caller=true'
+            'catalog_members_verified_by_caller=true'
+            'devcon_signature_verified_by_caller=true'
+            'installer_exit_alone_is_installation_proof=false'
+            'setup_proof_claimed=false'
+            'setup_proof_artifact=windows-installation-canary.txt'
+            'runner_lifetime=ephemeral_job_only'
+            'persistent_runner=false'
+            'license_material=not_requested_or_logged'
+            'purpose=bounded_endpoint_enumeration_only'
+            'excluded_claims=capture,playback,default_device,roundtrip,rsac'
           ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-supply-chain-boundary.txt" -Encoding utf8
+          if ($env:VERIFIED_INSTALL_OUTCOME -ne 'success') {
+            throw "Verified VB-CABLE installation outcome is not success."
+          }
+          Start-Service -Name Audiosrv -ErrorAction Stop
+          (Get-Service -Name Audiosrv).WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(20)
+          )
           $endpoints = @(
             Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction Stop |
               Sort-Object FriendlyName, InstanceId |
@@ -413,24 +641,152 @@ jobs:
                 @{Name = 'friendly_name'; Expression = { $_.FriendlyName }}, `
                 @{Name = 'instance_id'; Expression = { $_.InstanceId }}
           )
-          if ($endpoints.Count -eq 0) {
-            throw "No present AudioEndpoint records found after the enumeration baseline."
-          }
           $cableEndpoints = @(
             $endpoints | Where-Object friendly_name -Match 'CABLE (Input|Output)|VB-Audio Virtual Cable'
           )
-          if ($cableEndpoints.Count -eq 0) {
-            throw "No expected VB-CABLE endpoint is present after verified installation."
-          }
+          $cableRender = @(
+            $endpoints | Where-Object {
+              $_.status -eq 'OK' -and
+                $_.friendly_name -match '^(CABLE Input|Speakers) \(VB-Audio Virtual Cable\)$'
+            }
+          )
+          $cableCapture = @(
+            $endpoints | Where-Object {
+              $_.status -eq 'OK' -and
+                $_.friendly_name -match '^CABLE Output \(VB-Audio Virtual Cable\)$'
+            }
+          )
+          $vbCableDevices = @(
+            foreach ($device in @(Get-PnpDevice -PresentOnly -ErrorAction Stop)) {
+              $property = Get-PnpDeviceProperty `
+                -InstanceId $device.InstanceId `
+                -KeyName 'DEVPKEY_Device_HardwareIds' `
+                -ErrorAction SilentlyContinue
+              $hardwareIds = ''
+              if ($null -ne $property -and
+                $property.PSObject.Properties.Name -contains 'Data') {
+                $hardwareIds = @($property.Data) -join ';'
+              }
+              if ($device.Status -eq 'OK' -and $hardwareIds -match 'VBAudioVACWDM') {
+                $device
+              }
+            }
+          )
+          $audioService = Get-Service -Name Audiosrv -ErrorAction Stop
           [ordered]@{
             schema = 'audio-graph-2df3-endpoint-inventory-v1'
             allowlisted_fields = @('status', 'class', 'friendly_name', 'instance_id')
             max_records = 64
             record_count = $endpoints.Count
             vb_cable_record_count = $cableEndpoints.Count
+            vb_cable_device_count = $vbCableDevices.Count
+            audiosrv_status = $audioService.Status.ToString()
             records = $endpoints
           } | ConvertTo-Json -Depth 5 |
             Set-Content -Path "$env:EVIDENCE_DIR/windows-endpoints.json" -Encoding utf8
+          if ($endpoints.Count -eq 0) {
+            throw "No present AudioEndpoint records found after the enumeration baseline."
+          }
+          if ($cableEndpoints.Count -lt 2 -or $cableRender.Count -eq 0 -or $cableCapture.Count -eq 0) {
+            throw "Expected VB-CABLE render and capture endpoints must both be present after LABSN."
+          }
+          if ($vbCableDevices.Count -eq 0) {
+            throw "No present and healthy VBAudioVACWDM device is available after LABSN."
+          }
+          if ($audioService.Status -ne 'Running') {
+            throw "Audiosrv must be running after the LABSN action."
+          }
+          @(
+            'status=PASS'
+            'proof=post_action_vb_cable_device_and_endpoint_presence'
+            "vb_cable_device_count=$($vbCableDevices.Count)"
+            "ready_render_endpoint_count=$($cableRender.Count)"
+            "ready_capture_endpoint_count=$($cableCapture.Count)"
+            "audiosrv_status=$($audioService.Status)"
+            'evidence_class=device_and_endpoint_enumeration_only_no_pcm'
+          ) | Set-Content -Path "$env:EVIDENCE_DIR/windows-installation-canary.txt" -Encoding utf8
+
+      - name: Run cc9a native qualification filter (Unix)
+        if: matrix.os != 'windows'
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        timeout-minutes: 45
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud cc9a_native_ -- --nocapture --test-threads=1 \
+            2>&1 | tee "$EVIDENCE_DIR/cc9a_native.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          native_exit="${pipeline_status[0]}"
+          tee_exit="${pipeline_status[1]}"
+          test_count="$(awk '$1 == "running" && $2 ~ /^[0-9]+$/ && ($3 == "test" || $3 == "tests") { print $2; exit }' \
+            "$EVIDENCE_DIR/cc9a_native.log")"
+          awk '
+            $1 == "test" && $2 ~ /cc9a_native_/ && $3 == "..." {
+              name=$2
+              sub(/:$/, "", name)
+              sub(/^.*::/, "", name)
+              pending_name=""
+              if ($4 == "ok" && NF == 4) {
+                print name
+              } else if ($4 == "CC9A_MACOS_DIAGNOSTIC") {
+                pending_name=name
+              }
+              next
+            }
+            pending_name != "" && $0 ~ /^CC9A_MACOS_DIAGNOSTIC / { next }
+            pending_name != "" && $0 == "ok" {
+              print pending_name
+              pending_name=""
+              next
+            }
+            pending_name != "" { pending_name="" }
+          ' "$EVIDENCE_DIR/cc9a_native.log" | LC_ALL=C sort -u > "$EVIDENCE_DIR/cc9a_native.names"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            awk '
+              {
+                marker=index($0, "CC9A_MACOS_DIAGNOSTIC ")
+                if (marker == 1 ||
+                  ($1 == "test" && $2 ~ /cc9a_native_/ && $3 == "..." && $4 == "CC9A_MACOS_DIAGNOSTIC")) {
+                  print substr($0, marker)
+                }
+              }
+            ' "$EVIDENCE_DIR/cc9a_native.log" > "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt"
+          fi
+          printf '%s\n' "$native_exit" > "$EVIDENCE_DIR/cc9a_native.exit"
+          printf '%s\n' "$tee_exit" > "$EVIDENCE_DIR/cc9a_native.tee.exit"
+          printf '%s\n' "${test_count:-0}" > "$EVIDENCE_DIR/cc9a_native.tests"
+          exit 0
+
+      - name: Run cc9a native qualification filter (Windows)
+        if: ${{ matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true }}
+        working-directory: audio-graph/src-tauri
+        shell: pwsh
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud cc9a_native_ -- --nocapture --test-threads=1 2>&1 |
+            Tee-Object -FilePath "$env:EVIDENCE_DIR/cc9a_native.log" -ErrorAction Stop
+          $nativeExit = $LASTEXITCODE
+          $match = Select-String `
+            -Path "$env:EVIDENCE_DIR/cc9a_native.log" `
+            -Pattern '^running ([0-9]+) tests?$' |
+            Select-Object -First 1
+          $testCount = if ($match) { $match.Matches[0].Groups[1].Value } else { '0' }
+          $testNames = Select-String `
+            -Path "$env:EVIDENCE_DIR/cc9a_native.log" `
+            -Pattern '^test .+::(cc9a_native_[^ ]+) \.\.\. ok$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } |
+            Sort-Object -Unique
+          $testNames | Set-Content -Path "$env:EVIDENCE_DIR/cc9a_native.names" -Encoding utf8
+          Set-Content -Path "$env:EVIDENCE_DIR/cc9a_native.exit" -Value $nativeExit -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/cc9a_native.tee.exit" -Value 0 -Encoding ascii
+          Set-Content -Path "$env:EVIDENCE_DIR/cc9a_native.tests" -Value $testCount -Encoding ascii
+          exit 0
 
       - name: Run canonical durability filter (Unix)
         if: matrix.os != 'windows'
@@ -525,35 +881,160 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$EVIDENCE_DIR"
+          cc9a="$(cat "$EVIDENCE_DIR/cc9a_native.exit" 2>/dev/null || printf 'not_run')"
+          cc9a_tee="$(cat "$EVIDENCE_DIR/cc9a_native.tee.exit" 2>/dev/null || printf 'not_run')"
+          cc9a_tests="$(cat "$EVIDENCE_DIR/cc9a_native.tests" 2>/dev/null || printf '0')"
           first="$(cat "$EVIDENCE_DIR/canonical_durability.exit" 2>/dev/null || printf 'not_run')"
           first_tee="$(cat "$EVIDENCE_DIR/canonical_durability.tee.exit" 2>/dev/null || printf 'not_run')"
           first_tests="$(cat "$EVIDENCE_DIR/canonical_durability.tests" 2>/dev/null || printf '0')"
           second="$(cat "$EVIDENCE_DIR/canonical_crash_harness.exit" 2>/dev/null || printf 'not_run')"
           second_tee="$(cat "$EVIDENCE_DIR/canonical_crash_harness.tee.exit" 2>/dev/null || printf 'not_run')"
           second_tests="$(cat "$EVIDENCE_DIR/canonical_crash_harness.tests" 2>/dev/null || printf '0')"
+          cc9a_log=false
           durability_log=false
           crash_harness_log=false
+          if [ -s "$EVIDENCE_DIR/cc9a_native.log" ]; then
+            cc9a_log=true
+          fi
           if [ -s "$EVIDENCE_DIR/canonical_durability.log" ]; then
             durability_log=true
           fi
           if [ -s "$EVIDENCE_DIR/canonical_crash_harness.log" ]; then
             crash_harness_log=true
           fi
-          case "$durability_log:$crash_harness_log" in
-            true:true) test_logs=full ;;
-            false:false) test_logs=not_run ;;
+          case "$cc9a_log:$durability_log:$crash_harness_log" in
+            true:true:true) test_logs=full ;;
+            false:false:false) test_logs=not_run ;;
             *) test_logs=partial ;;
           esac
+          expected_cc9a_names="$(printf '%s\n' \
+            'cc9a_native_qualified_guard_refuses_recreated_root_before_coordination_mutation' \
+            'cc9a_native_qualified_initial_cas_has_parent_barrier' \
+            'cc9a_native_qualified_replacement_refuses_foreign_open_head_before_temp_creation')"
+          actual_cc9a_names="$(cat "$EVIDENCE_DIR/cc9a_native.names" 2>/dev/null || true)"
+          cc9a_name_markers=FAIL
+          if [ "$actual_cc9a_names" = "$expected_cc9a_names" ]; then
+            cc9a_name_markers=PASS
+          fi
+          cc9a_artifacts=complete
+          for artifact in cc9a_native.log cc9a_native.exit cc9a_native.tee.exit cc9a_native.tests cc9a_native.names; do
+            if [ ! -s "$EVIDENCE_DIR/$artifact" ]; then
+              cc9a_artifacts=incomplete
+            fi
+          done
+          cc9a_macos_diagnostics_present=not_applicable
+          cc9a_macos_diagnostics_complete=not_applicable
+          cc9a_macos_exact_mount_identity=not_applicable
+          macos_mount_diagnostics_complete=not_applicable
+          mount_target_count=not_applicable
+          mount_resolved_count=not_applicable
+          mount_success_count=not_applicable
+          mount_failure_count=not_applicable
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cc9a_macos_diagnostics_present=false
+            cc9a_macos_diagnostics_complete=false
+            cc9a_macos_exact_mount_identity=false
+            macos_mount_diagnostics_complete=false
+            mount_target_count="$(sed -n 's/^target_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_resolved_count="$(sed -n 's/^resolved_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_success_count="$(sed -n 's/^success_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            mount_failure_count="$(sed -n 's/^failure_count=//p' \
+              "$EVIDENCE_DIR/macos-mount-diagnostics.txt" 2>/dev/null || true)"
+            if [ -s "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" ]; then
+              cc9a_macos_diagnostics_present=true
+              diagnostic_total_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC ' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_inventory_count="$(sed -n \
+                -e 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=available$/\1/p' \
+                -e 's/^CC9A_MACOS_DIAGNOSTIC root .* inventory_count=\([0-9][0-9]*\) root_fsid_result=unavailable$/\1/p' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
+              diagnostic_observation_count="$(grep -c '^CC9A_MACOS_DIAGNOSTIC observation ' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_observation_schema_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC observation index=[0-9]+ mount_path=.* filesystem_class=[^ ]+ filesystem_string=.* metadata_result=(available|unavailable) dev=([0-9]+|unavailable) same_root_dev=(true|false|unavailable) fsid_result=(available|unavailable) same_root_fsid=(true|false|unavailable) read_only=(true|false) removable=(true|false)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_root_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC root canonical_root=.* root_dev=.* inventory_count=[0-9]+ root_fsid_result=(available|unavailable)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_root_field_uniqueness_count="$(awk '
+                /^CC9A_MACOS_DIAGNOSTIC root / {
+                  if (gsub(/canonical_root=/, "&") == 1 &&
+                    gsub(/root_dev=/, "&") == 1 &&
+                    gsub(/inventory_count=/, "&") == 1 &&
+                    gsub(/root_fsid_result=/, "&") == 1) {
+                    valid += 1
+                  }
+                }
+                END { print valid + 0 }
+              ' "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt")"
+              diagnostic_summary_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC summary metadata_unavailable_count=[0-9]+ same_root_dev_count=[0-9]+ branch=(root_missing|zero_match_clean|zero_match_with_unavailable|unique|ambiguous|unique_then_validate_mismatch)$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              diagnostic_exact_count="$(grep -Ec '^CC9A_MACOS_DIAGNOSTIC exact root_equals_data=true root_differs_system=true same_root_fsid_count=1 probe_unavailable_count=0 root_before_after_stable=true selection_authority=fsid mounted_on_text_authority=false$' \
+                "$EVIDENCE_DIR/cc9a_macos_diagnostics.txt" || true)"
+              if [ "$diagnostic_total_count" = 5 ] &&
+                [ "$diagnostic_inventory_count" = 2 ] &&
+                [ "$diagnostic_observation_count" = 2 ] &&
+                [ "$diagnostic_observation_schema_count" = 2 ] &&
+                [ "$diagnostic_root_count" = 1 ] &&
+                [ "$diagnostic_root_field_uniqueness_count" = 1 ] &&
+                [ "$diagnostic_summary_count" = 1 ] &&
+                [ "$diagnostic_exact_count" = 1 ]; then
+                cc9a_macos_diagnostics_complete=true
+                cc9a_macos_exact_mount_identity=true
+              fi
+            fi
+            if [ -s "$EVIDENCE_DIR/macos-mount-diagnostics.txt" ] &&
+              [ "$(grep -c '^stat_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^stat_exit=0$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^diskutil_target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^target=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^resolved_mount=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$(grep -c '^diskutil_exit=0$' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 3 ] &&
+              [ "$mount_target_count" = 3 ] &&
+              [ "$mount_resolved_count" = 3 ] &&
+              [ "$mount_success_count" = 3 ] &&
+              [ "$mount_failure_count" = 0 ] &&
+              grep -q '^mount_record=' "$EVIDENCE_DIR/macos-mount-diagnostics.txt" &&
+              [ "$(grep -c '^diagnostics_complete=true$' \
+                "$EVIDENCE_DIR/macos-mount-diagnostics.txt" || true)" = 1 ]; then
+              macos_mount_diagnostics_complete=true
+            fi
+          fi
           status=PASS
-          if [ "$first" != 0 ] || [ "$first_tee" != 0 ] ||
+          if [ "$cc9a" != 0 ] || [ "$cc9a_tee" != 0 ] ||
+            [ "$cc9a_tests" != "$EXPECTED_CC9A_NATIVE_TESTS" ] ||
+            [ "$cc9a_name_markers" != PASS ] || [ "$cc9a_artifacts" != complete ] ||
+            [ "$first" != 0 ] || [ "$first_tee" != 0 ] ||
             [ "$second" != 0 ] || [ "$second_tee" != 0 ] ||
             [ "$test_logs" != full ] ||
             [ "$first_tests" != "$EXPECTED_DURABILITY_TESTS" ] ||
             [ "$second_tests" != "$EXPECTED_CRASH_HARNESS_TESTS" ]; then
             status=FAIL
           fi
+          if [ "$RUNNER_OS" = "macOS" ] &&
+            { [ "$cc9a_macos_diagnostics_present" != true ] ||
+              [ "$cc9a_macos_diagnostics_complete" != true ] ||
+              [ "$cc9a_macos_exact_mount_identity" != true ] ||
+              [ "$macos_mount_diagnostics_complete" != true ]; }; then
+            status=FAIL
+          fi
           {
             printf 'status=%s\n' "$status"
+            printf 'cc9a_native_exit=%s\n' "$cc9a"
+            printf 'cc9a_native_tee_exit=%s\n' "$cc9a_tee"
+            printf 'cc9a_native_tests=%s\n' "$cc9a_tests"
+            printf 'cc9a_native_expected_tests=%s\n' "$EXPECTED_CC9A_NATIVE_TESTS"
+            printf 'cc9a_native_name_markers=%s\n' "$cc9a_name_markers"
+            printf 'cc9a_native_artifacts=%s\n' "$cc9a_artifacts"
+            printf 'cc9a_macos_diagnostics_present=%s\n' "$cc9a_macos_diagnostics_present"
+            printf 'cc9a_macos_diagnostics_complete=%s\n' "$cc9a_macos_diagnostics_complete"
+            printf 'cc9a_macos_exact_mount_identity=%s\n' "$cc9a_macos_exact_mount_identity"
+            printf 'macos_mount_diagnostics_complete=%s\n' "$macos_mount_diagnostics_complete"
+            printf 'macos_mount_target_count=%s\n' "$mount_target_count"
+            printf 'macos_mount_resolved_count=%s\n' "$mount_resolved_count"
+            printf 'macos_mount_success_count=%s\n' "$mount_success_count"
+            printf 'macos_mount_failure_count=%s\n' "$mount_failure_count"
             printf 'canonical_durability_exit=%s\n' "$first"
             printf 'canonical_durability_tee_exit=%s\n' "$first_tee"
             printf 'canonical_durability_tests=%s\n' "$first_tests"
@@ -573,6 +1054,15 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:EVIDENCE_DIR | Out-Null
+          $cc9a = if (Test-Path "$env:EVIDENCE_DIR/cc9a_native.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/cc9a_native.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $cc9aTee = if (Test-Path "$env:EVIDENCE_DIR/cc9a_native.tee.exit") {
+            (Get-Content "$env:EVIDENCE_DIR/cc9a_native.tee.exit" -Raw).Trim()
+          } else { 'not_run' }
+          $cc9aTests = if (Test-Path "$env:EVIDENCE_DIR/cc9a_native.tests") {
+            (Get-Content "$env:EVIDENCE_DIR/cc9a_native.tests" -Raw).Trim()
+          } else { '0' }
           $first = if (Test-Path "$env:EVIDENCE_DIR/canonical_durability.exit") {
             (Get-Content "$env:EVIDENCE_DIR/canonical_durability.exit" -Raw).Trim()
           } else { 'not_run' }
@@ -591,18 +1081,47 @@ jobs:
           $secondTests = if (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.tests") {
             (Get-Content "$env:EVIDENCE_DIR/canonical_crash_harness.tests" -Raw).Trim()
           } else { '0' }
+          $cc9aLog = (Test-Path "$env:EVIDENCE_DIR/cc9a_native.log" -PathType Leaf) -and
+            ((Get-Item "$env:EVIDENCE_DIR/cc9a_native.log").Length -gt 0)
           $durabilityLog = (Test-Path "$env:EVIDENCE_DIR/canonical_durability.log" -PathType Leaf) -and
             ((Get-Item "$env:EVIDENCE_DIR/canonical_durability.log").Length -gt 0)
           $crashHarnessLog = (Test-Path "$env:EVIDENCE_DIR/canonical_crash_harness.log" -PathType Leaf) -and
             ((Get-Item "$env:EVIDENCE_DIR/canonical_crash_harness.log").Length -gt 0)
-          $testLogs = if ($durabilityLog -and $crashHarnessLog) {
+          $testLogs = if ($cc9aLog -and $durabilityLog -and $crashHarnessLog) {
             'full'
-          } elseif ($durabilityLog -or $crashHarnessLog) {
+          } elseif ($cc9aLog -or $durabilityLog -or $crashHarnessLog) {
             'partial'
           } else {
             'not_run'
           }
+          $expectedCc9aNames = @(
+            'cc9a_native_windows_qualified_existing_root_refuses_before_manifest_coordination_or_temp_mutation'
+          )
+          $actualCc9aNames = if (Test-Path "$env:EVIDENCE_DIR/cc9a_native.names") {
+            @(Get-Content "$env:EVIDENCE_DIR/cc9a_native.names" | Where-Object { $_ })
+          } else { @() }
+          $cc9aNameMarkers = if (
+            $actualCc9aNames.Count -eq $expectedCc9aNames.Count -and
+            (Compare-Object $actualCc9aNames $expectedCc9aNames).Count -eq 0
+          ) { 'PASS' } else { 'FAIL' }
+          $cc9aArtifacts = 'complete'
+          foreach ($artifact in @(
+            'cc9a_native.log',
+            'cc9a_native.exit',
+            'cc9a_native.tee.exit',
+            'cc9a_native.tests',
+            'cc9a_native.names'
+          )) {
+            $artifactPath = Join-Path $env:EVIDENCE_DIR $artifact
+            if (-not (Test-Path $artifactPath -PathType Leaf) -or
+              (Get-Item $artifactPath).Length -eq 0) {
+              $cc9aArtifacts = 'incomplete'
+            }
+          }
           $status = if (
+            $cc9a -eq '0' -and $cc9aTee -eq '0' -and
+            $cc9aTests -eq $env:EXPECTED_CC9A_NATIVE_TESTS -and
+            $cc9aNameMarkers -eq 'PASS' -and $cc9aArtifacts -eq 'complete' -and
             $first -eq '0' -and $firstTee -eq '0' -and
             $firstTests -eq $env:EXPECTED_DURABILITY_TESTS -and
             $second -eq '0' -and $secondTee -eq '0' -and
@@ -611,6 +1130,12 @@ jobs:
           ) { 'PASS' } else { 'FAIL' }
           @(
             "status=$status"
+            "cc9a_native_exit=$cc9a"
+            "cc9a_native_tee_exit=$cc9aTee"
+            "cc9a_native_tests=$cc9aTests"
+            "cc9a_native_expected_tests=$env:EXPECTED_CC9A_NATIVE_TESTS"
+            "cc9a_native_name_markers=$cc9aNameMarkers"
+            "cc9a_native_artifacts=$cc9aArtifacts"
             "canonical_durability_exit=$first"
             "canonical_durability_tee_exit=$firstTee"
             "canonical_durability_tests=$firstTests"
