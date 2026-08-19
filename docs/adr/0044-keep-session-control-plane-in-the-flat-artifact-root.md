@@ -6,7 +6,7 @@ deciders:
 drafter: "Codex agent (non-decider)"
 ---
 
-# ADR-0038: Keep the Session Control Plane in the Flat Artifact Root
+# ADR-0044: Keep the Session Control Plane in the Flat Artifact Root
 
 > **Note (2026-08-19):** two later records narrow parts of this one.
 > [ADR-0039](0039-let-a-session-abandon-its-own-staged-manifest-temporary.md)
@@ -219,7 +219,7 @@ qualified flat artifact root and retain the one store-wide coordination lock.
     the decision after the confirmation review. That lifecycle transition is
     one separate docs-only commit that changes this record's status to
     `accepted`, changes its date to the actual acceptance date, and changes the
-    ADR-0038 README index status/date in the same commit. It changes no other
+    ADR-0044 README index status/date in the same commit. It changes no other
     claim, production path, or Seed. Acceptance is decision evidence, not
     implementation authorization; implementation and queue mutations still
     require their own scoped work.

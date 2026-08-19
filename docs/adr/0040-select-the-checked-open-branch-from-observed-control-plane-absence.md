@@ -4,13 +4,13 @@ date: 2026-08-19
 deciders:
   - "AudioGraph maintainer (accepted 2026-08-19)"
 drafter: "Claude agent (non-decider)"
-narrows: ADR-0038
+narrows: ADR-0044
 ---
 
 # ADR-0040: Select the Checked-Open Branch from Observed Control-Plane Absence
 
 > **Provenance.** The maintainer decided this on 2026-08-19, choosing between
-> accepting the deviation and implementing ADR-0038 item 5 literally, after the
+> accepting the deviation and implementing ADR-0044 item 5 literally, after the
 > `audio-graph-e8e7` review escalated it as a conformance question no agent
 > should settle. The reasoning below was drafted by an agent from that review's
 > evidence; the maintainer reviewed the trade-off and the cost of the
@@ -18,7 +18,7 @@ narrows: ADR-0038
 
 ## Context and Problem Statement
 
-[ADR-0038](0038-keep-session-control-plane-in-the-flat-artifact-root.md) item 5
+[ADR-0044](0044-keep-session-control-plane-in-the-flat-artifact-root.md) item 5
 fixes two checked-open branches **by capability** and closes with: "These
 branches are fixed by capability; an implementer does not choose between them."
 
@@ -55,7 +55,7 @@ would still need their own branch.
 
 ## Decision Drivers
 
-- ADR-0038's guarantee exists to stop a stale absent result from being admitted
+- ADR-0044's guarantee exists to stop a stale absent result from being admitted
   as v1 while a concurrent mutator advances the Session.
 - Reading history must not require creating coordination state on disk.
 - A deviation that is safe only because a caller does not exist yet must be
@@ -68,7 +68,7 @@ would still need their own branch.
 - **A. Select the branch from observed control-plane absence** (what shipped):
   keep the unguarded sandwich for the no-control-plane case on every platform,
   and require replacement by a single guarded call site before a v2 writer lands.
-- **B. Implement ADR-0038 item 5 literally**: always construct the store and
+- **B. Implement ADR-0044 item 5 literally**: always construct the store and
   take the shared guard on qualified platforms, establishing the coordination
   entry on first read.
 - **C. Block the read seam** until a writer exists, leaving canonical reads
@@ -97,7 +97,7 @@ This narrows item 5 as follows, and **only** as follows:
    producer, must first replace the branch selection with a single guarded call
    site, and must not treat this record as authorization to keep the sandwich.
 
-Everything else in ADR-0038 — the flat control plane, the store-owned lock, the
+Everything else in ADR-0044 — the flat control plane, the store-owned lock, the
 mutation contract, the proof shape, and item 5's guarded branch for a Session
 that has a control plane — remains in force.
 
@@ -117,7 +117,7 @@ that has a control plane — remains in force.
   observes no control plane and then races a hypothetical mutator relies on the
   post-check to catch it. That check is sound, but the branch *decision* was
   still made from unlocked bytes, which is what item 5 forbade.
-- **Negative**: narrows an accepted ADR, so a reader of ADR-0038 item 5 must now
+- **Negative**: narrows an accepted ADR, so a reader of ADR-0044 item 5 must now
   read this record to know the current rule.
 - **Neutral**: no behaviour changes for a Session that already has a control
   plane, and none on Windows/Other, whose branch this record does not touch.
@@ -134,7 +134,7 @@ that has a control plane — remains in force.
 - Bad, because it substitutes a contingent safety argument for a structural one.
 - Bad, because the expiry condition is documentary, not mechanical.
 
-### B. Implement ADR-0038 item 5 literally
+### B. Implement ADR-0044 item 5 literally
 
 - Good, because it is race-safe by construction and needs no expiry clause.
 - Good, because it removes an ADR deviation instead of recording one.
@@ -152,8 +152,8 @@ that has a control plane — remains in force.
 
 ## More Information
 
-- **Relationship to ADR-0038**: narrows item 5's branch-selection rule only.
-  ADR-0038 keeps its `accepted` status and carries a pointer here, following this
+- **Relationship to ADR-0044**: narrows item 5's branch-selection rule only.
+  ADR-0044 keeps its `accepted` status and carries a pointer here, following this
   repository's partial-supersession convention (ADR-0003 / ADR-0006, and
   ADR-0028 / ADR-0035).
 - **Where the deviation is disclosed in code**: `open_session_for_content`'s
@@ -165,5 +165,8 @@ that has a control plane — remains in force.
 - **Numbering note**: `0040` was chosen after enumerating `docs/adr` across every
   local and remote ref, not just the checked-out branch, because seed
   `audio-graph-c306` records that master and this integration branch already
-  carry four different ADRs under numbers 0035 through 0038. Resolving that
-  collision is c306's job and is not attempted here.
+  carry four different ADRs under numbers 0035 through 0038. Seed
+  `audio-graph-c306` has since resolved that collision on this branch by
+  renumbering this branch's four records to 0041-0044, per the convention that
+  the later-merged branch renumbers; `0040` and ADR-0039 never collided and kept
+  their numbers. See the renumbering note in `README.md` for the mapping.

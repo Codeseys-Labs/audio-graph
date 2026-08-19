@@ -65,7 +65,7 @@ SCANNED: list[tuple[str, bool]] = [
 MANIFEST = "src-tauri/src/persistence/session_artifact_manifest.rs"
 SEMANTICS = "src-tauri/src/persistence/session_semantics.rs"
 LOG = "src-tauri/src/persistence/canonical_log.rs"
-ADR = "docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md"
+ADR = "docs/adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md"
 
 EXPECTED: dict[tuple[str, int], str] = {
     # Shipped by this seed.
@@ -110,7 +110,7 @@ EXPECTED: dict[tuple[str, int], str] = {
     (LOG, 973): "fn manifest_candidate(",
     (LOG, 1032): "SessionArtifactManifestV1::candidate(",
     (LOG, 1107): ".compare_and_swap_recovery(self.expected_generation, candidate)",
-    # ADR-0038, the authority this seed closes an implementation gap against.
+    # ADR-0044, the authority this seed closes an implementation gap against.
     (ADR, 2): "status: accepted",
     (ADR, 158): "A mutator holds the exclusive guard across",
     (ADR, 188): "A missing, duplicate, altered, unavailable,",

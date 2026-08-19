@@ -57,13 +57,13 @@ So the binding is scoped to `!proof_owned` V2 candidates on an addressed store
 whose head is already V2 — precisely the set the re-key admits, and precisely
 where the forgery lives.
 
-**Governing authority.** ADR-0038
-(`docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md:2` is
+**Governing authority.** ADR-0044
+(`docs/adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md:2` is
 `status: accepted`) decision outcome point 4
-(`docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md:158`):
+(`docs/adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md:158`):
 a mutator holds the exclusive guard across proof creation/revalidation and
 manifest compare-and-swap. Point 6
-(`docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md:188`): a
+(`docs/adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md:188`): a
 missing, duplicate, altered, unavailable, residual, mismatched, or self-hashing
 proof refuses admission. Reading and revalidating the proof inside a guard-owned
 CAS is authorized by the accepted decision; the code satisfied point 6 only for
@@ -384,7 +384,7 @@ deliberately skips),
    gains a short superseding note. Its round-4 history is NOT rewritten. Its
    instruction "when the binding exists, that test should be inverted rather than
    deleted" is discharged by T1 and the note points at T1's name.
-4. No ADR change and no new ADR; ADR-0038 outcome points 4 and 6 are the
+4. No ADR change and no new ADR; ADR-0044 outcome points 4 and 6 are the
    authority (§1).
 5. `.seeds/` untouched.
 

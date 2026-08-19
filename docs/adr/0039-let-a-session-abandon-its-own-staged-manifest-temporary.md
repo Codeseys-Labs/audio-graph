@@ -10,7 +10,7 @@ drafter: "Claude agent (non-decider)"
 
 ## Context and Problem Statement
 
-ADR-0038 decision item 3 assigns per-Session ownership of the manifest, its
+ADR-0044 decision item 3 assigns per-Session ownership of the manifest, its
 intent temporary, and the immutable transition proof, keeps the one
 `.audio-graph-canonical.lock` store-owned, and closes with "Delete owns any
 retained Session temporary as recovery residue". Its drivers ask for one
@@ -33,12 +33,12 @@ Seed `audio-graph-3cf2` adds the missing capability on
 durable unlink primitive in `canonical_durability.rs`
 (`CanonicalExclusiveGuard::unlink_canonical_entry`) and one public entry point,
 `ManifestWriteTransaction::abandon_staged_transition`. Abandon is a second,
-non-delete remover of a Session temporary, which is a scope change to ADR-0038
+non-delete remover of a Session temporary, which is a scope change to ADR-0044
 item 3's ownership sentence rather than a fact that sentence already covers.
 That change is recorded here. It was briefly recorded instead as an in-place
-dated amendment inside accepted ADR-0038 (commit `2ae6435` on the same branch);
+dated amendment inside accepted ADR-0044 (commit `2ae6435` on the same branch);
 that edit is reverted, because `docs/adr/README.md` makes accepted records
-immutable and ADR-0038 carries no self-amendment clause.
+immutable and ADR-0044 carries no self-amendment clause.
 
 The implementation exists but is dormant: `abandon_staged_transition` has no
 production caller, only unit tests, so no shipped behavior depends on this
@@ -66,7 +66,7 @@ transition and install a different candidate without deleting the Session.
 
 ### Keep delete as the sole remover and rely on byte-exact replay
 
-This preserves ADR-0038 item 3 verbatim, but it leaves the wedge: the refusal
+This preserves ADR-0044 item 3 verbatim, but it leaves the wedge: the refusal
 outcome names no candidate to replay, so a caller that discarded the candidate
 has no reachable escape short of deleting the Session and its content. Rejected
 because it makes an install refusal permanently unrecoverable for that Session.
@@ -96,14 +96,14 @@ chosen option.
 
 ## Decision Outcome
 
-Chosen option: scope ADR-0038 item 3's temporary-removal ownership rule and
+Chosen option: scope ADR-0044 item 3's temporary-removal ownership rule and
 add a bound durable-unlink primitive with a Session-scoped abandon entry point.
 
 1. **Ownership, refined.** Delete remains the sole owner of Session-temporary
    removal among lifecycle operations acting on a Session from outside a write
    transaction. A Session holding its own exclusive-guard manifest write
    transaction may additionally abandon its own retained manifest intent
-   temporary. Every other ownership assignment in ADR-0038 item 3 — the
+   temporary. Every other ownership assignment in ADR-0044 item 3 — the
    Session-owned manifest, temporary, and proof; the store-owned global lock;
    what export contains; that no manifest inventories itself — is unchanged.
 2. **The store-owned lock stays store-owned.** The removal primitive refuses
@@ -138,7 +138,7 @@ add a bound durable-unlink primitive with a Session-scoped abandon entry point.
    rename may already have consumed the temporary. Abandon is therefore not the
    reconciliation for a `DurabilityIndeterminate` outcome; that reconciliation
    remains the exact rerun keyed by the outcome's own recovery key.
-7. **This record is `proposed`.** Until a human decider accepts it, ADR-0038
+7. **This record is `proposed`.** Until a human decider accepts it, ADR-0044
    item 3 remains the in-force ownership rule, and the landed primitive and
    entry point stay without any production caller. Acceptance is evidence only:
    it authorizes no consumer activation, closes no Seed, and does not itself
@@ -163,7 +163,7 @@ add a bound durable-unlink primitive with a Session-scoped abandon entry point.
 - **Negative:** Abandon does not authenticate the temporary's bytes, by design,
   so it cannot distinguish this transaction's own stale temporary from one left
   by an earlier transaction of the same Session.
-- **Negative:** A second remover exists while ADR-0038's accepted text still
+- **Negative:** A second remover exists while ADR-0044's accepted text still
   names delete, until this record is accepted or rejected.
 
 ### Confirmation
@@ -189,7 +189,11 @@ unlink_fault_cuts_are_honest_and_exact_rerun_is_a_no_effect_assessment
 ```
 
 Review runs the repository's authoritative gates and confirms that accepted
-ADR-0038 is byte-identical to its acceptance commit:
+ADR-0044 is byte-identical to its acceptance commit. The gate below is recorded
+as it ran, under that record's then-current number `0038`; seed
+`audio-graph-c306` later renumbered it to `0044` to resolve a collision with
+master, changing only its filename and its H1 line, so the recorded path and the
+byte-identity result both describe the pre-renumber file:
 
 ```text
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 clippy --locked \
@@ -213,7 +217,7 @@ a consumer activation would need its own evidence.
 
 | Relationship | ADR | Note |
 | --- | --- | --- |
-| Refines | [ADR-0038](0038-keep-session-control-plane-in-the-flat-artifact-root.md) | Scopes only decision item 3's temporary-removal ownership sentence to lifecycle operations outside a write transaction and adds the removal primitive's fences; ADR-0038 remains accepted and unedited in every other respect. |
+| Refines | [ADR-0044](0044-keep-session-control-plane-in-the-flat-artifact-root.md) | Scopes only decision item 3's temporary-removal ownership sentence to lifecycle operations outside a write transaction and adds the removal primitive's fences; ADR-0044 remains accepted and unedited in every other respect. |
 | Relates-To | [ADR-0027](0027-file-canonical-durable-session-store.md) | Keeps the typed manifest authoritative for delete, recovery, and retention; abandon adds no second inventory. |
 
 This record supersedes no ADR.
