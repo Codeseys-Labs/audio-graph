@@ -6,7 +6,7 @@ deciders:
 drafter: "Codex agent (non-decider)"
 ---
 
-# ADR-0035: Keep Versioned Speech Revisions in One Canonical Transcript Stream
+# ADR-0041: Keep Versioned Speech Revisions in One Canonical Transcript Stream
 
 ## Context and Problem Statement
 

@@ -24,7 +24,7 @@ provider, app, or unavailable confidence/turn/speaker/channel evidence; v2
 source order; and exact supersession. It would also force timing-unavailable
 spans through an ordering function that requires legacy scalar times.
 
-ADR-0035 establishes one canonical stream containing legacy-v1 and v2 payloads.
+ADR-0041 establishes one canonical stream containing legacy-v1 and v2 payloads.
 A mixed Projection Basis therefore needs one declared semantic interpretation,
 not a hash of whichever Rust or JSON representation a caller happens to hold.
 The exact implementation surface and blocked vertical tracer are recorded in
@@ -143,7 +143,7 @@ semantics.
    optional evidence is tagged unavailable. V2 source order and app-owned span
    identity remain explicitly absent for that legacy row rather than being
    synthesized.
-8. The `session_semantics_version` defined by ADR-0035 is the sole durable
+8. The `session_semantics_version` defined by ADR-0041 is the sole durable
    cutover guard for transcript, basis, and patch semantics. Its v1-to-v2
    transition must be durably Accepted under ADR-0027 before a hash-v2 basis or
    hash-v2 patch is created or applied. Basis creation, patch creation, and
@@ -249,7 +249,7 @@ Activation requires named executable gates, not only this decision text, for:
   creation with hash v2;
 - independent refusal fixtures for a hash-v2 basis and a hash-v2 patch found
   while the accepted floor remains v1, with no floor promotion or v1 fallback;
-- the predecessor-binary compatibility canary required by ADR-0035.
+- the predecessor-binary compatibility canary required by ADR-0041.
 
 These v2 gates do not yet exist as current passing commands. `audio-graph-4249`
 and `audio-graph-48de` remain blocked until they exist and pass.
@@ -261,7 +261,7 @@ and `audio-graph-48de` remain blocked until they exist and pass.
 | Depends-On | [ADR-0024](0024-event-sourced-notes-graph-projections.md) | Projection Basis exists to bind both notes and graph work to the same immutable transcript evidence. |
 | Depends-On | [ADR-0027](0027-file-canonical-durable-session-store.md) | Canonical Accepted record order supplies the deterministic cross-source admission order. |
 | Refines | [ADR-0031](0031-classify-projection-bases-as-current-append-only-or-revised.md) | Specializes covered-subset hashing and currency dispatch for declared v1 versus v2 semantics. |
-| Depends-On | [ADR-0035](0035-keep-versioned-speech-revisions-in-one-canonical-stream.md) | Mixed normalization and admission order assume one canonical transcript revision stream. |
+| Depends-On | [ADR-0041](0041-keep-versioned-speech-revisions-in-one-canonical-stream.md) | Mixed normalization and admission order assume one canonical transcript revision stream. |
 
 ## Compliance
 

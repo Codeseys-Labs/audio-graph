@@ -155,7 +155,7 @@ that has a control plane — remains in force.
 - **Relationship to ADR-0044**: narrows item 5's branch-selection rule only.
   ADR-0044 keeps its `accepted` status and carries a pointer here, following this
   repository's partial-supersession convention (ADR-0003 / ADR-0006, and
-  ADR-0028 / ADR-0035).
+  ADR-0028 / ADR-0041).
 - **Where the deviation is disclosed in code**: `open_session_for_content`'s
   rustdoc states it is not race-safe and names the two symbols whose activation
   requires replacing it; the `audio-graph-e8e7` report records it as residual R1.

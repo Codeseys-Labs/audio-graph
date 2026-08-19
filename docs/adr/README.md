@@ -41,12 +41,12 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0032] | Layer Validation Evidence by Claim | accepted | — | 2026-07-09 |
 | [0033] | Enforce MVP Provider Enablement at Every Content-Bearing Start | accepted | — | 2026-07-09 |
 | [0034] | Require Exhaustive Evidence for Negative Data-Egress Claims | accepted | — | 2026-07-10 |
-| [0035] | Keep Versioned Speech Revisions in One Canonical Transcript Stream | accepted | Refines ADR-0024 and ADR-0027; relates to ADR-0031 and ADR-0042 | 2026-08-14 |
 | [0039] | Let a Session Abandon Its Own Staged Manifest Temporary | accepted | Refines ADR-0044 decision item 3's temporary-removal ownership scope; supersedes none; seed `audio-graph-3cf2` | 2026-08-18 |
 | [0040] | Select the Checked-Open Branch from Observed Control-Plane Absence | accepted | Narrows ADR-0044 item 5's branch selection; **expires when a v2 writer is activated**; seed `audio-graph-e8e7` | 2026-08-19 |
-| [0042] | Version Projection Basis Hashes by Speech-Revision Semantics | accepted | Refines ADR-0031; depends on ADR-0024, ADR-0027, and accepted ADR-0035 | 2026-08-14 |
+| [0041] | Keep Versioned Speech Revisions in One Canonical Transcript Stream | accepted | Refines ADR-0024 and ADR-0027; relates to ADR-0031 and ADR-0042 | 2026-08-14 |
+| [0042] | Version Projection Basis Hashes by Speech-Revision Semantics | accepted | Refines ADR-0031; depends on ADR-0024, ADR-0027, and accepted ADR-0041 | 2026-08-14 |
 | [0043] | Freeze the Canonical Event Stream Registry | accepted | Refines ADR-0027; freezes canonical event-domain IDs and outer schema v1 | 2026-07-10 |
-| [0044] | Keep the Session Control Plane in the Flat Artifact Root | accepted | Refines ADR-0027 and ADR-0035; relates to ADR-0043; item 3 scoped by ADR-0039 and item 5 narrowed by ADR-0040; supersedes none | 2026-08-16 |
+| [0044] | Keep the Session Control Plane in the Flat Artifact Root | accepted | Refines ADR-0027 and ADR-0041; relates to ADR-0043; item 3 scoped by ADR-0039 and item 5 narrowed by ADR-0040; supersedes none | 2026-08-16 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -82,9 +82,9 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0032]: 0032-layer-validation-evidence-by-claim.md
 [0033]: 0033-enforce-mvp-provider-enablement-at-content-start.md
 [0034]: 0034-require-exhaustive-evidence-for-negative-data-egress-claims.md
-[0035]: 0035-keep-versioned-speech-revisions-in-one-canonical-stream.md
 [0039]: 0039-let-a-session-abandon-its-own-staged-manifest-temporary.md
 [0040]: 0040-select-the-checked-open-branch-from-observed-control-plane-absence.md
+[0041]: 0041-keep-versioned-speech-revisions-in-one-canonical-stream.md
 [0042]: 0042-version-projection-basis-hashes-by-speech-semantics.md
 [0043]: 0043-freeze-canonical-event-stream-registry.md
 [0044]: 0044-keep-session-control-plane-in-the-flat-artifact-root.md
@@ -92,7 +92,8 @@ after acceptance — to change one, write a new ADR that supersedes it.
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
 > references are historical and do not name the current speech-semantics
-> ADR-0035 and ADR-0036. See the
+> records, which are ADR-0041 and ADR-0042 (numbered 0035 and 0036 before the
+> renumbering below). See the
 > [Wave 7B durability plan](../agentic-runs/2026-08-14-session-memory-continuation/audio-graph-8e73-wave7b-plan.md)
 > for the exact blob lineage and implementation boundary.
 

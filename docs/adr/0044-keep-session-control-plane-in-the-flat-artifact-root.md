@@ -21,7 +21,7 @@ drafter: "Codex agent (non-decider)"
 ## Context and Problem Statement
 
 ADR-0027 makes one typed Session Artifact manifest authoritative for load,
-export, backup, delete, purge, recovery, retention, and usage. ADR-0035 then
+export, backup, delete, purge, recovery, retention, and usage. ADR-0041 then
 requires one monotonic `session_semantics_version` floor to become durably
 Accepted before any v2 transcript, Projection Basis, or projection patch can
 become authoritative. The dormant manifest kernel currently stores one
@@ -294,10 +294,10 @@ base-range footprint checks. Confirmation is conformance evidence only.
 | Relationship | ADR | Note |
 | --- | --- | --- |
 | Refines | [ADR-0027](0027-file-canonical-durable-session-store.md) | Narrows its typed manifest and provenance authority to collision-free per-Session control files in the existing qualified flat root. |
-| Refines | [ADR-0035](0035-keep-versioned-speech-revisions-in-one-canonical-stream.md) | Narrows the durable v1-to-v2 floor evidence to one immutable exact proof plus a manifest CAS under one guard. |
+| Refines | [ADR-0041](0041-keep-versioned-speech-revisions-in-one-canonical-stream.md) | Narrows the durable v1-to-v2 floor evidence to one immutable exact proof plus a manifest CAS under one guard. |
 | Relates-To | [ADR-0043](0043-freeze-canonical-event-stream-registry.md) | Preserves the four-stream registry by classifying the transition proof as a bounded control artifact, not a fifth event stream. |
 
-This record supersedes no ADR. ADR-0027 and ADR-0035 remain accepted in all
+This record supersedes no ADR. ADR-0027 and ADR-0041 remain accepted in all
 other respects.
 
 ## Compliance
