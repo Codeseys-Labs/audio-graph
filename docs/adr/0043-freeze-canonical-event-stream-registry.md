@@ -4,7 +4,7 @@ date: 2026-07-10
 deciders: [AudioGraph maintainers]
 ---
 
-# ADR-0037: Freeze the Canonical Event Stream Registry
+# ADR-0043: Freeze the Canonical Event Stream Registry
 
 ## Context and Problem Statement
 

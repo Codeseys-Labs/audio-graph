@@ -65,7 +65,7 @@ change.
   coordination lock.
 - Make the v1-to-v2 floor transition provable from immutable persisted bytes,
   not from manifest metadata alone.
-- Keep ADR-0037's four canonical event streams frozen; this decision must not
+- Keep ADR-0043's four canonical event streams frozen; this decision must not
   create a fifth stream by implication.
 - Linearize floor admission with cooperating manifest mutation and prevent an
   absent-manifest preflight race.
@@ -103,9 +103,9 @@ organizational improvement, so it is rejected for this bounded activation.
 
 An append-only lifecycle stream could eventually represent every source,
 clock, route, discontinuity, and lifecycle transition promised by ADR-0027.
-Adding it now would change ADR-0037's frozen four-stream registry and broaden a
+Adding it now would change ADR-0043's frozen four-stream registry and broaden a
 single v1-to-v2 guard into a general provenance subsystem. It is rejected
-without separate ADR-0037 backflow and the richer lifecycle design.
+without separate ADR-0043 backflow and the richer lifecycle design.
 
 ### Keep the transition only as manifest metadata
 
@@ -187,7 +187,7 @@ qualified flat artifact root and retain the one store-wide coordination lock.
    bytes are durable before the manifest can Accept floor v2. Exact retry
    reuses identical bytes. A missing, duplicate, altered, unavailable,
    residual, mismatched, or self-hashing proof refuses admission. The file is
-   not an ADR-0037 canonical event stream, and its one-record form must not be
+   not an ADR-0043 canonical event stream, and its one-record form must not be
    appended to.
 
    The exact proof wire, canonical serialization, and golden fixture belong to
@@ -234,7 +234,7 @@ qualified flat artifact root and retain the one store-wide coordination lock.
 - **Positive:** Multiple Sessions can share one qualified flat root without a
   manifest, proof, or temporary collision.
 - **Positive:** The v2 floor has independently persisted exact evidence while
-  ADR-0037's canonical stream registry remains unchanged.
+  ADR-0043's canonical stream registry remains unchanged.
 - **Positive:** Checked open and mutation share one proven coordination domain,
   and Windows remains useful for compatible reads without overstating
   namespace durability.
@@ -295,7 +295,7 @@ base-range footprint checks. Confirmation is conformance evidence only.
 | --- | --- | --- |
 | Refines | [ADR-0027](0027-file-canonical-durable-session-store.md) | Narrows its typed manifest and provenance authority to collision-free per-Session control files in the existing qualified flat root. |
 | Refines | [ADR-0035](0035-keep-versioned-speech-revisions-in-one-canonical-stream.md) | Narrows the durable v1-to-v2 floor evidence to one immutable exact proof plus a manifest CAS under one guard. |
-| Relates-To | [ADR-0037](0037-freeze-canonical-event-stream-registry.md) | Preserves the four-stream registry by classifying the transition proof as a bounded control artifact, not a fifth event stream. |
+| Relates-To | [ADR-0043](0043-freeze-canonical-event-stream-registry.md) | Preserves the four-stream registry by classifying the transition proof as a bounded control artifact, not a fifth event stream. |
 
 This record supersedes no ADR. ADR-0027 and ADR-0035 remain accepted in all
 other respects.
@@ -323,7 +323,7 @@ other respects.
   `admitted_session_semantics_floor` and accepts only `Accepted` or exact
   `AlreadyCompleted`, never a generic receipt or proof-only result.
 - The proof is one record and is not registered or replayed as a fifth
-  ADR-0037 canonical stream.
+  ADR-0043 canonical stream.
 - Qualified Linux/macOS checked open establishes/acquires the global
   coordination entry and revalidates absent manifest under its shared guard;
   unqualified Windows/Other creates nothing and requires exact pre/post
