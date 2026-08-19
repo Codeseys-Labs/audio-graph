@@ -252,10 +252,29 @@ async-trait = "0.1"
 
 # AWS SDK (always compiled — users switch providers in-app)
 aws-config = { version = "1.1", features = ["behavior-version-latest", "sso"] }
-aws-sdk-transcribestreaming = "1.102"
-aws-sdk-bedrockruntime = "1.102"
+# `default-features = false` drops ONLY the SDK crates' default `rustls`
+# feature, which buys nothing but the deprecated hyper-0.14 connector
+# (rustls -> aws-smithy-runtime/tls-rustls -> legacy-rustls-ring -> hyper-014
+# -> h2 0.3). Real TLS comes from `default-https-client`, which selects the
+# hyper 1.x rustls<aws-lc> connector on h2 0.4. Every other default feature is
+# re-enabled explicitly below, so this is a subtraction of one, not an opt-out.
+# Keeping it removed prunes h2 0.3.27, hyper 0.14.32, hyper-rustls 0.24.2,
+# rustls 0.21.12, and rustls-webpki 0.101.7 from the graph — see
+# .cargo/audit.toml, which no longer needs to except any of them.
+aws-sdk-transcribestreaming = { version = "1.102", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-bedrockruntime = { version = "1.102", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-credential-types = "1"
-aws-sdk-sts = "1.101"
+aws-sdk-sts = { version = "1.101", default-features = false, features = [
+    "sigv4a",
+    "default-https-client",
+    "rt-tokio",
+] }
 # NOTE: no direct aws-smithy-http dep. EventStreamSender is imported via the
 # SDK's re-export (aws_sdk_transcribestreaming::primitives::event_stream),
 # which guarantees the same crate instance + `event-stream` feature the SDK

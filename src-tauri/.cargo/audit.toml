@@ -13,22 +13,6 @@
 # the failing run into the inline comment so a reviewer can grep for context
 # without leaving the file.
 ignore = [
-    # ── AWS SDK rustls 0.21 chain ────────────────────────────────────
-    # Source: transitive via aws-smithy-http-client 1.1.12 → rustls 0.21 →
-    # rustls-webpki 0.101.7. Cannot fix independently.
-    # Blocker: AWS SDK for Rust is still on rustls 0.21 in its generated
-    # smithy runtime. smithy-rs is producing a separate
-    # `aws-smithy-http-client-reqwest` crate as a transitional path.
-    # Remediation: bump when aws-config / aws-smithy-* ship with rustls
-    # >= 0.23. Re-check after each AWS SDK minor bump.
-    # Threat model: AudioGraph talks to AWS / Deepgram / AssemblyAI / Gemini
-    # over public CA chains and does not parse CRLs, so the affected paths
-    # (URI-name constraints, wildcard cert bypasses, CRL parser panic) are
-    # not reachable in our deployment.
-    "RUSTSEC-2026-0098", # rustls-webpki: name-constraint URI bypass
-    "RUSTSEC-2026-0099", # rustls-webpki: wildcard cert handling
-    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
-
     # ── Tauri v2 Linux stack: unmaintained gtk-rs / GTK3 bindings ────
     # Source: pulled by Tauri v2's Linux runtime (gtk, gdk, gdkx11, atk,
     # cairo, glib bindings + their -sys / -macros sub-crates).
