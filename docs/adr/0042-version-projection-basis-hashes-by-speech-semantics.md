@@ -6,7 +6,7 @@ deciders:
 drafter: "Codex agent (non-decider)"
 ---
 
-# ADR-0036: Version Projection Basis Hashes by Speech-Revision Semantics
+# ADR-0042: Version Projection Basis Hashes by Speech-Revision Semantics
 
 ## Context and Problem Statement
 

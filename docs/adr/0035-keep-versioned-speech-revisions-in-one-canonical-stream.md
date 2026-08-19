@@ -250,8 +250,8 @@ evidence.
 | --- | --- | --- |
 | Refines | [ADR-0024](0024-event-sourced-notes-graph-projections.md) | Narrows the immutable transcript source to one stream whose inner revision payloads are versioned. |
 | Refines | [ADR-0027](0027-file-canonical-durable-session-store.md) | Specializes file-canonical storage for mixed legacy-v1 and v2 transcript payloads without dual authority. |
-| Relates-To | [ADR-0031](0031-classify-projection-bases-as-current-append-only-or-revised.md) | Basis currency remains separate and is versioned by ADR-0036. |
-| Relates-To | [ADR-0036](0036-version-projection-basis-hashes-by-speech-semantics.md) | The mixed canonical stream supplies the revisions whose semantic hashes ADR-0036 defines. |
+| Relates-To | [ADR-0031](0031-classify-projection-bases-as-current-append-only-or-revised.md) | Basis currency remains separate and is versioned by ADR-0042. |
+| Relates-To | [ADR-0042](0042-version-projection-basis-hashes-by-speech-semantics.md) | The mixed canonical stream supplies the revisions whose semantic hashes ADR-0042 defines. |
 
 ## Compliance
 
