@@ -8,6 +8,16 @@ drafter: "Codex agent (non-decider)"
 
 # ADR-0038: Keep the Session Control Plane in the Flat Artifact Root
 
+> **Note (2026-08-19):** two later records narrow parts of this one.
+> [ADR-0039](0039-let-a-session-abandon-its-own-staged-manifest-temporary.md)
+> scopes item 3's rule that Delete is the sole remover of a Session temporary.
+> [ADR-0040](0040-select-the-checked-open-branch-from-observed-control-plane-absence.md)
+> narrows item 5's branch-selection rule: checked open may select its branch from
+> an unlocked observation of control-plane presence, and that narrowing expires
+> when a v2 writer is activated. Read both wherever items 3 and 5 apply.
+> Everything else below — the flat control plane, the store-owned lock, the
+> mutation contract, and the proof shape — remains in force.
+
 ## Context and Problem Statement
 
 ADR-0027 makes one typed Session Artifact manifest authoritative for load,
