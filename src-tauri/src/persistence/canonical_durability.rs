@@ -803,11 +803,51 @@ pub struct CanonicalExclusiveGuard {
     algorithm_test: Option<AlgorithmTestRootBinding>,
 }
 
+impl Drop for CanonicalExclusiveGuard {
+    fn drop(&mut self) {
+        release_coordination_lock(&self._lock_file);
+    }
+}
+
 /// Shared strict-reader guard bound to the same deterministic coordination
 /// file. Acquisition never creates the managed root or lock file.
 pub struct CanonicalSharedGuard {
     _namespace: ManagedNamespace,
     _lock_file: File,
+}
+
+impl Drop for CanonicalSharedGuard {
+    fn drop(&mut self) {
+        release_coordination_lock(&self._lock_file);
+    }
+}
+
+/// Release the coordination lock EXPLICITLY, rather than leaving it to the
+/// descriptor close that dropping the handle performs.
+///
+/// This is not redundant, and the difference is observable. The lock is an
+/// advisory whole-file lock, which the kernel attaches to the OPEN FILE
+/// DESCRIPTION, not to the descriptor or to the process. Closing one descriptor
+/// releases the lock only when it was the last descriptor referring to that
+/// description. `fork` duplicates every descriptor into the child, so while a
+/// child exists that has not yet reached `exec` — where close-on-exec finally
+/// drops its copies — a descriptor the parent has already closed can still be
+/// holding the lock. Unlocking removes the lock from the description itself, so
+/// the release does not depend on how many copies of the descriptor exist.
+///
+/// This process forks: `canonical_crash_harness` spawns subprocess children of
+/// the test binary while other threads hold coordination guards on their own
+/// managed roots. audio-graph-bcf9 was that race — a guard dropped in one thread
+/// stayed locked across another thread's spawn window, so the next acquisition on
+/// the same root reported `Contended` for a lock nothing logically held. The
+/// module's tests describe the reproduction and the measurement.
+///
+/// The outcome is deliberately discarded. This runs on the drop path, the lock is
+/// advisory, and the descriptor close that follows is the backstop for every
+/// error an unlock can report; a panic here would convert a released lock into a
+/// double panic during unwinding.
+fn release_coordination_lock(lock_file: &File) {
+    let _ = lock_file.unlock();
 }
 
 #[cfg(test)]
@@ -4332,6 +4372,72 @@ mod tests {
         ] {
             fs::remove_dir_all(root).expect("clean production binding fixture");
         }
+    }
+
+    /// Dropping a coordination guard releases the lock even while a DUPLICATE of
+    /// its descriptor is still open, which is what makes this process safe to
+    /// fork from while other threads hold guards.
+    ///
+    /// audio-graph-bcf9: the persistence suite failed under default parallel test
+    /// threading and passed under `--test-threads=1`. Measured cause, not
+    /// inferred — every observed failure was `Coordination(Contended)` on the
+    /// failing test's OWN freshly created fixture root, `/proc/locks` showed NO
+    /// holder for that lock's inode at the moment of the refusal, the suite was
+    /// clean in 8 of 8 runs with `--skip persistence::canonical_crash_harness`,
+    /// and each persistence module was clean in 6 of 6 runs on its own. The
+    /// crash harness is the one module that spawns subprocesses: `fork`
+    /// duplicates every descriptor into the child, and until the child reaches
+    /// `exec` those copies keep the lock's open file description alive, so a
+    /// guard another thread had already dropped was still holding its lock.
+    ///
+    /// `try_clone` reproduces exactly that state without a subprocess: it is a
+    /// descriptor duplication, so both descriptors name one open file
+    /// description, and the lock therefore outlives closing either one alone.
+    /// That makes the pin deterministic where the spawn window is not — the
+    /// window between `fork` and `exec` cannot be held open from a test.
+    ///
+    /// Both guard kinds are covered because both block a later exclusive
+    /// acquisition: an outstanding shared lock is as effective a wedge as an
+    /// outstanding exclusive one.
+    ///
+    /// Before the explicit unlock, both legs below reported
+    /// `CanonicalCoordinationError::Contended`.
+    #[test]
+    #[cfg(unix)]
+    fn dropping_a_guard_releases_its_lock_even_with_a_duplicated_descriptor() {
+        let root = temp_root("bcf9-duplicated-lock-descriptor");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let durability = CanonicalDurability::new();
+
+        let exclusive = durability
+            .try_lock_exclusive(&root)
+            .expect("acquire the first exclusive guard");
+        let exclusive_duplicate = exclusive
+            ._lock_file
+            .try_clone()
+            .expect("duplicate the exclusive guard's lock descriptor");
+        drop(exclusive);
+        let reacquired = durability
+            .try_lock_exclusive(&root)
+            .expect("a dropped exclusive guard must not leave its lock held");
+        drop(reacquired);
+        drop(exclusive_duplicate);
+
+        let shared = durability
+            .try_lock_shared(&root)
+            .expect("acquire a shared guard");
+        let shared_duplicate = shared
+            ._lock_file
+            .try_clone()
+            .expect("duplicate the shared guard's lock descriptor");
+        drop(shared);
+        let after_shared = durability
+            .try_lock_exclusive(&root)
+            .expect("a dropped shared guard must not leave its lock held");
+        drop(after_shared);
+        drop(shared_duplicate);
+
+        fs::remove_dir_all(&root).expect("clean fixture root");
     }
 
     #[test]

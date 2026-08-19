@@ -719,8 +719,8 @@ exit 1. The table and the checker were then updated together.
 | `src-tauri/src/persistence/session_artifact_manifest.rs:2676` | `fn is_internal_identity(identity: &str) -> bool {` |
 | `src-tauri/src/persistence/session_artifact_manifest.rs:2890` | `pub fn retire_owned_control_plane(` |
 | `src-tauri/src/persistence/session_artifact_manifest.rs:5350` | `fn windows_other_session_transition_refuses_before_any_control_mutation()` |
-| `src-tauri/src/persistence/canonical_durability.rs:1388` | `pub(crate) fn unlink_canonical_entry(` |
-| `src-tauri/src/persistence/canonical_durability.rs:3740` | `const fn namespace_supported_for(platform: CanonicalPlatform) -> bool {` |
+| `src-tauri/src/persistence/canonical_durability.rs:1428` | `pub(crate) fn unlink_canonical_entry(` |
+| `src-tauri/src/persistence/canonical_durability.rs:3780` | `const fn namespace_supported_for(platform: CanonicalPlatform) -> bool {` |
 | `src-tauri/src/sessions/mod.rs:1679` | `assert_eq!(actual.len(), 18` |
 | `src-tauri/src/commands.rs:6911` | `fn read_session_transcript_snapshot(` |
 
