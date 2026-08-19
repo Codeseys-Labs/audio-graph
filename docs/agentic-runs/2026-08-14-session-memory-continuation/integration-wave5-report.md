@@ -20,7 +20,7 @@ their exact declared tips before fan-in.
 | --- | --- | --- | --- | --- |
 | Custody `01f1aa507df265e5c29125ee11750ded641a071d` | previously integrated custody `10cc6b60b3b0d1c4c519ec75b8394be0cba52459` | 2 linear commits, 0 merges | only `.seeds/issues.jsonl`, 5 insertions and 4 deletions | landed at `708c4158900f755f63debacf0219bf27b608a311` |
 | Reviewed readiness tip `2f5bd68a7feb9f641dba46b5d4deec54a21eb58a` | exact integration base `2dd2a02883df4b4e254913e3fe9eaf4473127dea` | 2 linear commits, 0 merges | exact 7-file report/registry/readiness/generated-types scope, 1,230 insertions | Spec **SHIP**, corrected Standards **SHIP**; landed at `44015a3322e701b272df9f56b98c6a380b451563` |
-| Design/report tip `88358e1bc19d2752d022a6d96e31f3381f789348` | exact integration base `2dd2a02883df4b4e254913e3fe9eaf4473127dea` | 2 linear commits, 0 merges | one blocked 48de report, proposed ADR-0035/0036, hash-v2 design, and ADR index; 1,285 insertions | independent ADR review **READY_FOR_HUMAN_REVIEW**; landed at `b6304b0784ee14f1a0341fb5ebe80de0e6bf86bb` |
+| Design/report tip `88358e1bc19d2752d022a6d96e31f3381f789348` | exact integration base `2dd2a02883df4b4e254913e3fe9eaf4473127dea` | 2 linear commits, 0 merges | one blocked 48de report, proposed ADR-0041/0042, hash-v2 design, and ADR index; 1,285 insertions | independent ADR review **READY_FOR_HUMAN_REVIEW**; landed at `b6304b0784ee14f1a0341fb5ebe80de0e6bf86bb` |
 
 All three histories were preserved through non-fast-forward three-way merges.
 No merge had a conflict. The reviewed readiness branch contains no `.seeds`,
@@ -62,7 +62,7 @@ has SHA-256 `146c2f405826cdd083a8f67268407d6a63c00421fe5c8eb02ae1073fdc3f359f`.
 
 ## Proposed-design invariants
 
-ADR-0035 and ADR-0036 both retain `status: proposed`, are linked from the ADR
+ADR-0041 and ADR-0042 both retain `status: proposed`, are linked from the ADR
 index, and cross-link the hash-v2 encoding design. The three documents use one
 `session_semantics_version` floor: it must become durably Accepted before the
 first v2 transcript, hash-v2 basis, or hash-v2 patch. Hash-v1 history remains
@@ -125,7 +125,7 @@ Custody has already closed `audio-graph-4dbb`. `audio-graph-98ef` remains
 conductor-owned and is eligible for root closure after this integrated
 evidence is reconciled. `audio-graph-ada2` remains `in_progress`.
 
-ADR-0035 and ADR-0036 are ready for human review but remain proposed. Seed
+ADR-0041 and ADR-0042 are ready for human review but remain proposed. Seed
 `audio-graph-4249` remains design-blocked until that decision is accepted, and
 `audio-graph-48de` remains blocked by 4249. `audio-graph-fcca` remains blocked
 by 98ef until closure and queue refresh. No integration failure Seed was filed

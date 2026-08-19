@@ -14,7 +14,7 @@ is tracked in this stable D0 snapshot rather than remaining an external
 worktree-only dependency.
 
 Governing decisions: [ADR-0027](../../adr/0027-file-canonical-durable-session-store.md)
-and [ADR-0037](../../adr/0037-freeze-canonical-event-stream-registry.md)
+and [ADR-0043](../../adr/0043-freeze-canonical-event-stream-registry.md)
 
 ## Outcome and done boundary
 
@@ -45,19 +45,19 @@ described as power-loss proof.
 ## Evidence and lineage boundary
 
 The strict reader at `src-tauri/src/persistence/canonical_reader.rs` already
-hard-codes ADR-0037's four stream identifiers and outer schema-v1 mappings and
-cites ADR-0037 for the data-movement inner/outer version assertion. Before D0,
+hard-codes ADR-0043's four stream identifiers and outer schema-v1 mappings and
+cites ADR-0043 for the data-movement inner/outer version assertion. Before D0,
 the accepted ADR file and its index entry were absent.
 
-D0 restores ADR-0037 byte-for-byte from non-ancestor commit `5487c3b`; its
+D0 restores ADR-0043 byte-for-byte from non-ancestor commit `5487c3b`; its
 required Git blob is `6f94d5a9fb183afbef70826add08fc3c1f163f59`.
 The ADR's historical references to ADR-0035 and ADR-0036 name non-ancestor
 canonical-log framing and recovery decisions. They do not name the current
 accepted speech-semantics decisions:
 
-- current ADR-0035 blob:
+- current ADR-0041 blob:
   `91ffb0304c06323be6254889d716e639ebc4d79e`;
-- current ADR-0036 blob:
+- current ADR-0042 blob:
   `3af2bcfeafe14d01544b4f122c10b8df78335fe2`.
 
 Those current files remain byte-for-byte unchanged. This lineage clarification
@@ -112,18 +112,18 @@ must consume after their separate acceptance.
 
 ## D0 — `audio-graph-1189`: restore the accepted registry lineage
 
-Ownership is limited to the exact ADR-0037 blob, the current-format README
+Ownership is limited to the exact ADR-0043 blob, the current-format README
 index entry and lineage warning, the corrected reviewed durability research
 artifact, this plan, and the D0 report. There is no product, Seeds, workflow,
 package, generated-file, or other-ADR ownership.
 
 The RED proof is absence of the ADR file and index row while the current strict
-reader cites ADR-0037. GREEN requires the exact historical blob, a linked
-accepted index row dated 2026-07-10, unchanged current ADR-0035/0036 blobs,
+reader cites ADR-0043. GREEN requires the exact historical blob, a linked
+accepted index row dated 2026-07-10, unchanged current ADR-0041/0042 blobs,
 the exact corrected research blob, resolving relative links, and a base-range
 footprint limited to the five owned files.
 
-Stop if the source blob differs, current ADR-0035/0036 changes, any lineage
+Stop if the source blob differs, current ADR-0041/0042 changes, any lineage
 clarification would require editing the archival ADR, or any product/Seeds/
 workflow mutation appears. Rollback is branch disposal or reversal of this
 documentation-only commit before fan-in; it has no runtime or persisted-data
@@ -174,7 +174,7 @@ every transition, deterministic restart/retry, exact residual-state checks,
 secret hygiene, Betterleaks, and range diff.
 
 Stop if the selected form is an event stream: create a new ADR proposal and
-backflow an ADR-0037 registry update before any kernel implementation. Do not
+backflow an ADR-0043 registry update before any kernel implementation. Do not
 silently add a fifth canonical stream. No production code or consumer
 migration is allowed. Rollback discards the non-production model/design branch
 and changes no runtime or persisted state.

@@ -95,9 +95,9 @@ exact completed retry returns `AlreadyCompleted` without replacement or
 generation advancement.
 
 The selected manifest is typed state rather than a fifth append-only canonical
-event stream, so ADR-0037 backflow is not triggered. Both log candidates are
+event stream, so ADR-0043 backflow is not triggered. Both log candidates are
 crash-correct under the model, but selecting either would have stopped this
-integration path for a new ADR and ADR-0037 registry update.
+integration path for a new ADR and ADR-0043 registry update.
 
 The selected snapshot still requires qualified namespace durability for
 quarantine publication and manifest replacement. Unsupported capability is a

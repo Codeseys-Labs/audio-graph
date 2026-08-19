@@ -24,7 +24,7 @@ The starting integration tip was the exact clean
   `.seeds/issues.jsonl`. Its queue contains 639 valid JSONL rows.
 - D0 has exact merge-base `c7d3fec`, two linear non-merge commits, and a clean
   owning worktree. Its true contribution is 1,195 added lines across exactly
-  five authorized paths: ADR-0037, the ADR index, the corrected research note,
+  five authorized paths: ADR-0043, the ADR index, the corrected research note,
   the 8e73 Wave 7B plan, and the 1189 implementation report.
 - The D0 footprint contains no Seed, workflow, product, generated, dependency,
   credential, vendor, or build-output path. Placeholder, whitespace, and
@@ -40,12 +40,12 @@ exact ADR blob requirements.
 
 - Corrected research blob:
   `10e0049246f78ba2b2aa31abc67cd95f0866225b`.
-- Restored immutable ADR-0037 blob:
+- Restored immutable ADR-0043 blob:
   `6f94d5a9fb183afbef70826add08fc3c1f163f59`.
-- Current ADR-0035 and ADR-0036 remain unchanged from the integration base at
+- Current ADR-0041 and ADR-0042 remain unchanged from the integration base at
   blobs `91ffb0304c06323be6254889d716e639ebc4d79e` and
   `3af2bcfeafe14d01544b4f122c10b8df78335fe2`.
-- The ADR index has exactly the accepted ADR-0037 row and file link plus a
+- The ADR index has exactly the accepted ADR-0043 row and file link plus a
   discoverable warning that the archival ADR's internal ADR-0035/0036 names
   belong to the non-ancestor canonical-log lineage. The warning links the Wave
   7B plan.
@@ -75,7 +75,7 @@ exact ADR blob requirements.
 | docs/Seeds secret hygiene | 0 findings |
 | exact range diff | passed `git diff --check` |
 
-The first ADR-0035/0036 immutability command used stale filenames and stopped
+The first ADR-0041/0042 immutability command used stale filenames and stopped
 before assembly. Resolving the paths from the exact base tree and comparing
 their blobs directly passed. This was an assertion-harness error, not a
 snapshot or product failure.

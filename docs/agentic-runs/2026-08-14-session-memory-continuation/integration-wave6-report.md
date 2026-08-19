@@ -56,7 +56,7 @@ The exact `MVP_SELECTABLE_PROVIDERS` source block and its sorted 10-provider
 set are also byte-identical to the base. The sorted-set SHA-256 is
 `146c2f405826cdd083a8f67268407d6a63c00421fe5c8eb02ae1073fdc3f359f`.
 
-ADR-0035 and ADR-0036 retain `status: proposed`. All previously accepted ADR
+ADR-0041 and ADR-0042 retain `status: proposed`. All previously accepted ADR
 blobs are byte-identical to the Wave 6 base.
 
 ## Assembled gates
@@ -104,7 +104,7 @@ Custody has already closed `audio-graph-98ef`. `audio-graph-fcca` remains
 conductor-owned and is eligible for root closure after this integrated
 evidence is reconciled. `audio-graph-ada2` remains `in_progress`.
 
-ADR-0035 and ADR-0036 remain proposed and await a human decision. Seed
+ADR-0041 and ADR-0042 remain proposed and await a human decision. Seed
 `audio-graph-4249` retains its proposed-decision state, and
 `audio-graph-48de` remains blocked by 4249. No integration failure Seed was
 filed because every required product gate passed.
@@ -122,7 +122,7 @@ The complete queue remains 92 ready and 89 blocked. `audio-graph-fcca`,
 `audio-graph-98ef`, and `audio-graph-4dbb` are closed and absent from both open
 queues. `audio-graph-4249` is open, classified `AWAITING_HUMAN_DECISION`, and
 ready. `audio-graph-48de` is directly blocked by 4249, while
-`audio-graph-ada2` is transitively blocked through 48de. ADR-0035 and ADR-0036
+`audio-graph-ada2` is transitively blocked through 48de. ADR-0041 and ADR-0042
 remain proposed.
 
 Seeds Doctor again reported 10 checks passed, 2 custody-carried warning groups,

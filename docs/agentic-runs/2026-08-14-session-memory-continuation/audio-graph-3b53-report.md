@@ -15,7 +15,7 @@ Date: 2026-08-16
 - No Seed, workflow, frontend, dependency, lockfile, writer, projection,
   consumer, generated-contract, or integration-branch change was made.
 
-The accepted ADR-0038 shared-persistence workstream is implemented but remains
+The accepted ADR-0044 shared-persistence workstream is implemented but remains
 runtime-dark. This work does not call `admitted_session_semantics_floor`, does
 not authorize v2 content admission, and does not add a fifth stream.
 The Standards/Spec BLOCK findings described below are corrected locally; this
@@ -756,7 +756,7 @@ Two consequences follow:
 - a manifest candidate can inventory the addressed store's own live manifest or
   temporary as an ordinary managed artifact.
   `validate_managed_identity` (`:2006`) refuses only the legacy names, so
-  ADR-0038's "no manifest inventories itself" rule is unenforced for every
+  ADR-0044's "no manifest inventories itself" rule is unenforced for every
   addressed Session. The proof is a different case: the manifest is required to
   inventory it as `SessionProvenanceEvents`.
 - `validate_recovery_identity_reservations` (`canonical_log.rs:1205`) builds its
@@ -767,7 +767,7 @@ Two consequences follow:
   `self.source.set_len(self.source_after.content.byte_length)`
   (`canonical_log.rs:706`), truncating the authoritative manifest.
 
-ADR-0038's Compliance section requires that inventory, export, delete, and
+ADR-0044's Compliance section requires that inventory, export, delete, and
 recovery "treat all three per-Session control identities consistently and exclude
 the global lock". Address-blind reservation does not satisfy that bullet: it is
 consistent only in the legacy unaddressed shape this wave is superseding.

@@ -10,10 +10,10 @@ Seed `audio-graph-67a1` is the P0 architectural prerequisite for the bounded
 `work/audio-graph-67a1-session-control-plane-wave7c` in the clean worktree
 `/home/codeseys/DevBox/audio-graph/.worktrees/67a1-session-control-plane-wave7c`.
 
-[ADR-0038](../../adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md)
+[ADR-0044](../../adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md)
 is `proposed`. This plan records a future implementation shape; it authorizes
 no production code, Seed mutation, workflow action, push, merge, release, or
-deployment. A human decider must first accept ADR-0038. The conductor then
+deployment. A human decider must first accept ADR-0044. The conductor then
 assigns a focused child Seed and clean worktree for each serial workstream.
 Acceptance itself lands separately as one docs-only commit that atomically
 changes the ADR status, its actual acceptance date, and the README row status
@@ -34,7 +34,7 @@ them inside a code workstream:
 - addressability refusal is content-free and precedes path derivation or I/O,
   and a manifest loaded from a derived path must exactly match the requested
   validated Session id;
-- manifest, immutable v1-to-v2 proof, and manifest temporary use the ADR-0038
+- manifest, immutable v1-to-v2 proof, and manifest temporary use the ADR-0044
   role-specific basenames at the existing qualified flat root;
 - those three identities are Session-owned while
   `.audio-graph-canonical.lock` is store-owned and global;
@@ -60,7 +60,7 @@ state.
 
 ## Versioned transition proof wire specification
 
-This section, rather than ADR-0038, owns the bounded proof wire. The proof is
+This section, rather than ADR-0044, owns the bounded proof wire. The proof is
 compact UTF-8 JSON with fields in the fixed order `schema_version`,
 `session_id`, `from`, `to`, `idempotency_id`, and `transition_kind`. The floor
 values are exactly 1 and 2, the transition kind is exactly
@@ -284,10 +284,10 @@ worktrees only after acceptance.
 
 ### Changed documentation
 
-- Added proposed Extended-tier MADR 3.0 ADR-0038 with four real options,
+- Added proposed Extended-tier MADR 3.0 ADR-0044 with four real options,
   explicit negative consequences, typed relationships, compliance assertions,
   confirmation, reversal condition, and a human acceptance gate.
-- Rebuilt the ADR index view for 38 on-disk ADRs by adding the sorted ADR-0038
+- Rebuilt the ADR index view for 38 on-disk ADRs by adding the sorted ADR-0044
   row and reference link.
 - Added the exact-base custody record and this two-workstream serial TDD plan.
 - Changed no production code, test, Seed, workflow, dependency, generated
@@ -368,7 +368,7 @@ guarded qualified admission and non-mutating pre/post read-only admission. A
 future acceptance must atomically update status and actual date in both ADR and
 index in a separate docs-only, non-authorizing commit.
 
-Correction round 2 removes proof-wire schema from ADR-0038 and makes this plan's
+Correction round 2 removes proof-wire schema from ADR-0044 and makes this plan's
 wire-specification section its sole detailed authority. It also reconciles the
 narrow production Sessions addressability contract with the broader dormant
 manifest wire validator: broad wire validity remains intact, while path
@@ -376,5 +376,5 @@ derivation refuses ineligible ids content-free before I/O and exact loaded-id
 matching prevents cross-Session selection. The current dormant/no-migration
 evidence boundary is now explicit.
 
-No ADR-authoring question remains open. Human acceptance of ADR-0038 and later
+No ADR-authoring question remains open. Human acceptance of ADR-0044 and later
 assignment of two implementation child Seeds remain required external actions.

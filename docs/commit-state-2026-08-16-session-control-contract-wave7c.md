@@ -5,7 +5,7 @@ Date: 2026-08-16
 ## Fixed custody
 
 - Seed: `audio-graph-3b53`, first serial implementation child of
-  `audio-graph-7e81` under accepted ADR-0038.
+  `audio-graph-7e81` under accepted ADR-0044.
 - Exact base: `b5145b2b630a38df7065905263139575b44ead7e`.
 - Branch: `work/audio-graph-3b53-session-control-contract-wave7c`.
 - Worktree:
@@ -16,7 +16,7 @@ Date: 2026-08-16
 
 ## Accepted authority and current evidence
 
-- ADR-0038 is accepted at this base and keeps Session control artifacts in the
+- ADR-0044 is accepted at this base and keeps Session control artifacts in the
   qualified flat root under one store-owned global lock.
 - `sessions::session_id_is_valid` is the production addressability authority:
   non-empty, at most 128 bytes, ASCII alphanumeric/hyphen/underscore.

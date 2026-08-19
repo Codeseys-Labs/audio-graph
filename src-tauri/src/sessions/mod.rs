@@ -718,7 +718,7 @@ fn remove_artifact_paths(
 /// Retire one Session's three OWNED control-plane entries, returning the
 /// residual rows that must keep the index entry durable for a retry.
 ///
-/// ADR-0038 §3 makes per-Session control lifecycle a separate authority from the
+/// ADR-0044 §3 makes per-Session control lifecycle a separate authority from the
 /// manifest's managed artifact inventory, which is why these three identities are
 /// deliberately NOT members of [`default_session_artifact_paths`] and not
 /// members of [`remove_artifact_paths`]'s allow-list. The store-owned

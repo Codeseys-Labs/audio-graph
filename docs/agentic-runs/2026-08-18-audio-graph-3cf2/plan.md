@@ -239,32 +239,34 @@ both far from 68a1's sites.
    `begin_write` observes the head advanced to the candidate the caller tried to
    abandon.
 
-## 6. ADR-0038 and the new proposed ADR-0039
+## 6. ADR-0044 and the new proposed ADR-0039
 
-ADR-0038 §3 says "Delete owns any retained Session temporary as recovery
+ADR-0044 §3 says "Delete owns any retained Session temporary as recovery
 residue" and its drivers ask for **one explicit ownership rule**;
 `abandon_staged_transition` is a second, non-delete owner of temporary removal,
-so that sentence does not describe shipped code. ADR-0038 is `accepted`, and
+so that sentence does not describe shipped code. ADR-0044 is `accepted`, and
 `docs/adr/README.md` states that accepted ADRs are immutable — to change one,
 write a new ADR. It carries no self-amendment clause, and its deciders line
 requires human acceptance.
 
 So the scope change is a NEW record, not an edit:
 `docs/adr/0039-let-a-session-abandon-its-own-staged-manifest-temporary.md`,
-status `proposed`, refining ADR-0038 decision item 3 in part and superseding
+status `proposed`, refining ADR-0044 decision item 3 in part and superseding
 nothing. It scopes the single-owner rule to lifecycle operations acting from
 outside a write transaction, allows a Session to abandon its own retained
 temporary from inside its exclusive-guard write transaction, and records the
 removal primitive's fences (store-owned lock refused under every ASCII-case
 spelling before any I/O, non-regular and out-of-root targets refused, immediate
-children of the qualified root only). ADR-0038's own bytes stay identical to its
+children of the qualified root only). ADR-0044's own bytes stay identical to its
 acceptance commit `fcd5d10`; the README index gains an 0039 row and link and
-0038's row is untouched, matching how ADR-0036 records "Refines ADR-0031"
-without editing ADR-0031's row.
+ADR-0044's row is untouched, matching how ADR-0042 records "Refines ADR-0031"
+without editing ADR-0031's row. (Both records were numbered 0038 and 0036 while
+this wave ran; seed `audio-graph-c306` later renumbered them, which is the only
+subsequent change to ADR-0044's bytes.)
 
-Because ADR-0039 is `proposed`, ADR-0038 item 3 remains the in-force rule and
+Because ADR-0039 is `proposed`, ADR-0044 item 3 remains the in-force rule and
 the landed primitive keeps having no production caller. A later review round of
-this wave reverted an earlier in-place amendment of ADR-0038 (commit `2ae6435`)
+this wave reverted an earlier in-place amendment of ADR-0044 (commit `2ae6435`)
 in favour of this arrangement.
 
 ## 7. Out of scope

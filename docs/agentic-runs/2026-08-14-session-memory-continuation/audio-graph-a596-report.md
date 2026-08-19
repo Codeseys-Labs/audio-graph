@@ -40,7 +40,7 @@ The public seam provides:
   outside the artifact inventory.
 
 The artifact-kind vocabulary includes Original Session Audio, session
-provenance, the four ADR-0037 streams, materialized notes/graph and snapshot
+provenance, the four ADR-0043 streams, materialized notes/graph and snapshot
 forms, scheduler, usage, live-assist current/audit, data movement, quarantine,
 recovery, metadata, and legacy compatibility artifacts.
 

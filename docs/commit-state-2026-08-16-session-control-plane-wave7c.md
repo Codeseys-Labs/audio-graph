@@ -17,8 +17,8 @@ Date: 2026-08-16
 
 This workstream owns exactly:
 
-- `docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md`;
-- the ADR-0038 row and link in `docs/adr/README.md`;
+- `docs/adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md`;
+- the ADR-0044 row and link in `docs/adr/README.md`;
 - this commit-state document; and
 - `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-67a1-session-control-plane-plan.md`.
 
@@ -31,9 +31,9 @@ worktree.
 
 - ADR-0027 requires one typed Session Artifact manifest to drive lifecycle
   parity and durable provenance.
-- ADR-0035 requires a monotonic, durably Accepted v1-to-v2 Session semantics
+- ADR-0041 requires a monotonic, durably Accepted v1-to-v2 Session semantics
   floor before v2 transcript, basis, or patch authority.
-- ADR-0037 freezes four canonical event streams; a fifth stream requires
+- ADR-0043 freezes four canonical event streams; a fifth stream requires
   explicit architectural backflow.
 - The dormant manifest kernel hard-codes one manifest/temp pair at an explicit
   root, inventories a v2 provenance identity, and uses the canonical global
@@ -53,7 +53,7 @@ they are not implementation authorization.
 
 ## Proposed decision and human gate
 
-ADR-0038 recommends per-Session manifest/provenance/temp filenames at the
+ADR-0044 recommends per-Session manifest/provenance/temp filenames at the
 existing qualified flat root, one bounded injective lowercase Base32 key, the
 existing store-wide lock, and one immutable exact v1-to-v2 proof. The proof is
 not a fifth canonical stream. Historical bootstrap must report Original

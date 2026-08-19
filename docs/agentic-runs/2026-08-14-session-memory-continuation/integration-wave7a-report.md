@@ -200,8 +200,8 @@ so no product suite was rerun.
 
 Custody `dd038da` and reviewed D0 tip `bc2da20` were merged without conflict at
 `98d4013` and `367d344`. The 639-row queue is byte-identical to custody. The
-corrected research and immutable ADR-0037 blobs, unchanged current
-ADR-0035/0036, lineage warning, five-versus-two ownership split, complete crash
+corrected research and immutable ADR-0043 blobs, unchanged current
+ADR-0041/0042, lineage warning, five-versus-two ownership split, complete crash
 cuts, and Blacksmith stop/list-clean/no-workflow controls were verified on the
 assembled snapshot. The reviewed research branch was not merged separately.
 

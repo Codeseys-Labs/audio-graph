@@ -15,8 +15,8 @@ covered.
 | --- | --- |
 | `f13306f` | `fix(audio-graph-3cf2): classify install refusals that leave a durable proof` |
 | `534745a` | `feat(audio-graph-3cf2): add a durable unlink primitive and a public abandon path` |
-| `2ae6435` | `docs(audio-graph-3cf2): amend ADR-0038 ownership, record the wave, scope stale claims` |
-| review-round `docs` commit | reverts that in-place ADR-0038 amendment; adds proposed ADR-0039 + README index row instead |
+| `2ae6435` | `docs(audio-graph-3cf2): amend ADR-0044 ownership, record the wave, scope stale claims` |
+| review-round `docs` commit | reverts that in-place ADR-0044 amendment; adds proposed ADR-0039 + README index row instead |
 | review-round-1 fix commit | rescopes `Durability`'s rustdoc from the transaction to the one refused call, and corrects ADR-0039's unlink receiver to `CanonicalExclusiveGuard` |
 
 Files touched: `src-tauri/src/persistence/session_artifact_manifest.rs`,
@@ -312,18 +312,22 @@ gate, and Betterleaks.
 
 ## 7. Documents changed, and the checks that were run
 
-- **ADR-0038** (accepted): **not changed by this branch.** Commit `2ae6435`
+- **ADR-0044** (accepted): **not changed by this branch.** Commit `2ae6435`
   did add a dated in-place amendment paragraph to decision item 3 and rewrite one
   Compliance bullet; review found that this violates `docs/adr/README.md`, which
   states that accepted ADRs are immutable and that changing one requires a new
-  superseding record, and ADR-0038 has no self-amendment clause and a
+  superseding record, and ADR-0044 has no self-amendment clause and a
   human-acceptance deciders line. A later review round reverted both hunks, so
-  ADR-0038 is byte-identical to its acceptance commit `fcd5d10` and the README
+  ADR-0044 is byte-identical to its acceptance commit `fcd5d10` and the README
   index row still truthfully presents it as unchanged since 2026-08-16.
   Verified with `git diff --exit-code fcd5d10 -- docs/adr/0038-...md` (exit 0).
+  That gate ran on this wave's tip, when the record was numbered `0038`. Seed
+  `audio-graph-c306` has since renumbered it to `0044` to resolve a collision
+  with master, changing its filename and H1 line, so the command above no
+  longer reproduces on later tips and the claim is scoped to this wave.
 - **ADR-0039** (new, `proposed`):
   `docs/adr/0039-let-a-session-abandon-its-own-staged-manifest-temporary.md`
-  carries the ownership scope change instead. ADR-0038 item 3's "Delete owns any
+  carries the ownership scope change instead. ADR-0044 item 3's "Delete owns any
   retained Session temporary as recovery residue" sentence and its "one explicit
   ownership rule" driver do not describe shipped code, because
   `abandon_staged_transition` is a second, non-delete remover of a Session
@@ -333,11 +337,11 @@ gate, and Betterleaks.
   transaction, and the removal primitive's fences are recorded (store-owned lock
   refused under every ASCII-case spelling before any filesystem access,
   non-regular and out-of-root targets refused, immediate children only). It
-  supersedes nothing. Because it is `proposed`, ADR-0038 item 3 remains in force
+  supersedes nothing. Because it is `proposed`, ADR-0044 item 3 remains in force
   and the landed entry point still has no production caller; acceptance is the
   human decider's, and nothing here claims it.
 - **`docs/adr/README.md`**: one index row and one link definition for ADR-0039,
-  in the same style as ADR-0036's "Refines ADR-0031" row. ADR-0038's row is not
+  in the same style as ADR-0042's "Refines ADR-0031" row. ADR-0044's row is not
   touched, matching the existing convention that the refining record carries the
   relationship note.
 - **`docs/commit-state-2026-08-16-session-control-contract-wave7c.md`**: a
@@ -361,8 +365,11 @@ checked, and neither this report nor the plan adds any.
 
 **Second check performed.**
 `git diff --exit-code fcd5d10 -- docs/adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md`
-exits 0 on the branch tip, which is the assertion that accepted ADR-0038 is
-byte-identical to its acceptance commit after the amendment revert. ADR-0039
+exited 0 on this wave's branch tip, which is the assertion that accepted
+ADR-0044 — numbered `0038` when this check ran — is byte-identical to its
+acceptance commit after the amendment revert. Seed `audio-graph-c306` later
+renumbered that record to `0044`, so the path above is the one the check
+actually used and the result is scoped to this wave's tip. ADR-0039
 cites no file line numbers; its two test-name blocks were checked by grepping
 each name in the named source file.
 
@@ -395,7 +402,7 @@ CanonicalExclusiveGuard` opens the only impl block enclosing
 | Windows test cfg-gating defects on a real NTFS host | `audio-graph-a58b` |
 | Rotation HomeGuard known-folder override gap | `audio-graph-0641` |
 | A general delete/purge facility for nested Session artifacts (ADR-0027) | unimplemented; `bind_parent` deliberately keeps this primitive to immediate children |
-| ADR-0039 is `proposed`: accepted ADR-0038 item 3 still names delete as the owner of a retained temporary, so the shipped second remover has no accepted decision behind it until a human decides | the human decider; nothing in production calls the abandon entry point meanwhile |
+| ADR-0039 is `proposed`: accepted ADR-0044 item 3 still names delete as the owner of a retained temporary, so the shipped second remover has no accepted decision behind it until a human decides | the human decider; nothing in production calls the abandon entry point meanwhile |
 
 ## 9. Deliberate deviations from the brief
 

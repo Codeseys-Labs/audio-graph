@@ -29,7 +29,7 @@ const PROJECTION_PATCHES_SCHEMA_VERSION: u32 = 1;
 const DATA_MOVEMENT_EVENTS_SCHEMA_VERSION: u32 = 1;
 const DATA_MOVEMENT_EVENTS_EMBEDDED_SCHEMA_VERSION: u32 = 1;
 
-// ADR-0037 pins the IPC payload version supported by outer stream schema v1.
+// ADR-0043 pins the IPC payload version supported by outer stream schema v1.
 // If the IPC crate advances, this must fail until an explicit multi-version
 // mapping or migration is added instead of silently reinterpreting old rows.
 const _: () = assert!(

@@ -24,7 +24,7 @@ closed, and `.seeds/issues.jsonl` was not modified.
 The file repository now has one strict, presence-bearing canonical read
 authority for transcript revisions, speaker revisions, projection patches, and
 data-movement events. It accepts legacy JSONL and legacy-prefix/framed-v1
-streams, preserves `Missing` versus `Present(empty)`, validates the ADR-0037
+streams, preserves `Missing` versus `Present(empty)`, validates the ADR-0043
 stream registry and movement payload context, and fails closed on structural,
 context, version, hash, and payload errors.
 
@@ -48,7 +48,7 @@ backed up nor rewritten by Review/export/transcript inventory lookup.
 - ADR-0035 key-canonical framed-v1 commitments and immutable integrity checks.
 - ADR-0036 fail-closed strict tail behavior; reader paths do not quarantine or
   repair.
-- ADR-0037 registry identifiers and independent outer schema versions:
+- ADR-0043 registry identifiers and independent outer schema versions:
   `transcript_revisions`, `speaker_revisions`, `projection_patches`, and
   `data_movement_events`, all version 1.
 - The reviewed `daf1ff6` `NotFound` backflow: only a strict read-side
@@ -117,7 +117,7 @@ present-empty authority regression.
   - preserves filesystem `NotFound` on read;
   - test-local type alias added to satisfy strict Clippy.
 - `src-tauri/src/persistence/canonical_reader.rs`
-  - private ADR-0037 registry;
+  - private ADR-0043 registry;
   - `Missing | Present(CanonicalLogSnapshot<T>)` strict reads;
   - movement session/schema validation and focused fixtures.
 - `src-tauri/src/persistence/mod.rs`

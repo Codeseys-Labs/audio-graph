@@ -5,7 +5,7 @@ Date: 2026-08-14
 ## Assignment and correction round
 
 - Seed: `audio-graph-1189` — Restore accepted canonical stream registry
-  ADR-0037 lineage.
+  ADR-0043 lineage.
 - Worktree:
   `/home/codeseys/DevBox/audio-graph/.worktrees/1189-adr0037-wave7b`
 - Branch: `work/1189-adr0037-wave7b`
@@ -13,9 +13,9 @@ Date: 2026-08-14
 - Initial reviewed tip: `6f51f2626ab19740746dfb84e0678fefb7ec7876`.
 - Review disposition: both axes blocked the initial tip; this is bounded
   correction round 1 of at most 2.
-- Corrected acceptance: preserve exact ADR-0037 blob
-  `6f94d5a9fb183afbef70826add08fc3c1f163f59`; preserve the current ADR-0035
-  and ADR-0036 blobs; add corrected reviewed research blob
+- Corrected acceptance: preserve exact ADR-0043 blob
+  `6f94d5a9fb183afbef70826add08fc3c1f163f59`; preserve the current ADR-0041
+  and ADR-0042 blobs; add corrected reviewed research blob
   `10e0049246f78ba2b2aa31abc67cd95f0866225b`; make the non-ancestor lineage
   warning discoverable from the index; correct manifest/durability ownership,
   crash cuts, and clean-worktree Seeds gates; and change no product, Seeds,
@@ -36,7 +36,7 @@ already-installed repository-pinned Seeds CLI without installing, patching, or
 symlinking packages in a clean worktree.
 
 No product code, Seed, workflow, package, generated artifact, current
-ADR-0035/0036 byte, ADR-0037 byte, or integration checkpoint changed. This
+ADR-0041/0042 byte, ADR-0043 byte, or integration checkpoint changed. This
 workstream did not close a Seed, merge, push, dispatch a workflow, start a
 Blacksmith job, or install/patch a dependency.
 
@@ -69,9 +69,9 @@ non-ancestor ADR source commit `5487c3b` was cherry-picked or merged.
 ## What changed
 
 - Restored
-  [ADR-0037](../../adr/0037-freeze-canonical-event-stream-registry.md)
+  [ADR-0043](../../adr/0043-freeze-canonical-event-stream-registry.md)
   byte-for-byte from non-ancestor commit `5487c3b`.
-- Added ADR-0037's current-format accepted index row/reference and a nearby
+- Added ADR-0043's current-format accepted index row/reference and a nearby
   warning that its internal ADR-0035/0036 references belong to the historical
   non-ancestor canonical-log lineage. The warning links the Wave 7B plan.
 - Added the
@@ -88,14 +88,14 @@ non-ancestor ADR source commit `5487c3b` was cherry-picked or merged.
 
 ## Lineage and queue clarification
 
-The restored ADR-0037 is immutable archival content. Its references to
+The restored ADR-0043 is immutable archival content. Its references to
 ADR-0035 and ADR-0036 name non-ancestor canonical-log framing and recovery
 decisions that existed beside it at source commit `5487c3b`. The current
-accepted ADR-0035 and ADR-0036 are distinct speech-semantics decisions. They
+accepted ADR-0041 and ADR-0042 are distinct speech-semantics decisions. They
 remain at these exact blobs:
 
-- ADR-0035: `91ffb0304c06323be6254889d716e639ebc4d79e`;
-- ADR-0036: `3af2bcfeafe14d01544b4f122c10b8df78335fe2`.
+- ADR-0041: `91ffb0304c06323be6254889d716e639ebc4d79e`;
+- ADR-0042: `3af2bcfeafe14d01544b4f122c10b8df78335fe2`.
 
 This branch's tracked Seed snapshot predates the custody review updates. The
 worker did not edit it. Final fan-in must include the already-recorded custody
@@ -103,7 +103,7 @@ Seed correction before conductor reconciliation or closure.
 
 ## Final five-file footprint
 
-- `docs/adr/0037-freeze-canonical-event-stream-registry.md`
+- `docs/adr/0043-freeze-canonical-event-stream-registry.md`
 - `docs/adr/README.md`
 - `docs/research/canonical-directory-durability-2026-08-14.md`
 - `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-8e73-wave7b-plan.md`

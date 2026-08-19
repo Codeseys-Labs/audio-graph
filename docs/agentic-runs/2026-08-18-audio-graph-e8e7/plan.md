@@ -60,7 +60,7 @@ them verbatim under *Residuals and deviations*.
 
 | # | Edit | Authority | If refused |
 | --- | --- | --- | --- |
-| A1 | `ArtifactUnavailableReason::HistoricalUnknown` appended to the wire enum | ADR-0038 §8 and its Consequences bullet: *"If the v1 manifest wire cannot represent that distinction, implementation stops for a reviewed schema refinement rather than choosing a plausible reason"* | **STOP on acceptance (1).** Do not substitute `NeverCaptured`/`Inaccessible` (both are fabricated histories ADR §8 names) and do not omit the entry (`MissingOriginalSessionAudio`). |
+| A1 | `ArtifactUnavailableReason::HistoricalUnknown` appended to the wire enum | ADR-0044 §8 and its Consequences bullet: *"If the v1 manifest wire cannot represent that distinction, implementation stops for a reviewed schema refinement rather than choosing a plausible reason"* | **STOP on acceptance (1).** Do not substitute `NeverCaptured`/`Inaccessible` (both are fabricated histories ADR §8 names) and do not omit the entry (`MissingOriginalSessionAudio`). |
 | A2 | New public `SessionArtifactManifestStore::retire_owned_control_plane` (plus a non-panicking `addressed_control_identities` accessor, a `pub` on the already-existing proof-size ceiling, and a new recovery-key domain) inside `session_artifact_manifest.rs` | Critique finding 1: raw `std::fs::remove_file` retirement is unshippable — no parent-directory barrier, no reserved-name/regular-file/identity fences, no recovery key. `unlink_canonical_entry` is `pub(crate)` on the guard and the transaction's guard field is module-private, so the only correct home is that module. | **STOP on acceptance (4)'s delete leg** for a scope amendment. Inventory/export/recovery parity still ships. |
 | A3 | One sentence of `CanonicalExclusiveGuard::unlink_canonical_entry`'s TRUST BOUNDARY rustdoc in `canonical_durability.rs`, which today asserts *"Its only production caller is `ManifestWriteTransaction::abandon_staged_transition`"* | A2 adds a second production caller. Leaving the sentence would ship a doc that misdescribes the code, which this repo treats as a blocking defect. | Refuse A2 as well; the two stand or fall together. |
 
@@ -190,16 +190,16 @@ which runs while the shared guard is alive:
 
 Taking `&SessionArtifactManifestStore` is load-bearing: it lets tests inject
 `qualified_for_test_session` and `for_test_session_platform(.., Windows)` stores
-and exercise both ADR-0038 §5 branches on Linux.
+and exercise both ADR-0044 §5 branches on Linux.
 
 **Rustdoc honesty requirement.** On the qualified branch `checked_read`
 *establishes* the coordination entry when it is missing (it drops an exclusive
 guard to create the lock, then re-acquires shared). The wrapper's doc says the
 read path may create the store-owned lock file on Linux/macOS.
 
-### 3.1 The ADR-0038 §5 sandwich (critique finding 3)
+### 3.1 The ADR-0044 §5 sandwich (critique finding 3)
 
-ADR-0038 §5 fixes two branches by capability and states *"An unlocked preflight
+ADR-0044 §5 fixes two branches by capability and states *"An unlocked preflight
 result alone is never an admitted floor"* and, for the read-only branch, that the
 implementation *"checks the Session manifest and global coordination entry before
 reading, builds the complete content snapshot without releasing bytes to the
@@ -375,7 +375,7 @@ pub fn historical_session_bootstrap_from_live_inventory(
    and therefore `AlreadyCompleted`. Floor is `V1`; the bootstrap never writes V2.
 6. **No production caller, no CAS.** The bootstrap returns a candidate.
    Installing it is a `compare_and_swap`, which **stays uncalled in production**
-   per ADR-0038 §11 and the seed's "no writer activation".
+   per ADR-0044 §11 and the seed's "no writer activation".
 7. **Live inventory scope.** The bootstrap inventory covers the twelve durable
    per-Session artifacts with an explicit kind and privacy class each. The six
    `*.json.tmp` write sidecars in `default_session_artifact_paths` are interrupted-write
@@ -431,7 +431,7 @@ and never exported.
 Amendments over the brief:
 
 - A **V2** manifest with an absent proof is `Err(V2ProofMissing)`, never
-  `Some(manifest) + None`. ADR-0038 §3: *"A successful export contains the
+  `Some(manifest) + None`. ADR-0044 §3: *"A successful export contains the
   manifest and an available proof."*
 - The proof bytes are **authenticated** before they are included: the file must
   be regular, within the canonical proof ceiling, exactly one canonical
@@ -538,7 +538,7 @@ rather than resolved by a non-durable removal.
 ### 5.3 Narrow `sessions/mod.rs` wiring
 
 The three control paths are **not** added to `default_session_artifact_paths`.
-ADR-0038 §3 makes per-Session control lifecycle a separate authority *"in addition
+ADR-0044 §3 makes per-Session control lifecycle a separate authority *"in addition
 to the manifest's managed artifact inventory"*. Keeping them out means the content
 inventory and its delete allow-list keep their exact current authority,
 `default_artifact_inventory_covers_every_managed_session_file_and_temp` (18 paths)

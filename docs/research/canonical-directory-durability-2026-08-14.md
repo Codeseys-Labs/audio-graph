@@ -157,7 +157,7 @@ The safe sequence is:
 This protocol deliberately does **not** choose an append-only event log, an
 atomic snapshot replacement, or another manifest representation.
 `audio-graph-661f` owns that physical-form decision and its corresponding
-barriers. Choosing an event stream requires backflow into ADR-0037 before
+barriers. Choosing an event stream requires backflow into ADR-0043 before
 implementation. **[documented project dependency: `audio-graph-661f`]**
 
 This ordering prevents source destruction before there is a synchronized,

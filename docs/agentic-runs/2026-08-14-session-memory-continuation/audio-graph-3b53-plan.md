@@ -6,7 +6,7 @@ Date: 2026-08-16
 
 Seed `audio-graph-3b53` implements only the first serial shared-persistence
 workstream under accepted
-[ADR-0038](../../adr/0038-keep-session-control-plane-in-the-flat-artifact-root.md).
+[ADR-0044](../../adr/0044-keep-session-control-plane-in-the-flat-artifact-root.md).
 Execution is fixed to base `b5145b2b630a38df7065905263139575b44ead7e` on
 branch `work/audio-graph-3b53-session-control-contract-wave7c` in clean
 worktree

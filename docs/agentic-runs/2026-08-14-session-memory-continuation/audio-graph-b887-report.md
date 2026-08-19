@@ -44,7 +44,7 @@ bind the transition fingerprint to the provenance content SHA-256. The
 existing unqualified and Windows policy refusal paths remain unchanged and
 passing.
 
-The design is dormant. There is no fifth ADR-0037 stream, production v2
+The design is dormant. There is no fifth ADR-0043 stream, production v2
 artifact append, basis or patch activation, broad consumer migration,
 predecessor canary, dependency/workflow/generated/frontend change, or new
 durability claim.

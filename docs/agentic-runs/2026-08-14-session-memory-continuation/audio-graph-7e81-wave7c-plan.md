@@ -55,7 +55,7 @@ scope.
 
 ## Hard stops
 
-- No fifth ADR-0037 canonical stream.
+- No fifth ADR-0043 canonical stream.
 - No production `CanonicalFilesystemQualification` constructor.
 - No v2 artifact writer, Projection Basis, or patch activation.
 - No broad Review/load/export/delete/recovery migration.

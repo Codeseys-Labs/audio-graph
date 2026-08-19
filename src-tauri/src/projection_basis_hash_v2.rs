@@ -121,7 +121,7 @@ impl From<ProjectionSemanticError> for ProjectionBasisHashV2Error {
     }
 }
 
-/// Hash normalized projection semantics using ADR-0036's frozen v2 encoding.
+/// Hash normalized projection semantics using ADR-0042's frozen v2 encoding.
 pub fn projection_basis_hash_v2(
     records: &[PositionedProjectionSemanticRevision],
 ) -> Result<String, ProjectionBasisHashV2Error> {

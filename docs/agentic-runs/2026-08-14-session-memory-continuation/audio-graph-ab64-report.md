@@ -40,7 +40,7 @@ Date: 2026-08-14
   empty legacy supersession references, and v2 source/ordinal/span-id identity
   mismatches. The included-field mutation matrix now creates only valid
   revisions through `SpeechSpanRevisionNormalizer`.
-- Added a shared golden catalog with the four active ADR-0036 digests and an
+- Added a shared golden catalog with the four active ADR-0042 digests and an
   independently implemented Bun normalizer/encoder/verifier.
 - Added focused public-seam and conformance tests for v2 access, legacy/v2
   normalization, excluded operational mutations, all goldens, included-field

@@ -148,7 +148,7 @@ frontend 70 files/963 tests all passed. Repo-authoritative `verify:fast`, Seeds
 JSON/Doctor/output, ADR/static-hash, Betterleaks, secret, and diff gates passed.
 
 `audio-graph-98ef` is eligible for conductor closure after reconciliation.
-ADR-0035 and ADR-0036 are **proposed** and only ready for human review;
+ADR-0041 and ADR-0042 are **proposed** and only ready for human review;
 `audio-graph-4249` remains `BLOCKED_DESIGN`, and `audio-graph-48de` remains
 blocked by 4249. Exact evidence is in
 [`integration-wave5-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave5-report.md).
@@ -189,8 +189,8 @@ integrated queue is byte-identical to custody with 625 valid rows.
 The queue contains 92 ready and 89 blocked issues. `audio-graph-fcca`,
 `audio-graph-98ef`, and `audio-graph-4dbb` are closed and absent from the open
 queues. `audio-graph-4249` is ready for a human decision; 48de remains directly
-blocked by 4249, and ada2 is transitively blocked through 48de. ADR-0035 and
-ADR-0036 remain proposed.
+blocked by 4249, and ada2 is transitively blocked through 48de. ADR-0041 and
+ADR-0042 remain proposed.
 
 Seeds Doctor has 0 failures. Pinned `verify:fast`, all five contracts, Seeds
 JSON/output, Betterleaks, secret, and range-diff gates passed. No product suite
@@ -207,7 +207,7 @@ Its one linear commit after custody `9738ca3` changes only
 Human-authorized acceptance tip
 `4eaa99c239b8b4b8e7b8aba41d4c8c30a1395fc8` was then merged without conflict
 at `17e5ab266165ae7a1d2f8f735e19967d9d7377dc`. Its one commit from the exact
-starting base changes only ADR-0035, ADR-0036, and their README index rows. Both
+starting base changes only ADR-0041, ADR-0042, and their README index rows. Both
 ADRs are accepted, name only the AudioGraph user and product owner as human
 decider, retain byte-identical decision bodies, and preserve all previously
 accepted ADR files.
@@ -249,7 +249,7 @@ Decision Outcomes, consequences, relationships, semantic compliance rules,
 reversal conditions, and hash-v2 design remain identical to the accepted base;
 only lifecycle authority and conductor-owned queue wording changed.
 
-ADR-0035 and ADR-0036 remain accepted, and their index entries and links remain
+ADR-0041 and ADR-0042 remain accepted, and their index entries and links remain
 current. Seeds JSON/output, Doctor, all five contracts, pinned `verify:fast`,
 Betterleaks, docs/Seeds secret, and range-diff gates passed. Seeds Doctor
 reported 10 passed, 2 custody-carried warning groups, and 0 failures; the queue
@@ -391,8 +391,8 @@ dispatched, and no branch was pushed.
 
 Custody `dd038da` and reviewed D0 `bc2da20` were integrated without conflict at
 `98d4013` and `367d344`. The 639-row queue is byte-identical to custody; the
-research branch was not separately merged. Exact research, ADR-0037, and
-current ADR-0035/0036 blobs, the index lineage warning, ownership split, crash
+research branch was not separately merged. Exact research, ADR-0043, and
+current ADR-0041/0042 blobs, the index lineage warning, ownership split, crash
 cuts, and Blacksmith evidence controls all passed assembled assertions.
 
 Relative links, the five contracts, Seeds output/doctor, pinned `verify:fast`,

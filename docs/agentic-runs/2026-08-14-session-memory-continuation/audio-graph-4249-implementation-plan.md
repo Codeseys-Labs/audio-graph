@@ -2,7 +2,7 @@
 
 Date: 2026-08-14
 
-Accepted decisions: ADR-0035 and ADR-0036
+Accepted decisions: ADR-0041 and ADR-0042
 
 Planning base: `142492261ecca4539d457bed0c3578869e75dd1f`
 

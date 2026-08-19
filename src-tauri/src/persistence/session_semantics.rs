@@ -241,7 +241,7 @@ pub enum SessionSemanticsAdmissionError {
 /// The outcome never leaves this function: no boolean, receipt, head re-read, or
 /// caller-asserted success crosses the boundary, so no caller can synthesise the
 /// evidence [`admitted_session_semantics_floor`] classifies. That is the
-/// structural form of ADR-0038 §6's requirement that logical admission consume
+/// structural form of ADR-0044 §6's requirement that logical admission consume
 /// the actual `ManifestCasOutcome`.
 ///
 /// This has no production caller at this base: activating a v2 writer is out of
@@ -337,7 +337,7 @@ pub enum GuardedSessionOpenError<E> {
     ControlPlaneStore(ManifestStoreError),
     ControlPlaneObservation(SessionControlPlaneObservationError),
     /// A control identity was observed immediately before the unguarded content
-    /// snapshot was built, or immediately before it escaped. ADR-0038 §5 requires
+    /// snapshot was built, or immediately before it escaped. ADR-0044 §5 requires
     /// a typed refusal here rather than v1.
     ControlPlaneAppearedDuringUnguardedRead,
     ContentReader(E),
@@ -391,13 +391,13 @@ impl<E: fmt::Display> fmt::Display for GuardedSessionOpenError<E> {
 /// On a namespace-mutating platform this READ MAY CREATE the store-owned
 /// `.audio-graph-canonical.lock`: `SessionArtifactManifestStore::checked_read`
 /// establishes the coordination entry when it is missing, by taking and dropping
-/// an exclusive guard before re-acquiring a shared one. That is ADR-0038 §5's
+/// an exclusive guard before re-acquiring a shared one. That is ADR-0044 §5's
 /// qualified branch, and it is the only namespace mutation any path in this
 /// function can perform.
 ///
 /// An `UncoordinatedAbsence` — reachable only on the unqualified read-only
 /// branch, where nothing at all exists — is admitted as `V1` through the
-/// pre/post absence sandwich ADR-0038 §5 mandates, never from a single unlocked
+/// pre/post absence sandwich ADR-0044 §5 mandates, never from a single unlocked
 /// look.
 pub fn guarded_session_open<T, E>(
     store: &SessionArtifactManifestStore,
@@ -478,7 +478,7 @@ pub fn guarded_session_open<T, E>(
 }
 
 /// Admit `V1` from observed absence on a path where no guard can be held, with
-/// the exact pre/post re-validation ADR-0038 §5 requires of that branch: the
+/// the exact pre/post re-validation ADR-0044 §5 requires of that branch: the
 /// content snapshot is built without releasing bytes to the caller, both the
 /// Session identities and the store-owned coordination identity are checked
 /// again immediately before the snapshot escapes, and any appearance returns a
@@ -506,7 +506,7 @@ fn unguarded_absence_admission<T, E>(
     Ok(snapshot)
 }
 
-/// Open one Session for a content read, choosing the ADR-0038 §5 branch from the
+/// Open one Session for a content read, choosing the ADR-0044 §5 branch from the
 /// control-plane state that actually exists at this root.
 ///
 /// With no control plane at all — every Session at this base — this constructs no
@@ -515,7 +515,7 @@ fn unguarded_absence_admission<T, E>(
 /// having no control plane check at all.
 ///
 /// CONSTRAINT the code cannot show: the branch choice itself is made from an
-/// unlocked observation, which ADR-0038 §5 fixes by capability rather than by
+/// unlocked observation, which ADR-0044 §5 fixes by capability rather than by
 /// observation. It is admissible only while nothing can create a control plane
 /// or a v2 artifact concurrently: at this base
 /// `ManifestWriteTransaction::advance_session_semantics_v1_to_v2` has no caller
@@ -549,7 +549,7 @@ pub fn open_session_for_content<T, E>(
     match SessionArtifactManifestStore::qualified_existing_session(data_root, session_id) {
         Ok(store) => guarded_session_open(&store, maximum_supported, content_reader),
         // The production namespace policy makes manifest mutation unavailable on
-        // this platform, which is exactly ADR-0038 §5's read-only branch.
+        // this platform, which is exactly ADR-0044 §5's read-only branch.
         Err(ManifestStoreError::Qualification(
             CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { .. },
         )) => {
@@ -564,7 +564,7 @@ pub fn open_session_for_content<T, E>(
 }
 
 // ---------------------------------------------------------------------------
-// Session-owned control-plane surface (ADR-0038 §3).
+// Session-owned control-plane surface (ADR-0044 §3).
 // ---------------------------------------------------------------------------
 
 /// The three Session-OWNED control paths.
@@ -675,7 +675,7 @@ fn any_control_entry_present(
 }
 
 // ---------------------------------------------------------------------------
-// Per-Session control-plane export (ADR-0038 §3).
+// Per-Session control-plane export (ADR-0044 §3).
 // ---------------------------------------------------------------------------
 
 /// One Session's exported control plane.
@@ -706,7 +706,7 @@ pub enum SessionControlPlaneExportError {
     /// The record is a canonical proof for a different Session than this store's
     /// address.
     ProofSessionMismatch,
-    /// A V2 manifest is present and its durable proof is absent. ADR-0038 §3: a
+    /// A V2 manifest is present and its durable proof is absent. ADR-0044 §3: a
     /// successful export contains the manifest AND an available proof, so this is
     /// never reported as a successful export with no proof.
     V2ProofMissing,
@@ -870,7 +870,7 @@ fn read_session_transition_proof(
 }
 
 // ---------------------------------------------------------------------------
-// Per-Session control-plane retirement (ADR-0038 §3 delete parity).
+// Per-Session control-plane retirement (ADR-0044 §3 delete parity).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -983,7 +983,7 @@ fn retire_qualified_control_plane(
 }
 
 // ---------------------------------------------------------------------------
-// Historical bootstrap (ADR-0038 §8).
+// Historical bootstrap (ADR-0044 §8).
 // ---------------------------------------------------------------------------
 
 /// The builder-owned managed identity for the mandatory Original Session Audio
@@ -1245,7 +1245,7 @@ pub fn historical_managed_inventory(session_id: &str) -> Vec<HistoricalInventory
 ///
 /// The candidate's floor is `V1` — `SessionArtifactManifestV1::candidate`
 /// hardcodes it and this function never raises it. Installing the candidate is a
-/// `compare_and_swap`, which STAYS UNCALLED IN PRODUCTION per ADR-0038 §11 and
+/// `compare_and_swap`, which STAYS UNCALLED IN PRODUCTION per ADR-0044 §11 and
 /// this seed's "no writer activation": nothing here writes a manifest.
 pub fn historical_session_bootstrap_candidate(
     session_id: &str,

@@ -1,21 +1,21 @@
 # Projection Basis Hash v2 Canonical Encoding
 
 Status: active companion design for accepted
-[ADR-0036](../adr/0036-version-projection-basis-hashes-by-speech-semantics.md).
+[ADR-0042](../adr/0042-version-projection-basis-hashes-by-speech-semantics.md).
 
 ## Purpose and scope
 
 This document freezes the byte-level encoder, logical-span ordering fold, and
-cross-version golden fixtures for Projection Basis transcript hash v2. ADR-0036
+cross-version golden fixtures for Projection Basis transcript hash v2. ADR-0042
 owns the architectural decision to version hashes by speech-revision semantics;
 this document owns implementation detail that does not belong in an ADR.
 
 It does not change canonical-log framing, define the projection patch schema,
 authorize a Session semantics-floor transition, or change provider
 selectability. The Session stream and downgrade decision is established in
-[ADR-0035](../adr/0035-keep-versioned-speech-revisions-in-one-canonical-stream.md).
+[ADR-0041](../adr/0041-keep-versioned-speech-revisions-in-one-canonical-stream.md).
 
-Normative words `MUST`, `MUST NOT`, and `SHOULD` apply because ADR-0036 is
+Normative words `MUST`, `MUST NOT`, and `SHOULD` apply because ADR-0042 is
 accepted.
 
 ## Session semantics floor and hash-version selection

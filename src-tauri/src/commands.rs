@@ -6889,7 +6889,7 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
 }
 
 /// Read one past Session's transcript through the guarded compatibility-floor
-/// admission seam (ADR-0038 §5, seed audio-graph-e8e7).
+/// admission seam (ADR-0044 §5, seed audio-graph-e8e7).
 ///
 /// This is the shared canonical-versus-legacy fork for `load_session_impl`,
 /// `load_session_transcript`, and `session_export_bundle`, so gating it gates the

@@ -194,7 +194,7 @@ separate function, `refuse_reserved_control_identities`, called later in
 
 **No production caller and no CAS.** The bootstrap returns a candidate.
 Installing it is a `compare_and_swap`, which **stays uncalled in production** per
-ADR-0038 section 11 and this seed's "no writer activation".
+ADR-0044 section 11 and this seed's "no writer activation".
 
 ### (2) Guard-owned `checked_session_open` before canonical OR legacy reads
 
@@ -214,7 +214,7 @@ notes/graph and live-assist streams *outside* the closure, and two whole command
 `load_transcript_event_stream` with no floor check at all. Wiring them is outside
 this seed's narrow-caller scope; residual **R8** carries them with an owner.
 
-Both unguarded `V1` admissions carry the ADR-0038 section-5 pre/post absence
+Both unguarded `V1` admissions carry the ADR-0044 section-5 pre/post absence
 sandwich in `unguarded_absence_admission`: all three Session identities plus the
 store-owned coordination identity are re-observed after the reader runs and before
 its value escapes, and any appearance is
@@ -609,7 +609,7 @@ posture for each.
 
 | # | Edit | Consequence if refused |
 | --- | --- | --- |
-| A1 | `ArtifactUnavailableReason::HistoricalUnknown` appended in `session_artifact_manifest.rs`, on ADR-0038 section 8's explicit instruction | **STOP on acceptance (1).** No substitution of `NeverCaptured`/`Inaccessible`; no omission of the entry. |
+| A1 | `ArtifactUnavailableReason::HistoricalUnknown` appended in `session_artifact_manifest.rs`, on ADR-0044 section 8's explicit instruction | **STOP on acceptance (1).** No substitution of `NeverCaptured`/`Inaccessible`; no omission of the entry. |
 | A2 | New public `SessionArtifactManifestStore::retire_owned_control_plane`, plus `addressed_control_identities`, `session_control_identities_for`, a `pub` on the already-existing proof-size ceiling, and one new recovery-key domain — all in one appended, clearly separated block | **STOP on acceptance (4)'s delete leg.** Inventory, export, and recovery parity still ship. Do NOT fall back to raw-unlink retirement. |
 | A3 | One sentence of `unlink_canonical_entry`'s TRUST BOUNDARY rustdoc in `canonical_durability.rs`, which asserted it had exactly one production caller | Refuse A2 too; they stand or fall together. |
 
@@ -639,7 +639,7 @@ and rustdoc precision in `session_artifact_manifest.rs` and
 
 | # | Residual | Owner |
 | --- | --- | --- |
-| R1 | **The `open_session_for_content` branch choice is made from an unlocked observation.** ADR-0038 section 5 fixes the branch by capability, not by observation. The floor itself is always admitted either under the shared guard or through the pre/post sandwich, so no unlocked look is an admitted floor — but the choice of branch is one. It is admissible only while nothing can concurrently create a control plane or a v2 artifact: at this base `advance_session_semantics_v1_to_v2` has no caller and `validate_artifact_semantics` has none outside its own module. A code comment on `open_session_for_content` states the constraint and names `guarded_session_open` as the single-call-site replacement. It is described as race-safe nowhere. **This is an explicit ADR-deviation decision for the human reviewer.** | whichever seed activates a v2 writer or a v2 artifact reader |
+| R1 | **The `open_session_for_content` branch choice is made from an unlocked observation.** ADR-0044 section 5 fixes the branch by capability, not by observation. The floor itself is always admitted either under the shared guard or through the pre/post sandwich, so no unlocked look is an admitted floor — but the choice of branch is one. It is admissible only while nothing can concurrently create a control plane or a v2 artifact: at this base `advance_session_semantics_v1_to_v2` has no caller and `validate_artifact_semantics` has none outside its own module. A code comment on `open_session_for_content` states the constraint and names `guarded_session_open` as the single-call-site replacement. It is described as race-safe nowhere. **This is an explicit ADR-deviation decision for the human reviewer.** | whichever seed activates a v2 writer or a v2 artifact reader |
 | R2 | **A data root carried onto a filesystem the substrate cannot qualify, WITH control residue present, becomes undeletable.** `retire_owned_control_plane` needs a qualified exclusive guard for a durable unlink; without one it reports `Residual`, and `permanently_delete_session` returns `Err` with the index entry preserved and no retry that can succeed at that root. Production cannot create that residue there — the only writer is `begin_write`, which needs the same qualification — so it requires a copied root. The fail-closed direction was chosen over a non-durable removal, whose resurrection of a manifest head would make it assert `Present` for artifacts `remove_artifact_paths` had already destroyed. | the platform-probe / filesystem-policy workstream |
 | R3 | **The same root, WITH control residue, now refuses the READ** instead of admitting historical v1. `load_session` errors. Known user-visible consequence, fail-closed, documented in `plan.md` section 3.2. With no residue — every host today — behaviour is unchanged. | same as R2 |
 | R4 | ~~**`validate_managed_identity` still does not reserve per-Session control identities.**~~ **CLOSED at `098a674`**, on the maintainer's 2026-08-19 decision to lift the scope fence that made it partial by construction. The reservation is now enforced at the manifest validator — `refuse_reserved_control_identities`, called from `validate_and_normalize` — which covers the generic `compare_and_swap` path, the transition path, `SessionArtifactManifestV1::candidate`, and the load path, and refuses this Session's manifest, temporary, and provenance identities plus `sessions.json` as `ReservedSessionControlIdentity`. `validate_managed_identity` and `is_internal_identity` were deliberately **not** changed and keep their exact prior meanings; the store-owned coordination lock is still refused by them, as `ReservedInternalIdentity`. Section 3.(4) records the enforcement point, the reserved set, the V2 provenance exemption, and the one disclosed reclassification. Two narrower residuals survive it, R10 and R11. | closed |

@@ -36,7 +36,7 @@ copies: `canonical_log.rs` is 123,489 bytes, `canonical_reader.rs` is 23,419
 bytes, the worker report is 12,440 bytes, and the assembled touched source
 files range from 13,064 to 663,499 bytes. A post-merge semantic invariant also
 proved one canonical-log module declaration, one canonical-reader module
-declaration, and all four ADR-0037 registry identifiers:
+declaration, and all four ADR-0043 registry identifiers:
 `transcript_revisions`, `speaker_revisions`, `projection_patches`, and
 `data_movement_events`.
 

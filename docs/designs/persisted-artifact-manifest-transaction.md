@@ -12,7 +12,7 @@ Prototype branch: `prototype/audio-graph-661f-manifest-model-wave7b`
 Corrected prototype tip: `88849b89cea3aaf476ffcf5fdd98029a4f095822`
 
 Governing decisions: [ADR-0027](../adr/0027-file-canonical-durable-session-store.md)
-and [ADR-0037](../adr/0037-freeze-canonical-event-stream-registry.md)
+and [ADR-0043](../adr/0043-freeze-canonical-event-stream-registry.md)
 
 Platform boundary: [canonical directory durability research](../research/canonical-directory-durability-2026-08-14.md)
 and the [Wave 7B plan](../agentic-runs/2026-08-14-session-memory-continuation/audio-graph-8e73-wave7b-plan.md)
@@ -33,7 +33,7 @@ namespace barrier completes before that manifest transition returns
 `Accepted`.
 
 This selection does not add a fifth canonical stream and therefore does not
-trigger ADR-0037 backflow. Selecting either log candidate would require a new
+trigger ADR-0043 backflow. Selecting either log candidate would require a new
 ADR and registry update before implementation.
 
 ## Question and evidence
@@ -237,7 +237,7 @@ writes, auxiliary view writes, namespace replacements, distinct restart-skew
 domains, torn-tail handling, and replay. It is a design-complexity comparison,
 not a performance benchmark.
 
-| Candidate | Authority | Manifest writes | Namespace replacements | Additional recovery | ADR-0037 | Score |
+| Candidate | Authority | Manifest writes | Namespace replacements | Additional recovery | ADR-0043 | Score |
 | --- | --- | ---: | ---: | --- | --- | ---: |
 | Versioned atomic snapshot + generation CAS | one current snapshot | 2 | 2 | old/new head plus replacement temp; no replay | no backflow | **6** |
 | Append-only manifest log | one new event stream | 2 | 0 after creation | torn-tail quarantine and replay | new fifth stream; stop/backflow required | 7 |
@@ -247,7 +247,7 @@ The log's lower steady-state namespace replacement count does not offset its
 new canonical event domain, framing/torn-tail protocol, replay, and migration
 surface. The hybrid retains all log costs and adds a second physical structure
 whose lag must be detected and repaired. The snapshot wins the comparison even
-before applying the ADR-0037 stop rule.
+before applying the ADR-0043 stop rule.
 
 ## Production handoff and non-goals
 
