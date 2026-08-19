@@ -405,10 +405,15 @@ pub fn purge_expired_sessions_excluding(
     let mut residual_failures = Vec::new();
     for (session_id, paths) in candidates {
         let report = remove_artifact_paths(&session_id, &paths);
-        if report.failed_files.is_empty() {
+        if !report.failed_files.is_empty() {
+            residual_failures.extend(report.failed_files);
+            continue;
+        }
+        let control_failures = retire_session_control_plane_residue(&session_id);
+        if control_failures.is_empty() {
             purged.push(session_id);
         } else {
-            residual_failures.extend(report.failed_files);
+            residual_failures.extend(control_failures);
         }
     }
 
@@ -710,6 +715,41 @@ fn remove_artifact_paths(
     report
 }
 
+/// Retire one Session's three OWNED control-plane entries, returning the
+/// residual rows that must keep the index entry durable for a retry.
+///
+/// ADR-0038 §3 makes per-Session control lifecycle a separate authority from the
+/// manifest's managed artifact inventory, which is why these three identities are
+/// deliberately NOT members of [`default_session_artifact_paths`] and not
+/// members of [`remove_artifact_paths`]'s allow-list. The store-owned
+/// `.audio-graph-canonical.lock` is unrepresentable in the type the retirement
+/// derives, and another Session's entries are unreachable from this Session's
+/// validated address.
+///
+/// With no control residue — every Session at this base, because the only writer
+/// is the dormant manifest kernel — this performs three `symlink_metadata` calls
+/// and returns no rows, so delete and purge behave exactly as before.
+fn retire_session_control_plane_residue(session_id: &str) -> Vec<String> {
+    use crate::persistence::session_semantics::{
+        SessionControlPlaneRetirement, retire_session_control_plane,
+    };
+
+    let root = match crate::user_data::resolve_data_root() {
+        Ok(root) => root,
+        Err(error) => {
+            return vec![format!(
+                "session control plane for {session_id}: data root unresolved: {error}"
+            )];
+        }
+    };
+    match retire_session_control_plane(&root, session_id) {
+        SessionControlPlaneRetirement::Nothing | SessionControlPlaneRetirement::Retired => {
+            Vec::new()
+        }
+        SessionControlPlaneRetirement::Residual { failures } => failures,
+    }
+}
+
 /// Permanently delete one session using the same retry-safe ordering as
 /// retention purge: remove the complete managed artifact inventory first and
 /// publish the index removal only after every unlink succeeds or is already
@@ -735,10 +775,18 @@ pub fn permanently_delete_session(
         .map(session_artifact_paths)
         .unwrap_or_else(|| default_session_artifact_paths(session_id));
     let report = remove_artifact_paths(session_id, &artifact_paths);
-    if !report.failed_files.is_empty() {
+    // Content inventory first, then the Session-owned control plane, then the
+    // index entry. Control retirement is attempted only once every content
+    // unlink succeeded, so a content residual can never leave this Session's
+    // manifest head removed while the artifacts it classifies survive.
+    let mut residual_failures = report.failed_files.clone();
+    if residual_failures.is_empty() {
+        residual_failures.extend(retire_session_control_plane_residue(session_id));
+    }
+    if !residual_failures.is_empty() {
         return Err(format!(
             "session deletion incomplete for {session_id}; residual artifacts remain and the index entry was preserved for retry: {}",
-            report.failed_files.join("; ")
+            residual_failures.join("; ")
         ));
     }
 
@@ -2213,6 +2261,136 @@ mod tests {
             Some(0),
             "backwards-clock duration must saturate to 0, not wrap"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- audio-graph-e8e7: per-Session control-plane parity -----------------
+
+    /// The historical bootstrap inventory is exactly the live artifact inventory
+    /// minus its interrupted-write `*.json.tmp` sidecars, which have no kind in
+    /// the manifest wire vocabulary. If either side drifts this fails.
+    #[test]
+    fn bootstrap_inventory_matches_the_live_session_artifact_inventory() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("bootstrap-inventory-parity");
+        let _g = HomeGuard::set(&dir);
+        let session_id = "bootstrap-parity";
+
+        let root = crate::user_data::data_root().expect("data root");
+        let live = default_session_artifact_paths(session_id)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let bootstrap =
+            crate::persistence::session_semantics::historical_managed_inventory(session_id)
+                .into_iter()
+                .map(|entry| root.join(entry.managed_identity))
+                .collect::<HashSet<_>>();
+
+        assert!(
+            bootstrap.is_subset(&live),
+            "every bootstrap identity must be a live managed artifact path"
+        );
+        let uncovered = live
+            .difference(&bootstrap)
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            uncovered.len(),
+            6,
+            "only the six interrupted-write sidecars may be uncovered: {uncovered:?}"
+        );
+        assert!(
+            uncovered.iter().all(|path| path.ends_with(".json.tmp")),
+            "the uncovered paths must all be `*.json.tmp` sidecars: {uncovered:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control residue alone must not resurrect or rename a Session: the recovery
+    /// scan reads only the artifact subdirectories, never the flat root.
+    #[test]
+    fn recovery_scan_ignores_session_control_residue() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("recovery-ignores-control-residue");
+        let _g = HomeGuard::set(&dir);
+        let session_id = "control-residue-only";
+
+        let root = crate::user_data::data_root().expect("data root");
+        let paths =
+            crate::persistence::session_semantics::session_control_plane_paths(&root, session_id)
+                .expect("control paths");
+        for path in paths.all() {
+            write_artifact(path, b"control residue");
+        }
+        let lock =
+            crate::persistence::session_semantics::store_coordination_path(&root, session_id)
+                .expect("coordination path");
+        write_artifact(&lock, b"");
+
+        let report = rebuild_index_from_files().expect("rebuild");
+        assert_eq!(report.discovered, 0, "control residue is not a candidate");
+        assert_eq!(report.recovered, 0);
+        assert!(find_session(session_id).is_none());
+        for path in paths.all() {
+            assert!(path.exists(), "the recovery scan removed nothing: {path:?}");
+        }
+        assert!(lock.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Delete residual/retry parity for the control plane.
+    ///
+    /// The obstruction is a NON-REGULAR entry at the manifest control identity,
+    /// which is host-independent: on a root the substrate qualifies, the durable
+    /// unlink refuses `NonRegularCanonicalEntry`; on a root it cannot qualify,
+    /// retirement has no durable removal path at all. Both are `Residual`, so
+    /// this test asserts the same contract on every host. The durable-removal
+    /// half is asserted against a test-qualified store in
+    /// `persistence::session_semantics::guarded_admission_tests`.
+    #[test]
+    fn permanent_delete_preserves_the_index_on_control_plane_residue() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("delete-control-residue");
+        let _g = HomeGuard::set(&dir);
+        let session_id = "delete-control-residue";
+
+        let mut entry = make_meta(session_id);
+        entry.deleted = true;
+        save_index(&[entry]).expect("seed index");
+        let root = crate::user_data::data_root().expect("data root");
+        let paths =
+            crate::persistence::session_semantics::session_control_plane_paths(&root, session_id)
+                .expect("control paths");
+        fs::create_dir_all(&paths.manifest).expect("non-regular control residue");
+
+        let refused = permanently_delete_session(session_id)
+            .expect_err("control residue that cannot be retired must refuse the delete");
+        assert!(
+            refused.contains("index entry was preserved for retry"),
+            "the refusal must keep the documented retry contract: {refused}"
+        );
+        assert!(
+            find_session(session_id).is_some(),
+            "the index entry survives for a retry"
+        );
+        assert!(
+            paths.manifest.exists(),
+            "a refused retirement removes nothing"
+        );
+
+        // Obstruction cleared: the retry converges and publishes the index removal.
+        fs::remove_dir(&paths.manifest).expect("clear the residue");
+        permanently_delete_session(session_id).expect("retry after the obstruction clears");
+        assert!(find_session(session_id).is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

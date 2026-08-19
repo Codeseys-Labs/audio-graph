@@ -27,7 +27,7 @@ use super::canonical_durability::{
     CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSnapshotExpectation,
     CanonicalUnlinkOutcome,
 };
-use super::session_semantics::SessionSemanticsVersion;
+use super::session_semantics::{SESSIONS_INDEX_IDENTITY, SessionSemanticsVersion};
 
 pub const SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_SEMANTICS_TRANSITION_PROOF_SCHEMA_VERSION: u32 = 1;
@@ -147,6 +147,9 @@ pub enum ArtifactUnavailableReason {
     Expired,
     DeletedByUser,
     Inaccessible,
+    /// Historical bootstrap observed no bytes at this identity and has no
+    /// evidence of why. It never infers retention, capture, expiry, or deletion.
+    HistoricalUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,11 +473,37 @@ pub enum V2ProvenanceProofBindingError {
     ProvenanceContentMismatch,
 }
 
+/// Which reserved control identity an ordinary inventory entry collided with.
+///
+/// The store-owned coordination lock has no member here on purpose: it is one of
+/// the three root-wide constants `is_internal_identity` already compares, so
+/// `validate_managed_identity` refuses it as `ReservedInternalIdentity` earlier
+/// in the same loop, and a member here would be unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedControlIdentity {
+    /// This Session's manifest head.
+    SessionManifest,
+    /// This Session's staging temporary.
+    SessionTemporary,
+    /// This Session's durable v1-to-v2 transition proof, named by anything other
+    /// than the exact `SessionProvenanceEvents` entry the module itself installs
+    /// there on a V2 manifest.
+    SessionProvenance,
+    /// The flat-root Session index.
+    SessionIndex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
-    UnsupportedSchema { actual: u32 },
-    UnsupportedSessionSemanticsVersion { actual: u32 },
-    InvalidGeneration { actual: u64 },
+    UnsupportedSchema {
+        actual: u32,
+    },
+    UnsupportedSessionSemanticsVersion {
+        actual: u32,
+    },
+    InvalidGeneration {
+        actual: u64,
+    },
     EmptySessionId,
     InvalidSessionId,
     EmptyIdempotencyId,
@@ -484,6 +513,10 @@ pub enum ManifestValidationError {
     PreparedWithoutQuarantine,
     InvalidManagedIdentity,
     ReservedInternalIdentity,
+    /// An ordinary inventory entry named a control identity this module or the
+    /// Session index owns. Distinct from `ReservedInternalIdentity`, which keeps
+    /// its exact meaning: the three root-wide constants.
+    ReservedSessionControlIdentity(ReservedControlIdentity),
     CaseEquivalentManagedIdentity,
     MissingOriginalSessionAudio,
     DuplicateOriginalSessionAudio,
@@ -2143,6 +2176,11 @@ fn validate_and_normalize(
         1 => {}
         _ => return Err(ManifestValidationError::DuplicateOriginalSessionAudio),
     }
+    // The last identity-level gate: placed here so it wins over the coarser
+    // quarantine-shape mismatches below. It runs before `artifacts.sort_by`, so
+    // it sees the caller's wire order — which is why it classifies by fixed
+    // class precedence rather than by first match.
+    refuse_reserved_control_identities(manifest)?;
     if let Some(transaction) = &manifest.quarantine_transaction {
         validate_quarantine_transaction(manifest, transaction)?;
     }
@@ -2152,6 +2190,128 @@ fn validate_and_normalize(
             .then_with(|| left.kind.cmp(&right.kind))
     });
     Ok(())
+}
+
+/// Reserve this Session's own control identities, and the flat-root Session
+/// index, against an ordinary inventory entry.
+///
+/// This is the closure of audio-graph-e8e7's residual R4, which carried
+/// audio-graph-3b53 finding B2's reservation leg. `refuse_reserved_observed_identity`
+/// established the reservation at the historical bootstrap builder only; that
+/// builder is not on the write path, so a writer going through
+/// `compare_and_swap` could still record a control identity as an ordinary
+/// artifact.
+///
+/// `validate_and_normalize` is the honest enforcement point, and the check is
+/// deliberately CONTEXT-INDEPENDENT. `prepare_compare_and_swap` validates every
+/// candidate and re-validates the generation-stamped result,
+/// `advance_session_semantics_v1_to_v2_inner` validates directly, and
+/// `load_manifest_file_with_after_open` validates every head that is read, so
+/// one check here covers the generic write path, the transition path, and the
+/// load path. Reserving only in `ManifestValidationContext::Candidate` would
+/// leave an advanced V2 head unloadable, because that head legitimately carries
+/// its provenance entry at the control identity.
+///
+/// `validate_managed_identity` is NOT the point. `is_internal_identity` compares
+/// only the three root-wide constants, and tightening
+/// `ManagedArtifactIdentity::new` would refuse the very identities
+/// `session_control_address` derives for its own callers. The store-owned
+/// coordination lock therefore needs no arm here: it is one of those three
+/// constants, so `validate_managed_identity` already refuses it as
+/// `ReservedInternalIdentity` earlier in the same loop, including on a
+/// deserialized entry that bypassed `new`.
+///
+/// Matching is ASCII-case-insensitive, like every other identity reservation in
+/// this crate — `is_internal_identity`, the `CaseEquivalentManagedIdentity` fold
+/// in `validate_and_normalize`, and
+/// `canonical_log::validate_recovery_identity_reservations` — because a
+/// case-variant spelling names the same file on a case-insensitive filesystem.
+///
+/// One exemption, and it is required rather than a convenience: a V2 manifest's
+/// `SessionProvenanceEvents` entry at EXACTLY the provenance identity.
+/// `advance_session_semantics_v1_to_v2_inner` overwrites that entry's identity
+/// with the store-derived one before it validates, and
+/// `bind_v2_provenance_to_durable_proof` then demands the same identity on every
+/// later generation of an advanced Session, so the entry must keep passing for
+/// the whole life of that Session. Three things narrow the exemption:
+/// the module's own kind label; the V2 floor, at which point
+/// `validate_v2_session_provenance` has already run in this same function and
+/// proved the entry unique, `CanonicalSessionMemory`, `Present`, and bound to the
+/// transition fingerprint (a V1 floor proves none of that, so the label there is
+/// unproven and is not trusted); and exact equality rather than case
+/// equivalence, which is the same carve-out shape
+/// `validate_recovery_identity_reservations` uses for its retry quarantine.
+///
+/// The reservation is against THIS Session's identities only, derived from
+/// `manifest.session_id`. Another Session's control identity remains admissible
+/// here; the bootstrap builder refuses it as
+/// `IdentityOutsideManagedArtifactTree`, and closing it at the validator would
+/// need a prefix-based ban carrying this same exemption.
+fn refuse_reserved_control_identities(
+    manifest: &SessionArtifactManifestV1,
+) -> Result<(), ManifestValidationError> {
+    // `Err` means the id is not addressable at all, so no per-Session control
+    // entry can exist for it: `for_session` and `qualified_existing_session`
+    // refuse such an id before a store exists. Not a hole — the root-wide names
+    // are refused by `validate_managed_identity` and the index name below is
+    // address-independent.
+    let control = session_control_address(&manifest.session_id).ok();
+    let proven_v2 = manifest.session_semantics_version == SessionSemanticsVersion::V2;
+    // Every match is collected and the reported class is chosen by the fixed
+    // precedence below, NOT by which entry the wire happened to list first. An
+    // early return on first match would make an inventory naming two reserved
+    // identities report a different error for the same content depending on
+    // entry order, and this scan runs before `artifacts.sort_by`, so that order
+    // is entirely the caller's.
+    // Stated as an explicit rank rather than an `Ord` derive so the precedence is
+    // a decision in this function, not an accident of declaration order: the two
+    // identities a write would actually collide with outrank the proof, which
+    // outranks the store-wide index.
+    const fn rank(class: ReservedControlIdentity) -> u8 {
+        match class {
+            ReservedControlIdentity::SessionManifest => 0,
+            ReservedControlIdentity::SessionTemporary => 1,
+            ReservedControlIdentity::SessionProvenance => 2,
+            ReservedControlIdentity::SessionIndex => 3,
+        }
+    }
+    let mut matched: Option<ReservedControlIdentity> = None;
+    let mut record = |class: ReservedControlIdentity| {
+        if matched.is_none_or(|current| rank(class) < rank(current)) {
+            matched = Some(class);
+        }
+    };
+    for artifact in &manifest.artifacts {
+        let identity = &artifact.managed_identity;
+        if identity
+            .as_str()
+            .eq_ignore_ascii_case(SESSIONS_INDEX_IDENTITY)
+        {
+            record(ReservedControlIdentity::SessionIndex);
+        }
+        let Some(reserved) = control.as_ref().map(|address| &address.identities) else {
+            continue;
+        };
+        if identity.ascii_case_equivalent(&reserved.manifest) {
+            record(ReservedControlIdentity::SessionManifest);
+        }
+        if identity.ascii_case_equivalent(&reserved.temporary) {
+            record(ReservedControlIdentity::SessionTemporary);
+        }
+        if identity.ascii_case_equivalent(&reserved.provenance)
+            && !(proven_v2
+                && artifact.kind == SessionArtifactKind::SessionProvenanceEvents
+                && *identity == reserved.provenance)
+        {
+            record(ReservedControlIdentity::SessionProvenance);
+        }
+    }
+    match matched {
+        Some(class) => Err(ManifestValidationError::ReservedSessionControlIdentity(
+            class,
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The exact pieces of a validated V2 provenance entry that
@@ -2211,7 +2371,7 @@ pub(crate) fn validate_v2_session_provenance(
 /// capped at 255 bytes and, because their validators refuse control characters
 /// and `\`, JSON escaping can at most double them (`"` to `\"`): 118 + 2 * 2 *
 /// 255 = 1138 bytes is the true ceiling. 4096 is the rounded bound.
-const MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES: u64 = 4096;
+pub const MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES: u64 = 4096;
 
 /// Tie a V2 candidate's validated `SessionProvenanceEvents` entry to this
 /// Session's durable v1-to-v2 transition-proof record.
@@ -2595,6 +2755,194 @@ fn encode_lowercase_base32(bytes: &[u8]) -> String {
         encoded.push(char::from(ALPHABET[index]));
     }
     encoded
+}
+
+// ---------------------------------------------------------------------------
+// audio-graph-e8e7: per-Session control-plane addressing and durable retirement.
+//
+// Appended as one separated block so it touches no existing rustdoc block,
+// item, or test in this module. It adds no CAS, validation, gate, or
+// classification behaviour: every function here either re-exports an already
+// derived address or composes the durability substrate's existing primitives.
+// ---------------------------------------------------------------------------
+
+/// Derive one Session's control identities without a store, a root, or any I/O.
+///
+/// This is the addressing seam for per-Session inventory, export, recovery, and
+/// delete parity. It is the same derivation `for_session` performs, so the
+/// Base32 control key is never computed a second time, and
+/// `sessions::session_id_is_valid` still refuses an ineligible id before any
+/// identity is produced.
+///
+/// The returned bundle carries the store-owned coordination identity alongside
+/// the three Session-owned ones. A Session-lifecycle consumer must not iterate
+/// it; `session_semantics::session_control_plane_paths` is the projection that
+/// cannot express the lock at all.
+pub fn session_control_identities_for(
+    session_id: &str,
+) -> Result<SessionControlIdentities, ManifestStoreError> {
+    Ok(session_control_address(session_id)?.identities)
+}
+
+/// Domain separator so a retirement key can never equal a candidate-fingerprint
+/// key or a temporary-abandon key for any input.
+const CONTROL_PLANE_RETIREMENT_KEY_DOMAIN: &[u8] =
+    b"audio-graph/session-control-plane-retirement/v1\0";
+
+/// Recovery key for one retirement unlink of one derived Session control entry.
+///
+/// Keyed on the entry's own pathname, exactly like
+/// `temporary_abandon_recovery_key`, and with the same consequence: the root is
+/// taken verbatim from the caller and is not canonicalized, so two spellings of
+/// one root derive different keys for the same logical unlink. A caller that
+/// matches outcome keys across a restart must reconcile through a store built
+/// from the same spelling.
+fn control_plane_retirement_recovery_key(path: &Path) -> CanonicalRecoveryKey {
+    let mut hasher = Sha256::new();
+    hasher.update(CONTROL_PLANE_RETIREMENT_KEY_DOMAIN);
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    CanonicalRecoveryKey::from_opaque_bytes(bytes)
+}
+
+/// Per-entry evidence from one control-plane retirement, in the order the
+/// retirement performs it.
+///
+/// `None` means the step was NOT attempted because an earlier step in the fixed
+/// order did not reach durable absence. It never means "already gone".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionControlPlaneRetirementReport {
+    pub temporary: CanonicalUnlinkOutcome,
+    pub manifest: Option<CanonicalUnlinkOutcome>,
+    pub provenance: Option<CanonicalUnlinkOutcome>,
+}
+
+impl SessionControlPlaneRetirementReport {
+    /// Every attempted step reached durable absence.
+    pub fn is_complete(&self) -> bool {
+        [Some(self.temporary), self.manifest, self.provenance]
+            .into_iter()
+            .all(|outcome| {
+                matches!(
+                    outcome,
+                    Some(
+                        CanonicalUnlinkOutcome::Unlinked(_)
+                            | CanonicalUnlinkOutcome::AlreadyAbsent(_)
+                    )
+                )
+            })
+    }
+}
+
+fn reached_absence(outcome: CanonicalUnlinkOutcome) -> bool {
+    matches!(
+        outcome,
+        CanonicalUnlinkOutcome::Unlinked(_) | CanonicalUnlinkOutcome::AlreadyAbsent(_)
+    )
+}
+
+impl SessionArtifactManifestStore {
+    /// The Session-owned control identities, or `None` for a store with no
+    /// Session address.
+    ///
+    /// Non-panicking peer of `control_identities`, which a consumer that may
+    /// hold an unaddressed store cannot call.
+    pub fn addressed_control_identities(&self) -> Option<&SessionControlIdentities> {
+        self.address.as_ref().map(|address| &address.identities)
+    }
+
+    /// Durably retire exactly this Session's three OWNED control entries.
+    ///
+    /// The store-owned `.audio-graph-canonical.lock` is not among them and
+    /// cannot become one: it is not derived here, and the substrate's unlink
+    /// primitive independently refuses the coordination name under every
+    /// ASCII-case spelling. Another Session's entries are equally unreachable —
+    /// every pathname is derived from THIS store's validated address.
+    ///
+    /// This deliberately does NOT go through `begin_write`. That constructor
+    /// re-loads and re-validates the manifest head, so a truncated head, or one
+    /// whose `session_id` does not match the derived identity, would refuse with
+    /// `ManifestStoreError::Load` on every retry and leave the Session
+    /// permanently undeletable. Retirement needs no head: its authorization is
+    /// the exclusive guard plus the three derived identities. It therefore also
+    /// reads nothing, classifies nothing about manifest content, and reports no
+    /// floor.
+    ///
+    /// Fixed order — temporary, then manifest head, then provenance proof —
+    /// stopping at the first step that does not reach durable absence, so the
+    /// only crash intermediate that survives a head removal is an orphan
+    /// immutable proof with no head. The reverse order would leave a V2 head
+    /// whose durable proof is absent, which every later compare-and-swap refuses
+    /// as `DurableProofAbsent`.
+    ///
+    /// The temporary is removed by the same unlink of the same pathname under
+    /// the same recovery-key domain as
+    /// `ManifestWriteTransaction::abandon_staged_transition`, so an exact rerun
+    /// of either reconciles the other. The head and the proof use their own
+    /// domain-separated key.
+    ///
+    /// `Err` is returned only when no unlink was attempted at all: no Session
+    /// address, no namespace qualification (which includes every platform and
+    /// filesystem the substrate refuses), or a coordination failure acquiring
+    /// the exclusive guard.
+    pub fn retire_owned_control_plane(
+        &self,
+    ) -> Result<SessionControlPlaneRetirementReport, ManifestStoreError> {
+        let address = self
+            .address
+            .as_ref()
+            .ok_or(ManifestStoreError::InvalidSessionAddress)?;
+        let qualification = self
+            .qualification
+            .as_ref()
+            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
+        let guard = self
+            .durability
+            .try_lock_exclusive_qualified(&self.root, qualification)
+            .map_err(ManifestStoreError::Coordination)?;
+
+        let temporary_path = self.temporary_path();
+        let temporary = guard.unlink_canonical_entry(
+            &temporary_path,
+            self.qualification.as_ref(),
+            temporary_abandon_recovery_key(&temporary_path),
+        );
+        if !reached_absence(temporary) {
+            return Ok(SessionControlPlaneRetirementReport {
+                temporary,
+                manifest: None,
+                provenance: None,
+            });
+        }
+
+        let manifest_path = self.manifest_path();
+        let manifest = guard.unlink_canonical_entry(
+            &manifest_path,
+            self.qualification.as_ref(),
+            control_plane_retirement_recovery_key(&manifest_path),
+        );
+        if !reached_absence(manifest) {
+            return Ok(SessionControlPlaneRetirementReport {
+                temporary,
+                manifest: Some(manifest),
+                provenance: None,
+            });
+        }
+
+        let provenance_path = self.root.join(address.identities.provenance.as_str());
+        let provenance = guard.unlink_canonical_entry(
+            &provenance_path,
+            self.qualification.as_ref(),
+            control_plane_retirement_recovery_key(&provenance_path),
+        );
+        Ok(SessionControlPlaneRetirementReport {
+            temporary,
+            manifest: Some(manifest),
+            provenance: Some(provenance),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3904,13 +4252,22 @@ mod tests {
     /// shape, and re-keying the transition-proof gate did not open it.
     ///
     /// The named cause is `SessionArtifactManifestV1::candidate`, which
-    /// hardcodes `session_semantics_version: SessionSemanticsVersion::V1`; the
-    /// production quarantine candidate is built through exactly that constructor
-    /// (`canonical_log.rs` `manifest_candidate`) and reaches this CAS through
-    /// `compare_and_swap_recovery` with `proof_owned = false`. So a V1 candidate
-    /// is a floor regression, while V2 validation demands `Completed` and
-    /// quarantine prepare demands `Prepared` — the closure below. Every candidate
-    /// here carries genuine provenance, so the binding is never the cause.
+    /// hardcodes `session_semantics_version: SessionSemanticsVersion::V1`. So a
+    /// V1 candidate is a floor regression, while V2 validation demands
+    /// `Completed` and quarantine prepare demands `Prepared` — the closure below.
+    /// Every candidate here carries genuine provenance, so the binding is never
+    /// the cause.
+    ///
+    /// The candidates below are hand-built and reach this CAS directly. The
+    /// PRODUCTION rebuild (`canonical_log.rs` `manifest_candidate`, then
+    /// `compare_and_swap_recovery` with `proof_owned = false`) no longer reaches
+    /// the CAS on a V2 head at all: since the control-identity reservation landed
+    /// in `validate_and_normalize`, that rebuild inherits the V2 head's
+    /// provenance entry at the control identity into a V1-floor candidate, which
+    /// loses the exemption and is refused at construction as
+    /// `ReservedSessionControlIdentity(SessionProvenance)`. The path is closed
+    /// either way; `rebuilding_a_v1_floor_candidate_from_a_v2_head_is_refused_at_construction`
+    /// pins the earlier refusal.
     #[cfg(unix)]
     #[test]
     fn quarantine_recovery_remains_closed_on_a_v2_session() {
@@ -6473,6 +6830,338 @@ mod tests {
         assert_eq!(
             std::fs::read(&provenance_path).expect("orphaned proof survives the abandon"),
             proof_bytes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-e8e7 residual R4: the control-identity reservation at the
+    // manifest validator.
+    // -----------------------------------------------------------------------
+
+    /// An ordinary inventory entry may not name one of THIS Session's control
+    /// identities, nor the flat-root Session index.
+    ///
+    /// `validate_managed_identity` cannot close this and is deliberately left
+    /// alone: `is_internal_identity` compares only the three root-wide
+    /// constants, so every per-Session control name passes it in full. The
+    /// reservation lives in `validate_and_normalize`, the one validator that
+    /// both write paths and the load path funnel through.
+    #[test]
+    fn candidate_inventory_reserves_this_sessions_control_identities_and_the_index() {
+        let control = session_control_identities_for("session-1").expect("addressable Session");
+        for (reserved, expected) in [
+            (
+                control.manifest.clone(),
+                ReservedControlIdentity::SessionManifest,
+            ),
+            (
+                control.temporary.clone(),
+                ReservedControlIdentity::SessionTemporary,
+            ),
+            (
+                control.provenance.clone(),
+                ReservedControlIdentity::SessionProvenance,
+            ),
+            (
+                identity(SESSIONS_INDEX_IDENTITY),
+                ReservedControlIdentity::SessionIndex,
+            ),
+            // Case-variant spellings name the same file on a case-insensitive
+            // filesystem, so they are refused as the same class.
+            (
+                identity(&control.manifest.as_str().to_ascii_uppercase()),
+                ReservedControlIdentity::SessionManifest,
+            ),
+            (
+                identity(&SESSIONS_INDEX_IDENTITY.to_ascii_uppercase()),
+                ReservedControlIdentity::SessionIndex,
+            ),
+        ] {
+            let mut candidate = basic_candidate("reserve-1", 'e');
+            candidate.artifacts.push(SessionArtifactEntry {
+                kind: SessionArtifactKind::SessionMetadata,
+                privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+                managed_identity: reserved.clone(),
+                availability: ArtifactAvailability::Present {
+                    content: content('f', 12),
+                },
+            });
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedSessionControlIdentity(
+                    expected
+                )),
+                "{} must not be admissible as an ordinary artifact",
+                reserved.as_str()
+            );
+        }
+    }
+
+    /// Self-labelling an entry `SessionProvenanceEvents` does not buy the
+    /// exemption at a V1 floor, where nothing has proved the label.
+    #[test]
+    fn a_v1_candidate_cannot_claim_the_provenance_exemption_by_self_labelling() {
+        let control = session_control_identities_for("session-1").expect("addressable Session");
+        let mut candidate = basic_candidate("reserve-v1-label", 'e');
+        candidate.artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionProvenanceEvents,
+            privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+            managed_identity: control.provenance.clone(),
+            availability: ArtifactAvailability::Present {
+                content: content('e', 48),
+            },
+        });
+        assert_eq!(
+            candidate.session_semantics_version,
+            SessionSemanticsVersion::V1
+        );
+        assert_eq!(
+            validate_candidate_and_normalize(&mut candidate),
+            Err(ManifestValidationError::ReservedSessionControlIdentity(
+                ReservedControlIdentity::SessionProvenance
+            ))
+        );
+    }
+
+    /// The store-owned class is covered earlier and by a different symbol, so the
+    /// new variant is not what a coordination-lock entry reports.
+    ///
+    /// `managed_identities_enforce_the_portable_floor_and_case_equivalence`
+    /// covers `ManagedArtifactIdentity::new`; this covers the validator, which is
+    /// the path a deserialized entry takes — `#[serde(transparent)]` means
+    /// decoding never calls `new`.
+    #[test]
+    fn the_store_owned_coordination_lock_is_still_reserved_as_an_internal_identity() {
+        for spelling in [
+            COORDINATION_FILE_NAME.to_owned(),
+            COORDINATION_FILE_NAME.to_ascii_uppercase(),
+        ] {
+            let mut candidate = basic_candidate("reserve-lock-1", 'e');
+            candidate.artifacts.push(SessionArtifactEntry {
+                kind: SessionArtifactKind::SessionMetadata,
+                privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+                managed_identity: ManagedArtifactIdentity(spelling.clone()),
+                availability: ArtifactAvailability::Present {
+                    content: content('f', 12),
+                },
+            });
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedInternalIdentity),
+                "{spelling} is one of the three root-wide constants"
+            );
+        }
+    }
+
+    /// Review found the placement rationale backwards: the scan runs before
+    /// `artifacts.sort_by`, so it sees the caller's wire order, and an early
+    /// return on first match would let entry order pick the reported class. The
+    /// same content must classify the same way whichever order it arrives in.
+    #[test]
+    fn two_reserved_identities_classify_by_precedence_not_by_wire_order() {
+        // `basic_candidate`'s argument is the TRANSITION id; the session id it
+        // builds is always "session-1", which is whose control identities the
+        // validator derives.
+        let reserved = session_control_address("session-1")
+            .expect("addressable session")
+            .identities;
+        let index_entry = SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionMetadata,
+            privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+            managed_identity: ManagedArtifactIdentity(SESSIONS_INDEX_IDENTITY.to_owned()),
+            availability: ArtifactAvailability::Present {
+                content: content('f', 12),
+            },
+        };
+        let manifest_entry = SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionMetadata,
+            privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+            managed_identity: reserved.manifest.clone(),
+            availability: ArtifactAvailability::Present {
+                content: content('a', 13),
+            },
+        };
+        for (label, extra) in [
+            (
+                "index first",
+                vec![index_entry.clone(), manifest_entry.clone()],
+            ),
+            (
+                "manifest first",
+                vec![manifest_entry.clone(), index_entry.clone()],
+            ),
+        ] {
+            let mut candidate = basic_candidate("reserve-order-1", 'e');
+            candidate.artifacts.extend(extra);
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedSessionControlIdentity(
+                    ReservedControlIdentity::SessionManifest
+                )),
+                "{label}: the reported class must come from the fixed precedence, \
+                 not from whichever reserved entry the wire listed first"
+            );
+        }
+    }
+
+    /// A Session id that this module's `validate_session_id` admits but
+    /// `sessions::session_id_is_valid` refuses derives no control identities, so
+    /// the per-Session arms are skipped and the manifest still validates.
+    ///
+    /// That is not a hole: such an id cannot address a store at all, so no
+    /// per-Session control entry can exist for it. The address-independent index
+    /// name stays reserved.
+    #[test]
+    fn an_unaddressable_session_id_reserves_the_index_but_derives_no_control_identities() {
+        let unaddressable = "sess ion";
+        assert!(validate_session_id(unaddressable).is_ok());
+        assert!(!crate::sessions::session_id_is_valid(unaddressable));
+
+        let mut candidate = SessionArtifactManifestV1::candidate(
+            unaddressable,
+            transition(
+                "reserve-unaddressable",
+                'e',
+                ManifestTransitionState::Completed,
+            ),
+            vec![original_audio(ArtifactAvailability::Unavailable {
+                reason: ArtifactUnavailableReason::RetentionDisabled,
+            })],
+            None,
+        )
+        .expect("an unaddressable id is still a valid manifest session id");
+        candidate.artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionMetadata,
+            privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+            managed_identity: identity(SESSIONS_INDEX_IDENTITY),
+            availability: ArtifactAvailability::Present {
+                content: content('f', 12),
+            },
+        });
+        assert_eq!(
+            validate_candidate_and_normalize(&mut candidate),
+            Err(ManifestValidationError::ReservedSessionControlIdentity(
+                ReservedControlIdentity::SessionIndex
+            ))
+        );
+    }
+
+    /// The reservation covers the generic `compare_and_swap` path end to end,
+    /// which the direct-validator assertion above cannot show on its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_generic_cas_refuses_an_inventory_entry_at_this_sessions_manifest_identity() {
+        let root = root("cas-reserves-control-identity");
+        let store = SessionArtifactManifestStore::qualified_for_test_session(&root, "session-1")
+            .expect("qualified addressed store");
+        let reserved = store.control_identities().manifest.clone();
+        let mut candidate = basic_candidate("reserve-cas-1", 'e');
+        candidate.artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionMetadata,
+            privacy_class: ArtifactPrivacyClass::OperationalMetadata,
+            managed_identity: reserved,
+            availability: ArtifactAvailability::Present {
+                content: content('f', 12),
+            },
+        });
+        let mut transaction = store.begin_write().expect("addressed transaction");
+        assert_eq!(
+            transaction.compare_and_swap(0, candidate),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::ReservedSessionControlIdentity(
+                    ReservedControlIdentity::SessionManifest
+                )
+            ))
+        );
+        drop(transaction);
+        // The refusal is what keeps the head from being written to the very
+        // pathname the entry named.
+        assert!(!store.manifest_path().exists());
+    }
+
+    /// The legitimate case: an advanced V2 head's own provenance entry sits at
+    /// the control identity, and the reservation must keep admitting it on every
+    /// path — construction, load, and the generic `compare_and_swap`.
+    ///
+    /// If this test fails, the enforcement point or the exemption is wrong; the
+    /// entry is REQUIRED there by `bind_v2_provenance_to_durable_proof`.
+    #[cfg(unix)]
+    #[test]
+    fn advanced_v2_head_keeps_its_provenance_entry_at_the_control_identity() {
+        let (_root, store, advanced, _proof_bytes) =
+            advanced_v2_session("reservation-exempts-provenance");
+        assert_eq!(
+            provenance_entry(&advanced).managed_identity,
+            store.control_identities().provenance
+        );
+        assert!(matches!(
+            store.load().expect("load the advanced head"),
+            ManifestLoadOutcome::Present(head)
+                if provenance_entry(&head).managed_identity
+                    == store.control_identities().provenance
+        ));
+
+        let mut transaction = store.begin_write().expect("addressed transaction");
+        assert!(matches!(
+            transaction.compare_and_swap(1, later_generation(&advanced, "gen-2")),
+            ManifestCasOutcome::Accepted { manifest, .. } if manifest.generation == 2
+        ));
+
+        // The exemption is exact-equality only: a case variant of the provenance
+        // identity collides with the real durable proof on a case-insensitive
+        // filesystem, so the reservation refuses it even with the right kind and
+        // at a V2 floor. Validation runs before `refuse_unproven_v2_candidate`,
+        // so this reports the reservation rather than
+        // `V2ProvenanceProofBindingError::ProvenanceIdentityMismatch`.
+        let mut case_variant = later_generation(&advanced, "gen-3");
+        let entry = provenance_entry_mut(&mut case_variant);
+        entry.managed_identity =
+            ManagedArtifactIdentity(entry.managed_identity.as_str().to_ascii_uppercase());
+        assert_eq!(
+            transaction.compare_and_swap(2, case_variant),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Validation(
+                ManifestValidationError::ReservedSessionControlIdentity(
+                    ReservedControlIdentity::SessionProvenance
+                )
+            ))
+        );
+    }
+
+    /// One disclosed reclassification: rebuilding a V1-floor candidate from an
+    /// advanced V2 head's own inventory now fails at CONSTRUCTION, not later at
+    /// the CAS.
+    ///
+    /// That rebuild is exactly what `canonical_log`'s
+    /// `RecoveryTransaction::manifest_candidate` performs — it takes
+    /// `head.artifacts` verbatim and calls `SessionArtifactManifestV1::candidate`,
+    /// which hardcodes `SessionSemanticsVersion::V1`. A V2 head's inherited
+    /// provenance entry therefore loses the exemption and reports
+    /// `ReservedSessionControlIdentity(SessionProvenance)`, where before this
+    /// reservation the candidate was constructible and
+    /// `compare_and_swap_recovery` refused it as
+    /// `SessionSemanticsFloorRegression`. Both are refusals of the same already
+    /// closed path (`quarantine_recovery_remains_closed_on_a_v2_session`); only
+    /// the classification and the stage moved.
+    ///
+    /// Scope of this pin: the constructor, which is the reclassified step. It is
+    /// not an end-to-end `canonical_log` recovery, because a recovery store is
+    /// built by `qualified_for_algorithm_test` with `address: None` and an
+    /// unaddressed store cannot advance to V2 at all.
+    #[cfg(unix)]
+    #[test]
+    fn rebuilding_a_v1_floor_candidate_from_a_v2_head_is_refused_at_construction() {
+        let (_root, _store, advanced, _proof_bytes) =
+            advanced_v2_session("v1-rebuild-from-v2-head");
+        assert_eq!(
+            SessionArtifactManifestV1::candidate(
+                advanced.session_id.clone(),
+                advanced.transition.clone(),
+                advanced.artifacts.clone(),
+                None,
+            ),
+            Err(ManifestValidationError::ReservedSessionControlIdentity(
+                ReservedControlIdentity::SessionProvenance
+            ))
         );
     }
 }

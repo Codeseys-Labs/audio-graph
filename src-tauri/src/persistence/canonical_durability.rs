@@ -1348,9 +1348,13 @@ impl CanonicalExclusiveGuard {
     /// longer names the object this guard opened. It does NOT know which of the
     /// caller's records are meant to be immutable — keeping a canonical
     /// manifest head or an immutable proof record out of `path` is the caller's
-    /// obligation. Its only production caller is
-    /// `ManifestWriteTransaction::abandon_staged_transition`, which passes the
-    /// Session's own derived manifest temporary.
+    /// obligation. It has exactly two production callers, both of which pass
+    /// only pathnames derived from one validated Session address:
+    /// `ManifestWriteTransaction::abandon_staged_transition`, which passes that
+    /// Session's own manifest temporary, and
+    /// `SessionArtifactManifestStore::retire_owned_control_plane`, which passes
+    /// that Session's temporary, manifest head, and transition proof in that
+    /// order as part of deleting the Session itself.
     ///
     /// `Unlinked` follows the qualified parent-namespace barrier. No file
     /// barrier is claimed: the object is gone. `AlreadyAbsent` crosses the same

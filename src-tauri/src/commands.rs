@@ -6651,9 +6651,41 @@ fn strict_speaker_history(
     }
 }
 
+/// Floor-admitted like [`read_session_transcript_snapshot`]: every canonical
+/// stream this reads is v1-only, so an unadmitted v2 Session would replay v2
+/// revisions through v1 logic. `maximum_supported` is v1 for that reason.
 fn projection_replay_report_for_session(session_id: &str) -> AppResult<ProjectionReplayReport> {
     validate_session_id(session_id).map_err(AppError::from)?;
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| projection_replay_report_for_admitted_session(session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
 
+/// Collapse an admission refusal into `AppError` WITHOUT flattening the reader's
+/// own typed error: `ContentReader` carries the `AppError` the closure returned,
+/// so stringifying the whole enum would turn every real failure into `Internal`.
+fn unadmitted_session_error(
+    error: crate::persistence::session_semantics::GuardedSessionOpenError<AppError>,
+) -> AppError {
+    match error {
+        crate::persistence::session_semantics::GuardedSessionOpenError::ContentReader(inner) => {
+            inner
+        }
+        refusal => AppError::SessionInvalid {
+            reason: refusal.to_string(),
+        },
+    }
+}
+
+fn projection_replay_report_for_admitted_session(
+    session_id: &str,
+) -> AppResult<ProjectionReplayReport> {
     let repository = FileMemoryRepository::user_data();
     let transcript_events = repository
         .load_transcript_event_stream(session_id)?
@@ -6856,11 +6888,45 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
     Ok(segments)
 }
 
+/// Read one past Session's transcript through the guarded compatibility-floor
+/// admission seam (ADR-0038 §5, seed audio-graph-e8e7).
+///
+/// This is the shared canonical-versus-legacy fork for `load_session_impl`,
+/// `load_session_transcript`, and `session_export_bundle`, so gating it gates the
+/// transcript read of all three. Both branches of the fork run INSIDE the admitted
+/// floor: neither the canonical replay nor the legacy JSONL fallback can observe
+/// bytes of a Session whose floor this reader does not support.
+///
+/// CONSTRAINT the code cannot show: this is NOT every production read of canonical
+/// Session content. `projection_replay_report_for_session` and `session_timeline`
+/// call `load_transcript_event_stream` with no floor check, and the
+/// speaker-revision / projection-patch / materialized / live-assist reads inside
+/// `load_session_impl` and `session_export_bundle` happen outside this closure.
+/// Harmless only while nothing writes v2; the seed that activates a v2 writer owns
+/// routing them through here (report residual R8).
+///
+/// `maximum_supported` is v1 because this reader understands only v1 transcript
+/// semantics. Raising it belongs to whichever workstream activates v2 transcript
+/// revisions.
 fn read_session_transcript_snapshot(
     repository: &FileMemoryRepository,
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
     validate_session_id(session_id)?;
+    let data_root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| read_admitted_session_transcript_snapshot(repository, session_id),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_admitted_session_transcript_snapshot(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<SessionTranscriptSnapshot, String> {
     match repository.load_transcript_event_stream(session_id)? {
         crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
             Ok(SessionTranscriptSnapshot {
@@ -7181,6 +7247,22 @@ fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::Timeline
         });
     }
 
+    // Floor-admitted for the same reason as the transcript snapshot and the
+    // replay report: every canonical stream folded below is v1-only.
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| session_timeline_for_admitted_session(session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn session_timeline_for_admitted_session(
+    session_id: &str,
+) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
     let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
     let repository = FileMemoryRepository::user_data();
     let transcript_events = repository
@@ -11403,6 +11485,52 @@ mod tests {
         let error = export_session_bundle(session_id.to_string())
             .expect_err("session export must fail closed");
         assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-e8e7: the production read seam refuses an unreadable control
+    /// plane instead of admitting historical v1 and serving legacy bytes.
+    ///
+    /// The obstruction is a NON-REGULAR entry at the derived manifest control
+    /// identity, so the refusal is host-independent: a root the substrate
+    /// qualifies refuses on the strict manifest load, and a root it cannot
+    /// qualify refuses on qualification.
+    #[test]
+    fn guarded_open_refuses_a_session_whose_control_plane_cannot_be_read() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("guarded-open-refuses-control-plane");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "guarded-control-plane";
+        let secret = "legacy text must stay behind the floor gate";
+
+        seed_legacy_transcript(session_id, secret);
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("a session with no control plane still loads");
+        assert_eq!(transcript.len(), 1, "the baseline read is unchanged");
+
+        let root = crate::user_data::data_root().expect("data root");
+        let paths =
+            crate::persistence::session_semantics::session_control_plane_paths(&root, session_id)
+                .expect("control paths");
+        std::fs::create_dir_all(&paths.manifest).expect("unreadable control plane");
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("an unreadable control plane must refuse the read");
+        assert!(
+            !error.to_string().contains(secret),
+            "the refusal must not carry Session content: {error}"
+        );
+
+        std::fs::remove_dir(&paths.manifest).expect("clear the obstruction");
+        assert_eq!(
+            load_session_transcript(session_id.to_string())
+                .expect("the read converges once the control plane is gone")
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -393,16 +393,16 @@ are now FALSE:
   candidate's floor rather than on whether the call performs the advance." It is
   now keyed on whether this call performs the transition, in
   `refuse_unproven_v2_candidate`
-  (`src-tauri/src/persistence/session_artifact_manifest.rs:1598`).
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:1631`).
 - "do not re-attempt the re-key before it lands" and "The wedge is pinned
   deliberately by `committed_v2_head_refuses_later_generations_until_proof_binding_exists`".
   The binding landed first, in the same commit as the re-key, and the pinning test
   was INVERTED, not deleted, into
   `committed_v2_head_records_later_generations_only_against_the_durable_proof`
-  (`src-tauri/src/persistence/session_artifact_manifest.rs:3798`).
+  (`src-tauri/src/persistence/session_artifact_manifest.rs:4146`).
 
 What replaced the wedge: `bind_v2_provenance_to_durable_proof`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:2232`) reads the durable
+(`src-tauri/src/persistence/session_artifact_manifest.rs:2392`) reads the durable
 v1-to-v2 proof record at the DERIVED control provenance identity, under the
 exclusive guard, before anything is staged, and refuses a V2 candidate whose
 `SessionProvenanceEvents` entry is not exactly that record — absent, non-regular,
@@ -431,7 +431,7 @@ committed V2 head:
 Quarantine recovery on an advanced Session is still fully closed for every
 candidate shape, and now has executable evidence in
 `quarantine_recovery_remains_closed_on_a_v2_session`
-(`src-tauri/src/persistence/session_artifact_manifest.rs:3916`); the
+(`src-tauri/src/persistence/session_artifact_manifest.rs:4273`); the
 `SessionArtifactManifestV1::candidate` V1 hardcode remains the named cause and is
 deliberately not fixed.
 
