@@ -365,7 +365,7 @@ jobs:
               }
           )
           if ($publisherMatches.Count -gt 1) {
-            throw "Pinned LABSN publisher certificate has an ambiguous pre-action store state."
+            throw "Pinned LABSN publisher certificate has an ambiguous pre-install store state."
           }
 
           $endpoints = @(
