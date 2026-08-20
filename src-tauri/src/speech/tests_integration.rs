@@ -330,6 +330,162 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     );
 }
 
+/// audio-graph-653a findings 2 + 4 regression: `run_deepgram_event_receiver`
+/// must keep processing drained `Transcript` events that arrive AFTER an idle
+/// `recv_timeout` tick, and must only exit once `event_rx` actually
+/// disconnects — never because some external flag went false. The pre-fix
+/// version took an `is_transcribing: Arc<AtomicBool>` and (a) broke out of
+/// the loop on the very next 500ms timeout tick once that flag cleared, and
+/// (b) discarded an already-dequeued event outright if the flag had cleared
+/// in between — both of which threw away exactly the drained tail-of-utterance
+/// events the client-side close-drain fix (deepgram.rs) exists to recover.
+/// This test proves neither failure mode survives: a second transcript sent
+/// after a tick that is long enough to have tripped the old flag-check still
+/// reaches the transcript buffer, and the thread only exits once the sender
+/// side of `event_rx` is fully dropped.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close() {
+    let data_dir = unique_tempdir("deepgram-event-receiver");
+    let _guard = DataDirGuard::set(&data_dir);
+    let app_handle = super::shared_test_app_handle();
+    let session_id = "deepgram-event-receiver-session";
+    let models_dir = std::env::temp_dir().join(format!(
+        "audio-graph-deepgram-receiver-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&models_dir).expect("create temp models dir");
+
+    let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
+        Arc::new(RwLock::new(VecDeque::new()));
+    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
+    let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+    let graph_extractor = Arc::new(RuleBasedExtractor::new());
+    let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
+    let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
+    let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+    let openrouter_client: Arc<Mutex<Option<OpenRouterClient>>> = Arc::new(Mutex::new(None));
+    let llm_executor = LlmExecutor::new(
+        llm_engine.clone(),
+        api_client.clone(),
+        openrouter_client.clone(),
+        mistralrs_engine.clone(),
+    );
+    // A real (not `None`) canonical writer -- `record_asr_span_revision_event`
+    // refuses to advance the ledger (and therefore never pushes to
+    // `transcript_buffer`) without one, matching the production wiring
+    // `run_deepgram_speech_processor` provides.
+    let transcript_event_writer = Arc::new(Mutex::new(TranscriptEventWriter::spawn(session_id)));
+    assert!(
+        transcript_event_writer.lock().unwrap().is_some(),
+        "integration fixture requires an accepting canonical writer"
+    );
+
+    let shared = SpeechShared {
+        transcript_buffer: transcript_buffer.clone(),
+        transcript_writer: Arc::new(Mutex::new(None)),
+        transcript_event_writer,
+        transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
+            session_id,
+        ))),
+        speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+            session_id,
+        ))),
+        projection_schedulers: Arc::new(Mutex::new(
+            crate::projection_scheduler::ProjectionSchedulers::new(session_id),
+        )),
+        projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(session_id),
+        active_session_id: Arc::new(RwLock::new(session_id.to_string())),
+        pipeline_status: pipeline_status.clone(),
+        app_handle,
+        knowledge_graph,
+        graph_snapshot,
+        graph_extractor,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_executor,
+        pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let config = SpeechConfig {
+        models_dir: models_dir.clone(),
+        llm_provider: LlmProvider::default(),
+        llm_allow_cloud_fallbacks: true,
+        provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+    };
+    let source_id_hint = Arc::new(RwLock::new(Some("integration-source".to_string())));
+
+    let (event_tx, event_rx) =
+        crossbeam_channel::bounded::<crate::asr::deepgram::DeepgramEvent>(16);
+    let receiver_thread = std::thread::spawn(move || {
+        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0);
+    });
+
+    let transcript_event =
+        |text: &str, start: f64| crate::asr::deepgram::DeepgramEvent::Transcript {
+            text: text.to_string(),
+            confidence: 0.9,
+            is_final: true,
+            speech_final: true,
+            start,
+            duration: 0.5,
+            words: Vec::new(),
+        };
+
+    event_tx
+        .send(transcript_event("first drained tail", 0.0))
+        .expect("send first transcript");
+    wait_until("first drained transcript to land", || {
+        transcript_buffer
+            .read()
+            .map(|buf| buf.len() == 1)
+            .unwrap_or(false)
+    });
+
+    // Sleep well past one `recv_timeout(500ms)` tick. The pre-fix receiver
+    // treated a cleared `is_transcribing` flag as its exit signal on exactly
+    // this kind of idle tick; this test never sets any such flag at all —
+    // the receiver must still be alive and processing afterward.
+    std::thread::sleep(Duration::from_millis(700));
+
+    event_tx
+        .send(transcript_event("second drained tail", 1.0))
+        .expect("send second transcript");
+    wait_until("second drained transcript to land", || {
+        transcript_buffer
+            .read()
+            .map(|buf| buf.len() == 2)
+            .unwrap_or(false)
+    });
+
+    {
+        let buffer = transcript_buffer.read().expect("transcript buffer lock");
+        let texts: Vec<&str> = buffer.iter().map(|seg| seg.text.as_str()).collect();
+        assert_eq!(texts, vec!["first drained tail", "second drained tail"]);
+    }
+
+    // Dropping the sender is the ONLY thing that should end the receiver
+    // thread now — it must exit promptly once `event_rx` disconnects, and
+    // must not have exited (or hung) before this point. Joined through a
+    // bounded watcher (not a direct `.join()`) so a regression that hangs
+    // the receiver fails this test instead of hanging the whole suite.
+    drop(event_tx);
+    let (join_done_tx, join_done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = join_done_tx.send(receiver_thread.join());
+    });
+    join_done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("event receiver thread must exit within 3s of the channel disconnecting")
+        .expect("event receiver thread must exit cleanly once the channel disconnects");
+
+    let _ = fs::remove_dir_all(&models_dir);
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",

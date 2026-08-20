@@ -219,6 +219,40 @@ const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_bac
 const KEEPALIVE_INTERVAL_SECS: u64 = 4;
 const KEEPALIVE_PAYLOAD: &str = r#"{"type":"KeepAlive"}"#;
 
+/// Bounded post-`Terminal` drain window (audio-graph-653a).
+///
+/// Deepgram's documented `CloseStream` flow is: client sends an empty binary
+/// frame ("Terminal"), server keeps flushing whatever it is still finalizing
+/// (the trailing utterance's finals), THEN the server sends its own WS Close
+/// frame. Before this constant existed, both the `Some(AudioCmd::Stop)` and
+/// `None` arms of `run_io_with_keepalive_interval` sent Terminal and then
+/// immediately called `writer.close()` and returned — abandoning the reader
+/// before Deepgram's server could flush or close from its side. Every real
+/// stop-capture lost the tail of the last utterance as a result (confirmed
+/// live: protected-provider-smoke run 32404655072 — a 25s *counted* drain
+/// window on the old code still read zero finals for the last 3s of speech,
+/// because the client had already torn down the socket and structurally could
+/// not read anything the server sent after that point).
+///
+/// Current value (900ms) is a first-cut, not a measured p99: Deepgram's own
+/// flush is documented as sub-second once `CloseStream` is received, and the
+/// "stop" button's latency budget matters too — a capture-stop that visibly
+/// hangs for multiple seconds is its own UX bug, so the window is deliberately
+/// bounded well under that. A silent/wedged server (dead peer, box dropped
+/// packets) must not be able to hang `disconnect()` — that is exactly the
+/// bound this constant enforces (acceptance case (b) in audio-graph-653a):
+/// the drain always ends, either on the server's Close frame or here.
+///
+/// Tuning procedure (mirrors `state::TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT`,
+/// ag#8 idiom): once this ships, log the elapsed wall-clock of each drain at
+/// INFO (`deepgram.close_drain elapsed_ms=… ended_by=<close|deadline|error>`).
+/// After ~1-2 weeks of real stop-captures, grep those logs, compute the
+/// `ended_by=close` p50/p95/p99, and retune this constant to
+/// `p99 + ~200-300ms safety margin` — document the new value with a "Chosen
+/// because: p99 = Xms over N stop-captures on dates …" comment, the same way
+/// `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` was tuned.
+const DEEPGRAM_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(900);
+
 enum AudioCmd {
     /// Raw i16 LE PCM bytes ready to send as a binary frame.
     Chunk(Vec<u8>),
@@ -274,6 +308,24 @@ pub struct DeepgramStreamingClient {
     _reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the writer task (for join on shutdown).
     _writer_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Fires exactly once, the instant the session task (including its
+    /// close-drain -- audio-graph-653a) finishes.
+    ///
+    /// `disconnect()` blocks on this (bounded) before returning so the only
+    /// production caller doesn't drop `self` -- tripping `Drop`'s
+    /// `rt.shutdown_timeout()`, which cancels whatever is still pending on
+    /// the runtime -- before the drain this fix exists to run has actually
+    /// completed.
+    ///
+    /// A plain `std::sync::mpsc` receiver, not a tokio primitive: it must be
+    /// safe to block on from ANY calling thread, including one that is
+    /// itself already inside a *different* tokio runtime (e.g. the live
+    /// smoke test's `#[tokio::test(flavor = "current_thread")]` body calls
+    /// `disconnect()` directly). `Runtime::block_on` panics in that
+    /// situation ("Cannot start a runtime from within a runtime"); a std
+    /// mpsc `recv_timeout` does not touch tokio's per-thread runtime-entry
+    /// guard, so it has no such restriction.
+    session_done_rx: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl DeepgramStreamingClient {
@@ -293,6 +345,7 @@ impl DeepgramStreamingClient {
             reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             _reader_handle: None,
             _writer_handle: None,
+            session_done_rx: None,
         }
     }
 
@@ -353,7 +406,7 @@ impl DeepgramStreamingClient {
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
-        let (audio_tx, session_handle) = rt.block_on(async move {
+        let (audio_tx, session_handle, session_done_rx) = rt.block_on(async move {
             // Initial connect — surfaced synchronously so the caller sees
             // auth / network errors immediately instead of through the
             // reconnect loop.
@@ -368,7 +421,7 @@ impl DeepgramStreamingClient {
 
             // Spawn the session task, which owns both halves of the socket
             // and handles reconnects internally.
-            let session_handle = tokio::spawn(session_task(DeepgramSessionCtx {
+            let (session_handle, session_done_rx) = spawn_session_task(DeepgramSessionCtx {
                 writer,
                 reader,
                 audio_rx: arx,
@@ -382,15 +435,16 @@ impl DeepgramStreamingClient {
                 reconnect_opener: None,
                 #[cfg(test)]
                 run_io_entries: None,
-            }));
+            });
 
-            Ok::<_, String>((atx, session_handle))
+            Ok::<_, String>((atx, session_handle, session_done_rx))
         })?;
 
         self.audio_tx = Some(audio_tx);
         self._reader_handle = Some(session_handle);
         self._writer_handle = None;
         self.rt = Some(rt);
+        self.session_done_rx = Some(session_done_rx);
 
         Ok(())
     }
@@ -497,10 +551,33 @@ impl DeepgramStreamingClient {
 
     /// Disconnect from Deepgram and clean up resources.
     ///
-    /// Sends a close frame, waits for background tasks to finish, and shuts
-    /// down the internal tokio runtime. Setting `user_disconnected` prevents
-    /// the session task from attempting to auto-reconnect.
-    pub fn disconnect(&self) {
+    /// Sends a close frame, then blocks (bounded) until the session task's
+    /// close-drain has actually finished before returning. Setting
+    /// `user_disconnected` prevents the session task from attempting to
+    /// auto-reconnect.
+    ///
+    /// # Why this blocks (audio-graph-653a)
+    ///
+    /// The only production caller (`run_deepgram_speech_processor`) drops
+    /// `self` the instant this call returns. `Drop::drop` then calls
+    /// `rt.shutdown_timeout()`, which CANCELS whatever is still pending on
+    /// the runtime. If `disconnect()` returned immediately after merely
+    /// queuing `AudioCmd::Stop` (as it used to), the caller would drop the
+    /// client -- and the runtime would shut down -- microseconds later,
+    /// cancelling the close-drain (`drain_after_terminal`) before it could
+    /// read Deepgram's flushed finals. Blocking here, bounded at
+    /// `DEEPGRAM_CLOSE_DRAIN_TIMEOUT` plus slack, keeps the runtime alive
+    /// for exactly as long as the drain needs and no longer -- a wedged
+    /// session task can't hang the caller's stop path; `Drop`'s
+    /// `shutdown_timeout` remains the final backstop if the wait itself
+    /// times out.
+    ///
+    /// This ordering also fixes the `Disconnected`-event ordering: the
+    /// session task emits its own (deduplicated) `Disconnected` right after
+    /// the drain, before this function's own trailing call -- which is a
+    /// no-op in the common case -- so `Disconnected` reaches `event_rx`
+    /// AFTER any drained `Transcript`/`Turn` events, not before.
+    pub fn disconnect(&mut self) {
         log::info!("DeepgramStreamingClient: disconnecting (user-initiated)");
 
         // Mark this teardown as user-initiated so the session task does not
@@ -515,6 +592,30 @@ impl DeepgramStreamingClient {
             let _ = tx.send(AudioCmd::Stop);
         }
 
+        // Block until the session task (and its close-drain) actually
+        // finishes, or the bounded deadline elapses. A plain std mpsc
+        // `recv_timeout` -- safe to call from any thread, including one
+        // already inside a *different* tokio runtime; see the
+        // `session_done_rx` field doc comment.
+        if let Some(done_rx) = self.session_done_rx.take() {
+            match done_rx.recv_timeout(DEEPGRAM_CLOSE_DRAIN_TIMEOUT + Duration::from_millis(500)) {
+                Ok(()) => {
+                    log::debug!("DeepgramStreamingClient: session task finished draining");
+                }
+                Err(e) => {
+                    log::warn!(
+                        "DeepgramStreamingClient: timed out waiting for the session task to \
+                         finish draining ({e}); proceeding -- Drop's shutdown_timeout is the \
+                         final backstop"
+                    );
+                }
+            }
+        }
+
+        // Guarded by `disconnected_emitted`: in the common case the session
+        // task already emitted `Disconnected` (after the drain) while we
+        // were waiting above, so this is a no-op. It only actually fires
+        // here if the session task never ran or the wait above timed out.
         emit_disconnected_once(&self.event_tx, &self.disconnected_emitted);
     }
 }
@@ -915,6 +1016,28 @@ fn emit_disconnected_once(
 ///    comes back.
 /// 6. On failure, loops back to step 2 with the incremented attempt count.
 /// 7. After 4 failed attempts, emits a fatal `Error` event and exits.
+///
+/// Spawns [`session_task`] and returns a handle to it plus a receiver that
+/// fires exactly once the task finishes -- no matter which of the task's
+/// internal break/return paths ends it (clean stop, policy block, exhausted
+/// reconnect budget, or a mid-backoff cancel).
+///
+/// Factored out of [`DeepgramStreamingClient::connect`] purely so a unit
+/// test can drive it directly with a scripted-server fixture instead of a
+/// real WebSocket handshake (audio-graph-653a: this wiring is what lets
+/// `disconnect()` block until the close-drain has actually run instead of
+/// racing `Drop`'s `rt.shutdown_timeout()`).
+fn spawn_session_task(
+    ctx: DeepgramSessionCtx,
+) -> (tokio::task::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+    let (session_done_tx, session_done_rx) = std::sync::mpsc::channel::<()>();
+    let handle = tokio::spawn(async move {
+        session_task(ctx).await;
+        let _ = session_done_tx.send(());
+    });
+    (handle, session_done_rx)
+}
+
 async fn session_task(ctx: DeepgramSessionCtx) {
     let DeepgramSessionCtx {
         writer: initial_writer,
@@ -1093,6 +1216,88 @@ async fn session_task(ctx: DeepgramSessionCtx) {
     log::info!("Deepgram: session task exited");
 }
 
+/// After we have sent the `Terminal` (empty-binary `CloseStream`) frame,
+/// keep reading through the SAME message-handling path the live loop uses
+/// (`handle_server_message_with_key` — transcript parsing, policy
+/// classification, event emission, all unchanged) until either the server
+/// sends its own WS Close frame or `deadline` elapses.
+///
+/// This is a free function — factored out of the `Some(AudioCmd::Stop)` /
+/// `None` arms below — purely so a unit test can drive it directly with a
+/// short deadline instead of waiting out the full production
+/// [`DEEPGRAM_CLOSE_DRAIN_TIMEOUT`] twice (once per arm's test).
+///
+/// Deliberately returns `()`, not a [`DisconnectKind`]: no matter how the
+/// drain ends — server Close, reader-stream end, a read error, or the
+/// deadline — the caller (both arms) always classifies the teardown as the
+/// same clean-end `DisconnectKind` it already returns today. That is what
+/// keeps a flaky/slow/silent server during the drain window from ever being
+/// misclassified as a network error or tripping the reconnect ladder
+/// (audio-graph-653a acceptance: server-Close-during-drain and
+/// deadline-exhaustion both stay on the clean-end path).
+///
+/// No keepalive ticks fire in here — this loop does not select on the
+/// keep-alive timer, so nothing is sent to Deepgram after `Terminal` except
+/// the final WS Close frame the caller sends once this returns.
+async fn drain_after_terminal(
+    reader: &mut AsrWsReader,
+    event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    api_key: &str,
+    deadline: Duration,
+) {
+    let sleep = tokio::time::sleep(deadline);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => {
+                log::info!(
+                    "Deepgram: close-drain deadline ({deadline:?}) elapsed before server Close"
+                );
+                return;
+            }
+            frame = reader.next() => {
+                match frame {
+                    None => {
+                        log::info!("Deepgram: close-drain reader ended without an explicit Close");
+                        return;
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        log::info!("Deepgram: close-drain observed the server's Close frame");
+                        return;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        // Same handling path as the live loop: a final
+                        // transcript the server flushes in response to
+                        // Terminal lands exactly like a live-phase message.
+                        handle_server_message_with_key(&text, event_tx, api_key);
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+                        // Protocol-level frames; nothing to do.
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        log::debug!("Deepgram: unexpected binary message during close-drain");
+                    }
+                    Some(Err(e)) => {
+                        // A read error during the drain is still a clean end
+                        // from the caller's perspective — log for diagnosis
+                        // but do not reclassify or reconnect. Redact: some
+                        // tungstenite error variants carry provider-supplied
+                        // text (e.g. an embedded upgrade request), so scrub
+                        // the key before it reaches logs.
+                        let diag = crate::error::redacted_provider_diagnostic(
+                            &format!("close-drain reader error (treated as clean end): {e}"),
+                            [api_key],
+                        );
+                        log::info!("Deepgram: {diag}");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Pumps audio out and transcripts back for a single WebSocket instance.
 ///
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
@@ -1205,19 +1410,48 @@ async fn run_io_with_keepalive_interval(
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
-                        // Graceful user-initiated close.
+                        // Graceful user-initiated close: send Deepgram's
+                        // documented CloseStream signal (empty binary
+                        // Terminal frame), then keep reading through the
+                        // normal message path until the server flushes its
+                        // remaining finals and sends its own Close, or the
+                        // bounded drain window elapses — see
+                        // `drain_after_terminal` / `DEEPGRAM_CLOSE_DRAIN_TIMEOUT`
+                        // (audio-graph-653a: slamming the socket shut here
+                        // used to abandon the reader before the server could
+                        // flush, silently dropping the last utterance's
+                        // words — live-evidenced by protected-provider-smoke
+                        // run 32404655072).
                         let _ = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
                             .await;
+                        drain_after_terminal(
+                            reader,
+                            event_tx,
+                            api_key,
+                            DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
+                        )
+                        .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
                     }
                     None => {
                         // Caller dropped the sender. No more audio will ever
-                        // arrive — end the session without reconnecting.
+                        // arrive — end the session without reconnecting, but
+                        // still give Deepgram the same bounded close-drain
+                        // window as the explicit Stop arm above: the
+                        // CloseStream flush defect applies here too
+                        // (audio-graph-653a).
                         let _ = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
                             .await;
+                        drain_after_terminal(
+                            reader,
+                            event_tx,
+                            api_key,
+                            DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
+                        )
+                        .await;
                         let _ = writer.close().await;
                         return DisconnectKind::WriterEnded;
                     }
@@ -2698,6 +2932,12 @@ mod tests {
             ),
             ws_fixture::ServerStep::expect_binary(vec![1, 2, 3, 4]),
             ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+            // Deepgram's real CloseStream flow: the server closes from its own
+            // side right after Terminal. With the close-drain fix the client no
+            // longer slams its own Close immediately — it waits to observe this
+            // one — so the scripted server must actually send it for the drain
+            // to resolve (audio-graph-653a).
+            ws_fixture::ServerStep::send_close(),
             ws_fixture::ServerStep::expect_close(),
         ])
         .await;
@@ -2812,8 +3052,14 @@ mod tests {
                         text_frames.push(text);
                     }
                     Message::Binary(bytes) => {
+                        let is_terminal = bytes.is_empty();
                         binary_frames.push(bytes.to_vec());
-                        if binary_frames.last().is_some_and(Vec::is_empty) {
+                        if is_terminal {
+                            // Mirror Deepgram's documented CloseStream flow:
+                            // the server closes from its own side right after
+                            // Terminal, which is exactly what the fixed
+                            // close-drain waits to observe (audio-graph-653a).
+                            let _ = websocket.close(None).await;
                             break;
                         }
                     }
@@ -2909,6 +3155,436 @@ mod tests {
             .await
             .expect("server task should finish")
             .expect("server task panicked");
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-653a: close-drain regression coverage.
+    //
+    // Before the fix, both the `Some(AudioCmd::Stop)` and `None` arms sent
+    // Terminal and then immediately closed the writer and returned —
+    // abandoning the reader before Deepgram's server could flush the finals
+    // it produces in response to Terminal (its documented CloseStream flow)
+    // or complete the close handshake. Live-evidenced by
+    // protected-provider-smoke run 32404655072: a 25s *counted* post-close
+    // drain window still read zero finals for the last 3s of speech, because
+    // the client had already torn the socket down and structurally could not
+    // read anything the server sent afterward.
+    // -----------------------------------------------------------------------
+
+    /// (a) + (c): a message the server sends between our `Terminal` and its
+    /// `Close` is processed through the SAME handling path as a live-phase
+    /// message (a final transcript + turn event lands), and the drain
+    /// resolves via the server's `Close` frame — fast, not at the deadline —
+    /// rather than being misclassified as a network error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_after_terminal_processes_server_messages_and_stops_at_server_close() {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"start":2.0,"duration":0.3,"channel":{"alternatives":[{"transcript":"drained final","confidence":0.9,"words":[]}]}}"#,
+            ),
+            ws_fixture::ServerStep::send_close(),
+        ])
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (_writer, mut reader) = client_socket.split();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+
+        // A deliberately generous deadline (5s) — if this test passes fast
+        // (well under it, asserted below), the drain resolved via the
+        // server's Close frame, not the deadline.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            drain_after_terminal(&mut reader, &event_tx, "test-key", Duration::from_secs(5)),
+        )
+        .await
+        .expect("drain should resolve via server Close, not the 5s deadline");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "drain should end promptly on server Close, not wait out the deadline"
+        );
+
+        match recv_event(&event_rx, Duration::from_millis(200)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "drained final");
+                assert!(is_final);
+            }
+            other => panic!("expected a drained transcript event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_millis(200)).await {
+            DeepgramEvent::Turn { kind, text, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+                assert_eq!(text.as_deref(), Some("drained final"));
+            }
+            other => panic!("expected a drained speech-final turn event, got {other:?}"),
+        }
+        // (e): exactly one Transcript + one Turn — no duplicate emission.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "drain must not emit any event more than once"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+    }
+
+    /// (b): a server that never sends anything and never closes cannot wedge
+    /// the drain — it ends at the bounded deadline regardless.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_after_terminal_returns_at_deadline_when_server_is_silent() {
+        let (url, server) = ws_fixture::spawn_server(|mut websocket| async move {
+            // Keep the TCP connection genuinely alive with WS-level Ping
+            // control frames (handled as a no-op by the drain loop, same as
+            // live) well past the short deadline this test uses below — but
+            // never send anything the app treats as "done" (no transcript,
+            // no Close). This models a wedged/silent-from-Deepgram's-
+            // perspective server without an idle loopback socket.
+            for _ in 0..50 {
+                if websocket
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (_writer, mut reader) = client_socket.split();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+
+        let deadline = Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        drain_after_terminal(&mut reader, &event_tx, "test-key", deadline).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= deadline,
+            "drain must not return before its deadline: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a silent server must not wedge the drain past its bounded deadline: elapsed={elapsed:?}"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a silent server must not produce any spurious events"
+        );
+
+        server.abort();
+    }
+
+    /// (a) + (c) + (d) + (e), Stop arm: `run_io`'s `Some(AudioCmd::Stop)` arm
+    /// keeps reading through the normal handler path after `Terminal`, emits
+    /// the server's drained final exactly once, resolves fast via the
+    /// server's Close (not the deadline), and returns the clean
+    /// `UserRequested` kind — never `NetworkError`, never triggering
+    /// reconnect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_stop_arm_drains_server_messages_before_close_and_returns_clean() {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_binary(vec![9, 9, 9]),
+            ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"start":2.0,"duration":0.3,"channel":{"alternatives":[{"transcript":"drained final","confidence":0.9,"words":[]}]}}"#,
+            ),
+            ws_fixture::ServerStep::send_close(),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        let started = std::time::Instant::now();
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "test-key",
+                )
+                .await
+            }
+        });
+
+        audio_tx
+            .send(AudioCmd::Chunk(vec![9, 9, 9]))
+            .expect("queue audio chunk");
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        // The drained final must land — proving the Stop arm routes messages
+        // received during the drain through the SAME handling path as the
+        // live loop (a). It arrives well before the production close-drain
+        // deadline because the scripted server closes right after Terminal.
+        match recv_event(&event_rx, Duration::from_millis(500)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "drained final");
+                assert!(is_final);
+            }
+            other => panic!("expected a drained transcript event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_millis(500)).await {
+            DeepgramEvent::Turn { kind, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+            }
+            other => panic!("expected a drained speech-final turn event, got {other:?}"),
+        }
+
+        let disconnect = tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .expect(
+                "run_io should return promptly via the server's Close frame, \
+                 not the close-drain deadline",
+            )
+            .expect("run_io task panicked");
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "server Close observed during the drain must map to the clean \
+             UserRequested kind, never NetworkError/reconnect: got {disconnect:?}"
+        );
+        assert!(
+            started.elapsed() < DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
+            "a server that closes promptly must not pay the full drain deadline"
+        );
+        assert_eq!(
+            pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "sent audio chunk must decrement pending count"
+        );
+        // (e): no duplicate emission across the stop sequence.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "stop must not emit any event more than once"
+        );
+
+        let client_frames = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+        assert_eq!(
+            client_frames,
+            vec![
+                ws_fixture::ClientFrame::Binary(vec![9, 9, 9]),
+                ws_fixture::ClientFrame::Binary(Vec::new()),
+                ws_fixture::ClientFrame::Close,
+            ]
+        );
+    }
+
+    /// (a) + (c) + (d), None arm: dropping the audio sender drives the
+    /// `None` branch, which must drain identically to the `Stop` arm — same
+    /// handler path for in-flight messages, same clean-close-during-drain
+    /// classification — and return `WriterEnded`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_none_arm_drains_server_messages_before_close_and_returns_clean() {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"start":1.0,"duration":0.2,"channel":{"alternatives":[{"transcript":"writer ended final","confidence":0.9,"words":[]}]}}"#,
+            ),
+            ws_fixture::ServerStep::send_close(),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        // Drop the sender BEFORE run_io starts polling so the very first
+        // `audio_rx.recv()` observes `None` (caller dropped the sender).
+        drop(audio_tx);
+
+        let started = std::time::Instant::now();
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "test-key",
+                )
+                .await
+            }
+        });
+
+        match recv_event(&event_rx, Duration::from_millis(500)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "writer ended final");
+                assert!(is_final);
+            }
+            other => panic!("expected a drained transcript event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_millis(500)).await {
+            DeepgramEvent::Turn { kind, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+            }
+            other => panic!("expected a drained speech-final turn event, got {other:?}"),
+        }
+
+        let disconnect = tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .expect("run_io should return promptly via the server's Close frame")
+            .expect("run_io task panicked");
+        assert!(
+            matches!(disconnect, DisconnectKind::WriterEnded),
+            "server Close observed during the drain must map to the clean \
+             WriterEnded kind, never NetworkError/reconnect: got {disconnect:?}"
+        );
+        assert!(
+            started.elapsed() < DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
+            "a server that closes promptly must not pay the full drain deadline"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "writer-ended teardown must not emit any event more than once"
+        );
+
+        let client_frames = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+        assert_eq!(
+            client_frames,
+            vec![
+                ws_fixture::ClientFrame::Binary(Vec::new()),
+                ws_fixture::ClientFrame::Close,
+            ]
+        );
+    }
+
+    /// (b), end-to-end through the real Stop arm with the PRODUCTION
+    /// [`DEEPGRAM_CLOSE_DRAIN_TIMEOUT`]: a server that goes silent right after
+    /// Terminal (never sends its Close) cannot wedge `disconnect()` forever —
+    /// the drain still ends at the deadline and `run_io` still returns the
+    /// clean `UserRequested` kind, not `NetworkError`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_stop_arm_silent_server_ends_drain_at_deadline_with_clean_kind() {
+        let (url, server) = ws_fixture::spawn_server(|mut websocket| async move {
+            // Model a wedged/silent-from-Deepgram's-perspective server:
+            // accept the connection, then never send a transcript or a
+            // Close for well past the production drain deadline. WS-level
+            // Ping control frames keep the underlying TCP connection
+            // genuinely alive (a truly idle loopback socket can be reset by
+            // the environment) without giving the app anything it would
+            // treat as "done".
+            for _ in 0..300 {
+                if websocket
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        let started = std::time::Instant::now();
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "test-key",
+                )
+                .await
+            }
+        });
+
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        let disconnect =
+            tokio::time::timeout(DEEPGRAM_CLOSE_DRAIN_TIMEOUT + Duration::from_secs(2), run)
+                .await
+                .expect(
+                    "a silent server must not wedge stop forever — the bounded \
+             drain deadline must still fire",
+                )
+                .expect("run_io task panicked");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "deadline-exhaustion during the drain must stay on the clean \
+             UserRequested path, never NetworkError/reconnect: got {disconnect:?}"
+        );
+        assert!(
+            elapsed >= DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
+            "the drain must not return before its deadline: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < DEEPGRAM_CLOSE_DRAIN_TIMEOUT + Duration::from_secs(1),
+            "the drain must not wedge past its bounded deadline (fixed grace \
+             above DEEPGRAM_CLOSE_DRAIN_TIMEOUT for scheduling jitter, not a \
+             stale hardcoded bound): elapsed={elapsed:?}"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a silent server must not produce any spurious events"
+        );
+
+        server.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3243,6 +3919,114 @@ mod tests {
             .await
             .expect("initial server task should finish")
             .expect("initial server task panicked");
+    }
+
+    /// audio-graph-653a blocker regression: proves the wiring
+    /// `DeepgramStreamingClient::disconnect()` blocks on (`spawn_session_task`'s
+    /// completion signal) actually gates on the session task -- and its
+    /// close-drain -- having FULLY finished, not merely started. Without this,
+    /// `disconnect()` used to queue `AudioCmd::Stop` and return immediately;
+    /// the only production caller then dropped the client, and `Drop`'s
+    /// `rt.shutdown_timeout()` cancelled the drain before it could read
+    /// Deepgram's flushed finals.
+    ///
+    /// Also proves the event-ordering fix (finding 3): the drained
+    /// `Transcript`/`Turn` events reach `event_rx` BEFORE `Disconnected`,
+    /// because the session task's own `emit_disconnected_once` call happens
+    /// AFTER `run_io`'s drain returns -- and the completion signal only fires
+    /// after that.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_session_task_signal_fires_only_after_the_drain_finishes_with_disconnected_last()
+    {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_binary(Vec::new()), // Terminal
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"start":1.0,"duration":0.2,"channel":{"alternatives":[{"transcript":"drained tail","confidence":0.9,"words":[]}]}}"#,
+            ),
+            ws_fixture::ServerStep::send_close(),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (writer, reader) = client_socket.split();
+        let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let connected = Arc::new(AtomicBool::new(true));
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_emitted = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let (handle, done_rx) = spawn_session_task(DeepgramSessionCtx {
+            writer,
+            reader,
+            audio_rx,
+            config: test_config("nova-3"),
+            event_tx,
+            connected,
+            user_disconnected: Arc::clone(&user_disconnected),
+            disconnected_emitted,
+            pending_chunks,
+            reconnect_opener: None,
+            run_io_entries: None,
+        });
+
+        // Mirrors `disconnect()`'s own ordering: mark user-initiated, then
+        // queue Stop.
+        user_disconnected.store(true, Ordering::SeqCst);
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        // The completion signal must not fire before the session task (and
+        // its close-drain) has actually finished running. `recv_timeout` is a
+        // genuine OS-thread block (matching how `disconnect()` calls it in
+        // production, from a plain `std::thread`, never from a tokio worker),
+        // so it must run via `spawn_blocking` here -- this test's runtime is
+        // `current_thread`, and `spawn_session_task`'s task runs on that same
+        // single worker; blocking it directly would deadlock the task it's
+        // waiting on.
+        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("spawn_blocking join")
+            .expect("session completion signal must fire once the drain finishes");
+
+        // By the time the signal fires, the task itself must already be
+        // finished -- not merely "about to finish" -- otherwise a caller
+        // that treats the signal as "safe to drop the runtime now" (as
+        // `disconnect()` does) could still race a task with one more await
+        // point left.
+        tokio::time::timeout(Duration::from_millis(50), handle)
+            .await
+            .expect("session task must already be finished by the time its completion signal fires")
+            .expect("session task panicked");
+
+        match recv_event(&event_rx, Duration::from_millis(200)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "drained tail");
+                assert!(is_final);
+            }
+            other => panic!("expected the drained transcript event first, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_millis(200)).await {
+            DeepgramEvent::Turn { kind, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+            }
+            other => panic!("expected the drained speech-final turn event next, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_millis(200)).await {
+            DeepgramEvent::Disconnected => {}
+            other => panic!(
+                "expected Disconnected LAST, strictly after the drained events, got {other:?}"
+            ),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no further events after Disconnected"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3743,7 +4527,7 @@ mod tests {
         // thread that carries no runtime context, matching the pattern
         // `live_openrouter_routed_smoke` already uses for its own blocking
         // client call (openrouter.rs).
-        let client = tokio::task::spawn_blocking(move || {
+        let mut client = tokio::task::spawn_blocking(move || {
             let mut client = client;
             client
                 .connect()

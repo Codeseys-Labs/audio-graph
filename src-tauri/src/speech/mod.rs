@@ -5116,7 +5116,8 @@ pub(crate) fn run_deepgram_speech_processor(
     let source_id_hint = Arc::new(RwLock::new(None::<String>));
 
     // Spawn the Deepgram event receiver thread (processes transcript results).
-    let is_transcribing_rx = is_transcribing.clone();
+    // It outlives `is_transcribing` flipping false by design -- see
+    // `run_deepgram_event_receiver`'s doc comment (audio-graph-653a).
     let pipeline_status_for_status_update = shared.pipeline_status.clone();
     let _receiver_handle = std::thread::Builder::new()
         .name("deepgram-event-rx".to_string())
@@ -5128,7 +5129,6 @@ pub(crate) fn run_deepgram_speech_processor(
             move || {
                 run_deepgram_event_receiver(
                     event_rx,
-                    is_transcribing_rx,
                     shared_for_receiver,
                     config_for_receiver,
                     source_id_hint_for_receiver,
@@ -5233,9 +5233,14 @@ fn remap_deepgram_speaker(
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
+///
+/// Deliberately takes no `is_transcribing` flag: this thread's lifecycle is
+/// tied solely to `event_rx` disconnecting, not to that flag, so it cannot
+/// exit (or discard an already-dequeued event) before the Deepgram client's
+/// close-drain has delivered the last utterance's finals. See the loop body
+/// below for the full audio-graph-653a rationale.
 fn run_deepgram_event_receiver(
     event_rx: crossbeam_channel::Receiver<crate::asr::deepgram::DeepgramEvent>,
-    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
     shared: SpeechShared,
     config: SpeechConfig,
     source_id_hint: Arc<RwLock<Option<String>>>,
@@ -5269,13 +5274,23 @@ fn run_deepgram_event_receiver(
     log::info!("Deepgram event receiver: entering processing loop");
 
     loop {
+        // This loop's lifecycle is driven entirely by the event channel
+        // actually disconnecting (below) -- NOT by `is_transcribing`.
+        // `is_transcribing` clears on the stop path BEFORE the Deepgram
+        // client's close-drain runs (audio-graph-653a): the audio-sender
+        // loop only calls `client.disconnect()` after observing the cleared
+        // flag, and `disconnect()` itself now blocks until the drain
+        // finishes. Breaking here on the flag -- or discarding an
+        // already-dequeued event because the flag had cleared -- would
+        // throw away exactly the drained tail-of-utterance events the drain
+        // exists to recover, even after the client-side fix lets them
+        // arrive. The channel closes deterministically and boundedly once
+        // the client that owns `event_tx` is torn down (`disconnect()`'s own
+        // bounded wait, followed by the caller dropping the client), so
+        // waiting for `RecvTimeoutError::Disconnected` cannot hang.
         let event = match event_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => ev,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if !is_transcribing.load(Ordering::Relaxed) {
-                    log::info!("Deepgram event receiver: is_transcribing flag cleared, exiting");
-                    break;
-                }
                 // Heartbeat: flush a coalesced extraction batch once speech has
                 // paused (idle/age), without waiting for the next segment.
                 flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
@@ -5286,11 +5301,6 @@ fn run_deepgram_event_receiver(
                 break;
             }
         };
-
-        if !is_transcribing.load(Ordering::Relaxed) {
-            log::info!("Deepgram event receiver: is_transcribing flag cleared, exiting");
-            break;
-        }
 
         match event {
             DeepgramEvent::Transcript {
