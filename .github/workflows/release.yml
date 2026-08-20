@@ -19,6 +19,18 @@
 #
 # Cargo.toml pins rsac by full Git revision and the committed Cargo.lock is the
 # single release dependency authority. Every metadata/build invocation is locked.
+#
+# Job layout is deliberately split so only one job ever holds contents:write:
+# - `prepare` resolves the release tag + Cargo-locked rsac identity. It makes
+#   no API mutation, so it inherits the workflow-level read-only default.
+# - `build` runs the untrusted third-party build/sign toolchain (cargo, bun,
+#   choco/apt/brew, tauri-action) and holds the code-signing secrets. It
+#   builds in tauri-action's build-only mode (no releaseId/tagName, so no
+#   GitHub Release API calls) and hands its outputs to `publish` as Actions
+#   artifacts. It also inherits the read-only default.
+# - `publish` is the only job with contents:write. It creates the draft
+#   release and attaches every platform's bundles, rsac manifests, and
+#   standalone binaries from the downloaded build artifacts.
 
 name: Release
 
@@ -33,22 +45,20 @@ on:
         required: false
         default: "false"
 
+# Default minimal token scope. Only the `publish` job elevates to write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  create-release:
-    name: Create draft release
+  prepare:
+    name: Resolve release inputs
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    permissions:
-      # Needed to call repos.createRelease via github.rest. The default token
-      # in this workflow is read-only by virtue of GitHub's recent default;
-      # explicit write keeps tag pushes working without flipping the
-      # repo-wide setting.
-      contents: write
+    timeout-minutes: 10
     outputs:
-      release_id: ${{ steps.create.outputs.result }}
       release_tag: ${{ steps.tag.outputs.tag }}
       rsac_version: ${{ steps.rsac.outputs.version }}
       rsac_revision: ${{ steps.rsac.outputs.revision }}
@@ -110,40 +120,9 @@ jobs:
             echo "- Cargo-locked rsac revision: \`$resolved_revision\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Create draft GitHub Release
-        id: create
-        if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          RSAC_RELEASE_VERSION: ${{ steps.rsac.outputs.version }}
-          RSAC_RELEASE_REVISION: ${{ steps.rsac.outputs.revision }}
-        with:
-          script: |
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: "${{ steps.tag.outputs.tag }}",
-              name: "AudioGraph ${{ steps.tag.outputs.tag }}",
-              body: [
-                "Automated release. See CHANGELOG.md for details.",
-                "",
-                "Build inputs:",
-                `- rsac version: ${process.env.RSAC_RELEASE_VERSION}`,
-                `- rsac revision: ${process.env.RSAC_RELEASE_REVISION}`,
-              ].join("\n"),
-              draft: true,
-              prerelease: false,
-            });
-            return data.id;
-          result-encoding: string
-
   build:
     name: Build (${{ matrix.platform }})
-    needs: create-release
-    permissions:
-      # tauri-action uploads built artifacts to the draft release; needs
-      # write on contents.
-      contents: write
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -151,13 +130,20 @@ jobs:
           - platform: "macos"
             runner: blacksmith-6vcpu-macos-15
             args: "--target universal-apple-darwin -- --locked"
+            cache_key: "release-macos-universal-apple-darwin"
+            build_timeout: 90
           - platform: "linux"
             runner: blacksmith-4vcpu-ubuntu-2404
             args: "-- --locked"
+            cache_key: "release-linux-x86_64"
+            build_timeout: 45
           - platform: "windows"
             runner: blacksmith-4vcpu-windows-2025
             args: "-- --locked"
+            cache_key: "release-windows-x86_64"
+            build_timeout: 45
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.build_timeout }}
     steps:
       - name: Checkout audio-graph
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
@@ -180,13 +166,54 @@ jobs:
         if: matrix.platform != 'macos'
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
+      - name: Cache Rust build (release profile)
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+          key: ${{ matrix.cache_key }}
+          # target/ holds prebuilt rlibs + build-script output. Restoring it
+          # lets cargo relink existing dependency object code instead of
+          # recompiling, and the locked-metadata assertion below only checks
+          # resolved version/revision strings, not object code, so it can't
+          # detect that. Cache only the registry (.crate archives, which
+          # cargo itself checksum-verifies against Cargo.lock) — never the
+          # target/ build output.
+          cache-targets: false
+          # Cache entries are scoped by ref, and a tag push (this workflow's
+          # primary trigger) writes to a scope no future run ever reads
+          # (each release tag is new). Unrestricted saves therefore just
+          # burn the repo-wide 10 GB cache budget — competing with ci.yml's
+          # caches — for a write nothing consumes. Restrict saves to the
+          # default branch so the only writer is a deliberate action on
+          # trunk, not every tag push or every dry-run dispatch.
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Discard any cached rsac git checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Swatinem/rust-cache unconditionally caches ~/.cargo/git/checkouts
+          # (no input disables it, unlike cache-targets above), and GitHub's
+          # cache restore does not verify restored bytes against git's
+          # content-addressable object model — it just unpacks a tarball. A
+          # poisoned cache entry could carry a tampered working tree at the
+          # correct pinned rsac revision, and the locked-metadata assertion
+          # below only checks the resolved version/revision strings against
+          # Cargo.lock (itself checked out fresh, not from cache) — it never
+          # inspects file contents, so it would not catch that. Discard the
+          # restored checkout so Cargo re-clones and checks out the pinned
+          # rev fresh: git's content-addressable model guarantees a working
+          # tree that checks out at a given commit hash cannot be swapped
+          # for arbitrary content short of a SHA-1 collision.
+          rm -rf ~/.cargo/git/checkouts/rust-crossplat-audio-capture-*
+
       - name: Verify and record Cargo-locked rsac identity
         working-directory: audio-graph/src-tauri
         shell: bash
         run: |
           set -euo pipefail
-          expected_version="${{ needs.create-release.outputs.rsac_version }}"
-          expected_revision="${{ needs.create-release.outputs.rsac_revision }}"
+          expected_version="${{ needs.prepare.outputs.rsac_version }}"
+          expected_revision="${{ needs.prepare.outputs.rsac_revision }}"
           IFS=$'\t' read -r resolved_version resolved_revision < <(
             cargo metadata --format-version 1 --locked |
               node -e '
@@ -227,13 +254,6 @@ jobs:
             echo "- revision: \`$resolved_revision\`"
             echo "- platform: \`${{ matrix.platform }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Attach rsac revision manifest
-        if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.create-release.outputs.release_tag }}" "$RUNNER_TEMP/release-metadata/rsac-${{ matrix.platform }}.txt" --clobber -R "$GITHUB_REPOSITORY"
 
       - name: Install Linux system dependencies
         if: matrix.platform == 'linux'
@@ -280,11 +300,14 @@ jobs:
         working-directory: audio-graph
         run: bun install --frozen-lockfile
 
-      - name: Build + release via tauri-action
+      - name: Build + sign via tauri-action
         if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Build-only mode: releaseId/tagName are intentionally omitted
+          # below, so tauri-action never calls the GitHub Release API —
+          # no GITHUB_TOKEN needed and no contents:write required in this
+          # job. `publish` attaches the built bundles afterward.
           # ── Apple code signing + notarization (optional) ──────────
           # Set all 6 to enable. Missing any → skip signing (unsigned DMG).
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -301,13 +324,24 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: audio-graph
-          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
 
       - name: Build local release artifacts (dry run)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
         working-directory: audio-graph
         run: bun run tauri build --ci --no-sign ${{ matrix.args }}
+
+      - name: Upload build artifacts for publish
+        if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-build-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            audio-graph/src-tauri/target/**/release/bundle/**
+            audio-graph/src-tauri/target/**/release/audio-graph*
+            ${{ runner.temp }}/release-metadata/rsac-${{ matrix.platform }}.txt
 
       - name: Upload dry-run release artifacts
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
@@ -320,46 +354,160 @@ jobs:
             audio-graph/src-tauri/target/**/release/audio-graph*
             ${{ runner.temp }}/release-metadata/rsac-${{ matrix.platform }}.txt
 
-      # ── Standalone (no-install) primary artifacts ──────────────────────
-      # Goal: "standalone primary, installer secondary." tauri-action uploads
-      # only installers + the macOS .app.tar.gz; it does NOT emit the bare
-      # Windows .exe / Linux ELF. macOS (.app.tar.gz) and Linux (.AppImage) are
-      # already no-install standalones, so the only genuine gap is the raw
-      # Windows executable — which runs in place (WebView2 is Evergreen on
-      # Win11). Attach it (and, for parity, the Linux ELF) to the same draft
-      # release. Best-effort: never fails the build if the binary is absent.
-      - name: Attach Windows standalone executable
-        if: ${{ matrix.platform == 'windows' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          ver=$(node -p "require('./audio-graph/package.json').version")
-          src="audio-graph/src-tauri/target/release/audio-graph.exe"
-          if [ ! -f "$src" ]; then
-            echo "::warning::standalone exe not found at $src — skipping"
-            exit 0
-          fi
-          dst="AudioGraph_${ver}_x64_standalone.exe"
-          cp "$src" "$dst"
-          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${{ needs.create-release.outputs.release_id }}" --jq .tag_name)
-          gh release upload "$tag" "$dst" --clobber -R "$GITHUB_REPOSITORY"
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    # Runs whenever `prepare` succeeded, regardless of individual `build`
+    # matrix-leg outcomes, so one platform's build failure degrades to a
+    # partial release instead of blocking every platform's assets. A matrix
+    # job's aggregate `needs.build.result` is "failure" if even ONE leg
+    # failed, so it can't distinguish "one platform failed" (should still
+    # publish a partial release) from "every platform failed" (should not
+    # publish anything) — that floor is enforced below, before release
+    # creation, by checking whether any build artifacts actually downloaded.
+    # `!cancelled()` (not `always()`) so cancelling the run stops publication
+    # instead of still creating/populating a draft release.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
+    permissions:
+      # The only job in this workflow that holds contents:write — kept apart
+      # from `build`, which runs the untrusted build/sign toolchain and holds
+      # the code-signing secrets, and from `prepare`, which never mutates
+      # anything.
+      contents: write
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
 
-      - name: Attach Linux standalone binary
-        if: ${{ matrix.platform == 'linux' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
+      # A platform whose build failed simply has no artifact to download —
+      # degrade to a partial release instead of failing the whole publish.
+      # Downloaded (and its zero-artifact floor, next step) BEFORE release
+      # creation: if every build leg failed, there is nothing to publish and
+      # we must not leave behind an empty draft release that reports green.
+      - name: Download build artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-build-*
+          merge-multiple: false
+
+      - name: Require at least one platform's build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=(release-build-*/)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "::error::no build artifacts were downloaded from any platform — every build leg failed (or produced nothing). Refusing to create an empty draft release."
+            exit 1
+          fi
+          echo "Found artifacts for: ${dirs[*]}"
+
+      - name: Create draft GitHub Release
+        id: create
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RSAC_RELEASE_VERSION: ${{ needs.prepare.outputs.rsac_version }}
+          RSAC_RELEASE_REVISION: ${{ needs.prepare.outputs.rsac_revision }}
+        with:
+          script: |
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: "${{ needs.prepare.outputs.release_tag }}",
+              name: "AudioGraph ${{ needs.prepare.outputs.release_tag }}",
+              body: [
+                "Automated release. See CHANGELOG.md for details.",
+                "",
+                "Build inputs:",
+                `- rsac version: ${process.env.RSAC_RELEASE_VERSION}`,
+                `- rsac revision: ${process.env.RSAC_RELEASE_REVISION}`,
+              ].join("\n"),
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+          result-encoding: string
+
+      # ── Standalone (no-install) primary artifacts ──────────────────────
+      # Goal: "standalone primary, installer secondary." tauri-action's
+      # bundles cover installers + the macOS .app.tar.gz; they do NOT
+      # include the bare Windows .exe / Linux ELF. macOS (.app.tar.gz) and
+      # Linux (.AppImage) are already no-install standalones, so the only
+      # genuine gap is the raw Windows executable — which runs in place
+      # (WebView2 is Evergreen on Win11). Attach it (and, for parity, the
+      # Linux ELF). Best-effort: never fails the release if a binary or
+      # platform artifact is absent.
+      - name: Attach bundles, rsac manifests, and standalone binaries
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          tag="${{ needs.prepare.outputs.release_tag }}"
           ver=$(node -p "require('./audio-graph/package.json').version")
-          src="audio-graph/src-tauri/target/release/audio-graph"
-          if [ ! -f "$src" ]; then
-            echo "::warning::standalone binary not found at $src — skipping"
+
+          upload() {
+            echo "Uploading $1"
+            gh release upload "$tag" "$1" --clobber -R "$GITHUB_REPOSITORY"
+          }
+
+          shopt -s nullglob
+          dirs=(release-build-*/)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "::warning::no build artifacts were downloaded — nothing to attach"
             exit 0
           fi
-          dst="AudioGraph_${ver}_x86_64_standalone"
-          cp "$src" "$dst"
-          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${{ needs.create-release.outputs.release_id }}" --jq .tag_name)
-          gh release upload "$tag" "$dst" --clobber -R "$GITHUB_REPOSITORY"
+
+          # Tauri-produced installer bundles (dmg, app.tar.gz, nsis exe,
+          # AppImage, deb) — upload only the actual deliverables, by
+          # extension. tauri-bundler does NOT clean up its staging trees
+          # after bundling (macOS `.app/`, the AppImage `.AppDir/`, the deb
+          # `control`/`data` staging dir, the dmg support/ template files
+          # all persist under bundle/ after the run completes), so a bare
+          # `find ... -type f` over `bundle/` would also pick up every file
+          # inside those staging trees — hundreds of MB of linuxdeploy-staged
+          # libs on Linux, an unversioned `audio-graph` basename colliding
+          # across all three platforms' staging binaries under
+          # `--clobber`, etc. The extensions below match
+          # bundle.targets = ["app", "dmg", "nsis", "appimage", "deb"] in
+          # src-tauri/tauri.conf.json and docs/RELEASE.md's artifact
+          # taxonomy; update both lists together if bundle.targets changes.
+          find "${dirs[@]}" -path '*/release/bundle/*' -type f \( \
+              -name '*.dmg' -o \
+              -name '*.app.tar.gz*' -o \
+              -name '*.AppImage*' -o \
+              -name '*.deb' -o \
+              -name '*-setup.exe*' \
+            \) -print0 |
+            while IFS= read -r -d '' f; do upload "$f"; done
+
+          # rsac revision manifests — upload as-is.
+          find "${dirs[@]}" -name 'rsac-*.txt' -type f -print0 |
+            while IFS= read -r -d '' f; do upload "$f"; done
+
+          win_exe=""
+          if [ -d release-build-windows ]; then
+            win_exe=$(find release-build-windows -path '*/release/audio-graph.exe' -type f | head -n1)
+          fi
+          if [ -n "$win_exe" ]; then
+            dst="AudioGraph_${ver}_x64_standalone.exe"
+            cp "$win_exe" "$dst"
+            upload "$dst"
+          else
+            echo "::warning::standalone exe not found in downloaded artifacts — skipping"
+          fi
+
+          linux_bin=""
+          if [ -d release-build-linux ]; then
+            linux_bin=$(find release-build-linux -path '*/release/audio-graph' -type f | head -n1)
+          fi
+          if [ -n "$linux_bin" ]; then
+            dst="AudioGraph_${ver}_x86_64_standalone"
+            cp "$linux_bin" "$dst"
+            upload "$dst"
+          else
+            echo "::warning::standalone binary not found in downloaded artifacts — skipping"
+          fi
