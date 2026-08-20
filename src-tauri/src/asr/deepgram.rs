@@ -3659,11 +3659,32 @@ mod tests {
     ///   `Transcript`, or a `SpeechFinal`/`EndOfTurn` `Turn` event).
     /// - The tolerant keyword threshold
     ///   ([`DEEPGRAM_SMOKE_KEYWORD_THRESHOLD`] of [`DEEPGRAM_SMOKE_KEYWORDS`])
-    ///   is met.
+    ///   is met, with >= 1 hit from EACH speaker segment.
     /// - Collected event `start` times are monotonically non-decreasing.
     /// - `disconnect()` yields a `Disconnected` event within a bounded
     ///   timeout.
     /// - The printed report contains no transcript text, raw audio, or key.
+    ///
+    /// **Close-then-drain ordering (audio-graph-1ee3).** A prior version of
+    /// this test called `client.disconnect()` only AFTER a fixed 25s
+    /// accounting drain, and separately observed `b_words=0` for the second
+    /// speaker segment despite verified-clean, verified-correct source audio
+    /// (see the 1ee3 seed history: the excerpt was proven byte-identical to
+    /// the official LibriSpeech source, so the audio was never the defect).
+    /// The real mechanism: `AudioCmd::Stop` (queued by `disconnect()`) is
+    /// what makes the writer task send Deepgram's Terminal payload + WS close
+    /// frame (`run_io`'s `Some(AudioCmd::Stop)` arm) — that is the signal
+    /// that tells Deepgram no more audio is coming and to flush any pending
+    /// utterance now, rather than keep waiting for a same-stream silence gap
+    /// that the LAST speaker segment in the fixture (unlike the first, which
+    /// is followed by a real 400ms gap) has no way to provide. Calling
+    /// `disconnect()` only after the accounting window already closed meant
+    /// that flush — and therefore the second segment's finalized words —
+    /// landed strictly AFTER counting had stopped. The fix: call
+    /// `disconnect()` immediately once all audio is sent, then keep draining
+    /// and counting `Transcript`/`Turn` events (including the ones the
+    /// close-triggered flush produces) in the SAME bounded-deadline loop,
+    /// instead of only after it.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "hits the live Deepgram API; requires DEEPGRAM_API_KEY. Run with -- --ignored"]
     async fn live_deepgram_streaming_smoke() {
@@ -3750,10 +3771,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
         }
 
-        // Drain events with a bounded OVERALL timeout, collecting only
-        // counts/booleans/timing. `transcript_lower` is a local accumulator
-        // used solely to compute a keyword-hit COUNT below — it is never
-        // printed, logged, or stored beyond this scope.
+        // Send the close signal IMMEDIATELY once all audio is sent — not
+        // after a fixed wait. `disconnect()` queues `AudioCmd::Stop`, which
+        // is what makes the writer task send Deepgram's Terminal payload +
+        // WS close frame (`run_io`'s `Some(AudioCmd::Stop)` arm); THAT is
+        // Deepgram's real end-of-audio completion signal, not a fixed clock
+        // duration. See the doc comment above for why a fixed pre-disconnect
+        // wait was audio-graph-1ee3's actual root cause.
+        let disconnect_started = std::time::Instant::now();
+        client.disconnect();
+
+        // Drain + count events in ONE continuous, bounded-deadline window
+        // that starts AFTER the close signal above, so the finalize flush
+        // Deepgram sends in response to it lands INSIDE this accounting
+        // window rather than after it. `transcript_lower` is a local
+        // accumulator used solely to compute a keyword-hit COUNT below — it
+        // is never printed, logged, or stored beyond this scope.
         let overall_deadline = std::time::Instant::now() + Duration::from_secs(25);
         let mut transcript_events = 0usize;
         let mut turn_events = 0usize;
@@ -3769,6 +3802,16 @@ mod tests {
         // utterance 1320-122617-0022 (metadata defect).
         let mut segment_a_words = 0usize;
         let mut segment_b_words = 0usize;
+        // `disconnect()` above fires the client-side `Disconnected` event
+        // essentially immediately — it is a local, deduped, one-shot signal
+        // (`emit_disconnected_once`), not proof the server round-trip
+        // finished — almost certainly before the writer's Terminal+close
+        // frame has even reached Deepgram. Recording it here, without
+        // breaking the loop, means this same loop keeps counting whatever
+        // Transcript/Turn events the close-triggered flush produces, and the
+        // later "did we see Disconnected" check does not have to re-drain a
+        // channel this loop may have already consumed it from.
+        let mut disconnected_at: Option<std::time::Instant> = None;
         while std::time::Instant::now() < overall_deadline {
             let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
             let slice = remaining.min(Duration::from_millis(500));
@@ -3808,10 +3851,15 @@ mod tests {
                         speech_final_seen = true;
                     }
                 }
+                Some(DeepgramEvent::Disconnected) => {
+                    disconnected_at.get_or_insert_with(std::time::Instant::now);
+                }
                 Some(_) | None => {
-                    // Either a non-transcript/turn event (Error/Connected/
-                    // Reconnecting/...) or nothing arrived in this slice —
-                    // keep polling until the overall deadline above.
+                    // Either a non-transcript/turn/disconnected event
+                    // (Error/Connected/Reconnecting/...) or nothing arrived
+                    // in this slice — keep polling until the overall
+                    // deadline above, so a flush that lands late (but still
+                    // inside the window) is not missed.
                 }
             }
         }
@@ -3836,9 +3884,6 @@ mod tests {
         let timing_monotonic = timing_is_monotonic_nondecreasing(&starts);
         drop(transcript_lower); // never persisted or printed beyond this point
 
-        let disconnect_started = std::time::Instant::now();
-        client.disconnect();
-
         // Drop the client OFF this test's tokio runtime thread, explicitly and
         // BEFORE the strict-pass marker prints below. `Drop for
         // DeepgramStreamingClient` calls `rt.shutdown_timeout(..)` on the
@@ -3848,33 +3893,36 @@ mod tests {
         // allowed"). Letting `client` fall out of scope implicitly at the end
         // of this async fn body would hit that panic AFTER the marker had
         // already printed — a green-looking log over a failed live test.
-        // `disconnect()` above already queued the `Disconnected` event
-        // synchronously (`emit_disconnected_once`), so moving the drop here,
-        // ahead of the drain loop below, does not change what that loop
-        // observes.
         tokio::task::spawn_blocking(move || drop(client))
             .await
             .expect("spawn_blocking join for client drop");
 
-        let mut disconnected = false;
-        let disconnect_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < disconnect_deadline {
-            let remaining =
-                disconnect_deadline.saturating_duration_since(std::time::Instant::now());
-            match try_recv_event(&event_rx, remaining.min(Duration::from_millis(200))).await {
-                Some(DeepgramEvent::Disconnected) => {
-                    disconnected = true;
-                    break;
+        // Safety net: the accounting loop above almost always observes
+        // `Disconnected` itself (see the comment above `disconnected_at`'s
+        // declaration), but if it somehow did not, give it one more short,
+        // bounded chance rather than asserting on a technicality.
+        if disconnected_at.is_none() {
+            let disconnect_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while disconnected_at.is_none() && std::time::Instant::now() < disconnect_deadline {
+                let remaining =
+                    disconnect_deadline.saturating_duration_since(std::time::Instant::now());
+                if let Some(DeepgramEvent::Disconnected) =
+                    try_recv_event(&event_rx, remaining.min(Duration::from_millis(200))).await
+                {
+                    disconnected_at = Some(std::time::Instant::now());
                 }
-                _ => continue,
             }
         }
         assert!(
-            disconnected,
+            disconnected_at.is_some(),
             "Disconnected event must arrive within the bounded close timeout"
         );
-        let disconnect_ms =
-            u64::try_from(disconnect_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let disconnect_ms = disconnected_at
+            .map(|at| {
+                u64::try_from(at.saturating_duration_since(disconnect_started).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+            .unwrap_or(u64::MAX);
 
         let report = StreamingSmokeReport {
             status: "ok",
