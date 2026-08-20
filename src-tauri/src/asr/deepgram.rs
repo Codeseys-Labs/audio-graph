@@ -3388,4 +3388,516 @@ mod tests {
             "expected HTTP 400 for the invalid bare `general` model, got {rejected}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // LIVE streaming smoke (env-gated; #[ignore]d so CI without a key stays
+    // green). Wave 4 (audio-graph-315d): unlike the handshake test above,
+    // which only proves the raw WS upgrade accepts `nova-3`, this test drives
+    // the REAL `DeepgramStreamingClient` end to end (`connect` -> `send_audio`
+    // -> `event_rx` -> `disconnect`) with a checked-in speech fixture and
+    // requires normalized partial/final transcript events plus a bounded
+    // close.
+    // -----------------------------------------------------------------------
+
+    /// Sanitized metrics-only summary of one Deepgram streaming smoke run.
+    ///
+    /// **Content-free by construction**, mirroring
+    /// `openrouter::tests::RoutedSmokeReport` (audio-graph-fe7b/8772): every
+    /// field is a count, a boolean, a duration, or a short status/model
+    /// string — never transcript text, raw audio, or the API key.
+    /// [`Self::has_no_content_fields`] exists so a unit test can assert the
+    /// guarantee holds without inspecting field values.
+    #[derive(Debug, Serialize)]
+    pub(crate) struct StreamingSmokeReport {
+        /// `"ok"` on success. Never contains transcript text.
+        pub status: &'static str,
+        /// Model requested for the session (e.g. `"nova-3"`).
+        pub model: String,
+        /// Count of normalized `DeepgramEvent::Transcript` events received.
+        pub transcript_events: usize,
+        /// Count of normalized `DeepgramEvent::Turn` events received.
+        pub turn_events: usize,
+        /// Whether any event signaled the end of a spoken turn: either a
+        /// `Transcript { speech_final: true, .. }` or a
+        /// `Turn { kind: SpeechFinal | EndOfTurn, .. }`.
+        pub speech_final_seen: bool,
+        /// Case-insensitive substring hit count against a fixed, content-free
+        /// keyword list drawn from the fixture's reference transcript. The
+        /// keywords themselves never appear in this report — only the count.
+        pub keyword_hits: usize,
+        pub keyword_threshold: usize,
+        pub keyword_total: usize,
+        /// Whether the collected event `start` times were non-decreasing.
+        pub timing_monotonic: bool,
+        /// Wall-clock time to complete the authenticated WS connect.
+        pub connect_ms: u64,
+        /// Wall-clock time from calling `disconnect()` to observing the
+        /// `Disconnected` event.
+        pub disconnect_ms: u64,
+    }
+
+    impl StreamingSmokeReport {
+        /// Returns `true` — exists so a unit test can prove the guarantee is
+        /// structural (see `RoutedSmokeReport::has_no_content_fields` in
+        /// `openrouter.rs` for the same pattern). Combined with this struct
+        /// having no field capable of carrying transcript/audio/key content,
+        /// this satisfies the privacy invariant for audio-graph-315d.
+        pub(crate) fn has_no_content_fields(&self) -> bool {
+            true
+        }
+    }
+
+    /// Fixed, content-free keyword list drawn from the `turn-taking-speech`
+    /// fixture's manifest-derived reference transcript (audio-graph-315d,
+    /// Wave 4 plan §3), TIMING-filtered rather than merely rarity-filtered:
+    /// the reference sentences are "CONCORD RETURNED TO ITS PLACE AMIDST THE
+    /// TENTS" (speaker A, 0-3000ms) and "THE DELAWARES ARE CHILDREN OF THE
+    /// TORTOISE AND THEY OUTSTRIP THE DEER" (speaker B, 3400-6400ms per
+    /// `fixtures/audio_signal/manifest.json`), but each component WAV is
+    /// documented as a **3-second excerpt**
+    /// (`fixtures/source_separation/manifest.json`'s `generation.notes`), and
+    /// its reference transcript's own ASR status is `"pending_real_run"` —
+    /// i.e. unverified against a real transcription of these specific 3s
+    /// clips. Measuring the 100ms-window RMS envelope at the tail of both
+    /// component WAVs shows sustained speech-level energy (~1060 / ~3670)
+    /// right up to the 3.000s cut, not a taper into silence — both clips are
+    /// almost certainly truncated mid-utterance, not naturally finished. The
+    /// full sentences are independently verifiable public-domain text (Dumas,
+    /// "The Vicomte de Bragelonne" / Cooper, "The Last of the Mohicans"); at
+    /// a typical ~2.5-2.7 words/sec audiobook narration pace, 8-word "Concord
+    /// ... tents" plausibly finishes right AT ~3.0-3.3s (its tail word
+    /// "tents" is a coin flip), while 12-word "The Delawares ... deer" needs
+    /// ~4.5-5.5s — meaning its own tail words "tortoise" and "outstrip" are
+    /// very likely NOT present in this 3-second excerpt at all. Both original
+    /// keywords were originally drawn from the version at risk of truncation.
+    ///
+    /// This list instead uses only the words estimated to land BEFORE the
+    /// truncation point on both sides (word 1 and word 6-of-8 for speaker A;
+    /// word 2 and word 4-of-12 for speaker B — all comfortably under the
+    /// ~2.5s mark by the same pace estimate), and matches on a shortened
+    /// substring for the two words most exposed to real ASR wording/
+    /// punctuation variance: `"amid"` (also matches an "amidst" rendering)
+    /// and `"delaware"` (also matches a "Delaware's" rendering, where the
+    /// apostrophe would otherwise defeat a `"delawares"` substring match).
+    /// Exactly 2 keywords are drawn from EACH speaker segment, so the >= 3-of-4
+    /// tolerant threshold below structurally guarantees at least one hit from
+    /// BOTH segments (3 can only split 2+1 or 1+2 across two 2-item groups,
+    /// never 3+0) — preserving the original "both halves actually
+    /// transcribed" proof without pinning exact wording.
+    ///
+    /// Still not independently confirmed against a real transcription of
+    /// these exact clips (no real Deepgram key is available in this
+    /// environment) — record the actual `keyword_hits` from the first live
+    /// dispatched run in `docs/ops/protected-provider-smoke.md` and revisit
+    /// this list/threshold if it undershoots.
+    const DEEPGRAM_SMOKE_KEYWORDS: [&str; 4] = ["concord", "amid", "delaware", "children"];
+    /// Tolerant threshold: at least 3 of the 4 keywords above (miss at most
+    /// one), not an exact match — real ASR wording/casing/punctuation varies
+    /// run to run. See the keyword list's doc comment for why 3-of-4 (with 2
+    /// keywords per speaker segment) still guarantees both-segments coverage.
+    const DEEPGRAM_SMOKE_KEYWORD_THRESHOLD: usize = 3;
+
+    /// Case-insensitive substring hit count against `keywords`.
+    /// `transcript_lower` is only ever a LOCAL accumulator in the caller —
+    /// this function returns a count, never the text.
+    fn keyword_hit_count(transcript_lower: &str, keywords: &[&str]) -> usize {
+        keywords
+            .iter()
+            .filter(|keyword| transcript_lower.contains(*keyword))
+            .count()
+    }
+
+    /// `true` when `starts` is non-decreasing (duplicate timestamps are
+    /// allowed; a strict decrease is not) — Deepgram's own event-ordering
+    /// guarantee for a single streaming session.
+    fn timing_is_monotonic_nondecreasing(starts: &[f64]) -> bool {
+        starts.windows(2).all(|pair| pair[1] >= pair[0])
+    }
+
+    /// Poll `rx` non-blockingly until an event arrives or `timeout` elapses.
+    /// Unlike `recv_event` above, this never panics on timeout — it returns
+    /// `None` — so a caller can distinguish "nothing arrived in this slice,
+    /// keep going" from "the overall bounded wait is exhausted" without a
+    /// panic-driven control-flow surprise mid-drain.
+    async fn try_recv_event(
+        rx: &crossbeam_channel::Receiver<DeepgramEvent>,
+        timeout: Duration,
+    ) -> Option<DeepgramEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(event) = rx.try_recv() {
+                return Some(event);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn streaming_smoke_report_has_no_content_fields() {
+        let report = StreamingSmokeReport {
+            status: "ok",
+            model: DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
+            transcript_events: 4,
+            turn_events: 1,
+            speech_final_seen: true,
+            keyword_hits: 3,
+            keyword_threshold: DEEPGRAM_SMOKE_KEYWORD_THRESHOLD,
+            keyword_total: DEEPGRAM_SMOKE_KEYWORDS.len(),
+            timing_monotonic: true,
+            connect_ms: 120,
+            disconnect_ms: 45,
+        };
+        assert!(report.has_no_content_fields());
+
+        let json = serde_json::to_string_pretty(&report).expect("report must serialize");
+        let json_lower = json.to_lowercase();
+        for keyword in DEEPGRAM_SMOKE_KEYWORDS {
+            assert!(
+                !json_lower.contains(keyword),
+                "report JSON must not contain keyword text itself, only counts: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyword_hit_count_matches_case_insensitively_and_tolerates_misses() {
+        // Only 3 of the 4 keywords appear ("children" is missing) — proves
+        // the tolerant threshold (3) is met without every keyword present.
+        let transcript = "concord returned to its place amid the tents the delaware are here";
+        assert_eq!(
+            keyword_hit_count(transcript, &DEEPGRAM_SMOKE_KEYWORDS),
+            3,
+            "concord, amid, delaware should hit; children should not"
+        );
+    }
+
+    #[test]
+    fn keyword_hit_count_tolerates_wording_variance_on_amid_and_delaware() {
+        // Real ASR renderings this substring choice is specifically meant to
+        // survive: "amidst" (not just bare "amid") and a possessive-looking
+        // "Delaware's" (apostrophe would defeat a `"delawares"` substring
+        // match).
+        let transcript = "concord returned amidst the tents; delaware's children were there";
+        assert_eq!(
+            keyword_hit_count(transcript, &DEEPGRAM_SMOKE_KEYWORDS),
+            4,
+            "amidst/delaware's renderings must still count as hits on amid/delaware"
+        );
+    }
+
+    #[test]
+    fn keyword_hit_count_is_zero_for_empty_transcript() {
+        // Proves the threshold check fails CLOSED on empty input — e.g. a
+        // stalled drain loop that never accumulated any final text — rather
+        // than accidentally passing via a threshold/total mix-up.
+        let hits = keyword_hit_count("", &DEEPGRAM_SMOKE_KEYWORDS);
+        assert_eq!(hits, 0);
+        assert!(
+            hits < DEEPGRAM_SMOKE_KEYWORD_THRESHOLD,
+            "an empty transcript must NOT satisfy the tolerant keyword threshold"
+        );
+    }
+
+    #[test]
+    fn keyword_hit_count_ignores_keywordless_unrelated_text() {
+        assert_eq!(
+            keyword_hit_count(
+                "the quick brown fox jumps over the lazy dog",
+                &DEEPGRAM_SMOKE_KEYWORDS
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn timing_is_monotonic_nondecreasing_true_for_sorted_starts_with_duplicates() {
+        // Duplicate timestamps (two events reporting the same `start`) must
+        // NOT be flagged as non-monotonic — only a strict decrease should be.
+        assert!(timing_is_monotonic_nondecreasing(&[
+            0.0, 0.5, 0.5, 1.2, 3.4
+        ]));
+        assert!(timing_is_monotonic_nondecreasing(&[]));
+        assert!(timing_is_monotonic_nondecreasing(&[5.0]));
+    }
+
+    #[test]
+    fn timing_is_monotonic_nondecreasing_false_for_a_decrease() {
+        assert!(!timing_is_monotonic_nondecreasing(&[0.0, 1.0, 0.9, 2.0]));
+    }
+
+    /// LIVE, network-dependent proof that the REAL `DeepgramStreamingClient`
+    /// (not the raw-`tungstenite` handshake helper used above) can connect,
+    /// stream a checked-in speech fixture, receive normalized transcript/turn
+    /// events, and close within a bounded timeout. IGNORED by default so CI
+    /// (which has no key) stays green.
+    ///
+    /// Run manually with a real key:
+    ///
+    /// ```text
+    /// DEEPGRAM_API_KEY=dg_xxx cargo test --no-default-features --features cloud \
+    ///     -p audio-graph deepgram::tests::live_deepgram_streaming_smoke \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// **Missing-credential handling (audio-graph-315d).** Unlike the
+    /// handshake test above (which `panic!`s on a missing key), an absent
+    /// `DEEPGRAM_API_KEY` here prints an explicit "expected-unavailable"
+    /// precondition line and returns *without* panicking. The protected CI
+    /// job's vacuous-pass guard tells this apart from a real pass by
+    /// requiring the separate `"deepgram streaming smoke strict pass:"`
+    /// marker string, which ONLY the real assertion path below ever prints —
+    /// a precondition-skip and a genuine pass both exit the test function
+    /// successfully, but only one of them leaves that marker in the log.
+    ///
+    /// Asserts (live path):
+    /// - The real `connect()` succeeds (authenticated WS handshake) and emits
+    ///   `Connected` first.
+    /// - At least one normalized `Transcript` event fires.
+    /// - At least one event signals end-of-turn (`speech_final` on a
+    ///   `Transcript`, or a `SpeechFinal`/`EndOfTurn` `Turn` event).
+    /// - The tolerant keyword threshold
+    ///   ([`DEEPGRAM_SMOKE_KEYWORD_THRESHOLD`] of [`DEEPGRAM_SMOKE_KEYWORDS`])
+    ///   is met.
+    /// - Collected event `start` times are monotonically non-decreasing.
+    /// - `disconnect()` yields a `Disconnected` event within a bounded
+    ///   timeout.
+    /// - The printed report contains no transcript text, raw audio, or key.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "hits the live Deepgram API; requires DEEPGRAM_API_KEY. Run with -- --ignored"]
+    async fn live_deepgram_streaming_smoke() {
+        let Ok(api_key) = std::env::var("DEEPGRAM_API_KEY") else {
+            println!(
+                "deepgram streaming smoke precondition-skip: DEEPGRAM_API_KEY not set — \
+                 expected-unavailable, not a regression. Run with a real key: \
+                 DEEPGRAM_API_KEY=dg_xxx cargo test -p audio-graph \
+                 deepgram::tests::live_deepgram_streaming_smoke -- --ignored --nocapture"
+            );
+            return;
+        };
+        assert!(!api_key.trim().is_empty(), "DEEPGRAM_API_KEY is empty");
+
+        // Load + decode the checked-in speech fixture. Its sha256/duration
+        // are pinned in `fixtures/audio_signal/manifest.json` and verified
+        // elsewhere (`audio_signal_fixtures.rs`); this test trusts that pin
+        // rather than re-checking the hash itself.
+        let fixture_bytes = std::fs::read("fixtures/audio_signal/audio/turn-taking-speech.wav")
+            .expect("turn-taking-speech.wav fixture must be checked in");
+        let wav = crate::audio::wav_io::decode(&fixture_bytes)
+            .expect("fixture must decode as a canonical WAV");
+        assert_eq!(
+            wav.sample_rate, 16_000,
+            "fixture must be 16kHz mono per manifest"
+        );
+        assert_eq!(wav.channels, 1, "fixture must be mono per manifest");
+        // i16 -> f32 using the SAME scaling convention the pipeline's encode
+        // side uses (`crate::audio::pcm::f32_sample_to_pcm_s16`), so this is a
+        // faithful round trip, not an ad hoc rescale (see `pcm::tests::
+        // pcm_s16_to_f32_round_trips_through_the_encode_side_convention`).
+        let samples_f32 = crate::audio::pcm::pcm_s16_to_f32(&wav.samples);
+
+        let config = DeepgramConfig {
+            api_key,
+            model: DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
+            enable_diarization: false,
+            endpointing_ms: None,
+            utterance_end_ms: None,
+            vad_events: false,
+            eot_threshold: None,
+            eager_eot_threshold: None,
+            eot_timeout_ms: None,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+        };
+
+        let client = DeepgramStreamingClient::new(config);
+        let connect_started = std::time::Instant::now();
+        // `connect()` builds its OWN dedicated multi-thread tokio runtime and
+        // calls `rt.block_on(..)` on it (see `DeepgramStreamingClient::connect`)
+        // to perform the initial WS handshake synchronously. Calling that
+        // directly from this test's own tokio runtime thread panics with
+        // "Cannot start a runtime from within a runtime" (tokio forbids
+        // entering a second runtime from a thread that is already driving
+        // one). `spawn_blocking` moves the call onto a plain blocking-pool
+        // thread that carries no runtime context, matching the pattern
+        // `live_openrouter_routed_smoke` already uses for its own blocking
+        // client call (openrouter.rs).
+        let client = tokio::task::spawn_blocking(move || {
+            let mut client = client;
+            client
+                .connect()
+                .expect("real DeepgramStreamingClient::connect() must succeed with a valid key");
+            client
+        })
+        .await
+        .expect("spawn_blocking join for connect()");
+        let connect_ms = u64::try_from(connect_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let event_rx = client.event_rx();
+        match recv_event(&event_rx, Duration::from_secs(5)).await {
+            DeepgramEvent::Connected => {}
+            other => panic!("expected Connected as the first event, got {other:?}"),
+        }
+
+        // Stream at the pipeline's real chunk cadence with paced sleeps —
+        // not one giant frame dump — so Deepgram sees realistic timing.
+        let chunk_ms = crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS;
+        let chunk_samples = ((u64::from(wav.sample_rate) * chunk_ms / 1000) as usize).max(1);
+        for chunk in samples_f32.chunks(chunk_samples) {
+            client
+                .send_audio(chunk)
+                .expect("send_audio must accept fixture PCM on a healthy connection");
+            tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
+        }
+
+        // Drain events with a bounded OVERALL timeout, collecting only
+        // counts/booleans/timing. `transcript_lower` is a local accumulator
+        // used solely to compute a keyword-hit COUNT below — it is never
+        // printed, logged, or stored beyond this scope.
+        let overall_deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let mut transcript_events = 0usize;
+        let mut turn_events = 0usize;
+        let mut speech_final_seen = false;
+        let mut starts: Vec<f64> = Vec::new();
+        let mut transcript_lower = String::new();
+        while std::time::Instant::now() < overall_deadline {
+            let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
+            let slice = remaining.min(Duration::from_millis(500));
+            match try_recv_event(&event_rx, slice).await {
+                Some(DeepgramEvent::Transcript {
+                    text,
+                    is_final,
+                    speech_final,
+                    start,
+                    ..
+                }) => {
+                    transcript_events += 1;
+                    starts.push(start);
+                    if speech_final {
+                        speech_final_seen = true;
+                    }
+                    if is_final || speech_final {
+                        transcript_lower.push_str(&text.to_ascii_lowercase());
+                        transcript_lower.push(' ');
+                    }
+                }
+                Some(DeepgramEvent::Turn { kind, start, .. }) => {
+                    turn_events += 1;
+                    if let Some(start) = start {
+                        starts.push(start);
+                    }
+                    if matches!(
+                        kind,
+                        DeepgramTurnKind::SpeechFinal | DeepgramTurnKind::EndOfTurn
+                    ) {
+                        speech_final_seen = true;
+                    }
+                }
+                Some(_) | None => {
+                    // Either a non-transcript/turn event (Error/Connected/
+                    // Reconnecting/...) or nothing arrived in this slice —
+                    // keep polling until the overall deadline above.
+                }
+            }
+        }
+
+        let keyword_hits = keyword_hit_count(&transcript_lower, &DEEPGRAM_SMOKE_KEYWORDS);
+        let timing_monotonic = timing_is_monotonic_nondecreasing(&starts);
+        drop(transcript_lower); // never persisted or printed beyond this point
+
+        let disconnect_started = std::time::Instant::now();
+        client.disconnect();
+
+        // Drop the client OFF this test's tokio runtime thread, explicitly and
+        // BEFORE the strict-pass marker prints below. `Drop for
+        // DeepgramStreamingClient` calls `rt.shutdown_timeout(..)` on the
+        // internal runtime `connect()` built, and tokio forbids that blocking
+        // join from inside any runtime's own async task context (it panics
+        // with "Cannot drop a runtime in a context where blocking is not
+        // allowed"). Letting `client` fall out of scope implicitly at the end
+        // of this async fn body would hit that panic AFTER the marker had
+        // already printed — a green-looking log over a failed live test.
+        // `disconnect()` above already queued the `Disconnected` event
+        // synchronously (`emit_disconnected_once`), so moving the drop here,
+        // ahead of the drain loop below, does not change what that loop
+        // observes.
+        tokio::task::spawn_blocking(move || drop(client))
+            .await
+            .expect("spawn_blocking join for client drop");
+
+        let mut disconnected = false;
+        let disconnect_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < disconnect_deadline {
+            let remaining =
+                disconnect_deadline.saturating_duration_since(std::time::Instant::now());
+            match try_recv_event(&event_rx, remaining.min(Duration::from_millis(200))).await {
+                Some(DeepgramEvent::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            disconnected,
+            "Disconnected event must arrive within the bounded close timeout"
+        );
+        let disconnect_ms =
+            u64::try_from(disconnect_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let report = StreamingSmokeReport {
+            status: "ok",
+            model: DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
+            transcript_events,
+            turn_events,
+            speech_final_seen,
+            keyword_hits,
+            keyword_threshold: DEEPGRAM_SMOKE_KEYWORD_THRESHOLD,
+            keyword_total: DEEPGRAM_SMOKE_KEYWORDS.len(),
+            timing_monotonic,
+            connect_ms,
+            disconnect_ms,
+        };
+
+        assert!(report.has_no_content_fields());
+        assert!(
+            report.transcript_events >= 1,
+            "expected at least one normalized Transcript event, got 0"
+        );
+        assert!(
+            report.speech_final_seen,
+            "expected a speech_final Transcript or a SpeechFinal/EndOfTurn Turn event"
+        );
+        assert!(
+            report.keyword_hits >= report.keyword_threshold,
+            "expected >= {}/{} tolerant keyword hits, got {}",
+            report.keyword_threshold,
+            report.keyword_total,
+            report.keyword_hits
+        );
+        assert!(
+            report.timing_monotonic,
+            "collected event start times must be non-decreasing"
+        );
+
+        let report_json =
+            serde_json::to_string_pretty(&report).expect("StreamingSmokeReport must serialize");
+        println!("\n=== StreamingSmokeReport (audio-graph-315d) ===");
+        println!("{report_json}");
+        println!("================================================\n");
+
+        // Stable, greppable pass marker for `protected-provider-smoke.yml`'s
+        // vacuous-pass guard — see `openrouter.rs`'s matching marker for why
+        // cargo's exit code alone is not sufficient evidence (a `--exact`
+        // typo matching zero tests, or this same precondition-skip path,
+        // both exit the process successfully with no such line printed).
+        println!(
+            "deepgram streaming smoke strict pass: transcripts={} speech_final={} keyword_hits={}/{}",
+            report.transcript_events,
+            report.speech_final_seen,
+            report.keyword_hits,
+            report.keyword_total
+        );
+    }
 }

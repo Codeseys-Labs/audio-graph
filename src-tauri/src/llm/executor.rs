@@ -844,7 +844,14 @@ fn api_route_for_client(
 /// where `route.openrouter` sharpens into `route.cerebras_via_openrouter`: the
 /// routing policy reaches this layer only through `OpenRouterConfig`, and both
 /// routes gate on `llm.openrouter`, so the refinement cannot widen egress.
-fn openrouter_route_for_client(
+///
+/// `pub(crate)` (not private) so `openrouter::tests::live_openrouter_routed_smoke`
+/// can dispatch through the EXACT function production traffic uses
+/// (audio-graph-8772, Wave 4) instead of re-deriving an equivalent call from
+/// `route_for_openrouter_policy` alone — the live smoke exercises the same
+/// `AuthorizedRoute` + refinement gate `executor.rs` itself runs, not a
+/// parallel approximation of it.
+pub(crate) fn openrouter_route_for_client(
     route: &AuthorizedRoute,
     client: &OpenRouterClient,
 ) -> Result<&'static crate::llm::route::RouteDescriptor, String> {

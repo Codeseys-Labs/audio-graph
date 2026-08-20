@@ -1,0 +1,224 @@
+# Protected Provider Smoke — Tier C evidence, NOT a required PR gate.
+#
+# This workflow never runs on `pull_request` (schedule + workflow_dispatch
+# only), so it cannot appear as a required status check on a PR by
+# construction — mirroring `audio-signal-nightly.yml`'s comment on the same
+# point. It exists to prove that AudioGraph's REAL Deepgram streaming client
+# and REAL OpenRouter routed-dispatch path (not a mock, and not a raw ad hoc
+# client call) still authenticate and behave against the live providers'
+# current protocol (audio-graph-315d / audio-graph-8772, Wave 4).
+#
+# One job, one OS (Blacksmith Linux) — the provider protocol is OS-independent,
+# so this deliberately does NOT matrix across macOS/Windows (that would call
+# each live provider 3x for zero additional protocol coverage and 3x the
+# secret exposure surface).
+#
+# Secrets live in the `real-key-testing` GitHub Environment, which SHOULD
+# ALSO be configured (repo Settings -> Environments) as
+# deployment-branch-restricted to `master` — but the job itself carries an
+# explicit `if: github.ref == 'refs/heads/master'` guard so master-only
+# enforcement does not rest solely on that repo setting (which this YAML
+# cannot verify, and which GitHub auto-creates with NO protection rules the
+# first time an as-yet-unconfigured Environment name is referenced).
+#
+# Third-party actions are SHA-pinned with the exact same SHAs `ci.yml` and
+# `audio-signal-nightly.yml` use, for the same reproducibility reason.
+
+name: Protected Provider Smoke (Tier C evidence)
+
+on:
+  schedule:
+    # Offset from audio-signal-nightly's "47 3 * * *" by a different hour AND
+    # minute so the two Tier C nightly jobs do not contend for Blacksmith
+    # Linux runners or rate-limit the same provider accounts at the same
+    # instant.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  live-provider-smoke:
+    name: Live Deepgram + OpenRouter smoke (Blacksmith Linux) — Tier C, not a PR gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # In-workflow ref guard, IN ADDITION TO (not instead of) the
+    # `real-key-testing` Environment's own deployment-branch policy below.
+    # That repo-settings policy is a precondition this YAML cannot verify or
+    # enforce, and referencing an Environment name that does not exist yet
+    # auto-creates it with NO protection rules on the first run — so
+    # master-only enforcement must not rest on that setting alone. This `if`
+    # makes it hold by construction: a `workflow_dispatch` (or, in principle,
+    # a `schedule`) run on any other ref skips the whole job before any
+    # credentialed step, regardless of how the Environment ends up
+    # configured.
+    if: github.ref == 'refs/heads/master'
+    # Branch-restricted deployment Environment: secrets below are only
+    # readable when this workflow run's ref is the protected branch. See the
+    # header comment — this Environment must exist in repo settings already.
+    environment: real-key-testing
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+
+      # `--features cloud` still pulls in an unconditional `tauri` dependency
+      # (see src-tauri/Cargo.toml), so the Linux build needs the same
+      # webkit2gtk/gtk3 system chain `ci.yml`'s `rust-cloud-smoke` job installs
+      # for its own `--no-default-features --features cloud` build — this is
+      # NOT the virtual-audio PipeWire adapter `audio-signal-nightly.yml`
+      # needs (no real audio device is used here), just the link-time system
+      # dependencies for compiling the crate at all.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config xvfb
+
+      # Fresh evidence every run: target/ is restored from Swatinem/rust-cache,
+      # so a stale target/protected-smoke-logs/*.log from a previous run could
+      # otherwise satisfy this run's own vacuous-pass guard below without this
+      # run's tests having done anything (same concern documented in
+      # audio-signal-nightly.yml).
+      - name: Fresh evidence directory
+        working-directory: audio-graph/src-tauri
+        run: |
+          rm -rf target/protected-smoke-logs
+          mkdir -p target/protected-smoke-logs
+
+      # Compile the (ignored-by-default) live smoke tests ONCE, with no
+      # per-step timeout pressure from network I/O — cold-cache compilation of
+      # this crate's full `cloud` feature tree (Tauri, AWS SDK, rustls, ...)
+      # can legitimately take longer than either live-call step's own bounded
+      # budget below. `--no-run` compiles the test binary without executing
+      # anything, so no secret is needed for this step.
+      - name: Build provider smoke test binaries once
+        working-directory: audio-graph/src-tauri
+        timeout-minutes: 20
+        run: |
+          cargo build --locked -p audio-graph --lib --no-default-features --features cloud
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud --no-run
+
+      # Per-step timeout is intentionally NOT sized to Deepgram's full
+      # documented reconnect ladder (up to ~458s worst case across every rung
+      # — see src/asr/deepgram.rs's RECONNECT_AUDIO_BUFFER_MAX_CHUNKS comment);
+      # this smoke connects once and does not exercise a mid-session drop, so
+      # its own internal bounds (~15s connect + ~6.4s fixture audio + <=25s
+      # drain + <=5s disconnect wait) total well under a minute in the healthy
+      # case. 8 minutes leaves generous headroom above that for provider-side
+      # latency without silently waiting out a genuine multi-minute outage,
+      # which should fail this smoke rather than hang the job.
+      - name: Run Deepgram streaming smoke
+        working-directory: audio-graph/src-tauri
+        timeout-minutes: 8
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+        run: |
+          xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features cloud \
+            asr::deepgram::tests::live_deepgram_streaming_smoke -- --exact --ignored --nocapture \
+            | tee target/protected-smoke-logs/deepgram.log
+
+      - name: Run OpenRouter routed smoke
+        working-directory: audio-graph/src-tauri
+        timeout-minutes: 5
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features cloud \
+            llm::openrouter::tests::live_openrouter_routed_smoke -- --exact --ignored --nocapture \
+            | tee target/protected-smoke-logs/openrouter.log
+
+      # Belt-and-suspenders against a green job that asserted nothing: cargo
+      # exits 0 both when a live smoke genuinely passes AND when `--exact`
+      # matches zero tests (a stale/typo test path — "0 passed; 0 failed" is
+      # still exit 0) or when the credential precondition was not met (this
+      # repo's live smokes print an explicit precondition-skip line and
+      # return `Ok` rather than panicking — audio-graph-315d). Both vacuous-pass
+      # shapes leave NO matching "strict pass" line in the log, so require one
+      # explicitly instead of trusting cargo's exit code alone (mirrors
+      # audio-signal-nightly.yml's `run_pass` guard exactly).
+      - name: Vacuous-pass guard — require the strict pass marker, not just exit 0
+        working-directory: audio-graph/src-tauri
+        run: |
+          status=0
+          grep -qF "deepgram streaming smoke strict pass:" target/protected-smoke-logs/deepgram.log \
+            || { echo "::error::no deepgram strict-pass marker in deepgram.log — 0-tests-matched or a credential precondition-skip may be masquerading as green"; status=1; }
+          grep -qF "openrouter routed smoke strict pass:" target/protected-smoke-logs/openrouter.log \
+            || { echo "::error::no openrouter strict-pass marker in openrouter.log — 0-tests-matched or a credential precondition-skip may be masquerading as green"; status=1; }
+          exit "$status"
+
+      # Docs/Seeds-scoped gate (f3e3): the scanner's allowlist is deliberately
+      # narrow (see scripts/check-docs-secret-hygiene.mjs's comment on why a
+      # broad docs/ or .seeds/ exemption would defeat audio-graph-de28) and it
+      # accepts no path argument, so it is run here UNMODIFIED over its fixed
+      # scanRoots (docs/.seeds/README.md/AGENTS.md) — this covers any narrative
+      # written back into Seeds/docs about this smoke, not the smoke evidence
+      # artifact itself (that is the separate step below).
+      - name: Secret-hygiene scan (docs/Seeds narrative)
+        if: always()
+        working-directory: audio-graph
+        run: bun scripts/check-docs-secret-hygiene.mjs
+
+      # Evidence-specific gate (f3e3). check-docs-secret-hygiene.mjs cannot see
+      # target/protected-smoke-logs/ (outside its scanRoots, and it takes no
+      # --path argument by design), so this is a SEPARATE, explicit,
+      # defense-in-depth check bound to the exact secret values THIS run
+      # actually holds — in addition to, not instead of, the structural
+      # content-free report guarantees enforced on every CI run (no key
+      # needed) by `llm::openrouter::tests::report_carries_no_content_fields`
+      # and `asr::deepgram::tests::streaming_smoke_report_has_no_content_fields`.
+      - name: Evidence redaction check (smoke logs must not contain the raw keys)
+        id: evidence_redaction_check
+        if: always()
+        working-directory: audio-graph/src-tauri
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          status=0
+          if [ -n "${DEEPGRAM_API_KEY:-}" ] && grep -qF -- "$DEEPGRAM_API_KEY" target/protected-smoke-logs/*.log 2>/dev/null; then
+            echo "::error::DEEPGRAM_API_KEY literal value found in smoke evidence log"
+            status=1
+          fi
+          if [ -n "${OPENROUTER_API_KEY:-}" ] && grep -qF -- "$OPENROUTER_API_KEY" target/protected-smoke-logs/*.log 2>/dev/null; then
+            echo "::error::OPENROUTER_API_KEY literal value found in smoke evidence log"
+            status=1
+          fi
+          exit "$status"
+
+      # Content-free: deepgram.log / openrouter.log carry only the sanitized
+      # StreamingSmokeReport / RoutedSmokeReport JSON (counts, timing, model
+      # slug, route id, hashed request id) plus cargo's own test-harness
+      # chatter — never raw transcript text, raw audio, prompt, reply, or key.
+      #
+      # Gated on the redaction check's own `outcome` (not just `always()`):
+      # that step is what proves these specific logs carry no live key. If a
+      # future change to either live smoke (or a panic path outside the
+      # redacted helpers) prints a raw key into a log, the redaction check
+      # above fails closed — but with only `if: always()` here, THIS step
+      # would still publish that leaking log as a public, 14-day-retained
+      # artifact, turning a caught leak into a shipped one. Requiring
+      # `steps.evidence_redaction_check.outcome == 'success'` means a failed
+      # redaction check blocks the upload instead of merely reporting past it.
+      - name: Upload sanitized evidence (metrics only, no content)
+        if: always() && steps.evidence_redaction_check.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-provider-smoke-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: audio-graph/src-tauri/target/protected-smoke-logs/

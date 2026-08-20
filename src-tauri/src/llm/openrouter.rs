@@ -4745,6 +4745,12 @@ mod tests {
         /// `Some(true)` when served provider differed from preferred, `Some(false)`
         /// when it matched, `None` when no preference was set.
         pub fallback_from_preferred: Option<bool>,
+        /// The `route.*` id [`crate::llm::route::route_for_openrouter_policy`]
+        /// resolved for this run (e.g. `"route.openrouter"` or
+        /// `"route.cerebras_via_openrouter"`). A route table identifier, not
+        /// provider/policy content — proves the single-skin route table (not
+        /// just the raw client) was exercised (audio-graph-8772, Wave 4).
+        pub route_id: &'static str,
     }
 
     impl RoutedSmokeReport {
@@ -4756,6 +4762,7 @@ mod tests {
         pub(crate) fn from_telemetry(
             telemetry: &OpenRouterRoutingTelemetry,
             policy: Option<&OpenRouterRoutingPolicy>,
+            route_id: &'static str,
         ) -> Self {
             let model = telemetry
                 .served_model
@@ -4824,6 +4831,7 @@ mod tests {
                 total_tokens: u64::from(telemetry.usage.total_tokens.unwrap_or(0)),
                 request_id_hash,
                 fallback_from_preferred: telemetry.fallback_from_preferred,
+                route_id,
             }
         }
 
@@ -4871,7 +4879,8 @@ mod tests {
             ..OpenRouterRoutingPolicy::default()
         };
 
-        let report = RoutedSmokeReport::from_telemetry(&telemetry, Some(&policy));
+        let report =
+            RoutedSmokeReport::from_telemetry(&telemetry, Some(&policy), "route.openrouter");
 
         // Structural redaction guarantee: the constructor accepts no prompt or
         // reply text — the only String-typed fields in the report are derived
@@ -4890,6 +4899,7 @@ mod tests {
         assert_eq!(report.completion_tokens, 7);
         assert_eq!(report.total_tokens, 12);
         assert_eq!(report.fallback_from_preferred, Some(false));
+        assert_eq!(report.route_id, "route.openrouter");
 
         // Routing policy summary must be content-free (count-based, not raw
         // provider strings).
@@ -4922,10 +4932,42 @@ mod tests {
         );
     }
 
+    /// Offline proof (no key, runs in every CI invocation — NOT `#[ignore]`d)
+    /// that the exact routing policy `live_openrouter_routed_smoke` builds
+    /// resolves through [`crate::llm::route::route_for_openrouter_policy`] to
+    /// the generic OpenRouter route, not the Cerebras-via-OpenRouter singleton
+    /// route. The live test itself only runs the resolved route through the
+    /// same assertions when a real `OPENROUTER_API_KEY` is present, so this
+    /// test is what actually exercises that logic in ordinary CI (audio-graph-8772,
+    /// Wave 4).
+    #[test]
+    fn live_smoke_policy_resolves_to_generic_openrouter_route() {
+        let policy = OpenRouterRoutingPolicy {
+            order: vec!["openai".to_string()],
+            allow_fallbacks: Some(true),
+            ..OpenRouterRoutingPolicy::default()
+        };
+        let route = crate::llm::route::route_for_openrouter_policy(Some(&policy), None);
+        assert_eq!(route.provider_id, "llm.openrouter");
+        assert_eq!(route.id, "route.openrouter");
+    }
+
     /// LIVE, network-dependent routed-smoke harness (env-gated; `#[ignore]`d so
-    /// CI without a key stays green). This is the HARNESS PLUMBING built by seed
-    /// audio-graph-fe7b. The live RUN is owned by seed 8772 (needs secret-hygiene
-    /// scanner + CI secret wiring — NOT wired here).
+    /// CI without a key stays green). The harness plumbing (report struct,
+    /// redaction guarantee) was built by seed audio-graph-fe7b; the live RUN
+    /// plus CI wiring is owned by seed audio-graph-8772 (Wave 4).
+    ///
+    /// **Wave 4 (audio-graph-8772) single-skin dispatch.** Earlier revisions of
+    /// this test built an `OpenRouterConfig` and called
+    /// `OpenRouterClient::chat_completion_with_routing_telemetry` directly,
+    /// bypassing [`crate::llm::route::route_for_openrouter_policy`] — the named
+    /// route table `executor.rs` actually dispatches production traffic
+    /// through (audio-graph-3624). That meant the smoke never proved the route
+    /// table resolves this policy the way production does. This test now calls
+    /// `route_for_openrouter_policy` with the same policy before dispatching,
+    /// asserts on the resolved [`crate::llm::route::RouteDescriptor`], and
+    /// carries its `id` into the [`RoutedSmokeReport`] — the routing decision
+    /// itself is now exercised, not just the raw client call.
     ///
     /// Run manually with a real OpenRouter key:
     ///
@@ -4940,15 +4982,24 @@ mod tests {
     /// intentionally discarded immediately after the call returns — it is never
     /// stored in `report` or any other variable that outlives the assertion
     /// block. The printed artifact is a `RoutedSmokeReport`: counts, timing,
-    /// model slug, sanitized policy description, and a hashed request id.
-    /// No raw prompt text, no raw reply text, no API key appears in the output.
+    /// model slug, sanitized policy description, route id, and a hashed
+    /// request id. No raw prompt text, no raw reply text, no API key appears
+    /// in the output.
     ///
     /// Asserts (live path):
+    /// - `route_for_openrouter_policy` resolves this policy onto the
+    ///   `llm.openrouter` registry descriptor (the route table was consulted).
     /// - The completion call succeeds (status = ok).
     /// - Token counts ≥ 1 (provider returned a usage block).
     /// - `report.has_no_content_fields()` holds after a real completion.
     /// - The report JSON contains neither the synthetic prompt text nor the
     ///   API key string.
+    ///
+    /// On success this prints a stable, greppable pass marker
+    /// (`"openrouter routed smoke strict pass:"`) that
+    /// `protected-provider-smoke.yml`'s vacuous-pass guard greps for — cargo
+    /// exiting 0 alone (a `--exact` typo matching zero tests, or a
+    /// precondition-skip) is not treated as evidence.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "hits the live OpenRouter API; requires OPENROUTER_API_KEY. Run with -- --ignored"]
     async fn live_openrouter_routed_smoke() {
@@ -4974,11 +5025,12 @@ mod tests {
         // We store it only to assert it does NOT appear in the report artifact.
         let synthetic_prompt = "Reply with the single digit 1.";
 
+        let model = "openai/gpt-4o-mini".to_string();
         let config = OpenRouterConfig {
             api_key: api_key.clone(),
             // openai/gpt-4o-mini is the cheapest broadly-available model on
             // OpenRouter; ideal for a smoke ping that just needs ≥1 token back.
-            model: "openai/gpt-4o-mini".to_string(),
+            model: model.clone(),
             base_url: DEFAULT_BASE_URL.to_string(),
             provider_order: Some(policy.order.clone()),
             routing_policy: Some(policy.clone()),
@@ -4991,6 +5043,43 @@ mod tests {
 
         let client = OpenRouterClient::new(config)
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+
+        // Exercise the SAME `AuthorizedRoute` gate + refinement production
+        // dispatch runs (audio-graph-3624 / audio-graph-8772), not merely the
+        // low-level `route_for_openrouter_policy` resolver in isolation.
+        // `authorize_route_dispatch` is the ADR-0033 start gate — the same
+        // call `executor.rs` makes from the job's `LlmProvider` settings
+        // snapshot — and `openrouter_route_for_client` is the EXACT function
+        // `executor.rs::projection_openrouter` calls to re-resolve and stamp
+        // the route from the LIVE client config before dispatching. Calling
+        // both here (rather than re-deriving an equivalent check from
+        // `route_for_openrouter_policy` alone) means a regression in either
+        // the gate or the refinement step fails this live smoke, not just the
+        // offline `live_smoke_policy_resolves_to_generic_openrouter_route`
+        // test above.
+        let settings_provider = crate::settings::LlmProvider::OpenRouter {
+            model: model.clone(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            provider_order: Some(policy.order.clone()),
+            include_usage_in_stream: true,
+            api_key: api_key.clone(),
+        };
+        let authorized = crate::llm::route::authorize_route_dispatch(&settings_provider)
+            .expect("authorize_route_dispatch must admit the OpenRouter registry descriptor");
+        let route = crate::llm::executor::openrouter_route_for_client(&authorized, &client).expect(
+            "openrouter_route_for_client must refine the authorized route from the live \
+                 OpenRouterClient config",
+        );
+        assert_eq!(
+            route.provider_id, "llm.openrouter",
+            "the refined live route must still authorize against the OpenRouter registry \
+             descriptor"
+        );
+        assert_eq!(
+            route.id, "route.openrouter",
+            "an unpinned (allow_fallbacks=true) policy must resolve to the generic \
+             OpenRouter route, not the Cerebras-via-OpenRouter singleton route"
+        );
 
         let prompt_for_call = synthetic_prompt.to_string();
         // Run the blocking client on a dedicated thread (reqwest::blocking
@@ -5009,7 +5098,7 @@ mod tests {
         // while making it explicit that we are discarding the reply text here.
         // The report carries no content.
 
-        let report = RoutedSmokeReport::from_telemetry(&telemetry, Some(&policy));
+        let report = RoutedSmokeReport::from_telemetry(&telemetry, Some(&policy), route.id);
 
         // Privacy invariant: report must carry no raw prompt, reply, or key.
         let report_json =
@@ -5036,8 +5125,19 @@ mod tests {
         assert_eq!(report.status, "ok");
 
         // Emit the sanitized report for manual inspection (`--nocapture`).
-        println!("\n=== RoutedSmokeReport (audio-graph-fe7b) ===");
+        println!("\n=== RoutedSmokeReport (audio-graph-fe7b / audio-graph-8772) ===");
         println!("{report_json}");
-        println!("============================================\n");
+        println!("================================================================\n");
+
+        // Stable, greppable pass marker (audio-graph-8772, Wave 4). This is the
+        // vacuous-pass guard's grep target in `protected-provider-smoke.yml` —
+        // cargo exiting 0 does not by itself prove the strict assertions above
+        // actually ran and passed (a `--exact` typo matching zero tests exits 0
+        // too), so the workflow greps the captured log for this exact string
+        // instead of trusting the exit code alone.
+        println!(
+            "openrouter routed smoke strict pass: status=ok total_tokens={} route_id={}",
+            report.total_tokens, report.route_id
+        );
     }
 }
