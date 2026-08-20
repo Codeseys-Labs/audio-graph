@@ -245,3 +245,329 @@ fn live_audio_enumerates_and_negotiates_a_real_device() {
     //    The full PCM play-through round-trip is the deferred next slice.
     capture_roundtrip_probe();
 }
+
+// ---------------------------------------------------------------------------
+// Strict signal assertions (seed audio-graph-f166): a real PCM round trip,
+// not just enumeration + format negotiation.
+// ---------------------------------------------------------------------------
+//
+// These two tests capture from the system-default target and assert on the
+// ACTUAL signal — RMS floor/ceiling, single-bin tone energy, clipping rate,
+// monotonic timestamps — using the pure helpers in
+// [`crate::audio::signal_assertions`] (which have their own device-free unit
+// tests proving silence and clipping both fail). They rely on something
+// outside this test process actually feeding the named fixture into the
+// virtual device: the `fixture-player` binary
+// (`src/bin/fixture_player.rs`), driven by the `audio-signal-nightly.yml`
+// workflow.
+//
+// That precondition is NOT implicit. Each test checks the
+// `AUDIO_SIGNAL_FIXTURE_PLAYING` env var for its own fixture's manifest id
+// before asserting anything. When it is absent or names a different
+// fixture — e.g. under ci.yml's bare `live-audio-smoke` job, which proves
+// enumeration/format negotiation but plays nothing — the test logs an
+// explicit "expected-unavailable" classification and returns. This is the
+// same honest-negative discipline the enumeration test above uses for
+// unsupported `CaptureTarget`s: never a silent pass on captured silence, but
+// also never a spurious failure of an unrelated job that was never asked to
+// set up a fixture in the first place.
+mod strict_signal {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use serde::Deserialize;
+
+    use crate::audio::pcm::f32_sample_to_pcm_s16;
+    use crate::audio::signal_assertions::{
+        assert_clipping_rate_below, assert_monotonic_timestamps, assert_nonzero_buffers_and_frames,
+        assert_rms_in_range, assert_single_bin_tone_energy,
+    };
+
+    use super::{first_supported_default_format, log_line};
+
+    /// Set by the driving workflow to the manifest `id` of the fixture it
+    /// just started playing. Read at test time, never cached.
+    const FIXTURE_ENV_VAR: &str = "AUDIO_SIGNAL_FIXTURE_PLAYING";
+    /// Long enough to cover several loops of a 2 s fixture even with
+    /// negotiation/scheduling jitter.
+    const CAPTURE_WINDOW: Duration = Duration::from_millis(2_500);
+    /// Mirrors the existing 3 s stop-deadline convention documented in
+    /// `capture.rs` (`stop_capture` finding #53a).
+    const STOP_DEADLINE: Duration = Duration::from_secs(3);
+    /// Generous relative to a healthy buffer cadence (tens of ms); this is
+    /// meant to catch a real stall/dropout, not to be a tight SLO.
+    const MAX_TIMESTAMP_GAP: Duration = Duration::from_millis(500);
+
+    #[derive(Debug, Deserialize)]
+    struct AudioSignalManifest {
+        fixtures: Vec<ToneOrChirpFixture>,
+        #[serde(default)]
+        speech_fixtures: Vec<SpeechFixture>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ToneOrChirpFixture {
+        id: String,
+        expected_signal: ToneOrChirpExpectedSignal,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ToneOrChirpExpectedSignal {
+        rms_floor: f64,
+        rms_ceiling: f64,
+        max_clipping_rate: f64,
+        target_hz: Option<f64>,
+        min_single_bin_energy_fraction: Option<f64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpeechFixture {
+        id: String,
+        expected_signal: SpeechExpectedSignal,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpeechExpectedSignal {
+        rms_floor: f64,
+        rms_ceiling: f64,
+        max_clipping_rate: f64,
+    }
+
+    fn load_manifest() -> AudioSignalManifest {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("audio_signal")
+            .join("manifest.json");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+    }
+
+    /// The honest-negative gate: `true` only when the driving workflow has
+    /// declared (via env var) that `expected_fixture_id` is actually
+    /// playing right now.
+    fn precondition_met(expected_fixture_id: &str) -> bool {
+        std::env::var(FIXTURE_ENV_VAR)
+            .map(|value| value == expected_fixture_id)
+            .unwrap_or(false)
+    }
+
+    fn log_expected_unavailable(expected_fixture_id: &str) {
+        log_line(
+            "strict-signal.log",
+            &format!(
+                "expected-unavailable: {FIXTURE_ENV_VAR} does not name {expected_fixture_id:?} \
+                 (fixture-player must be looping this exact fixture into the virtual device — \
+                 see audio-signal-nightly.yml); skipping strict signal assertions for this run."
+            ),
+        );
+    }
+
+    struct Capture {
+        samples_i16: Vec<i16>,
+        buffer_count: usize,
+        frame_count: usize,
+        timestamps: Vec<Duration>,
+        sample_rate: u32,
+        channels: u16,
+    }
+
+    /// Capture from the system-default target for `window`, converting
+    /// every rsac buffer's `f32` samples to `i16` via the same mapping the
+    /// production PCM path uses. Asserts the stop-deadline itself (bounded
+    /// stop is part of the acceptance, not a side note).
+    ///
+    /// `first_supported_default_format()` is ADVISORY DISCOVERY ONLY on
+    /// Linux/PipeWire — the per-buffer negotiated format each `AudioBuffer`
+    /// carries is the single source of truth for what was actually
+    /// delivered (rsac docs). We use the advisory format only to *build*
+    /// the capture; every sample-rate/channel value used in the returned
+    /// [`Capture`] (and therefore in the tone/RMS math downstream) comes
+    /// from the buffers that actually arrived, de-interleaved to channel 0
+    /// so a negotiated multi-channel format doesn't get read as a
+    /// sample-and-hold signal at N times the true per-channel rate.
+    fn capture_signal(window: Duration) -> Option<Capture> {
+        use rsac::{AudioCaptureBuilder, CaptureTarget};
+
+        let fmt = first_supported_default_format()?;
+        let mut capture = AudioCaptureBuilder::new()
+            .with_target(CaptureTarget::SystemDefault)
+            .sample_rate(fmt.sample_rate)
+            .channels(fmt.channels)
+            .sample_format(fmt.sample_format)
+            .build()
+            .ok()?;
+        capture.start().ok()?;
+
+        let mut samples_i16 = Vec::new();
+        let mut buffer_count = 0usize;
+        let mut frame_count = 0usize;
+        let mut timestamps = Vec::new();
+        // The authoritative (negotiated) format, learned from the first
+        // buffer that actually arrives — NOT the advisory `fmt` above.
+        let mut negotiated: Option<(u32, u16)> = None;
+
+        if let Ok(rx) = capture.subscribe_with_errors() {
+            let deadline = Instant::now() + window;
+            while Instant::now() < deadline {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(buffer)) => {
+                        buffer_count += 1;
+                        frame_count += buffer.num_frames();
+                        let buf_rate = buffer.sample_rate();
+                        let buf_channels = buffer.channels().max(1);
+                        match negotiated {
+                            None => negotiated = Some((buf_rate, buf_channels)),
+                            Some((rate, channels)) => assert_eq!(
+                                (buf_rate, buf_channels),
+                                (rate, channels),
+                                "capture format changed mid-stream at buffer {buffer_count}: \
+                                 was {rate}Hz/{channels}ch, now {buf_rate}Hz/{buf_channels}ch \
+                                 — the tone/RMS math assumes a stable negotiated format"
+                            ),
+                        }
+                        samples_i16.extend(
+                            buffer
+                                .data()
+                                .chunks_exact(buf_channels as usize)
+                                .map(|frame| f32_sample_to_pcm_s16(frame[0])),
+                        );
+                        if let Some(ts) = buffer.timestamp() {
+                            timestamps.push(ts);
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => continue,
+                }
+            }
+        }
+
+        let stop_started = Instant::now();
+        let _ = capture.stop();
+        let stop_elapsed = stop_started.elapsed();
+        assert!(
+            stop_elapsed <= STOP_DEADLINE,
+            "capture.stop() took {stop_elapsed:?}, exceeding the bounded-stop deadline {STOP_DEADLINE:?}"
+        );
+
+        // Only reachable when zero buffers ever arrived (samples_i16 stays
+        // empty either way); `assert_nonzero_buffers_and_frames` will fail
+        // on that regardless of which rate/channels we report here.
+        let (sample_rate, channels) = negotiated.unwrap_or((fmt.sample_rate, fmt.channels));
+
+        Some(Capture {
+            samples_i16,
+            buffer_count,
+            frame_count,
+            timestamps,
+            sample_rate,
+            channels,
+        })
+    }
+
+    #[test]
+    fn strict_signal_calibration_tone_round_trip() {
+        const FIXTURE_ID: &str = "calibration-tone-440hz";
+        if !precondition_met(FIXTURE_ID) {
+            log_expected_unavailable(FIXTURE_ID);
+            return;
+        }
+
+        let manifest = load_manifest();
+        let fixture = manifest
+            .fixtures
+            .iter()
+            .find(|f| f.id == FIXTURE_ID)
+            .unwrap_or_else(|| panic!("manifest missing fixture {FIXTURE_ID:?}"));
+        let expected = &fixture.expected_signal;
+        let target_hz = expected
+            .target_hz
+            .expect("calibration-tone-440hz manifest entry must declare target_hz");
+        let min_fraction = expected.min_single_bin_energy_fraction.expect(
+            "calibration-tone-440hz manifest entry must declare min_single_bin_energy_fraction",
+        );
+
+        let capture = capture_signal(CAPTURE_WINDOW).expect(
+            "capture_signal must succeed once AUDIO_SIGNAL_FIXTURE_PLAYING has been asserted \
+             (device + fixture-player are expected to already be set up)",
+        );
+
+        assert_nonzero_buffers_and_frames(capture.buffer_count, capture.frame_count)
+            .expect("expected nonzero capture buffers and frames while the calibration tone plays");
+
+        let rms = assert_rms_in_range(
+            &capture.samples_i16,
+            expected.rms_floor,
+            expected.rms_ceiling,
+        )
+        .expect("captured RMS must fall inside the manifest's declared range");
+        let clip_rate =
+            assert_clipping_rate_below(&capture.samples_i16, 128, expected.max_clipping_rate)
+                .expect("captured clipping rate must stay under the manifest's declared maximum");
+        let fraction = assert_single_bin_tone_energy(
+            &capture.samples_i16,
+            capture.sample_rate,
+            target_hz,
+            min_fraction,
+        )
+        .expect("captured single-bin tone energy must clear the manifest's declared minimum");
+        assert_monotonic_timestamps(&capture.timestamps, MAX_TIMESTAMP_GAP)
+            .expect("capture timestamps must be monotonic with no large discontinuity");
+
+        log_line(
+            "strict-signal.log",
+            &format!(
+                "calibration tone strict pass: buffers={} frames={} \
+                 negotiated={}Hz/{}ch rms={rms} clip_rate={clip_rate} \
+                 single_bin_fraction={fraction}",
+                capture.buffer_count, capture.frame_count, capture.sample_rate, capture.channels,
+            ),
+        );
+    }
+
+    #[test]
+    fn strict_signal_turn_taking_speech_round_trip() {
+        const FIXTURE_ID: &str = "turn-taking-speech";
+        if !precondition_met(FIXTURE_ID) {
+            log_expected_unavailable(FIXTURE_ID);
+            return;
+        }
+
+        let manifest = load_manifest();
+        let fixture = manifest
+            .speech_fixtures
+            .iter()
+            .find(|f| f.id == FIXTURE_ID)
+            .unwrap_or_else(|| panic!("manifest missing speech fixture {FIXTURE_ID:?}"));
+        let expected = &fixture.expected_signal;
+
+        let capture = capture_signal(CAPTURE_WINDOW).expect(
+            "capture_signal must succeed once AUDIO_SIGNAL_FIXTURE_PLAYING has been asserted \
+             (device + fixture-player are expected to already be set up)",
+        );
+
+        assert_nonzero_buffers_and_frames(capture.buffer_count, capture.frame_count)
+            .expect("expected nonzero capture buffers and frames while the speech fixture plays");
+
+        let rms = assert_rms_in_range(
+            &capture.samples_i16,
+            expected.rms_floor,
+            expected.rms_ceiling,
+        )
+        .expect("captured RMS must fall inside the manifest's declared range");
+        let clip_rate =
+            assert_clipping_rate_below(&capture.samples_i16, 128, expected.max_clipping_rate)
+                .expect("captured clipping rate must stay under the manifest's declared maximum");
+        assert_monotonic_timestamps(&capture.timestamps, MAX_TIMESTAMP_GAP)
+            .expect("capture timestamps must be monotonic with no large discontinuity");
+
+        log_line(
+            "strict-signal.log",
+            &format!(
+                "turn-taking speech strict pass: buffers={} frames={} \
+                 negotiated={}Hz/{}ch rms={rms} clip_rate={clip_rate}",
+                capture.buffer_count, capture.frame_count, capture.sample_rate, capture.channels,
+            ),
+        );
+    }
+}

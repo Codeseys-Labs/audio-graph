@@ -1,0 +1,217 @@
+# Audio Signal Nightly — Tier C evidence, NOT a required PR gate.
+#
+# This workflow never runs on `pull_request` (schedule + workflow_dispatch
+# only), so it cannot appear as a required status check on a PR by
+# construction. It exists to prove a REAL PCM round trip through a virtual
+# Linux audio device — feed a known calibration tone / speech fixture in via
+# the `fixture-player` binary, capture it back through rsac, and assert on
+# the actual signal (RMS floor/ceiling, single-bin tone energy, clipping
+# rate, monotonic timestamps) using `audio::signal_assertions` — rather than
+# just proving a device enumerates (`ci.yml`'s existing `live-audio-smoke`
+# job, which this workflow deliberately does not modify or duplicate).
+#
+# Linux virtual-audio adapter: PipeWire null-sink + `.monitor`, per
+# docs/research/ci-virtual-audio-devices-2026-06-27.md §2 (rsac captures via
+# PipeWire, not raw ALSA). Third-party actions are SHA-pinned with the exact
+# same SHAs `ci.yml` uses, for the same reproducibility reason.
+
+name: Audio Signal Nightly (Tier C evidence)
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  strict-signal-smoke:
+    name: Strict audio signal smoke (Linux) — Tier C nightly evidence, not a PR gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          # rsac capture IS PipeWire (not raw ALSA): the runtime daemons let a
+          # userspace null-sink + .monitor exist at job time. The GTK/webkit
+          # chain is linked into the audio-graph test binary + fixture-player
+          # via Tauri even though neither opens a window.
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config xvfb \
+            pipewire pipewire-pulse wireplumber pipewire-alsa \
+            pulseaudio-utils dbus-x11
+
+      - name: Build fixture-player and the live-audio-smoke test binary once
+        working-directory: audio-graph/src-tauri
+        run: |
+          cargo build --locked -p audio-graph --bin fixture-player --no-default-features --features cloud
+          cargo test --locked -p audio-graph --lib --no-default-features --features cloud,live-audio-smoke --no-run
+
+      - name: Linux — virtual audio (PipeWire null-sink + .monitor) + strict signal smoke
+        working-directory: audio-graph/src-tauri
+        run: |
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "$XDG_RUNTIME_DIR"
+          # Fresh evidence every run: target/ is restored from Swatinem/rust-cache,
+          # so a stale target/audio-smoke-logs/strict-signal.log from a previous
+          # run could otherwise satisfy this run's own "did the strict test
+          # actually log a pass line" check below without this run's test having
+          # done anything.
+          rm -rf target/audio-smoke-logs
+          mkdir -p target/audio-smoke-logs
+
+          # Run the daemons AND both fixture passes inside ONE dbus session so
+          # the null-sink outlives every step. The sink is created at the
+          # fixture set's own rate/channels/format (16 kHz mono s16le) so the
+          # round trip needs no resampling anywhere in the chain.
+          #
+          # The argument below is a single-quoted literal BY DESIGN: its
+          # $variables must expand inside that inner `bash -u -c` invocation,
+          # not in this outer script.
+          # shellcheck disable=SC2016
+          dbus-run-session -- bash -u -c '
+            pipewire & sleep 1
+            wireplumber & pipewire-pulse & sleep 2
+            pactl load-module module-null-sink sink_name=ag_signal_sink \
+              rate=16000 channels=1 format=s16le \
+              sink_properties=device.description=ag_signal_sink
+            pactl set-default-sink   ag_signal_sink
+            pactl set-default-source ag_signal_sink.monitor
+            pactl info        > target/audio-smoke-logs/pactl-info.log    2>&1
+            pactl list short sinks   > target/audio-smoke-logs/pactl-sinks.log   2>&1
+            pactl list short sources > target/audio-smoke-logs/pactl-sources.log 2>&1
+
+            overall_status=0
+
+            run_pass() {
+              fixture_id="$1"
+              fixture_wav="$2"
+              test_name="$3"
+              expected_marker="$4"
+              player_log="target/audio-smoke-logs/player-${fixture_id}.log"
+
+              # `--device` is matched against cpal names, which on Linux are
+              # ALSA PCM ids — never PulseAudio/PipeWire sink names. "pipewire"
+              # is the named ALSA PCM the `pipewire-alsa` package registers
+              # (type=pipewire, playback_node=-1, i.e. "whatever PipeWire
+              # currently considers the default sink"), which is exactly
+              # `ag_signal_sink` per the `pactl set-default-sink` call above.
+              # Passing the sink name itself here (ag_signal_sink) does not
+              # resolve to any ALSA PCM and fails with DeviceNotFound before
+              # printing READY.
+              #
+              # stdin is redirected from a long-lived process substitution
+              # (NOT left to bash defaults): when job control is inactive,
+              # bash redirects an asynchronous ("&") commands stdin from
+              # /dev/null unless it already has an explicit redirection. An
+              # immediate /dev/null EOF trips the fixture-player stdin-close
+              # watcher within milliseconds of READY, stopping playback
+              # before capture ever starts. `<(sleep 300)` holds stdin open
+              # (blocked, no EOF) for up to 5 minutes — comfortably longer
+              # than one fixture pass — while the explicit SIGTERM below
+              # remains the normal stop path.
+              ./target/debug/fixture-player --device pipewire "$fixture_wav" \
+                > "$player_log" 2>&1 < <(sleep 300) &
+              player_pid=$!
+
+              waited_ms=0
+              while ! grep -q "^READY " "$player_log" 2>/dev/null; do
+                if ! kill -0 "$player_pid" 2>/dev/null; then
+                  echo "fixture-player exited before printing READY for $fixture_id" >&2
+                  cat "$player_log" >&2
+                  return 1
+                fi
+                if [ "$waited_ms" -ge 15000 ]; then
+                  echo "fixture-player did not print READY within 15s for $fixture_id" >&2
+                  kill -TERM "$player_pid" 2>/dev/null
+                  return 1
+                fi
+                sleep 0.2
+                waited_ms=$((waited_ms + 200))
+              done
+              echo "fixture-player ready for $fixture_id ($(cat "$player_log" | tr -d "\n"))"
+
+              AUDIO_SIGNAL_FIXTURE_PLAYING="$fixture_id" \
+                xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features \
+                  --features cloud,live-audio-smoke "$test_name" \
+                  -- --exact --nocapture --test-threads=1
+              status=$?
+
+              # Belt-and-suspenders against a green job that asserted
+              # nothing: cargo exits 0 both when the strict test genuinely
+              # passes AND when `test_name` matches zero tests (a stale/typo
+              # `--exact` path — "0 passed; 0 failed" is still exit 0) or when
+              # the fixture-playing precondition silently was not met (the
+              # test logs "expected-unavailable" and returns Ok without
+              # asserting). Both vacuous-pass shapes leave NO matching
+              # "strict pass" line in strict-signal.log for this fixture, so
+              # require one explicitly instead of trusting the exit code
+              # from cargo test alone.
+              if ! grep -qF "$expected_marker" target/audio-smoke-logs/strict-signal.log 2>/dev/null; then
+                echo "strict-signal.log has no line matching [$expected_marker] for $fixture_id — the strict assertions did not actually run and pass (stale --exact test path, or the fixture-playing precondition was not met when the test ran)" >&2
+                status=1
+              fi
+
+              kill -TERM "$player_pid" 2>/dev/null
+              stopped_ms=0
+              while kill -0 "$player_pid" 2>/dev/null; do
+                if [ "$stopped_ms" -ge 5000 ]; then
+                  echo "fixture-player did not exit within 5s of SIGTERM for $fixture_id" >&2
+                  kill -KILL "$player_pid" 2>/dev/null
+                  break
+                fi
+                sleep 0.2
+                stopped_ms=$((stopped_ms + 200))
+              done
+              wait "$player_pid" 2>/dev/null
+
+              return "$status"
+            }
+
+            run_pass \
+              "calibration-tone-440hz" \
+              "fixtures/audio_signal/audio/calibration-tone-440hz.wav" \
+              "audio::live_audio_smoke::strict_signal::strict_signal_calibration_tone_round_trip" \
+              "calibration tone strict pass:" \
+              || overall_status=1
+
+            run_pass \
+              "turn-taking-speech" \
+              "fixtures/audio_signal/audio/turn-taking-speech.wav" \
+              "audio::live_audio_smoke::strict_signal::strict_signal_turn_taking_speech_round_trip" \
+              "turn-taking speech strict pass:" \
+              || overall_status=1
+
+            exit "$overall_status"
+          '
+
+      # Content-free: strict-signal.log / player-*.log carry text metrics
+      # (buffer/frame counts, RMS, clipping rate, single-bin energy fraction)
+      # and pactl enumeration output — never raw captured PCM.
+      - name: Upload evidence logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audio-signal-nightly-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: audio-graph/src-tauri/target/audio-smoke-logs/

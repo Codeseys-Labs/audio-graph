@@ -80,6 +80,8 @@ pub mod ws_request;
 #[cfg(test)]
 mod aec_vad_fixtures;
 #[cfg(test)]
+mod audio_signal_fixtures;
+#[cfg(test)]
 mod source_separation_fixtures;
 
 use std::sync::atomic::{AtomicBool, Ordering};

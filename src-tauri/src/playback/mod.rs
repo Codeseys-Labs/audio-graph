@@ -328,9 +328,28 @@ impl AudioPlayer {
 
     /// Free samples available in the active ring buffer. Returns 0 if no
     /// stream is open.
+    ///
+    /// **Units**: this is `HeapProd::vacant_len()`, measured in
+    /// **device-rate** (post-resample) mono samples. A caller comparing this
+    /// against a **source-rate** sample count (e.g. a fixture chunk length)
+    /// will under-reserve whenever `source_sample_rate != device_sample_rate`
+    /// — use [`Self::sample_rates`] to convert first.
     pub fn free_samples(&self) -> usize {
         let slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
         slot.as_ref().map(PlaybackProducer::vacant_len).unwrap_or(0)
+    }
+
+    /// `(source_sample_rate, device_sample_rate)` of the currently open
+    /// stream, i.e. the ratio [`Self::push_samples`] resamples by before
+    /// writing into the ring buffer that [`Self::free_samples`] measures.
+    /// `None` if no stream is open. Callers that gate on `free_samples()`
+    /// before pushing a source-rate chunk must scale that chunk's length by
+    /// `device_sample_rate / source_sample_rate` first, or they will
+    /// under-reserve ring space and `push_samples`'s resampled output will be
+    /// silently truncated by the ring buffer.
+    pub fn sample_rates(&self) -> Option<(u32, u32)> {
+        let slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().map(PlaybackProducer::sample_rates)
     }
 }
 
@@ -521,6 +540,8 @@ fn build_stream(
 struct PlaybackProducer {
     prod: HeapProd<i16>,
     resampler: Option<MonoI16OutputResampler>,
+    source_rate: u32,
+    device_rate: u32,
 }
 
 impl PlaybackProducer {
@@ -530,7 +551,12 @@ impl PlaybackProducer {
         } else {
             Some(MonoI16OutputResampler::new(source_rate, output_rate)?)
         };
-        Ok(Self { prod, resampler })
+        Ok(Self {
+            prod,
+            resampler,
+            source_rate,
+            device_rate: output_rate,
+        })
     }
 
     fn push_source_samples(&mut self, samples: &[i16]) -> usize {
@@ -572,6 +598,10 @@ impl PlaybackProducer {
 
     fn vacant_len(&self) -> usize {
         self.prod.vacant_len()
+    }
+
+    fn sample_rates(&self) -> (u32, u32) {
+        (self.source_rate, self.device_rate)
     }
 }
 

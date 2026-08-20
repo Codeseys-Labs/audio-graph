@@ -16,6 +16,18 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# CI-only fixture driver (seed audio-graph-f166 / wave1-fixture-player): plays
+# a fixture WAV out a named device on a loop for the strict live-audio-smoke
+# signal assertions. `test = false` because it is a thin wrapper with no
+# tests of its own — the real logic it calls into
+# (`audio_graph::audio::fixture_player`) is a library module and is exercised
+# by the normal `cargo test -p audio-graph --lib` run.
+[[bin]]
+name = "fixture-player"
+path = "src/bin/fixture_player.rs"
+test = false
+bench = false
+
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
 
