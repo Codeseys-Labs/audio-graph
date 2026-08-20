@@ -1155,6 +1155,14 @@ pub struct ProjectionPatch {
     pub operations: Vec<ProjectionOperation>,
     pub confidence: f32,
     pub provenance: ProjectionProvenance,
+    /// Content-free route evidence for this patch (ADR-0038): wire skin,
+    /// normalized terminal status, retry class, constrained-decoding grade,
+    /// completion-budget clamp, and the upstream provider that served the request.
+    /// Patch-level — one per patch, deliberately NOT multiplied into every
+    /// materialized item the way [`ProjectionProvenance`] is. `None` on records
+    /// written before this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::llm::route::RouteRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1180,6 +1188,7 @@ impl fmt::Debug for ProjectionPatch {
             .field("operations", &operations)
             .field("confidence", &self.confidence)
             .field("provenance", &self.provenance)
+            .field("route", &self.route)
             .field("queued_at_ms", &self.queued_at_ms)
             .field("generation_latency_ms", &self.generation_latency_ms)
             .field("apply_latency_ms", &self.apply_latency_ms)
@@ -1307,11 +1316,28 @@ impl fmt::Debug for DebugGraphNodeDraft<'_> {
     }
 }
 
+/// Per-item LLM provenance, cloned into every materialized note / node / edge and
+/// persisted, so per-item byte cost governs what may live here (ADR-0038).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ProjectionProvenance {
+    /// The REGISTRY provider id the route was authorized against (`llm.openrouter`,
+    /// `llm.cerebras`, …). Before ADR-0038 this carried a fourth ad-hoc naming
+    /// scheme (`"api"` / `"openrouter"` / `"local_llama"` / `"mistralrs"`).
     pub provider: String,
+    /// The SERVED model when the response reported one; see
+    /// [`model_source`](Self::model_source), which says which it is rather than
+    /// leaving a reader to assume.
     pub model: String,
     pub prompt_id: String,
+    /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records
+    /// written before this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    /// Whether [`model`](Self::model) is the served id or the requested one.
+    /// Defaults to `Requested` so pre-contract records are read honestly and never
+    /// mistaken for served identity.
+    #[serde(default)]
+    pub model_source: crate::llm::route::ModelIdentitySource,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
@@ -3124,6 +3150,7 @@ mod tests {
         let event = TranscriptEvent::from(asr_payload("span-1", 2, "decision made"));
         let basis = ProjectionBasis::from_transcript_events(&[event]);
         let patch = ProjectionPatch {
+            route: None,
             sequence: 7,
             kind: ProjectionKind::Notes,
             llm_request_id: "llm-req-1".to_string(),
@@ -3139,6 +3166,8 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3167,6 +3196,7 @@ mod tests {
     #[test]
     fn projection_patch_debug_redacts_note_and_graph_sensitive_payloads() {
         let patch = ProjectionPatch {
+            route: None,
             sequence: 42,
             kind: ProjectionKind::Graph,
             llm_request_id: "llm-req-sensitive".to_string(),
@@ -3206,6 +3236,8 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "gpt-4.1".to_string(),
                 prompt_id: "graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3363,6 +3395,7 @@ mod tests {
         body: &str,
     ) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: ProjectionKind::Notes,
             llm_request_id: format!("llm-req-{sequence}"),
@@ -3378,6 +3411,8 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3389,6 +3424,7 @@ mod tests {
     fn graph_patch(sequence: u64, operations: Vec<ProjectionOperation>) -> ProjectionPatch {
         let event = TranscriptEvent::from(asr_payload("span-graph", sequence, "graph basis"));
         ProjectionPatch {
+            route: None,
             sequence,
             kind: ProjectionKind::Graph,
             llm_request_id: format!("llm-graph-req-{sequence}"),
@@ -3399,6 +3435,8 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3457,6 +3495,7 @@ mod tests {
             generation_latency_ms: None,
             apply_latency_ms: None,
             created_at_ms: 1_700_000_000_104,
+            route: None,
         };
         notes.apply_patch(&reorder).expect("reorder patch");
         assert_eq!(notes.last_sequence, 4);
@@ -3483,6 +3522,7 @@ mod tests {
             generation_latency_ms: None,
             apply_latency_ms: None,
             created_at_ms: 1_700_000_000_105,
+            route: None,
         };
         notes.apply_patch(&delete).expect("delete patch");
 
@@ -3518,6 +3558,7 @@ mod tests {
         );
 
         let missing_reorder = ProjectionPatch {
+            route: None,
             sequence: 3,
             kind: ProjectionKind::Notes,
             llm_request_id: "llm-req-reorder".to_string(),
@@ -3531,6 +3572,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "test".to_string(),
                 prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

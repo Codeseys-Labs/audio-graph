@@ -1,0 +1,18 @@
+$ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud --no-run 2>&1 | grep -E "^error|^  -->"
+
+error[E0432]: unresolved import `crate::llm::route`
+error[E0432]: unresolved import `crate::llm::route`
+error[E0432]: unresolved import `crate::llm::route`
+error[E0432]: unresolved import `crate::llm::route`
+error[E0432]: unresolved import `crate::llm::route`
+error[E0599]: no method named `chat_completion_with_wire_outcome` found for struct `api_client::ApiClient` in the current scope
+error[E0433]: cannot find type `RequestOutputForm` in this scope
+error[E0599]: no method named `chat_completion_with_wire_outcome` found for struct `api_client::ApiClient` in the current scope
+error[E0433]: cannot find type `RequestOutputForm` in this scope
+error[E0599]: no method named `chat_completion_with_wire_outcome` found for struct `api_client::ApiClient` in the current scope
+error[E0609]: no field `wire` on type `executor::ProjectionBackendOutput`
+error[E0425]: cannot find function `run_projection_patch_on_route` in this scope
+error[E0599]: no method named `chat_completion_with_wire_outcome` found for struct `openrouter::OpenRouterClient` in the current scope
+error[E0599]: no method named `chat_completion_with_wire_outcome` found for struct `openrouter::OpenRouterClient` in the current scope
+error[E0433]: cannot find type `RequestOutputForm` in this scope
+error: could not compile `audio-graph` (lib test) due to 15 previous errors

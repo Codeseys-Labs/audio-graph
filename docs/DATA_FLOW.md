@@ -607,7 +607,7 @@ flowchart TD
         IQ --> WORKER
         BQ --> WORKER
     end
-    WORKER -->|"one job at a time"| BACKENDS["native llama.cpp / OpenRouter /<br/>API / mistral.rs (fallback chain)"]
+    WORKER -->|"one job at a time"| BACKENDS["ONE authorized route<br/>(llm/route.rs; no fallback chain)"]
 
     CHATSTREAM["streaming chat<br/>(Api / OpenRouter)<br/>streaming.rs:244"] -.->|"BYPASSES executor<br/>own tokio task"| SSE["SSE stream"]
 ```

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::route::{
+    RequestOutputForm, WireOutcome, sanitize_route_metadata, terminal_status_from_finish_reason,
+};
 
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -128,6 +131,48 @@ struct ApiMessage {
 struct ResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
+    /// Present only for `type: "json_schema"` structured outputs. Omitted for
+    /// `json_object` mode so that request stays byte-identical to the legacy
+    /// shape.
+    ///
+    /// Before ADR-0038 this struct carried only `format_type`, so direct Cerebras
+    /// — the one endpoint in the table that DOCUMENTS schema-constrained
+    /// generation — literally could not express its own guarantee (ADR-0038
+    /// defect 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<JsonSchemaSpec>,
+}
+
+/// The `json_schema` payload of an OpenAI-shape structured-outputs request.
+/// Mirrors `openrouter::JsonSchemaSpec` field for field so both wire layers send
+/// one identical body shape.
+#[derive(Serialize)]
+struct JsonSchemaSpec {
+    name: String,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
+impl ResponseFormat {
+    /// `{ "type": "json_object" }` — generic JSON mode, no schema constraint.
+    fn json_object() -> Self {
+        Self {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        }
+    }
+
+    /// `{ "type": "json_schema", "json_schema": { name, strict: true, schema } }`.
+    fn json_schema(name: &str, schema: serde_json::Value) -> Self {
+        Self {
+            format_type: "json_schema".to_string(),
+            json_schema: Some(JsonSchemaSpec {
+                name: name.to_string(),
+                strict: true,
+                schema,
+            }),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -142,11 +187,19 @@ struct ChatCompletionResponse {
     /// responses. Optional so a provider that omits it deserializes cleanly.
     #[serde(default)]
     usage: Option<Usage>,
+    /// Top-level `model` echo naming the model that actually served the request.
+    /// Sanitized before it is recorded anywhere; can differ from the requested id.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    /// OpenAI-compatible stop signal. Dropping this field made a truncated
+    /// response indistinguishable from a clean stop (ADR-0038 defect 1).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +280,19 @@ impl ApiClient {
         &self.config
     }
 
+    /// The `(budget, clamped)` completion cap this client will actually
+    /// declare on the wire: `config.max_tokens` clamped to the endpoint this
+    /// client's `endpoint` resolves to via [`crate::llm::route::route_for_api_endpoint`]
+    /// (ADR-0038). Exposed as its own pure step — not just inlined into the
+    /// request builder — so it is unit-testable without a live HTTP mock: the
+    /// one endpoint with a documented completion ceiling
+    /// (`route.cerebras_direct`, 40,960) is matched by exact host
+    /// (`CEREBRAS_BASE_URL`), which a local mock server cannot impersonate.
+    pub(crate) fn effective_completion_budget(&self) -> (u32, bool) {
+        crate::llm::route::route_for_api_endpoint(&self.config.endpoint)
+            .clamp_completion_budget(self.config.max_tokens)
+    }
+
     // ------------------------------------------------------------------
     // Low-level chat completion
     // ------------------------------------------------------------------
@@ -243,7 +309,7 @@ impl ApiClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<String, String> {
-        self.chat_completion_inner(messages, json_mode, None)
+        self.chat_completion_with_usage(messages, json_mode)
             .map(|(text, _tokens)| text)
     }
 
@@ -255,7 +321,13 @@ impl ApiClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<(String, u32), String> {
-        self.chat_completion_inner(messages, json_mode, None)
+        let form = if json_mode {
+            RequestOutputForm::JsonObject
+        } else {
+            RequestOutputForm::Unconstrained
+        };
+        self.chat_completion_with_wire_outcome(messages, form)
+            .map(|(text, tokens, _wire)| (text, tokens))
     }
 
     pub(crate) fn chat_completion_with_structured_outputs_with_usage(
@@ -263,7 +335,11 @@ impl ApiClient {
         messages: Vec<(String, String)>,
         schema: serde_json::Value,
     ) -> Result<(String, u32), String> {
-        self.chat_completion_inner(messages, false, Some(schema))
+        self.chat_completion_with_wire_outcome(
+            messages,
+            RequestOutputForm::VllmStructuredOutputs { schema },
+        )
+        .map(|(text, tokens, _wire)| (text, tokens))
     }
 
     fn chat_completion_with_structured_outputs(
@@ -275,12 +351,19 @@ impl ApiClient {
             .map(|(text, _tokens)| text)
     }
 
-    fn chat_completion_inner(
+    /// The route-contract entry point (ADR-0038): send one chat completion in the
+    /// request form the resolved route selected, and return the reply, the token
+    /// total, and the content-free [`WireOutcome`].
+    ///
+    /// The request form is chosen from the route's
+    /// [`ConstrainedDecodingGrade`](crate::llm::route::ConstrainedDecodingGrade),
+    /// not from a host substring — that is what lets direct Cerebras request its
+    /// documented strict-decoding guarantee (ADR-0038 defect 2).
+    pub(crate) fn chat_completion_with_wire_outcome(
         &self,
         messages: Vec<(String, String)>,
-        json_mode: bool,
-        structured_outputs: Option<serde_json::Value>,
-    ) -> Result<(String, u32), String> {
+        form: RequestOutputForm,
+    ) -> Result<(String, u32, WireOutcome), String> {
         self.content_egress_policy.check_prompt("llm.api")?;
 
         let api_messages: Vec<ApiMessage> = messages
@@ -288,21 +371,29 @@ impl ApiClient {
             .map(|(role, content)| ApiMessage { role, content })
             .collect();
 
-        let response_format = if json_mode && structured_outputs.is_none() {
-            Some(ResponseFormat {
-                format_type: "json_object".to_string(),
-            })
-        } else {
-            None
+        let (response_format, structured_outputs) = match &form {
+            RequestOutputForm::Unconstrained => (None, None),
+            RequestOutputForm::JsonObject => (Some(ResponseFormat::json_object()), None),
+            RequestOutputForm::StrictJsonSchema { name, schema } => (
+                Some(ResponseFormat::json_schema(name, schema.clone())),
+                None,
+            ),
+            RequestOutputForm::VllmStructuredOutputs { schema } => (None, Some(schema.clone())),
         };
+
+        // The per-endpoint-clamped completion budget (ADR-0038): a request can
+        // never declare more completion tokens than the endpoint documents
+        // (e.g. Cerebras's 40,960), regardless of what `llm_api_config.max_tokens`
+        // a config file requests.
+        let (clamped_budget, _clamped) = self.effective_completion_budget();
 
         // Route the token cap to the field this model family accepts: OpenAI
         // reasoning / o-series models require `max_completion_tokens` and reject
         // the legacy `max_tokens`; everything else keeps `max_tokens`. See
         // `token_limit_field` + the provider-API audit (§3b).
         let (max_tokens, max_completion_tokens) = match token_limit_field(&self.config.model) {
-            TokenLimitField::MaxTokens => (Some(self.config.max_tokens), None),
-            TokenLimitField::MaxCompletionTokens => (None, Some(self.config.max_tokens)),
+            TokenLimitField::MaxTokens => (Some(clamped_budget), None),
+            TokenLimitField::MaxCompletionTokens => (None, Some(clamped_budget)),
         };
 
         let request = ChatCompletionRequest {
@@ -319,6 +410,13 @@ impl ApiClient {
             "{}/chat/completions",
             self.config.endpoint.trim_end_matches('/')
         );
+        // The strongest grade this endpoint can be credited with, read from the
+        // route table rather than assumed: only the direct-Cerebras row declares
+        // `GuaranteedConstrained`.
+        let constrained_decoding_ceiling =
+            crate::llm::route::route_for_api_endpoint(&self.config.endpoint)
+                .capability
+                .constrained_decoding;
 
         let mut req = self.client.post(&url).json(&request);
 
@@ -354,12 +452,28 @@ impl ApiClient {
         // A missing `usage` block (or a provider that omits `total_tokens`)
         // reports 0 — never fabricated.
         let total_tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
+        // Sanitized through the same three guards the OpenRouter telemetry path
+        // uses, so a hostile upstream that echoes a key into `model` cannot
+        // smuggle it into persisted provenance.
+        let served_model = completion
+            .model
+            .as_deref()
+            .and_then(sanitize_route_metadata);
 
-        completion
+        let choice = completion
             .choices
             .first()
-            .map(|c| (c.message.content.clone(), total_tokens))
-            .ok_or_else(|| "No response choices from API".to_string())
+            .ok_or_else(|| "No response choices from API".to_string())?;
+
+        let wire = WireOutcome {
+            terminal_status: terminal_status_from_finish_reason(choice.finish_reason.as_deref()),
+            served_model,
+            // Only OpenRouter reports an upstream provider; a direct endpoint IS
+            // the upstream.
+            served_upstream_provider: None,
+            constrained_decoding: form.achieved_grade(constrained_decoding_ceiling),
+        };
+        Ok((choice.message.content.clone(), total_tokens, wire))
     }
 
     // ------------------------------------------------------------------
@@ -473,6 +587,20 @@ impl ApiClient {
         graph_context: &str,
     ) -> Result<(String, u32), String> {
         self.chat_completion_with_usage(self.history_messages(messages, graph_context), false)
+    }
+
+    /// Like [`chat_with_history_with_usage`](Self::chat_with_history_with_usage)
+    /// but also returns the content-free [`WireOutcome`], so the executor can
+    /// record the normalized terminal status for the dispatched route.
+    pub(crate) fn chat_with_history_with_wire_outcome(
+        &self,
+        messages: &[crate::llm::engine::ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32, WireOutcome), String> {
+        self.chat_completion_with_wire_outcome(
+            self.history_messages(messages, graph_context),
+            RequestOutputForm::Unconstrained,
+        )
     }
 
     /// Build the `(role, content)` message list for the history chat paths:
@@ -1113,6 +1241,222 @@ mod tests {
         })
         .expect_err("empty choices must be Err");
         assert!(err.contains("No response choices"), "got: {err}");
+    }
+
+    // ----- ADR-0038 defect (a): finish_reason on the generic blocking path ---
+
+    #[test]
+    fn chat_completion_maps_length_finish_reason_to_truncated() {
+        use crate::llm::route::TerminalStatus;
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // OpenAI-compatible servers (and OpenRouter) turn some length overruns
+        // into HTTP 200 + finish_reason "length" with a truncated body.
+        let body = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[" },
+                "finish_reason": "length"
+            }]
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let (_text, _tokens, wire) = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                RequestOutputForm::JsonObject,
+            )
+        })
+        .expect("a 200 with finish_reason=length still decodes");
+        assert_eq!(wire.terminal_status, TerminalStatus::Truncated);
+    }
+
+    #[test]
+    fn chat_completion_absent_finish_reason_is_completed() {
+        use crate::llm::route::TerminalStatus;
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "{}" } }]
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let (_text, _tokens, wire) = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                RequestOutputForm::JsonObject,
+            )
+        })
+        .expect("ok");
+        assert_eq!(wire.terminal_status, TerminalStatus::Completed);
+    }
+
+    // ----- completion-budget clamp is actually wired into the wire request --
+
+    #[test]
+    fn effective_completion_budget_clamps_direct_cerebras_but_not_a_generic_endpoint() {
+        // The one endpoint in the route table with a documented completion
+        // ceiling: a config file requesting far more than 40,960 must be
+        // clamped BEFORE it reaches `chat_completion_with_wire_outcome`'s
+        // request builder — this is the wiring finding 1/4 required.
+        let mut cerebras_config = config(crate::settings::CEREBRAS_BASE_URL, Some("sk-test"));
+        cerebras_config.max_tokens = 262_144;
+        let cerebras_client = ApiClient::new(cerebras_config);
+        assert_eq!(
+            cerebras_client.effective_completion_budget(),
+            (40_960, true),
+            "a config requesting more than Cerebras's documented 40,960 must be clamped"
+        );
+
+        // The shipped defaults (2048 / 512) stay far under the ceiling, so the
+        // clamp is structural, not load-bearing, for those.
+        let mut under_budget = config(crate::settings::CEREBRAS_BASE_URL, Some("sk-test"));
+        under_budget.max_tokens = 2_048;
+        assert_eq!(
+            ApiClient::new(under_budget).effective_completion_budget(),
+            (2_048, false)
+        );
+
+        // A generic OpenAI-compatible endpoint has no documented ceiling in
+        // this table, so the same oversized request passes through unclamped
+        // — a fabricated cap would be worse than an absent one.
+        let mut generic_config = config("https://api.openai.com/v1", Some("sk-test"));
+        generic_config.max_tokens = 262_144;
+        assert_eq!(
+            ApiClient::new(generic_config).effective_completion_budget(),
+            (262_144, false)
+        );
+    }
+
+    // ----- ADR-0038 defect (b): direct Cerebras requests strict decoding -----
+
+    #[test]
+    fn cerebras_route_sends_strict_json_schema_response_format() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "{\"operations\":[]}" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let _ = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "patch".to_string())],
+                RequestOutputForm::StrictJsonSchema {
+                    name: "projection_patch".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "operations": { "type": "array" } }
+                    }),
+                },
+            )
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        assert!(
+            req.contains("\"response_format\":{\"type\":\"json_schema\""),
+            "a GuaranteedConstrained route must request json_schema, got:\n{req}"
+        );
+        assert!(
+            req.contains("\"strict\":true"),
+            "the strict flag is the documented decoding guarantee, got:\n{req}"
+        );
+        assert!(
+            !req.contains("\"structured_outputs\""),
+            "structured_outputs is the vLLM-only field, got:\n{req}"
+        );
+    }
+
+    #[test]
+    fn vllm_form_still_sends_structured_outputs_not_json_schema() {
+        // The vLLM body field is a separate, non-standard extension: an endpoint
+        // selected by `prefers_vllm_structured_outputs()` must keep receiving it,
+        // and must NOT be handed a `response_format` at the same time.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "{\"operations\":[]}" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let _ = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "patch".to_string())],
+                RequestOutputForm::VllmStructuredOutputs {
+                    schema: serde_json::json!({ "type": "object" }),
+                },
+            )
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        assert!(
+            req.contains("\"structured_outputs\":{\"json\":"),
+            "the vLLM form must carry structured_outputs, got:\n{req}"
+        );
+        assert!(
+            !req.contains("\"response_format\""),
+            "the vLLM form must not also set response_format, got:\n{req}"
+        );
+    }
+
+    #[test]
+    fn strict_schema_rejection_reports_the_status_so_the_caller_can_downgrade() {
+        // A 400-class rejection of the strict schema must surface with the status
+        // in the message, because that is what `executor::is_schema_rejection`
+        // reads to downgrade to JSON mode ON THE SAME ROUTE — a mode downgrade,
+        // never a provider substitution.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (base, _captured) = rt.block_on(spawn_mock(
+            400,
+            "Bad Request",
+            "schema unsupported".to_string(),
+        ));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let err = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "patch".to_string())],
+                RequestOutputForm::StrictJsonSchema {
+                    name: "projection_patch".to_string(),
+                    schema: serde_json::json!({ "type": "object" }),
+                },
+            )
+        })
+        .expect_err("a 400 is an error");
+        assert!(err.contains("status=400"), "got: {err}");
+        assert!(
+            !err.contains("schema unsupported"),
+            "the provider body must not be echoed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn json_object_mode_records_unconstrained_even_on_a_guaranteed_endpoint() {
+        // ADR-0038 sub-decision 5's honesty requirement: the recorded grade is what
+        // the request form ACHIEVED, not the route's declared ambition. A JSON-mode
+        // call is `Unconstrained` regardless of what the endpoint could have done.
+        use crate::llm::route::ConstrainedDecodingGrade;
+        assert_eq!(
+            RequestOutputForm::JsonObject
+                .achieved_grade(ConstrainedDecodingGrade::GuaranteedConstrained),
+            ConstrainedDecodingGrade::Unconstrained
+        );
+        assert_eq!(
+            RequestOutputForm::StrictJsonSchema {
+                name: "n".to_string(),
+                schema: serde_json::json!({})
+            }
+            .achieved_grade(ConstrainedDecodingGrade::GuaranteedConstrained),
+            ConstrainedDecodingGrade::GuaranteedConstrained
+        );
     }
 
     #[test]

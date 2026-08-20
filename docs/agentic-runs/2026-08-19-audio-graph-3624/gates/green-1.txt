@@ -1,0 +1,4 @@
+$ cd src-tauri && cargo fmt --check
+(no output; exit 0)
+
+Run at commit 5a2da94, 2026-08-19. Clean — no files need reformatting.

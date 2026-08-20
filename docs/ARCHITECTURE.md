@@ -606,25 +606,24 @@ reasoning, and TTS providers rather than requiring a monolithic local model:
 - **GPU:** CPU by default; opt-in Metal support requires full Xcode (not just CLT) for the Metal shader compiler. Set `MISTRALRS_METAL_PRECOMPILE=0` to skip shader precompilation
 - **Implementation:** `llm/mistralrs_engine.rs`
 
-### Extraction Chain (Fallback Order)
+### LLM Route Table (one authorized route per job)
 
-LLM work is dispatched through a priority queue (`llm/executor.rs`) that lets interactive chat preempt background entity extraction. Each provider's fallback order:
+LLM work is dispatched through a priority queue (`llm/executor.rs`) that lets interactive chat preempt background entity extraction. **There is no cross-provider fallback chain.** Per [ADR-0038](adr/0038-route-llm-operations-through-a-single-skin-named-route-table.md), each job resolves the configured provider to exactly ONE named route in `llm/route.rs`, runs the [ADR-0033](adr/0033-enforce-mvp-provider-enablement-at-content-start.md) start gate against that route's registry descriptor, and dispatches only that route's backend:
 
 ```
-LlmProvider::LocalLlama:
-  native llama.cpp --> OpenRouter --> API client --> mistral.rs --> rule-based NER
-
-LlmProvider::OpenRouter:
-  OpenRouter --> API client --> native llama.cpp --> mistral.rs --> rule-based NER
-
-LlmProvider::Api or LlmProvider::AwsBedrock:
-  API client --> OpenRouter --> native llama.cpp --> mistral.rs --> rule-based NER
-
-LlmProvider::MistralRs:
-  Candle GGUF inference --> native llama.cpp --> OpenRouter --> API client --> rule-based NER
+route.local_llama              (llm.local_llama)  --> native llama.cpp
+route.mistralrs                (llm.mistralrs)    --> Candle GGUF inference
+route.cerebras_direct          (llm.cerebras)     --> OpenAI-compatible client, strict json_schema
+route.sambanova_direct         (llm.sambanova)    --> OpenAI-compatible client
+route.openai_compatible        (llm.api)          --> OpenAI-compatible client
+route.openrouter               (llm.openrouter)   --> OpenRouter client
+route.cerebras_via_openrouter  (llm.openrouter)   --> OpenRouter client, singleton Cerebras pin
+route.aws_bedrock              (llm.aws_bedrock)  --> no blocking route (streaming chat only)
 ```
 
-The rule-based extractor (`graph/extraction.rs`) is always available as a final fallback using regex-based NER patterns. The vocabulary (entity/relation types and the shared extraction prompt) is defined in `ontology.rs`.
+A dispatch carries an `AuthorizedRoute` token whose only constructor runs the start gate, so an ungated dispatch does not compile. A route attempt that fails surfaces its own error; it never hops to another provider, and a repair prompt re-runs on the same route. Same-provider **mode** downgrades (json_schema → json_object, vLLM structured outputs → json_object) are retained and recorded in the patch's route record — a mode substitution, never a provider substitution.
+
+For entity extraction only, the rule-based extractor (`graph/extraction.rs`) remains the final fallback using regex-based NER patterns. That is a local, non-egress substitution, not a provider hop. The vocabulary (entity/relation types and the shared extraction prompt) is defined in `ontology.rs`.
 
 ---
 
@@ -835,7 +834,7 @@ sequenceDiagram
     Speech->>Speech: Merge transcript + speaker labels
     Speech-->>Main: transcript-update event
     Speech->>Exec: background entity extraction job
-    Exec->>Speech: ExtractionResult (LLM fallback chain or rule-based)
+    Exec->>Speech: ExtractionResult (single authorized LLM route or rule-based)
     Speech->>Graph: apply entities + relations
     Graph->>Graph: Entity resolution + temporal edge update
     Speech->>Agent: spawn proposal review for segment
@@ -1072,7 +1071,7 @@ flowchart TD
 
     subgraph PROVIDERS["Provider Startup"]
         STATE --> ASR_P["ASR Provider<br/>(local/cloud/streaming)"]
-        STATE --> LLM_P["LLM Provider<br/>(executor fallback order)"]
+        STATE --> LLM_P["LLM Provider<br/>(executor route table)"]
         STATE --> GEM_P["Gemini Client<br/>(API key or Vertex AI)"]
     end
 ```

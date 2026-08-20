@@ -306,7 +306,13 @@ mod tests {
                 provider: "fixture-llm".into(),
                 model: "fixture-model".into(),
                 prompt_id: "notes-v1".into(),
+                // Pre-contract record shape (ADR-0038): absent route identity,
+                // model id recorded as requested — the same values serde
+                // defaults when reading a patch written before the route table.
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
+            route: None,
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,

@@ -3204,6 +3204,7 @@ mod shutdown_tests {
 
     fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: crate::projections::ProjectionKind::Notes,
             llm_request_id: format!("llm-request-{sequence}"),
@@ -3227,6 +3228,8 @@ mod shutdown_tests {
                 provider: "openrouter".into(),
                 model: "anthropic/claude-sonnet-4".into(),
                 prompt_id: "notes-v1".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3637,6 +3640,7 @@ mod local_memory_repository_tests {
         created_at_ms: u64,
     ) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: crate::projections::ProjectionKind::Notes,
             llm_request_id: format!("llm-notes-{sequence}"),
@@ -3652,6 +3656,8 @@ mod local_memory_repository_tests {
                 provider: "openrouter".into(),
                 model: "model-a".into(),
                 prompt_id: "notes-v1".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(120),
@@ -3666,6 +3672,7 @@ mod local_memory_repository_tests {
         created_at_ms: u64,
     ) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: crate::projections::ProjectionKind::Graph,
             llm_request_id: format!("llm-graph-{sequence}"),
@@ -3681,6 +3688,8 @@ mod local_memory_repository_tests {
                 provider: "openrouter".into(),
                 model: "model-a".into(),
                 prompt_id: "graph-v1".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(140),
@@ -3697,6 +3706,7 @@ mod local_memory_repository_tests {
         created_at_ms: u64,
     ) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind,
             llm_request_id: format!("llm-conformance-{sequence}"),
@@ -3707,6 +3717,8 @@ mod local_memory_repository_tests {
                 provider: "test-provider".into(),
                 model: "projection-conformance".into(),
                 prompt_id: "repository-replay-parity".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(25)),
             generation_latency_ms: Some(50),
@@ -4035,6 +4047,8 @@ mod local_memory_repository_tests {
                     provider: "openrouter".into(),
                     model: "model-a".into(),
                     prompt_id: "projection-v1".into(),
+                    route_id: None,
+                    model_source: crate::llm::route::ModelIdentitySource::Requested,
                 }),
                 confidence: Some(0.91),
                 created_at_ms: 1_700_000_000_000,

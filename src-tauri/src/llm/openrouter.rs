@@ -18,6 +18,9 @@ use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::http_diag::{diagnostic_path, response_request_id};
+use crate::llm::route::{
+    ConstrainedDecodingGrade, RequestOutputForm, WireOutcome, terminal_status_from_finish_reason,
+};
 use crate::llm::stream_contract::StreamUsage;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -756,6 +759,12 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    /// OpenAI-compatible stop signal. OpenRouter converts some length overruns
+    /// into HTTP 200 with `finish_reason: "length"`, so dropping this field made
+    /// a truncated response indistinguishable from a clean stop (ADR-0038 defect
+    /// 1). Optional + serde-default because some upstreams omit it.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1108,7 +1117,7 @@ fn fallback_evidence(preferred: Option<&str>, served: Option<&str>) -> Option<bo
 /// hyphen, trimming leading/trailing separators. So `"Amazon Bedrock"`,
 /// `"amazon_bedrock"`, and `"amazon-bedrock"` all normalize to
 /// `"amazon-bedrock"`.
-fn normalize_provider_name(raw: &str) -> String {
+pub(crate) fn normalize_provider_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut pending_sep = false;
     for ch in raw.chars() {
@@ -1125,54 +1134,22 @@ fn normalize_provider_name(raw: &str) -> String {
     out
 }
 
-/// Maximum length of a retained provider/model metadata token. Real OpenRouter
-/// provider names (`"Cerebras"`, `"Together"`, `"Amazon Bedrock"`) and model
-/// slugs (`"anthropic/claude-sonnet-4.5"`) sit well under this; the cap is
-/// tight enough that a full prompt or reply cannot survive as metadata.
-const MAX_METADATA_LEN: usize = 64;
+/// Maximum length of a retained provider/model metadata token. The cap itself now
+/// lives in [`crate::llm::route`] so the OpenRouter telemetry path and the shared
+/// route record enforce one identical value; this alias exists so the redaction
+/// tests below keep asserting against the real constant rather than a literal.
+#[cfg(test)]
+const MAX_METADATA_LEN: usize = crate::llm::route::MAX_METADATA_LEN;
 
 /// Sanitize a free-form provider/model metadata string into a bounded,
 /// non-secret token, or drop it entirely.
 ///
-/// Redaction defense-in-depth (seed audio-graph-76bd):
-/// 1. Reject anything longer than [`MAX_METADATA_LEN`] outright — a provider
-///    name / model slug is short, so an over-length value is not routing
-///    metadata (it is prompt/reply spill) and is dropped rather than truncated.
-/// 2. Reject values carrying a credential-shaped token (`sk-…`, `Bearer …`) so
-///    a hostile upstream that echoes a key into the `provider`/`model` field
-///    cannot smuggle it into persisted telemetry.
-/// 3. Keep only `[A-Za-z0-9 ._:/-]` (mirrors [`response_request_id`]'s filter),
-///    trim, and drop if nothing survives.
+/// The implementation moved to [`crate::llm::route::sanitize_route_metadata`] so
+/// the served-model echo on the generic `ApiClient` path passes through the same
+/// three guards (length cap, credential shape, character allowlist) that this
+/// path has always used — a single redaction implementation, not two.
 fn sanitize_metadata_value(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_METADATA_LEN {
-        return None;
-    }
-    if looks_credential_shaped(trimmed) {
-        return None;
-    }
-
-    let sanitized: String = trimmed
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | ':' | '/'))
-        .collect();
-    let sanitized = sanitized.trim();
-    if sanitized.is_empty() {
-        None
-    } else {
-        Some(sanitized.to_string())
-    }
-}
-
-/// Heuristic guard: does this value contain a credential-shaped token? Catches
-/// the common API-key prefixes and bearer-token shapes so a routed-provider
-/// echo can never persist a secret as "metadata". Case-insensitive.
-fn looks_credential_shaped(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("sk-")
-        || lower.contains("bearer ")
-        || lower.contains("api_key")
-        || lower.contains("apikey")
+    crate::llm::route::sanitize_route_metadata(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,7 +1503,7 @@ impl OpenRouterClient {
         cache_hint: Option<PromptCacheHint>,
     ) -> Result<(String, u32), String> {
         self.chat_completion_with_routing_telemetry_cached(messages, json_mode, cache_hint)
-            .map(|(text, telemetry)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
+            .map(|(text, telemetry, _wire)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
     }
 
     /// Send a blocking chat completion, returning the reply text **and** the
@@ -1543,7 +1520,7 @@ impl OpenRouterClient {
         json_mode: bool,
     ) -> Result<(String, StreamUsage), String> {
         self.chat_completion_with_routing_telemetry(messages, json_mode)
-            .map(|(text, telemetry)| (text, telemetry.usage))
+            .map(|(text, telemetry, _wire)| (text, telemetry.usage))
     }
 
     /// Send a blocking chat completion, returning the reply text **and** the
@@ -1562,7 +1539,7 @@ impl OpenRouterClient {
         &self,
         messages: Vec<(String, String)>,
         json_mode: bool,
-    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
+    ) -> Result<(String, OpenRouterRoutingTelemetry, WireOutcome), String> {
         self.chat_completion_with_routing_telemetry_cached(messages, json_mode, None)
     }
 
@@ -1578,13 +1555,32 @@ impl OpenRouterClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
         cache_hint: Option<PromptCacheHint>,
-    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
-        let response_format = if json_mode {
-            Some(ResponseFormat::json_object())
+    ) -> Result<(String, OpenRouterRoutingTelemetry, WireOutcome), String> {
+        let form = if json_mode {
+            RequestOutputForm::JsonObject
         } else {
-            None
+            RequestOutputForm::Unconstrained
         };
-        self.chat_completion_send(messages, response_format, cache_hint)
+        self.chat_completion_send(messages, &form, cache_hint)
+    }
+
+    /// The route-contract entry point (ADR-0038): send one chat completion on an
+    /// already-authorized route and return the reply, the token total, and the
+    /// content-free [`WireOutcome`] — normalized terminal status plus the SERVED
+    /// model and upstream provider.
+    ///
+    /// This is what closes ADR-0038 defect 3 for this client: the two former
+    /// `.map(|(text, telemetry)| ...)` projections discarded `selected_provider`
+    /// and `served_model` before any caller could stamp them, so provenance
+    /// recorded the requested slug from `client.config().model`.
+    pub fn chat_completion_with_wire_outcome(
+        &self,
+        messages: Vec<(String, String)>,
+        form: &RequestOutputForm,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, u32, WireOutcome), String> {
+        self.chat_completion_send(messages, form, cache_hint)
+            .map(|(text, telemetry, wire)| (text, telemetry.usage.total_tokens.unwrap_or(0), wire))
     }
 
     /// Cache-aware structured-outputs projection call (seed audio-graph-a324):
@@ -1611,9 +1607,12 @@ impl OpenRouterClient {
         schema: serde_json::Value,
         cache_hint: Option<PromptCacheHint>,
     ) -> Result<(String, u32), String> {
-        let response_format = Some(ResponseFormat::json_schema(schema_name, schema));
-        self.chat_completion_send(messages, response_format, cache_hint)
-            .map(|(text, telemetry)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
+        let form = RequestOutputForm::StrictJsonSchema {
+            name: schema_name.to_string(),
+            schema,
+        };
+        self.chat_completion_send(messages, &form, cache_hint)
+            .map(|(text, telemetry, _wire)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
     }
 
     /// Shared blocking send + bounded retry + telemetry collection for every
@@ -1623,10 +1622,28 @@ impl OpenRouterClient {
     fn chat_completion_send(
         &self,
         messages: Vec<(String, String)>,
-        response_format: Option<ResponseFormat>,
+        form: &RequestOutputForm,
         cache_hint: Option<PromptCacheHint>,
-    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
+    ) -> Result<(String, OpenRouterRoutingTelemetry, WireOutcome), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
+
+        let response_format = match form {
+            RequestOutputForm::Unconstrained => None,
+            RequestOutputForm::JsonObject => Some(ResponseFormat::json_object()),
+            RequestOutputForm::StrictJsonSchema { name, schema } => {
+                Some(ResponseFormat::json_schema(name, schema.clone()))
+            }
+            // `structured_outputs` is a vLLM-only body field with no OpenRouter
+            // equivalent; the route table never selects it for an OpenRouter
+            // route, so this arm exists only to keep the match exhaustive.
+            RequestOutputForm::VllmStructuredOutputs { .. } => Some(ResponseFormat::json_object()),
+        };
+        // The strongest grade any OpenRouter-fronted endpoint can be credited
+        // with. OpenRouter's own docs warn that enforcement varies by upstream
+        // even with `strict: true`, so this client never claims
+        // `GuaranteedConstrained`; the Cerebras-via-OpenRouter route row records
+        // that ambition, and this records what the wire actually supports.
+        let constrained_decoding_ceiling = ConstrainedDecodingGrade::AdvertisedHint;
 
         let breakpoint_index = cache_hint
             .as_ref()
@@ -1774,11 +1791,22 @@ impl OpenRouterClient {
         // and token/latency sums accrue.
         OpenRouterRuntimeAccounting::record_global(&telemetry);
 
-        completion
+        let choice = completion
             .choices
             .first()
-            .map(|c| (c.message.content.clone(), telemetry))
-            .ok_or_else(|| "No response choices from OpenRouter".to_string())
+            .ok_or_else(|| "No response choices from OpenRouter".to_string())?;
+
+        // ADR-0038 defect 1 + 3: read the stop signal and the SERVED identity off
+        // the response instead of dropping both. `served_model` /
+        // `served_upstream_provider` come from the already-sanitized telemetry, so
+        // no unsanitized upstream string can reach provenance.
+        let wire = WireOutcome {
+            terminal_status: terminal_status_from_finish_reason(choice.finish_reason.as_deref()),
+            served_model: telemetry.served_model.clone(),
+            served_upstream_provider: telemetry.selected_provider.clone(),
+            constrained_decoding: form.achieved_grade(constrained_decoding_ceiling),
+        };
+        Ok((choice.message.content.clone(), telemetry, wire))
     }
 
     /// Extract entities and relationships from a transcript segment via
@@ -1848,6 +1876,33 @@ impl OpenRouterClient {
 
         self.chat_completion_with_usage(api_messages, false)
     }
+
+    /// Like [`chat_with_history_with_usage`](Self::chat_with_history_with_usage)
+    /// but also returns the content-free [`WireOutcome`], so the executor can
+    /// record the normalized terminal status for the dispatched route.
+    pub(crate) fn chat_with_history_with_wire_outcome(
+        &self,
+        messages: &[crate::llm::engine::ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32, WireOutcome), String> {
+        let system_prompt = format!(
+            "You are a knowledge graph assistant analyzing a live audio conversation. \
+             Here is the current knowledge graph context:\n\n{}\n\n\
+             Answer the user's question about the conversation, people, topics, or relationships discussed.",
+            graph_context
+        );
+
+        let mut api_messages = vec![("system".to_string(), system_prompt)];
+        for msg in messages {
+            api_messages.push((msg.role.clone(), msg.content.clone()));
+        }
+
+        self.chat_completion_with_wire_outcome(
+            api_messages,
+            &RequestOutputForm::Unconstrained,
+            None,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,11 +1935,20 @@ fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
 }
 
-/// Whether a transport-level reqwest error warrants a retry. Timeouts and
-/// connect failures are transient; anything else (decode/body/request-shape) is
-/// treated as terminal (M4 / audio-graph-7060).
+/// Whether a transport-level reqwest error on the **send** phase warrants a
+/// retry. Only a connect failure does: connect failed ⇒ nothing was sent ⇒ the
+/// provider performed no work, which is `TransientAvailability`
+/// (`crate::llm::route::RetryClass`).
+///
+/// A `.send()` timeout is deliberately NOT retried. It fires before the status
+/// line arrives, but that includes the case where the request was fully
+/// transmitted and the provider is generating: the route layer cannot tell, so it
+/// is `ExternalEffectUnknown`, which ADR-0038 forbids auto-reissuing without
+/// idempotency proof plus cost/egress authorization. Narrowing this reduces
+/// auto-retry, which is the safe direction (M4 / audio-graph-7060 originally
+/// retried both).
 fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect()
+    error.is_connect()
 }
 
 /// Whether a **body-decode** failure on an otherwise-successful (2xx) response
@@ -1896,6 +1960,16 @@ fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
 /// A read timeout mid-body is also classified as a decode/body failure here;
 /// only the success path calls this (a 4xx is handled before the body is read),
 /// so auth/validation errors can never reach a decode retry.
+///
+/// The honest split against [`is_retryable_chat_transport_error`]: this function
+/// runs only **after** a 2xx status line, so the remote effect is KNOWN to have
+/// happened and been billed — `RetryClass::UnusableCompletion`, which ADR-0038
+/// does not forbid reissuing on the same route. A timeout **before** the status
+/// line is `ExternalEffectUnknown` and is not retried. So "a post-send timeout is
+/// never auto-retried" is true pre-headers and false post-headers, and that is
+/// the deliberate line. Deleting this arm would regress seed audio-graph-a324
+/// (the user's "error decoding response body" x9); reconciling the one surviving
+/// in-client reissue with retry progression is `audio-graph-3b48`'s.
 fn is_retryable_chat_decode_error(error: &reqwest::Error) -> bool {
     error.is_decode() || error.is_body() || error.is_timeout()
 }
@@ -2727,6 +2801,61 @@ mod tests {
         assert!(
             is_retryable_chat_decode_error(&timeout_err),
             "a timeout must be retryable on the decode path"
+        );
+    }
+
+    /// The deliberate line between the two retry classifiers (ADR-0038, critique
+    /// finding 4). A reqwest timeout is ONE error type but two situations:
+    ///
+    /// - Before the status line it is a `.send()` failure the route layer cannot
+    ///   interpret — the request may have been fully transmitted and the provider
+    ///   may be generating. That is `ExternalEffectUnknown`, never auto-retried.
+    /// - After a 2xx status line the remote effect is KNOWN to have happened and
+    ///   been billed. That is `UnusableCompletion`, which ADR-0038 does not forbid
+    ///   reissuing on the same route, and which seed audio-graph-a324 fixed.
+    ///
+    /// The two mock behaviours that pin the observable halves are
+    /// `chat_completion_retries_truncated_body_then_succeeds` (2xx headers then
+    /// truncate → exactly two requests) and, for connect-phase transience, the
+    /// classifier assertions below.
+    #[test]
+    fn timeout_is_not_retried_pre_status_but_is_retried_post_2xx() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let timeout_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(1))
+                .build()
+                .unwrap()
+                // A routable-but-unresponsive address forces a timeout.
+                .get("http://10.255.255.1/")
+                .send()
+                .await
+                .expect_err("must time out")
+        });
+        assert!(timeout_err.is_timeout());
+        assert!(
+            !is_retryable_chat_transport_error(&timeout_err),
+            "a pre-status timeout is ExternalEffectUnknown and must NOT be auto-retried"
+        );
+        assert!(
+            is_retryable_chat_decode_error(&timeout_err),
+            "the same error class AFTER a 2xx is UnusableCompletion, which may be reissued"
+        );
+
+        let connect_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .build()
+                .unwrap()
+                // Port 1 on loopback refuses immediately.
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("must fail to connect")
+        });
+        assert!(connect_err.is_connect());
+        assert!(
+            is_retryable_chat_transport_error(&connect_err),
+            "connect failed ⇒ nothing was sent ⇒ TransientAvailability"
         );
     }
 
@@ -4041,6 +4170,78 @@ mod tests {
         );
     }
 
+    // ----- ADR-0038 defects (a) + (c) on the OpenRouter blocking path --------
+
+    #[test]
+    fn blocking_length_finish_reason_is_truncated() {
+        use crate::llm::route::TerminalStatus;
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        // OpenRouter converts some length overruns into HTTP 200 with
+        // finish_reason "length" and a truncated body (ADR-0038:41-43).
+        let (base, _captured) = rt.block_on(spawn_mock(|_| {
+            (
+                200,
+                "OK",
+                serde_json::json!({
+                    "choices": [{
+                        "message": { "content": "{\"operations\":[" },
+                        "finish_reason": "length"
+                    }]
+                })
+                .to_string(),
+            )
+        }));
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let (_text, _tokens, wire) = std::thread::spawn(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                &RequestOutputForm::JsonObject,
+                None,
+            )
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("a 200 with finish_reason=length still decodes");
+        assert_eq!(wire.terminal_status, TerminalStatus::Truncated);
+    }
+
+    #[test]
+    fn blocking_wire_outcome_records_served_model_and_upstream_provider() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        // The requested slug is `openai/gpt-5.2` (retry_test_config); OpenRouter
+        // reports a different SERVED slug plus the upstream provider that served
+        // it. Provenance must record the served identity, not the request echo.
+        let (base, _captured) = rt.block_on(spawn_mock(|_| {
+            (
+                200,
+                "OK",
+                serde_json::json!({
+                    "choices": [{ "message": { "content": "{}" }, "finish_reason": "stop" }],
+                    "model": "openai/gpt-5.2-turbo",
+                    "provider": "Cerebras"
+                })
+                .to_string(),
+            )
+        }));
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let (_text, _tokens, wire) = std::thread::spawn(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                &RequestOutputForm::JsonObject,
+                None,
+            )
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("ok");
+        assert_eq!(wire.served_model.as_deref(), Some("openai/gpt-5.2-turbo"));
+        assert_eq!(wire.served_upstream_provider.as_deref(), Some("Cerebras"));
+    }
+
     #[test]
     fn routing_telemetry_never_persists_secret_or_prompt_or_reply_text() {
         // A hostile upstream that echoes a key + prompt + reply into the
@@ -4208,7 +4409,7 @@ mod tests {
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
         let prompt = "patient said private diagnosis";
         let prompt_owned = prompt.to_string();
-        let (reply, telemetry) = std::thread::spawn(move || {
+        let (reply, telemetry, _wire) = std::thread::spawn(move || {
             client.chat_completion_with_routing_telemetry(
                 vec![("user".to_string(), prompt_owned)],
                 false,
@@ -4803,7 +5004,7 @@ mod tests {
         .await
         .expect("spawn_blocking join");
 
-        let (_reply, telemetry) = result.expect("live OpenRouter completion must succeed");
+        let (_reply, telemetry, _wire) = result.expect("live OpenRouter completion must succeed");
         // `_reply` is intentionally unused — binding prevents dead-code warnings
         // while making it explicit that we are discarding the reply text here.
         // The report carries no content.

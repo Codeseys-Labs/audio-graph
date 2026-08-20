@@ -1309,6 +1309,7 @@ mod rotation_tests {
         body: &str,
     ) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: ProjectionKind::Notes,
             llm_request_id: format!("llm-notes-{sequence}"),
@@ -1324,6 +1325,8 @@ mod rotation_tests {
                 provider: "openrouter".into(),
                 model: "anthropic/claude-sonnet-4".into(),
                 prompt_id: "notes-v1".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -1334,6 +1337,7 @@ mod rotation_tests {
 
     fn runtime_graph_patch(sequence: u64, basis: ProjectionBasis) -> ProjectionPatch {
         ProjectionPatch {
+            route: None,
             sequence,
             kind: ProjectionKind::Graph,
             llm_request_id: format!("llm-graph-{sequence}"),
@@ -1349,6 +1353,8 @@ mod rotation_tests {
                 provider: "openrouter".into(),
                 model: "anthropic/claude-sonnet-4".into(),
                 prompt_id: "graph-v1".into(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

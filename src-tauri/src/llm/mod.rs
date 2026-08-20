@@ -10,8 +10,11 @@
 //! - **MistralRs** (`mistralrs_engine`): Rust-native GGUF inference via mistral.rs (Candle),
 //!   with JSON Schema-constrained structured generation for entity extraction.
 //!
-//! The speech processor and chat commands try the user's preferred backend first,
-//! then fallback alternatives, then rule-based extraction as a final fallback.
+//! Which backend a request reaches is decided by the named route table in
+//! [`route`] (ADR-0038): each content-bearing dispatch resolves **exactly one**
+//! authorized route and there is no automatic cross-provider fallback. Entity
+//! extraction still has the local rule-based extractor as its final fallback —
+//! that is a local, non-egress substitution, not a provider hop.
 
 pub mod api_client;
 pub mod bedrock;
@@ -20,6 +23,7 @@ pub mod executor;
 pub(crate) mod http_diag;
 pub mod mistralrs_engine;
 pub mod openrouter;
+pub mod route;
 pub mod sse;
 pub mod stream_contract;
 pub mod streaming;

@@ -1,0 +1,12 @@
+$ cd src-tauri && cargo clippy --no-default-features --features cloud -- -D warnings
+
+    Compiling audio-graph v0.1.0-rc.1 (/home/codeseys/DevBox/audio-graph/.worktrees/3624-llm-route-contract/src-tauri)
+    Checking audio-graph-ipc-contract v0.1.0-rc.1 (/home/codeseys/DevBox/audio-graph/.worktrees/3624-llm-route-contract/src-tauri/crates/ipc-contract)
+    Checking audio-graph-provider-registry v0.1.0-rc.1 (/home/codeseys/DevBox/audio-graph/.worktrees/3624-llm-route-contract/src-tauri/crates/provider-registry)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.45s
+
+Run at commit 5a2da94, 2026-08-19. Zero warnings, exit 0.
+
+Second run (incremental, same commit) for the report's exact wording:
+    Checking audio-graph v0.1.0-rc.1 (/home/codeseys/DevBox/audio-graph/.worktrees/3624-llm-route-contract/src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.09s

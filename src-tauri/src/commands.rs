@@ -3206,9 +3206,6 @@ pub async fn send_chat_message(
     // graph context once so we still have it for the error fallback path.
     let executor = state.llm_executor.clone();
     let graph_for_error = graph_context.clone();
-    let allow_cloud_fallbacks = settings
-        .privacy_mode
-        .allows_session_cloud_content_transfer();
     // `chat_with_history` now returns the reply text plus the token usage the
     // backend reported. The native `LlmEngine` surfaces a real (prompt +
     // completion) count; the cloud backends routed through this blocking path
@@ -3216,12 +3213,7 @@ pub async fn send_chat_message(
     // their `chat_with_history` signatures don't carry usage yet — never
     // fabricated. On error we synthesize a fallback message with no count.
     let (response_text, tokens_used) = match tokio::task::spawn_blocking(move || {
-        executor.chat_with_history_with_policy(
-            messages,
-            graph_context,
-            llm_provider,
-            allow_cloud_fallbacks,
-        )
+        executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
     .map_err(|e| format!("chat task join failed: {}", e))?
@@ -3321,16 +3313,8 @@ pub async fn synthesize_notes(
     }];
 
     let executor = state.llm_executor.clone();
-    let allow_cloud_fallbacks = settings
-        .privacy_mode
-        .allows_session_cloud_content_transfer();
     let outcome = tokio::task::spawn_blocking(move || {
-        executor.chat_with_history_with_policy(
-            messages,
-            graph_context,
-            llm_provider,
-            allow_cloud_fallbacks,
-        )
+        executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
     .map_err(|e| format!("notes synthesis task join failed: {}", e))?
@@ -3476,7 +3460,12 @@ fn approved_agent_projection_patch(
             provider: "audiograph".to_string(),
             model: "rule-based-live-assist".to_string(),
             prompt_id: prompt_id.to_string(),
+            // Locally generated: no LLM route was dispatched, so there is no route
+            // to stamp and the model id is ours, not a served one.
+            route_id: None,
+            model_source: crate::llm::route::ModelIdentitySource::Requested,
         },
+        route: None,
         queued_at_ms: Some(now_ms),
         generation_latency_ms: Some(0),
         apply_latency_ms: None,
@@ -11087,6 +11076,7 @@ mod tests {
             sequence,
             kind: crate::projections::ProjectionKind::Notes,
             llm_request_id: format!("report-note-{sequence}"),
+            route: None,
             basis,
             operations: vec![crate::projections::ProjectionOperation::UpsertNote {
                 id: "note-report".to_string(),
@@ -11099,6 +11089,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "projection-report".to_string(),
                 prompt_id: "report-notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: Some(1_700_000_050_000 + sequence),
             generation_latency_ms: Some(30 + sequence),
@@ -11115,6 +11107,7 @@ mod tests {
             sequence,
             kind: crate::projections::ProjectionKind::Graph,
             llm_request_id: format!("report-graph-{sequence}"),
+            route: None,
             basis,
             operations: vec![crate::projections::ProjectionOperation::UpsertGraphNode {
                 id: "node-report".to_string(),
@@ -11127,6 +11120,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "projection-report".to_string(),
                 prompt_id: "report-graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: Some(1_700_000_150_000 + sequence),
             generation_latency_ms: Some(40 + sequence),
@@ -11140,6 +11135,7 @@ mod tests {
             sequence: 1,
             kind: crate::projections::ProjectionKind::Graph,
             llm_request_id: "report-invalid-graph".to_string(),
+            route: None,
             basis: crate::projections::ProjectionBasis {
                 span_revisions: Vec::new(),
                 diarization_span_revisions: Vec::new(),
@@ -11159,6 +11155,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "projection-report".to_string(),
                 prompt_id: "report-invalid-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -11205,6 +11203,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "stale-artifact".to_string(),
                 prompt_id: "stale-notes".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
         });
         notes
@@ -11232,6 +11232,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "stale-artifact".to_string(),
                 prompt_id: "stale-graph".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
         });
         graph
@@ -11249,6 +11251,8 @@ mod tests {
             provider: "test".to_string(),
             model: "active-before-load".to_string(),
             prompt_id: "active-before-load".to_string(),
+            route_id: None,
+            model_source: crate::llm::route::ModelIdentitySource::Requested,
         };
         let mut state = crate::projections::MaterializedProjectionState::new(session_id);
         state.notes.last_sequence = 99;
@@ -12867,6 +12871,7 @@ mod tests {
             sequence: 1,
             kind: crate::projections::ProjectionKind::Graph,
             llm_request_id: "report-graph-seed".to_string(),
+            route: None,
             basis: basis.clone(),
             operations: vec![
                 crate::projections::ProjectionOperation::UpsertGraphNode {
@@ -12909,6 +12914,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "projection-report".to_string(),
                 prompt_id: "report-graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -12919,6 +12926,7 @@ mod tests {
             sequence: 2,
             kind: crate::projections::ProjectionKind::Graph,
             llm_request_id: "report-graph-retcon".to_string(),
+            route: None,
             basis: basis.clone(),
             operations: vec![crate::projections::ProjectionOperation::MergeGraphNodes {
                 source_id: "person:alicia".to_string(),
@@ -12929,6 +12937,8 @@ mod tests {
                 provider: "test".to_string(),
                 model: "projection-report".to_string(),
                 prompt_id: "report-graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

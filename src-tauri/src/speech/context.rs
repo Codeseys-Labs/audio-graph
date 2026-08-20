@@ -70,6 +70,18 @@ pub(crate) struct SpeechShared {
 pub(crate) struct SpeechConfig {
     pub models_dir: PathBuf,
     pub llm_provider: LlmProvider,
+    /// Whether the session's privacy mode allows session content to leave the
+    /// device (`PrivacyMode::ByokCloud`).
+    ///
+    /// Since ADR-0038 this field authorizes NOTHING. It used to select the
+    /// executor's fallback chain; automatic cross-provider fallback is gone, and a
+    /// cloud route under a non-`ByokCloud` mode is now refused by the client's own
+    /// content-egress policy instead of silently downgraded to a local model. What
+    /// remains is a privacy-REPORT input: it is persisted in per-session
+    /// data-movement events (`ProjectionMovementFacts::cloud_transfer_allowed`) and
+    /// gates whether the remote summary/prefix movement is emitted at all (seed
+    /// audio-graph-72d5). Removing it would be an ADR-0027 migration for no safety
+    /// gain, so the name is kept and its reach is narrowed.
     pub llm_allow_cloud_fallbacks: bool,
     pub provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
@@ -93,6 +105,18 @@ pub(crate) struct ExtractionDeps<'a> {
     pub mistralrs_engine: &'a Arc<Mutex<Option<MistralRsEngine>>>,
     pub llm_executor: &'a LlmExecutor,
     pub llm_provider: &'a LlmProvider,
+    /// Whether the session's privacy mode allows session content to leave the
+    /// device (`PrivacyMode::ByokCloud`).
+    ///
+    /// Since ADR-0038 this field authorizes NOTHING. It used to select the
+    /// executor's fallback chain; automatic cross-provider fallback is gone, and a
+    /// cloud route under a non-`ByokCloud` mode is now refused by the client's own
+    /// content-egress policy instead of silently downgraded to a local model. What
+    /// remains is a privacy-REPORT input: it is persisted in per-session
+    /// data-movement events (`ProjectionMovementFacts::cloud_transfer_allowed`) and
+    /// gates whether the remote summary/prefix movement is emitted at all (seed
+    /// audio-graph-72d5). Removing it would be an ADR-0027 migration for no safety
+    /// gain, so the name is kept and its reach is narrowed.
     pub llm_allow_cloud_fallbacks: bool,
     pub graph_extractor: &'a Arc<RuleBasedExtractor>,
     pub knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,

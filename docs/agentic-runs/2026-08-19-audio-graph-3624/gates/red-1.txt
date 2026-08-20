@@ -1,0 +1,31 @@
+$ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud -- --test-threads=1 llm::executor::tests::projection_dispatch_invokes_exactly_one_route llm::executor::tests::repair_never_leaves
+
+running 2 tests
+test llm::executor::tests::projection_dispatch_invokes_exactly_one_route_and_surfaces_its_error ... FAILED
+test llm::executor::tests::repair_never_leaves_the_authorized_route ... FAILED
+
+failures:
+
+---- llm::executor::tests::projection_dispatch_invokes_exactly_one_route_and_surfaces_its_error stdout ----
+
+thread 'llm::executor::tests::projection_dispatch_invokes_exactly_one_route_and_surfaces_its_error' (1248391) panicked at src/llm/executor.rs:1745:9:
+assertion `left == right` failed: exactly one route must be invoked — no fallback hop
+  left: ["openrouter", "api", "native", "mistralrs"]
+ right: ["openrouter"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- llm::executor::tests::repair_never_leaves_the_authorized_route stdout ----
+
+thread 'llm::executor::tests::repair_never_leaves_the_authorized_route' (1248392) panicked at src/llm/executor.rs:1815:9:
+assertion `left == right` failed: the repair must stay on the route that produced the draft
+  left: ["route-under-test", "other-provider"]
+ right: ["route-under-test", "route-under-test"]
+
+
+failures:
+    llm::executor::tests::projection_dispatch_invokes_exactly_one_route_and_surfaces_its_error
+    llm::executor::tests::repair_never_leaves_the_authorized_route
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1506 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

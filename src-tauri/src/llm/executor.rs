@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::{ChatMessage, ChatOutcome};
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
@@ -19,6 +20,12 @@ use crate::projection_llm::{
 };
 use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
+
+use super::route::{
+    AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade, ModelIdentitySource,
+    RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome, authorize_route_dispatch,
+    retry_class_for_terminal_status, route_for_api_endpoint, route_for_openrouter_policy,
+};
 
 /// Models where the structured-outputs (`response_format: json_schema`) request
 /// is worth skipping for the rest of this process run because NO provider for
@@ -52,13 +59,16 @@ fn note_openrouter_schema_unsupported(model: &str) {
     }
 }
 
-/// Whether an OpenRouter error means the structured-outputs request should
-/// **retry without the schema** — a 400/404/422-class rejection, as opposed to a
+/// Whether a provider error means the structured-outputs request should **retry
+/// without the schema** — a 400/404/422-class rejection, as opposed to a
 /// transient failure or an auth error (which must NOT trigger the schema-less
 /// retry: a schema-less call would just fail the same way on auth, and transient
-/// errors are already retried in-client). The blocking OpenRouter error string
-/// carries `status=<code>` (see `openrouter_http_error_message`).
-fn is_openrouter_schema_rejection(err: &str) -> bool {
+/// errors are already retried in-client). Both blocking error strings carry
+/// `status=<code>` (`openrouter_http_error_message` / `api_error_message`).
+///
+/// The retry it authorizes is a MODE downgrade on the SAME authorized route —
+/// json_schema to json_object — never a provider substitution (ADR-0038).
+fn is_schema_rejection(err: &str) -> bool {
     err.contains("status=400") || err.contains("status=404") || err.contains("status=422")
 }
 
@@ -151,20 +161,24 @@ struct QueueState {
     background: VecDeque<LlmJob>,
 }
 
+/// A queued unit of LLM work.
+///
+/// `provider` is the session's configured provider; the worker resolves it to
+/// exactly ONE authorized route (`llm/route.rs`). There is no per-job
+/// fallback-policy flag: ADR-0038 removed automatic cross-provider fallback, so
+/// there is nothing for a flag to select.
 enum LlmJob {
     Extract {
         text: String,
         speaker: String,
         context: String,
         provider: LlmProvider,
-        allow_cloud_fallbacks: bool,
         response_tx: mpsc::Sender<LlmJobResult>,
     },
     Chat {
         messages: Vec<ChatMessage>,
         graph_context: String,
         provider: LlmProvider,
-        allow_cloud_fallbacks: bool,
         response_tx: mpsc::Sender<LlmJobResult>,
     },
     ProjectionPatch {
@@ -173,7 +187,6 @@ enum LlmJob {
         sequence: u64,
         created_at_ms: u64,
         provider: LlmProvider,
-        allow_cloud_fallbacks: bool,
         response_tx: mpsc::Sender<LlmJobResult>,
     },
 }
@@ -238,18 +251,6 @@ impl LlmExecutor {
         provider: LlmProvider,
         priority: LlmPriority,
     ) -> Option<ExtractionResult> {
-        self.extract_entities_with_policy(text, speaker, context, provider, priority, true)
-    }
-
-    pub fn extract_entities_with_policy(
-        &self,
-        text: String,
-        speaker: String,
-        context: String,
-        provider: LlmProvider,
-        priority: LlmPriority,
-        allow_cloud_fallbacks: bool,
-    ) -> Option<ExtractionResult> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             priority,
@@ -258,7 +259,6 @@ impl LlmExecutor {
                 speaker,
                 context,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             },
         );
@@ -290,16 +290,6 @@ impl LlmExecutor {
         graph_context: String,
         provider: LlmProvider,
     ) -> Result<ChatOutcome, String> {
-        self.chat_with_history_with_policy(messages, graph_context, provider, true)
-    }
-
-    pub fn chat_with_history_with_policy(
-        &self,
-        messages: Vec<ChatMessage>,
-        graph_context: String,
-        provider: LlmProvider,
-        allow_cloud_fallbacks: bool,
-    ) -> Result<ChatOutcome, String> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Interactive,
@@ -307,7 +297,6 @@ impl LlmExecutor {
                 messages,
                 graph_context,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             },
         );
@@ -338,25 +327,6 @@ impl LlmExecutor {
         sequence: u64,
         created_at_ms: u64,
     ) -> Result<ProjectionPatchOutcome, String> {
-        self.generate_projection_patch_with_policy(
-            job,
-            ledger,
-            provider,
-            sequence,
-            created_at_ms,
-            true,
-        )
-    }
-
-    pub fn generate_projection_patch_with_policy(
-        &self,
-        job: ProjectionJob,
-        ledger: TranscriptLedger,
-        provider: LlmProvider,
-        sequence: u64,
-        created_at_ms: u64,
-        allow_cloud_fallbacks: bool,
-    ) -> Result<ProjectionPatchOutcome, String> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Background,
@@ -366,7 +336,6 @@ impl LlmExecutor {
                 sequence,
                 created_at_ms,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             },
         );
@@ -453,33 +422,18 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
                 speaker,
                 context,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             } => {
-                let result = run_extraction(
-                    &handles,
-                    &provider,
-                    &text,
-                    &speaker,
-                    &context,
-                    allow_cloud_fallbacks,
-                );
+                let result = run_extraction(&handles, &provider, &text, &speaker, &context);
                 let _ = response_tx.send(LlmJobResult::Extraction(result));
             }
             LlmJob::Chat {
                 messages,
                 graph_context,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             } => {
-                let result = run_chat(
-                    &handles,
-                    &provider,
-                    &messages,
-                    &graph_context,
-                    allow_cloud_fallbacks,
-                );
+                let result = run_chat(&handles, &provider, &messages, &graph_context);
                 let _ = response_tx.send(LlmJobResult::Chat(result));
             }
             LlmJob::ProjectionPatch {
@@ -488,7 +442,6 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
                 sequence,
                 created_at_ms,
                 provider,
-                allow_cloud_fallbacks,
                 response_tx,
             } => {
                 let result = run_projection_patch(
@@ -498,12 +451,63 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
                     &ledger,
                     sequence,
                     created_at_ms,
-                    allow_cloud_fallbacks,
                 );
                 let _ = response_tx.send(LlmJobResult::ProjectionPatch(result));
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: exactly one authorized route per job (ADR-0038)
+// ---------------------------------------------------------------------------
+//
+// There is no chain walker in this module and no per-provider attempt list.
+// `authorize_route_dispatch` resolves the session's provider to ONE named route,
+// runs the ADR-0033 start gate, and hands back an `AuthorizedRoute` token that
+// every backend function below requires. Because that token has a private field
+// and only one constructor, a dispatch that skipped the gate does not compile.
+
+/// Peek the completion budget the dispatch will request, from the backend
+/// handle the route will actually use — without holding the lock across the
+/// blocking HTTP call that happens later in the same job.
+///
+/// `None` for `NativeLlama` / `MistralRs`: neither route row in
+/// [`crate::llm::route::LLM_ROUTES`] documents a per-endpoint completion
+/// maximum, so [`crate::llm::route::RouteDescriptor::clamp_completion_budget`]
+/// would be a no-op for them regardless of what is passed in. `None` also when
+/// the corresponding client is not yet configured; the dispatch fails with its
+/// own "not configured" error immediately after, so there is nothing to clamp.
+fn requested_completion_budget(handles: &BackendHandles, route: &AuthorizedRoute) -> Option<u32> {
+    match route.descriptor().blocking_backend {
+        Some(BlockingBackend::OpenAiCompatible) => handles
+            .api_client
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|client| client.config().max_tokens)),
+        Some(BlockingBackend::OpenRouter) => handles
+            .openrouter_client
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|client| client.config().max_tokens)),
+        Some(BlockingBackend::NativeLlama) | Some(BlockingBackend::MistralRs) | None => None,
+    }
+}
+
+/// Mint the route, then stamp it with the per-endpoint-clamped completion
+/// budget this dispatch will request (ADR-0038's "clamped at mint time"): the
+/// one gate every content-bearing dispatch below goes through, so
+/// `RouteRecord.completion_budget_clamped` can only ever be `true` when a
+/// route's documented maximum actually constrained this request.
+fn authorize_and_budget_route_dispatch(
+    handles: &BackendHandles,
+    provider: &LlmProvider,
+) -> Result<AuthorizedRoute, AppError> {
+    let route = authorize_route_dispatch(provider)?;
+    Ok(match requested_completion_budget(handles, &route) {
+        Some(requested) => route.with_completion_budget(requested),
+        None => route,
+    })
 }
 
 fn run_extraction(
@@ -512,138 +516,133 @@ fn run_extraction(
     text: &str,
     speaker: &str,
     context: &str,
-    allow_cloud_fallbacks: bool,
 ) -> Option<ExtractionResult> {
     // Skip background extraction entirely while cooling down from a 429 so we
     // don't keep hammering a rate-limited endpoint.
     if extraction_in_cooldown() {
         return None;
     }
-    if !allow_cloud_fallbacks {
-        return match provider {
-            LlmProvider::Api { .. } if !provider.requires_cloud_content_transfer() => {
-                extract_api(handles, text, speaker, context)
-                    .or_else(|| extract_native(handles, text, speaker))
-                    .or_else(|| extract_mistralrs(handles, text, speaker))
-            }
-            LlmProvider::MistralRs { .. } => extract_mistralrs(handles, text, speaker)
-                .or_else(|| extract_native(handles, text, speaker)),
-            _ => extract_native(handles, text, speaker)
-                .or_else(|| extract_mistralrs(handles, text, speaker)),
-        };
-    }
-    match provider {
-        LlmProvider::LocalLlama => extract_native(handles, text, speaker)
-            .or_else(|| extract_openrouter(handles, text, speaker, context))
-            .or_else(|| extract_api(handles, text, speaker, context))
-            .or_else(|| extract_mistralrs(handles, text, speaker)),
-        LlmProvider::OpenRouter { .. } => extract_openrouter(handles, text, speaker, context)
-            .or_else(|| extract_api(handles, text, speaker, context))
-            .or_else(|| extract_native(handles, text, speaker))
-            .or_else(|| extract_mistralrs(handles, text, speaker)),
-        LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-            extract_api(handles, text, speaker, context)
-                .or_else(|| extract_openrouter(handles, text, speaker, context))
-                .or_else(|| extract_native(handles, text, speaker))
-                .or_else(|| extract_mistralrs(handles, text, speaker))
+    let route = match authorize_and_budget_route_dispatch(handles, provider) {
+        Ok(route) => route,
+        Err(error) => {
+            // Content-free: registry identity only (ADR-0033). `None` here means
+            // the caller falls back to the LOCAL rule-based extractor, which is
+            // not a provider substitution.
+            log::warn!("LLM extraction route refused: {error}");
+            return None;
         }
-        LlmProvider::MistralRs { .. } => extract_mistralrs(handles, text, speaker)
-            .or_else(|| extract_native(handles, text, speaker))
-            .or_else(|| extract_openrouter(handles, text, speaker, context))
-            .or_else(|| extract_api(handles, text, speaker, context)),
+    };
+    match route.descriptor().blocking_backend {
+        Some(BlockingBackend::NativeLlama) => extract_native(handles, text, speaker),
+        Some(BlockingBackend::OpenAiCompatible) => {
+            extract_api(handles, &route, text, speaker, context)
+        }
+        Some(BlockingBackend::OpenRouter) => {
+            extract_openrouter(handles, &route, text, speaker, context)
+        }
+        Some(BlockingBackend::MistralRs) => extract_mistralrs(handles, text, speaker),
+        None => {
+            log::warn!(
+                "{} has no blocking route; extraction falls back to the local rule-based extractor",
+                route.id()
+            );
+            None
+        }
     }
 }
-
-/// A single chat backend attempt: same signature for every provider so the
-/// fallback chain can be expressed as a slice.
-type ChatAttemptFn = fn(&BackendHandles, &[ChatMessage], &str) -> Result<ChatOutcome, String>;
 
 fn run_chat(
     handles: &BackendHandles,
     provider: &LlmProvider,
     messages: &[ChatMessage],
     graph_context: &str,
-    allow_cloud_fallbacks: bool,
 ) -> Result<ChatOutcome, String> {
-    let attempts: &[ChatAttemptFn] = if allow_cloud_fallbacks {
-        match provider {
-            LlmProvider::LocalLlama => &[chat_native, chat_openrouter, chat_api, chat_mistralrs],
-            LlmProvider::OpenRouter { .. } => {
-                &[chat_openrouter, chat_api, chat_native, chat_mistralrs]
-            }
-            LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-                &[chat_api, chat_openrouter, chat_native, chat_mistralrs]
-            }
-            LlmProvider::MistralRs { .. } => {
-                &[chat_mistralrs, chat_native, chat_openrouter, chat_api]
-            }
+    let route = authorize_and_budget_route_dispatch(handles, provider)
+        .map_err(|error| error.to_string())?;
+    match route.descriptor().blocking_backend {
+        Some(BlockingBackend::NativeLlama) => chat_native(handles, messages, graph_context),
+        Some(BlockingBackend::OpenAiCompatible) => {
+            chat_api(handles, &route, messages, graph_context)
         }
-    } else {
-        match provider {
-            LlmProvider::Api { .. } if !provider.requires_cloud_content_transfer() => {
-                &[chat_api, chat_native, chat_mistralrs]
-            }
-            LlmProvider::MistralRs { .. } => &[chat_mistralrs, chat_native],
-            _ => &[chat_native, chat_mistralrs],
+        Some(BlockingBackend::OpenRouter) => {
+            chat_openrouter(handles, &route, messages, graph_context)
         }
-    };
-
-    run_attempts(attempts, |attempt| {
-        attempt(handles, messages, graph_context)
-    })
+        Some(BlockingBackend::MistralRs) => chat_mistralrs(handles, messages, graph_context),
+        None => Err(no_blocking_route_error(&route)),
+    }
 }
 
+/// The honest terminal error for a route with no blocking implementation.
+///
+/// `route.aws_bedrock` used to be dispatched at `projection_api` / `chat_api`
+/// while `api_config_from_runtime_settings` returns `None` for it, so the user saw
+/// "API LLM client is not configured" — a diagnostic about the wrong client.
+fn no_blocking_route_error(route: &AuthorizedRoute) -> String {
+    format!(
+        "{} has no blocking route; this provider serves streaming chat only",
+        route.id()
+    )
+}
+
+/// One route attempt's content-free result.
 #[derive(Debug)]
 struct ProjectionBackendOutput {
     raw_json: String,
-    provider: String,
+    /// The route id stamped by trusted code, refined from the LIVE client config.
+    route_id: &'static str,
+    /// The registry provider id the route was authorized against (ADR-0033).
+    provider_id: &'static str,
+    wire_skin: &'static str,
+    /// The SERVED model when the response reported one, else the requested id —
+    /// which of those it is, is recorded in `model_source`, never guessed.
     model: String,
+    model_source: ModelIdentitySource,
     tokens_used: u32,
-    structured_output_mode: ProjectionStructuredOutputMode,
+    wire: WireOutcome,
+    completion_budget_clamped: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionStructuredOutputMode {
-    JsonMode,
-    VllmStructuredOutputs,
-    OpenRouterJsonSchema,
-    MistralRsJsonSchema,
+impl ProjectionBackendOutput {
+    fn route_record(&self) -> RouteRecord {
+        RouteRecord {
+            route_id: self.route_id.to_string(),
+            provider_id: self.provider_id.to_string(),
+            wire_skin: self.wire_skin.to_string(),
+            terminal_status: self.wire.terminal_status,
+            retry_class: retry_class_for_terminal_status(self.wire.terminal_status),
+            constrained_decoding: self.wire.constrained_decoding,
+            completion_budget_clamped: self.completion_budget_clamped,
+            served_upstream_provider: self.wire.served_upstream_provider.clone(),
+        }
+    }
 }
 
 /// Per-call context for stable-prefix prompt caching (ADR-0025 §2d / seed
-/// audio-graph-d77e) plus the projection kind. Passed to every projection
-/// backend attempt; only cache-capable providers (OpenRouter → Anthropic
-/// passthrough) act on the cache hint, and only the OpenRouter structured-output
-/// path reads `kind` (to pick the strict schema — seed audio-graph-a324).
+/// audio-graph-d77e) plus the projection kind. Only cache-capable providers
+/// (OpenRouter → Anthropic passthrough) act on the cache hint, and only the
+/// schema-constrained paths read `kind` (to pick the strict schema — seed
+/// audio-graph-a324).
 #[derive(Clone)]
 struct ProjectionCacheContext {
     session_id: String,
     /// Index of the last stable-prefix message the `cache_control` breakpoint
     /// rides on (immutable system + append-only stable-context blocks).
     cache_breakpoint_message_index: usize,
-    /// Which projection kind this job is, so the OpenRouter attempt can request
+    /// Which projection kind this job is, so the constrained paths can request
     /// the kind-scoped strict output schema.
     kind: ProjectionKind,
 }
 
 impl ProjectionCacheContext {
-    /// A (session, resolved-provider)-scoped hint. A mid-session failover to a
-    /// different provider yields a different key → a cold cache by design (a
-    /// summary/prefix computed for one vendor's tokenizer is meaningless to
-    /// another).
-    fn hint_for(&self, provider_key: &str) -> crate::llm::openrouter::PromptCacheHint {
+    /// A (session, route)-scoped hint. Keyed on the stamped route id so a summary
+    /// or prefix computed for one vendor's tokenizer is never reused for another.
+    fn hint_for(&self, route_id: &str) -> crate::llm::openrouter::PromptCacheHint {
         crate::llm::openrouter::PromptCacheHint {
             cache_breakpoint_message_index: self.cache_breakpoint_message_index,
-            cache_key: format!("{}::{}", self.session_id, provider_key),
+            cache_key: format!("{}::{}", self.session_id, route_id),
         }
     }
 }
-
-type ProjectionAttemptFn = fn(
-    &BackendHandles,
-    &[ChatMessage],
-    &ProjectionCacheContext,
-) -> Result<ProjectionBackendOutput, String>;
 
 fn run_projection_patch(
     handles: &BackendHandles,
@@ -652,8 +651,9 @@ fn run_projection_patch(
     ledger: &TranscriptLedger,
     sequence: u64,
     created_at_ms: u64,
-    allow_cloud_fallbacks: bool,
 ) -> Result<ProjectionPatchOutcome, String> {
+    let route = authorize_and_budget_route_dispatch(handles, provider)
+        .map_err(|error| error.to_string())?;
     let messages = projection_patch_prompt_messages(job, ledger).map_err(|e| e.to_string())?;
     let cache_context = ProjectionCacheContext {
         session_id: job.session_id.clone(),
@@ -661,46 +661,9 @@ fn run_projection_patch(
             crate::projection_llm::PROJECTION_STABLE_PREFIX_MESSAGE_COUNT.saturating_sub(1),
         kind: job.kind.clone(),
     };
-    let attempts: &[ProjectionAttemptFn] = if allow_cloud_fallbacks {
-        match provider {
-            LlmProvider::LocalLlama => &[
-                projection_native,
-                projection_openrouter,
-                projection_api,
-                projection_mistralrs,
-            ],
-            LlmProvider::OpenRouter { .. } => &[
-                projection_openrouter,
-                projection_api,
-                projection_native,
-                projection_mistralrs,
-            ],
-            LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => &[
-                projection_api,
-                projection_openrouter,
-                projection_native,
-                projection_mistralrs,
-            ],
-            LlmProvider::MistralRs { .. } => &[
-                projection_mistralrs,
-                projection_native,
-                projection_openrouter,
-                projection_api,
-            ],
-        }
-    } else {
-        match provider {
-            LlmProvider::Api { .. } if !provider.requires_cloud_content_transfer() => {
-                &[projection_api, projection_native, projection_mistralrs]
-            }
-            LlmProvider::MistralRs { .. } => &[projection_mistralrs, projection_native],
-            _ => &[projection_native, projection_mistralrs],
-        }
-    };
 
-    run_projection_patch_with_attempts(
-        attempts,
-        |attempt, messages| attempt(handles, messages, &cache_context),
+    run_projection_patch_on_route(
+        |messages| projection_on_route(handles, &route, messages, &cache_context),
         &messages,
         job,
         ledger,
@@ -709,16 +672,43 @@ fn run_projection_patch(
     )
 }
 
-fn run_projection_patch_with_attempts<A>(
-    attempts: &[A],
-    mut run: impl FnMut(&A, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
+/// Dispatch a projection prompt on one authorized route.
+fn projection_on_route(
+    handles: &BackendHandles,
+    route: &AuthorizedRoute,
+    messages: &[ChatMessage],
+    cache: &ProjectionCacheContext,
+) -> Result<ProjectionBackendOutput, String> {
+    match route.descriptor().blocking_backend {
+        Some(BlockingBackend::NativeLlama) => projection_native(handles, route, messages),
+        Some(BlockingBackend::OpenAiCompatible) => projection_api(handles, route, messages, cache),
+        Some(BlockingBackend::OpenRouter) => projection_openrouter(handles, route, messages, cache),
+        Some(BlockingBackend::MistralRs) => projection_mistralrs(handles, route, messages),
+        None => Err(no_blocking_route_error(route)),
+    }
+}
+
+/// Draft → terminal-status check → validate → **same-route** repair → validate.
+///
+/// `run` is invoked with the draft prompt and, if the draft fails validation, with
+/// the repair prompt. It closes over ONE authorized route, so the repair
+/// structurally cannot reach a second provider — that is the removal ADR-0038
+/// requires, expressed as the absence of a second candidate rather than as a rule.
+///
+/// The honest cost: seed audio-graph-a324 measured 6/6 same-model repair
+/// double-failures, so when the route reproduces the failure the patch fails with
+/// `UnusableCompletion` and does not hop.
+fn run_projection_patch_on_route(
+    mut run: impl FnMut(&[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
     messages: &[ChatMessage],
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
     sequence: u64,
     created_at_ms: u64,
 ) -> Result<ProjectionPatchOutcome, String> {
-    let (attempt_index, output) = run_projection_attempts(attempts, &mut run, messages)?;
+    let output = run(messages)?;
+    ensure_usable_completion(&output)?;
+
     match projection_outcome_from_output(
         &output,
         job,
@@ -739,19 +729,8 @@ fn run_projection_patch_with_attempts<A>(
                 &first_error,
             )
             .map_err(|e| e.to_string())?;
-            // Repair escalates to the NEXT backend in the chain rather than
-            // re-running the one that produced the invalid draft (seed
-            // audio-graph-a324): when the model is the problem, a same-model
-            // repair reproduces the failure (user data: 6/6 same-model repair
-            // double-failures). Falls back to the producing backend only when no
-            // subsequent backend is configured (the common single-provider case),
-            // so a repair is still attempted.
-            let repair_output = run_projection_repair_escalation(
-                attempts,
-                &mut run,
-                &repair_messages,
-                attempt_index,
-            )?;
+            let repair_output = run(&repair_messages)?;
+            ensure_usable_completion(&repair_output)?;
             let mut outcome = projection_outcome_from_output(
                 &repair_output,
                 job,
@@ -771,68 +750,35 @@ fn run_projection_patch_with_attempts<A>(
     }
 }
 
-/// Run the repair prompt against the NEXT backend in the fallback chain after
-/// the one that produced the invalid draft (`produced_index`), skipping any
-/// subsequent backend that is unavailable (returns `Err`). The first backend
-/// that returns output handles the repair. When no subsequent backend is
-/// available (e.g. the user has only OpenRouter configured), fall back to
-/// re-running the producing backend so a repair is still attempted — no worse
-/// than the prior same-backend behavior (seed audio-graph-a324).
-fn run_projection_repair_escalation<A>(
-    attempts: &[A],
-    run: &mut impl FnMut(&A, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
-    repair_messages: &[ChatMessage],
-    produced_index: usize,
-) -> Result<ProjectionBackendOutput, String> {
-    for attempt in attempts.iter().skip(produced_index + 1) {
-        match run(attempt, repair_messages) {
-            Ok(output) => return Ok(output),
-            // The next-backend error is downstream "not configured/loaded"
-            // boilerplate — demote it to debug rather than let it surface. When
-            // the escalation exhausts and we fall back to the producing backend,
-            // that backend's own error is the diagnostic that matters; surfacing
-            // the next-backend noise instead would be the exact cb46 masking bug
-            // this PR exists to kill (CodeRabbit on PR #96).
-            Err(e) => log::debug!(
-                "projection repair escalation attempt failed (masked by the producing \
-                 backend's error): {e}"
-            ),
-        }
+/// Reject a non-`Completed` terminal status **before** the JSON parse.
+///
+/// This is what stops ADR-0038 defect 1 from re-manifesting: a `Truncated`
+/// response used to fail as invalid JSON and enter the repair path, which embeds
+/// the truncated draft in a new prompt. Per ADR-0038 sub-decision 4 a truncation
+/// must not auto-spend a larger-budget attempt either — a larger declared
+/// `max_completion_tokens` also raises the Cerebras pre-generation rate-limit
+/// charge (ADR-0038:219-225), so the "safe" retry makes a 429 more likely.
+///
+/// Where a truncated INCREMENTAL patch finally rests is genuinely unresolved:
+/// ADR-0035's `Finalization Blocked` is per-Session post-stop and does not exist
+/// in this runtime, and the stalled-lane behaviour is `audio-graph-3b48`'s. This
+/// function ships the classification and the no-larger-budget guarantee; it does
+/// not invent a resting state.
+fn ensure_usable_completion(output: &ProjectionBackendOutput) -> Result<(), String> {
+    if output.wire.terminal_status == TerminalStatus::Completed {
+        return Ok(());
     }
-    run(&attempts[produced_index], repair_messages)
-}
-
-fn run_projection_attempts<A>(
-    attempts: &[A],
-    mut run: impl FnMut(&A, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
-    messages: &[ChatMessage],
-) -> Result<(usize, ProjectionBackendOutput), String> {
-    // Surface the FIRST attempt's error — that of the *selected* provider —
-    // rather than the last (audio-graph-cb46). The fallback chain for an
-    // OpenRouter user is [openrouter, api, native, mistralrs]; when the real
-    // OpenRouter call fails, the remaining backends fail with their own
-    // "not configured / not loaded" boilerplate, and returning the last error
-    // surfaced "mistral.rs LLM is not loaded" for a session where mistral.rs
-    // was never selected. That masked the real OpenRouter incident. The
-    // selected provider's error is the diagnostic that matters; the downstream
-    // fallback noise belongs at debug level.
-    let mut first_error: Option<String> = None;
-    for (index, attempt) in attempts.iter().enumerate() {
-        match run(attempt, messages) {
-            Ok(output) => return Ok((index, output)),
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                } else {
-                    log::debug!(
-                        "projection fallback attempt {index} failed (masked by the selected \
-                         provider's error): {e}"
-                    );
-                }
-            }
-        }
-    }
-    Err(first_error.unwrap_or_else(|| "No projection LLM backend configured".to_string()))
+    let record = output.route_record();
+    Err(format!(
+        "projection route attempt is not a usable completion: route={} terminal_status={} \
+         retry_class={}",
+        record.route_id,
+        output.wire.terminal_status.as_str(),
+        record
+            .retry_class
+            .map(|class| format!("{class:?}"))
+            .unwrap_or_else(|| "none".to_string())
+    ))
 }
 
 fn projection_outcome_from_output(
@@ -844,15 +790,17 @@ fn projection_outcome_from_output(
     request_suffix: Option<&str>,
 ) -> Result<ProjectionPatchOutcome, ProjectionPatchDraftError> {
     log::debug!(
-        "Projection patch backend output: provider={}, model={}, structured_output_mode={:?}",
-        output.provider,
-        output.model,
-        output.structured_output_mode
+        "Projection patch route output: route={}, provider={}, model_source={:?}, \
+         constrained_decoding={:?}",
+        output.route_id,
+        output.provider_id,
+        output.model_source,
+        output.wire.constrained_decoding
     );
-    let provider_key = output.provider.replace(':', "_");
+    let route_key = output.route_id.replace('.', "_");
     let llm_request_id = match request_suffix {
-        Some(suffix) => format!("{}:{}:{}:{}", job.id, provider_key, sequence, suffix),
-        None => format!("{}:{}:{}", job.id, provider_key, sequence),
+        Some(suffix) => format!("{}:{}:{}:{}", job.id, route_key, sequence, suffix),
+        None => format!("{}:{}:{}", job.id, route_key, sequence),
     };
     let patch = trusted_projection_patch_from_model_json(
         &output.raw_json,
@@ -860,8 +808,11 @@ fn projection_outcome_from_output(
         ProjectionPatchBuildContext {
             sequence,
             llm_request_id,
-            provider: output.provider.clone(),
+            provider: output.provider_id.to_string(),
             model: output.model.clone(),
+            model_source: output.model_source,
+            route_id: Some(output.route_id.to_string()),
+            route: Some(output.route_record()),
             prompt_id: prompt_id.to_string(),
             created_at_ms,
         },
@@ -872,31 +823,43 @@ fn projection_outcome_from_output(
     })
 }
 
-/// Walk a fallback chain: invoke each attempt via `run` in order, return the
-/// first `Ok`, or the **last** `Err` if every attempt fails (a default
-/// message if the chain is empty).
+// ---------------------------------------------------------------------------
+// Per-backend route attempts
+// ---------------------------------------------------------------------------
+
+/// Re-resolve and stamp the route from the LIVE `ApiClient` config.
 ///
-/// Generic over the attempt type, the success type, and the invoker closure so
-/// it can be unit-tested with recorder closures (no backends, no network).
-/// Behaviour is identical to the prior inline loop in `run_chat`.
-fn run_attempts<A, T>(
-    attempts: &[A],
-    mut run: impl FnMut(&A) -> Result<T, String>,
-) -> Result<T, String> {
-    let mut last_error = None;
-    for attempt in attempts {
-        match run(attempt) {
-            Ok(value) => return Ok(value),
-            Err(e) => last_error = Some(e),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "No LLM backend configured".to_string()))
+/// `AuthorizedRoute` was minted from the job's `LlmProvider` **snapshot**, but the
+/// client handle is the shared one that `sync_llm_api_client_from_settings_cache`
+/// rebuilds on every settings save. Resolving again here is what makes the stamp
+/// true and the gate current.
+fn api_route_for_client(
+    route: &AuthorizedRoute,
+    client: &ApiClient,
+) -> Result<&'static crate::llm::route::RouteDescriptor, String> {
+    route.refine_within_authorization(route_for_api_endpoint(&client.config().endpoint))
+}
+
+/// Re-resolve and stamp the route from the LIVE `OpenRouterClient` config. This is
+/// where `route.openrouter` sharpens into `route.cerebras_via_openrouter`: the
+/// routing policy reaches this layer only through `OpenRouterConfig`, and both
+/// routes gate on `llm.openrouter`, so the refinement cannot widen egress.
+fn openrouter_route_for_client(
+    route: &AuthorizedRoute,
+    client: &OpenRouterClient,
+) -> Result<&'static crate::llm::route::RouteDescriptor, String> {
+    let config = client.config();
+    route.refine_within_authorization(route_for_openrouter_policy(
+        config.routing_policy.as_ref(),
+        config.provider_order.as_deref(),
+    ))
 }
 
 fn projection_api(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
-    _cache: &ProjectionCacheContext,
+    cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let client = {
         let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
@@ -905,52 +868,66 @@ fn projection_api(
             .ok_or_else(|| "API LLM client is not configured".to_string())?
             .clone()
     };
-    let model = client.config().model.clone();
-    let (raw_json, tokens_used, structured_output_mode) =
-        if client.prefers_vllm_structured_outputs() {
-            let schema = projection_patch_draft_json_schema()?;
-            match client
-                .chat_completion_with_structured_outputs_with_usage(prompt_tuples(messages), schema)
-            {
-                Ok((raw_json, tokens_used)) => (
-                    raw_json,
-                    tokens_used,
-                    ProjectionStructuredOutputMode::VllmStructuredOutputs,
-                ),
-                Err(e) => {
-                    log::warn!(
-                        "vLLM structured projection output failed, falling back to JSON mode: {}",
-                        e
-                    );
-                    let (raw_json, tokens_used) =
-                        client.chat_completion_with_usage(prompt_tuples(messages), true)?;
-                    (
-                        raw_json,
-                        tokens_used,
-                        ProjectionStructuredOutputMode::JsonMode,
-                    )
-                }
+    let live = api_route_for_client(route, &client)?;
+    let requested_model = client.config().model.clone();
+
+    // Route-driven, not host-substring-driven: an endpoint whose row declares
+    // `GuaranteedConstrained` (direct Cerebras) requests its documented strict
+    // schema. `prefers_vllm_structured_outputs()` stays the ONE endpoint
+    // heuristic, and it selects only the vLLM-specific body field.
+    let constrained_form = match live.capability.constrained_decoding {
+        ConstrainedDecodingGrade::GuaranteedConstrained => {
+            Some(RequestOutputForm::StrictJsonSchema {
+                name: "projection_patch".to_string(),
+                schema: projection_patch_strict_json_schema(&cache.kind),
+            })
+        }
+        _ if client.prefers_vllm_structured_outputs() => {
+            Some(RequestOutputForm::VllmStructuredOutputs {
+                schema: projection_patch_draft_json_schema()?,
+            })
+        }
+        _ => None,
+    };
+
+    let (raw_json, tokens_used, wire) = match constrained_form {
+        Some(form) => match client.chat_completion_with_wire_outcome(prompt_tuples(messages), form)
+        {
+            Ok(result) => result,
+            Err(error) if is_schema_rejection(&error) => {
+                // A MODE downgrade on the SAME route, recorded rather than only
+                // logged: the returned `WireOutcome` carries `Unconstrained`.
+                log::warn!(
+                    "constrained projection output rejected on {} (falling back to JSON mode on \
+                     the same route): {error}",
+                    live.id
+                );
+                client.chat_completion_with_wire_outcome(
+                    prompt_tuples(messages),
+                    RequestOutputForm::JsonObject,
+                )?
             }
-        } else {
-            let (raw_json, tokens_used) =
-                client.chat_completion_with_usage(prompt_tuples(messages), true)?;
-            (
-                raw_json,
-                tokens_used,
-                ProjectionStructuredOutputMode::JsonMode,
-            )
-        };
-    Ok(ProjectionBackendOutput {
+            Err(error) => return Err(error),
+        },
+        None => client.chat_completion_with_wire_outcome(
+            prompt_tuples(messages),
+            RequestOutputForm::JsonObject,
+        )?,
+    };
+
+    Ok(projection_output_from_wire(
+        route,
+        live,
         raw_json,
-        provider: "api".to_string(),
-        model,
+        requested_model,
         tokens_used,
-        structured_output_mode,
-    })
+        wire,
+    ))
 }
 
 fn projection_openrouter(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
     cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
@@ -964,50 +941,51 @@ fn projection_openrouter(
             .ok_or_else(|| "OpenRouter client is not configured".to_string())?
             .clone()
     };
-    let model = client.config().model.clone();
+    let live = openrouter_route_for_client(route, &client)?;
+    let requested_model = client.config().model.clone();
     // Stable-prefix prompt caching (ADR-0025 §2d / seed audio-graph-d77e): mark
-    // the cache breakpoint on the stable prefix and route this session's turns
-    // to the same cache-warm machine via a (session, resolved-provider) key. The
-    // `response_format` (json mode vs json_schema) is orthogonal to the cache
-    // hint, so both paths below route identically.
-    let hint = cache.hint_for("openrouter");
+    // the cache breakpoint on the stable prefix and route this session's turns to
+    // the same cache-warm machine via a (session, route) key. The request output
+    // form is orthogonal to the cache hint, so both paths below route identically.
+    let hint = cache.hint_for(live.id);
 
-    // Prefer OpenRouter structured outputs (response_format: json_schema, strict,
-    // with provider.require_parameters=true so routing only picks a schema-capable
-    // provider) so the model is constrained to the projection-patch schema at
-    // generation time (seed audio-graph-a324). Contrast the previous json-mode
-    // call, which let gpt-oss-120b emit patches missing id/title/tags.
+    // Prefer OpenRouter structured outputs (with provider.require_parameters=true
+    // so routing only picks a schema-capable provider) so the model is constrained
+    // to the projection-patch schema at generation time (seed audio-graph-a324).
     //
-    // On a schema rejection (400/404/422-class) we fall back to JSON mode for THIS
-    // call. We only cache the model as schema-unsupported on a model-level signal
-    // (404 = require_parameters found no provider for the model that supports the
-    // schema); a 400/422 came from a routed-to provider that DID advertise support
-    // and is schema-specific, so caching it would wrongly demote a schema-capable
-    // model to JSON mode for the whole session (Codex P2).
-    if !openrouter_schema_unsupported(&model) {
-        let schema = projection_patch_strict_json_schema(&cache.kind);
-        match client.chat_completion_with_schema_cached(
+    // On a schema rejection (400/404/422-class) we downgrade to JSON mode for THIS
+    // call, on the SAME route. We only cache the model as schema-unsupported on a
+    // model-level signal (404 = require_parameters found no provider for the model
+    // that supports the schema); a 400/422 came from a routed-to provider that DID
+    // advertise support and is schema-specific, so caching it would wrongly demote
+    // a schema-capable model to JSON mode for the whole session (Codex P2).
+    if !openrouter_schema_unsupported(&requested_model) {
+        let form = RequestOutputForm::StrictJsonSchema {
+            name: "projection_patch".to_string(),
+            schema: projection_patch_strict_json_schema(&cache.kind),
+        };
+        match client.chat_completion_with_wire_outcome(
             prompt_tuples(messages),
-            "projection_patch",
-            schema,
+            &form,
             Some(hint.clone()),
         ) {
-            Ok((raw_json, tokens_used)) => {
-                return Ok(ProjectionBackendOutput {
+            Ok((raw_json, tokens_used, wire)) => {
+                return Ok(projection_output_from_wire(
+                    route,
+                    live,
                     raw_json,
-                    provider: "openrouter".to_string(),
-                    model,
+                    requested_model,
                     tokens_used,
-                    structured_output_mode: ProjectionStructuredOutputMode::OpenRouterJsonSchema,
-                });
+                    wire,
+                ));
             }
-            Err(e) if is_openrouter_schema_rejection(&e) => {
+            Err(e) if is_schema_rejection(&e) => {
                 if is_openrouter_schema_unsupported_by_model(&e) {
                     log::warn!(
                         "OpenRouter structured projection output: no schema-capable provider for \
                          model (caching + falling back to JSON mode for the session): {e}"
                     );
-                    note_openrouter_schema_unsupported(&model);
+                    note_openrouter_schema_unsupported(&requested_model);
                 } else {
                     log::warn!(
                         "OpenRouter structured projection output rejected for this call (falling \
@@ -1015,27 +993,60 @@ fn projection_openrouter(
                          next call): {e}"
                     );
                 }
-                // fall through to JSON mode below
+                // fall through to JSON mode below, on the SAME route
             }
             Err(e) => return Err(e),
         }
     }
 
-    let (raw_json, tokens_used) =
-        client.chat_completion_with_usage_cached(prompt_tuples(messages), true, Some(hint))?;
-    Ok(ProjectionBackendOutput {
+    let (raw_json, tokens_used, wire) = client.chat_completion_with_wire_outcome(
+        prompt_tuples(messages),
+        &RequestOutputForm::JsonObject,
+        Some(hint),
+    )?;
+    Ok(projection_output_from_wire(
+        route,
+        live,
         raw_json,
-        provider: "openrouter".to_string(),
-        model,
+        requested_model,
         tokens_used,
-        structured_output_mode: ProjectionStructuredOutputMode::JsonMode,
-    })
+        wire,
+    ))
+}
+
+/// Assemble the route-stamped output. The route id and provider id come from
+/// trusted code; `model` is the SERVED id when the response reported one, and
+/// `model_source` records which it is so no reader can mistake a config echo for
+/// served identity (ADR-0038 defect 3).
+fn projection_output_from_wire(
+    route: &AuthorizedRoute,
+    live: &'static crate::llm::route::RouteDescriptor,
+    raw_json: String,
+    requested_model: String,
+    tokens_used: u32,
+    wire: WireOutcome,
+) -> ProjectionBackendOutput {
+    let (model, model_source) = match wire.served_model.clone() {
+        Some(served) => (served, ModelIdentitySource::Served),
+        None => (requested_model, ModelIdentitySource::Requested),
+    };
+    ProjectionBackendOutput {
+        raw_json,
+        route_id: live.id,
+        provider_id: live.provider_id,
+        wire_skin: route.skin().as_str(),
+        model,
+        model_source,
+        tokens_used,
+        wire,
+        completion_budget_clamped: route.completion_budget_clamped(),
+    }
 }
 
 fn projection_native(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
-    _cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
@@ -1044,49 +1055,61 @@ fn projection_native(
     let outcome = engine.chat(messages, "")?;
     Ok(ProjectionBackendOutput {
         raw_json: outcome.text,
-        provider: "local_llama".to_string(),
+        route_id: route.id(),
+        provider_id: route.provider_id(),
+        wire_skin: route.skin().as_str(),
+        // The in-process engine has no wire, so there is nothing to echo: the
+        // loaded model IS the requested one, recorded as such.
         model: "loaded_local_llama".to_string(),
+        model_source: ModelIdentitySource::Requested,
         tokens_used: outcome.tokens_used,
-        structured_output_mode: ProjectionStructuredOutputMode::JsonMode,
+        wire: WireOutcome::plain(
+            TerminalStatus::Completed,
+            ConstrainedDecodingGrade::Unconstrained,
+        ),
+        completion_budget_clamped: route.completion_budget_clamped(),
     })
 }
 
 fn projection_mistralrs(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
-    _cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
         .as_ref()
         .ok_or_else(|| "mistral.rs LLM is not loaded".to_string())?;
-    let (raw_json, tokens_used, structured_output_mode) = match engine
-        .projection_patch_draft_with_usage(messages)
-    {
+    let (raw_json, tokens_used, grade) = match engine.projection_patch_draft_with_usage(messages) {
         Ok((raw_json, tokens_used)) => (
             raw_json,
             tokens_used,
-            ProjectionStructuredOutputMode::MistralRsJsonSchema,
+            ConstrainedDecodingGrade::AdvertisedHint,
         ),
         Err(e) => {
+            // A MODE downgrade inside one local engine, recorded in the route
+            // record rather than only logged.
             log::warn!(
-                "mistral.rs structured projection output failed, falling back to chat JSON mode: {}",
-                e
+                "mistral.rs structured projection output failed, falling back to chat JSON mode: {e}"
             );
             let (raw_json, tokens_used) = engine.chat_with_history_usage(messages, "")?;
             (
                 raw_json,
                 tokens_used,
-                ProjectionStructuredOutputMode::JsonMode,
+                ConstrainedDecodingGrade::Unconstrained,
             )
         }
     };
     Ok(ProjectionBackendOutput {
         raw_json,
-        provider: "mistralrs".to_string(),
+        route_id: route.id(),
+        provider_id: route.provider_id(),
+        wire_skin: route.skin().as_str(),
         model: "loaded_mistralrs".to_string(),
+        model_source: ModelIdentitySource::Requested,
         tokens_used,
-        structured_output_mode,
+        wire: WireOutcome::plain(TerminalStatus::Completed, grade),
+        completion_budget_clamped: route.completion_budget_clamped(),
     })
 }
 
@@ -1111,6 +1134,7 @@ fn extract_native(handles: &BackendHandles, text: &str, speaker: &str) -> Option
 
 fn extract_api(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     text: &str,
     speaker: &str,
     context: &str,
@@ -1122,6 +1146,10 @@ fn extract_api(
         let guard = handles.api_client.lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref()?.clone()
     };
+    if let Err(error) = api_route_for_client(route, &client) {
+        log::warn!("LLM extraction route refused: {error}");
+        return None;
+    }
     match client.extract_entities(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
@@ -1134,6 +1162,7 @@ fn extract_api(
 
 fn extract_openrouter(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     text: &str,
     speaker: &str,
     context: &str,
@@ -1146,6 +1175,10 @@ fn extract_openrouter(
             .unwrap_or_else(|e| e.into_inner());
         guard.as_ref()?.clone()
     };
+    if let Err(error) = openrouter_route_for_client(route, &client) {
+        log::warn!("LLM extraction route refused: {error}");
+        return None;
+    }
     match client.extract_entities(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
@@ -1191,6 +1224,7 @@ fn chat_native(
 
 fn chat_api(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
 ) -> Result<ChatOutcome, String> {
@@ -1202,17 +1236,20 @@ fn chat_api(
             .ok_or_else(|| "API LLM client is not configured".to_string())?
             .clone()
     };
+    let live = api_route_for_client(route, &client)?;
     // `ApiClient::chat_with_history_with_usage` (and the Bedrock requests routed
     // through it) surfaces the OpenAI `usage.total_tokens` from the response.
     // A provider that omits the `usage` block reports 0 — never fabricated
     // (FA-7c).
-    client
-        .chat_with_history_with_usage(messages, graph_context)
-        .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
+    let (text, tokens_used, wire) =
+        client.chat_with_history_with_wire_outcome(messages, graph_context)?;
+    log_non_completed_chat_status(live.id, &wire);
+    Ok(ChatOutcome { text, tokens_used })
 }
 
 fn chat_openrouter(
     handles: &BackendHandles,
+    route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
 ) -> Result<ChatOutcome, String> {
@@ -1227,13 +1264,30 @@ fn chat_openrouter(
             .ok_or_else(|| "OpenRouter client is not configured".to_string())?
             .clone()
     };
+    let live = openrouter_route_for_client(route, &client)?;
     // OpenRouter is OpenAI-compatible: the non-streaming response carries
-    // `usage.total_tokens`. `chat_with_history_with_usage` surfaces that real
-    // count (FA-7c). It is 0 only when the upstream provider omits the usage
-    // block — never fabricated.
-    client
-        .chat_with_history_with_usage(messages, graph_context)
-        .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
+    // `usage.total_tokens`. It is 0 only when the upstream provider omits the
+    // usage block — never fabricated (FA-7c).
+    let (text, tokens_used, wire) =
+        client.chat_with_history_with_wire_outcome(messages, graph_context)?;
+    log_non_completed_chat_status(live.id, &wire);
+    Ok(ChatOutcome { text, tokens_used })
+}
+
+/// Record a non-`Completed` terminal status on the interactive chat path.
+///
+/// Scope statement, because the code cannot show it: interactive chat REPORTS the
+/// normalized terminal status and still returns the partial reply. Acting on a
+/// truncated chat reply changes the frontend terminal-frame contract, which is not
+/// this contract's surface — the projection path is where an unread stop signal
+/// caused the cross-provider escalation ADR-0038 removes.
+fn log_non_completed_chat_status(route_id: &str, wire: &WireOutcome) {
+    if wire.terminal_status != TerminalStatus::Completed {
+        log::warn!(
+            "chat reply on {route_id} ended with terminal_status={} — the reply may be incomplete",
+            wire.terminal_status.as_str()
+        );
+    }
 }
 
 fn chat_mistralrs(
@@ -1332,94 +1386,7 @@ mod tests {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
     }
 
-    // ----- run_attempts fallback loop --------------------------------------
-
-    #[test]
-    fn run_attempts_returns_first_ok_and_stops() {
-        let calls = Arc::new(Mutex::new(Vec::<usize>::new()));
-        // Three attempts: first fails, second succeeds, third must NOT run.
-        let attempts: Vec<Box<dyn Fn() -> Result<String, String>>> = vec![
-            {
-                let calls = calls.clone();
-                Box::new(move || {
-                    calls.lock().unwrap().push(0);
-                    Err("first failed".to_string())
-                })
-            },
-            {
-                let calls = calls.clone();
-                Box::new(move || {
-                    calls.lock().unwrap().push(1);
-                    Ok("second ok".to_string())
-                })
-            },
-            {
-                let calls = calls.clone();
-                Box::new(move || {
-                    calls.lock().unwrap().push(2);
-                    Ok("third ok".to_string())
-                })
-            },
-        ];
-
-        let result = run_attempts(&attempts, |a| a());
-        assert_eq!(result, Ok("second ok".to_string()));
-        assert_eq!(
-            *calls.lock().unwrap(),
-            vec![0, 1],
-            "attempts run in order and stop at the first Ok"
-        );
-    }
-
-    #[test]
-    fn run_attempts_returns_last_error_when_all_fail() {
-        let attempts: Vec<&str> = vec!["a", "b", "c"];
-        // Every attempt errors, so the Ok type is unconstrained — pin it.
-        let result: Result<String, String> =
-            run_attempts(&attempts, |&name| Err(format!("{name} failed")));
-        assert_eq!(
-            result,
-            Err("c failed".to_string()),
-            "the LAST error surfaces when every attempt fails"
-        );
-    }
-
-    #[test]
-    fn run_attempts_empty_chain_returns_default() {
-        let attempts: Vec<&str> = vec![];
-        let result: Result<String, String> = run_attempts(&attempts, |_| Ok("never".to_string()));
-        assert_eq!(result, Err("No LLM backend configured".to_string()));
-    }
-
-    // ----- chat token usage flows through the fallback chain ----------------
-
-    /// The real seam the blocking chat path uses: `run_chat` → `run_attempts`
-    /// over `ChatAttemptFn`s, each returning a `ChatOutcome`. This asserts that
-    /// when an attempt reports a non-zero `tokens_used`, that count is preserved
-    /// (not dropped or zeroed) on the way back to `chat_with_history` /
-    /// `send_chat_message`. Uses recorder closures so no backend/model/network
-    /// is needed.
-    #[test]
-    fn run_attempts_preserves_chat_token_count() {
-        // First attempt fails; second succeeds with a real (non-zero) count.
-        let attempts: Vec<&str> = vec!["fail", "ok"];
-        let result = run_attempts(&attempts, |&name| {
-            if name == "ok" {
-                Ok(ChatOutcome {
-                    text: "hi".to_string(),
-                    tokens_used: 42,
-                })
-            } else {
-                Err(format!("{name} failed"))
-            }
-        });
-        let outcome = result.expect("the second attempt succeeds");
-        assert_eq!(outcome.text, "hi");
-        assert_eq!(
-            outcome.tokens_used, 42,
-            "a non-zero token count from a backend must flow through unchanged"
-        );
-    }
+    // ----- test fixtures ----------------------------------------------------
 
     fn projection_test_event(span_id: &str, text: &str) -> TranscriptEvent {
         TranscriptEvent {
@@ -1464,34 +1431,99 @@ mod tests {
         (job, ledger)
     }
 
+    /// A completed route output stamped with a fixed test route id. The recorder
+    /// tests below assert on `route_id`, which is how "the repair never left the
+    /// authorized route" is observable at all.
     fn projection_output(raw_json: String, tokens_used: u32) -> ProjectionBackendOutput {
-        ProjectionBackendOutput {
-            raw_json,
-            provider: "test-provider".to_string(),
-            model: "test-model".to_string(),
-            tokens_used,
-            structured_output_mode: ProjectionStructuredOutputMode::JsonMode,
-        }
+        route_projection_output("route.openrouter", raw_json, tokens_used)
     }
 
-    fn structured_projection_output(
+    fn route_projection_output(
+        route_id: &'static str,
         raw_json: String,
         tokens_used: u32,
-        structured_output_mode: ProjectionStructuredOutputMode,
     ) -> ProjectionBackendOutput {
         ProjectionBackendOutput {
             raw_json,
-            provider: "test-provider".to_string(),
+            route_id,
+            provider_id: "llm.openrouter",
+            wire_skin: "chat_completions",
             model: "test-model".to_string(),
+            model_source: ModelIdentitySource::Served,
             tokens_used,
-            structured_output_mode,
+            wire: WireOutcome::plain(
+                TerminalStatus::Completed,
+                ConstrainedDecodingGrade::AdvertisedHint,
+            ),
+            completion_budget_clamped: false,
         }
     }
+
+    fn graded_projection_output(
+        raw_json: String,
+        tokens_used: u32,
+        grade: ConstrainedDecodingGrade,
+    ) -> ProjectionBackendOutput {
+        let mut output = projection_output(raw_json, tokens_used);
+        output.wire.constrained_decoding = grade;
+        output
+    }
+
+    // ----- token usage flows through the single-route dispatch --------------
+
+    #[test]
+    fn route_dispatch_preserves_chat_token_count() {
+        // The real seam the blocking chat path uses: `run_chat` resolves one
+        // route, dispatches through `chat_api`, and returns that backend's
+        // `ChatOutcome` unchanged. Drives the REAL wire path against a mock
+        // endpoint reporting `usage.total_tokens`, so a regression that
+        // discards the tuple element from `chat_with_history_with_wire_outcome`
+        // (e.g. `chat_api`/`chat_openrouter` returning `tokens_used: 0`) would
+        // fail this test — a self-asserting `ChatOutcome` literal could not.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{
+                "message": { "content": "hi there" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "total_tokens": 77 }
+        })
+        .to_string();
+        let (base, request_count) = rt.block_on(spawn_counting_mock(vec![body]));
+
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let outcome =
+            std::thread::spawn(move || run_chat(&handles, &provider, &[], "graph context"))
+                .join()
+                .expect("worker thread panic")
+                .expect("a completed chat reply");
+
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one request reaches the wire"
+        );
+        assert_eq!(outcome.text, "hi there");
+        assert_eq!(
+            outcome.tokens_used, 77,
+            "the backend-reported usage.total_tokens must reach the caller unchanged"
+        );
+
+        let route =
+            authorize_route_dispatch(&LlmProvider::LocalLlama).expect("local_llama is selectable");
+        assert_eq!(route.id(), "route.local_llama");
+    }
+
+    // ----- repair: same route, one route only -------------------------------
 
     #[test]
     fn projection_patch_retries_once_with_repair_prompt() {
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let attempts = vec!["fake"];
         let call_count = Arc::new(Mutex::new(0usize));
         let seen_messages = Arc::new(Mutex::new(Vec::<Vec<ChatMessage>>::new()));
         let invalid_first = serde_json::json!({
@@ -1516,12 +1548,11 @@ mod tests {
         })
         .to_string();
 
-        let outcome = run_projection_patch_with_attempts(
-            &attempts,
+        let outcome = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
                 let seen_messages = seen_messages.clone();
-                move |_, messages| {
+                move |messages| {
                     let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
                     seen_messages
@@ -1549,10 +1580,17 @@ mod tests {
             outcome.patch.provenance.prompt_id,
             PROJECTION_PATCH_REPAIR_PROMPT_ID
         );
+        // The request id is keyed on the stamped ROUTE id, not on a fourth ad-hoc
+        // provider naming scheme.
         assert_eq!(
             outcome.patch.llm_request_id,
-            "projection:session-1:notes:1:test-provider:4:repair"
+            "projection:session-1:notes:1:route_openrouter:4:repair"
         );
+        assert_eq!(
+            outcome.patch.provenance.route_id.as_deref(),
+            Some("route.openrouter")
+        );
+        assert_eq!(outcome.patch.provenance.provider, "llm.openrouter");
         assert!(matches!(
             outcome.patch.operations.first(),
             Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
@@ -1568,7 +1606,6 @@ mod tests {
     #[test]
     fn projection_patch_fails_after_one_repair_attempt() {
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let attempts = vec!["fake"];
         let call_count = Arc::new(Mutex::new(0usize));
         let invalid = serde_json::json!({
             "operations": [{
@@ -1581,11 +1618,10 @@ mod tests {
         })
         .to_string();
 
-        let err = run_projection_patch_with_attempts(
-            &attempts,
+        let err = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
-                move |_, _messages| {
+                move |_messages| {
                     let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
                     Ok(projection_output(invalid.clone(), 3))
@@ -1607,7 +1643,6 @@ mod tests {
     #[test]
     fn schema_constrained_projection_output_still_uses_repair_fallback() {
         let (job, ledger) = projection_test_job(ProjectionKind::Graph);
-        let attempts = vec!["fake"];
         let call_count = Arc::new(Mutex::new(0usize));
         let invalid_first = serde_json::json!({
             "operations": [{
@@ -1630,24 +1665,23 @@ mod tests {
         })
         .to_string();
 
-        let outcome = run_projection_patch_with_attempts(
-            &attempts,
+        let outcome = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
-                move |_, _messages| {
+                move |_messages| {
                     let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
                     if *count == 1 {
-                        Ok(structured_projection_output(
+                        Ok(graded_projection_output(
                             invalid_first.clone(),
                             7,
-                            ProjectionStructuredOutputMode::VllmStructuredOutputs,
+                            ConstrainedDecodingGrade::GuaranteedConstrained,
                         ))
                     } else {
-                        Ok(structured_projection_output(
+                        Ok(graded_projection_output(
                             repaired.clone(),
                             8,
-                            ProjectionStructuredOutputMode::VllmStructuredOutputs,
+                            ConstrainedDecodingGrade::GuaranteedConstrained,
                         ))
                     }
                 }
@@ -1666,65 +1700,158 @@ mod tests {
             outcome.patch.provenance.prompt_id, PROJECTION_PATCH_REPAIR_PROMPT_ID,
             "schema-constrained JSON still goes through semantic validation and repair"
         );
+        // ADR-0038 sub-decision 5: the grade is RECORDED, and it never gated
+        // dispatch — a `GuaranteedConstrained` route still had to be validated.
+        let record = outcome.patch.route.as_ref().expect("route record");
+        assert_eq!(
+            record.constrained_decoding,
+            ConstrainedDecodingGrade::GuaranteedConstrained
+        );
+        assert_eq!(record.terminal_status, TerminalStatus::Completed);
+        assert_eq!(record.retry_class, None);
         assert!(matches!(
             outcome.patch.operations.first(),
             Some(ProjectionOperation::UpsertGraphNode { id, .. }) if id == "person:alice"
         ));
     }
 
-    // ----- cb46: first (selected-provider) error surfaces, not the last -----
+    // ----- ADR-0038 defect (d): no dispatch without an authorized route -----
 
     #[test]
-    fn run_projection_attempts_surfaces_first_error_not_last() {
-        // Mirror the OpenRouter user's chain: [openrouter, api, native,
-        // mistralrs]. openrouter is the SELECTED provider and fails with the
-        // real (parse/decode) error; the rest fail with "not configured/loaded"
-        // boilerplate. The surfaced error must be openrouter's — not the last
-        // ("mistral.rs LLM is not loaded"), which masked the real incident
-        // (audio-graph-cb46).
-        let attempts = vec!["openrouter", "api", "native", "mistralrs"];
-        let err = run_projection_attempts(
-            &attempts,
-            |&name, _messages| {
-                Err(match name {
-                    "openrouter" => "OpenRouter HTTP error: status=502".to_string(),
-                    "api" => "API LLM client is not configured".to_string(),
-                    "native" => "Native LLM is not loaded".to_string(),
-                    _ => "mistral.rs LLM is not loaded".to_string(),
-                })
+    fn dispatch_requires_an_authorized_route_token() {
+        use crate::llm::route::{BlockingBackend, authorize_route_dispatch};
+        let authorized = authorize_route_dispatch(&LlmProvider::LocalLlama)
+            .expect("llm.local_llama is MVP-selectable");
+        assert_eq!(authorized.descriptor().id, "route.local_llama");
+        assert!(matches!(
+            authorized.descriptor().blocking_backend,
+            Some(BlockingBackend::NativeLlama)
+        ));
+    }
+
+    // ----- ADR-0038 defect (a): Truncated never enters the repair path -------
+
+    #[test]
+    fn truncated_draft_never_reaches_repair_and_never_raises_the_budget() {
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let calls = Arc::new(Mutex::new(0usize));
+        let err = run_projection_patch_on_route(
+            {
+                let calls = calls.clone();
+                move |_messages| {
+                    *calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    let mut output = projection_output("{\"operations\":[".to_string(), 40_960);
+                    output.wire.terminal_status = TerminalStatus::Truncated;
+                    Ok(output)
+                }
+            },
+            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &job,
+            &ledger,
+            4,
+            123,
+        )
+        .expect_err("a truncated draft is not a usable completion");
+
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "Truncated short-circuits before the parse: no repair, no second call"
+        );
+        assert!(
+            err.contains("Truncated"),
+            "the error must name the normalized terminal status, got: {err}"
+        );
+        assert!(
+            err.contains("UnusableCompletion"),
+            "and its retry class, got: {err}"
+        );
+    }
+
+    #[test]
+    fn refused_draft_never_reaches_repair() {
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let calls = Arc::new(Mutex::new(0usize));
+        let err = run_projection_patch_on_route(
+            {
+                let calls = calls.clone();
+                move |_messages| {
+                    *calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    let mut output = projection_output("{}".to_string(), 3);
+                    output.wire.terminal_status = TerminalStatus::Refused;
+                    Ok(output)
+                }
+            },
+            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &job,
+            &ledger,
+            4,
+            123,
+        )
+        .expect_err("a refusal is not a usable completion");
+        assert_eq!(*calls.lock().unwrap_or_else(|e| e.into_inner()), 1);
+        assert!(err.contains("Refused"), "got: {err}");
+    }
+
+    // ----- ADR-0038: exactly one route, no cross-provider hop ---------------
+
+    #[test]
+    fn projection_dispatch_invokes_exactly_one_route_and_surfaces_its_error() {
+        // ADR-0038: automatic cross-provider fallback is removed. A projection
+        // dispatch invokes exactly ONE authorized route; when that route fails,
+        // its own error surfaces verbatim and no second provider is touched.
+        //
+        // This is the inversion of the deleted `run_projection_attempts` walker
+        // (whose job was to pick which of four backends' errors to surface) and
+        // the promotion of its "No projection LLM backend configured" default:
+        // with one route there is no chain, so the route's real error is the only
+        // error there is.
+        let calls = Arc::new(Mutex::new(0usize));
+        let err = run_projection_patch_on_route(
+            {
+                let calls = calls.clone();
+                move |_messages| {
+                    *calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    Err("OpenRouter client is not configured".to_string())
+                }
             },
             &[],
+            &projection_test_job(ProjectionKind::Notes).0,
+            &projection_test_job(ProjectionKind::Notes).1,
+            4,
+            123,
         )
-        .expect_err("all attempts fail");
-        assert!(
-            err.contains("OpenRouter HTTP error: status=502"),
-            "the selected provider's (first) error must surface, got: {err}"
+        .expect_err("the single authorized route fails");
+
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "exactly one route must be invoked — no fallback hop"
+        );
+        assert_eq!(
+            err, "OpenRouter client is not configured",
+            "the authorized route's own error must surface verbatim"
         );
         assert!(
-            !err.contains("mistral.rs LLM is not loaded"),
-            "the last fallback's boilerplate must NOT surface, got: {err}"
+            !err.contains("mistral.rs LLM is not loaded")
+                && !err.contains("No projection LLM backend configured"),
+            "no downstream boilerplate and no generic chain default, got: {err}"
         );
     }
 
     #[test]
-    fn run_projection_attempts_empty_chain_reports_projection_specific_default() {
-        let attempts: Vec<&str> = vec![];
-        let err =
-            run_projection_attempts(&attempts, |_, _| Ok(projection_output("{}".into(), 0)), &[])
-                .expect_err("empty chain");
-        assert_eq!(err, "No projection LLM backend configured");
-    }
-
-    // ----- a324: repair escalates to the NEXT backend in the chain ----------
-
-    #[test]
-    fn repair_escalates_to_next_backend_when_available() {
-        // Two backends: the first (selected) produces an invalid draft; repair
-        // must run against the SECOND backend, not re-run the first
-        // (audio-graph-a324). The recorder captures which backend each call hit.
+    fn repair_never_leaves_the_authorized_route() {
+        // ADR-0038 / seed audio-graph-3624: the repair prompt embeds the invalid
+        // draft plus transcript-derived context. It must re-run on the SAME
+        // authorized route; escalating it to the next provider is unauthorized
+        // egress caused purely by a validator rejection.
+        //
+        // This is the direct inversion of the deleted
+        // `repair_escalates_to_next_backend_when_available`, whose
+        // `vec!["backend-a", "backend-b"]` fixture asserted exactly what ADR-0038
+        // forbids.
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let attempts = vec!["backend-a", "backend-b"];
-        let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let route_ids = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let invalid_first = serde_json::json!({
             "operations": [{
                 "type": "upsert_graph_node",
@@ -1747,20 +1874,22 @@ mod tests {
         })
         .to_string();
 
-        let outcome = run_projection_patch_with_attempts(
-            &attempts,
+        let outcome = run_projection_patch_on_route(
             {
-                let calls = calls.clone();
-                move |&name, _messages| {
-                    calls.lock().unwrap_or_else(|e| e.into_inner()).push(name);
-                    match name {
-                        // backend-a is the selected provider: it succeeds at the
-                        // transport level but returns a kind-wrong (invalid) draft.
-                        "backend-a" => Ok(projection_output(invalid_first.clone(), 5)),
-                        // backend-b is the next in the chain: it produces a valid
-                        // repaired draft.
-                        _ => Ok(projection_output(repaired.clone(), 7)),
-                    }
+                let route_ids = route_ids.clone();
+                let mut seen = 0usize;
+                move |_messages| {
+                    seen += 1;
+                    let output = if seen == 1 {
+                        route_projection_output("route.openrouter", invalid_first.clone(), 5)
+                    } else {
+                        route_projection_output("route.openrouter", repaired.clone(), 7)
+                    };
+                    route_ids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(output.route_id);
+                    Ok(output)
                 }
             },
             &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
@@ -1769,99 +1898,32 @@ mod tests {
             4,
             123,
         )
-        .expect("repair via next backend succeeds");
+        .expect("same-route repair succeeds");
 
-        let seen = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
-            seen,
-            vec!["backend-a", "backend-b"],
-            "the initial draft runs on backend-a; repair must escalate to backend-b"
+            *route_ids.lock().unwrap_or_else(|e| e.into_inner()),
+            vec!["route.openrouter", "route.openrouter"],
+            "the repair must stay on the route that produced the draft"
         );
-        assert_eq!(outcome.tokens_used, 12, "initial + repair tokens accrue");
         assert_eq!(
             outcome.patch.provenance.prompt_id,
             PROJECTION_PATCH_REPAIR_PROMPT_ID
         );
-        assert!(matches!(
-            outcome.patch.operations.first(),
-            Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
-        ));
-    }
-
-    #[test]
-    fn repair_falls_back_to_producing_backend_when_no_next_backend() {
-        // Single-provider case (the common OpenRouter-only setup): there is no
-        // next backend to escalate to, so repair re-runs the producing backend —
-        // no worse than the prior same-backend behavior (audio-graph-a324).
-        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let attempts = vec!["only"];
-        let call_count = Arc::new(Mutex::new(0usize));
-        let invalid_first = serde_json::json!({
-            "operations": [{
-                "type": "upsert_graph_node",
-                "id": "person:alice",
-                "name": "Alice",
-                "entity_type": "person",
-                "description": null
-            }]
-        })
-        .to_string();
-        let repaired = serde_json::json!({
-            "operations": [{
-                "type": "upsert_note",
-                "id": "note:alice-bob",
-                "title": "Alice and Bob",
-                "body": "Alice met Bob.",
-                "tags": ["people"]
-            }],
-            "confidence": 0.8
-        })
-        .to_string();
-
-        let outcome = run_projection_patch_with_attempts(
-            &attempts,
-            {
-                let call_count = call_count.clone();
-                move |_, _messages| {
-                    let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
-                    *count += 1;
-                    if *count == 1 {
-                        Ok(projection_output(invalid_first.clone(), 5))
-                    } else {
-                        Ok(projection_output(repaired.clone(), 7))
-                    }
-                }
-            },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
-            &job,
-            &ledger,
-            4,
-            123,
-        )
-        .expect("repair on the same backend still runs when no next backend exists");
-
         assert_eq!(
-            *call_count.lock().unwrap_or_else(|e| e.into_inner()),
-            2,
-            "one initial draft + one repair on the same (only) backend"
+            outcome.patch.provenance.route_id.as_deref(),
+            Some("route.openrouter")
         );
-        assert!(matches!(
-            outcome.patch.operations.first(),
-            Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
-        ));
     }
 
     #[test]
-    fn repair_escalation_surfaces_producing_backend_error_not_next_backend_boilerplate() {
-        // cb46-class regression guard (CodeRabbit on PR #96): the producing
-        // backend (index 0) yields an invalid draft, then on the repair attempt
-        // fails with its OWN real error; the next backend (index 1) fails with
-        // downstream "not configured/loaded" boilerplate. When escalation
-        // exhausts and falls back to the producing backend, the surfaced error
-        // must be the producing backend's — NOT the next backend's boilerplate,
-        // which is the exact masking cb46 kills.
+    fn same_route_repair_error_surfaces_and_no_second_route_appears() {
+        // The a324 finding is real: a same-route repair can reproduce the failure
+        // (6/6 same-model repair double-failures in user data). When it does, the
+        // route's own repair error surfaces and the patch fails — it does NOT hop.
+        // This replaces
+        // `repair_escalation_surfaces_producing_backend_error_not_next_backend_boilerplate`,
+        // whose masking concern cannot arise once there is only one candidate.
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let attempts = vec!["producer", "next"];
         let invalid_first = serde_json::json!({
             "operations": [{
                 "type": "upsert_graph_node",
@@ -1872,28 +1934,15 @@ mod tests {
             }]
         })
         .to_string();
-        let producer_calls = Arc::new(Mutex::new(0usize));
+        let mut seen = 0usize;
 
-        let err = run_projection_patch_with_attempts(
-            &attempts,
-            {
-                let producer_calls = producer_calls.clone();
-                move |&name, _messages| match name {
-                    // First call: producer returns an (invalid-kind) draft, which
-                    // triggers repair. Second call (the repair on the producer):
-                    // it fails with its own real error.
-                    "producer" => {
-                        let mut n = producer_calls.lock().unwrap_or_else(|e| e.into_inner());
-                        *n += 1;
-                        if *n == 1 {
-                            Ok(projection_output(invalid_first.clone(), 5))
-                        } else {
-                            Err("OpenRouter HTTP error: status=502 (producer repair failed)"
-                                .to_string())
-                        }
-                    }
-                    // The next backend in the chain fails with boilerplate.
-                    _ => Err("mistral.rs LLM is not loaded".to_string()),
+        let err = run_projection_patch_on_route(
+            move |_messages| {
+                seen += 1;
+                if seen == 1 {
+                    Ok(projection_output(invalid_first.clone(), 5))
+                } else {
+                    Err("OpenRouter HTTP error: status=502 (repair failed)".to_string())
                 }
             },
             &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
@@ -1902,37 +1951,37 @@ mod tests {
             4,
             123,
         )
-        .expect_err("repair fails on every backend");
+        .expect_err("the repair fails on the same route");
 
         assert!(
-            err.contains("status=502 (producer repair failed)"),
-            "the producing backend's own repair error must surface, got: {err}"
+            err.contains("status=502 (repair failed)"),
+            "the authorized route's own repair error must surface, got: {err}"
         );
         assert!(
             !err.contains("mistral.rs LLM is not loaded"),
-            "the next backend's boilerplate must NOT mask the producing backend's error, got: {err}"
+            "there is no next backend whose boilerplate could mask it, got: {err}"
         );
     }
 
     // ----- a324: OpenRouter structured-output rejection classification ------
 
     #[test]
-    fn openrouter_schema_rejection_matches_4xx_class_only() {
+    fn schema_rejection_matches_4xx_class_only() {
         // A model that lacks structured-output support returns a 400/404/422;
         // those trigger the schema-less retry.
-        assert!(is_openrouter_schema_rejection(
+        assert!(is_schema_rejection(
             "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=400 body_bytes=12"
         ));
-        assert!(is_openrouter_schema_rejection("... status=404 ..."));
-        assert!(is_openrouter_schema_rejection("... status=422 ..."));
+        assert!(is_schema_rejection("... status=404 ..."));
+        assert!(is_schema_rejection("... status=422 ..."));
         // Auth and transient failures must NOT be treated as schema rejections —
         // a schema-less retry would fail the same way (401/403) or should have
         // been retried in-client (429/5xx).
-        assert!(!is_openrouter_schema_rejection("... status=401 ..."));
-        assert!(!is_openrouter_schema_rejection("... status=403 ..."));
-        assert!(!is_openrouter_schema_rejection("... status=429 ..."));
-        assert!(!is_openrouter_schema_rejection("... status=502 ..."));
-        assert!(!is_openrouter_schema_rejection(
+        assert!(!is_schema_rejection("... status=401 ..."));
+        assert!(!is_schema_rejection("... status=403 ..."));
+        assert!(!is_schema_rejection("... status=429 ..."));
+        assert!(!is_schema_rejection("... status=502 ..."));
+        assert!(!is_schema_rejection(
             "OpenRouter chat completion request failed: timed out"
         ));
     }
@@ -1957,7 +2006,7 @@ mod tests {
         // Sanity: every model-level signal is also a (broader) schema rejection.
         let no_providers =
             "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404";
-        assert!(is_openrouter_schema_rejection(no_providers));
+        assert!(is_schema_rejection(no_providers));
         assert!(is_openrouter_schema_unsupported_by_model(no_providers));
     }
 
@@ -1992,7 +2041,6 @@ mod tests {
             messages: Vec::new(),
             graph_context: tag.to_string(),
             provider: LlmProvider::LocalLlama,
-            allow_cloud_fallbacks: true,
             response_tx: tx,
         };
         (job, rx)
@@ -2083,23 +2131,31 @@ mod tests {
         );
     }
 
-    // ----- run_chat / run_extraction with no backends ----------------------
+    // ----- one route, no backends: the route's own error, nothing else -------
 
     #[test]
-    fn run_chat_with_no_backends_reports_first_attempt_error() {
+    fn run_chat_on_a_route_with_no_backend_reports_only_that_route_error() {
         let handles = empty_handles();
-        // LocalLlama order = [native, openrouter, api, mistralrs]; all None.
-        // Every attempt errors → the LAST attempt's error surfaces.
-        let err = run_chat(&handles, &LlmProvider::LocalLlama, &[], "ctx", true)
-            .expect_err("no backends → Err");
+        // LocalLlama resolves to `route.local_llama` and nothing else, so the only
+        // error that can surface is the native engine's.
+        let err =
+            run_chat(&handles, &LlmProvider::LocalLlama, &[], "ctx").expect_err("no backend → Err");
+        assert_eq!(err, "Native LLM is not loaded");
         assert!(
-            err.contains("mistral.rs LLM is not loaded"),
-            "last attempt (mistralrs) error should surface, got: {err}"
+            !err.contains("mistral.rs") && !err.contains("OpenRouter") && !err.contains("API LLM"),
+            "a single-route dispatch must not mention any other provider, got: {err}"
         );
     }
 
     #[test]
-    fn run_chat_restricted_policy_omits_cloud_attempts() {
+    fn run_chat_on_the_openrouter_route_never_falls_back_to_a_local_engine() {
+        // This replaces `run_chat_restricted_policy_omits_cloud_attempts`, whose
+        // premise was the deleted privacy-boolean local-only chain. A cloud route
+        // under a non-ByokCloud privacy mode is now refused by the CLIENT's
+        // content-egress policy (`ApiClient::new` / `OpenRouterClient::new` default
+        // to `block("explicit_policy_required")`), not silently downgraded to a
+        // local model — so what must be proven here is that no local engine is
+        // reached at all.
         let handles = empty_handles();
         let err = run_chat(
             &handles,
@@ -2112,16 +2168,36 @@ mod tests {
             },
             &[],
             "ctx",
-            false,
         )
-        .expect_err("no local backends → Err");
+        .expect_err("no OpenRouter client → Err");
+        assert_eq!(err, "OpenRouter client is not configured");
         assert!(
-            err.contains("mistral.rs LLM is not loaded"),
-            "restricted policy should only try local backends and surface the local fallback error, got: {err}"
+            !err.contains("mistral.rs") && !err.contains("Native LLM"),
+            "the OpenRouter route must never reach a local engine, got: {err}"
         );
+    }
+
+    #[test]
+    fn bedrock_route_reports_no_blocking_route_not_a_missing_api_client() {
+        // Bedrock used to be dispatched at `chat_api`, so the user saw "API LLM
+        // client is not configured" — a diagnostic about the wrong client.
+        let handles = empty_handles();
+        let err = run_chat(
+            &handles,
+            &LlmProvider::AwsBedrock {
+                region: "us-east-1".into(),
+                model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
+                credential_source: Default::default(),
+            },
+            &[],
+            "ctx",
+        )
+        .expect_err("bedrock has no blocking route");
+        assert!(err.contains("route.aws_bedrock"), "got: {err}");
+        assert!(err.contains("streaming chat only"), "got: {err}");
         assert!(
-            !err.contains("OpenRouter") && !err.contains("API LLM"),
-            "restricted policy must not surface cloud backend attempts, got: {err}"
+            !err.contains("API LLM client is not configured"),
+            "the old misleading diagnostic must be gone, got: {err}"
         );
     }
 
@@ -2142,11 +2218,271 @@ mod tests {
             "Alice met Bob",
             "Alice",
             "",
-            true,
         );
         assert!(
             result.is_none(),
-            "with no backends configured, extraction yields None (→ rule-based fallback)"
+            "with no backend on the authorized route, extraction yields None → the \
+             LOCAL rule-based extractor, which is not a provider substitution"
+        );
+    }
+
+    // ----- ADR-0038: the removal, proven against a real wire ----------------
+
+    /// Serve `responses` (one per incoming connection, in order) and report how
+    /// many requests actually arrived. The count is the proof: a fallback hop
+    /// would have to open a second connection to a second backend, and with only
+    /// one backend configured the surfaced error names it and nothing else.
+    async fn spawn_counting_mock(
+        responses: Vec<String>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_task = count.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                let mut content_len: Option<usize> = None;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if content_len.is_none()
+                        && let Some(hdr_end) = total.find("\r\n\r\n")
+                    {
+                        content_len = total[..hdr_end]
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok());
+                    }
+                    match (content_len, total.find("\r\n\r\n")) {
+                        (Some(cl), Some(hdr_end)) if total.len() - (hdr_end + 4) >= cl => break,
+                        (None, Some(_)) => break,
+                        _ => {}
+                    }
+                }
+                count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), count)
+    }
+
+    fn handles_with_only_api_client(endpoint: &str) -> BackendHandles {
+        let client = ApiClient::new(crate::llm::ApiConfig {
+            endpoint: endpoint.to_string(),
+            api_key: Some("sk-route-removal-probe".to_string()),
+            model: "probe-model".to_string(),
+            max_tokens: 64,
+            temperature: 0.1,
+        })
+        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        BackendHandles {
+            // Every OTHER backend handle is deliberately loaded-and-available-free:
+            // if any fallback path survived, its "not loaded / not configured"
+            // error would appear in the surfaced message.
+            llm_engine: Arc::new(Mutex::new(None)),
+            api_client: Arc::new(Mutex::new(Some(client))),
+            openrouter_client: Arc::new(Mutex::new(None)),
+            mistralrs_engine: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn a_refused_response_does_not_reach_a_second_provider() {
+        // THE removal proof (seed audio-graph-3624). The one configured route
+        // returns HTTP 200 with finish_reason "content_filter" — a provider
+        // refusal. Before ADR-0038 an unusable draft escalated the repair prompt
+        // (which embeds the draft plus transcript-derived context) to the NEXT
+        // provider in a hardcoded chain, authorized only by a privacy boolean.
+        //
+        // Now: exactly ONE request reaches the wire, the error names the
+        // normalized terminal status, and no other provider is named or dialled.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let refusal = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[]}" },
+                "finish_reason": "content_filter"
+            }]
+        })
+        .to_string();
+        // Three responses are QUEUED so a surviving retry or repair would be
+        // served rather than merely failing to connect — the assertion is on the
+        // observed request count, not on the mock running out.
+        let (base, request_count) = rt.block_on(spawn_counting_mock(vec![
+            refusal.clone(),
+            refusal.clone(),
+            refusal,
+        ]));
+
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let err = std::thread::spawn(move || {
+            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect_err("a refusal is not a usable completion");
+
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refused request must reach exactly one provider — no repair \
+             escalation, no fallback hop"
+        );
+        assert!(err.contains("Refused"), "got: {err}");
+        assert!(err.contains("route.openai_compatible"), "got: {err}");
+        assert!(
+            !err.contains("mistral.rs")
+                && !err.contains("Native LLM")
+                && !err.contains("OpenRouter"),
+            "no other provider may be named, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_validator_rejected_draft_repairs_on_the_same_provider_only() {
+        // The rejected-draft half of the same proof: the draft is transport-OK but
+        // the WRONG KIND, so the validator rejects it and the repair prompt runs.
+        // It must run against the SAME endpoint — two requests to one provider, not
+        // one request each to two.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let wrong_kind = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_graph_node\",\
+\"id\":\"person:alice\",\"name\":\"Alice\",\"entity_type\":\"person\",\"description\":null}]}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base, request_count) = rt.block_on(spawn_counting_mock(vec![
+            wrong_kind.clone(),
+            wrong_kind.clone(),
+            wrong_kind,
+        ]));
+
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let err = std::thread::spawn(move || {
+            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect_err("the same-route repair reproduces the wrong kind");
+
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one draft + one SAME-route repair, and no third attempt"
+        );
+        assert!(
+            err.contains("projection patch draft invalid and repair failed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn served_model_echo_is_recorded_as_served_not_requested() {
+        // ADR-0038 defect 3, end to end on the generic blocking path: the request
+        // asks for `probe-model`, the response echoes a different served id, and
+        // provenance must record the SERVED one with `model_source: Served`.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:a\",\"title\":\"T\",\"body\":\"B\",\"tags\":[]}],\"confidence\":0.7}" },
+                "finish_reason": "stop"
+            }],
+            "model": "probe-model-turbo"
+        })
+        .to_string();
+        let (base, _count) = rt.block_on(spawn_counting_mock(vec![body]));
+
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let outcome = std::thread::spawn(move || {
+            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("a valid notes draft");
+
+        assert_eq!(outcome.patch.provenance.model, "probe-model-turbo");
+        assert_eq!(
+            outcome.patch.provenance.model_source,
+            ModelIdentitySource::Served
+        );
+        assert_eq!(
+            outcome.patch.provenance.route_id.as_deref(),
+            Some("route.openai_compatible")
+        );
+        assert_eq!(outcome.patch.provenance.provider, "llm.api");
+        let record = outcome.patch.route.as_ref().expect("route record");
+        assert_eq!(record.terminal_status, TerminalStatus::Completed);
+        assert_eq!(record.wire_skin, "chat_completions");
+        // No prompt, reply, or credential text may ride in the route record.
+        let json = serde_json::to_string(record).expect("serialize");
+        assert!(!json.contains("sk-route-removal-probe"), "got: {json}");
+        assert!(!json.contains("Alice met Bob"), "got: {json}");
+        assert!(!json.contains("note:a"), "got: {json}");
+    }
+
+    #[test]
+    fn a_mid_session_endpoint_repoint_fails_closed_instead_of_stamping_the_old_route() {
+        // Critique finding 1: the job's `LlmProvider` is a session-start SNAPSHOT,
+        // while egress goes through the shared client handle that
+        // `sync_llm_api_client_from_settings_cache` rebuilds on every settings
+        // save. A snapshot authorized as Cerebras must not egress to a re-pointed
+        // endpoint under the Cerebras route id and capability row.
+        let handles = handles_with_only_api_client("https://api.openai.com/v1");
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let stale_snapshot = LlmProvider::Api {
+            endpoint: crate::settings::CEREBRAS_BASE_URL.to_string(),
+            api_key: "sk-cerebras".to_string(),
+            model: "gpt-oss-120b".to_string(),
+        };
+
+        let err = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, 1, 100)
+            .expect_err("a re-pointed client must fail closed");
+        assert!(err.contains("route.cerebras_direct"), "got: {err}");
+        assert!(err.contains("route.openai_compatible"), "got: {err}");
+        assert!(err.contains("re-authorization required"), "got: {err}");
+        assert!(
+            !err.contains("api.openai.com") && !err.contains("sk-cerebras"),
+            "the refusal must stay content-free, got: {err}"
         );
     }
 

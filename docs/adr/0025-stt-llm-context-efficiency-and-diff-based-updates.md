@@ -1,5 +1,16 @@
 # ADR-0025: STT→LLM context efficiency + diff-based note/graph retroactive updates (extends ADR-0024)
 
+> **Note (2026-08-19):** Every statement in this record about a **provider
+> fallback chain** in `llm/executor.rs` is **narrowed by
+> [ADR-0038](0038-route-llm-operations-through-a-single-skin-named-route-table.md)**,
+> which removed automatic cross-provider fallback. There is no mid-session
+> failover and no fallback hop: a job resolves exactly one authorized route. The
+> prompt-cache key is now scoped per **(session, route)** rather than per
+> (session, resolved-provider), and a cold cache arises from a turn gap beyond
+> the vendor TTL or from a same-route mode downgrade — not from a provider hop.
+> Everything else in this record — incremental folding, pinned typed facts,
+> basis-checked patches, the data-movement ledger — remains in force.
+
 ## Status
 
 Proposed 2026-07-04. **Extends [ADR-0024](0024-event-sourced-notes-graph-projections.md)**

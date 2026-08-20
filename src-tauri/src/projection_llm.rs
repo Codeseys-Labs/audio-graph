@@ -138,8 +138,15 @@ pub struct ProjectionPatchDraft {
 pub struct ProjectionPatchBuildContext {
     pub sequence: u64,
     pub llm_request_id: String,
+    /// The registry provider id the route was authorized against (ADR-0033).
     pub provider: String,
     pub model: String,
+    /// Whether `model` is the served id or the requested one (ADR-0038 defect 3).
+    pub model_source: crate::llm::route::ModelIdentitySource,
+    /// The stamped route id, supplied by trusted code only.
+    pub route_id: Option<String>,
+    /// Content-free route evidence for this patch.
+    pub route: Option<crate::llm::route::RouteRecord>,
     pub prompt_id: String,
     pub created_at_ms: u64,
 }
@@ -443,7 +450,10 @@ pub fn trusted_projection_patch_from_model_json(
             provider: context.provider,
             model: context.model,
             prompt_id: context.prompt_id,
+            route_id: context.route_id,
+            model_source: context.model_source,
         },
+        route: context.route,
         queued_at_ms: Some(job.queued_at_ms),
         generation_latency_ms: None,
         apply_latency_ms: None,
@@ -973,8 +983,11 @@ mod tests {
         ProjectionPatchBuildContext {
             sequence: 7,
             llm_request_id: "llm-request-7".to_string(),
-            provider: "api".to_string(),
+            provider: "llm.api".to_string(),
             model: "test-model".to_string(),
+            model_source: crate::llm::route::ModelIdentitySource::Served,
+            route_id: Some("route.openai_compatible".to_string()),
+            route: None,
             prompt_id: PROJECTION_PATCH_PROMPT_ID.to_string(),
             created_at_ms: 20,
         }
@@ -1006,11 +1019,91 @@ mod tests {
         assert_eq!(patch.kind, ProjectionKind::Notes);
         assert_eq!(patch.basis, job.basis);
         assert_eq!(patch.confidence, 0.82);
-        assert_eq!(patch.provenance.provider, "api");
+        // Post-ADR-0038 provenance names the REGISTRY provider id, and records the
+        // stamped route id plus whether the model id is the served one.
+        assert_eq!(patch.provenance.provider, "llm.api");
         assert_eq!(patch.provenance.model, "test-model");
+        assert_eq!(
+            patch.provenance.route_id.as_deref(),
+            Some("route.openai_compatible")
+        );
+        assert_eq!(
+            patch.provenance.model_source,
+            crate::llm::route::ModelIdentitySource::Served
+        );
         assert_eq!(patch.provenance.prompt_id, PROJECTION_PATCH_PROMPT_ID);
         assert_eq!(patch.llm_request_id, "llm-request-7");
         assert_eq!(patch.created_at_ms, 20);
+    }
+
+    /// Measure the serialized size of the strict output schema per projection kind.
+    ///
+    /// This exists to put a NUMBER in the repository rather than reason about one.
+    /// Cerebras's documented strict-schema ceiling is cited in off-branch research
+    /// that does not exist in this worktree, so ADR-0038's contract deliberately
+    /// does NOT hardcode it: the 4xx → `json_object` downgrade on the same route
+    /// makes behaviour independent of the exact limit. What is worth recording is
+    /// how large the schema we actually send is, so a future reader can compare it
+    /// against whatever ceiling they can cite. The bound below is a loose
+    /// regression guard, not a provider claim.
+    #[test]
+    fn projection_patch_strict_schema_serialized_length_is_recorded() {
+        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+            let schema = projection_patch_strict_json_schema(&kind);
+            let len = serde_json::to_string(&schema)
+                .expect("serialize schema")
+                .len();
+            assert!(
+                (200..8_000).contains(&len),
+                "{kind:?} strict schema serializes to {len} bytes, outside the recorded \
+                 200..8000 envelope — re-measure before widening this bound"
+            );
+        }
+    }
+
+    /// The trusted-stamp boundary (ADR-0024 §3): model JSON supplies only
+    /// `operations` + `confidence`. A model that tries to dictate its own route id,
+    /// provider, or served-model identity is ignored — those come from
+    /// [`ProjectionPatchBuildContext`], which only trusted code constructs.
+    #[test]
+    fn model_json_cannot_dictate_route_provenance() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice met Bob."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+        let raw = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:alice-bob",
+                "title": "Alice and Bob",
+                "body": "Alice met Bob.",
+                "tags": []
+            }],
+            "confidence": 0.5,
+            "provenance": {
+                "provider": "llm.attacker",
+                "model": "attacker-model",
+                "prompt_id": "attacker",
+                "route_id": "route.attacker",
+                "model_source": "served"
+            },
+            "route": { "route_id": "route.attacker" }
+        })
+        .to_string();
+
+        // `ProjectionPatchDraft` is `deny_unknown_fields`, so the draft is rejected
+        // outright rather than partially honored — the new `route_id` / `route`
+        // fields inherit that boundary instead of widening it.
+        let error = trusted_projection_patch_from_model_json(&raw, &job, context())
+            .expect_err("a draft carrying trusted route metadata must be rejected");
+        assert!(
+            matches!(
+                &error,
+                ProjectionPatchDraftError::InvalidJson { error } if error.contains("unknown field")
+            ),
+            "got: {error:?}"
+        );
     }
 
     #[test]

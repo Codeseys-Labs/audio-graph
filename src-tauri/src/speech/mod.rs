@@ -1457,13 +1457,12 @@ pub(crate) fn process_extraction_and_emit(
     let extraction_start = Instant::now();
     let extraction_result = deps
         .llm_executor
-        .extract_entities_with_policy(
+        .extract_entities(
             text.to_string(),
             speaker.to_string(),
             context.to_string(),
             (*deps.llm_provider).clone(),
             LlmPriority::Background,
-            deps.llm_allow_cloud_fallbacks,
         )
         .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text));
 
@@ -1618,6 +1617,18 @@ pub(crate) struct TranscriptProcessingContext {
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     pub llm_executor: LlmExecutor,
     pub llm_provider: LlmProvider,
+    /// Whether the session's privacy mode allows session content to leave the
+    /// device (`PrivacyMode::ByokCloud`).
+    ///
+    /// Since ADR-0038 this field authorizes NOTHING. It used to select the
+    /// executor's fallback chain; automatic cross-provider fallback is gone, and a
+    /// cloud route under a non-`ByokCloud` mode is now refused by the client's own
+    /// content-egress policy instead of silently downgraded to a local model. What
+    /// remains is a privacy-REPORT input: it is persisted in per-session
+    /// data-movement events (`ProjectionMovementFacts::cloud_transfer_allowed`) and
+    /// gates whether the remote summary/prefix movement is emitted at all (seed
+    /// audio-graph-72d5). Removing it would be an ADR-0027 migration for no safety
+    /// gain, so the name is kept and its reach is narrowed.
     pub llm_allow_cloud_fallbacks: bool,
     pub graph_extractor: Arc<RuleBasedExtractor>,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
@@ -1643,6 +1654,9 @@ struct ProjectionDispatchContext {
     /// (derived from `PrivacyMode::ByokCloud`). Gates the whole
     /// context-efficiency remote path: a local-only session emits NO remote
     /// summary/prefix movement (seed audio-graph-72d5).
+    ///
+    /// Since ADR-0038 this authorizes no provider selection — it is a
+    /// privacy-report input only.
     llm_allow_cloud_fallbacks: bool,
     /// Data-movement ledger emitter (content-free). `None` disables emission
     /// (tests that don't assert on the ledger).
@@ -1721,7 +1735,6 @@ impl ProjectionRuntimeEventSink for TauriProjectionRuntimeEventSink {
 struct ExecutorProjectionPatchGenerator {
     llm_executor: LlmExecutor,
     llm_provider: LlmProvider,
-    allow_cloud_fallbacks: bool,
 }
 
 impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
@@ -1732,13 +1745,12 @@ impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
         sequence: u64,
         created_at_ms: u64,
     ) -> Result<ProjectionPatchOutcome, String> {
-        self.llm_executor.generate_projection_patch_with_policy(
+        self.llm_executor.generate_projection_patch(
             job,
             ledger,
             self.llm_provider.clone(),
             sequence,
             created_at_ms,
-            self.allow_cloud_fallbacks,
         )
     }
 }
@@ -1755,7 +1767,6 @@ impl TranscriptProcessingContext {
             patch_generator: Arc::new(ExecutorProjectionPatchGenerator {
                 llm_executor: self.llm_executor.clone(),
                 llm_provider: self.llm_provider.clone(),
-                allow_cloud_fallbacks: self.llm_allow_cloud_fallbacks,
             }),
             llm_provider: self.llm_provider.clone(),
             llm_allow_cloud_fallbacks: self.llm_allow_cloud_fallbacks,
@@ -2000,51 +2011,64 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
 }
 
 /// Which backend identity a projection data-movement event should record
-/// (Codex P2 on PR #77 / seed audio-graph-72d5). The executor can FALL BACK to
-/// a different backend than the configured provider within one job
-/// (`llm/executor.rs` attempt chains), so the terminal event must ledger the
-/// backend that actually served the call — never the configured intent — or
-/// privacy reports would understate remote flow.
+/// (Codex P2 on PR #77 / seed audio-graph-72d5).
+///
+/// Under ADR-0038 a job reaches exactly ONE authorized route, so this no longer
+/// exists to cover a mid-job provider hop. It still exists because the *served*
+/// identity can be sharper than the configured intent: `route.openrouter`
+/// sharpens into `route.cerebras_via_openrouter` once the live routing policy is
+/// read, and the served model can differ from the requested slug.
 enum ProjectionLedgerBackend<'a> {
-    /// Pre-call lifecycle marker: the configured provider intent (the chain
-    /// has not run yet; the terminal event is authoritative for what left).
+    /// Pre-call lifecycle marker: the configured provider intent (nothing has been
+    /// dispatched yet; the terminal event is authoritative for what left).
     Configured,
-    /// Terminal success: the backend the executor actually used, reported via
-    /// the patch provenance ("openrouter" / "api" / "local_llama" /
-    /// "mistralrs").
+    /// Terminal success: the identity reported by the patch provenance, which is
+    /// the registry provider id of the route that actually served the call.
     Actual(&'a crate::projections::ProjectionProvenance),
-    /// Terminal failure: no backend reported. Conservative: when cloud
-    /// fallbacks are allowed the executor's attempt chain always includes
-    /// cloud backends (OpenRouter + generic API), so the prompt may have left
-    /// the device in a failed attempt — record the flow as remote rather than
-    /// understate it.
-    FailedChain,
+    /// Terminal failure on the single authorized route: no backend reported.
+    FailedRoute,
 }
 
-/// Map the executor's actually-used backend key to ledger identity:
+/// Map the provenance-reported provider identity to ledger identity:
 /// (provider_id, requires_cloud_transfer, has_cached_prefix).
+///
+/// Post-ADR-0038 provenance already carries the registry id, so the `llm.*` arm is
+/// a pass-through. The four legacy arms are REQUIRED, not vestigial: records
+/// written by builds before this contract carry the old ad-hoc keys (`"openrouter"`
+/// / `"api"` / `"local_llama"` / `"mistralrs"`), and a privacy report reading them
+/// must still resolve an identity rather than silently mislabel one.
 fn actual_backend_identity(
     dispatch: &ProjectionDispatchContext,
     backend: &str,
 ) -> (String, bool, bool) {
     match backend {
-        // Only the OpenRouter adapter sends the cache_control prefix hint
-        // (llm/executor.rs projection_openrouter), so only it can persist a
-        // vendor-side cached prefix.
-        "openrouter" => ("llm.openrouter".to_string(), true, true),
-        "local_llama" => ("llm.local_llama".to_string(), false, false),
-        "mistralrs" => ("llm.mistralrs".to_string(), false, false),
-        "api" => {
-            // The generic API backend may be a loopback (local) or a remote
-            // endpoint. When it IS the configured provider its endpoint check
-            // answers precisely; a fallback hop onto "api" is only reachable
-            // when cloud fallbacks are allowed, so record it as remote
-            // (conservative — never understate off-device flow).
-            let cloud = match &dispatch.llm_provider {
-                LlmProvider::Api { .. } => dispatch.llm_provider.requires_cloud_content_transfer(),
-                _ => true,
+        // Pass-through for the post-contract registry id.
+        "llm.openrouter" | "openrouter" => ("llm.openrouter".to_string(), true, true),
+        "llm.local_llama" | "local_llama" => ("llm.local_llama".to_string(), false, false),
+        "llm.mistralrs" | "mistralrs" => ("llm.mistralrs".to_string(), false, false),
+        "llm.aws_bedrock" => ("llm.aws_bedrock".to_string(), true, false),
+        "llm.api" | "llm.cerebras" | "llm.sambanova" | "api" => {
+            // A generic OpenAI-compatible endpoint may be loopback (local) or
+            // remote, so the configured provider's own endpoint check answers
+            // precisely. There is no longer a fallback hop onto this backend, so
+            // the former blanket "record it as remote" conservatism no longer
+            // applies to it; a pinned cloud accelerator (`llm.cerebras` /
+            // `llm.sambanova`) is remote by construction.
+            let cloud = match backend {
+                "llm.cerebras" | "llm.sambanova" => true,
+                _ => match &dispatch.llm_provider {
+                    LlmProvider::Api { .. } => {
+                        dispatch.llm_provider.requires_cloud_content_transfer()
+                    }
+                    _ => true,
+                },
             };
-            ("llm.api".to_string(), cloud, false)
+            let provider_id = if backend.starts_with("llm.") {
+                backend.to_string()
+            } else {
+                "llm.api".to_string()
+            };
+            (provider_id, cloud, false)
         }
         other => (
             format!("llm.{other}"),
@@ -2078,10 +2102,14 @@ fn projection_movement_facts(
             matches!(dispatch.llm_provider, LlmProvider::OpenRouter { .. }),
             String::new(),
         ),
-        ProjectionLedgerBackend::FailedChain => (
+        // A failed attempt on the single authorized route: its cloud-ness is
+        // exactly the configured provider's. The former
+        // `|| dispatch.llm_allow_cloud_fallbacks` widening existed because the
+        // attempt chain could have reached a cloud backend the user did not select;
+        // ADR-0038 removed that chain, so widening here would now overstate flow.
+        ProjectionLedgerBackend::FailedRoute => (
             dispatch.llm_provider.runtime_provider_id().to_string(),
-            dispatch.llm_provider.requires_cloud_content_transfer()
-                || dispatch.llm_allow_cloud_fallbacks,
+            dispatch.llm_provider.requires_cloud_content_transfer(),
             false,
             String::new(),
         ),
@@ -2269,7 +2297,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &ledger,
                 0,
                 0,
-                ProjectionLedgerBackend::FailedChain,
+                ProjectionLedgerBackend::FailedRoute,
             );
             dispatch.data_movement_sink.record(
                 &job.session_id,
@@ -4349,7 +4377,6 @@ pub(crate) fn run_speech_processor_diarization_only(
         patch_generator: Arc::new(ExecutorProjectionPatchGenerator {
             llm_executor: shared.llm_executor.clone(),
             llm_provider: config.llm_provider.clone(),
-            allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
         }),
         llm_provider: config.llm_provider.clone(),
         llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
@@ -7442,6 +7469,7 @@ mod tests_status {
             }],
         };
         ProjectionPatch {
+            route: None,
             sequence,
             kind: job.kind.clone(),
             llm_request_id: format!("fake:{}:{}", job.id, sequence),
@@ -7452,6 +7480,8 @@ mod tests_status {
                 provider: "fake".to_string(),
                 model: "projection-dispatch-test".to_string(),
                 prompt_id: "projection_patch_v1_test".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -9403,13 +9433,22 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Codex P2 (PR #77): when the executor FALLS BACK from the configured
-    /// local provider to a remote backend within one job (cloud fallbacks
-    /// allowed), the terminal ledger event must record the backend that
-    /// actually served the call — not the configured local intent — or privacy
-    /// reports would understate remote flow.
+    /// Codex P2 (PR #77), re-framed for ADR-0038: the terminal ledger event must
+    /// record the identity that ACTUALLY served the call, not the configured
+    /// intent, or privacy reports would understate remote flow.
+    ///
+    /// The original premise — a LocalLlama-configured session served by OpenRouter
+    /// via the executor's attempt chain — is now unreachable: a job resolves
+    /// exactly one authorized route. The actual-vs-configured property is still
+    /// real and still worth pinning, because the SERVED identity can be sharper
+    /// than the configured one (`route.openrouter` sharpens into
+    /// `route.cerebras_via_openrouter` once the live routing policy is read, and
+    /// the served model can differ from the requested slug). This test therefore
+    /// keeps the ledger property and drives it from an OpenRouter-configured
+    /// session whose provenance reports the OpenRouter registry id, rather than
+    /// from a cross-provider hop that no longer exists.
     #[test]
-    fn runtime_projection_dispatch_ledgers_actual_fallback_backend_not_configured() {
+    fn runtime_projection_dispatch_ledgers_served_route_not_configured_intent() {
         use crate::persistence::{DataClass, DataMovementEventType, DestinationBoundary};
 
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -9452,14 +9491,16 @@ mod tests_status {
             }
         };
 
-        // Simulate the executor fallback: local native engine unavailable, the
-        // attempt chain served the patch via OpenRouter (provenance is what the
-        // real executor stamps in projection_openrouter).
+        // Provenance reports what the single authorized OpenRouter route served,
+        // including a SERVED model slug that differs from the requested one — the
+        // shape `projection_openrouter` now stamps (ADR-0038 defect 3).
         let (generator, _calls) =
             FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
                 let mut patch = test_projection_patch(&job, sequence, created_at_ms);
-                patch.provenance.provider = "openrouter".to_string();
+                patch.provenance.provider = "llm.openrouter".to_string();
                 patch.provenance.model = "anthropic/claude-sonnet-4.5".to_string();
+                patch.provenance.route_id = Some("route.openrouter".to_string());
+                patch.provenance.model_source = crate::llm::route::ModelIdentitySource::Served;
                 Ok(ProjectionPatchOutcome {
                     patch,
                     tokens_used: 42,
@@ -9468,8 +9509,13 @@ mod tests_status {
         let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
             &app,
             generator,
-            LlmProvider::LocalLlama, // configured LOCAL
-            true,                    // cloud fallbacks allowed
+            // Configured LOCAL: the pre-call marker records that intent, and the
+            // terminal event records what the served route actually was. The
+            // divergence is the property under test; producing it no longer
+            // requires a cross-provider hop, only a generator that reports a
+            // different served identity.
+            LlmProvider::LocalLlama,
+            true,
         );
         run_projection_job(dispatch, notes_job);
 
@@ -9489,7 +9535,7 @@ mod tests_status {
         assert_eq!(
             terminal.destination.boundary,
             DestinationBoundary::Provider,
-            "fallback to a remote backend must be ledgered as a remote flow"
+            "a remote served route must be ledgered as a remote flow"
         );
         assert_eq!(
             terminal.destination.provider_id.as_deref(),
@@ -9498,7 +9544,7 @@ mod tests_status {
         );
         assert!(
             terminal.data_classes.contains(&DataClass::Notes),
-            "remote fallback carries the rolling summary off-device"
+            "a remote served route carries the rolling summary off-device"
         );
         assert!(
             terminal

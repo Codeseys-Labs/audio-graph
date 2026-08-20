@@ -7,6 +7,11 @@
 > not an on-demand whole-conversation synthesis. The `synthesize_notes` command
 > this ADR proposed survives as a manual, user-triggered prose escape hatch —
 > see ADR-0024 for the migration.
+>
+> **Note (2026-08-19):** this record's Context says `executor.chat_with_history`
+> runs "with a provider fallback chain". That is **narrowed by
+> [ADR-0038](0038-route-llm-operations-through-a-single-skin-named-route-table.md)**:
+> the chain is gone. `chat_with_history` resolves exactly one authorized route.
 
 ## Status
 

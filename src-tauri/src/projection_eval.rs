@@ -211,6 +211,7 @@ pub fn run_offline_projection_fixture(
                     operations: plan.operations,
                     confidence: plan.confidence,
                     provenance: default_fixture_provenance(),
+                    route: None,
                     queued_at_ms: None,
                     generation_latency_ms: None,
                     apply_latency_ms: None,
@@ -385,6 +386,9 @@ fn default_fixture_provenance() -> crate::projections::ProjectionProvenance {
         provider: "offline-fixture".to_string(),
         model: "deterministic".to_string(),
         prompt_id: "offline-projection-eval-v1".to_string(),
+        // Deterministic fixture: no route was dispatched.
+        route_id: None,
+        model_source: crate::llm::route::ModelIdentitySource::Requested,
     }
 }
 
@@ -847,6 +851,7 @@ mod tests {
             }],
         };
         ProjectionPatch {
+            route: None,
             sequence,
             kind: job.kind.clone(),
             llm_request_id: format!("offline:{}:{sequence}", job.id),
@@ -862,6 +867,8 @@ mod tests {
                 provider: "offline-fixture".to_string(),
                 model: "deterministic".to_string(),
                 prompt_id: "offline-projection-eval-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -1491,6 +1498,7 @@ mod tests {
             generation_latency_ms: None,
             apply_latency_ms: None,
             created_at_ms: 1_100,
+            route: None,
         };
 
         // While the provisional rev is current, the patch applies.
