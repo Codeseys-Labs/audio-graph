@@ -6758,18 +6758,9 @@ mod tests {
     // audio-graph-dbd4 — the one unlink arm that can leave a real durability
     // question open in production: `remove_file` itself failing.
 
-    /// Measure whether a read-only parent directory actually denies removal on
-    /// this host, and report the exact error it denies with.
-    ///
-    /// This is a capability, never an assumption: an effective root uid keeps
-    /// write access to a `0o555` directory, so there is nothing to deny and no
-    /// `EACCES` for the primitive to classify. Returning the observed
-    /// `ErrorKind`/errno pair also keeps the test free of a hardcoded errno
-    /// constant — it asserts the error the host raised, not one this file
-    /// guessed.
-    #[cfg(target_os = "linux")]
     /// The effective uid, without taking a `libc` dependency for one call: a
     /// file this process just created is owned by exactly that uid.
+    #[cfg(target_os = "linux")]
     fn effective_uid() -> u32 {
         use std::os::unix::fs::MetadataExt;
 
@@ -6784,6 +6775,16 @@ mod tests {
         uid
     }
 
+    /// Measure whether a read-only parent directory actually denies removal on
+    /// this host, and report the exact error it denies with.
+    ///
+    /// This is a capability, never an assumption: an effective root uid keeps
+    /// write access to a `0o555` directory, so there is nothing to deny and no
+    /// `EACCES` for the primitive to classify. Returning the observed
+    /// `ErrorKind`/errno pair also keeps the test free of a hardcoded errno
+    /// constant — it asserts the error the host raised, not one this file
+    /// guessed.
+    #[cfg(target_os = "linux")]
     fn read_only_parent_removal_denial() -> Option<(io::ErrorKind, Option<i32>)> {
         use std::os::unix::fs::PermissionsExt;
 
