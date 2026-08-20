@@ -6,6 +6,16 @@ deciders: [AudioGraph maintainers]
 
 # ADR-0030: Organize the MVP Shell Around Ready, LiveNow, Review, and Inspect
 
+> **Note (2026-08-20):** This record's workspace **structure is amended by
+> [ADR-0046](0046-collapse-shell-to-capture-and-sessions.md)**. The four
+> named workspaces — Ready, LiveNow, Review, Inspect — collapse into two
+> destinations (Capture, Sessions) with a persistent NOW STRIP and contextual
+> lenses/drawers; none of the four names are deleted, they relocate. Read
+> ADR-0046 as the current shell structure. Everything else below — the
+> decision drivers, the planned/observed route-evidence rule, the visual
+> direction, and ADR-0028's independent lifecycle contract — remains in force
+> and is preserved by ADR-0046.
+
 ## Context and Problem Statement
 
 AudioGraph's MVP job is to select audio, start once, receive trustworthy live

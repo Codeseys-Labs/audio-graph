@@ -36,7 +36,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0027] | Adopt File-Canonical Durable Session Storage | accepted | Supersedes ADR-0021 | 2026-07-09 |
 | [0028] | Separate Capture Lifecycle from Foreground Workspace | accepted | Finalization arm narrowed by ADR-0035 | 2026-07-09 |
 | [0029] | Gate Rebuildable Query Indexes on Measured Demand | accepted | — | 2026-07-09 |
-| [0030] | Organize the MVP Shell Around Ready, LiveNow, Review, and Inspect | accepted | — | 2026-07-09 |
+| [0030] | Organize the MVP Shell Around Ready, LiveNow, Review, and Inspect | accepted | Structure amended by ADR-0046 | 2026-07-09 |
 | [0031] | Classify Projection Bases as Current, Append-Only, or Revised | accepted | — | 2026-07-09 |
 | [0032] | Layer Validation Evidence by Claim | accepted | — | 2026-07-09 |
 | [0033] | Enforce MVP Provider Enablement at Every Content-Bearing Start | accepted | — | 2026-07-09 |
@@ -52,6 +52,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0043] | Freeze the Canonical Event Stream Registry | accepted | Refines ADR-0027; freezes canonical event-domain IDs and outer schema v1 | 2026-07-10 |
 | [0044] | Keep the Session Control Plane in the Flat Artifact Root | accepted | Refines ADR-0027 and ADR-0041; relates to ADR-0043; item 3 scoped by ADR-0039 and item 5 narrowed by ADR-0040; supersedes none | 2026-08-16 |
 | [0045] | Schedule Projections on Per-Kind Coalescing Slots with Derived Coverage Heads | accepted | Refines ADR-0024, ADR-0027, ADR-0031; relates to ADR-0029/0035/0036/0042; maintainer-decided via grilling; seed `audio-graph-3b48` | 2026-08-20 |
+| [0046] | Collapse the Shell to Capture and Sessions with a Persistent Active-Session Strip | accepted | Amends ADR-0030's workspace structure; preserves ADR-0028/0033/0034; ratified 2026-08-20 via the design panel; seed `audio-graph-19c7` | 2026-08-20 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -98,6 +99,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0043]: 0043-freeze-canonical-event-stream-registry.md
 [0044]: 0044-keep-session-control-plane-in-the-flat-artifact-root.md
 [0045]: 0045-schedule-projections-on-per-kind-coalescing-slots-with-derived-coverage-heads.md
+[0046]: 0046-collapse-shell-to-capture-and-sessions.md
 
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
