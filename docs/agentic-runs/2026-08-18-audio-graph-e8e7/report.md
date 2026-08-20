@@ -282,6 +282,12 @@ unreachable through the wrapper and reachable for direct callers.
 
 #### The carried B2 reservation, now enforced at the validator (`098a674`, closes R4)
 
+> **Superseded in part.** This subsection is what shipped at `098a674`. The
+> reservation was later extended to be address-independent, and the quarantine
+> roles were brought under it, by audio-graph-f629; section 9 is the current
+> state and wins where the two differ. Everything below about the enforcement
+> point, the V2 provenance exemption, and the reclassification still holds.
+
 audio-graph-3b53 finding B2 was carried into this acceptance as "per-Session control
 identities are reserved nowhere today, so the parity work includes establishing that
 reservation." This run first established it at the **historical bootstrap builder**
@@ -642,7 +648,7 @@ and rustdoc precision in `session_artifact_manifest.rs` and
 | R1 | **The `open_session_for_content` branch choice is made from an unlocked observation.** ADR-0044 section 5 fixes the branch by capability, not by observation. The floor itself is always admitted either under the shared guard or through the pre/post sandwich, so no unlocked look is an admitted floor — but the choice of branch is one. It is admissible only while nothing can concurrently create a control plane or a v2 artifact: at this base `advance_session_semantics_v1_to_v2` has no caller and `validate_artifact_semantics` has none outside its own module. A code comment on `open_session_for_content` states the constraint and names `guarded_session_open` as the single-call-site replacement. It is described as race-safe nowhere. **This is an explicit ADR-deviation decision for the human reviewer.** | whichever seed activates a v2 writer or a v2 artifact reader |
 | R2 | **A data root carried onto a filesystem the substrate cannot qualify, WITH control residue present, becomes undeletable.** `retire_owned_control_plane` needs a qualified exclusive guard for a durable unlink; without one it reports `Residual`, and `permanently_delete_session` returns `Err` with the index entry preserved and no retry that can succeed at that root. Production cannot create that residue there — the only writer is `begin_write`, which needs the same qualification — so it requires a copied root. The fail-closed direction was chosen over a non-durable removal, whose resurrection of a manifest head would make it assert `Present` for artifacts `remove_artifact_paths` had already destroyed. | the platform-probe / filesystem-policy workstream |
 | R3 | **The same root, WITH control residue, now refuses the READ** instead of admitting historical v1. `load_session` errors. Known user-visible consequence, fail-closed, documented in `plan.md` section 3.2. With no residue — every host today — behaviour is unchanged. | same as R2 |
-| R4 | ~~**`validate_managed_identity` still does not reserve per-Session control identities.**~~ **CLOSED at `098a674`**, on the maintainer's 2026-08-19 decision to lift the scope fence that made it partial by construction. The reservation is now enforced at the manifest validator — `refuse_reserved_control_identities`, called from `validate_and_normalize` — which covers the generic `compare_and_swap` path, the transition path, `SessionArtifactManifestV1::candidate`, and the load path, and refuses this Session's manifest, temporary, and provenance identities plus `sessions.json` as `ReservedSessionControlIdentity`. `validate_managed_identity` and `is_internal_identity` were deliberately **not** changed and keep their exact prior meanings; the store-owned coordination lock is still refused by them, as `ReservedInternalIdentity`. Section 3.(4) records the enforcement point, the reserved set, the V2 provenance exemption, and the one disclosed reclassification. Two narrower residuals survive it, R10 and R11. | closed |
+| R4 | ~~**`validate_managed_identity` still does not reserve per-Session control identities.**~~ **CLOSED at `098a674`**, on the maintainer's 2026-08-19 decision to lift the scope fence that made it partial by construction. The reservation is now enforced at the manifest validator — `refuse_reserved_control_identities`, called from `validate_and_normalize` — which covers the generic `compare_and_swap` path, the transition path, `SessionArtifactManifestV1::candidate`, and the load path, and refuses this Session's manifest, temporary, and provenance identities plus `sessions.json` as `ReservedSessionControlIdentity`. `validate_managed_identity` and `is_internal_identity` were deliberately **not** changed and keep their exact prior meanings; the store-owned coordination lock is still refused by them, as `ReservedInternalIdentity`. Section 3.(4) records the enforcement point, the reserved set, the V2 provenance exemption, and the one disclosed reclassification. Two narrower residuals survived it, R10 and R11; both are now closed too, by audio-graph-f629, and section 9 carries the current state. | closed |
 | R5 | **The production-qualification leg of `retire_session_control_plane` is not asserted end-to-end.** `permanent_delete_preserves_the_index_on_control_plane_residue` asserts the classified-refusal contract with a host-independent non-regular obstruction; asserting the *durable removal* through production `permanently_delete_session` would require the fixture data root to qualify, which is host-dependent, and no injection seam into `sessions/mod.rs` is in scope. The durable-removal contract is asserted against a test-qualified store in `session_semantics`. | whichever seed adds a data-root injection seam to `sessions/mod.rs` |
 | R6 | **An orphan immutable proof is a reachable crash intermediate of retirement.** Crashing between the head unlink and the proof unlink leaves a proof with no head. It obstructs only a *future* advance of a *re-created* Session with the same id and a different transition id, and a retirement rerun clears it. The reverse order was rejected because a surviving V2 head with an absent proof is refused by every later CAS as `DurableProofAbsent`. | accepted by design; revisit with the writer-activation seed |
 | R7 | **If a later reviewer prefers the control identities inside `default_session_artifact_paths`**, then `default_artifact_inventory_covers_every_managed_session_file_and_temp` (18 paths) and `purge_removes_all_expired_session_artifacts` must both change, and the interaction between an unqualifiable root and `begin_write` must be re-analysed. Flagged, not chosen. | reviewer decision |
@@ -650,8 +656,8 @@ and rustdoc precision in `session_artifact_manifest.rs` and
 
 | R9 | **The unqualified word "dormant" in two fence-blocked module headers is now false, and this seed could not fix it.** `session_semantics.rs`'s own header was corrected in this run's review-fix round, because this seed put `open_session_for_content` and `retire_session_control_plane` on production paths. The same wiring falsifies `session_artifact_manifest.rs`'s "This dormant deep module" and `canonical_durability.rs`'s "This dormant module": `open_session_for_content` calls `session_control_identities_for` **unconditionally** on every production transcript read, so the manifest module now executes in production; and `retire_session_control_plane` reaches `retire_owned_control_plane`, hence `unlink_canonical_entry`, so both modules now hold production call sites that perform filesystem unlinks — reached only when Session control residue exists, which no production writer creates at this base (see R2). Rustdoc in both files belongs to the concurrent workstream that owns rustdoc precision there, and the scope fence forbids editing existing rustdoc blocks in them, so the correction is named here instead of made silently. The repo's established meaning of "dormant" is "no production callers", and where it means something narrower it qualifies the word explicitly — `canonical_log.rs` says "deliberately does not replace any runtime writer yet" and scopes itself to "Dormant tail repair". Neither of these two headers carries such a qualification, which is why the unqualified word now misleads. | the concurrent workstream that owns rustdoc precision in `session_artifact_manifest.rs` and `canonical_durability.rs` |
 
-| R10 | **The validator reserves only THIS Session's control identities, not another Session's.** `refuse_reserved_control_identities` derives the reserved set from `manifest.session_id`, so `.audio-graph-session-<other-key>-artifacts.v1.json` remains an admissible ordinary artifact at the validator. The bootstrap builder does refuse it, as `IdentityOutsideManagedArtifactTree`, and `control_plane_retirement_removes_all_three_and_nothing_else` still proves a second Session's entries survive retirement byte-identical, so nothing *destroys* them — the gap is that a manifest may name them. Closing it needs an address-independent `SESSION_CONTROL_PREFIX` ban, which must carry the same kind / V2 / exact-equality exemption or it will refuse the legitimate provenance entry. Deliberately not done here: the maintainer's task scoped the work to "this Session's own control identities", and the prefix ban is a strictly larger change with its own false-refusal risk. | whichever seed activates a cross-Session manifest producer |
-| R11 | **A V2 `SessionProvenanceEvents` entry at the control identity could in principle be named as a quarantine SOURCE.** The exemption admits the entry; `validate_quarantine_transaction` does not additionally refuse `source_before.managed_identity == identities.provenance`, so a quarantine transaction naming the durable proof as its source would let recovery truncate the proof. Unreachable today, and doubly so: quarantine recovery is closed on V2 Sessions, and since `098a674` the production rebuild does not even construct (see section 3.(4)'s reclassification). A future quarantine-on-V2 activation must add that check to `validate_quarantine_transaction`. | whichever seed activates quarantine recovery on a V2 Session |
+| R10 | ~~**The validator reserves only THIS Session's control identities, not another Session's.**~~ **CLOSED by audio-graph-f629.** `refuse_reserved_control_identities` now classifies through `reserved_control_identity_class`, which adds an address-independent leg: any identity inside the `SESSION_CONTROL_PREFIX` namespace is refused as `ReservedSessionControlIdentity(SessionControlNamespace)`, whichever Session owns it and whether or not any Session does. The prefix comes from the one const `session_control_address` mints every control identity from, so the reservation cannot drift from the writer, and no Session enumeration is involved — which is why this was the rule chosen. The three per-Session classes and the index keep exact precedence over the catch-all, and the V2 proof exemption is unchanged and still exact-identity-scoped. The bootstrap builder's `MANAGED_ARTIFACT_ROOTS` allow-list was deliberately NOT adopted at the validator; section 9 records why with evidence. Pins: `another_sessions_control_identity_is_refused_by_the_namespace_ban`, `the_namespace_ban_yields_to_a_specific_class_and_spares_the_exempt_proof`, `a_root_wide_manifest_name_reports_the_internal_reservation_not_the_namespace`, `an_unaddressable_session_id_still_reserves_the_control_namespace`. | closed |
+| R11 | ~~**A V2 `SessionProvenanceEvents` entry at the control identity could in principle be named as a quarantine SOURCE.**~~ **CLOSED by audio-graph-f629.** `validate_quarantine_transaction` now refuses a reserved control identity in any of its three roles, as `QuarantineRoleAtReservedIdentity`, with no exemption — the inventory exemption exists because `bind_v2_provenance_to_durable_proof` REQUIRES the entry there, and nothing requires a quarantine role to name a control identity. That function's rustdoc now specifies the rule, why the validator is the sufficient enforcement point (recovery's `set_len` runs only after the Prepared CAS is `Accepted`, so a refusal here precedes any truncation), and the honest reachability: no production path constructs such a candidate, but `validate_persisted_and_normalize` runs on whatever bytes are at the head. Pins: `a_v2_quarantine_transaction_cannot_name_the_durable_proof_as_its_source` (both contexts, five role/class combinations, against an `Ok` baseline) and `a_root_wide_name_in_a_quarantine_role_still_reports_the_internal_reservation`. The R11 half about the V1-floor rebuild needed no code change; section 9 records that finding and its evidence. | closed |
 
 Explicitly out of scope and not touched: a fifth canonical stream; any
 `SessionArtifactKind` member in either enum; broad e969 consumer migration;
@@ -714,11 +720,11 @@ exit 1. The table and the checker were then updated together.
 | `src-tauri/src/persistence/session_semantics.rs:526` | `pub fn open_session_for_content<T, E>(` |
 | `src-tauri/src/persistence/session_semantics.rs:996` | the `HISTORICAL_ORIGINAL_AUDIO_IDENTITY` constant and its value |
 | `src-tauri/src/persistence/session_artifact_manifest.rs:152` | `HistoricalUnknown,` |
-| `src-tauri/src/persistence/session_artifact_manifest.rs:1576` | `pub fn abandon_staged_transition(&self)` |
-| `src-tauri/src/persistence/session_artifact_manifest.rs:2175` | `MissingOriginalSessionAudio` |
-| `src-tauri/src/persistence/session_artifact_manifest.rs:2676` | `fn is_internal_identity(identity: &str) -> bool {` |
-| `src-tauri/src/persistence/session_artifact_manifest.rs:2890` | `pub fn retire_owned_control_plane(` |
-| `src-tauri/src/persistence/session_artifact_manifest.rs:5350` | `fn windows_other_session_transition_refuses_before_any_control_mutation()` |
+| `src-tauri/src/persistence/session_artifact_manifest.rs:1595` | `pub fn abandon_staged_transition(&self)` |
+| `src-tauri/src/persistence/session_artifact_manifest.rs:2194` | `MissingOriginalSessionAudio` |
+| `src-tauri/src/persistence/session_artifact_manifest.rs:2847` | `fn is_internal_identity(identity: &str) -> bool {` |
+| `src-tauri/src/persistence/session_artifact_manifest.rs:3061` | `pub fn retire_owned_control_plane(` |
+| `src-tauri/src/persistence/session_artifact_manifest.rs:5521` | `fn windows_other_session_transition_refuses_before_any_control_mutation()` |
 | `src-tauri/src/persistence/canonical_durability.rs:1428` | `pub(crate) fn unlink_canonical_entry(` |
 | `src-tauri/src/persistence/canonical_durability.rs:3780` | `const fn namespace_supported_for(platform: CanonicalPlatform) -> bool {` |
 | `src-tauri/src/sessions/mod.rs:1679` | `assert_eq!(actual.len(), 18` |
@@ -814,3 +820,154 @@ a rustdoc caveat naming `user_data.rs` as the coupled writer that does not read 
 and it counted six `advanced_v2_session` tests in the manifest module where there
 were five — but neither changed any conclusion, and every anchor was re-derived by
 symbol against the source rather than taken from the brief.
+
+---
+
+## 9. The R10 and R11 closures (audio-graph-f629)
+
+Branch `work/audio-graph-f629-bcf9-residuals`, base `484f9dc`. Both residuals in
+section 6 are now closed; this section is the reasoning and the evidence, and it
+is the authority where it disagrees with section 3.(4)'s "another Session's control
+identity remains admissible here" note, which this work supersedes.
+
+### 9.1 R10 — the reservation is address-independent, by prefix
+
+**The rule.** `reserved_control_identity_class` is now the single classifier for
+every reserved control name. It returns the Session index for `sessions.json`,
+then — for any identity inside the `SESSION_CONTROL_PREFIX` namespace — this
+manifest's `SessionManifest`, `SessionTemporary`, or `SessionProvenance` when the
+identity is case-equivalent to one of the three the manifest's own `session_id`
+derives, and otherwise `SessionControlNamespace`. `refuse_reserved_control_identities`
+applies the V2 proof exemption before calling it; `validate_quarantine_transaction`
+applies none.
+
+**Why a prefix ban and not a Session list.** The validator holds one `session_id`
+and no directory listing. A rule that asked "is this some OTHER live Session's
+control identity?" would have to enumerate Sessions, which this seam cannot
+honestly do — any answer it gave would be a claim about the store that the manifest
+bytes it was handed do not support. The prefix is address-independent, so the
+question never arises: a name in the namespace is refused whether it belongs to a
+live Session, a deleted one, or none. `SESSION_CONTROL_PREFIX` is the same const
+`session_control_address` mints every control identity from, so the reservation and
+the writer cannot drift; the seed's R10 note named exactly this ban, and it carries
+the kind / V2 / exact-equality exemption the note required.
+
+**Why the bootstrap builder's rule does NOT belong here, which the seed asked to be
+judged.** `refuse_reserved_observed_identity` refuses any identity whose first
+segment is not in `MANAGED_ARTIFACT_ROOTS`, reporting
+`IdentityOutsideManagedArtifactTree`, and that does catch another Session's control
+identity without enumerating Sessions. It is right there and wrong here, and the
+difference is the set of producers each seam serves, not a difference of strictness.
+That builder's entire inventory is `historical_managed_inventory`, whose eleven
+identities all live under those eight roots, so the allow-list costs it nothing. The
+manifest validator is the common seam for every producer in the crate, and
+`canonical_log` and `canonical_crash_harness` legitimately inventory identities
+outside that list: flat-root `events.jsonl` and `streams/events.jsonl` appear as
+`TranscriptRevisions` entries in manifests both modules build and validate, and
+`manifest_candidate` pushes the `recovery/...` quarantine name as a
+`QuarantineRecovery` entry.
+Adopting the allow-list here would refuse all of them: it would be a regression
+dressed as a tightening. The identity vocabulary a manifest may carry is the
+portable-path floor `validate_managed_identity` enforces plus the reserved names,
+not one module's directory layout. That reasoning is recorded in
+`refuse_reserved_control_identities`'s rustdoc, and the reciprocal note is in
+`refuse_reserved_observed_identity`'s, which previously claimed the validator does
+not refuse another Session's control identity and would otherwise now misdescribe
+the code.
+
+**Precedence.** `reserved_class_rank` moved out of the function body and gained the
+catch-all at rank 4, behind the index. The catch-all ranks last because every class
+above it except the index is also inside the namespace, so reporting it would hide
+which control file a write would have clobbered.
+`the_namespace_ban_yields_to_a_specific_class_and_spares_the_exempt_proof` asserts
+that in both wire orders.
+
+**Nothing was reclassified.** `MANIFEST_FILE_NAME` and `MANIFEST_TEMP_FILE_NAME`
+are inside the control namespace by spelling — the one place the new ban could have
+silently taken over an existing refusal. It cannot: `validate_managed_identity`
+refuses all three root-wide constants earlier in the same loop, and earlier in
+`validate_quarantine_transaction` as well.
+`a_root_wide_manifest_name_reports_the_internal_reservation_not_the_namespace`
+asserts the overlap exists and the classification is still
+`ReservedInternalIdentity`, so the test cannot pass vacuously.
+
+**One behaviour change beyond the residual, disclosed.** An unaddressable
+`session_id` — one `validate_session_id` admits but `sessions::session_id_is_valid`
+refuses — used to lose the whole per-Session reservation, because no identities
+could be derived. It now still gets the namespace ban, which is the honest
+classification: such an id cannot address a store, so NO control-namespace name is
+legitimate for it. `an_unaddressable_session_id_still_reserves_the_control_namespace`
+pins it, alongside the pre-existing index-leg test.
+
+### 9.2 R11 — no quarantine role may name a reserved control identity
+
+**The rule, and where it is specified.** `validate_quarantine_transaction` gained
+rustdoc that states the intended behaviour and a second pass that enforces it: none
+of `source_before`, `source_after`, or `quarantine` may name a reserved control
+identity, reported as `QuarantineRoleAtReservedIdentity`. No exemption. The
+inventory exemption exists only because `bind_v2_provenance_to_durable_proof`
+REQUIRES the proof entry at that identity for the life of an advanced Session;
+nothing requires a quarantine role to name a control identity, ever.
+
+**The gap was real, and narrow.** On a V1 manifest an entry at the proof identity is
+already refused by `refuse_reserved_control_identities`, which runs first. On a V2
+manifest the proof entry is exempt there — and this function's `source_matches`
+count then matches a source role against that entry while ignoring `kind`. So the
+exemption admitted the entry and the source count accepted it.
+
+**Why the validator is the sufficient enforcement point.** Recovery truncates the
+source with `set_len` only after the Prepared manifest CAS returns `Accepted`:
+`execute` publishes the quarantine, builds the Prepared candidate through
+`manifest_candidate`, commits it, and only then truncates. Every candidate that CAS
+sees is validated here, so a refusal here happens strictly before any byte of the
+named source is removed. `validate_recovery_identity_reservations` reserves only the
+three root-wide names from `internal_identities` and does not cover the per-Session
+proof; on this evidence it does not need to.
+
+**Reachability, stated without inflation.** No production path constructs such a
+candidate today, for two independent reasons: quarantine recovery is closed on a V2
+Session in both directions, and `SessionArtifactManifestV1::candidate` hardcodes a
+V1 floor. What IS reachable is the load path —
+`validate_persisted_and_normalize` runs on whatever bytes are at the head, so a
+hostile or corrupt V2 head naming the proof as a quarantine source loaded as
+`Present` before this check. That is the surface the pin asserts, in both contexts,
+across five role/class combinations, each measured against a baseline assertion that
+the unmodified manifest validates `Ok` — so every refusal is attributable to the
+role identity and not to another shape mismatch.
+
+**The V1-floor rebuild half of R11 needed no code change, and here is the
+evidence.** R11 also pinned that rebuilding a V1-floor candidate from a V2 head now
+fails at construction rather than at the CAS's `SessionSemanticsFloorRegression`,
+because `SessionArtifactManifestV1::candidate` hardcodes V1 and the inherited proof
+entry loses the exemption. That was already both specified and pinned at `098a674`:
+`rebuilding_a_v1_floor_candidate_from_a_v2_head_is_refused_at_construction` asserts
+the new classification, and `quarantine_recovery_remains_closed_on_a_v2_session`'s
+rustdoc already states that the production rebuild no longer reaches the CAS on a V2
+head. Both statements were re-read against the current source and remain accurate.
+Changing the constructor to inherit a head's floor was considered and rejected: it
+would let a caller that asked for a V1 candidate silently receive a V2 one, and the
+refusal is not a liveness problem because the path it guards is closed anyway. No
+code change is warranted, and none was made.
+
+### 9.3 What did not change
+
+`validate_managed_identity` and `is_internal_identity` keep their exact prior
+meanings, as at `098a674`. The V2 proof exemption's three narrowings — kind, V2
+floor, exact equality — are untouched. `default_session_artifact_paths` still
+excludes the control identities. The 282 pre-existing persistence tests, including
+every `advanced_v2_session` witness and
+`advanced_v2_head_keeps_its_provenance_entry_at_the_control_identity`, passed
+untouched with both new checks in place; that is the evidence that no legitimate
+producer's identity was caught.
+
+### 9.4 RED evidence for the four behavioural pins
+
+Both behaviour changes were reverted in place — the namespace catch-all replaced
+with `None`, and the quarantine-role pass deleted — and the module's tests re-run
+serially. Result: `74 passed; 4 failed`, the four failures being
+`another_sessions_control_identity_is_refused_by_the_namespace_ban`,
+`the_namespace_ban_yields_to_a_specific_class_and_spares_the_exempt_proof`,
+`an_unaddressable_session_id_still_reserves_the_control_namespace`, and
+`a_v2_quarantine_transaction_cannot_name_the_durable_proof_as_its_source`. The two
+no-reclassification pins stayed green in both states, which is what they are for.
+The revert was then discarded and the module re-run: `78 passed; 0 failed`.

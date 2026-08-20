@@ -1367,13 +1367,21 @@ pub fn historical_session_bootstrap_from_live_inventory(
 ///
 /// The manifest VALIDATOR now reserves the same names too, in
 /// `session_artifact_manifest::refuse_reserved_control_identities`, which is what
-/// covers the `compare_and_swap` and load paths this builder is not on. This
-/// check still earns its place: it runs before the candidate exists, so it gives
-/// three distinct classifications (`SessionIndexIdentity`,
-/// `SessionControlIdentity`, `IdentityOutsideManagedArtifactTree`) instead of one,
-/// and its `MANAGED_ARTIFACT_ROOTS` allow-list additionally refuses ANOTHER
-/// Session's control identity, which the validator — deriving only from
-/// `manifest.session_id` — does not.
+/// covers the `compare_and_swap` and load paths this builder is not on. Since
+/// audio-graph-f629 closed residual R10, that validator also refuses ANOTHER
+/// Session's control identity, by an address-independent namespace ban rather than
+/// by this function's allow-list.
+///
+/// This check still earns its place, on two counts. It runs before the candidate
+/// exists, so it gives three distinct classifications (`SessionIndexIdentity`,
+/// `SessionControlIdentity`, `IdentityOutsideManagedArtifactTree`) where the
+/// validator gives one. And `MANAGED_ARTIFACT_ROOTS` is strictly stronger for THIS
+/// builder's inputs: it refuses every flat-root and unknown-root name, not just
+/// the reserved ones, which is correct here because this builder's whole inventory
+/// comes from `historical_managed_inventory` and lives under those roots. The
+/// validator cannot adopt that allow-list, because it is the common seam for
+/// producers whose identities legitimately sit outside this list — `canonical_log`
+/// inventories flat-root `events.jsonl` and `streams/events.jsonl`.
 ///
 /// The store-owned coordination identity needs no arm of its own: it is the one
 /// flat-root name `ManagedArtifactIdentity::new` already refuses, as

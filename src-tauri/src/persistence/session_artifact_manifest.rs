@@ -491,6 +491,16 @@ pub enum ReservedControlIdentity {
     SessionProvenance,
     /// The flat-root Session index.
     SessionIndex,
+    /// An identity in the per-Session control NAMESPACE that is none of the three
+    /// identities this manifest's own address derives. ANOTHER Session's manifest,
+    /// temporary, or proof lands here, as does any unclaimed name in the
+    /// namespace.
+    ///
+    /// Reported without the validator knowing which Sessions exist, which it
+    /// could not honestly discover: it holds one `session_id` and no directory
+    /// listing. The namespace is reserved by the prefix `session_control_address`
+    /// mints from, so admissibility does not depend on who is live.
+    SessionControlNamespace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +527,15 @@ pub enum ManifestValidationError {
     /// Session index owns. Distinct from `ReservedInternalIdentity`, which keeps
     /// its exact meaning: the three root-wide constants.
     ReservedSessionControlIdentity(ReservedControlIdentity),
+    /// A quarantine transaction named a reserved control identity in one of its
+    /// three ROLES — `source_before`, `source_after`, or `quarantine`.
+    ///
+    /// Separate from `ReservedSessionControlIdentity`, which is about the artifact
+    /// INVENTORY, because the two carry opposite exemptions. An advanced V2
+    /// Session's proof entry must stay admissible in the inventory for the whole
+    /// life of that Session; no quarantine role is ever legitimately a control
+    /// identity, so this one has no exemption at all.
+    QuarantineRoleAtReservedIdentity(ReservedControlIdentity),
     CaseEquivalentManagedIdentity,
     MissingOriginalSessionAudio,
     DuplicateOriginalSessionAudio,
@@ -2242,68 +2261,68 @@ fn validate_and_normalize(
 /// equivalence, which is the same carve-out shape
 /// `validate_recovery_identity_reservations` uses for its retry quarantine.
 ///
-/// The reservation is against THIS Session's identities only, derived from
-/// `manifest.session_id`. Another Session's control identity remains admissible
-/// here; the bootstrap builder refuses it as
-/// `IdentityOutsideManagedArtifactTree`, and closing it at the validator would
-/// need a prefix-based ban carrying this same exemption.
+/// The reservation is ADDRESS-INDEPENDENT, which closes audio-graph-e8e7's
+/// residual R10. Deriving the reserved set from `manifest.session_id` alone left
+/// another Session's control identity admissible here as an ordinary artifact.
+/// It is now refused as `SessionControlNamespace`, by the prefix
+/// `session_control_address` mints every control identity from, so the refusal
+/// needs no knowledge of which Sessions are live — which this validator could not
+/// honestly obtain. It holds one `session_id` and no directory listing, and
+/// enumerating Sessions from here would be a claim about the store that the
+/// manifest bytes cannot support. Per-Session precedence is preserved: an entry
+/// that matches one of THIS manifest's three derived identities still reports
+/// that specific class, because a specific collision is more useful than the
+/// catch-all it also falls under.
+///
+/// The bootstrap builder's rule was deliberately NOT adopted here.
+/// `refuse_reserved_observed_identity` refuses any identity whose first segment
+/// is not in `MANAGED_ARTIFACT_ROOTS` (`IdentityOutsideManagedArtifactTree`),
+/// which catches another Session's control identity as a side effect of an
+/// allow-list. That is right for that builder, whose entire inventory comes from
+/// `historical_managed_inventory` and therefore lives under those roots. It is
+/// wrong HERE, and would be a regression rather than a tightening: this validator
+/// is the common seam for every producer in the crate, and `canonical_log` and
+/// `canonical_crash_harness` legitimately inventory identities outside that list:
+/// `events.jsonl` (flat-root) and `streams/events.jsonl` as `TranscriptRevisions`
+/// entries, and the `recovery/...` names `manifest_candidate` pushes as
+/// `QuarantineRecovery` entries. An allow-list would refuse all of them. The identity vocabulary a manifest may
+/// carry is the portable-path floor `validate_managed_identity` enforces plus the
+/// reserved names below, not one module's directory layout.
 fn refuse_reserved_control_identities(
     manifest: &SessionArtifactManifestV1,
 ) -> Result<(), ManifestValidationError> {
     // `Err` means the id is not addressable at all, so no per-Session control
     // entry can exist for it: `for_session` and `qualified_existing_session`
-    // refuse such an id before a store exists. Not a hole — the root-wide names
-    // are refused by `validate_managed_identity` and the index name below is
-    // address-independent.
+    // refuse such an id before a store exists. It costs nothing now — the index
+    // name and the namespace ban are both address-independent, so an unaddressable
+    // id loses only the three specific per-Session classes, not the reservation.
     let control = session_control_address(&manifest.session_id).ok();
     let proven_v2 = manifest.session_semantics_version == SessionSemanticsVersion::V2;
-    // Every match is collected and the reported class is chosen by the fixed
-    // precedence below, NOT by which entry the wire happened to list first. An
-    // early return on first match would make an inventory naming two reserved
-    // identities report a different error for the same content depending on
-    // entry order, and this scan runs before `artifacts.sort_by`, so that order
-    // is entirely the caller's.
-    // Stated as an explicit rank rather than an `Ord` derive so the precedence is
-    // a decision in this function, not an accident of declaration order: the two
-    // identities a write would actually collide with outrank the proof, which
-    // outranks the store-wide index.
-    const fn rank(class: ReservedControlIdentity) -> u8 {
-        match class {
-            ReservedControlIdentity::SessionManifest => 0,
-            ReservedControlIdentity::SessionTemporary => 1,
-            ReservedControlIdentity::SessionProvenance => 2,
-            ReservedControlIdentity::SessionIndex => 3,
-        }
-    }
+    // Every match is collected and the reported class comes from the fixed
+    // precedence in `reserved_class_rank`, NOT from which entry the wire listed
+    // first.
+    let reserved = control.as_ref().map(|address| &address.identities);
     let mut matched: Option<ReservedControlIdentity> = None;
     let mut record = |class: ReservedControlIdentity| {
-        if matched.is_none_or(|current| rank(class) < rank(current)) {
+        if matched.is_none_or(|current| reserved_class_rank(class) < reserved_class_rank(current)) {
             matched = Some(class);
         }
     };
     for artifact in &manifest.artifacts {
         let identity = &artifact.managed_identity;
-        if identity
-            .as_str()
-            .eq_ignore_ascii_case(SESSIONS_INDEX_IDENTITY)
+        // The one legitimate inhabitant of the reserved namespace, and the reason
+        // the namespace ban had to be written as a classifier with an exemption
+        // rather than as a flat prefix refusal: an advanced V2 Session's proof
+        // entry is MANDATORY at exactly this identity for the whole life of that
+        // Session, so refusing it would make an advanced head unloadable.
+        if proven_v2
+            && artifact.kind == SessionArtifactKind::SessionProvenanceEvents
+            && reserved.is_some_and(|reserved| *identity == reserved.provenance)
         {
-            record(ReservedControlIdentity::SessionIndex);
-        }
-        let Some(reserved) = control.as_ref().map(|address| &address.identities) else {
             continue;
-        };
-        if identity.ascii_case_equivalent(&reserved.manifest) {
-            record(ReservedControlIdentity::SessionManifest);
         }
-        if identity.ascii_case_equivalent(&reserved.temporary) {
-            record(ReservedControlIdentity::SessionTemporary);
-        }
-        if identity.ascii_case_equivalent(&reserved.provenance)
-            && !(proven_v2
-                && artifact.kind == SessionArtifactKind::SessionProvenanceEvents
-                && *identity == reserved.provenance)
-        {
-            record(ReservedControlIdentity::SessionProvenance);
+        if let Some(class) = reserved_control_identity_class(identity, reserved) {
+            record(class);
         }
     }
     match matched {
@@ -2312,6 +2331,94 @@ fn refuse_reserved_control_identities(
         )),
         None => Ok(()),
     }
+}
+
+/// Fixed precedence for the reported reserved class.
+///
+/// Stated as an explicit rank rather than an `Ord` derive so the precedence is a
+/// decision in code, not an accident of declaration order: the two identities a
+/// write would actually collide with outrank the proof, which outranks the
+/// store-wide index, which outranks the namespace catch-all. The catch-all ranks
+/// last because every identity above it except the index is also inside the
+/// namespace, so reporting it would hide the precise collision.
+///
+/// `refuse_reserved_control_identities` needs a total order because it collects
+/// every match instead of returning on the first: it runs before
+/// `artifacts.sort_by`, so entry order is entirely the caller's, and an early
+/// return would let the wire order pick which error the same content reports.
+const fn reserved_class_rank(class: ReservedControlIdentity) -> u8 {
+    match class {
+        ReservedControlIdentity::SessionManifest => 0,
+        ReservedControlIdentity::SessionTemporary => 1,
+        ReservedControlIdentity::SessionProvenance => 2,
+        ReservedControlIdentity::SessionIndex => 3,
+        ReservedControlIdentity::SessionControlNamespace => 4,
+    }
+}
+
+/// Classify one identity against every reserved control name, with NO exemption.
+///
+/// Callers own their exemptions, because they differ:
+/// `refuse_reserved_control_identities` must admit an advanced V2 Session's own
+/// proof entry, and `validate_quarantine_transaction` must admit nothing.
+/// Returning the class rather than a bool is what lets both share the matching
+/// while reporting through their own error variants.
+///
+/// The three store-owned root-wide names need no arm and deliberately have none:
+/// two of them (`MANIFEST_FILE_NAME`, `MANIFEST_TEMP_FILE_NAME`) are inside the
+/// control namespace by spelling, but `validate_managed_identity` refuses all
+/// three as `ReservedInternalIdentity` before either caller reaches here, so no
+/// reclassification is possible. Three tests pin it, one per surface:
+///
+/// - `a_root_wide_manifest_name_reports_the_internal_reservation_not_the_namespace`
+/// - `a_root_wide_name_in_a_quarantine_role_still_reports_the_internal_reservation`
+/// - `the_store_owned_coordination_lock_is_still_reserved_as_an_internal_identity`
+fn reserved_control_identity_class(
+    identity: &ManagedArtifactIdentity,
+    reserved: Option<&SessionControlIdentities>,
+) -> Option<ReservedControlIdentity> {
+    if identity
+        .as_str()
+        .eq_ignore_ascii_case(SESSIONS_INDEX_IDENTITY)
+    {
+        return Some(ReservedControlIdentity::SessionIndex);
+    }
+    if !in_session_control_namespace(identity) {
+        return None;
+    }
+    if let Some(reserved) = reserved {
+        if identity.ascii_case_equivalent(&reserved.manifest) {
+            return Some(ReservedControlIdentity::SessionManifest);
+        }
+        if identity.ascii_case_equivalent(&reserved.temporary) {
+            return Some(ReservedControlIdentity::SessionTemporary);
+        }
+        if identity.ascii_case_equivalent(&reserved.provenance) {
+            return Some(ReservedControlIdentity::SessionProvenance);
+        }
+    }
+    Some(ReservedControlIdentity::SessionControlNamespace)
+}
+
+/// Whether an identity lies in the per-Session control namespace.
+///
+/// Matched against `SESSION_CONTROL_PREFIX`, the one const
+/// `session_control_address` mints every per-Session control identity from, so
+/// the reservation and the writer cannot drift apart. That is what makes this
+/// address-independent rather than a duplicated filename literal: no Session id is
+/// involved, so a name belonging to a Session this manifest has never heard of is
+/// still refused.
+///
+/// ASCII-case-insensitive, like every other identity reservation in this crate,
+/// because a case-variant spelling names the same file on a case-insensitive
+/// filesystem. Compared over bytes rather than by slicing the string, so a
+/// multi-byte character straddling the prefix boundary cannot panic.
+fn in_session_control_namespace(identity: &ManagedArtifactIdentity) -> bool {
+    identity
+        .as_str()
+        .as_bytes()
+        .get(..SESSION_CONTROL_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(SESSION_CONTROL_PREFIX.as_bytes()))
 }
 
 /// The exact pieces of a validated V2 provenance entry that
@@ -2451,10 +2558,55 @@ fn binding_io(error: io::Error) -> V2ProvenanceProofBindingError {
     }
 }
 
+/// Validate one quarantine transaction against the manifest that carries it.
+///
+/// # No quarantine role may be a reserved control identity
+///
+/// This is the specified answer to audio-graph-e8e7's residual R11, which asked
+/// what a V2 Session's `SessionProvenanceEvents` entry means when a quarantine
+/// transaction names it as a SOURCE. The answer is that it is refused, as
+/// `QuarantineRoleAtReservedIdentity`, and the rule has no exemption: the
+/// inventory exemption exists because
+/// `bind_v2_provenance_to_durable_proof` REQUIRES that entry at that identity for
+/// the whole life of an advanced Session, and nothing requires any quarantine role
+/// to name a control identity, ever.
+///
+/// Why the reservation has to be here and not only in
+/// `refuse_reserved_control_identities`. That scan is over `manifest.artifacts`,
+/// and `refuse_reserved_control_identities` runs first, so on a V1 manifest an
+/// entry at the proof identity is already refused before this function sees it.
+/// On a V2 manifest the proof entry is exempt there — and this function's own
+/// `source_matches` count then MATCHES a source role against it, ignoring
+/// `kind`. That is the one gap: the exemption admits the entry and the source
+/// count accepts it, so without this check a quarantine transaction could name the
+/// durable proof as the file it truncates.
+///
+/// Why the manifest validator is the sufficient place to close it, and not
+/// `canonical_log`. Recovery truncates the source with `set_len` only AFTER the
+/// Prepared manifest CAS is `Accepted`; `execute` publishes the quarantine, calls
+/// `manifest_candidate`, commits, and only then truncates. Every candidate that
+/// CAS sees is validated here. So a refusal here happens strictly before any byte
+/// of the named source is removed, and the proof cannot be truncated by a recovery
+/// whose candidate this function refuses. `validate_recovery_identity_reservations`
+/// reserves only the three ROOT-WIDE names from `internal_identities`, so it does
+/// not cover the per-Session proof; it does not need to, for the same reason.
+///
+/// Reachability, stated honestly. No production path can build such a candidate
+/// today, and the reasons are independent: quarantine recovery is closed on a V2
+/// Session in both directions (V2 validation demands `Completed`, quarantine
+/// prepare demands `Prepared`), and `SessionArtifactManifestV1::candidate`
+/// hardcodes a V1 floor, so `canonical_log`'s rebuild from a V2 head is refused at
+/// construction by the inventory reservation before it ever reaches a quarantine
+/// role. What IS reachable is the LOAD path: `validate_persisted_and_normalize`
+/// runs on whatever bytes are at the head, and a hostile or corrupt V2 head naming
+/// the proof as a quarantine source loaded as `Present` before this check.
+/// `a_v2_quarantine_transaction_cannot_name_the_durable_proof_as_its_source` pins
+/// the refusal on both the candidate and the persisted context.
 fn validate_quarantine_transaction(
     manifest: &SessionArtifactManifestV1,
     transaction: &QuarantineTransaction,
 ) -> Result<(), ManifestValidationError> {
+    let control = session_control_address(&manifest.session_id).ok();
     validate_idempotency_id(&transaction.idempotency_id)?;
     validate_sha256(&transaction.fingerprint)?;
     if transaction.idempotency_id != manifest.transition.idempotency_id
@@ -2463,13 +2615,32 @@ fn validate_quarantine_transaction(
     {
         return Err(ManifestValidationError::TransitionMismatch);
     }
-    for source in [
+    let roles = [
         &transaction.source_before,
         &transaction.source_after,
         &transaction.quarantine,
-    ] {
+    ];
+    for source in roles {
         validate_managed_identity(&source.managed_identity)?;
         validate_sha256(&source.content.sha256)?;
+    }
+    // A SECOND pass, deliberately, rather than folding this into the loop above:
+    // it keeps every pre-existing classification exact. Were the reservation
+    // checked per role inside the first loop, an inventory whose `source_before`
+    // is reserved AND whose `source_after` identity is malformed would report the
+    // reservation where it used to report `InvalidManagedIdentity`.
+    //
+    // The role order here is fixed by the struct, not by the wire, so first match
+    // is deterministic and needs no rank of its own.
+    for source in roles {
+        if let Some(class) = reserved_control_identity_class(
+            &source.managed_identity,
+            control.as_ref().map(|address| &address.identities),
+        ) {
+            return Err(ManifestValidationError::QuarantineRoleAtReservedIdentity(
+                class,
+            ));
+        }
     }
     if transaction.source_before.managed_identity != transaction.source_after.managed_identity
         || transaction.source_before.managed_identity == transaction.quarantine.managed_identity
@@ -7163,5 +7334,446 @@ mod tests {
                 ReservedControlIdentity::SessionProvenance
             ))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-e8e7 residual R10: the reservation is address-independent, so
+    // ANOTHER Session's control identity is refused too.
+    // -----------------------------------------------------------------------
+
+    /// A V2 candidate that carries its own legitimate exempt proof entry.
+    ///
+    /// `quarantine_candidate`'s transition fingerprint is `digest('e')`, so a
+    /// `Present` proof entry of `content('e', 48)` satisfies
+    /// `validate_v2_session_provenance`'s fingerprint binding. Built without a
+    /// store on purpose: the subject is the validator, and every fact this
+    /// manifest needs lives inside it, so the pin is not gated on a filesystem
+    /// fixture the way `advanced_v2_session` is.
+    fn v2_quarantine_candidate_with_exempt_proof() -> SessionArtifactManifestV1 {
+        let control = session_control_identities_for("session-1").expect("addressable Session");
+        let mut candidate = quarantine_candidate(
+            ManifestTransitionState::Completed,
+            QuarantineResidualState::SourceTruncated,
+        );
+        candidate.session_semantics_version = SessionSemanticsVersion::V2;
+        candidate.artifacts.push(SessionArtifactEntry {
+            kind: SessionArtifactKind::SessionProvenanceEvents,
+            privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+            managed_identity: control.provenance.clone(),
+            availability: ArtifactAvailability::Present {
+                content: content('e', 48),
+            },
+        });
+        candidate
+    }
+
+    fn reserved_entry(
+        kind: SessionArtifactKind,
+        managed_identity: ManagedArtifactIdentity,
+    ) -> SessionArtifactEntry {
+        SessionArtifactEntry {
+            kind,
+            privacy_class: match kind {
+                SessionArtifactKind::SessionProvenanceEvents => {
+                    ArtifactPrivacyClass::CanonicalSessionMemory
+                }
+                _ => ArtifactPrivacyClass::OperationalMetadata,
+            },
+            managed_identity,
+            availability: ArtifactAvailability::Present {
+                content: content('f', 12),
+            },
+        }
+    }
+
+    /// ANOTHER Session's control identity is no longer admissible as an ordinary
+    /// artifact, and the refusal needs no knowledge of which Sessions exist.
+    ///
+    /// This closes residual R10. The reservation used to derive its whole set from
+    /// `manifest.session_id`, so `.audio-graph-session-<other-key>-artifacts.v1.json`
+    /// passed every check here; only the bootstrap builder refused it, and that
+    /// builder is not on any write path. The rule now has an address-independent
+    /// leg: any identity inside the namespace `session_control_address` mints from
+    /// is reserved, whoever owns it.
+    ///
+    /// The last case is the point of choosing a namespace ban over anything that
+    /// would need a Session list. `.audio-graph-session-nobody-owns-this` belongs
+    /// to no Session at all, and the validator — which holds one `session_id` and
+    /// no directory listing — refuses it without having to answer a question it
+    /// cannot honestly answer.
+    #[test]
+    fn another_sessions_control_identity_is_refused_by_the_namespace_ban() {
+        let other = session_control_identities_for("session-2").expect("addressable Session");
+        let own = session_control_identities_for("session-1").expect("addressable Session");
+        assert_ne!(other.manifest, own.manifest);
+
+        for (label, kind, reserved) in [
+            (
+                "another Session's manifest head",
+                SessionArtifactKind::SessionMetadata,
+                other.manifest.clone(),
+            ),
+            (
+                "another Session's staging temporary",
+                SessionArtifactKind::SessionMetadata,
+                other.temporary.clone(),
+            ),
+            (
+                "another Session's durable proof",
+                SessionArtifactKind::SessionMetadata,
+                other.provenance.clone(),
+            ),
+            // The proof exemption is scoped to THIS manifest's own derived
+            // identity. Self-labelling with the proof kind does not import it onto
+            // a foreign proof. This candidate is a V1 floor, where the exemption
+            // never arms and the namespace ban reports; on a proven-V2 candidate
+            // the same shape is refused earlier, as a provenance duplicate —
+            // pinned in `the_namespace_ban_yields_to_a_specific_class_and_
+            // spares_the_exempt_proof`.
+            (
+                "another Session's durable proof, labelled as a proof",
+                SessionArtifactKind::SessionProvenanceEvents,
+                other.provenance.clone(),
+            ),
+            (
+                "case variant of another Session's manifest head",
+                SessionArtifactKind::SessionMetadata,
+                identity(&other.manifest.as_str().to_ascii_uppercase()),
+            ),
+            (
+                "a namespace name no Session owns",
+                SessionArtifactKind::SessionMetadata,
+                identity(".audio-graph-session-nobody-owns-this"),
+            ),
+        ] {
+            let mut candidate = basic_candidate("reserve-foreign-1", 'e');
+            candidate
+                .artifacts
+                .push(reserved_entry(kind, reserved.clone()));
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedSessionControlIdentity(
+                    ReservedControlIdentity::SessionControlNamespace
+                )),
+                "{label} ({}) must not be admissible as an ordinary artifact",
+                reserved.as_str()
+            );
+        }
+    }
+
+    /// The namespace ban is the CATCH-ALL, not a replacement: a collision with one
+    /// of this manifest's own three identities still reports that specific class,
+    /// and the legitimate V2 proof entry still passes.
+    ///
+    /// Both halves matter. Reporting the catch-all for an own-identity collision
+    /// would lose the information about which control file a write would have
+    /// clobbered; refusing the exempt proof entry would make an advanced V2 head
+    /// unloadable, since `bind_v2_provenance_to_durable_proof` requires it there.
+    #[test]
+    fn the_namespace_ban_yields_to_a_specific_class_and_spares_the_exempt_proof() {
+        let own = session_control_identities_for("session-1").expect("addressable Session");
+        let other = session_control_identities_for("session-2").expect("addressable Session");
+
+        // A V2 manifest whose own proof entry is exempt still refuses a foreign
+        // control identity alongside it.
+        let mut foreign_beside_exempt = v2_quarantine_candidate_with_exempt_proof();
+        foreign_beside_exempt.artifacts.push(reserved_entry(
+            SessionArtifactKind::SessionMetadata,
+            other.provenance.clone(),
+        ));
+        assert_eq!(
+            validate_candidate_and_normalize(&mut foreign_beside_exempt),
+            Err(ManifestValidationError::ReservedSessionControlIdentity(
+                ReservedControlIdentity::SessionControlNamespace
+            ))
+        );
+
+        // Without that extra entry the same manifest validates, which is what
+        // proves the exemption survived the namespace ban rather than being
+        // shadowed by it.
+        let mut exempt_only = v2_quarantine_candidate_with_exempt_proof();
+        assert_eq!(validate_candidate_and_normalize(&mut exempt_only), Ok(()));
+
+        // Self-labelling with the proof kind cannot reach an ARMED exemption at
+        // all: a second proof-kind entry is refused as a V2 provenance duplicate
+        // before any identity is classified, so a foreign proof identity carrying
+        // the proof kind never gets to ask whether the exemption is keyed on kind
+        // or on identity. Together with the V1-floor leg in
+        // `another_sessions_control_identity_is_refused_by_the_namespace_ban`
+        // (where the exemption never arms and the namespace ban reports), every
+        // floor refuses the shape — by different guards, which this pin names.
+        let mut foreign_proof_kind = v2_quarantine_candidate_with_exempt_proof();
+        foreign_proof_kind.artifacts.push(reserved_entry(
+            SessionArtifactKind::SessionProvenanceEvents,
+            other.provenance.clone(),
+        ));
+        assert_eq!(
+            validate_candidate_and_normalize(&mut foreign_proof_kind),
+            Err(ManifestValidationError::InvalidV2SessionProvenance(
+                V2SessionProvenanceError::Duplicate
+            ))
+        );
+
+        // Precedence, in both wire orders: a specific own-identity collision
+        // outranks the namespace catch-all.
+        let foreign = reserved_entry(SessionArtifactKind::SessionMetadata, other.manifest.clone());
+        let mine = reserved_entry(SessionArtifactKind::SessionMetadata, own.manifest.clone());
+        for (label, extra) in [
+            ("foreign first", vec![foreign.clone(), mine.clone()]),
+            ("own first", vec![mine.clone(), foreign.clone()]),
+        ] {
+            let mut candidate = basic_candidate("reserve-precedence-1", 'e');
+            candidate.artifacts.extend(extra);
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedSessionControlIdentity(
+                    ReservedControlIdentity::SessionManifest
+                )),
+                "{label}: the specific collision must outrank the namespace catch-all"
+            );
+        }
+    }
+
+    /// The two root-wide store-owned manifest names are inside the control
+    /// namespace BY SPELLING, and still report `ReservedInternalIdentity`.
+    ///
+    /// This is the one place the namespace ban could have silently reclassified an
+    /// existing refusal. It does not, because `validate_managed_identity` refuses
+    /// all three root-wide constants earlier in the same loop, and in the
+    /// quarantine roles earlier in the same function. The assertion on
+    /// `in_session_control_namespace` is what makes this a real test rather than a
+    /// vacuous one: it fails if the overlap it guards ever stops existing.
+    #[test]
+    fn a_root_wide_manifest_name_reports_the_internal_reservation_not_the_namespace() {
+        for name in [MANIFEST_FILE_NAME, MANIFEST_TEMP_FILE_NAME] {
+            let spelled = ManagedArtifactIdentity(name.to_owned());
+            assert!(
+                in_session_control_namespace(&spelled),
+                "{name} must overlap the control namespace for this test to mean anything"
+            );
+            let mut candidate = basic_candidate("reserve-root-wide-1", 'e');
+            candidate.artifacts.push(reserved_entry(
+                SessionArtifactKind::SessionMetadata,
+                spelled,
+            ));
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedInternalIdentity),
+                "{name} is one of the three root-wide constants"
+            );
+        }
+    }
+
+    /// An unaddressable Session id derives no per-Session identities, and the
+    /// namespace ban still applies — which is the reservation that used to be lost
+    /// entirely in this case.
+    ///
+    /// `an_unaddressable_session_id_reserves_the_index_but_derives_no_control_identities`
+    /// covers the index leg. This covers the namespace leg: such an id cannot
+    /// address a store, so NO control-namespace name is legitimate for it, and the
+    /// catch-all is the honest classification rather than a specific class the
+    /// validator cannot derive.
+    #[test]
+    fn an_unaddressable_session_id_still_reserves_the_control_namespace() {
+        let unaddressable = "sess ion";
+        assert!(validate_session_id(unaddressable).is_ok());
+        assert!(!crate::sessions::session_id_is_valid(unaddressable));
+
+        let mut candidate = SessionArtifactManifestV1::candidate(
+            unaddressable,
+            transition(
+                "reserve-unaddressable-namespace",
+                'e',
+                ManifestTransitionState::Completed,
+            ),
+            vec![original_audio(ArtifactAvailability::Unavailable {
+                reason: ArtifactUnavailableReason::RetentionDisabled,
+            })],
+            None,
+        )
+        .expect("an unaddressable id is still a valid manifest session id");
+        candidate.artifacts.push(reserved_entry(
+            SessionArtifactKind::SessionMetadata,
+            session_control_identities_for("session-1")
+                .expect("addressable Session")
+                .provenance,
+        ));
+        assert_eq!(
+            validate_candidate_and_normalize(&mut candidate),
+            Err(ManifestValidationError::ReservedSessionControlIdentity(
+                ReservedControlIdentity::SessionControlNamespace
+            ))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-e8e7 residual R11: no quarantine ROLE may name a reserved
+    // control identity, with no exemption.
+    // -----------------------------------------------------------------------
+
+    /// A quarantine transaction may not name this Session's durable proof — or any
+    /// other reserved control identity — as a source, a truncated source, or the
+    /// quarantine itself.
+    ///
+    /// This closes residual R11. The V2 proof exemption admits the entry in the
+    /// INVENTORY, and `validate_quarantine_transaction`'s `source_matches` count
+    /// then matches a source role against that entry ignoring `kind` — so the
+    /// exemption plus the source count would have let a quarantine transaction
+    /// name the durable proof as the file recovery truncates. The roles get no
+    /// exemption, because nothing ever requires one to be a control identity.
+    ///
+    /// The baseline assertion is what makes the rest discriminating: the same
+    /// manifest validates `Ok` before a role is rewritten, so each refusal below is
+    /// attributable to the role identity and not to some other shape mismatch.
+    ///
+    /// Both validation contexts are asserted. The persisted one is the reachable
+    /// surface today — no production path constructs such a candidate, but
+    /// `validate_persisted_and_normalize` runs on whatever bytes are at the head.
+    #[test]
+    fn a_v2_quarantine_transaction_cannot_name_the_durable_proof_as_its_source() {
+        let own = session_control_identities_for("session-1").expect("addressable Session");
+        let other = session_control_identities_for("session-2").expect("addressable Session");
+
+        let mut baseline = v2_quarantine_candidate_with_exempt_proof();
+        assert_eq!(validate_candidate_and_normalize(&mut baseline), Ok(()));
+
+        #[derive(Clone, Copy)]
+        enum Role {
+            Source,
+            Quarantine,
+        }
+
+        for (label, role, named, expected) in [
+            (
+                "the durable proof as the source it truncates",
+                Role::Source,
+                own.provenance.clone(),
+                ReservedControlIdentity::SessionProvenance,
+            ),
+            (
+                "the durable proof as the quarantine",
+                Role::Quarantine,
+                own.provenance.clone(),
+                ReservedControlIdentity::SessionProvenance,
+            ),
+            (
+                "this Session's manifest head as the source",
+                Role::Source,
+                own.manifest.clone(),
+                ReservedControlIdentity::SessionManifest,
+            ),
+            (
+                "another Session's durable proof as the source",
+                Role::Source,
+                other.provenance.clone(),
+                ReservedControlIdentity::SessionControlNamespace,
+            ),
+            (
+                "the Session index as the quarantine",
+                Role::Quarantine,
+                identity(SESSIONS_INDEX_IDENTITY),
+                ReservedControlIdentity::SessionIndex,
+            ),
+        ] {
+            let mut candidate = v2_quarantine_candidate_with_exempt_proof();
+            {
+                let transaction = candidate
+                    .quarantine_transaction
+                    .as_mut()
+                    .expect("quarantine transaction");
+                match role {
+                    Role::Source => {
+                        transaction.source_before.managed_identity = named.clone();
+                        transaction.source_after.managed_identity = named.clone();
+                    }
+                    Role::Quarantine => {
+                        transaction.quarantine.managed_identity = named.clone();
+                    }
+                }
+            }
+            let mut persisted = candidate.clone();
+            persisted.generation = 1;
+
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::QuarantineRoleAtReservedIdentity(
+                    expected
+                )),
+                "candidate context, {label}"
+            );
+            assert_eq!(
+                validate_persisted_and_normalize(&mut persisted),
+                Err(ManifestValidationError::QuarantineRoleAtReservedIdentity(
+                    expected
+                )),
+                "persisted context, {label}"
+            );
+        }
+
+        // The legs above rewrite a role's IDENTITY but keep the fixture's role
+        // contents, so each was already refused pre-reservation — as a content
+        // mismatch, since `source_matches` filters on identity AND content. They
+        // pin the refusal's precedence, not the hazard. This leg pins the hazard:
+        // the source names the durable proof with content matching the exempt
+        // proof entry, and the truncation arithmetic stays consistent (88 - 48 is
+        // the quarantine's 40), so with the role reservation reverted,
+        // `source_matches` counts the proof entry, every shape check passes, the
+        // manifest validates `Ok`, and recovery's `set_len` aims at the durable
+        // proof.
+        let mut hazard = v2_quarantine_candidate_with_exempt_proof();
+        {
+            let transaction = hazard
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine transaction");
+            transaction.source_before.managed_identity = own.provenance.clone();
+            transaction.source_before.content = content('b', 88);
+            transaction.source_after.managed_identity = own.provenance.clone();
+            transaction.source_after.content = content('e', 48);
+        }
+        let mut hazard_persisted = hazard.clone();
+        hazard_persisted.generation = 1;
+        assert_eq!(
+            validate_candidate_and_normalize(&mut hazard),
+            Err(ManifestValidationError::QuarantineRoleAtReservedIdentity(
+                ReservedControlIdentity::SessionProvenance
+            )),
+            "candidate context, the hazard-shaped transaction"
+        );
+        assert_eq!(
+            validate_persisted_and_normalize(&mut hazard_persisted),
+            Err(ManifestValidationError::QuarantineRoleAtReservedIdentity(
+                ReservedControlIdentity::SessionProvenance
+            )),
+            "persisted context, the hazard-shaped transaction"
+        );
+    }
+
+    /// A root-wide store-owned name in a quarantine role keeps reporting
+    /// `ReservedInternalIdentity`, exactly as it did before this reservation.
+    ///
+    /// The role reservation runs in a second pass, after the pass that calls
+    /// `validate_managed_identity` on all three roles, precisely so no
+    /// pre-existing classification moves.
+    #[test]
+    fn a_root_wide_name_in_a_quarantine_role_still_reports_the_internal_reservation() {
+        for name in [
+            MANIFEST_FILE_NAME,
+            MANIFEST_TEMP_FILE_NAME,
+            COORDINATION_FILE_NAME,
+        ] {
+            let mut candidate = v2_quarantine_candidate_with_exempt_proof();
+            candidate
+                .quarantine_transaction
+                .as_mut()
+                .expect("quarantine transaction")
+                .quarantine
+                .managed_identity = ManagedArtifactIdentity(name.to_owned());
+            assert_eq!(
+                validate_candidate_and_normalize(&mut candidate),
+                Err(ManifestValidationError::ReservedInternalIdentity),
+                "{name} is one of the three root-wide constants"
+            );
+        }
     }
 }

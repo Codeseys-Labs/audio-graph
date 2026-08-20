@@ -364,11 +364,16 @@ pub fn historical_session_bootstrap_from_live_inventory(
    written. The gap that sentence describes was residual R4, and R4 is now
    **closed** — the maintainer lifted the scope fence on 2026-08-19 and the
    reservation was extended to the manifest validator, as
-   `refuse_reserved_control_identities` inside `validate_and_normalize`. Report
-   section 3.(4) carries the current state; report section 6 carries the two
-   narrower residuals that survive (R10, R11). `validate_managed_identity` is
-   still not the enforcement point, and deliberately so, so the sentence above
-   remains literally true.
+   `refuse_reserved_control_identities` inside `validate_and_normalize`. The two
+   narrower residuals that survived R4, R10 and R11, are now closed as well, by
+   audio-graph-f629; report section 9 carries the current state and supersedes
+   section 3.(4) where they differ. One consequence for the paragraph above: the
+   validator now also refuses ANOTHER Session's control identity, by an
+   address-independent namespace ban, so `IdentityOutsideManagedArtifactTree` is
+   no longer the only seam that catches it. This builder's classification is
+   unchanged, and its allow-list is still the stronger rule for its own inputs.
+   `validate_managed_identity` is still not the enforcement point, and
+   deliberately so, so the sentence above remains literally true.
 5. **Transition.** `state: Completed`, `quarantine_transaction: None`,
    `fingerprint = sha256` of a domain-tagged canonicalisation of the Session id
    plus the sorted observed inventory, so an unchanged rerun is byte-identical
