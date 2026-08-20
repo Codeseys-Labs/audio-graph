@@ -16,6 +16,59 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   } as unknown as typeof ResizeObserver;
 }
 
+// Some Node/jsdom pairings ship a spec-compliant `localStorage` that is only
+// wired up when a `--localstorage-file` path is provided (Node's own Web
+// Storage implementation) and jsdom no longer shims one in that case, so
+// both the bare `localStorage` global and `window.localStorage` come back
+// `undefined` — breaking every test that calls `localStorage.clear()` in
+// `beforeEach`/`afterEach` (audio-graph-1d92 discovered this while adding
+// unrelated component tests). Provide a minimal in-memory `Storage` polyfill
+// only when the real thing is missing, mirroring the `ResizeObserver` shim
+// above — a no-op on any Node/jsdom pairing where `localStorage` already
+// works.
+function needsLocalStoragePolyfill(candidate: unknown): boolean {
+  return (
+    typeof candidate !== "object" ||
+    candidate === null ||
+    typeof (candidate as Storage).clear !== "function"
+  );
+}
+if (
+  needsLocalStoragePolyfill(globalThis.localStorage) ||
+  (typeof window !== "undefined" &&
+    needsLocalStoragePolyfill(window.localStorage))
+) {
+  const store = new Map<string, string>();
+  const polyfill: Storage = {
+    getItem: (key) => (store.has(key) ? (store.get(key) as string) : null),
+    setItem: (key, value) => {
+      store.set(key, String(value));
+    },
+    removeItem: (key) => {
+      store.delete(key);
+    },
+    clear: () => {
+      store.clear();
+    },
+    key: (index) => Array.from(store.keys())[index] ?? null,
+    get length() {
+      return store.size;
+    },
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    value: polyfill,
+    configurable: true,
+    writable: true,
+  });
+  if (typeof window !== "undefined") {
+    Object.defineProperty(window, "localStorage", {
+      value: polyfill,
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
 // Mock the Tauri API so tests don't need a running Tauri runtime.
 //
 // `Channel` is the streaming-chat IPC transport (audio-graph-1534). The real
