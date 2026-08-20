@@ -711,7 +711,7 @@ jobs:
 
       - name: Upload default Tauri smoke artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tauri-default-smoke-${{ matrix.os }}
           if-no-files-found: warn
@@ -1053,7 +1053,7 @@ jobs:
 
       - name: Upload 2b2c evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: 2b2c-evidence-${{ matrix.os }}
           if-no-files-found: warn
@@ -1192,7 +1192,7 @@ jobs:
         # case this step exists for. always() matches the sibling "Upload
         # 2b2c evidence" step's convention elsewhere in this file.
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: audio-enum-${{ matrix.os }}
           if-no-files-found: warn
