@@ -390,18 +390,21 @@ mod strict_signal {
     fn capture_signal(window: Duration) -> Option<Capture> {
         use rsac::{AudioCaptureBuilder, CaptureTarget};
 
+        // Advisory discovery is retained as the PipeWire-connectivity probe
+        // and for the evidence log only. The builder request is fixed at
+        // 48 kHz stereo, mirroring rsac's own green Linux CI
+        // (tests/ci_audio/system_capture.rs at the pinned v0.4.4 rev): the
+        // builder validates the requested rate against a fixed list
+        // (22050..96000 — the second live nightly run was refused
+        // InvalidParameter for the advisory 16000), no `.sample_format(...)`
+        // because the PipeWire path delivers f32 regardless, and the math
+        // downstream trusts the NEGOTIATED per-buffer format, never this
+        // request. Every failure arm names its error in the evidence log.
         let fmt = first_supported_default_format()?;
-        // No `.sample_format(...)`: rsac's own green Linux CI
-        // (tests/ci_audio/system_capture.rs at the pinned v0.4.4 rev) builds
-        // SystemDefault captures with rate + channels only, and its PipeWire
-        // path delivers f32 buffers regardless of the device's advisory
-        // format — requesting the advisory I16 here is what the first live
-        // nightly run died on, silently, because both failure arms were
-        // `.ok()?`. Every arm now names its error in the evidence log.
         let mut capture = match AudioCaptureBuilder::new()
             .with_target(CaptureTarget::SystemDefault)
-            .sample_rate(fmt.sample_rate)
-            .channels(fmt.channels)
+            .sample_rate(48_000)
+            .channels(2)
             .build()
         {
             Ok(capture) => capture,

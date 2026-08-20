@@ -80,9 +80,12 @@ jobs:
           mkdir -p target/audio-smoke-logs
 
           # Run the daemons AND both fixture passes inside ONE dbus session so
-          # the null-sink outlives every step. The sink is created at the
-          # fixture set's own rate/channels/format (16 kHz mono s16le) so the
-          # round trip needs no resampling anywhere in the chain.
+          # the null-sink outlives every step. The sink is fixed 48 kHz
+          # stereo per the CI architecture doc's Linux adapter spec — NOT the
+          # fixture's 16 kHz: rsac's capture builder rejects rates below
+          # 22050 (first live run failed with InvalidParameter: Unsupported
+          # sample rate: 16000), so PipeWire resamples player->sink->capture
+          # and the strict math reads the negotiated rate from the buffers.
           #
           # The argument below is a single-quoted literal BY DESIGN: its
           # $variables must expand inside that inner `bash -u -c` invocation,
@@ -92,7 +95,7 @@ jobs:
             pipewire & sleep 1
             wireplumber & pipewire-pulse & sleep 2
             pactl load-module module-null-sink sink_name=ag_signal_sink \
-              rate=16000 channels=1 format=s16le \
+              rate=48000 channels=2 format=s16le \
               sink_properties=device.description=ag_signal_sink
             pactl set-default-sink   ag_signal_sink
             pactl set-default-source ag_signal_sink.monitor
