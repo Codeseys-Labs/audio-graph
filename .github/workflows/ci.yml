@@ -19,6 +19,10 @@ on:
     - cron: "17 9 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
 # Default minimal token scope. Individual jobs can elevate if needed.
 permissions:
   contents: read
@@ -34,6 +38,14 @@ jobs:
   lints:
     name: Lints (fmt + clippy)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # local-ml (whisper.cpp + llama.cpp + mistral.rs) is the default feature
+    # set, and clippy --all-targets additionally compiles the test targets.
+    # docs/adr/0007 documents a clean `cargo check` at ~5 min and a debug
+    # `tauri build` at ~11.5 min on a dev workstation; a Swatinem/rust-cache
+    # miss (e.g. a toolchain bump, since add-rust-environment-hash-key hashes
+    # rustc+env into the restore key) makes this a cold build. 30 min gives
+    # headroom above that documented cost on 4-vCPU runners.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -96,6 +108,7 @@ jobs:
   frontend:
     name: Frontend (TypeScript)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
       - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
@@ -113,6 +126,13 @@ jobs:
   security-audit:
     name: cargo audit
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    env:
+      # Pinned so the security gate is reproducible; nothing here bumps this
+      # automatically (Dependabot doesn't track `cargo install` versions
+      # inside a `run:` string), so re-check https://crates.io/crates/cargo-audit
+      # by hand periodically and bump this value.
+      CARGO_AUDIT_VERSION: "0.22.2"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -120,8 +140,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
+      # This job has no Cargo workspace of its own (it only builds/runs the
+      # cargo-audit tool binary), so `cache-targets: false` is deliberate: we
+      # use rust-cache purely for its `~/.cargo/bin` tool-binary cache
+      # (`cache-bin`, default true), keyed on the pinned tool version rather
+      # than the product Cargo.lock, so ordinary app dependency bumps don't
+      # invalidate this cache.
+      - name: Cache cargo-audit ${{ env.CARGO_AUDIT_VERSION }} binary
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          cache-targets: false
+          cache-bin: true
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        run: |
+          if command -v cargo-audit >/dev/null 2>&1 && \
+             [ "$(cargo audit --version 2>/dev/null | awk '{print $2}')" = "${CARGO_AUDIT_VERSION}" ]; then
+            echo "cargo-audit ${CARGO_AUDIT_VERSION} already present (cache hit)"
+          else
+            cargo install --locked --version "${CARGO_AUDIT_VERSION}" cargo-audit
+          fi
 
       - name: Cargo audit
         # Hard gate: advisories are either ignored in `.cargo/audit.toml`
@@ -177,6 +216,14 @@ jobs:
   rust-linux:
     name: Rust (Linux)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Default features == local-ml (whisper.cpp + llama.cpp + mistral.rs); a
+    # rust-cache miss (toolchain bump, cache eviction against the 10 GB
+    # per-repo ceiling) makes this a cold build+test, documented elsewhere in
+    # this repo at 13-20 min (docs/WINDOWS_QUICKSTART.md, docs/commit-state-
+    # 2026-08-14-*). 30 min matches the margin sibling local-ml jobs in this
+    # file already carry (rust-windows-debug-crt-smoke: 25 min for compile
+    # alone; storage-engine-evidence / Default Tauri smoke: 30 min).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -216,6 +263,7 @@ jobs:
   rust-cloud-smoke:
     name: Cloud-only smoke (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -262,22 +310,15 @@ jobs:
         working-directory: audio-graph/src-tauri
         run: cargo check --locked --no-default-features --features cloud
 
-      - name: Playback resampling regression (cloud-only, Linux)
-        if: matrix.os == 'linux'
-        working-directory: audio-graph/src-tauri
-        run: xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
-
-      - name: Playback resampling regression (cloud-only)
-        if: matrix.os != 'linux'
-        working-directory: audio-graph/src-tauri
-        env:
-          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
-        run: cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
-
       - name: Cargo test (cloud-only, Linux)
         if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
         run: xvfb-run -a cargo test --locked --no-default-features --features cloud -- --test-threads=1
+
+      - name: Playback resampling regression diagnostics (cloud-only, Linux)
+        if: matrix.os == 'linux' && failure()
+        working-directory: audio-graph/src-tauri
+        run: xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
 
       - name: Cargo test (cloud-only)
         if: matrix.os != 'linux'
@@ -286,97 +327,126 @@ jobs:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
         run: cargo test --locked --no-default-features --features cloud -- --test-threads=1
 
+      - name: Playback resampling regression diagnostics (cloud-only)
+        if: matrix.os != 'linux' && failure()
+        working-directory: audio-graph/src-tauri
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
+        run: cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
+
       - name: Tauri compile smoke (cloud-only, no bundle)
         working-directory: audio-graph
         run: bun run tauri build --no-bundle --ci -- --locked --no-default-features --features cloud
 
+  # ── Path classification for the optional-feature matrix ────────────
+  # Filters rust-optional-feature-smoke's matrix down to only the profiles
+  # whose exclusive source files changed; fails SAFE to the full matrix on
+  # any workflow/build-system/shared-dispatch-file change; emits
+  # {"include":[]} on `pull_request` and when nothing optional-feature-relevant
+  # changed. An empty `{"include":[]}` matrix does NOT skip the consumer job —
+  # GitHub fails strategy evaluation on a zero-vector matrix — so the consumer
+  # carries its own `if:` guard on this exact output string. Always runs (no
+  # `if:`) so that guard always has a defined value to compare against.
+  classify-optional-feature-paths:
+    name: Classify optional-feature paths
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.classify.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          fetch-depth: 0
+          path: audio-graph
+
+      - name: Classify changed paths and emit the filtered optional-feature matrix
+        id: classify
+        working-directory: audio-graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          full_table='[
+            {"profile":"asr-moonshine","features":"cloud,asr-moonshine","test_filter":"moonshine","os":"linux","runner":"blacksmith-4vcpu-ubuntu-2404"},
+            {"profile":"asr-moonshine","features":"cloud,asr-moonshine","test_filter":"moonshine","os":"macos","runner":"blacksmith-6vcpu-macos-15"},
+            {"profile":"asr-moonshine","features":"cloud,asr-moonshine","test_filter":"moonshine","os":"windows","runner":"blacksmith-4vcpu-windows-2025"},
+            {"profile":"diarization-clustering","features":"cloud,diarization-clustering","test_filter":"diarization","os":"linux","runner":"blacksmith-4vcpu-ubuntu-2404"},
+            {"profile":"diarization-clustering","features":"cloud,diarization-clustering","test_filter":"diarization","os":"macos","runner":"blacksmith-6vcpu-macos-15"},
+            {"profile":"diarization-clustering","features":"cloud,diarization-clustering","test_filter":"diarization","os":"windows","runner":"blacksmith-4vcpu-windows-2025"},
+            {"profile":"sherpa-streaming","features":"cloud,sherpa-streaming","test_filter":"sherpa_streaming","os":"linux","runner":"blacksmith-4vcpu-ubuntu-2404"},
+            {"profile":"sherpa-streaming","features":"cloud,sherpa-streaming","test_filter":"sherpa_streaming","os":"macos","runner":"blacksmith-6vcpu-macos-15"},
+            {"profile":"sherpa-streaming","features":"cloud,sherpa-streaming","test_filter":"sherpa_streaming","os":"windows","runner":"blacksmith-4vcpu-windows-2025"},
+            {"profile":"llm-llama","features":"cloud,llm-llama","test_filter":"local_llama_stream","os":"linux","runner":"blacksmith-4vcpu-ubuntu-2404"},
+            {"profile":"llm-llama","features":"cloud,llm-llama","test_filter":"local_llama_stream","os":"macos","runner":"blacksmith-6vcpu-macos-15"},
+            {"profile":"llm-llama","features":"cloud,llm-llama","test_filter":"local_llama_stream","os":"windows","runner":"blacksmith-4vcpu-windows-2025"},
+            {"profile":"llm-mistralrs","features":"cloud,llm-mistralrs","test_filter":"mistralrs_engine","os":"linux","runner":"blacksmith-4vcpu-ubuntu-2404"},
+            {"profile":"llm-mistralrs","features":"cloud,llm-mistralrs","test_filter":"mistralrs_engine","os":"macos","runner":"blacksmith-6vcpu-macos-15"},
+            {"profile":"llm-mistralrs","features":"cloud,llm-mistralrs","test_filter":"mistralrs_engine","os":"windows","runner":"blacksmith-4vcpu-windows-2025"}
+          ]'
+          emit_full() { echo "matrix=$(jq -c '{include: .}' <<<"$full_table")" >> "$GITHUB_OUTPUT"; }
+          emit_empty() { echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"; }
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            emit_empty; echo "pull_request: optional-feature matrix stays PR-excluded"; exit 0
+          fi
+          if [ "${{ github.event_name }}" != "push" ]; then
+            emit_full; echo "${{ github.event_name }}: full optional-feature matrix"; exit 0
+          fi
+
+          before="${{ github.event.before }}"; after="${{ github.event.after }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            emit_full; echo "no usable before-SHA: full optional-feature matrix (fail-safe)"; exit 0
+          fi
+
+          changed="$(git diff --name-only "${before}" "${after}")"
+          fail_safe_re='^(\.github/workflows/.*|src-tauri/(Cargo\.(toml|lock)|build\.rs)|Cargo\.(toml|lock)|package\.json|bun\.lock|src-tauri/src/(commands\.rs|lib\.rs|error\.rs|provider_registry\.rs|projections\.rs|projection_data_movement\.rs|speech/mod\.rs|asr/mod\.rs|settings/mod\.rs|models/mod\.rs|llm/mod\.rs|llm/route\.rs|llm/api_client\.rs|llm/executor\.rs))$'
+          declare -A pattern=(
+            [asr-moonshine]='^src-tauri/src/asr/moonshine\.rs$'
+            [sherpa-streaming]='^src-tauri/src/asr/sherpa_streaming\.rs$'
+            [diarization-clustering]='^src-tauri/src/diarization/'
+            [llm-llama]='^src-tauri/src/llm/(engine|streaming)\.rs$'
+            [llm-mistralrs]='^src-tauri/src/llm/mistralrs_engine\.rs$'
+          )
+
+          fail_safe=0; affected=()
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            [[ "$path" =~ $fail_safe_re ]] && fail_safe=1
+            for profile in "${!pattern[@]}"; do
+              [[ "$path" =~ ${pattern[$profile]} ]] && case " ${affected[*]:-} " in
+                *" ${profile} "*) ;; *) affected+=("$profile") ;;
+              esac
+            done
+          done <<< "$changed"
+
+          if [ "$fail_safe" -eq 1 ]; then
+            emit_full; echo "workflow/build-system/shared-dispatch change: full matrix (fail-safe)"
+          elif [ "${#affected[@]}" -eq 0 ]; then
+            emit_empty; echo "no optional-feature-relevant path changed: empty matrix"
+          else
+            affected_json=$(printf '%s\n' "${affected[@]}" | jq -R . | jq -sc .)
+            echo "matrix=$(jq -c --argjson p "$affected_json" '{include: [.[] | select(.profile as $x | $p | index($x) != null)]}' <<<"$full_table")" >> "$GITHUB_OUTPUT"
+            echo "affected profiles: ${affected_json}"
+          fi
+
   # ── Optional Rust features — cross-platform compile smoke ─────────
   # These are not PR gates yet: they exercise local/runtime feature shapes that
   # need Blacksmith OS evidence without requiring downloaded models or live
-  # provider credentials.
+  # provider credentials. The matrix is filtered by
+  # classify-optional-feature-paths above; that job always resolves PRs (and
+  # any push that touches nothing optional-feature-relevant) to the literal
+  # string '{"include":[]}'. A dynamic matrix with zero vectors is a hard
+  # strategy-evaluation FAILURE in GitHub Actions, not a skip, so this job
+  # keeps an explicit `if:` guard on that exact string.
   rust-optional-feature-smoke:
     name: Optional feature smoke (${{ matrix.profile }}, ${{ matrix.os }})
-    if: github.event_name != 'pull_request'
+    needs: classify-optional-feature-paths
+    if: needs.classify-optional-feature-paths.outputs.matrix != '{"include":[]}'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - profile: asr-moonshine
-            features: cloud,asr-moonshine
-            test_filter: moonshine
-            os: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - profile: asr-moonshine
-            features: cloud,asr-moonshine
-            test_filter: moonshine
-            os: macos
-            runner: blacksmith-6vcpu-macos-15
-          - profile: asr-moonshine
-            features: cloud,asr-moonshine
-            test_filter: moonshine
-            os: windows
-            runner: blacksmith-4vcpu-windows-2025
-          - profile: diarization-clustering
-            features: cloud,diarization-clustering
-            test_filter: diarization
-            os: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - profile: diarization-clustering
-            features: cloud,diarization-clustering
-            test_filter: diarization
-            os: macos
-            runner: blacksmith-6vcpu-macos-15
-          - profile: diarization-clustering
-            features: cloud,diarization-clustering
-            test_filter: diarization
-            os: windows
-            runner: blacksmith-4vcpu-windows-2025
-          - profile: sherpa-streaming
-            features: cloud,sherpa-streaming
-            test_filter: sherpa_streaming
-            os: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - profile: sherpa-streaming
-            features: cloud,sherpa-streaming
-            test_filter: sherpa_streaming
-            os: macos
-            runner: blacksmith-6vcpu-macos-15
-          - profile: sherpa-streaming
-            features: cloud,sherpa-streaming
-            test_filter: sherpa_streaming
-            os: windows
-            runner: blacksmith-4vcpu-windows-2025
-          - profile: llm-llama
-            features: cloud,llm-llama
-            test_filter: local_llama_stream
-            os: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - profile: llm-llama
-            features: cloud,llm-llama
-            test_filter: local_llama_stream
-            os: macos
-            runner: blacksmith-6vcpu-macos-15
-          - profile: llm-llama
-            features: cloud,llm-llama
-            test_filter: local_llama_stream
-            os: windows
-            runner: blacksmith-4vcpu-windows-2025
-          - profile: llm-mistralrs
-            features: cloud,llm-mistralrs
-            test_filter: mistralrs_engine
-            os: linux
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - profile: llm-mistralrs
-            features: cloud,llm-mistralrs
-            test_filter: mistralrs_engine
-            os: macos
-            runner: blacksmith-6vcpu-macos-15
-          - profile: llm-mistralrs
-            features: cloud,llm-mistralrs
-            test_filter: mistralrs_engine
-            os: windows
-            runner: blacksmith-4vcpu-windows-2025
+      matrix: ${{ fromJSON(needs.classify-optional-feature-paths.outputs.matrix) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -469,6 +539,7 @@ jobs:
     name: Windows --debug CRT smoke (local-ml)
     if: github.event_name != 'pull_request'
     runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 25
     env:
       # d47b: force the cmake/cc-built ML deps to the DEBUG dynamic CRT (/MDd)
       # so they share one heap with rustc's /MDd debug build. Two mechanisms,
@@ -570,6 +641,7 @@ jobs:
     name: Default Tauri smoke (${{ matrix.os }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -652,6 +724,10 @@ jobs:
   rust-macos:
     name: Rust (macOS)
     runs-on: blacksmith-6vcpu-macos-15
+    # See rust-linux above: default features are local-ml, and a cache miss
+    # makes this a cold build+test against the same documented 13-20 min
+    # native-ML compile cost.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -678,6 +754,11 @@ jobs:
   rust-windows:
     name: Rust (Windows)
     runs-on: blacksmith-4vcpu-windows-2025
+    # See rust-linux above. Windows is the slowest documented leg
+    # (docs/WINDOWS_QUICKSTART.md: ~13-15 min for the first release build
+    # alone), and this job also runs the full test suite after `cargo check`,
+    # so it gets more headroom than the Linux/macOS legs.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -749,6 +830,7 @@ jobs:
     # Manual + nightly only — this is evidence-gathering, never a PR gate.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -992,18 +1074,27 @@ jobs:
     # Manual + nightly only — never a PR gate.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ${{ matrix.runner }}
+    # Per-OS cap: docs/research/ci-build-test-architecture-2026-08-19.md
+    # recorded a scheduled macOS run at ~20 min against ~4 min on Linux
+    # (consistent with the managed-macOS AUHAL stall). A single job-wide
+    # timeout tight enough for Linux would truncate that macOS evidence
+    # before it finishes, so each matrix cell carries its own margin above
+    # its observed runtime.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: linux
             runner: blacksmith-4vcpu-ubuntu-2404
+            timeout: 15
           - os: macos
             runner: blacksmith-6vcpu-macos-15
+            timeout: 45
           # The windows leg is HELD on seed d3d3 (VB-CABLE expects a paid license
           # for automated/server use). Add a { os: windows, runner:
-          # blacksmith-4vcpu-windows-2025 } cell once d3d3 resolves the licensing
-          # path (or a strictly-FOSS Scream fallback is wired in).
+          # blacksmith-4vcpu-windows-2025, timeout: 15 } cell once d3d3 resolves
+          # the licensing path (or a strictly-FOSS Scream fallback is wired in).
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -1093,10 +1184,65 @@ jobs:
           '
 
       - name: Upload enumeration logs on failure
-        if: failure()
+        # always() (not failure()): timeout-minutes CANCELS the job rather
+        # than failing it, and failure() is false on cancellation — which is
+        # exactly the AUHAL-stall case this upload exists to diagnose.
+        # `if: !cancelled()` would be the WRONG fix here: it evaluates false
+        # precisely when the job was cancelled, i.e. it would skip the one
+        # case this step exists for. always() matches the sibling "Upload
+        # 2b2c evidence" step's convention elsewhere in this file.
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: audio-enum-${{ matrix.os }}
           if-no-files-found: warn
           retention-days: 7
           path: audio-graph/src-tauri/target/audio-smoke-logs/
+
+  # ── CI required — single stable status-check name for branch protection ─
+  # The individual required-tier job names below churn with matrix cells and
+  # renames; branch protection should eventually point at this one job
+  # instead (an out-of-band GitHub Settings change, not made by this diff).
+  # `if: !cancelled()` (NOT always()) makes this job report even when an
+  # upstream required job failed, while still resolving to `cancelled` (not
+  # a false `failure`) when THIS run itself was superseded by
+  # cancel-in-progress — always() runs even on cancellation, per GitHub's own
+  # troubleshooting docs, which is why the check step below no longer treats
+  # a `cancelled` need as a failure. classify-optional-feature-paths is in
+  # `needs` so a break in the path-classification chain itself (the classify
+  # script erroring, the strategy-evaluation failure guarded against on
+  # rust-optional-feature-smoke) is caught here too; rust-optional-feature-
+  # smoke is deliberately excluded from the "no job may be skipped" list
+  # below because it is BY DESIGN skipped on every PR and on any push that
+  # touches nothing optional-feature-relevant (see its own `if:` guard) — a
+  # real failure inside it still trips the `failure` check.
+  ci-required:
+    name: CI required
+    if: "!cancelled()"
+    needs:
+      - lints
+      - frontend
+      - security-audit
+      - rust-linux
+      - rust-cloud-smoke
+      - rust-macos
+      - rust-windows
+      - classify-optional-feature-paths
+      - rust-optional-feature-smoke
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Verify every required job succeeded
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          needs.lints.result == 'skipped' ||
+          needs.frontend.result == 'skipped' ||
+          needs.security-audit.result == 'skipped' ||
+          needs.rust-linux.result == 'skipped' ||
+          needs.rust-cloud-smoke.result == 'skipped' ||
+          needs.rust-macos.result == 'skipped' ||
+          needs.rust-windows.result == 'skipped' ||
+          needs.classify-optional-feature-paths.result == 'skipped'
+        run: |
+          echo "::error::one or more required jobs did not succeed: ${{ toJSON(needs) }}"
+          exit 1
