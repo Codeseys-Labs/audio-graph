@@ -3760,6 +3760,15 @@ mod tests {
         let mut speech_final_seen = false;
         let mut starts: Vec<f64> = Vec::new();
         let mut transcript_lower = String::new();
+        // Content-free per-window word counts (window split at the 3.3s
+        // silence gap between the fixture's two speaker segments). These
+        // separate the two failure modes a keyword miss cannot: zero B-window
+        // words means speaker B's audio yielded no transcript at all (fixture
+        // audio defect); nonzero with no B keyword hits means the words are
+        // real but the manifest's never-verified reference text is wrong for
+        // utterance 1320-122617-0022 (metadata defect).
+        let mut segment_a_words = 0usize;
+        let mut segment_b_words = 0usize;
         while std::time::Instant::now() < overall_deadline {
             let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
             let slice = remaining.min(Duration::from_millis(500));
@@ -3777,6 +3786,12 @@ mod tests {
                         speech_final_seen = true;
                     }
                     if is_final || speech_final {
+                        let words = text.split_whitespace().count();
+                        if start < 3.3 {
+                            segment_a_words += words;
+                        } else {
+                            segment_b_words += words;
+                        }
                         transcript_lower.push_str(&text.to_ascii_lowercase());
                         transcript_lower.push(' ');
                     }
@@ -3814,6 +3829,10 @@ mod tests {
                 transcript_lower.contains(keyword)
             );
         }
+        println!(
+            "[deepgram-smoke] window word counts (content-free): \
+             a_words={segment_a_words} b_words={segment_b_words}"
+        );
         let timing_monotonic = timing_is_monotonic_nondecreasing(&starts);
         drop(transcript_lower); // never persisted or printed beyond this point
 
