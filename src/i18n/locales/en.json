@@ -793,7 +793,24 @@
     },
     "trashedOn": "Trashed on {{date}}",
     "export": "Export",
-    "exporting": "Exporting…"
+    "exporting": "Exporting…",
+    "finalization": {
+      "pill": {
+        "finalizing": "Finalizing",
+        "finalization_blocked": "Blocked",
+        "finalized": "Finalized"
+      },
+      "retry": "Retry",
+      "viewDetails": "View status",
+      "hideDetails": "Hide status",
+      "variantsTitle": "Prototype comparison controls",
+      "variantListSurface": "List surface",
+      "variantListSurfaceBoth": "List + detail",
+      "variantListSurfaceDetailOnly": "Detail only",
+      "variantBackgroundAccess": "Background access",
+      "variantBackgroundAccessInline": "Coarse lock + inline retry",
+      "variantBackgroundAccessPerSession": "Per-session load gate"
+    }
   },
   "dataRoute": {
     "title": "Data route & privacy",
@@ -1392,5 +1409,89 @@
     "fallbackRetry": "Retry",
     "fallbackRetrying": "Retrying…",
     "fallbackOpenSettings": "Open settings"
+  },
+  "reviewFinalization": {
+    "title": "Finalization",
+    "loading": "Loading finalization status…",
+    "empty": "No finalization data for this session.",
+    "error": "Could not load finalization status: {{message}}",
+    "refresh": "Refresh",
+    "stage": {
+      "finalizing": "Finalizing",
+      "finalization_blocked": "Finalization Blocked",
+      "finalized": "Finalized"
+    },
+    "progressCaption": "Progress is computed each time you view this — it isn't stored.",
+    "lane": {
+      "notes": "Notes",
+      "graph": "Graph",
+      "required": "Required to finish",
+      "notRequired": "Not required to finish",
+      "covered": "Covered",
+      "pending": "{{count}} pending",
+      "pendingSince": "Oldest pending since {{time}}",
+      "graphInformationalNote": "Graph coverage never blocks Finalized — shown for visibility only."
+    },
+    "blocked": {
+      "title": "This session needs attention",
+      "cannotDismiss": "This can't be dismissed here — it stays until it's resolved.",
+      "userCancelledTitle": "Finalization paused",
+      "since": "Since {{time}}",
+      "classLabel": {
+        "never_dispatched": "Never dispatched",
+        "provably_absent": "Provably absent",
+        "external_uncertain": "External — uncertain",
+        "user_cancelled": "Paused by you"
+      },
+      "autoHealed": "Cleared automatically — a later attempt already succeeded. No retry needed."
+    },
+    "retry": {
+      "button": "Retry",
+      "retrying": "Retrying…",
+      "free": "Retry (free — no data leaves this device)",
+      "resume": "Resume finalization",
+      "authorize": "Authorize retry (may contact a provider and incur cost)",
+      "confirmPrompt": "Retrying will contact the provider again and may incur cost or send data off-device. Continue?",
+      "confirm": "Confirm retry",
+      "cancel": "Cancel",
+      "autoHealCaption": "AudioGraph rechecks this automatically — no click needed.",
+      "autoHealNote": "Auto-heal only re-checks the two cost-free classes; this class still needs your OK before it contacts a provider.",
+      "failed": "Retry didn't clear it: {{message}}"
+    },
+    "knowledgeGaps": {
+      "title": "Knowledge Gaps",
+      "empty": "No open knowledge gaps.",
+      "kind": {
+        "unmet_evidence_obligation": "Unmet evidence obligation",
+        "unconfirmed_high_impact_inference": "Unconfirmed high-impact inference"
+      }
+    },
+    "evidence": {
+      "title": "Evidence",
+      "toggle": "Show evidence",
+      "hide": "Hide evidence",
+      "ledgerEntry": "{{lane}} · {{outcome}} · {{time}}",
+      "costBadge": "cost / egress",
+      "noCostBadge": "no cost, no egress",
+      "empty": "No remote attempts recorded yet."
+    },
+    "transcript": {
+      "title": "Transcript confirmation",
+      "summary": "{{confirmed}} confirmed · {{interim}} interim",
+      "interimBadge": "Interim — not yet confirmed",
+      "confirmedBadge": "Confirmed"
+    },
+    "variants": {
+      "title": "Prototype comparison controls",
+      "blockedPresentation": "Blocked presentation",
+      "blockedPresentationBanner": "Banner",
+      "blockedPresentationBadge": "Badge",
+      "retryAffordance": "Retry affordance",
+      "retryAffordanceExplicit": "Explicit button",
+      "retryAffordanceAutoHeal": "Auto-heal only",
+      "graphLane": "Graph lane visibility",
+      "graphLaneHidden": "Hidden",
+      "graphLaneInformational": "Informational"
+    }
   }
 }

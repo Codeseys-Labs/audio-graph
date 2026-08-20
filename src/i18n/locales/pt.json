@@ -793,7 +793,24 @@
     },
     "trashedOn": "Enviado para lixeira em {{date}}",
     "export": "Exportar",
-    "exporting": "Exportando…"
+    "exporting": "Exportando…",
+    "finalization": {
+      "pill": {
+        "finalizing": "Finalizando",
+        "finalization_blocked": "Bloqueada",
+        "finalized": "Finalizada"
+      },
+      "retry": "Tentar novamente",
+      "viewDetails": "Ver status",
+      "hideDetails": "Ocultar status",
+      "variantsTitle": "Controles de comparação do prototype",
+      "variantListSurface": "Superfície da lista",
+      "variantListSurfaceBoth": "Lista + detalhe",
+      "variantListSurfaceDetailOnly": "Apenas detalhe",
+      "variantBackgroundAccess": "Acesso em segundo plano",
+      "variantBackgroundAccessInline": "Bloqueio amplo + retry embutido",
+      "variantBackgroundAccessPerSession": "Bloqueio por sessão"
+    }
   },
   "dataRoute": {
     "title": "Rota de dados e privacidade",
@@ -1392,5 +1409,89 @@
     "fallbackRetry": "Tentar novamente",
     "fallbackRetrying": "Tentando novamente…",
     "fallbackOpenSettings": "Abrir configurações"
+  },
+  "reviewFinalization": {
+    "title": "Finalização",
+    "loading": "Carregando status de finalização…",
+    "empty": "Sem dados de finalização para esta sessão.",
+    "error": "Não foi possível carregar o status de finalização: {{message}}",
+    "refresh": "Atualizar",
+    "stage": {
+      "finalizing": "Finalizando",
+      "finalization_blocked": "Finalização bloqueada",
+      "finalized": "Finalizada"
+    },
+    "progressCaption": "O progresso é calculado a cada visualização — não é armazenado.",
+    "lane": {
+      "notes": "Notas",
+      "graph": "Grafo",
+      "required": "Obrigatório para concluir",
+      "notRequired": "Não obrigatório para concluir",
+      "covered": "Coberto",
+      "pending": "{{count}} pendente(s)",
+      "pendingSince": "Pendente desde {{time}}",
+      "graphInformationalNote": "A cobertura do grafo nunca bloqueia a finalização — exibida apenas para visibilidade."
+    },
+    "blocked": {
+      "title": "Esta sessão precisa de atenção",
+      "cannotDismiss": "Isso não pode ser descartado aqui — permanece até ser resolvido.",
+      "userCancelledTitle": "Finalização pausada",
+      "since": "Desde {{time}}",
+      "classLabel": {
+        "never_dispatched": "Nunca despachado",
+        "provably_absent": "Comprovadamente ausente",
+        "external_uncertain": "Externo — incerto",
+        "user_cancelled": "Pausado por você"
+      },
+      "autoHealed": "Resolvido automaticamente — uma tentativa posterior já teve sucesso. Nenhuma nova tentativa é necessária."
+    },
+    "retry": {
+      "button": "Tentar novamente",
+      "retrying": "Tentando novamente…",
+      "free": "Tentar novamente (gratuito — nenhum dado sai deste dispositivo)",
+      "resume": "Retomar finalização",
+      "authorize": "Autorizar nova tentativa (pode contatar um provedor e gerar custo)",
+      "confirmPrompt": "Tentar novamente vai contatar o provedor de novo e pode gerar custo ou enviar dados para fora do dispositivo. Continuar?",
+      "confirm": "Confirmar nova tentativa",
+      "cancel": "Cancelar",
+      "autoHealCaption": "O AudioGraph verifica isso automaticamente — nenhum clique necessário.",
+      "autoHealNote": "O modo auto-healing só reverifica as duas classes sem custo; esta classe ainda precisa da sua autorização antes de contatar um provedor.",
+      "failed": "A nova tentativa não resolveu: {{message}}"
+    },
+    "knowledgeGaps": {
+      "title": "Lacunas de Conhecimento",
+      "empty": "Nenhuma lacuna de conhecimento em aberto.",
+      "kind": {
+        "unmet_evidence_obligation": "Obrigação de evidência não cumprida",
+        "unconfirmed_high_impact_inference": "Inferência de alto impacto não confirmada"
+      }
+    },
+    "evidence": {
+      "title": "Evidências",
+      "toggle": "Mostrar evidências",
+      "hide": "Ocultar evidências",
+      "ledgerEntry": "{{lane}} · {{outcome}} · {{time}}",
+      "costBadge": "custo / saída de dados",
+      "noCostBadge": "sem custo, sem saída de dados",
+      "empty": "Nenhuma tentativa remota registrada ainda."
+    },
+    "transcript": {
+      "title": "Confirmação da transcrição",
+      "summary": "{{confirmed}} confirmada(s) · {{interim}} provisória(s)",
+      "interimBadge": "Provisório — ainda não confirmado",
+      "confirmedBadge": "Confirmado"
+    },
+    "variants": {
+      "title": "Controles de comparação do prototype",
+      "blockedPresentation": "Apresentação do bloqueio",
+      "blockedPresentationBanner": "Faixa",
+      "blockedPresentationBadge": "Selo",
+      "retryAffordance": "Affordance de nova tentativa",
+      "retryAffordanceExplicit": "Botão explícito",
+      "retryAffordanceAutoHeal": "Somente auto-healing",
+      "graphLane": "Visibilidade da faixa do grafo",
+      "graphLaneHidden": "Oculta",
+      "graphLaneInformational": "Informativa"
+    }
   }
 }

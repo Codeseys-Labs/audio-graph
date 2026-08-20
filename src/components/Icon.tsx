@@ -30,6 +30,7 @@ import {
   FolderTree,
   Headphones,
   Info,
+  Lock,
   type LucideIcon,
   Maximize,
   MessageSquare,
@@ -86,6 +87,7 @@ export const ICONS = {
   info: Info,
   success: CircleCheck,
   error: CircleAlert,
+  lock: Lock,
 } satisfies Record<string, LucideIcon>;
 
 export type IconName = keyof typeof ICONS;
