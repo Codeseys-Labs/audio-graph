@@ -111,7 +111,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
-      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - name: Biome (format + lint)
         run: bunx @biomejs/biome ci .
@@ -300,7 +300,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         if: matrix.os == 'windows'
 
-      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Install frontend dependencies
         working-directory: audio-graph
@@ -607,7 +607,7 @@ jobs:
             "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Install frontend dependencies
         working-directory: audio-graph
@@ -699,7 +699,7 @@ jobs:
             "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Install frontend dependencies
         working-directory: audio-graph
