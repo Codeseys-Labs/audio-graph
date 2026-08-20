@@ -27,6 +27,10 @@ const appBinaryPath =
 const tauriCapabilities: TauriCapabilities = {
   browserName: "tauri",
   "tauri:options": { application: appBinaryPath },
+  // The app's stderr is the only diagnostic when the binary dies before the
+  // embedded WebDriver is ready (run 32393747559 exited 101 with nothing to
+  // read); the service surfaces it in its own error output and log capture.
+  "wdio:tauriServiceOptions": { captureBackendLogs: true },
 };
 
 export const config: WebdriverIO.Config = {
