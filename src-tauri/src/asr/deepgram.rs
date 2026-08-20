@@ -3479,23 +3479,22 @@ mod tests {
     /// punctuation variance: `"amid"` (also matches an "amidst" rendering)
     /// and `"delaware"` (also matches a "Delaware's" rendering, where the
     /// apostrophe would otherwise defeat a `"delawares"` substring match).
-    /// Exactly 2 keywords are drawn from EACH speaker segment, so the >= 3-of-4
-    /// tolerant threshold below structurally guarantees at least one hit from
-    /// BOTH segments (3 can only split 2+1 or 1+2 across two 2-item groups,
-    /// never 3+0) — preserving the original "both halves actually
-    /// transcribed" proof without pinning exact wording.
+    /// Exactly 2 keywords are drawn from EACH speaker segment (A: first two,
+    /// B: last two), and the assertion below requires >= 1 hit from EACH
+    /// segment directly — both-segments coverage IS the property; a raw
+    /// total was only ever a proxy for it.
     ///
-    /// Still not independently confirmed against a real transcription of
-    /// these exact clips (no real Deepgram key is available in this
-    /// environment) — record the actual `keyword_hits` from the first live
-    /// dispatched run in `docs/ops/protected-provider-smoke.md` and revisit
-    /// this list/threshold if it undershoots.
+    /// First live run (32396516753, 2026-08-20): 3-of-4 was the rule then
+    /// and the run scored 2 total, failing the smoke on a genuinely working
+    /// stream — and the content-free count could not say which two hit or
+    /// whether both segments were covered. Hence the per-segment assertion
+    /// plus the per-keyword hit flags printed in the smoke log (the
+    /// keywords are public constants from public-domain fixture text, so
+    /// the flags leak nothing).
     const DEEPGRAM_SMOKE_KEYWORDS: [&str; 4] = ["concord", "amid", "delaware", "children"];
-    /// Tolerant threshold: at least 3 of the 4 keywords above (miss at most
-    /// one), not an exact match — real ASR wording/casing/punctuation varies
-    /// run to run. See the keyword list's doc comment for why 3-of-4 (with 2
-    /// keywords per speaker segment) still guarantees both-segments coverage.
-    const DEEPGRAM_SMOKE_KEYWORD_THRESHOLD: usize = 3;
+    /// Structural minimum for the report's threshold field: one hit per
+    /// speaker segment. The real gate is the per-segment assertion.
+    const DEEPGRAM_SMOKE_KEYWORD_THRESHOLD: usize = 2;
 
     /// Case-insensitive substring hit count against `keywords`.
     /// `transcript_lower` is only ever a LOCAL accumulator in the caller —
@@ -3803,6 +3802,18 @@ mod tests {
         }
 
         let keyword_hits = keyword_hit_count(&transcript_lower, &DEEPGRAM_SMOKE_KEYWORDS);
+        let segment_a_hits = keyword_hit_count(&transcript_lower, &DEEPGRAM_SMOKE_KEYWORDS[..2]);
+        let segment_b_hits = keyword_hit_count(&transcript_lower, &DEEPGRAM_SMOKE_KEYWORDS[2..]);
+        // Per-keyword flags: the keywords are public constants from
+        // public-domain fixture text, so naming which matched leaks no
+        // content — and the first live run proved a bare count is
+        // undiagnosable.
+        for keyword in DEEPGRAM_SMOKE_KEYWORDS {
+            println!(
+                "[deepgram-smoke] keyword {keyword:?} hit={}",
+                transcript_lower.contains(keyword)
+            );
+        }
         let timing_monotonic = timing_is_monotonic_nondecreasing(&starts);
         drop(transcript_lower); // never persisted or printed beyond this point
 
@@ -3870,11 +3881,13 @@ mod tests {
             "expected a speech_final Transcript or a SpeechFinal/EndOfTurn Turn event"
         );
         assert!(
-            report.keyword_hits >= report.keyword_threshold,
-            "expected >= {}/{} tolerant keyword hits, got {}",
-            report.keyword_threshold,
-            report.keyword_total,
-            report.keyword_hits
+            segment_a_hits >= 1 && segment_b_hits >= 1,
+            "expected >= 1 tolerant keyword hit from EACH speaker segment \
+             (A: {segment_a_hits}/2, B: {segment_b_hits}/2, total {}/{}) — \
+             both-segments coverage is the property; see the per-keyword \
+             hit flags above for which words missed",
+            report.keyword_hits,
+            report.keyword_total
         );
         assert!(
             report.timing_monotonic,

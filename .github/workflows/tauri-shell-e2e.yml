@@ -157,11 +157,17 @@ jobs:
       # The embedded @wdio/tauri-service provider needs NO webkit2gtk-driver
       # package (that's only for driverProvider:'external'/'official') — but
       # the real WebKitGTK window still needs a display server even so.
+      # libpipewire-0.3-0 is a hard DT_NEEDED dependency (rsac's Linux
+      # backend; `ldd` on the built binary lists it) and
+      # libayatana-appindicator3-1 is dlopen'd by the tray-icon path — the
+      # exit-101 startup crash in runs 32393747559/32395283903 happened on a
+      # runner missing them while the same binary ran clean on a full desktop.
       - name: Install Linux display + WebKitGTK runtime
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb
+          sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb \
+            libpipewire-0.3-0 libayatana-appindicator3-1
 
       - name: Download app-under-test artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -172,6 +178,26 @@ jobs:
       - name: Make binary executable (linux/macos)
         if: matrix.os != 'windows'
         run: chmod +x dist-bin/audio-graph
+
+# The installed @wdio/tauri-service does not implement backend stderr
+      # capture, so when the app dies before the WebDriver binds, the service
+      # reports only an exit code. This pre-step is the permanent diagnostic:
+      # launch the exact binary for 10s and require it to still be alive
+      # (timeout's exit 124); any earlier exit fails here with stderr in the
+      # job log, so a startup crash can never again hide behind the service.
+      - name: Launch smoke — binary must survive 10s under Xvfb (linux)
+        if: matrix.os == 'linux'
+        run: |
+          set +e
+          timeout 10 xvfb-run -a dist-bin/audio-graph > app-launch.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "::error::app exited code=$code inside the 10s launch window; stderr follows"
+            cat app-launch.log
+            exit 1
+          fi
+          echo "launch smoke: alive at 10s"
 
       - name: Run WDIO shell E2E (linux, under Xvfb)
         if: matrix.os == 'linux'

@@ -5000,9 +5000,15 @@ mod tests {
     /// `protected-provider-smoke.yml`'s vacuous-pass guard greps for — cargo
     /// exiting 0 alone (a `--exact` typo matching zero tests, or a
     /// precondition-skip) is not treated as evidence.
-    #[tokio::test(flavor = "current_thread")]
+    // A plain #[test], NOT #[tokio::test]: OpenRouterClient::new builds a
+    // reqwest::blocking::Client, whose internal runtime probe panics the
+    // moment it is created or dropped on an async runtime thread
+    // (tokio blocking/shutdown.rs:51 — live run 32396516753 died there in
+    // 0.11s before any network I/O). The whole smoke is blocking-path code;
+    // it needs no async context at all.
+    #[test]
     #[ignore = "hits the live OpenRouter API; requires OPENROUTER_API_KEY. Run with -- --ignored"]
-    async fn live_openrouter_routed_smoke() {
+    fn live_openrouter_routed_smoke() {
         let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") else {
             panic!(
                 "OPENROUTER_API_KEY not set — this #[ignore]d live test needs a real key.\n\
@@ -5082,16 +5088,10 @@ mod tests {
         );
 
         let prompt_for_call = synthetic_prompt.to_string();
-        // Run the blocking client on a dedicated thread (reqwest::blocking
-        // must not execute on an async runtime thread).
-        let result = tokio::task::spawn_blocking(move || {
-            client.chat_completion_with_routing_telemetry(
-                vec![("user".to_string(), prompt_for_call)],
-                false,
-            )
-        })
-        .await
-        .expect("spawn_blocking join");
+        let result = client.chat_completion_with_routing_telemetry(
+            vec![("user".to_string(), prompt_for_call)],
+            false,
+        );
 
         let (_reply, telemetry, _wire) = result.expect("live OpenRouter completion must succeed");
         // `_reply` is intentionally unused — binding prevents dead-code warnings
