@@ -1945,10 +1945,36 @@ fn observe_projection_schedulers_for_asr_revision(
             observation.notes,
             observation.graph
         );
+        log_attempt_budget_exhausted(
+            &observation.notes,
+            schedulers.notes().metrics().attempts_exhausted,
+        );
+        log_attempt_budget_exhausted(
+            &observation.graph,
+            schedulers.graph().metrics().attempts_exhausted,
+        );
         observation
     };
     if let Some(dispatch) = projection_dispatch {
         dispatch_projection_observation(dispatch.clone(), observation);
+    }
+}
+
+/// Stable, content-free retune signal for
+/// [`ProjectionSchedulerDecision::AttemptBudgetExhausted`] — the log key
+/// named in `PROJECTION_LANE_ATTEMPT_BUDGET`'s tuning-procedure doc comment.
+/// Logs only `kind`, the attempt count, and the cumulative
+/// `attempts_exhausted` metric — never the basis or transcript content — at
+/// `info` level so it is observable under the default log filter without
+/// needing `RUST_LOG=debug`.
+fn log_attempt_budget_exhausted(decision: &ProjectionSchedulerDecision, attempts_exhausted: u64) {
+    if let ProjectionSchedulerDecision::AttemptBudgetExhausted { kind, attempts, .. } = decision {
+        log::info!(
+            "projection_scheduler.attempt_budget_exhausted kind={:?} attempts={} attempts_exhausted={}",
+            kind,
+            attempts,
+            attempts_exhausted
+        );
     }
 }
 
@@ -1978,7 +2004,10 @@ fn dispatch_projection_decision(
         | ProjectionSchedulerDecision::DiscardedStaleNoCurrentBasis { .. }
         | ProjectionSchedulerDecision::FailedCurrent { .. }
         | ProjectionSchedulerDecision::FailedStaleNoCurrentBasis { .. }
-        | ProjectionSchedulerDecision::IgnoredSupersededCompletion { .. } => {}
+        | ProjectionSchedulerDecision::IgnoredSupersededCompletion { .. }
+        // Emit-only (audio-graph-ff10 / ADR-0045): no consumer is wired here.
+        // Routing a stalled lane onward is ADR-0036 territory.
+        | ProjectionSchedulerDecision::AttemptBudgetExhausted { .. } => {}
     }
 }
 

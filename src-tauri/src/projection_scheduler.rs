@@ -49,6 +49,12 @@ pub struct ProjectionSchedulerMetrics {
     pub follow_up_jobs_started: u64,
     #[serde(default)]
     pub superseded_completions_ignored: u64,
+    /// Count of [`ProjectionSchedulerDecision::AttemptBudgetExhausted`]
+    /// occurrences, incremented where that decision is constructed in
+    /// `observe_ledger`. This is the metric the
+    /// `PROJECTION_LANE_ATTEMPT_BUDGET` retune procedure reads.
+    #[serde(default)]
+    pub attempts_exhausted: u64,
     pub accepted_patches: u64,
     pub apply_failures: u64,
     pub tokens_used: u64,
@@ -146,7 +152,53 @@ pub enum ProjectionSchedulerDecision {
         active_job_id: Option<String>,
         active_session_id: Option<String>,
     },
+    AttemptBudgetExhausted {
+        kind: ProjectionKind,
+        basis: ProjectionBasis,
+        attempts: u8,
+        /// Structurally `None` today: the attempt budget only counts
+        /// `BasisCurrency::Current` failures (see `fail_in_flight`), and a
+        /// `Current` failure has no staleness to report. This field exists
+        /// for a future staleness-tracking producer (the render ticket,
+        /// audio-graph-1e1e) to populate once it tracks staleness alongside
+        /// the budget; nothing in this ticket ever sets it to `Some`.
+        last_staleness: Option<ProjectionBasisStaleness>,
+        oldest_pending_since_ms: Option<u64>,
+    },
 }
+
+/// Consecutive same-basis failures a lane may retry before `observe_ledger`
+/// emits [`ProjectionSchedulerDecision::AttemptBudgetExhausted`] instead of
+/// starting another retry job.
+///
+/// Current value (3) is a first-cut: enough to absorb a transient
+/// generation/apply blip without masking a lane that is genuinely wedged,
+/// small enough that a truly broken lane surfaces within a few failures
+/// instead of retrying silently forever. The counter is keyed to
+/// `last_failed_basis` identity: a failure for a basis different from
+/// `last_failed_basis` restarts the counter at one (not zero — that failure
+/// itself is attempt one), and a successful completion zeroes it outright.
+/// Either way, any basis change (a new final revision, or the
+/// `AppendOnlyStale`/`Revised` follow-up and repair paths, which never touch
+/// this counter directly) leaves today's self-heal property unchanged.
+///
+/// Residual hole, named not hidden: this bounds attempts *per pinned basis*,
+/// not per lane. A ledger that keeps appending between failures mints a new
+/// basis each time, which restarts the counter on every append — a lane that
+/// fails repeatedly while the transcript keeps growing can still accumulate
+/// unbounded attempts across bases, with no per-lane lifetime total. Bounding
+/// that is ADR-0036 territory (Finalization Blocked, constraints MUST #20),
+/// not this counter's job.
+///
+/// Tuning procedure: `AttemptBudgetExhausted` increments
+/// `ProjectionSchedulerMetrics::attempts_exhausted` and speech/mod.rs logs
+/// `projection_scheduler.attempt_budget_exhausted` at `info` level (kind +
+/// attempts + the cumulative exhausted count — never transcript content).
+/// Once real sessions accumulate telemetry, grep that log key (or read the
+/// metric) for how often exhaustion fires and at what attempt count, then
+/// retune this constant with a "Chosen because: …" comment the same way
+/// `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` in `state.rs` was.
+pub const PROJECTION_LANE_ATTEMPT_BUDGET: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ProjectionScheduler {
@@ -159,6 +211,25 @@ pub struct ProjectionScheduler {
     pending_basis: Option<ProjectionBasis>,
     last_completed_basis: Option<ProjectionBasis>,
     last_failed_basis: Option<ProjectionBasis>,
+    // Invariant: meaningful only while `last_failed_basis` is `Some`. Set to
+    // 1 on the first failure for a (new) basis, incremented on each
+    // consecutive failure of that same basis, and zeroed — together with
+    // `last_failed_basis` — on a successful completion. Do not read this
+    // field without also checking `last_failed_basis`; a stale nonzero value
+    // left over from a prior basis is otherwise indistinguishable from a
+    // live count.
+    failed_attempts: u8,
+    // Wired by the deferred-retry ticket (ADR-0045); this ticket only tracks
+    // the attempt budget, not a retry clock.
+    #[allow(dead_code)]
+    deferred_retry_at_ms: Option<u64>,
+    // Contract (shared with the render ticket, audio-graph-1e1e): stamped in
+    // `start_job` the first time a basis goes pending (only when currently
+    // `None`), so it survives retries/follow-ups/repairs without resetting.
+    // Cleared on a successful completion in `complete_in_flight`. This is
+    // the lane's "queue-onset" timestamp — how long it has had *any*
+    // unresolved work — not the time of its first failure.
+    pending_since_ms: Option<u64>,
     metrics: ProjectionSchedulerMetrics,
 }
 
@@ -201,6 +272,9 @@ impl ProjectionScheduler {
             pending_basis: None,
             last_completed_basis: None,
             last_failed_basis: None,
+            failed_attempts: 0,
+            deferred_retry_at_ms: None,
+            pending_since_ms: None,
             metrics: ProjectionSchedulerMetrics::default(),
         }
     }
@@ -352,7 +426,28 @@ impl ProjectionScheduler {
             return ProjectionSchedulerDecision::Idle;
         }
         if self.last_failed_basis.as_ref() == Some(&basis) {
-            return ProjectionSchedulerDecision::Idle;
+            if self.failed_attempts < PROJECTION_LANE_ATTEMPT_BUDGET {
+                let job = self.start_job(basis.clone(), ProjectionPriority::Realtime, now_ms);
+                // Load-bearing ordering: `start_job` just cleared
+                // `last_failed_basis` to `None` (it clears it on every job
+                // start). Restoring it here — rather than leaving it
+                // cleared — is what makes the *next* failure's
+                // `last_failed_basis.as_ref() == Some(&failed.basis)` check
+                // in `fail_in_flight` take the increment branch instead of
+                // the restart-at-one branch.
+                self.last_failed_basis = Some(basis);
+                return ProjectionSchedulerDecision::StartJob { job };
+            }
+            self.metrics.attempts_exhausted = self.metrics.attempts_exhausted.saturating_add(1);
+            return ProjectionSchedulerDecision::AttemptBudgetExhausted {
+                kind: self.kind.clone(),
+                basis,
+                attempts: self.failed_attempts,
+                // Always None: the budget only counts `BasisCurrency::Current`
+                // failures, which carry no staleness. See the field doc.
+                last_staleness: None,
+                oldest_pending_since_ms: self.pending_since_ms,
+            };
         }
 
         let job = self.start_job(basis, ProjectionPriority::Realtime, now_ms);
@@ -380,6 +475,14 @@ impl ProjectionScheduler {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.completed_jobs += 1;
                 self.last_completed_basis = Some(completed.basis);
+                // A successful completion clears the failure/pending state
+                // this lane accumulated getting here: `failed_attempts` is
+                // only meaningful while `last_failed_basis` is `Some`, so
+                // both are cleared together, and `pending_since_ms` (the
+                // queue-onset timestamp) is cleared per its field doc.
+                self.failed_attempts = 0;
+                self.last_failed_basis = None;
+                self.pending_since_ms = None;
                 let current_basis = ledger.current_projection_basis();
                 self.pending_basis = None;
                 if current_basis.span_revisions.is_empty()
@@ -401,6 +504,11 @@ impl ProjectionScheduler {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.completed_jobs += 1;
                 self.last_completed_basis = Some(completed.basis);
+                // Same success-clears-failure-state reasoning as the
+                // `Current` arm above.
+                self.failed_attempts = 0;
+                self.last_failed_basis = None;
+                self.pending_since_ms = None;
                 self.pending_basis = None;
                 self.metrics.follow_up_jobs_started += 1;
                 let job = self.start_job(
@@ -458,6 +566,16 @@ impl ProjectionScheduler {
 
         match ledger.classify_basis_currency(&failed.basis, None) {
             BasisCurrency::Current => {
+                if self.last_failed_basis.as_ref() == Some(&failed.basis) {
+                    self.failed_attempts = self.failed_attempts.saturating_add(1);
+                } else {
+                    // Restart-at-one, not reset-to-zero: this failure IS
+                    // attempt one for this (new) basis. `pending_since_ms`
+                    // is not touched here — it is stamped once in
+                    // `start_job` and cleared only on success, per its
+                    // field doc.
+                    self.failed_attempts = 1;
+                }
                 self.last_failed_basis = Some(failed.basis);
                 ProjectionSchedulerDecision::FailedCurrent {
                     failed_job_id: failed.id,
@@ -523,6 +641,14 @@ impl ProjectionScheduler {
         // in-flight job by `restore_from_snapshot`). Clear it so the
         // coalescing baseline restarts from this job.
         self.pending_basis = None;
+        // Queue-onset contract: stamp only the FIRST time this lane goes
+        // pending. Retries, follow-ups, and repairs all route through this
+        // function without clearing `pending_since_ms` first, so the
+        // timestamp survives them; only a successful completion in
+        // `complete_in_flight` clears it back to `None`.
+        if self.pending_since_ms.is_none() {
+            self.pending_since_ms = Some(now_ms);
+        }
         self.in_flight = Some(job.clone());
         job
     }
@@ -1333,43 +1459,196 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scheduler_failure_clears_in_flight_and_idles_until_basis_changes() {
+    fn assert_failure_retries_under_budget_then_basis_change_unwedges(now_offset: u64) {
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
             .apply_event(event("span-1", 1, "first"))
             .expect("first event");
         let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
 
-        let started = scheduler.observe_ledger(&ledger, 10);
+        let started = scheduler.observe_ledger(&ledger, now_offset + 10);
         let job_id = match started {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected start job, got {other:?}"),
         };
         assert_eq!(
-            scheduler.fail_in_flight(&job_id, "session-1", &ledger, 25),
+            scheduler.fail_in_flight(&job_id, "session-1", &ledger, now_offset + 25),
             ProjectionSchedulerDecision::FailedCurrent {
-                failed_job_id: job_id,
+                failed_job_id: job_id.clone(),
             }
         );
         assert_eq!(scheduler.metrics().failed_jobs, 1);
         assert_eq!(scheduler.metrics().last_job_lag_ms, 15);
         assert_eq!(scheduler.metrics().max_job_lag_ms, 15);
         assert!(scheduler.in_flight_job().is_none());
+
+        // Same failed basis, still under budget: retries instead of idling
+        // forever.
+        let retry_job_id = match scheduler.observe_ledger(&ledger, now_offset + 30) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => {
+                panic!("same failed basis under budget must retry, not idle forever, got {other:?}")
+            }
+        };
+        assert_ne!(retry_job_id, job_id);
         assert_eq!(
-            scheduler.observe_ledger(&ledger, 30),
-            ProjectionSchedulerDecision::Idle,
-            "unchanged failed basis must not retry forever"
+            scheduler.fail_in_flight(&retry_job_id, "session-1", &ledger, now_offset + 35),
+            ProjectionSchedulerDecision::FailedCurrent {
+                failed_job_id: retry_job_id,
+            }
         );
+        assert_eq!(scheduler.metrics().failed_jobs, 2);
 
         ledger
             .apply_event(event("span-2", 1, "second"))
             .expect("second event");
         assert!(matches!(
-            scheduler.observe_ledger(&ledger, 40),
+            scheduler.observe_ledger(&ledger, now_offset + 40),
             ProjectionSchedulerDecision::StartJob { .. }
         ));
-        assert_eq!(scheduler.metrics().jobs_started, 2);
+        assert_eq!(scheduler.metrics().jobs_started, 3);
+    }
+
+    #[test]
+    fn scheduler_failure_clears_in_flight_and_retries_under_budget_until_basis_changes() {
+        assert_failure_retries_under_budget_then_basis_change_unwedges(0);
+        assert_failure_retries_under_budget_then_basis_change_unwedges(1_000_000_000);
+    }
+
+    #[test]
+    fn scheduler_emits_attempt_budget_exhausted_after_three_failed_attempts() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+
+        let mut now = 0;
+        let mut previous_job_id: Option<String> = None;
+        // Queue-onset timestamp: stamped once, when the very first attempt's
+        // job starts (not when it later fails). It must survive every retry
+        // unchanged, since the lane never succeeds in this test.
+        let mut queue_onset_ms = 0;
+        for attempt in 1..=PROJECTION_LANE_ATTEMPT_BUDGET {
+            now += 10;
+            if attempt == 1 {
+                queue_onset_ms = now;
+            }
+            let job_id = match scheduler.observe_ledger(&ledger, now) {
+                ProjectionSchedulerDecision::StartJob { job } => job.id,
+                other => panic!("expected start job for attempt {attempt}, got {other:?}"),
+            };
+            if let Some(previous) = previous_job_id.take() {
+                assert_ne!(job_id, previous, "each retry must mint a new job id");
+            }
+            now += 15;
+            assert_eq!(
+                scheduler.fail_in_flight(&job_id, "session-1", &ledger, now),
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id: job_id.clone(),
+                }
+            );
+            previous_job_id = Some(job_id);
+        }
+        assert_eq!(
+            scheduler.metrics().failed_jobs,
+            u64::from(PROJECTION_LANE_ATTEMPT_BUDGET)
+        );
+        assert!(scheduler.in_flight_job().is_none());
+        assert_eq!(scheduler.metrics().attempts_exhausted, 0);
+
+        let exhausted = ProjectionSchedulerDecision::AttemptBudgetExhausted {
+            kind: ProjectionKind::Notes,
+            basis: ledger.current_projection_basis(),
+            attempts: PROJECTION_LANE_ATTEMPT_BUDGET,
+            last_staleness: None,
+            oldest_pending_since_ms: Some(queue_onset_ms),
+        };
+        now += 30;
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, now),
+            exhausted,
+            "budget-exhausted basis must not retry forever"
+        );
+        assert_eq!(scheduler.metrics().attempts_exhausted, 1);
+
+        // No retry timer exists in this ticket: elapsed wall-clock time alone
+        // never changes the outcome, only a basis change does.
+        now += 5_000_000;
+        assert_eq!(scheduler.observe_ledger(&ledger, now), exhausted);
+
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        now += 10;
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, now),
+            ProjectionSchedulerDecision::StartJob { .. }
+        ));
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            u64::from(PROJECTION_LANE_ATTEMPT_BUDGET) + 1
+        );
+    }
+
+    #[test]
+    fn scheduler_attempt_budget_resets_when_failed_basis_changes() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+
+        // Basis X fails twice — two of the three attempts in its budget.
+        let job1 = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        scheduler.fail_in_flight(&job1, "session-1", &ledger, 20);
+        let job2 = match scheduler.observe_ledger(&ledger, 30) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected retry job under budget, got {other:?}"),
+        };
+        scheduler.fail_in_flight(&job2, "session-1", &ledger, 40);
+        assert_eq!(scheduler.metrics().failed_jobs, 2);
+
+        // A real basis change (new revision) starts a fresh job for basis Y;
+        // basis X's two prior failures must not carry over.
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        let job3 = match scheduler.observe_ledger(&ledger, 50) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job for the new basis, got {other:?}"),
+        };
+        assert_eq!(
+            scheduler.fail_in_flight(&job3, "session-1", &ledger, 60),
+            ProjectionSchedulerDecision::FailedCurrent {
+                failed_job_id: job3,
+            }
+        );
+
+        // Basis Y gets its own full budget: two more retries before it
+        // exhausts, proving its counter restarted at one, not three.
+        let job4 = match scheduler.observe_ledger(&ledger, 70) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => {
+                panic!("basis Y's first retry should still be under its own budget, got {other:?}")
+            }
+        };
+        scheduler.fail_in_flight(&job4, "session-1", &ledger, 80);
+        let job5 = match scheduler.observe_ledger(&ledger, 90) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => {
+                panic!("basis Y's second retry should still be under its own budget, got {other:?}")
+            }
+        };
+        scheduler.fail_in_flight(&job5, "session-1", &ledger, 100);
+
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 110),
+            ProjectionSchedulerDecision::AttemptBudgetExhausted { attempts: 3, .. }
+        ));
     }
 
     #[test]
