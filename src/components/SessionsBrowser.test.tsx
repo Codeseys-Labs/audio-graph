@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FIXTURE_FINALIZATION_STATUSES } from "../fixtures/reviewFinalizationFixtures";
 import { useAudioGraphStore } from "../store";
 import type { SessionMetadata } from "../types";
 import SessionsBrowser, { applyFilterAndSort } from "./SessionsBrowser";
@@ -451,5 +459,163 @@ describe("SessionsBrowser component", () => {
     createObjectURL.mockRestore();
     revokeObjectURL.mockRestore();
     anchorClick.mockRestore();
+  });
+});
+
+describe("SessionsBrowser — Finalizing / Finalization Blocked prototype (audio-graph-1d92)", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    useAudioGraphStore.setState({
+      sessions: [],
+      sessionsLoading: false,
+      isCapturing: false,
+      isTranscribing: false,
+    });
+  });
+
+  function seed(sessions: SessionMetadata[]): void {
+    useAudioGraphStore.setState({ sessions, sessionsLoading: false });
+  }
+
+  function mockFinalizationInvoke(
+    extra?: (cmd: string, args: unknown) => unknown,
+  ) {
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_session_finalization_status_cmd") {
+        const sessionId = (args as { sessionId: string })?.sessionId;
+        return FIXTURE_FINALIZATION_STATUSES[sessionId] ?? null;
+      }
+      if (cmd === "list_sessions")
+        return useAudioGraphStore.getState().sessions;
+      if (extra) return extra(cmd, args);
+      return null;
+    });
+  }
+
+  it("shows a per-row finalization pill derived fresh from the fetched status (Q2 default: list + detail)", async () => {
+    mockFinalizationInvoke();
+    seed([
+      makeSession({ id: "fx-finalizing", title: "Finalizing session" }),
+      makeSession({ id: "fx-blocked-external", title: "Blocked session" }),
+    ]);
+    render(<SessionsBrowser />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("finalization-pill-fx-finalizing"),
+      ).toHaveTextContent(/finalizing/i),
+    );
+    expect(
+      screen.getByTestId("finalization-pill-fx-blocked-external"),
+    ).toHaveTextContent(/blocked/i);
+  });
+
+  it("one session's Finalization Blocked record never degrades another row (ADR-0035's core point)", async () => {
+    mockFinalizationInvoke();
+    seed([
+      makeSession({ id: "fx-blocked-external", title: "Blocked session" }),
+      makeSession({ id: "clean-session", title: "Unrelated clean session" }),
+    ]);
+    render(<SessionsBrowser />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("finalization-pill-fx-blocked-external"),
+      ).toHaveTextContent(/blocked/i),
+    );
+    // The unrelated session has no finalization fixture at all — no pill,
+    // normal status badge, and its own Load/Delete stay fully independent.
+    expect(
+      screen.queryByTestId("finalization-pill-clean-session"),
+    ).not.toBeInTheDocument();
+    const cleanItem = screen.getByTestId("session-clean-session");
+    expect(
+      within(cleanItem).getByRole("button", { name: /^load$/i }),
+    ).not.toBeDisabled();
+    expect(
+      within(cleanItem).getByRole("button", { name: /^delete$/i }),
+    ).not.toBeDisabled();
+  });
+
+  it("the list-level Retry is never gated by reviewLocked, so a background session stays retryable while another Session is Live (Q5 default)", async () => {
+    mockFinalizationInvoke((cmd) => {
+      if (cmd === "retry_session_finalization_cmd") {
+        return {
+          ...FIXTURE_FINALIZATION_STATUSES["fx-blocked-external"],
+          blocked_record: null,
+        };
+      }
+      return null;
+    });
+    seed([makeSession({ id: "fx-blocked-external", title: "Blocked" })]);
+    useAudioGraphStore.setState({ isCapturing: true, isTranscribing: true });
+    const user = userEvent.setup();
+    render(<SessionsBrowser />);
+
+    const retryBtn = await screen.findByTestId(
+      "finalization-retry-fx-blocked-external",
+    );
+    expect(retryBtn).not.toBeDisabled();
+    await user.click(retryBtn);
+
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "retry_session_finalization_cmd",
+        { sessionId: "fx-blocked-external", authorizeCostAndEgress: false },
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("finalization-pill-fx-blocked-external"),
+      ).not.toHaveTextContent(/blocked/i),
+    );
+    // Load stays disabled the whole time — the coarse lock is untouched.
+    const loadBtn = screen.getByRole("button", { name: /^load$/i });
+    expect(loadBtn).toBeDisabled();
+  });
+
+  it("list surface variant 'detailOnly' hides every row pill without fetching finalization data", async () => {
+    mockFinalizationInvoke();
+    seed([makeSession({ id: "fx-blocked-external", title: "Blocked" })]);
+    render(<SessionsBrowser />);
+
+    const surfaceSelect = await screen.findByTestId(
+      "sessions-variant-list-surface",
+    );
+    fireEvent.change(surfaceSelect, { target: { value: "detailOnly" } });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("finalization-pill-fx-blocked-external"),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("background access variant 'perSessionLoadGate' loads a non-active background session even while another Session is Live", async () => {
+    mockFinalizationInvoke();
+    seed([
+      makeSession({ id: "active-now", title: "Live now", status: "active" }),
+      makeSession({ id: "fx-blocked-external", title: "Background" }),
+    ]);
+    useAudioGraphStore.setState({ isCapturing: true, isTranscribing: true });
+    render(<SessionsBrowser />);
+
+    const accessSelect = await screen.findByTestId(
+      "sessions-variant-background-access",
+    );
+    fireEvent.change(accessSelect, { target: { value: "perSessionLoadGate" } });
+
+    const activeItem = screen.getByTestId("session-active-now");
+    const backgroundItem = screen.getByTestId("session-fx-blocked-external");
+    expect(
+      within(activeItem).getByRole("button", { name: /^load$/i }),
+    ).toBeDisabled();
+    expect(
+      within(backgroundItem).getByRole("button", { name: /^load$/i }),
+    ).not.toBeDisabled();
   });
 });

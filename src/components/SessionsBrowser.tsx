@@ -22,9 +22,17 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+// `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
+// relays a command-name-only failure diagnostic to analytics then rethrows, so
+// this call site's error handling is unchanged (audio-graph-3e71).
+import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { useAudioGraphStore } from "../store";
 import type { SessionMetadata } from "../types";
+import {
+  deriveFinalizationStage,
+  type SessionFinalizationStatus,
+} from "../types/reviewFinalization";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import IconButton from "./IconButton";
 
@@ -87,6 +95,33 @@ function formatDuration(seconds: number | null): string {
 /** CSS-class-friendly modifier for a session's status. */
 function statusModifier(status: SessionMetadata["status"]): string {
   return `sessions-browser__status--${status}`;
+}
+
+/** Background-access variant (Q5, audio-graph-1d92 / ADR-0036). */
+export type BackgroundAccessMode =
+  | "coarseLockPlusInlineRetry"
+  | "perSessionLoadGate";
+
+/**
+ * Whether a row's Load button is locked, given the chosen variant:
+ *   - `coarseLockPlusInlineRetry` (default, unchanged behavior): the
+ *     existing global `reviewLocked` flag locks every row's Load while
+ *     ANY capture/transcription is live, regardless of which session that
+ *     is — background Finalizing/Blocked sessions instead get an inline
+ *     Retry that is never gated by this flag (see `FinalizationPill`).
+ *   - `perSessionLoadGate`: reuses the same per-row signal Delete already
+ *     uses (`s.status === "active"`) instead of the coarse flag, so a
+ *     background (non-active) session stays loadable even while another
+ *     Session is Live.
+ */
+export function isLoadLocked(
+  session: SessionMetadata,
+  mode: BackgroundAccessMode,
+  reviewLocked: boolean,
+): boolean {
+  return mode === "perSessionLoadGate"
+    ? session.status === "active"
+    : reviewLocked;
 }
 
 /** Display name for a session — falls back to the short id. */
@@ -173,12 +208,89 @@ function SessionsBrowser() {
   );
   const reviewLocked = isCapturing || isTranscribing;
 
+  // Prototype comparison controls (audio-graph-1d92, ADR-0036). Two of the
+  // ticket's five open design questions live at the list level:
+  //   - `listSurfaceMode` (Q2): does Finalizing/Finalization Blocked surface
+  //     as a list pill IN ADDITION to the After-workspace detail banner
+  //     (`ReviewFinalizationPanel`), or only in the detail banner?
+  //   - `backgroundAccessMode` (Q5): while another Session is Live (the
+  //     coarse `reviewLocked` flag is true), can a background session's
+  //     Finalizing/Blocked state still be reached and retried from this
+  //     list without loading it (default), or should Load itself become a
+  //     per-session gate instead of the current global one?
+  const [listSurfaceMode, setListSurfaceMode] = useState<
+    "listAndDetail" | "detailOnly"
+  >("listAndDetail");
+  const [backgroundAccessMode, setBackgroundAccessMode] = useState<
+    "coarseLockPlusInlineRetry" | "perSessionLoadGate"
+  >("coarseLockPlusInlineRetry");
+
+  // Finalization status per session — the SAME prototype "data boundary"
+  // fake `ReviewFinalizationPanel` uses (see `types/reviewFinalization.ts`).
+  // Fetched independently per row via `Promise.allSettled` so one session's
+  // fetch failure can never affect another row's pill or actions — this is
+  // the list-level proof of ADR-0035's core point: a Finalization Blocked
+  // record is per-Session, never something that degrades the whole list.
+  const [finalizationStatuses, setFinalizationStatuses] = useState<
+    Record<string, SessionFinalizationStatus>
+  >({});
+  const [retryingFinalizationIds, setRetryingFinalizationIds] = useState<
+    Set<string>
+  >(() => new Set());
+
   // Refresh on mount — match the v2 store's own larger fetch (200) so the
   // browser's search can actually find old entries, not just the 10 most
   // recent the v1 overlay loaded.
   useEffect(() => {
     void listSessions(200);
   }, [listSessions]);
+
+  const visibleIdsKey = sessions.map((s) => s.id).join(",");
+  useEffect(() => {
+    if (listSurfaceMode === "detailOnly") return;
+    const ids = visibleIdsKey ? visibleIdsKey.split(",") : [];
+    let cancelled = false;
+    void Promise.allSettled(
+      ids.map((id) =>
+        invoke<SessionFinalizationStatus | null>(
+          "get_session_finalization_status_cmd",
+          { sessionId: id },
+        ).then((status) => ({ id, status })),
+      ),
+    ).then((results) => {
+      if (cancelled) return;
+      const next: Record<string, SessionFinalizationStatus> = {};
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value.status) {
+          next[result.value.id] = result.value.status;
+        }
+      }
+      setFinalizationStatuses(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [visibleIdsKey, listSurfaceMode]);
+
+  const retryFinalization = async (sessionId: string) => {
+    setRetryingFinalizationIds((prev) => new Set(prev).add(sessionId));
+    try {
+      const next = await invoke<SessionFinalizationStatus>(
+        "retry_session_finalization_cmd",
+        { sessionId, authorizeCostAndEgress: false },
+      );
+      setFinalizationStatuses((prev) => ({ ...prev, [sessionId]: next }));
+    } catch {
+      // Non-fatal in this prototype — the row's own next re-derivation
+      // (next poll/mount) will show whatever the ledger actually says.
+    } finally {
+      setRetryingFinalizationIds((prev) => {
+        const nextSet = new Set(prev);
+        nextSet.delete(sessionId);
+        return nextSet;
+      });
+    }
+  };
 
   const trashCount = useMemo(
     () => sessions.filter((s) => s.deleted === true).length,
@@ -339,6 +451,51 @@ function SessionsBrowser() {
                 : t("sessions.trashCount", { count: trashCount })}
             </button>
           </div>
+          <fieldset className="flex flex-wrap items-center gap-(--space-4) mb-(--space-4) rounded-md border border-dashed border-border-color px-(--space-4) py-(--space-3)">
+            <legend className="text-[0.75em] font-semibold uppercase tracking-[0.3px] opacity-70">
+              {t("sessions.finalization.variantsTitle")}
+            </legend>
+            <label className="flex items-center gap-(--space-3) text-[0.8em]">
+              <span>{t("sessions.finalization.variantListSurface")}</span>
+              <select
+                data-testid="sessions-variant-list-surface"
+                value={listSurfaceMode}
+                onChange={(e) =>
+                  setListSurfaceMode(
+                    e.target.value as "listAndDetail" | "detailOnly",
+                  )
+                }
+                className="py-(--space-2) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
+              >
+                <option value="listAndDetail">
+                  {t("sessions.finalization.variantListSurfaceBoth")}
+                </option>
+                <option value="detailOnly">
+                  {t("sessions.finalization.variantListSurfaceDetailOnly")}
+                </option>
+              </select>
+            </label>
+            <label className="flex items-center gap-(--space-3) text-[0.8em]">
+              <span>{t("sessions.finalization.variantBackgroundAccess")}</span>
+              <select
+                data-testid="sessions-variant-background-access"
+                value={backgroundAccessMode}
+                onChange={(e) =>
+                  setBackgroundAccessMode(
+                    e.target.value as BackgroundAccessMode,
+                  )
+                }
+                className="py-(--space-2) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
+              >
+                <option value="coarseLockPlusInlineRetry">
+                  {t("sessions.finalization.variantBackgroundAccessInline")}
+                </option>
+                <option value="perSessionLoadGate">
+                  {t("sessions.finalization.variantBackgroundAccessPerSession")}
+                </option>
+              </select>
+            </label>
+          </fieldset>
           {recoverySummary ? (
             <p className="settings-section__empty" role="status">
               {recoverySummary}
@@ -389,11 +546,21 @@ function SessionsBrowser() {
                           : formatTimestamp(s.created_at)}
                       </span>
                     </div>
-                    <span
-                      className={`sessions-browser__status ${statusModifier(s.status)} text-[0.75em] py-[2px] px-(--space-4) rounded-full border border-current opacity-80 capitalize whitespace-nowrap`}
-                    >
-                      {s.status}
-                    </span>
+                    <div className="flex items-center gap-(--space-3) shrink-0">
+                      <span
+                        className={`sessions-browser__status ${statusModifier(s.status)} text-[0.75em] py-[2px] px-(--space-4) rounded-full border border-current opacity-80 capitalize whitespace-nowrap`}
+                      >
+                        {s.status}
+                      </span>
+                      {listSurfaceMode === "listAndDetail" &&
+                        finalizationStatuses[s.id] && (
+                          <FinalizationPill
+                            status={finalizationStatuses[s.id]}
+                            retrying={retryingFinalizationIds.has(s.id)}
+                            onRetry={() => retryFinalization(s.id)}
+                          />
+                        )}
+                    </div>
                   </div>
 
                   <div className="text-[0.8em] opacity-75 flex gap-(--space-5) flex-wrap">
@@ -436,9 +603,13 @@ function SessionsBrowser() {
                           type="button"
                           className="settings-btn settings-btn--primary"
                           onClick={() => handleLoad(s.id)}
-                          disabled={reviewLocked}
+                          disabled={isLoadLocked(
+                            s,
+                            backgroundAccessMode,
+                            reviewLocked,
+                          )}
                           title={
-                            reviewLocked
+                            isLoadLocked(s, backgroundAccessMode, reviewLocked)
                               ? t("sessions.reviewLockedWhileLive")
                               : undefined
                           }
@@ -479,6 +650,56 @@ function SessionsBrowser() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * List-level Finalizing / Finalization Blocked pill (audio-graph-1d92,
+ * ADR-0036, Q2 + ADR-0035). Re-derives the stage fresh from `status` on
+ * every render — never a cached/persisted stage — so this row can never
+ * disagree with `ReviewFinalizationPanel`'s own derivation for the same
+ * session. When blocked, exposes an inline Retry that is intentionally
+ * NEVER gated by `reviewLocked`: a background session's Finalization
+ * Blocked record must stay reachable from Review while another Session is
+ * Live (Q5's default `coarseLockPlusInlineRetry` variant).
+ */
+function FinalizationPill({
+  status,
+  retrying,
+  onRetry,
+}: {
+  status: SessionFinalizationStatus;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  const stage = deriveFinalizationStage(status);
+  const tone =
+    stage === "finalization_blocked"
+      ? "text-accent-yellow border-current"
+      : stage === "finalized"
+        ? "text-accent-green border-current"
+        : "text-accent-blue border-current";
+  return (
+    <span className="flex items-center gap-(--space-2)">
+      <span
+        data-testid={`finalization-pill-${status.session_id}`}
+        className={`text-[0.7em] py-[1px] px-(--space-3) rounded-full border opacity-90 whitespace-nowrap ${tone}`}
+      >
+        {t(`sessions.finalization.pill.${stage}`)}
+      </span>
+      {stage === "finalization_blocked" && (
+        <button
+          type="button"
+          data-testid={`finalization-retry-${status.session_id}`}
+          className="settings-btn"
+          onClick={onRetry}
+          disabled={retrying}
+        >
+          {retrying ? t("common.loading") : t("sessions.finalization.retry")}
+        </button>
+      )}
+    </span>
   );
 }
 
