@@ -473,6 +473,97 @@ impl AuthorizedRoute {
     }
 }
 
+/// The identity of the route a dispatch actually reached, resolved from the
+/// LIVE client/endpoint rather than the session-start `LlmProvider` snapshot.
+///
+/// Seeds audio-graph-862c / audio-graph-7da4 (decision memo
+/// `docs/agentic-runs/2026-08-20-ledger-provider-identity/decision-memo.md`):
+/// before this type existed, a FAILED dispatch's ledger event fell back to
+/// `LlmProvider::runtime_provider_id()` / `requires_cloud_content_transfer()`
+/// — both read from the snapshot, which is exactly what a mid-session settings
+/// save (`sync_llm_api_client_from_settings_cache`) leaves stale. Every backend
+/// attempt function in `executor.rs` records one of these the moment it
+/// resolves the LIVE route — before the fallible network call — so a
+/// subsequent failure can still ledger under the identity that was actually
+/// dialled, the same discipline the success path already gets for free via
+/// `ProjectionProvenance::provider` (stamped from this same live resolution).
+/// A single dispatch attempt can resolve this TWICE (draft, then same-route
+/// repair); `fold` below is how the second resolution combines with the
+/// first without erasing whichever one actually egressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptedRouteIdentity {
+    pub provider_id: &'static str,
+    pub requires_cloud_transfer: bool,
+}
+
+impl AttemptedRouteIdentity {
+    /// Resolve the identity for a route about to be attempted.
+    ///
+    /// `endpoint` is the LIVE endpoint string dispatch is actually going out
+    /// on, required only for `route.openai_compatible`: that one registry row
+    /// covers both a loopback deployment (Ollama, self-hosted vLLM) and an
+    /// arbitrary cloud endpoint, so its cloud-ness cannot be read off the
+    /// route id alone — every other row's cloud-ness is fixed by the registry
+    /// (`route.rs`'s `LLM_ROUTES` table), so `endpoint` is ignored for them.
+    /// `None` is only expected for those fixed rows; passed for `llm.api` it
+    /// falls back to `true` (ADR-0034's positive-evidence bias: an unresolved
+    /// cloud-ness must never render as false-local).
+    pub fn for_route(route: &'static RouteDescriptor, endpoint: Option<&str>) -> Self {
+        let requires_cloud_transfer = match route.provider_id {
+            "llm.local_llama" | "llm.mistralrs" => false,
+            "llm.api" => endpoint
+                .map(|endpoint| !crate::settings::endpoint_is_loopback(endpoint))
+                .unwrap_or(true),
+            // llm.cerebras, llm.sambanova, llm.openrouter, llm.aws_bedrock: pinned
+            // cloud rows with no loopback deployment, so no endpoint check needed.
+            _ => true,
+        };
+        Self {
+            provider_id: route.provider_id,
+            requires_cloud_transfer,
+        }
+    }
+
+    /// Fold a newly-resolved live attempt into a previously-stamped one.
+    ///
+    /// `run_projection_patch_on_route` (executor.rs) dials the SAME
+    /// `attempted_route` out-param twice — once for the draft, once for the
+    /// same-route repair — and every backend attempt function re-resolves the
+    /// LIVE client on each call, so a mid-job settings save
+    /// (`sync_llm_api_client_from_settings_cache`) can make the two dials
+    /// disagree on `requires_cloud_transfer` even though both share
+    /// `provider_id` (that agreement is what `refine_within_authorization`
+    /// guarantees for any two live resolutions the SAME `AuthorizedRoute`
+    /// admits). Overwriting the stamp on the second dial — what every call
+    /// site did before this method existed — makes an egress that
+    /// genuinely happened (dial 1 reached a cloud endpoint) vanish from the
+    /// ledger the moment dial 2 reaches a local one.
+    ///
+    /// Stamp-once (keep `self`, ignore `other`) is equally wrong in the
+    /// opposite direction: a dial 1 that stayed local followed by a dial 2
+    /// that reached the cloud must ledger the cloud egress, not the stale
+    /// local one. So this folds to the MAX-egress identity: `OR` the
+    /// `requires_cloud_transfer` bits (an egress that happened stays
+    /// recorded even if the other dial didn't repeat it), and keep the
+    /// `provider_id` belonging to whichever side actually required cloud
+    /// transfer — that is the identity that egressed, so it is the more
+    /// informative one to name. When both sides agree (both cloud, or
+    /// neither), `other` (the more recent dial) wins, matching what every
+    /// existing single-dial call site already stamped.
+    pub fn fold(self, other: Self) -> Self {
+        let requires_cloud_transfer = self.requires_cloud_transfer || other.requires_cloud_transfer;
+        let provider_id = match (self.requires_cloud_transfer, other.requires_cloud_transfer) {
+            (true, false) => self.provider_id,
+            (false, true) => other.provider_id,
+            _ => other.provider_id,
+        };
+        Self {
+            provider_id,
+            requires_cloud_transfer,
+        }
+    }
+}
+
 /// Resolve, gate, and admit a route for a content-bearing dispatch.
 pub fn authorize_route_dispatch(provider: &LlmProvider) -> Result<AuthorizedRoute, AppError> {
     authorize_descriptor(resolve_route(provider))
@@ -1125,6 +1216,149 @@ mod tests {
                 && !err.contains("gpt-oss-120b"),
             "the refusal must be content-free: route ids only, got: {err}"
         );
+    }
+
+    // ----- AttemptedRouteIdentity (audio-graph-862c / audio-graph-7da4) -----
+
+    #[test]
+    fn attempted_identity_for_a_cerebras_shaped_endpoint_is_the_registry_id_not_the_settings_tag() {
+        // Pure, network-free: `route_for_api_endpoint` is a string match against
+        // the literal registry constant, so this proves the Cerebras
+        // classification without dialling `api.cerebras.ai` (the same
+        // constraint `ApiClient::effective_completion_budget`'s doc-comment
+        // names: "a local mock server cannot impersonate" the exact host).
+        let live = route_for_api_endpoint(crate::settings::CEREBRAS_BASE_URL);
+        let identity =
+            AttemptedRouteIdentity::for_route(live, Some(crate::settings::CEREBRAS_BASE_URL));
+        assert_eq!(identity.provider_id, "llm.cerebras");
+        assert!(
+            identity.requires_cloud_transfer,
+            "a Cerebras dispatch is remote by construction"
+        );
+
+        // Pin the pre-3624 convention as refused: `LlmProvider::runtime_provider_id()`
+        // collapses every `Api` endpoint to the literal "llm.api", which is what a
+        // revert of this fix would produce here instead of "llm.cerebras".
+        assert_ne!(
+            identity.provider_id,
+            LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.to_string(),
+                api_key: String::new(),
+                model: String::new(),
+            }
+            .runtime_provider_id()
+        );
+    }
+
+    #[test]
+    fn attempted_identity_for_a_loopback_api_endpoint_is_local() {
+        let live = route_for_api_endpoint("http://127.0.0.1:11434/v1");
+        let identity = AttemptedRouteIdentity::for_route(live, Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(identity.provider_id, "llm.api");
+        assert!(!identity.requires_cloud_transfer);
+    }
+
+    #[test]
+    fn attempted_identity_for_a_remote_api_endpoint_is_cloud() {
+        // Same registry row (`route.openai_compatible`) as the loopback case
+        // above — only the LIVE endpoint differs, which is exactly the
+        // ambiguity `route.openai_compatible` carries and the other rows don't.
+        let live = route_for_api_endpoint("https://api.openai.com/v1");
+        let identity = AttemptedRouteIdentity::for_route(live, Some("https://api.openai.com/v1"));
+        assert_eq!(identity.provider_id, "llm.api");
+        assert!(identity.requires_cloud_transfer);
+    }
+
+    #[test]
+    fn attempted_identity_for_pinned_rows_ignores_the_endpoint_argument() {
+        for (route_id, expect_cloud) in [
+            ("route.local_llama", false),
+            ("route.mistralrs", false),
+            ("route.openrouter", true),
+            ("route.aws_bedrock", true),
+            ("route.cerebras_direct", true),
+            ("route.sambanova_direct", true),
+        ] {
+            let route = route_by_id(route_id);
+            let identity = AttemptedRouteIdentity::for_route(route, None);
+            assert_eq!(identity.provider_id, route.provider_id);
+            assert_eq!(
+                identity.requires_cloud_transfer, expect_cloud,
+                "{route_id} cloud-ness must not depend on an endpoint argument"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_ors_cloud_transfer_in_the_cloud_to_local_direction() {
+        // The concrete finding trace: dial 1 reaches a cloud endpoint (stamped
+        // cloud=true), the settings save repoints the shared client to
+        // loopback before the repair dial, dial 2 stamps cloud=false. Folding
+        // must keep the egress dial 1 actually made, not let dial 2 erase it.
+        let cloud_dial = AttemptedRouteIdentity {
+            provider_id: "llm.api",
+            requires_cloud_transfer: true,
+        };
+        let local_dial = AttemptedRouteIdentity {
+            provider_id: "llm.api",
+            requires_cloud_transfer: false,
+        };
+        let folded = cloud_dial.fold(local_dial);
+        assert!(
+            folded.requires_cloud_transfer,
+            "an egress that happened on dial 1 must not vanish because dial 2 was local"
+        );
+        assert_eq!(folded.provider_id, "llm.api");
+    }
+
+    #[test]
+    fn fold_ors_cloud_transfer_in_the_local_to_cloud_direction() {
+        // The mirror direction the finding names explicitly: stamp-once
+        // (set-if-first) would keep dial 1's local identity even though dial 2
+        // is the one that reached the cloud.
+        let local_dial = AttemptedRouteIdentity {
+            provider_id: "llm.api",
+            requires_cloud_transfer: false,
+        };
+        let cloud_dial = AttemptedRouteIdentity {
+            provider_id: "llm.api",
+            requires_cloud_transfer: true,
+        };
+        let folded = local_dial.fold(cloud_dial);
+        assert!(
+            folded.requires_cloud_transfer,
+            "an egress dial 2 made must surface even though dial 1 was local"
+        );
+        assert_eq!(folded.provider_id, "llm.api");
+    }
+
+    #[test]
+    fn fold_is_a_no_op_when_both_dials_agree() {
+        for requires_cloud_transfer in [true, false] {
+            let identity = AttemptedRouteIdentity {
+                provider_id: "llm.openrouter",
+                requires_cloud_transfer,
+            };
+            assert_eq!(identity.fold(identity), identity);
+        }
+    }
+
+    #[test]
+    fn fold_prefers_the_cloud_providers_identity_when_provider_ids_differ() {
+        // Same-authorization live resolutions currently always share
+        // `provider_id` (guaranteed by `refine_within_authorization`), but the
+        // fold's provider_id tie-break is defensive independent of that
+        // invariant: whichever side actually egressed names the identity.
+        let cloud_dial = AttemptedRouteIdentity {
+            provider_id: "llm.cerebras",
+            requires_cloud_transfer: true,
+        };
+        let local_dial = AttemptedRouteIdentity {
+            provider_id: "llm.local_llama",
+            requires_cloud_transfer: false,
+        };
+        assert_eq!(cloud_dial.fold(local_dial).provider_id, "llm.cerebras");
+        assert_eq!(local_dial.fold(cloud_dial).provider_id, "llm.cerebras");
     }
 
     #[test]

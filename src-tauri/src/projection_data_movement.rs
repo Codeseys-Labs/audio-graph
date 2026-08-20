@@ -39,8 +39,12 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct ProjectionMovementFacts {
     pub session_id: String,
-    /// `runtime_provider_id()` of the *configured* provider, e.g.
-    /// `"llm.openrouter"`. The intended destination for the call.
+    /// The registry provider id (`llm.*`) of the route this call actually
+    /// reached or attempted, e.g. `"llm.cerebras"`. Callers stamp this from the
+    /// `Configured`/`Actual`/`FailedRoute` identity resolved in
+    /// `speech::mod::projection_movement_facts` — not a fixed "configured
+    /// provider" tag — so a Cerebras attempt is inventoried under `llm.cerebras`
+    /// whether it succeeded or failed (seeds audio-graph-862c / audio-graph-7da4).
     pub provider_id: String,
     /// Model id when known (empty string when the local sentinel).
     pub model_id: String,

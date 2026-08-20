@@ -30,6 +30,6 @@ pub mod streaming;
 
 pub use api_client::{ApiClient, ApiConfig};
 pub use engine::LlmEngine;
-pub use executor::{LlmExecutor, LlmPriority, ProjectionPatchOutcome};
+pub use executor::{LlmExecutor, LlmPriority, ProjectionPatchAttempt, ProjectionPatchOutcome};
 pub use mistralrs_engine::MistralRsEngine;
 pub use openrouter::{OpenRouterClient, OpenRouterConfig, OpenRouterModel};

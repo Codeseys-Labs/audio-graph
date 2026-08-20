@@ -66,7 +66,7 @@ use crate::graph::entities::{ExtractionResult, GraphDelta, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{
-    ApiClient, LlmEngine, LlmExecutor, LlmPriority, MistralRsEngine, ProjectionPatchOutcome,
+    ApiClient, LlmEngine, LlmExecutor, LlmPriority, MistralRsEngine, ProjectionPatchAttempt,
 };
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
@@ -1664,13 +1664,16 @@ struct ProjectionDispatchContext {
 }
 
 trait ProjectionPatchGenerator: Send + Sync {
+    /// Returns the dispatch outcome PLUS the identity of the route it actually
+    /// reached, so a failure can still ledger under that identity instead of
+    /// the session-start snapshot (seeds audio-graph-862c / audio-graph-7da4).
     fn generate_projection_patch(
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
         sequence: u64,
         created_at_ms: u64,
-    ) -> Result<ProjectionPatchOutcome, String>;
+    ) -> ProjectionPatchAttempt;
 }
 
 trait ProjectionRuntimeEventSink: Send + Sync {
@@ -1744,7 +1747,7 @@ impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
         ledger: TranscriptLedger,
         sequence: u64,
         created_at_ms: u64,
-    ) -> Result<ProjectionPatchOutcome, String> {
+    ) -> ProjectionPatchAttempt {
         self.llm_executor.generate_projection_patch(
             job,
             ledger,
@@ -2021,12 +2024,63 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
 enum ProjectionLedgerBackend<'a> {
     /// Pre-call lifecycle marker: the configured provider intent (nothing has been
     /// dispatched yet; the terminal event is authoritative for what left).
+    ///
+    /// Decision (audio-graph-862c, revised): `Configured` now stamps
+    /// `resolve_route(&dispatch.llm_provider).provider_id` — the SAME registry
+    /// resolver `authorize_route_dispatch` uses — rather than the coarse
+    /// `LlmProvider::runtime_provider_id()` settings-variant tag. Both reads
+    /// are of the session-start snapshot ONLY (no live client, no dispatch),
+    /// so this is a granularity fix, not a live-vs-snapshot one: for
+    /// `Api { endpoint: CEREBRAS_BASE_URL, .. }`, `resolve_route` sharpens
+    /// `llm.api` to `llm.cerebras` from the snapshot alone. Leaving it on the
+    /// coarse tag made a producer inventory list `llm.api` for a session
+    /// whose content only ever egressed to `llm.cerebras` — the harm 862c
+    /// names, still open even after `Actual`/`FailedRoute` were sharpened,
+    /// because `isContentEgress` (sessionDataRoute.ts) accepts the `started`
+    /// (Configured) row on its own and `buildSessionDataRouteReport` keys
+    /// transfers by provider id, so the coarse tag rendered as a SECOND
+    /// producer row next to the sharp terminal one. `Actual` and
+    /// `FailedRoute` still stamp the sharp registry id from the route
+    /// actually reached (a live resolution, sharper still when it can be —
+    /// e.g. `route.openrouter` → `route.cerebras_via_openrouter`); this
+    /// closes the remaining asymmetry rather than widening it, since
+    /// `resolve_route` never reports a route the eventual dispatch is not
+    /// itself authorized to reach.
     Configured,
-    /// Terminal success: the identity reported by the patch provenance, which is
-    /// the registry provider id of the route that actually served the call.
-    Actual(&'a crate::projections::ProjectionProvenance),
-    /// Terminal failure on the single authorized route: no backend reported.
-    FailedRoute,
+    /// Terminal success: the identity reported by the patch provenance (the
+    /// registry provider id of the route that actually served the call —
+    /// already sharp before audio-graph-862c, since provenance is stamped
+    /// from the `AuthorizedRoute`/route table), paired with the SAME
+    /// attempted-route identity `FailedRoute` uses below.
+    ///
+    /// Decision (audio-graph-7da4): carrying it here fixes the OTHER stale
+    /// fallback the decision memo names — `actual_backend_identity`'s generic
+    /// `llm.api` arm used to read `dispatch.llm_provider.requires_cloud_content_transfer()`
+    /// for cloud-ness, which is the session-start snapshot, not the endpoint
+    /// this SUCCESSFUL call actually reached. A same-descriptor mid-session
+    /// repoint (loopback to any generic cloud `Api` endpoint) could therefore
+    /// under- or over-report cloud-ness even on the success path.
+    Actual(
+        &'a crate::projections::ProjectionProvenance,
+        Option<crate::llm::route::AttemptedRouteIdentity>,
+    ),
+    /// Terminal failure: the identity of the route this attempt actually
+    /// reached, captured live at dispatch time (`AttemptedRouteIdentity`,
+    /// `llm/route.rs`) — the SAME identity the success path above records via
+    /// provenance. `None` only when nothing was dialled (client never
+    /// configured, or a cross-provider repoint refused before the wire), in
+    /// which case the snapshot-derived fallback below is honest, not stale.
+    ///
+    /// Decisions (audio-graph-862c, audio-graph-7da4 — Option 1 for both):
+    /// before this it was always `(LlmProvider::runtime_provider_id(),
+    /// LlmProvider::requires_cloud_content_transfer())`, i.e. entirely the
+    /// session-start snapshot. 862c fixed `provider_id` (a failed Cerebras
+    /// dispatch was inventoried under a producer that was never dialled);
+    /// 7da4 fixes `requires_cloud_transfer` in this same change — a
+    /// mid-session repoint from loopback to a cloud `Api` endpoint whose
+    /// dispatch then fails must ledger remote egress, not the stale loopback
+    /// boolean the snapshot still carries.
+    FailedRoute(Option<crate::llm::route::AttemptedRouteIdentity>),
 }
 
 /// Map the provenance-reported provider identity to ledger identity:
@@ -2037,9 +2091,16 @@ enum ProjectionLedgerBackend<'a> {
 /// written by builds before this contract carry the old ad-hoc keys (`"openrouter"`
 /// / `"api"` / `"local_llama"` / `"mistralrs"`), and a privacy report reading them
 /// must still resolve an identity rather than silently mislabel one.
+///
+/// `attempted_route` is the SAME live-resolved identity `FailedRoute` reads
+/// (`Some` on every call reached from a completed dispatch); it replaces the
+/// stale `dispatch.llm_provider.requires_cloud_content_transfer()` fallback in
+/// the generic `llm.api` arm, which read the session-start snapshot instead of
+/// the endpoint actually dialled (audio-graph-7da4).
 fn actual_backend_identity(
     dispatch: &ProjectionDispatchContext,
     backend: &str,
+    attempted_route: Option<crate::llm::route::AttemptedRouteIdentity>,
 ) -> (String, bool, bool) {
     match backend {
         // Pass-through for the post-contract registry id.
@@ -2049,19 +2110,21 @@ fn actual_backend_identity(
         "llm.aws_bedrock" => ("llm.aws_bedrock".to_string(), true, false),
         "llm.api" | "llm.cerebras" | "llm.sambanova" | "api" => {
             // A generic OpenAI-compatible endpoint may be loopback (local) or
-            // remote, so the configured provider's own endpoint check answers
-            // precisely. There is no longer a fallback hop onto this backend, so
-            // the former blanket "record it as remote" conservatism no longer
-            // applies to it; a pinned cloud accelerator (`llm.cerebras` /
-            // `llm.sambanova`) is remote by construction.
+            // remote, so the LIVE route's own endpoint check answers precisely.
+            // There is no longer a fallback hop onto this backend, so the former
+            // blanket "record it as remote" conservatism no longer applies to
+            // it; a pinned cloud accelerator (`llm.cerebras` / `llm.sambanova`)
+            // is remote by construction.
             let cloud = match backend {
                 "llm.cerebras" | "llm.sambanova" => true,
-                _ => match &dispatch.llm_provider {
-                    LlmProvider::Api { .. } => {
-                        dispatch.llm_provider.requires_cloud_content_transfer()
-                    }
-                    _ => true,
-                },
+                _ => attempted_route
+                    .map(|route| route.requires_cloud_transfer)
+                    .unwrap_or_else(|| match &dispatch.llm_provider {
+                        LlmProvider::Api { .. } => {
+                            dispatch.llm_provider.requires_cloud_content_transfer()
+                        }
+                        _ => true,
+                    }),
             };
             let provider_id = if backend.starts_with("llm.") {
                 backend.to_string()
@@ -2091,28 +2154,48 @@ fn projection_movement_facts(
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
     let shape = crate::projection_llm::projection_prompt_shape(job, ledger);
     let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
-        ProjectionLedgerBackend::Actual(provenance) => {
+        ProjectionLedgerBackend::Actual(provenance, attempted_route) => {
             let (provider_id, cloud, prefix) =
-                actual_backend_identity(dispatch, &provenance.provider);
+                actual_backend_identity(dispatch, &provenance.provider, attempted_route);
             (provider_id, cloud, prefix, provenance.model.clone())
         }
+        // `resolve_route` is the same registry resolver `authorize_route_dispatch`
+        // gates on, applied to the session-start snapshot alone — sharper than
+        // `runtime_provider_id()` (llm.api -> llm.cerebras for a Cerebras-shaped
+        // `Api` endpoint) without needing a live client (audio-graph-862c,
+        // revised: see the `Configured` doc comment above).
         ProjectionLedgerBackend::Configured => (
-            dispatch.llm_provider.runtime_provider_id().to_string(),
+            crate::llm::route::resolve_route(&dispatch.llm_provider)
+                .provider_id
+                .to_string(),
             dispatch.llm_provider.requires_cloud_content_transfer(),
             matches!(dispatch.llm_provider, LlmProvider::OpenRouter { .. }),
             String::new(),
         ),
-        // A failed attempt on the single authorized route: its cloud-ness is
-        // exactly the configured provider's. The former
-        // `|| dispatch.llm_allow_cloud_fallbacks` widening existed because the
-        // attempt chain could have reached a cloud backend the user did not select;
-        // ADR-0038 removed that chain, so widening here would now overstate flow.
-        ProjectionLedgerBackend::FailedRoute => (
-            dispatch.llm_provider.runtime_provider_id().to_string(),
-            dispatch.llm_provider.requires_cloud_content_transfer(),
-            false,
-            String::new(),
-        ),
+        // Stamp BOTH fields from the route actually attempted
+        // (`AttemptedRouteIdentity`, captured live at dispatch time — see the
+        // `FailedRoute` doc comment above), not the configured snapshot: a
+        // failed Cerebras dispatch must ledger `llm.cerebras` (audio-graph-862c),
+        // and a failed dispatch reached after a mid-session loopback-to-cloud
+        // repoint must ledger remote egress, not the stale loopback boolean the
+        // snapshot still carries (audio-graph-7da4). `None` means nothing was
+        // dialled (never-configured client, or a pre-wire authorization
+        // refusal), so the snapshot-derived values are the honest answer there,
+        // not a stale fallback.
+        ProjectionLedgerBackend::FailedRoute(attempted_route) => match attempted_route {
+            Some(route) => (
+                route.provider_id.to_string(),
+                route.requires_cloud_transfer,
+                false,
+                String::new(),
+            ),
+            None => (
+                dispatch.llm_provider.runtime_provider_id().to_string(),
+                dispatch.llm_provider.requires_cloud_content_transfer(),
+                false,
+                String::new(),
+            ),
+        },
     };
     crate::projection_data_movement::ProjectionMovementFacts {
         session_id: job.session_id.clone(),
@@ -2158,12 +2241,14 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
         );
     }
 
-    match dispatch.patch_generator.generate_projection_patch(
+    let attempt = dispatch.patch_generator.generate_projection_patch(
         job.clone(),
         ledger.clone(),
         sequence,
         created_at_ms,
-    ) {
+    );
+    let attempted_route = attempt.attempted_route;
+    match attempt.outcome {
         Ok(outcome) => {
             let generation_latency_ms = current_unix_millis().saturating_sub(generation_started_ms);
             // Terminal event ledgers the ACTUAL backend from the patch
@@ -2177,7 +2262,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &ledger,
                 u64::from(outcome.tokens_used),
                 0,
-                ProjectionLedgerBackend::Actual(&outcome.patch.provenance),
+                ProjectionLedgerBackend::Actual(&outcome.patch.provenance, attempted_route),
             );
             dispatch.data_movement_sink.record(
                 &job.session_id,
@@ -2297,7 +2382,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &ledger,
                 0,
                 0,
-                ProjectionLedgerBackend::FailedRoute,
+                ProjectionLedgerBackend::FailedRoute(attempted_route),
             );
             dispatch.data_movement_sink.record(
                 &job.session_id,
@@ -7095,8 +7180,8 @@ mod tests_provider_dispatch {
 mod tests_status {
     use super::{
         DiarizationDispatchContext, DiarizationEventSink, ExtractionDeps, PipelineStatus,
-        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchGenerator,
-        ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
+        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchAttempt,
+        ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
         SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
         aws_error_for_diagnostic_event, cloud_error_code, diarization_span_revision_for_transcript,
         emit_and_dispatch_diarization_span_revision,
@@ -7115,6 +7200,7 @@ mod tests_status {
     use crate::audio::pipeline::{PROCESSED_AUDIO_SAMPLE_RATE_HZ, ProcessedAudioChunk};
     use crate::events::{self, AsrSpanRevisionPayload, AsrSpanStability, DiarizationSpanStability};
     use crate::graph::entities::{GraphDelta, GraphSnapshot};
+    use crate::llm::ProjectionPatchOutcome;
     use crate::persistence::{
         FileMemoryRepository, LocalMemoryRepository, TranscriptEventWriter,
         load_materialized_graph, load_materialized_notes, load_projection_events,
@@ -7254,6 +7340,12 @@ mod tests_status {
     #[derive(Clone)]
     struct FnProjectionPatchGenerator {
         calls: Arc<AtomicUsize>,
+        /// The identity a real dispatch would have captured from the LIVE
+        /// route before the (here, test-driven) outcome. `None` reproduces the
+        /// pre-fix "nothing was resolved" case; existing tests that don't call
+        /// [`Self::with_attempted_route`] get this default, so they keep
+        /// exercising the snapshot-derived fallback unchanged.
+        attempted_route: Option<crate::llm::route::AttemptedRouteIdentity>,
         #[allow(clippy::type_complexity)]
         generate: Arc<
             dyn Fn(
@@ -7283,10 +7375,23 @@ mod tests_status {
             (
                 Self {
                     calls: calls.clone(),
+                    attempted_route: None,
                     generate: Arc::new(generate),
                 },
                 calls,
             )
+        }
+
+        /// Attach the route identity a real dispatch would have captured live
+        /// before failing, so a test can drive `run_projection_job` through the
+        /// SAME `FailedRoute` ledger path a production repoint/Cerebras failure
+        /// would (seeds audio-graph-862c / audio-graph-7da4).
+        fn with_attempted_route(
+            mut self,
+            identity: crate::llm::route::AttemptedRouteIdentity,
+        ) -> Self {
+            self.attempted_route = Some(identity);
+            self
         }
     }
 
@@ -7297,9 +7402,12 @@ mod tests_status {
             ledger: TranscriptLedger,
             sequence: u64,
             created_at_ms: u64,
-        ) -> Result<ProjectionPatchOutcome, String> {
+        ) -> ProjectionPatchAttempt {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            (self.generate)(job, ledger, sequence, created_at_ms)
+            ProjectionPatchAttempt {
+                outcome: (self.generate)(job, ledger, sequence, created_at_ms),
+                attempted_route: self.attempted_route,
+            }
         }
     }
 
@@ -9557,6 +9665,398 @@ mod tests_status {
         assert_eq!(
             model.model_id.as_deref(),
             Some("anthropic/claude-sonnet-4.5")
+        );
+        drop(recorded);
+        drain_app_writers(&app);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed audio-graph-862c, decision Option 1 (decision memo): a FAILED
+    /// dispatch's terminal ledger event must stamp the ATTEMPTED route's
+    /// registry provider id — the same identity `Actual` already records via
+    /// provenance — instead of `LlmProvider::runtime_provider_id()`'s coarse
+    /// `llm.api` collapse of every `Api` endpoint. The attempted identity here
+    /// comes from the REAL `crate::llm::route` resolver
+    /// (`route_for_api_endpoint` + `AttemptedRouteIdentity::for_route`), not a
+    /// hand-typed string, so this pins the actual registry mapping a live
+    /// Cerebras dispatch resolves to, then proves `run_projection_job` writes
+    /// it onto the `FailedRoute` ledger event.
+    ///
+    /// The session-start snapshot here is the SAME Cerebras endpoint (no
+    /// mid-session repoint — that is audio-graph-7da4's separate test): this
+    /// test isolates the provider_id convention question, and a plain
+    /// unrepointed Cerebras session is the simplest case that still
+    /// distinguishes the two conventions, because `requires_cloud_content_transfer()`
+    /// already reads `true` off this exact snapshot, so the pre-3624 fallback
+    /// (`dispatch.llm_provider.runtime_provider_id()`) would render the SAME
+    /// remote destination but under the literal `"llm.api"` — a revert of this
+    /// fix flips the assertion below from `"llm.cerebras"` to `"llm.api"` and
+    /// fails, pinning the pre-fix convention as refused.
+    #[test]
+    fn failed_route_ledgers_the_attempted_cerebras_route_not_the_settings_tag() {
+        use crate::llm::route::{AttemptedRouteIdentity, route_for_api_endpoint};
+        use crate::persistence::{DataMovementEventType, DestinationBoundary};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-failed-cerebras");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "failed-cerebras-span",
+                        1,
+                        "content that never left the device",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        let live = route_for_api_endpoint(crate::settings::CEREBRAS_BASE_URL);
+        let attempted =
+            AttemptedRouteIdentity::for_route(live, Some(crate::settings::CEREBRAS_BASE_URL));
+        assert_eq!(attempted.provider_id, "llm.cerebras");
+        assert!(attempted.requires_cloud_transfer);
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _sequence, _created_at_ms| {
+                Err(format!(
+                    "simulated Cerebras dispatch failure for {:?}",
+                    job.kind
+                ))
+            });
+        let generator = generator.with_attempted_route(attempted);
+
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.to_string(),
+                api_key: "sk-cerebras".to_string(),
+                model: "gpt-oss-120b".to_string(),
+            },
+            true,
+        );
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        let failed = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallFailed)
+            .expect("failed event ledgered");
+        assert_eq!(failed.destination.boundary, DestinationBoundary::Provider);
+        assert_eq!(
+            failed.destination.provider_id.as_deref(),
+            Some("llm.cerebras"),
+            "a failed Cerebras dispatch must ledger the attempted route's registry \
+             id, not the settings-variant tag \"llm.api\""
+        );
+        drop(recorded);
+        drain_app_writers(&app);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed audio-graph-7da4, decision Option 1: a mid-session repoint from a
+    /// loopback `Api` endpoint to a cloud endpoint whose dispatch subsequently
+    /// FAILS must ledger remote egress, computed from the attempted route
+    /// captured live at dispatch time — never from the session-start
+    /// `LlmProvider` snapshot. Before this fix `FailedRoute` read
+    /// `dispatch.llm_provider.requires_cloud_content_transfer()`, which is
+    /// exactly the stale loopback snapshot named in the decision memo's §4
+    /// trace; a revert makes this test observe `DestinationBoundary::Local`
+    /// instead of `Provider` and fail.
+    #[test]
+    fn failed_route_from_a_mid_session_loopback_to_cloud_repoint_ledgers_remote_egress() {
+        use crate::llm::route::{AttemptedRouteIdentity, route_for_api_endpoint};
+        use crate::persistence::{DataMovementEventType, DestinationBoundary};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-failed-repoint");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "failed-repoint-span",
+                        1,
+                        "content dialled after a mid-session repoint",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        // The identity a real dispatch would have captured LIVE from the
+        // re-pointed client, AFTER the session-start snapshot below was taken.
+        // Same-descriptor (`llm.api`) repoints — loopback Ollama to any generic
+        // cloud `Api` endpoint — are accepted by
+        // `AuthorizedRoute::refine_within_authorization`, so this is the
+        // majority case the decision memo's §4 names, not the narrower
+        // Cerebras/SambaNova one.
+        let live = route_for_api_endpoint("https://api.openai.com/v1");
+        let attempted = AttemptedRouteIdentity::for_route(live, Some("https://api.openai.com/v1"));
+        assert_eq!(attempted.provider_id, "llm.api");
+        assert!(attempted.requires_cloud_transfer);
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _sequence, _created_at_ms| {
+                Err(format!(
+                    "simulated post-repoint dispatch failure for {:?}",
+                    job.kind
+                ))
+            });
+        let generator = generator.with_attempted_route(attempted);
+
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            // Session-start SNAPSHOT: loopback. The pre-fix fallback
+            // (`requires_cloud_content_transfer()` on THIS value) would say
+            // `false` even though the live client was repointed to a cloud
+            // endpoint mid-session and that dispatch failed.
+            LlmProvider::Api {
+                endpoint: "http://127.0.0.1:11434/v1".to_string(),
+                api_key: String::new(),
+                model: "llama3.2".to_string(),
+            },
+            true,
+        );
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        let failed = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallFailed)
+            .expect("failed event ledgered");
+        assert_eq!(
+            failed.destination.boundary,
+            DestinationBoundary::Provider,
+            "a failed dispatch to a live-repointed cloud endpoint must ledger \
+             remote egress; the pre-fix code read the stale loopback snapshot \
+             and would have ledgered Local here"
+        );
+        drop(recorded);
+        drain_app_writers(&app);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed audio-graph-7da4's second half: the memo names
+    /// `actual_backend_identity`'s generic `llm.api` arm as carrying the SAME
+    /// staleness as `FailedRoute` — it fell back to
+    /// `dispatch.llm_provider.requires_cloud_content_transfer()` (the
+    /// session-start snapshot) even for a call that SUCCEEDED after a
+    /// mid-session repoint. Drives a successful dispatch whose provenance
+    /// reports the generic `"llm.api"` backend (not sharpened to
+    /// `llm.cerebras`/`llm.sambanova`) through `run_projection_job`, with the
+    /// snapshot loopback but the attempted route cloud — a revert makes this
+    /// test observe `DestinationBoundary::Local` instead of `Provider`.
+    #[test]
+    fn actual_route_from_a_mid_session_loopback_to_cloud_repoint_ledgers_remote_egress() {
+        use crate::llm::route::{AttemptedRouteIdentity, route_for_api_endpoint};
+        use crate::persistence::{DataMovementEventType, DestinationBoundary};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-actual-repoint");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "actual-repoint-span",
+                        1,
+                        "content served after a mid-session repoint",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        let live = route_for_api_endpoint("https://api.openai.com/v1");
+        let attempted = AttemptedRouteIdentity::for_route(live, Some("https://api.openai.com/v1"));
+        assert_eq!(attempted.provider_id, "llm.api");
+        assert!(attempted.requires_cloud_transfer);
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                let mut patch = test_projection_patch(&job, sequence, created_at_ms);
+                // Generic served identity — NOT sharpened to a pinned
+                // accelerator — so this exercises the ambiguous arm of
+                // `actual_backend_identity` that used to fall back to the
+                // stale snapshot.
+                patch.provenance.provider = "llm.api".to_string();
+                Ok(ProjectionPatchOutcome {
+                    patch,
+                    tokens_used: 12,
+                })
+            });
+        let generator = generator.with_attempted_route(attempted);
+
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            // Session-start SNAPSHOT: loopback. The pre-fix
+            // `actual_backend_identity` fallback would say `false` here even
+            // though the live client was repointed to a cloud endpoint
+            // mid-session and THIS call succeeded on it.
+            LlmProvider::Api {
+                endpoint: "http://127.0.0.1:11434/v1".to_string(),
+                api_key: String::new(),
+                model: "llama3.2".to_string(),
+            },
+            true,
+        );
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        let succeeded = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallSucceeded)
+            .expect("succeeded event ledgered");
+        assert_eq!(
+            succeeded.destination.boundary,
+            DestinationBoundary::Provider,
+            "a successful dispatch to a live-repointed cloud endpoint must ledger \
+             remote egress; the pre-fix code read the stale loopback snapshot \
+             and would have ledgered Local here"
+        );
+        drop(recorded);
+        drain_app_writers(&app);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed audio-graph-862c, revisited: `Configured` used to stamp
+    /// `LlmProvider::runtime_provider_id()` — the coarse settings-variant tag
+    /// (`llm.api` for every `Api` endpoint) — even after `Actual`/
+    /// `FailedRoute` were sharpened to the registry id the route actually
+    /// reached. `isContentEgress` (sessionDataRoute.ts) accepts the `started`
+    /// (Configured) row on its own merits, so a session that only ever
+    /// egressed to Cerebras rendered a SECOND producer row for the generic
+    /// `llm.api` tag next to the sharp `llm.cerebras` terminal row — the exact
+    /// harm 862c names, still open even after the terminal events were fixed.
+    /// Drives a dispatch whose session-start snapshot is a Cerebras-shaped
+    /// `Api` endpoint through `run_projection_job` and asserts the STARTED
+    /// event already carries the sharp `llm.cerebras` id from
+    /// `resolve_route`, resolved from the snapshot alone (no live client, no
+    /// dispatch yet) — a revert makes this test observe `llm.api` instead.
+    #[test]
+    fn configured_event_stamps_the_sharp_registry_id_not_the_settings_tag() {
+        use crate::persistence::DataMovementEventType;
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-configured-sharpening");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "configured-sharpening-span",
+                        1,
+                        "content projected under a Cerebras-shaped snapshot",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.to_string(),
+                api_key: String::new(),
+                model: "gpt-oss-120b".to_string(),
+            },
+            true,
+        );
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        let started = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallStarted)
+            .expect("started event ledgered");
+        assert_eq!(
+            started.destination.provider_id.as_deref(),
+            Some("llm.cerebras"),
+            "the pre-dispatch Configured row must name the sharp registry id, \
+             not the coarse llm.api settings-variant tag a revert would produce"
         );
         drop(recorded);
         drain_app_writers(&app);

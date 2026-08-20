@@ -788,13 +788,19 @@ mod tests {
             ],
             |job, ledger, sequence, created_at_ms| {
                 let started = Instant::now();
-                let outcome = executor.generate_projection_patch(
-                    job.clone(),
-                    ledger.clone(),
-                    provider.clone(),
-                    sequence,
-                    created_at_ms,
-                )?;
+                // `attempted_route` is unused here: this is an offline replay
+                // smoke test, not the live ledger path, so there is no
+                // FailedRoute event for it to correct (seeds audio-graph-862c /
+                // audio-graph-7da4 — see `llm::executor::ProjectionPatchAttempt`).
+                let outcome = executor
+                    .generate_projection_patch(
+                        job.clone(),
+                        ledger.clone(),
+                        provider.clone(),
+                        sequence,
+                        created_at_ms,
+                    )
+                    .outcome?;
                 let generation_latency_ms =
                     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 

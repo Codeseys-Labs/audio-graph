@@ -22,9 +22,10 @@ use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, Transcr
 use crate::settings::LlmProvider;
 
 use super::route::{
-    AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade, ModelIdentitySource,
-    RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome, authorize_route_dispatch,
-    retry_class_for_terminal_status, route_for_api_endpoint, route_for_openrouter_policy,
+    AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
+    ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
+    authorize_route_dispatch, retry_class_for_terminal_status, route_for_api_endpoint,
+    route_for_openrouter_policy,
 };
 
 /// Models where the structured-outputs (`response_format: json_schema`) request
@@ -197,13 +198,32 @@ enum LlmJob {
 enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
     Chat(Result<ChatOutcome, String>),
-    ProjectionPatch(Result<ProjectionPatchOutcome, String>),
+    ProjectionPatch(ProjectionPatchAttempt),
 }
 
 #[derive(Debug, Clone)]
 pub struct ProjectionPatchOutcome {
     pub patch: ProjectionPatch,
     pub tokens_used: u32,
+}
+
+/// One projection-patch dispatch attempt, paired with the identity of the
+/// route it actually reached — if resolution got that far before failing.
+///
+/// On success `outcome`'s patch provenance already carries this identity
+/// (ADR-0038's route table stamps it into `ProjectionProvenance::provider`);
+/// `attempted_route` exists so a FAILURE can ledger under that SAME identity
+/// instead of falling back to the session-start `LlmProvider` snapshot, which
+/// is exactly what seeds audio-graph-862c / audio-graph-7da4 ask for. `None`
+/// only when the attempt failed before a live route was resolved — the client
+/// was never configured, or `AuthorizedRoute::refine_within_authorization`
+/// refused a cross-provider repoint — and in both of those cases nothing was
+/// actually dialled, so the caller's snapshot-derived local fallback is
+/// correct, not stale.
+#[derive(Debug, Clone)]
+pub struct ProjectionPatchAttempt {
+    pub outcome: Result<ProjectionPatchOutcome, String>,
+    pub attempted_route: Option<AttemptedRouteIdentity>,
 }
 
 struct BackendHandles {
@@ -326,7 +346,7 @@ impl LlmExecutor {
         provider: LlmProvider,
         sequence: u64,
         created_at_ms: u64,
-    ) -> Result<ProjectionPatchOutcome, String> {
+    ) -> ProjectionPatchAttempt {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Background,
@@ -340,15 +360,24 @@ impl LlmExecutor {
             },
         );
 
+        // The three mismatch/disconnect arms below never reached a route, so
+        // `attempted_route: None` here is honest, not a stale default.
         match response_rx.recv() {
-            Ok(LlmJobResult::ProjectionPatch(result)) => result,
-            Ok(LlmJobResult::Extraction(_)) => {
-                Err("LLM executor returned extraction result for projection request".to_string())
-            }
-            Ok(LlmJobResult::Chat(_)) => {
-                Err("LLM executor returned chat result for projection request".to_string())
-            }
-            Err(e) => Err(format!("LLM executor projection response failed: {}", e)),
+            Ok(LlmJobResult::ProjectionPatch(attempt)) => attempt,
+            Ok(LlmJobResult::Extraction(_)) => ProjectionPatchAttempt {
+                outcome: Err(
+                    "LLM executor returned extraction result for projection request".to_string(),
+                ),
+                attempted_route: None,
+            },
+            Ok(LlmJobResult::Chat(_)) => ProjectionPatchAttempt {
+                outcome: Err("LLM executor returned chat result for projection request".to_string()),
+                attempted_route: None,
+            },
+            Err(e) => ProjectionPatchAttempt {
+                outcome: Err(format!("LLM executor projection response failed: {}", e)),
+                attempted_route: None,
+            },
         }
     }
 
@@ -644,6 +673,12 @@ impl ProjectionCacheContext {
     }
 }
 
+/// Dispatch one projection-patch job and report the route it actually reached
+/// alongside the outcome (seeds audio-graph-862c / audio-graph-7da4: the
+/// failure ledger must be able to name that route, not the session-start
+/// snapshot). `run_projection_patch_dispatch` does the real work and takes an
+/// out-param for the attempted identity so `?` still works inside it; this
+/// wrapper is what every caller (and every existing test) sees.
 fn run_projection_patch(
     handles: &BackendHandles,
     provider: &LlmProvider,
@@ -651,6 +686,31 @@ fn run_projection_patch(
     ledger: &TranscriptLedger,
     sequence: u64,
     created_at_ms: u64,
+) -> ProjectionPatchAttempt {
+    let mut attempted_route = None;
+    let outcome = run_projection_patch_dispatch(
+        handles,
+        provider,
+        job,
+        ledger,
+        sequence,
+        created_at_ms,
+        &mut attempted_route,
+    );
+    ProjectionPatchAttempt {
+        outcome,
+        attempted_route,
+    }
+}
+
+fn run_projection_patch_dispatch(
+    handles: &BackendHandles,
+    provider: &LlmProvider,
+    job: &ProjectionJob,
+    ledger: &TranscriptLedger,
+    sequence: u64,
+    created_at_ms: u64,
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionPatchOutcome, String> {
     let route = authorize_and_budget_route_dispatch(handles, provider)
         .map_err(|error| error.to_string())?;
@@ -663,7 +723,7 @@ fn run_projection_patch(
     };
 
     run_projection_patch_on_route(
-        |messages| projection_on_route(handles, &route, messages, &cache_context),
+        |messages| projection_on_route(handles, &route, messages, &cache_context, attempted_route),
         &messages,
         job,
         ledger,
@@ -673,17 +733,41 @@ fn run_projection_patch(
 }
 
 /// Dispatch a projection prompt on one authorized route.
+///
+/// `attempted_route` is stamped by whichever backend function below resolves
+/// the LIVE route, before that function's fallible network/engine call — so a
+/// subsequent `Err` still leaves the caller able to name the route that was
+/// actually reached. Left `None` when this returns before a live route
+/// resolves (client not configured, or a cross-provider repoint refused by
+/// `AuthorizedRoute::refine_within_authorization`); in both cases nothing was
+/// dialled, so the caller's snapshot-derived fallback is correct there.
+///
+/// This function runs twice per patch attempt (draft, then same-route repair
+/// — see `run_projection_patch_on_route` below), each time against the SAME
+/// `attempted_route` out-param. Every backend function stamps via
+/// `stamp_attempted_route`, which FOLDS the new resolution with whatever the
+/// first call already stamped rather than overwriting it, so a settings save
+/// between the two calls cannot make the first dial's egress disappear.
 fn projection_on_route(
     handles: &BackendHandles,
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     cache: &ProjectionCacheContext,
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionBackendOutput, String> {
     match route.descriptor().blocking_backend {
-        Some(BlockingBackend::NativeLlama) => projection_native(handles, route, messages),
-        Some(BlockingBackend::OpenAiCompatible) => projection_api(handles, route, messages, cache),
-        Some(BlockingBackend::OpenRouter) => projection_openrouter(handles, route, messages, cache),
-        Some(BlockingBackend::MistralRs) => projection_mistralrs(handles, route, messages),
+        Some(BlockingBackend::NativeLlama) => {
+            projection_native(handles, route, messages, attempted_route)
+        }
+        Some(BlockingBackend::OpenAiCompatible) => {
+            projection_api(handles, route, messages, cache, attempted_route)
+        }
+        Some(BlockingBackend::OpenRouter) => {
+            projection_openrouter(handles, route, messages, cache, attempted_route)
+        }
+        Some(BlockingBackend::MistralRs) => {
+            projection_mistralrs(handles, route, messages, attempted_route)
+        }
         None => Err(no_blocking_route_error(route)),
     }
 }
@@ -862,11 +946,34 @@ pub(crate) fn openrouter_route_for_client(
     ))
 }
 
+/// Stamp a newly-resolved live attempt into the shared out-param, folding it
+/// with whatever the FIRST dial already stamped rather than overwriting it.
+///
+/// `run_projection_patch_on_route` invokes the backend function below twice
+/// on the SAME `attempted_route` — once for the draft, once for the
+/// same-route repair — and each invocation re-resolves the live client, so a
+/// mid-job settings save can make the repair dial's identity disagree with
+/// the draft dial's (seed audio-graph-862c / audio-graph-7da4 follow-up,
+/// "two-dial projection job whose live client is repointed... between the
+/// initial call and the repair call"). `AttemptedRouteIdentity::fold` keeps
+/// the max-egress identity across both dials instead of letting whichever
+/// dial happens second silently erase the other's egress.
+fn stamp_attempted_route(
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
+    identity: AttemptedRouteIdentity,
+) {
+    *attempted_route = Some(match attempted_route.take() {
+        Some(previous) => previous.fold(identity),
+        None => identity,
+    });
+}
+
 fn projection_api(
     handles: &BackendHandles,
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     cache: &ProjectionCacheContext,
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionBackendOutput, String> {
     let client = {
         let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
@@ -876,6 +983,16 @@ fn projection_api(
             .clone()
     };
     let live = api_route_for_client(route, &client)?;
+    // Stamped from the LIVE client's endpoint, BEFORE the fallible network
+    // call below, so a failure still names the route actually dialled rather
+    // than the (possibly stale) session-start snapshot `route` was minted
+    // from (seeds audio-graph-862c / audio-graph-7da4). Folded, not
+    // overwritten, so a repair dial that lands on a re-pointed client cannot
+    // erase the draft dial's egress (see `stamp_attempted_route`).
+    stamp_attempted_route(
+        attempted_route,
+        AttemptedRouteIdentity::for_route(live, Some(&client.config().endpoint)),
+    );
     let requested_model = client.config().model.clone();
 
     // Route-driven, not host-substring-driven: an endpoint whose row declares
@@ -937,6 +1054,7 @@ fn projection_openrouter(
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     cache: &ProjectionCacheContext,
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionBackendOutput, String> {
     let client = {
         let guard = handles
@@ -949,6 +1067,15 @@ fn projection_openrouter(
             .clone()
     };
     let live = openrouter_route_for_client(route, &client)?;
+    // OpenRouter has no loopback deployment, so unlike the API route above no
+    // endpoint string is needed to know this is remote. Folded, not
+    // overwritten (see `stamp_attempted_route`) — always a no-op fold here
+    // since every OpenRouter row is cloud, but kept consistent with the other
+    // three backend functions rather than a special-cased overwrite.
+    stamp_attempted_route(
+        attempted_route,
+        AttemptedRouteIdentity::for_route(live, None),
+    );
     let requested_model = client.config().model.clone();
     // Stable-prefix prompt caching (ADR-0025 §2d / seed audio-graph-d77e): mark
     // the cache breakpoint on the stable prefix and route this session's turns to
@@ -1054,7 +1181,17 @@ fn projection_native(
     handles: &BackendHandles,
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionBackendOutput, String> {
+    // No live client to diverge from a snapshot here — the route is the
+    // identity, known before any fallible call. Folded, not overwritten (see
+    // `stamp_attempted_route`) — always a no-op fold since this route is
+    // fixed for the whole job, but kept consistent with the other three
+    // backend functions rather than a special-cased overwrite.
+    stamp_attempted_route(
+        attempted_route,
+        AttemptedRouteIdentity::for_route(route.descriptor(), None),
+    );
     let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
         .as_ref()
@@ -1082,7 +1219,16 @@ fn projection_mistralrs(
     handles: &BackendHandles,
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
+    attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionBackendOutput, String> {
+    // Folded, not overwritten (see `stamp_attempted_route`) — always a no-op
+    // fold since this route is fixed for the whole job, but kept consistent
+    // with the other three backend functions rather than a special-cased
+    // overwrite.
+    stamp_attempted_route(
+        attempted_route,
+        AttemptedRouteIdentity::for_route(route.descriptor(), None),
+    );
     let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
         .as_ref()
@@ -2347,12 +2493,14 @@ mod tests {
             api_key: "sk-route-removal-probe".to_string(),
             model: "probe-model".to_string(),
         };
-        let err = std::thread::spawn(move || {
+        let attempt = std::thread::spawn(move || {
             run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
         })
         .join()
-        .expect("worker thread panic")
-        .expect_err("a refusal is not a usable completion");
+        .expect("worker thread panic");
+        let err = attempt
+            .outcome
+            .expect_err("a refusal is not a usable completion");
 
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -2367,6 +2515,12 @@ mod tests {
                 && !err.contains("Native LLM")
                 && !err.contains("OpenRouter"),
             "no other provider may be named, got: {err}"
+        );
+        // The request reached the wire (and was refused there), so the
+        // attempted route must still be reported for the failure ledger.
+        assert_eq!(
+            attempt.attempted_route.map(|route| route.provider_id),
+            Some("llm.api")
         );
     }
 
@@ -2403,6 +2557,7 @@ mod tests {
         })
         .join()
         .expect("worker thread panic")
+        .outcome
         .expect_err("the same-route repair reproduces the wrong kind");
 
         assert_eq!(
@@ -2445,6 +2600,7 @@ mod tests {
         })
         .join()
         .expect("worker thread panic")
+        .outcome
         .expect("a valid notes draft");
 
         assert_eq!(outcome.patch.provenance.model, "probe-model-turbo");
@@ -2482,7 +2638,9 @@ mod tests {
             model: "gpt-oss-120b".to_string(),
         };
 
-        let err = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, 1, 100)
+        let attempt = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, 1, 100);
+        let err = attempt
+            .outcome
             .expect_err("a re-pointed client must fail closed");
         assert!(err.contains("route.cerebras_direct"), "got: {err}");
         assert!(err.contains("route.openai_compatible"), "got: {err}");
@@ -2491,6 +2649,78 @@ mod tests {
             !err.contains("api.openai.com") && !err.contains("sk-cerebras"),
             "the refusal must stay content-free, got: {err}"
         );
+        // The refusal fires BEFORE the live route resolves, so nothing was
+        // dialled and there is no attempted-route identity to report — the
+        // caller correctly falls back to the (here, still-honest) snapshot.
+        assert!(
+            attempt.attempted_route.is_none(),
+            "a refused, never-dialled dispatch must not report an attempted route"
+        );
+    }
+
+    #[test]
+    fn projection_api_repair_dial_does_not_erase_an_earlier_cloud_stamp() {
+        // Finding: `run_projection_patch_on_route` dials `projection_api`
+        // TWICE (draft, then same-route repair) against the SAME
+        // `attempted_route` out-param, and `projection_api` re-resolves the
+        // LIVE client on each call. Before `stamp_attempted_route` folded
+        // instead of overwrote, a draft dial that reached a cloud endpoint
+        // followed by a repair dial against a client re-pointed to loopback
+        // would have its cloud egress silently erased by the second stamp —
+        // exactly the case a mid-job settings save produces. This drives a
+        // REAL wire call for the second dial (against a loopback mock server)
+        // with the first dial's stamp pre-seeded, proving the fold survives
+        // through `projection_api` itself, not just the pure `fold` unit
+        // tests in `llm::route`.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base, _count) = rt.block_on(spawn_counting_mock(vec![body]));
+
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let messages = projection_patch_prompt_messages(&job, &ledger).expect("prompt");
+        let cache = ProjectionCacheContext {
+            session_id: job.session_id.clone(),
+            cache_breakpoint_message_index: 0,
+            kind: job.kind.clone(),
+        };
+
+        std::thread::spawn(move || {
+            let route = authorize_and_budget_route_dispatch(&handles, &provider)
+                .expect("the loopback endpoint authorizes");
+            // Seed the out-param as if a first (cloud) dial already ran and
+            // stamped it — the exact state a repair dial inherits mid-job.
+            let mut attempted_route = Some(AttemptedRouteIdentity {
+                provider_id: "llm.api",
+                requires_cloud_transfer: true,
+            });
+
+            projection_api(&handles, &route, &messages, &cache, &mut attempted_route)
+                .expect("the loopback mock responds");
+
+            assert_eq!(
+                attempted_route,
+                Some(AttemptedRouteIdentity {
+                    provider_id: "llm.api",
+                    requires_cloud_transfer: true,
+                }),
+                "a real second dial against a loopback client must not erase \
+                 the first dial's cloud stamp"
+            );
+        })
+        .join()
+        .expect("worker thread panic");
     }
 
     // ----- end-to-end through the live worker thread -----------------------
