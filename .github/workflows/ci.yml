@@ -47,7 +47,7 @@ jobs:
     # headroom above that documented cost on 4-vCPU runners.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -110,7 +110,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
       - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
       - run: bun install --frozen-lockfile
       - name: Biome (format + lint)
@@ -134,7 +134,7 @@ jobs:
       # by hand periodically and bump this value.
       CARGO_AUDIT_VERSION: "0.22.2"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -225,7 +225,7 @@ jobs:
     # alone; storage-engine-evidence / Default Tauri smoke: 30 min).
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -275,7 +275,7 @@ jobs:
           - os: windows
             runner: blacksmith-4vcpu-windows-2025
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -354,7 +354,7 @@ jobs:
     outputs:
       matrix: ${{ steps.classify.outputs.matrix }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           fetch-depth: 0
           path: audio-graph
@@ -448,7 +448,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.classify-optional-feature-paths.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -582,7 +582,7 @@ jobs:
       # and the link aborts (CVT1100 / LNK1123). It is scoped to the cargo-test
       # step below ONLY.
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -653,7 +653,7 @@ jobs:
           - os: windows
             runner: blacksmith-4vcpu-windows-2025
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -729,7 +729,7 @@ jobs:
     # native-ML compile cost.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -760,7 +760,7 @@ jobs:
     # so it gets more headroom than the Linux/macOS legs.
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -842,7 +842,7 @@ jobs:
           - os: linux
             runner: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -1096,7 +1096,7 @@ jobs:
           # blacksmith-4vcpu-windows-2025, timeout: 15 } cell once d3d3 resolves
           # the licensing path (or a strictly-FOSS Scream fallback is wired in).
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
