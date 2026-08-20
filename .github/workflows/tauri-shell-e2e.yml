@@ -217,6 +217,41 @@ jobs:
           APP_BINARY_PATH: ${{ github.workspace }}\dist-bin\audio-graph.exe
         run: npx wdio run e2e/wdio.conf.ts
 
+      # The one point where "no lingering audio-graph process" is actually
+      # observable: `@wdio/tauri-service`'s launcher-level `onComplete()` hook
+      # (which kills the embedded app process) runs strictly after `npx wdio
+      # run` exits, in the launcher process -- no step inside e2e/specs/*.e2e.ts
+      # can wait for or see that hook fire (see shell.e2e.ts's case-6 comment).
+      # This step is that check, immediately after the run it's checking.
+      - name: Verify no lingering audio-graph process (linux)
+        if: matrix.os == 'linux'
+        run: |
+          if pgrep -f "${GITHUB_WORKSPACE}/dist-bin/audio-graph$"; then
+            echo "::error::audio-graph process lingers after wdio run exited"
+            exit 1
+          fi
+          echo "no lingering audio-graph process"
+
+      - name: Verify no lingering audio-graph process (macos)
+        if: matrix.os == 'macos'
+        run: |
+          if pgrep -f "${GITHUB_WORKSPACE}/dist-bin/audio-graph$"; then
+            echo "::error::audio-graph process lingers after wdio run exited"
+            exit 1
+          fi
+          echo "no lingering audio-graph process"
+
+      - name: Verify no lingering audio-graph process (windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $out = tasklist /FI "IMAGENAME eq audio-graph.exe" /FO CSV
+          if ($out -match "audio-graph.exe") {
+            Write-Host "::error::audio-graph process lingers after wdio run exited"
+            exit 1
+          }
+          Write-Host "no lingering audio-graph process"
+
       - name: Upload WDIO logs + spec report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
