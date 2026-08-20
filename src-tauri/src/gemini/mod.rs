@@ -559,7 +559,6 @@ impl GeminiLiveClient {
             log::info!("Gemini Live: setup complete");
             connected.store(true, Ordering::SeqCst);
 
-            // Send Connected event
             let _ = event_tx.send(GeminiEvent::Connected);
 
             // Build the audio command channel the caller will push into.
@@ -727,7 +726,6 @@ impl GeminiLiveClient {
             let _ = tx.try_send(AudioCmd::Stop);
         }
 
-        // Emit Disconnected event.
         let _ = self.event_tx.send(GeminiEvent::Disconnected);
 
         // The runtime and task handles are cleaned up on Drop. We don't

@@ -189,7 +189,6 @@ function uniqueSourceIds(ids: readonly (string | undefined)[]): string[] {
   return [...new Set(ids.filter((id): id is string => Boolean(id)))];
 }
 
-// Group audio sources by type
 function getSourceGroup(source: AudioSourceInfo): {
   label: string;
   icon: IconName;
@@ -335,7 +334,6 @@ export default function AudioSourceSelector() {
 
   const filterText = searchFilter.toLowerCase().trim();
 
-  // Group and filter audio sources
   const groupedSources = useMemo(() => {
     const groups = new Map<
       string,
@@ -343,7 +341,6 @@ export default function AudioSourceSelector() {
     >();
 
     for (const source of audioSources) {
-      // Apply search filter
       if (filterText && !source.name.toLowerCase().includes(filterText)) {
         continue;
       }
@@ -364,7 +361,6 @@ export default function AudioSourceSelector() {
     );
   }, [audioSources, filterText]);
 
-  // Filter processes by search text
   const filteredProcesses = useMemo(() => {
     if (!filterText) return processes;
     return processes.filter(

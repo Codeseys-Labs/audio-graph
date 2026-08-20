@@ -1353,7 +1353,6 @@ fn handle_server_message_with_key(
                     .and_then(|c| c.as_f64())
                     .unwrap_or(0.0) as f32;
 
-                // Parse words array
                 let words: Vec<DeepgramWord> = alt
                     .get("words")
                     .and_then(|w| w.as_array())

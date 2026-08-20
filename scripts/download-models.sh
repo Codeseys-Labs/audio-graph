@@ -120,7 +120,6 @@ echo -e "${BOLD}AudioGraph Model Downloader${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Create models directory
 mkdir -p "$MODELS_DIR"
 info "Models directory: ${MODELS_DIR}"
 echo ""

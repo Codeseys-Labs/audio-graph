@@ -217,7 +217,6 @@ impl AudioPipeline {
                 }
             }
 
-            // Add mono samples to resampler input buffer
             state.resampler_input_buffer.extend_from_slice(&mono);
 
             // Feed resampler in exact input_frames_next() batches

@@ -98,7 +98,6 @@ Write-Host 'AudioGraph Model Downloader' -ForegroundColor White
 Write-Host ('=' * 35)
 Write-Host ''
 
-# Create models directory
 if (-not (Test-Path $ModelsDir)) {
     New-Item -ItemType Directory -Path $ModelsDir -Force | Out-Null
     Write-Host "  Created models directory: $ModelsDir" -ForegroundColor Cyan

@@ -4976,7 +4976,6 @@ pub(crate) fn run_deepgram_speech_processor(
             }
         });
 
-    // Mark ASR as running.
     if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
@@ -5429,7 +5428,6 @@ pub(crate) fn run_assemblyai_speech_processor(
             }
         });
 
-    // Mark ASR as running.
     if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
@@ -6048,7 +6046,6 @@ pub(crate) fn run_openai_realtime_speech_processor(
             }
         });
 
-    // Mark ASR as running.
     if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }

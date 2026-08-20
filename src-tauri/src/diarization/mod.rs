@@ -520,12 +520,10 @@ impl DiarizationWorker {
     fn get_or_create_sortformer_speaker(&mut self, sortformer_id: usize) -> usize {
         let target_id = format!("speaker-sf-{}", sortformer_id);
 
-        // Look for existing profile
         if let Some(idx) = self.speakers.iter().position(|s| s.id == target_id) {
             return idx;
         }
 
-        // Create a new profile with letter-based label (A, B, C, D)
         let letter = (b'A' + sortformer_id as u8) as char;
         let color_idx = sortformer_id % SPEAKER_COLORS.len();
 

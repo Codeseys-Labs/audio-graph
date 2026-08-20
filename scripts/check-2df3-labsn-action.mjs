@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import process from "node:process";
 
 const workflowPath = new URL(
     "../.github/workflows/2df3-native-durability.yml",

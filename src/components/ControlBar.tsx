@@ -77,7 +77,6 @@ function ControlBar() {
   const [transcribePending, setTranscribePending] = useState(false);
   const [geminiPending, setGeminiPending] = useState(false);
 
-  // Update elapsed timer every second while capturing
   useEffect(() => {
     if (!isCapturing || captureStartTime === null) {
       setElapsed("00:00");

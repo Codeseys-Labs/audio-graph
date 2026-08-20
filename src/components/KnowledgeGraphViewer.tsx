@@ -335,7 +335,6 @@ function KnowledgeGraphViewer() {
 
       const alpha = isDimmed ? 0.15 : 1;
 
-      // Draw circle
       ctx.beginPath();
       ctx.arc(x, y, r, 0, 2 * Math.PI, false);
       ctx.globalAlpha = alpha;

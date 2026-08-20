@@ -166,7 +166,6 @@ function LiveTranscript() {
     return revisions;
   }, [sessionTranscriptEvents]);
 
-  // Get color for a speaker, with fallback
   const getSpeakerColor = useCallback(
     (speakerId: string | null): string => {
       if (!speakerId) return FALLBACK_COLORS[0];
@@ -197,7 +196,6 @@ function LiveTranscript() {
     }
   }, [segments, asrPartial]);
 
-  // Track scroll position to decide auto-scroll behavior
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;

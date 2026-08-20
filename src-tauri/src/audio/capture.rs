@@ -1715,94 +1715,12 @@ impl AudioCaptureManager {
         log::info!("[capture-{}] Thread exiting", source_id);
         unexpected_exit
     }
-
-    // ----- internal: PipeWire application discovery (Linux only) -----------
-    // NOTE: This function is superseded by rsac::list_audio_sources() which
-    // handles PipeWire discovery cross-platform. Kept for reference only.
-
-    /// Discover PipeWire audio client applications by parsing `pw-dump` JSON.
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
-    fn list_pipewire_applications() -> Result<Vec<PipeWireApp>, String> {
-        let output = std::process::Command::new("pw-dump")
-            .output()
-            .map_err(|e| format!("Failed to run pw-dump: {}", e))?;
-
-        if !output.status.success() {
-            return Err(format!("pw-dump exited with status {}", output.status));
-        }
-
-        let json_str = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 from pw-dump: {}", e))?;
-
-        let nodes: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("Failed to parse pw-dump JSON: {}", e))?;
-
-        let mut apps: Vec<PipeWireApp> = Vec::new();
-        let mut seen_pids = std::collections::HashSet::new();
-
-        if let Some(arr) = nodes.as_array() {
-            for node in arr {
-                // We only care about PipeWire nodes that are audio output streams.
-                let media_class = node
-                    .pointer("/info/props/media.class")
-                    .and_then(|v| v.as_str());
-
-                if media_class != Some("Stream/Output/Audio") {
-                    continue;
-                }
-
-                let app_name = node
-                    .pointer("/info/props/application.name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-
-                let pid_str = node
-                    .pointer("/info/props/application.process.id")
-                    .and_then(|v| v.as_str());
-
-                let pid: u32 = match pid_str {
-                    Some(s) => match s.parse() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    },
-                    None => continue,
-                };
-
-                // Deduplicate by PID (an app may open multiple streams).
-                if seen_pids.insert(pid) {
-                    apps.push(PipeWireApp {
-                        id: pid.to_string(),
-                        name: app_name,
-                        pid,
-                    });
-                }
-            }
-        }
-
-        Ok(apps)
-    }
 }
 
 impl Default for AudioCaptureManager {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ---------------------------------------------------------------------------
-// PipeWire helpers (Linux)
-// ---------------------------------------------------------------------------
-
-/// Metadata for a PipeWire audio application discovered via `pw-dump`.
-/// NOTE: Superseded by rsac::AudioSource. Kept for reference.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-struct PipeWireApp {
-    id: String,
-    name: String,
-    pid: u32,
 }
 
 #[cfg(test)]
