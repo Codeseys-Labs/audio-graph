@@ -29,6 +29,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog_command": "list_available_models",
     "source_policy": "multi_source_independent",
     "event_semantics": "transcript_final_only",
+    "stt_fidelity": {
+      "revision_semantics": "final_only",
+      "timing": "app_estimated",
+      "confidence": "unavailable",
+      "turn": "unavailable",
+      "speaker": "unavailable",
+      "channel": "unavailable"
+    },
     "settings_groups": [
       "basic",
       "model_catalog"
@@ -113,6 +121,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog_command": "list_openai_compatible_llm_models_cmd",
     "source_policy": "multi_source_independent",
     "event_semantics": "transcript_final_only",
+    "stt_fidelity": {
+      "revision_semantics": "final_only",
+      "timing": "app_estimated",
+      "confidence": "unavailable",
+      "turn": "unavailable",
+      "speaker": "unavailable",
+      "channel": "unavailable"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -202,6 +218,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "AWS Transcribe streaming",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -289,6 +313,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog_command": "list_deepgram_models_cmd",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "provider_exact",
+      "confidence": "provider",
+      "turn": "provider",
+      "speaker": "provider",
+      "channel": "unavailable"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -377,6 +409,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "AssemblyAI streaming",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -476,6 +516,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Sherpa-ONNX streaming",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog"
@@ -598,6 +646,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Moonshine local streaming",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog"
@@ -692,6 +748,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "gpt-realtime-whisper",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -775,6 +839,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog_command": "list_soniox_models_cmd",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -858,6 +930,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "solaria-1",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -938,6 +1018,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "enhanced",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1018,6 +1106,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "scribe_v2_realtime",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1098,6 +1194,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "machine_v2",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1177,6 +1281,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "multi_source_mixed",
     "source_policy_label": "Google Speech-to-Text v2 streaming",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1276,6 +1388,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "multi_source_mixed",
     "source_policy_label": "Azure Speech SDK conversation stream",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1382,6 +1502,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "xAI STT watch metadata",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1468,6 +1596,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "NIM/Together deployment profile watch metadata",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1573,6 +1709,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Inworld STT watch metadata",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1657,6 +1801,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Smallest.ai Pulse watch metadata",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1741,6 +1893,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Gradium STT watch metadata",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1825,6 +1985,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Mistral Voxtral realtime watch metadata",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -1909,6 +2077,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "DashScope/Qwen regional endpoint watch metadata",
     "event_semantics": "transcript_partial_final",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",
@@ -2009,6 +2185,14 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "source_policy": "single_session",
     "source_policy_label": "Cartesia Ink-2 auto/manual STT watch metadata",
     "event_semantics": "transcript_partial_final_turns",
+    "stt_fidelity": {
+      "revision_semantics": "partial_and_final",
+      "timing": "unverified",
+      "confidence": "unverified",
+      "turn": "unverified",
+      "speaker": "unverified",
+      "channel": "unverified"
+    },
     "settings_groups": [
       "basic",
       "model_catalog",

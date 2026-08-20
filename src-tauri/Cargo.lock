@@ -598,6 +598,7 @@ dependencies = [
  "llama-cpp-2",
  "log",
  "mistralrs",
+ "nix 0.31.3",
  "parakeet-rs",
  "petgraph",
  "rayon",
@@ -640,9 +641,12 @@ dependencies = [
 name = "audio-graph-ipc-contract"
 version = "0.1.0-rc.1"
 dependencies = [
+ "hex",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1348,7 +1352,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2303,7 +2307,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "windows 0.62.2",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -4903,7 +4907,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -6561,7 +6565,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
  "libc",
  "objc2",
  "objc2-core-audio",
@@ -6576,11 +6579,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
 dependencies = [
- "bitflags 2.13.0",
- "block2",
  "objc2",
- "objc2-audio-toolbox",
- "objc2-core-audio-types",
  "objc2-foundation",
 ]
 
@@ -8365,24 +8364,23 @@ dependencies = [
 
 [[package]]
 name = "rsac"
-version = "0.4.1"
-source = "git+https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git?rev=7956e6ef24a44672d502e72b0500efb27530e3b9#7956e6ef24a44672d502e72b0500efb27530e3b9"
+version = "0.4.4"
+source = "git+https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git?rev=ea2019bba217cab695d45696bc2ca25430b23dc2#ea2019bba217cab695d45696bc2ca25430b23dc2"
 dependencies = [
  "block2",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "coreaudio-rs",
  "coreaudio-sys",
+ "dispatch2",
  "futures-core",
  "hound",
- "jni-sys 0.3.1",
  "libc",
  "libspa",
  "libspa-sys",
  "log",
  "objc2",
  "objc2-app-kit",
- "objc2-avf-audio",
  "objc2-foundation",
  "pipewire",
  "pkg-config",
@@ -10632,7 +10630,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
+ "toml 0.9.12+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid 1.23.4",
@@ -10657,7 +10655,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

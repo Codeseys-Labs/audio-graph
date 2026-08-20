@@ -67,16 +67,16 @@ live-audio-smoke = []
 # composes with `sherpa-streaming`. ADR-0017.
 diarization-clustering = ["dep:sherpa-onnx"]
 
-# Audio capture (rsac v0.4.1). rsac is not published on crates.io, so Cargo
-# pins the full commit peeled from the official v0.4.1 tag. This manifest plus
+# Audio capture (rsac v0.4.4). rsac is not published on crates.io, so Cargo
+# pins the full commit peeled from the official v0.4.4 tag. This manifest plus
 # the committed lockfile is the build/release source of truth. Contributors
 # developing both repositories may use an explicit, untracked local [patch]
 # override; a sibling checkout is never selected implicitly.
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "7956e6ef24a44672d502e72b0500efb27530e3b9", default-features = false, features = ["feat_linux"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_linux"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "7956e6ef24a44672d502e72b0500efb27530e3b9", default-features = false, features = ["feat_windows"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_windows"] }
 # SID-native owner-only ACL hardening (seed 403d). Direct dep so `fs_util` can
 # resolve the current process token SID and call SetNamedSecurityInfoW without
 # shelling out to `icacls`/`%USERNAME%`. Pinned to 0.62.2 — the exact version
@@ -91,7 +91,10 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "7956e6ef24a44672d502e72b0500efb27530e3b9", default-features = false, features = ["feat_macos"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_macos"] }
+# Safe descriptor-bound mounted-filesystem identity for canonical durability.
+# Target-only so Linux and Windows retain their existing dependency surface.
+nix = { version = "0.31.3", features = ["fs"] }
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.

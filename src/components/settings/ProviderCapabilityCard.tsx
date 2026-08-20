@@ -10,7 +10,10 @@
  */
 
 import type { ProviderDescriptor } from "../../types";
-import { providerCatalogSummary } from "../ProviderReadinessPanel";
+import {
+  ProviderSttFidelityDetails,
+  providerCatalogSummary,
+} from "../ProviderReadinessPanel";
 import {
   modelCatalogForProvider,
   providerCapabilityCredentialLabel,
@@ -313,6 +316,17 @@ export default function ProviderCapabilityCard({
       <p className="settings-provider-capability-card__readiness">
         {readiness?.message ?? "No readiness check has run for this provider."}
       </p>
+
+      {selected && (
+        <ProviderSttFidelityDetails
+          fidelity={readiness?.effective_stt_fidelity}
+          regionLabel={t(
+            "settings.providerReadiness.fidelity.regionLabel.selectedCapability",
+            { provider: descriptor.display_name },
+          )}
+          t={t}
+        />
+      )}
 
       <div className="settings-provider-capability-card__actions">
         {selectable && providerRoute ? (

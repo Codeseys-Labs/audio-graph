@@ -45,6 +45,12 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0036] | Derive Session Finalization State from Durable Barriers | accepted | Implementation blocked on 90f3/8e73; maintainer-decided via wayfinder grilling | 2026-08-18 |
 | [0037] | Admit Session Memory Items Through a Layered Claim-Class Evidence Table | accepted | Extends ADR-0034 discipline to knowledge claims; validator ships after ADR-0038's fallback removal | 2026-08-18 |
 | [0038] | Route LLM Operations Through a Single-Skin Named Route Table | accepted | Fallback removal precedes ADR-0037's validator | 2026-08-18 |
+| [0039] | Let a Session Abandon Its Own Staged Manifest Temporary | accepted | Refines ADR-0044 decision item 3's temporary-removal ownership scope; supersedes none; seed `audio-graph-3cf2` | 2026-08-18 |
+| [0040] | Select the Checked-Open Branch from Observed Control-Plane Absence | accepted | Narrows ADR-0044 item 5's branch selection; **expires when a v2 writer is activated**; seed `audio-graph-e8e7` | 2026-08-19 |
+| [0041] | Keep Versioned Speech Revisions in One Canonical Transcript Stream | accepted | Refines ADR-0024 and ADR-0027; relates to ADR-0031 and ADR-0042 | 2026-08-14 |
+| [0042] | Version Projection Basis Hashes by Speech-Revision Semantics | accepted | Refines ADR-0031; depends on ADR-0024, ADR-0027, and accepted ADR-0041 | 2026-08-14 |
+| [0043] | Freeze the Canonical Event Stream Registry | accepted | Refines ADR-0027; freezes canonical event-domain IDs and outer schema v1 | 2026-07-10 |
+| [0044] | Keep the Session Control Plane in the Flat Artifact Root | accepted | Refines ADR-0027 and ADR-0041; relates to ADR-0043; item 3 scoped by ADR-0039 and item 5 narrowed by ADR-0040; supersedes none | 2026-08-16 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -84,6 +90,44 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0036]: 0036-derive-session-finalization-state-from-durable-barriers.md
 [0037]: 0037-admit-session-memory-items-through-a-layered-claim-class-evidence-table.md
 [0038]: 0038-route-llm-operations-through-a-single-skin-named-route-table.md
+[0039]: 0039-let-a-session-abandon-its-own-staged-manifest-temporary.md
+[0040]: 0040-select-the-checked-open-branch-from-observed-control-plane-absence.md
+[0041]: 0041-keep-versioned-speech-revisions-in-one-canonical-stream.md
+[0042]: 0042-version-projection-basis-hashes-by-speech-semantics.md
+[0043]: 0043-freeze-canonical-event-stream-registry.md
+[0044]: 0044-keep-session-control-plane-in-the-flat-artifact-root.md
+
+> **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
+> non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
+> references are historical and do not name the current speech-semantics
+> records, which are ADR-0041 and ADR-0042 (numbered 0035 and 0036 before the
+> renumbering below). See the
+> [Wave 7B durability plan](../agentic-runs/2026-08-14-session-memory-continuation/audio-graph-8e73-wave7b-plan.md)
+> for the exact blob lineage and implementation boundary.
+
+> **Renumbering note (seed `audio-graph-c306`, 2026-08-18):** this branch and
+> master independently issued numbers 0035-0038 to four entirely different
+> records. Per the convention that the later-merged branch renumbers, and
+> because master is trunk and merges first, this branch's four records moved:
+>
+> | Was | Now | Record |
+> | --- | --- | --- |
+> | 0035 | [0041] | Keep Versioned Speech Revisions in One Canonical Transcript Stream |
+> | 0036 | [0042] | Version Projection Basis Hashes by Speech-Revision Semantics |
+> | 0037 | [0043] | Freeze the Canonical Event Stream Registry |
+> | 0038 | [0044] | Keep the Session Control Plane in the Flat Artifact Root |
+>
+> ADR-0039 and ADR-0040 never collided and kept their numbers. Renumbering
+> changed each file's name and its `# ADR-NNNN:` heading, and therefore its Git
+> blob hash. Two consequences for readers of older documents:
+>
+> - Run records under `docs/agentic-runs/` keep their recorded blob hashes and
+>   the pre-renumber paths inside fenced evidence blocks, because those blocks
+>   reproduce commands and output as they actually ran. Their prose names each
+>   record by its current number.
+> - ADR-0043 is immutable archival content restored from a non-ancestor
+>   canonical-log lineage. Its internal ADR-0035 and ADR-0036 references were
+>   deliberately left alone; see the lineage warning above.
 
 ## Status legend
 

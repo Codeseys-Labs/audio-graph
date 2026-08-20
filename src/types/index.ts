@@ -86,6 +86,24 @@ export type {
 
 export type SegmentId = string;
 
+// Rust-owned Speech Span Revision v2 contract. The current legacy
+// AsrSpanRevisionEvent below remains the display/event compatibility projection
+// until audio-graph-48de activates observation admission in the adapters.
+export type {
+  SpeechChannelFidelity,
+  SpeechConfidence,
+  SpeechSpanRevision,
+  SpeechSpanRevisionRef,
+  SpeechSpanSourceOrder,
+  SpeechSpanStability,
+  SpeechSpeakerFidelity,
+  SpeechSpeakerValue,
+  SpeechTiming,
+  SpeechTimingPrecision,
+  SpeechTurnFidelity,
+  SpeechTurnValue,
+} from "../generated/speechSpanRevision";
+
 export type SourceRecoveryIssueKind =
   | "unselected"
   | "unavailable"
@@ -1240,6 +1258,27 @@ export interface LocalModelRequirement {
  * This is the intended source of truth for future provider settings rendering,
  * readiness checks, and provider expansion work.
  */
+export type SttRevisionSemantics = "final_only" | "partial_and_final";
+
+export type SttTimingFidelity =
+  | "unavailable"
+  | "app_estimated"
+  | "provider_coarse"
+  | "provider_exact"
+  | "unverified";
+
+export type SttProviderEvidence = "unavailable" | "provider" | "unverified";
+
+/** Static provider capability metadata; per-span v2 evidence is authoritative. */
+export interface ProviderSttFidelityDescriptor {
+  revision_semantics: SttRevisionSemantics;
+  timing: SttTimingFidelity;
+  confidence: SttProviderEvidence;
+  turn: SttProviderEvidence;
+  speaker: SttProviderEvidence;
+  channel: SttProviderEvidence;
+}
+
 export interface ProviderDescriptor {
   id: string;
   display_name: string;
@@ -1267,6 +1306,7 @@ export interface ProviderDescriptor {
   source_policy?: ProviderSourcePolicy;
   source_policy_label?: string;
   event_semantics?: ProviderEventSemantics;
+  stt_fidelity?: ProviderSttFidelityDescriptor;
   settings_groups: ProviderSettingsGroup[];
   audio_input?: ProviderAudioInputDescriptor;
   lifecycle: ProviderLifecycleDescriptor;
@@ -1311,6 +1351,47 @@ export interface ProviderRuntimeReadiness {
   model_id?: string | null;
 }
 
+export type SttFidelityOrigin =
+  | "unavailable"
+  | "app"
+  | "provider"
+  | "unverified";
+
+export type SttFidelityDegradation =
+  | "final_only_revisions"
+  | "app_estimated_timing"
+  | "timing_unavailable"
+  | "confidence_unavailable"
+  | "turn_unavailable"
+  | "speaker_unavailable"
+  | "speaker_disabled_by_configuration"
+  | "speaker_unavailable_for_selected_model"
+  | "speaker_remapped_by_configuration"
+  | "channel_unavailable"
+  | "capability_unverified";
+
+export interface SttTurnDetectionCapabilities {
+  speech_start: boolean;
+  speech_final: boolean;
+  endpointing_configured: boolean;
+  utterance_end: boolean;
+  end_of_turn: boolean;
+  eager_end_of_turn: boolean;
+  turn_resume: boolean;
+}
+
+/** Selected-config readiness metadata; per-span v2 evidence is authoritative. */
+export interface EffectiveSttFidelity {
+  revision_semantics: SttRevisionSemantics;
+  timing: SttTimingFidelity;
+  confidence: SttFidelityOrigin;
+  turn: SttFidelityOrigin;
+  speaker: SttFidelityOrigin;
+  channel: SttFidelityOrigin;
+  turn_detection: SttTurnDetectionCapabilities;
+  degradations: SttFidelityDegradation[];
+}
+
 export interface ProviderReadiness {
   provider_id: string;
   status: ProviderReadinessStatus;
@@ -1326,6 +1407,7 @@ export interface ProviderReadiness {
   language_catalog?: ProviderModelCatalogItem[];
   openrouter_models?: OpenRouterModel[];
   runtime?: ProviderRuntimeReadiness | null;
+  effective_stt_fidelity?: EffectiveSttFidelity;
 }
 
 /**

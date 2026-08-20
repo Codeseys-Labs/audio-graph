@@ -55,6 +55,7 @@ pub mod ontology;
 pub mod openai_realtime;
 pub mod persistence;
 pub mod playback;
+pub mod projection_basis_hash_v2;
 pub mod projection_data_movement;
 pub mod projection_eval;
 pub mod projection_llm;
@@ -67,6 +68,7 @@ pub mod sessions;
 pub mod settings;
 pub mod speak_aloud;
 pub mod speech;
+pub mod speech_span_revision;
 pub mod state;
 pub mod timeline;
 #[cfg(desktop)]

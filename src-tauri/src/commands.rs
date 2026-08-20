@@ -319,6 +319,63 @@ pub struct ProviderRuntimeReadiness {
     pub model_id: Option<String>,
 }
 
+/// Origin of a value-free readiness capability. These names deliberately
+/// match the Speech Span Revision v2 evidence vocabulary, while remaining
+/// capability metadata rather than claiming evidence for an individual span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttFidelityOrigin {
+    Unavailable,
+    App,
+    Provider,
+    Unverified,
+}
+
+/// Typed reasons that the selected STT configuration cannot provide the
+/// registry's maximum declared fidelity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttFidelityDegradation {
+    FinalOnlyRevisions,
+    AppEstimatedTiming,
+    TimingUnavailable,
+    ConfidenceUnavailable,
+    TurnUnavailable,
+    SpeakerUnavailable,
+    SpeakerDisabledByConfiguration,
+    SpeakerUnavailableForSelectedModel,
+    SpeakerRemappedByConfiguration,
+    ChannelUnavailable,
+    CapabilityUnverified,
+}
+
+/// Provider-neutral turn signals enabled by the selected STT configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SttTurnDetectionCapabilities {
+    pub speech_start: bool,
+    pub speech_final: bool,
+    pub endpointing_configured: bool,
+    pub utterance_end: bool,
+    pub end_of_turn: bool,
+    pub eager_end_of_turn: bool,
+    pub turn_resume: bool,
+}
+
+/// Effective, selected-configuration STT fidelity returned with readiness.
+/// This is intentionally separate from registry-declared maximum fidelity and
+/// never supersedes authoritative per-span v2 evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EffectiveSttFidelity {
+    pub revision_semantics: crate::provider_registry::SttRevisionSemantics,
+    pub timing: crate::provider_registry::SttTimingFidelity,
+    pub confidence: SttFidelityOrigin,
+    pub turn: SttFidelityOrigin,
+    pub speaker: SttFidelityOrigin,
+    pub channel: SttFidelityOrigin,
+    pub turn_detection: SttTurnDetectionCapabilities,
+    pub degradations: Vec<SttFidelityDegradation>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProviderReadinessProbeResult {
     message: String,
@@ -351,6 +408,182 @@ pub struct ProviderReadiness {
     pub openrouter_models: Vec<OpenRouterModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ProviderRuntimeReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_stt_fidelity: Option<EffectiveSttFidelity>,
+}
+
+fn stt_fidelity_origin(
+    evidence: crate::provider_registry::SttProviderEvidence,
+) -> SttFidelityOrigin {
+    match evidence {
+        crate::provider_registry::SttProviderEvidence::Unavailable => {
+            SttFidelityOrigin::Unavailable
+        }
+        crate::provider_registry::SttProviderEvidence::Provider => SttFidelityOrigin::Provider,
+        crate::provider_registry::SttProviderEvidence::Unverified => SttFidelityOrigin::Unverified,
+    }
+}
+
+fn push_static_stt_degradations(
+    fidelity: &crate::provider_registry::ProviderSttFidelityDescriptor,
+    degradations: &mut Vec<SttFidelityDegradation>,
+) {
+    use crate::provider_registry::{SttProviderEvidence, SttRevisionSemantics, SttTimingFidelity};
+
+    if fidelity.revision_semantics == SttRevisionSemantics::FinalOnly {
+        degradations.push(SttFidelityDegradation::FinalOnlyRevisions);
+    }
+    match fidelity.timing {
+        SttTimingFidelity::AppEstimated => {
+            degradations.push(SttFidelityDegradation::AppEstimatedTiming);
+        }
+        SttTimingFidelity::Unavailable => {
+            degradations.push(SttFidelityDegradation::TimingUnavailable);
+        }
+        SttTimingFidelity::Unverified => {
+            degradations.push(SttFidelityDegradation::CapabilityUnverified);
+        }
+        SttTimingFidelity::ProviderCoarse | SttTimingFidelity::ProviderExact => {}
+    }
+    for (evidence, degradation) in [
+        (
+            fidelity.confidence,
+            SttFidelityDegradation::ConfidenceUnavailable,
+        ),
+        (fidelity.turn, SttFidelityDegradation::TurnUnavailable),
+        (fidelity.speaker, SttFidelityDegradation::SpeakerUnavailable),
+        (fidelity.channel, SttFidelityDegradation::ChannelUnavailable),
+    ] {
+        match evidence {
+            SttProviderEvidence::Unavailable => degradations.push(degradation),
+            SttProviderEvidence::Unverified
+                if !degradations.contains(&SttFidelityDegradation::CapabilityUnverified) =>
+            {
+                degradations.push(SttFidelityDegradation::CapabilityUnverified);
+            }
+            SttProviderEvidence::Provider | SttProviderEvidence::Unverified => {}
+        }
+    }
+}
+
+fn effective_stt_fidelity(
+    descriptor: &crate::provider_registry::ProviderDescriptor,
+    settings: &crate::settings::AppSettings,
+) -> Option<EffectiveSttFidelity> {
+    let declared = descriptor.stt_fidelity?;
+    if crate::provider_registry::descriptor_for_asr_provider(&settings.asr_provider).id
+        != descriptor.id
+    {
+        return None;
+    }
+
+    let mut degradations = Vec::new();
+    push_static_stt_degradations(&declared, &mut degradations);
+    let mut effective = EffectiveSttFidelity {
+        revision_semantics: declared.revision_semantics,
+        timing: declared.timing,
+        confidence: stt_fidelity_origin(declared.confidence),
+        turn: stt_fidelity_origin(declared.turn),
+        speaker: stt_fidelity_origin(declared.speaker),
+        channel: stt_fidelity_origin(declared.channel),
+        turn_detection: SttTurnDetectionCapabilities {
+            end_of_turn: declared.turn == crate::provider_registry::SttProviderEvidence::Provider,
+            ..SttTurnDetectionCapabilities::default()
+        },
+        degradations,
+    };
+
+    if descriptor.id != "asr.deepgram" {
+        return Some(effective);
+    }
+
+    // Resolve readiness from the same authoritative global diarization policy
+    // that startup applies before constructing the Deepgram runtime.
+    let mut selected_asr_provider = settings.asr_provider.clone();
+    let _ = selected_asr_provider.apply_diarization_settings(&settings.diarization);
+    let crate::settings::AsrProvider::DeepgramStreaming {
+        model,
+        enable_diarization,
+        endpointing_ms,
+        utterance_end_ms,
+        vad_events,
+        eot_threshold,
+        eager_eot_threshold,
+        max_speakers,
+        ..
+    } = &selected_asr_provider
+    else {
+        return None;
+    };
+    let flux = model.trim().to_ascii_lowercase().starts_with("flux-");
+    effective.degradations.clear();
+    // Deepgram is currently dispatched as mono (`channels=1`) and the adapter
+    // does not preserve channel attribution.
+    effective.channel = SttFidelityOrigin::Unavailable;
+    effective
+        .degradations
+        .push(SttFidelityDegradation::ChannelUnavailable);
+    effective.turn_detection = if flux {
+        let eager = *eager_eot_threshold > 0.0 && *eager_eot_threshold <= *eot_threshold;
+        SttTurnDetectionCapabilities {
+            speech_start: true,
+            speech_final: false,
+            endpointing_configured: false,
+            utterance_end: false,
+            end_of_turn: true,
+            eager_end_of_turn: eager,
+            turn_resume: eager,
+        }
+    } else {
+        SttTurnDetectionCapabilities {
+            speech_start: *vad_events,
+            // `0` leaves Deepgram Nova's provider endpointing default in place;
+            // it does not disable `speech_final` events.
+            speech_final: true,
+            endpointing_configured: *endpointing_ms > 0,
+            utterance_end: *utterance_end_ms > 0,
+            end_of_turn: false,
+            eager_end_of_turn: false,
+            turn_resume: false,
+        }
+    };
+    effective.turn = if effective.turn_detection.speech_start
+        || effective.turn_detection.speech_final
+        || effective.turn_detection.utterance_end
+        || effective.turn_detection.end_of_turn
+        || effective.turn_detection.eager_end_of_turn
+        || effective.turn_detection.turn_resume
+    {
+        SttFidelityOrigin::Provider
+    } else {
+        SttFidelityOrigin::Unavailable
+    };
+    if flux {
+        effective.revision_semantics = crate::provider_registry::SttRevisionSemantics::FinalOnly;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::FinalOnlyRevisions);
+        effective.speaker = SttFidelityOrigin::Unavailable;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::SpeakerUnavailableForSelectedModel);
+    } else if *enable_diarization {
+        effective.speaker = if *max_speakers == 0 {
+            SttFidelityOrigin::Provider
+        } else {
+            effective
+                .degradations
+                .push(SttFidelityDegradation::SpeakerRemappedByConfiguration);
+            SttFidelityOrigin::App
+        };
+    } else {
+        effective.speaker = SttFidelityOrigin::Unavailable;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::SpeakerDisabledByConfiguration);
+    }
+
+    Some(effective)
 }
 
 fn unix_millis() -> u64 {
@@ -6401,12 +6634,67 @@ fn record_projection_replay_stage_latency(
     kind_metrics.max_ms = kind_metrics.max_ms.max(latency_ms);
 }
 
+fn strict_speaker_history(
+    read: crate::persistence::canonical_reader::StrictCanonicalRead<
+        crate::projections::DiarizationSpanRevision,
+    >,
+) -> Option<Vec<crate::projections::DiarizationSpanRevision>> {
+    match read {
+        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => None,
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => Some(
+            snapshot
+                .records
+                .into_iter()
+                .map(|record| record.payload)
+                .collect(),
+        ),
+    }
+}
+
+/// Floor-admitted like [`read_session_transcript_snapshot`]: every canonical
+/// stream this reads is v1-only, so an unadmitted v2 Session would replay v2
+/// revisions through v1 logic. `maximum_supported` is v1 for that reason.
 fn projection_replay_report_for_session(session_id: &str) -> AppResult<ProjectionReplayReport> {
     validate_session_id(session_id).map_err(AppError::from)?;
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| projection_replay_report_for_admitted_session(session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
 
+/// Collapse an admission refusal into `AppError` WITHOUT flattening the reader's
+/// own typed error: `ContentReader` carries the `AppError` the closure returned,
+/// so stringifying the whole enum would turn every real failure into `Internal`.
+fn unadmitted_session_error(
+    error: crate::persistence::session_semantics::GuardedSessionOpenError<AppError>,
+) -> AppError {
+    match error {
+        crate::persistence::session_semantics::GuardedSessionOpenError::ContentReader(inner) => {
+            inner
+        }
+        refusal => AppError::SessionInvalid {
+            reason: refusal.to_string(),
+        },
+    }
+}
+
+fn projection_replay_report_for_admitted_session(
+    session_id: &str,
+) -> AppResult<ProjectionReplayReport> {
     let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let projection_events = repository.load_projection_patches(session_id)?;
+    let transcript_events = repository
+        .load_transcript_event_stream(session_id)?
+        .into_payloads();
+    let speaker_events =
+        strict_speaker_history(repository.load_speaker_revision_stream(session_id)?);
+    let projection_events = repository
+        .load_projection_patch_stream(session_id)?
+        .into_payloads();
     let stored_notes = repository.load_materialized_notes(session_id)?;
     let stored_graph = repository.load_materialized_graph(session_id)?;
 
@@ -6417,9 +6705,10 @@ fn projection_replay_report_for_session(session_id: &str) -> AppResult<Projectio
         };
 
     let (projection_replay_error, projection_history_validation, replayed_state) =
-        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
             session_id,
             transcript_events.clone(),
+            speaker_events,
             projection_events.clone(),
         ) {
             Ok(replay) => (
@@ -6547,48 +6836,128 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
     crate::sessions::validate_session_id(session_id)
 }
 
-fn indexed_session_paths(
+fn indexed_session_paths_resolve_only(
     session_id: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     validate_session_id(session_id)?;
-    if let Some(metadata) = crate::sessions::find_session(session_id) {
-        return Ok(crate::sessions::session_file_paths(&metadata));
+    if let Some(metadata) = crate::sessions::find_session_resolve_only(session_id) {
+        let root = crate::user_data::resolve_data_root()?;
+        let transcript = if metadata.transcript_path.trim().is_empty() {
+            root.join("transcripts").join(format!("{session_id}.jsonl"))
+        } else {
+            std::path::PathBuf::from(metadata.transcript_path)
+        };
+        let graph = if metadata.graph_path.trim().is_empty() {
+            root.join("graphs").join(format!("{session_id}.json"))
+        } else {
+            std::path::PathBuf::from(metadata.graph_path)
+        };
+        return Ok((transcript, graph));
     }
+    let root = crate::user_data::resolve_data_root()?;
     Ok((
-        crate::user_data::transcript_path(session_id)?,
-        crate::user_data::graph_path(session_id)?,
+        root.join("transcripts").join(format!("{session_id}.jsonl")),
+        root.join("graphs").join(format!("{session_id}.json")),
     ))
 }
 
-fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
-    validate_session_id(session_id)?;
-    let transcript_events = FileMemoryRepository::user_data().load_transcript_events(session_id)?;
-    if !transcript_events.is_empty() {
-        let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
-            .map_err(|error| {
-                format!("Transcript replay failed for session {session_id}: {error:?}")
-            })?;
-        return Ok(crate::projections::derive_legacy_transcript_segments(
-            &ledger,
-        ));
-    }
+struct SessionTranscriptSnapshot {
+    transcript: Vec<TranscriptSegment>,
+    events: Vec<crate::projections::TranscriptEvent>,
+}
 
-    let (path, _) = indexed_session_paths(session_id)?;
+fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
+    let (path, _) = indexed_session_paths_resolve_only(session_id)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
     let mut segments = Vec::new();
-    for line in contents.lines() {
+    for (line_index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<TranscriptSegment>(line) {
-            Ok(seg) => segments.push(seg),
-            Err(e) => log::warn!("Skipping malformed transcript line: {}", e),
-        }
+        let segment = serde_json::from_str::<TranscriptSegment>(line).map_err(|_| {
+            format!(
+                "Legacy transcript row {} is malformed; refusing incomplete transcript",
+                line_index + 1
+            )
+        })?;
+        segments.push(segment);
     }
     Ok(segments)
+}
+
+/// Read one past Session's transcript through the guarded compatibility-floor
+/// admission seam (ADR-0044 §5, seed audio-graph-e8e7).
+///
+/// This is the shared canonical-versus-legacy fork for `load_session_impl`,
+/// `load_session_transcript`, and `session_export_bundle`, so gating it gates the
+/// transcript read of all three. Both branches of the fork run INSIDE the admitted
+/// floor: neither the canonical replay nor the legacy JSONL fallback can observe
+/// bytes of a Session whose floor this reader does not support.
+///
+/// CONSTRAINT the code cannot show: this is NOT every production read of canonical
+/// Session content. `projection_replay_report_for_session` and `session_timeline`
+/// call `load_transcript_event_stream` with no floor check, and the
+/// speaker-revision / projection-patch / materialized / live-assist reads inside
+/// `load_session_impl` and `session_export_bundle` happen outside this closure.
+/// Harmless only while nothing writes v2; the seed that activates a v2 writer owns
+/// routing them through here (report residual R8).
+///
+/// `maximum_supported` is v1 because this reader understands only v1 transcript
+/// semantics. Raising it belongs to whichever workstream activates v2 transcript
+/// revisions.
+fn read_session_transcript_snapshot(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<SessionTranscriptSnapshot, String> {
+    validate_session_id(session_id)?;
+    let data_root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| read_admitted_session_transcript_snapshot(repository, session_id),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_admitted_session_transcript_snapshot(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<SessionTranscriptSnapshot, String> {
+    match repository.load_transcript_event_stream(session_id)? {
+        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
+            Ok(SessionTranscriptSnapshot {
+                transcript: read_legacy_session_transcript(session_id)?,
+                events: Vec::new(),
+            })
+        }
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => {
+            let events: Vec<_> = snapshot
+                .records
+                .into_iter()
+                .map(|record| record.payload)
+                .collect();
+            let ledger = crate::projections::TranscriptLedger::replay(session_id, events.clone())
+                .map_err(|error| {
+                format!("Transcript replay failed for session {session_id}: {error:?}")
+            })?;
+            Ok(SessionTranscriptSnapshot {
+                transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
+                events,
+            })
+        }
+    }
+}
+
+fn session_has_any_artifact(session_id: &str) -> Result<bool, String> {
+    Ok(
+        crate::sessions::session_artifact_paths_for_id_resolve_only(session_id)?
+            .iter()
+            .any(|path| path.exists()),
+    )
 }
 
 /// Load a past session's transcript from disk. Replays the canonical revision
@@ -6597,15 +6966,14 @@ fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, S
 #[tauri::command]
 pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
     validate_session_id(&session_id)?;
-    if !crate::sessions::session_artifact_paths_for_id(&session_id)
-        .iter()
-        .any(|path| path.exists())
-    {
+    if !session_has_any_artifact(&session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {session_id}"),
         });
     }
-    read_session_transcript(&session_id).map_err(AppError::from)
+    read_session_transcript_snapshot(&FileMemoryRepository::user_data(), &session_id)
+        .map(|snapshot| snapshot.transcript)
+        .map_err(AppError::from)
 }
 
 /// Load a past session's data-movement ledger (seed audio-graph-70a3) for the
@@ -6627,7 +6995,10 @@ pub fn load_session_data_movement_cmd(
     // into the ledgers directory (audio-graph-e692). Mirrors every sibling
     // session command, which all validate first.
     validate_session_id(&session_id)?;
-    crate::persistence::load_data_movement_events(&session_id).map_err(AppError::from)
+    FileMemoryRepository::user_data()
+        .load_data_movement_event_stream(&session_id)
+        .map(crate::persistence::canonical_reader::StrictCanonicalRead::into_payloads)
+        .map_err(AppError::from)
 }
 
 fn choose_materialized_notes(
@@ -6665,44 +7036,48 @@ pub fn load_session(session_id: String) -> AppResult<LoadedSession> {
 /// Read-only implementation of [`load_session`].
 fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     validate_session_id(&session_id)?;
-    let (_transcript_path, graph_path) = indexed_session_paths(&session_id)?;
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(&session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(&session_id)?;
+    if !session_has_any_artifact(&session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
-    let transcript = read_session_transcript(&session_id)?;
+    let repository = FileMemoryRepository::user_data();
+    let transcript_snapshot = read_session_transcript_snapshot(&repository, &session_id)?;
+    let transcript = transcript_snapshot.transcript;
+    let transcript_events = transcript_snapshot.events;
     let loaded_graph = if graph_path.exists() {
         crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
     } else {
         crate::graph::temporal::TemporalKnowledgeGraph::new()
     };
     let snapshot = loaded_graph.snapshot();
-    let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(&session_id)?;
     // Diarization span revisions (audio-graph-0b33): the persisted speaker log
     // the live path now writes (audio-graph-719d). Surfacing it lets the
     // frontend resolve trusted latest-wins speaker attribution on reload rather
     // than trusting the inline ASR labels. A session that never emitted
     // diarization rows loads an empty vec.
-    let diarization_events = repository.load_diarization_span_revisions(&session_id)?;
-    let projection_events = repository.load_projection_patches(&session_id)?;
-    // File existence, not merely a surviving row of a particular kind, marks
-    // the canonical-era projection authority. An empty/truncated canonical log
+    let speaker_history =
+        strict_speaker_history(repository.load_speaker_revision_stream(&session_id)?);
+    let diarization_events = speaker_history.clone().unwrap_or_default();
+    let projection_stream = repository.load_projection_patch_stream(&session_id)?;
+    // The opened snapshot presence, not a row count or second filesystem probe,
+    // marks canonical-era projection authority. An empty canonical log
     // must not let an orphan materialized cache become user-visible truth after
     // a crash between cache replacement and async event persistence.
-    let canonical_projection_stream_exists =
-        crate::user_data::projection_events_path(&session_id)?.exists();
+    let canonical_projection_stream_exists = matches!(
+        &projection_stream,
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(_)
+    );
+    let projection_events = projection_stream.into_payloads();
     let live_assist_cards = repository.load_live_assist_cards(&session_id)?;
     let notes = repository.load_materialized_notes(&session_id)?;
     let materialized_graph = repository.load_materialized_graph(&session_id)?;
     let replayed_projection_state = if canonical_projection_stream_exists {
-        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
             &session_id,
             transcript_events.clone(),
+            speaker_history,
             projection_events.clone(),
         ) {
             Ok(replay) => {
@@ -6783,17 +7158,17 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
 fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     validate_session_id(session_id)?;
 
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
 
-    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
-    let transcript = read_session_transcript(session_id)?;
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
+    let repository = FileMemoryRepository::user_data();
+    let transcript_snapshot = read_session_transcript_snapshot(&repository, session_id)?;
+    let transcript = transcript_snapshot.transcript;
+    let transcript_events = transcript_snapshot.events;
     let graph = if graph_path.exists() {
         Some(
             crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?.snapshot(),
@@ -6802,17 +7177,19 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         None
     };
 
-    let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
-    let projection_events = repository.load_projection_patches(session_id)?;
+    let diarization_events = repository
+        .load_speaker_revision_stream(session_id)?
+        .into_payloads();
+    let projection_events = repository
+        .load_projection_patch_stream(session_id)?
+        .into_payloads();
     let notes = repository.load_materialized_notes(session_id)?;
     let materialized_graph = repository.load_materialized_graph(session_id)?;
 
     Ok(SessionExportBundle {
         schema_version: SESSION_EXPORT_SCHEMA_VERSION,
         session_id: session_id.to_string(),
-        metadata: crate::sessions::find_session(session_id),
+        metadata: crate::sessions::find_session_resolve_only(session_id),
         transcript,
         transcript_events,
         diarization_events,
@@ -6864,19 +7241,36 @@ pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundl
 fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
     validate_session_id(session_id)?;
 
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
 
-    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
+    // Floor-admitted for the same reason as the transcript snapshot and the
+    // replay report: every canonical stream folded below is v1-only.
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| session_timeline_for_admitted_session(session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn session_timeline_for_admitted_session(
+    session_id: &str,
+) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
     let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
+    let transcript_events = repository
+        .load_transcript_event_stream(session_id)?
+        .into_payloads();
+    let diarization_events = repository
+        .load_speaker_revision_stream(session_id)?
+        .into_payloads();
 
     let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
         .map_err(|e| {
@@ -8303,6 +8697,27 @@ fn provider_readiness_config_fingerprint(
             } => openai_compatible_endpoint_fingerprint(endpoint, model),
             _ => "inactive".to_string(),
         },
+        "asr.deepgram" => match &settings.asr_provider {
+            crate::settings::AsrProvider::DeepgramStreaming {
+                model,
+                enable_diarization,
+                endpointing_ms,
+                utterance_end_ms,
+                vad_events,
+                eot_threshold,
+                eager_eot_threshold,
+                eot_timeout_ms,
+                max_speakers,
+                ..
+            } => format!(
+                "model={}|diarization={enable_diarization}|endpointing_ms={endpointing_ms}|utterance_end_ms={utterance_end_ms}|vad_events={vad_events}|eot_threshold={eot_threshold}|eager_eot_threshold={eager_eot_threshold}|eot_timeout_ms={eot_timeout_ms}|max_speakers={max_speakers}|global_diarization_mode={:?}|global_speaker_count={:?}|global_max_speakers={:?}",
+                model.trim(),
+                settings.diarization.mode,
+                settings.diarization.speaker_count,
+                settings.diarization.max_speakers,
+            ),
+            _ => "inactive".to_string(),
+        },
         "asr.aws_transcribe" => match &settings.asr_provider {
             crate::settings::AsrProvider::AwsTranscribe {
                 region,
@@ -8563,6 +8978,7 @@ fn base_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
 
@@ -8604,6 +9020,7 @@ fn cancelled_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
 
@@ -8954,6 +9371,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: probe.openrouter_models,
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
         Ok(Err(error)) => {
@@ -8975,6 +9393,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
         Err(_) => {
@@ -8999,6 +9418,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
     }
@@ -10487,6 +10907,34 @@ mod tests {
         }
     }
 
+    fn projection_status_test_speaker_revision(
+        span_id: &str,
+    ) -> crate::projections::DiarizationSpanRevision {
+        crate::projections::DiarizationSpanRevision {
+            span_id: span_id.to_string(),
+            provider: "test-diarizer".to_string(),
+            timeline_id: "session".to_string(),
+            source_id: Some("system".to_string()),
+            speaker_id: Some("speaker-1".to_string()),
+            speaker_label: Some("Private Speaker Label".to_string()),
+            provider_speaker_id: Some("provider-speaker-1".to_string()),
+            channel: None,
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: Some(0.9),
+            is_final: true,
+            stability: crate::projections::DiarizationEventStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            basis_asr_span_ids: vec!["report-span-1".to_string()],
+            basis_transcript_segment_ids: vec!["segment-report-span-1".to_string()],
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_001,
+        }
+    }
+
     fn drain_test_writers(state: &AppState) {
         if let Ok(mut guard) = state.transcript_writer.lock()
             && let Some(writer) = guard.take()
@@ -10569,6 +11017,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn write_legacy_then_framed<T>(
+        path: &std::path::Path,
+        session_id: &str,
+        stream_id: &str,
+        legacy: &T,
+        framed: &T,
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        std::fs::create_dir_all(path.parent().expect("stream parent"))
+            .expect("create stream parent");
+        let mut bytes = serde_json::to_vec(legacy).expect("serialize legacy prefix");
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).expect("write legacy prefix");
+
+        let mut appender = crate::persistence::canonical_log::CanonicalAppender::<T>::open(
+            path,
+            session_id,
+            stream_id,
+            1,
+            crate::persistence::canonical_log::CanonicalTailRecovery::Strict,
+        )
+        .expect("open canonical suffix appender");
+        assert!(matches!(
+            appender.append(
+                &crate::persistence::canonical_log::CanonicalEventMetadata::new(format!(
+                    "{stream_id}-framed"
+                )),
+                framed,
+            ),
+            crate::persistence::canonical_log::CanonicalAppendOutcome::Accepted(_)
+        ));
     }
 
     fn append_transcript_event(state: &AppState, event: &crate::projections::TranscriptEvent) {
@@ -10827,6 +11309,395 @@ mod tests {
         std::fs::write(&path, body).expect("write ledger");
     }
 
+    fn seed_legacy_transcript(session_id: &str, text: &str) {
+        let path =
+            crate::user_data::transcript_path(session_id).expect("resolve legacy transcript path");
+        let segment = TranscriptSegment {
+            id: "legacy-segment".to_string(),
+            source_id: "legacy-source".to_string(),
+            speaker_id: None,
+            speaker_label: None,
+            text: text.to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let body = format!(
+            "{}\n",
+            serde_json::to_string(&segment).expect("serialize legacy transcript")
+        );
+        std::fs::write(path, body).expect("write legacy transcript");
+    }
+
+    fn seed_malformed_legacy_transcript(session_id: &str, secret: &str) {
+        let path = crate::user_data::transcript_path(session_id)
+            .expect("resolve malformed legacy transcript path");
+        let valid = TranscriptSegment {
+            id: "valid-after-malformed".to_string(),
+            source_id: "legacy-source".to_string(),
+            speaker_id: None,
+            speaker_label: None,
+            text: "valid row after malformed input".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let body = format!(
+            "{{\"private\":\"{secret}\"\n{}\n",
+            serde_json::to_string(&valid).expect("serialize valid legacy transcript row")
+        );
+        std::fs::write(path, body).expect("write malformed legacy transcript");
+    }
+
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            snapshot: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("snapshot directory entry"))
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path under root")
+                    .to_path_buf();
+                if entry.file_type().expect("snapshot file type").is_dir() {
+                    snapshot.push((relative, None));
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.push((
+                        relative,
+                        Some(std::fs::read(&path).expect("read snapshot file")),
+                    ));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_malformed_index_is_tree_pure() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-index";
+
+        seed_legacy_transcript(session_id, "exportable legacy transcript");
+        std::fs::write(dir.join("sessions.json"), b"{ malformed index")
+            .expect("write malformed sessions index");
+        let before = snapshot_tree(&dir);
+
+        let bundle = export_session_bundle(session_id.to_string())
+            .expect("export should ignore an unavailable rebuildable index");
+        assert_eq!(bundle.transcript.len(), 1);
+        assert!(bundle.metadata.is_none());
+
+        let after = snapshot_tree(&dir);
+        assert!(
+            before == after,
+            "export must leave every artifact name and byte unchanged"
+        );
+        assert!(
+            !after.iter().any(|(path, _)| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".corrupt-"))),
+            "export must not back up or repair a malformed index"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_shared_legacy_reader_rejects_first_malformed_row() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-shared-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "shared-malformed-legacy";
+        let secret = "private-malformed-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = read_legacy_session_transcript(session_id)
+            .expect_err("the shared legacy reader must reject incomplete content");
+        assert!(!error.contains(secret), "legacy read error leaked content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_standalone_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-standalone-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "standalone-malformed-legacy";
+        let secret = "private-standalone-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("standalone transcript must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_review_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-review-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "review-malformed-legacy";
+        let secret = "private-review-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error =
+            load_session(session_id.to_string()).expect_err("historical Review must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-legacy";
+        let secret = "private-export-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = export_session_bundle(session_id.to_string())
+            .expect_err("session export must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-e8e7: the production read seam refuses an unreadable control
+    /// plane instead of admitting historical v1 and serving legacy bytes.
+    ///
+    /// The obstruction is a NON-REGULAR entry at the derived manifest control
+    /// identity, so the refusal is host-independent: a root the substrate
+    /// qualifies refuses on the strict manifest load, and a root it cannot
+    /// qualify refuses on qualification.
+    #[test]
+    fn guarded_open_refuses_a_session_whose_control_plane_cannot_be_read() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("guarded-open-refuses-control-plane");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "guarded-control-plane";
+        let secret = "legacy text must stay behind the floor gate";
+
+        seed_legacy_transcript(session_id, secret);
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("a session with no control plane still loads");
+        assert_eq!(transcript.len(), 1, "the baseline read is unchanged");
+
+        let root = crate::user_data::data_root().expect("data root");
+        let paths =
+            crate::persistence::session_semantics::session_control_plane_paths(&root, session_id)
+                .expect("control paths");
+        std::fs::create_dir_all(&paths.manifest).expect("unreadable control plane");
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("an unreadable control plane must refuse the read");
+        assert!(
+            !error.to_string().contains(secret),
+            "the refusal must not carry Session content: {error}"
+        );
+
+        std::fs::remove_dir(&paths.manifest).expect("clear the obstruction");
+        assert_eq!(
+            load_session_transcript(session_id.to_string())
+                .expect("the read converges once the control plane is gone")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_present_empty_transcript_stream_is_authoritative() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-present-empty-transcript");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "present-empty-transcript";
+
+        seed_legacy_transcript(session_id, "legacy text must stay hidden");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("present-empty canonical transcript should load");
+        assert!(
+            transcript.is_empty(),
+            "a present-empty canonical stream must suppress legacy transcript rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_loaded_session_reuses_one_present_empty_transcript_snapshot() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-loaded-session-snapshot");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "coherent-loaded-session";
+
+        seed_legacy_transcript(session_id, "legacy text must not diverge from events");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("present-empty historical session should load");
+        assert!(loaded.transcript_events.is_empty());
+        assert!(
+            loaded.transcript.is_empty(),
+            "the derived transcript and returned events must come from one snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_export_reuses_one_present_empty_transcript_snapshot() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-export-snapshot");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "coherent-export-session";
+
+        seed_legacy_transcript(session_id, "legacy export text must stay hidden");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let bundle = session_export_bundle(session_id)
+            .expect("present-empty historical session should export");
+        assert!(bundle.transcript_events.is_empty());
+        assert!(
+            bundle.transcript.is_empty(),
+            "the exported transcript and events must come from one snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_corrupt_canonical_transcript_blocks_legacy_fallback() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-corrupt-transcript");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "corrupt-canonical-transcript";
+
+        seed_legacy_transcript(session_id, "legacy text must not mask corruption");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"not a canonical transcript record\n",
+        )
+        .expect("write corrupt canonical transcript stream");
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("canonical corruption must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("deserialize") || message.contains("canonical"));
+        assert!(!message.contains("legacy text must not mask corruption"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_nominal_missing_replay_does_not_create_data_root() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = unique_tempdir("strict-missing-root-parent");
+        let data_root = parent.join("absent-data-root");
+        let _guard = HomeGuard::set(&data_root);
+
+        let report = projection_replay_report_for_session("missing-session")
+            .expect("missing canonical streams should replay as empty");
+        assert_eq!(report.transcript_event_count, 0);
+        assert_eq!(report.projection_event_count, 0);
+        assert!(
+            !data_root.exists(),
+            "a nominal strict read must not create the data root or stream directories"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn strict_reader_nominal_transcript_read_does_not_back_up_malformed_index() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "read-with-malformed-index";
+
+        seed_legacy_transcript(session_id, "legacy transcript remains readable");
+        std::fs::write(dir.join("sessions.json"), b"{ malformed index")
+            .expect("write malformed sessions index");
+
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("resolve-only transcript read should ignore malformed index");
+        assert_eq!(transcript.len(), 1);
+        let backup_exists = std::fs::read_dir(&dir)
+            .expect("read data root")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sessions.json.corrupt-")
+            });
+        assert!(
+            !backup_exists,
+            "a nominal read must not repair or back up a malformed sessions index"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn load_session_data_movement_cmd_returns_empty_for_session_without_ledger() {
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -10983,6 +11854,134 @@ mod tests {
         assert_eq!(graph.last_sequence, 1);
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].id, "node-report");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_replays_speaker_bearing_projection_state() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-speaker-bearing-projection");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-speaker-bearing-projection";
+        let repository = FileMemoryRepository::user_data();
+        let event = projection_status_test_event("report-span-1");
+        let speaker = projection_status_test_speaker_revision("speaker-span-1");
+        let basis = crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&event),
+            &[crate::projections::ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+
+        repository
+            .append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        repository
+            .append_diarization_span_revision(session_id, &speaker)
+            .expect("append speaker revision");
+        repository
+            .append_projection_patch(
+                session_id,
+                &report_note_patch(1, basis, "Speaker-aware replayed note."),
+            )
+            .expect("append speaker-bearing projection patch");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("load session should replay speaker-bearing projection state");
+        assert_eq!(loaded.diarization_events, vec![speaker]);
+        let notes = loaded.notes.expect("speaker-bearing notes should replay");
+        assert_eq!(notes.last_sequence, 1);
+        assert_eq!(notes.notes.len(), 1);
+        assert_eq!(notes.notes[0].body, "Speaker-aware replayed note.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_replays_mixed_transcript_speaker_and_projection_streams() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-mixed-speaker-projection");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-mixed-speaker-projection";
+        let base_ms = 1_700_000_000_000;
+
+        let mut transcript_one = projection_status_test_event("report-span-1");
+        transcript_one.received_at_ms = base_ms + 100;
+        let mut transcript_two = projection_status_test_event("report-span-2");
+        transcript_two.start_time = 2.0;
+        transcript_two.end_time = 3.0;
+        transcript_two.received_at_ms = base_ms + 200;
+        let mut speaker_one = projection_status_test_speaker_revision("speaker-span-1");
+        speaker_one.received_at_ms = base_ms + 110;
+        let mut speaker_two = projection_status_test_speaker_revision("speaker-span-2");
+        speaker_two.start_time = 2.0;
+        speaker_two.end_time = 3.0;
+        speaker_two.received_at_ms = base_ms + 210;
+
+        let basis_one =
+            crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+                std::slice::from_ref(&transcript_one),
+                &[crate::projections::ProjectionBasisSpan {
+                    span_id: speaker_one.span_id.clone(),
+                    revision_number: speaker_one.revision_number,
+                }],
+            );
+        let basis_two =
+            crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+                &[transcript_one.clone(), transcript_two.clone()],
+                &[
+                    crate::projections::ProjectionBasisSpan {
+                        span_id: speaker_one.span_id.clone(),
+                        revision_number: speaker_one.revision_number,
+                    },
+                    crate::projections::ProjectionBasisSpan {
+                        span_id: speaker_two.span_id.clone(),
+                        revision_number: speaker_two.revision_number,
+                    },
+                ],
+            );
+        let mut projection_one = report_note_patch(1, basis_one, "Legacy prefix note.");
+        projection_one.created_at_ms = base_ms + 120;
+        let mut projection_two = report_note_patch(2, basis_two, "Framed suffix note.");
+        projection_two.created_at_ms = base_ms + 220;
+
+        write_legacy_then_framed(
+            &crate::user_data::transcript_events_path(session_id).expect("transcript stream path"),
+            session_id,
+            "transcript_revisions",
+            &transcript_one,
+            &transcript_two,
+        );
+        write_legacy_then_framed(
+            &crate::user_data::diarization_events_path(session_id).expect("speaker stream path"),
+            session_id,
+            "speaker_revisions",
+            &speaker_one,
+            &speaker_two,
+        );
+        write_legacy_then_framed(
+            &crate::user_data::projection_events_path(session_id).expect("projection stream path"),
+            session_id,
+            "projection_patches",
+            &projection_one,
+            &projection_two,
+        );
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("mixed canonical streams should reconstruct projection state");
+        assert_eq!(loaded.transcript_events.len(), 2);
+        assert_eq!(loaded.diarization_events.len(), 2);
+        assert_eq!(loaded.projection_events.len(), 2);
+        let notes = loaded.notes.expect("mixed stream notes should replay");
+        assert_eq!(notes.last_sequence, 2);
+        assert_eq!(notes.notes.len(), 1);
+        assert_eq!(notes.notes[0].body, "Framed suffix note.");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11796,6 +12795,49 @@ mod tests {
             report.graph_artifact.status,
             ProjectionReplayArtifactStatus::Missing
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_replay_report_reconstructs_speaker_bearing_patch() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-replay-speaker-bearing");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "projection-replay-speaker-bearing";
+        let repository = FileMemoryRepository::user_data();
+        let event = projection_status_test_event("report-span-1");
+        let speaker = projection_status_test_speaker_revision("speaker-span-1");
+        let basis = crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&event),
+            &[crate::projections::ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+
+        repository
+            .append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        repository
+            .append_diarization_span_revision(session_id, &speaker)
+            .expect("append speaker revision");
+        repository
+            .append_projection_patch(
+                session_id,
+                &report_note_patch(1, basis, "Private note body."),
+            )
+            .expect("append speaker-bearing projection patch");
+
+        let report = projection_replay_report_for_session(session_id)
+            .expect("speaker-aware projection replay report");
+        assert_eq!(report.projection_checked_patch_count, 1);
+        assert_eq!(report.projection_invalid_basis_count, 0);
+        assert_eq!(report.replayed.notes_last_sequence, 1);
+        assert_eq!(report.replayed.note_count, 1);
+        assert!(!format!("{report:?}").contains("Private Speaker Label"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12826,6 +13868,262 @@ mod tests {
         assert_eq!(readiness.message, "Provider readiness check cancelled");
         let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
         assert!(!serialized.contains("sk-secret-cancel"));
+    }
+
+    #[test]
+    fn healthy_final_only_stt_readiness_is_ready_but_typed_degraded() {
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.api");
+        let settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::Api {
+                endpoint: "http://127.0.0.1:8080/v1".to_string(),
+                api_key: String::new(),
+                model: "final-only-fixture".to_string(),
+            },
+            ..Default::default()
+        };
+        let mut readiness = base_provider_readiness(
+            descriptor,
+            &settings,
+            &crate::credentials::CredentialStore::default(),
+            78,
+        );
+        readiness.status = ProviderReadinessStatus::Ready;
+
+        let fidelity = readiness
+            .effective_stt_fidelity
+            .expect("final-only readiness fidelity");
+        assert_eq!(readiness.status, ProviderReadinessStatus::Ready);
+        assert_eq!(
+            fidelity.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::FinalOnly
+        );
+        assert_eq!(
+            fidelity.timing,
+            crate::provider_registry::SttTimingFidelity::AppEstimated
+        );
+        assert_eq!(fidelity.confidence, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.turn, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.channel, SttFidelityOrigin::Unavailable);
+        assert_eq!(
+            fidelity.degradations,
+            vec![
+                SttFidelityDegradation::FinalOnlyRevisions,
+                SttFidelityDegradation::AppEstimatedTiming,
+                SttFidelityDegradation::ConfidenceUnavailable,
+                SttFidelityDegradation::TurnUnavailable,
+                SttFidelityDegradation::SpeakerUnavailable,
+                SttFidelityDegradation::ChannelUnavailable,
+            ]
+        );
+    }
+
+    #[test]
+    fn deepgram_effective_fidelity_uses_selected_model_diarization_and_turn_controls() {
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        let mut settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: false,
+                endpointing_ms: 0,
+                utterance_end_ms: 0,
+                vad_events: false,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 0,
+            },
+            ..Default::default()
+        };
+
+        let nova = effective_stt_fidelity(descriptor, &settings).expect("Nova fidelity");
+        assert_eq!(
+            nova.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::PartialAndFinal
+        );
+        assert_eq!(nova.turn, SttFidelityOrigin::Provider);
+        assert_eq!(nova.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(nova.channel, SttFidelityOrigin::Unavailable);
+        assert_eq!(
+            nova.turn_detection,
+            SttTurnDetectionCapabilities {
+                speech_start: false,
+                speech_final: true,
+                endpointing_configured: false,
+                utterance_end: false,
+                end_of_turn: false,
+                eager_end_of_turn: false,
+                turn_resume: false,
+            }
+        );
+        assert!(
+            nova.degradations
+                .contains(&SttFidelityDegradation::SpeakerDisabledByConfiguration)
+        );
+        assert!(
+            nova.degradations
+                .contains(&SttFidelityDegradation::ChannelUnavailable)
+        );
+
+        settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "flux-general-en".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.3,
+            eot_timeout_ms: 1500,
+            max_speakers: 2,
+        };
+        let flux = effective_stt_fidelity(descriptor, &settings).expect("Flux fidelity");
+        assert_eq!(
+            flux.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::FinalOnly
+        );
+        assert_eq!(flux.turn, SttFidelityOrigin::Provider);
+        assert_eq!(flux.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(flux.channel, SttFidelityOrigin::Unavailable);
+        assert_eq!(
+            flux.turn_detection,
+            SttTurnDetectionCapabilities {
+                speech_start: true,
+                speech_final: false,
+                endpointing_configured: false,
+                utterance_end: false,
+                end_of_turn: true,
+                eager_end_of_turn: true,
+                turn_resume: true,
+            }
+        );
+        assert!(
+            flux.degradations
+                .contains(&SttFidelityDegradation::SpeakerUnavailableForSelectedModel)
+        );
+        assert!(
+            flux.degradations
+                .contains(&SttFidelityDegradation::ChannelUnavailable)
+        );
+
+        let active_ids = active_provider_ids(&settings, false);
+        let flux_fingerprint =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "nova-3".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 0,
+        };
+        let nova_fingerprint = provider_readiness_config_fingerprint(
+            descriptor,
+            &settings,
+            &active_provider_ids(&settings, false),
+        );
+        assert_ne!(nova_fingerprint, flux_fingerprint);
+    }
+
+    #[test]
+    fn deepgram_effective_speaker_fidelity_follows_global_and_provider_diarization_policy() {
+        use crate::settings::DiarizationMode;
+
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        for (global_mode, provider_enabled, expected_speaker) in [
+            (DiarizationMode::Off, true, SttFidelityOrigin::Unavailable),
+            (DiarizationMode::Provider, true, SttFidelityOrigin::Provider),
+            (DiarizationMode::Off, false, SttFidelityOrigin::Unavailable),
+            (
+                DiarizationMode::Provider,
+                false,
+                SttFidelityOrigin::Unavailable,
+            ),
+        ] {
+            let settings = crate::settings::AppSettings {
+                asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                    api_key: String::new(),
+                    model: "nova-3".to_string(),
+                    enable_diarization: provider_enabled,
+                    endpointing_ms: 300,
+                    utterance_end_ms: 1000,
+                    vad_events: true,
+                    eot_threshold: 0.5,
+                    eager_eot_threshold: 0.0,
+                    eot_timeout_ms: 0,
+                    max_speakers: 0,
+                },
+                diarization: crate::settings::DiarizationSettings {
+                    mode: global_mode,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let fidelity =
+                effective_stt_fidelity(descriptor, &settings).expect("Deepgram fidelity");
+            assert_eq!(
+                fidelity.speaker, expected_speaker,
+                "global={global_mode:?} provider_enabled={provider_enabled}"
+            );
+            assert_eq!(
+                fidelity
+                    .degradations
+                    .contains(&SttFidelityDegradation::SpeakerDisabledByConfiguration),
+                expected_speaker == SttFidelityOrigin::Unavailable,
+                "global={global_mode:?} provider_enabled={provider_enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepgram_readiness_fingerprint_tracks_global_diarization_policy() {
+        use crate::settings::{DiarizationMode, DiarizationSpeakerCount};
+
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        let mut settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 0,
+            },
+            diarization: crate::settings::DiarizationSettings {
+                mode: DiarizationMode::Provider,
+                speaker_count: DiarizationSpeakerCount::Auto,
+                max_speakers: None,
+            },
+            ..Default::default()
+        };
+        let active_ids = active_provider_ids(&settings, false);
+        let provider_auto =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+
+        settings.diarization.mode = DiarizationMode::Off;
+        let globally_off =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(provider_auto, globally_off);
+
+        settings.diarization.mode = DiarizationMode::Provider;
+        settings.diarization.speaker_count = DiarizationSpeakerCount::Fixed;
+        settings.diarization.max_speakers = Some(4);
+        let fixed_four = provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(provider_auto, fixed_four);
+
+        settings.diarization.max_speakers = Some(5);
+        let fixed_five = provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(fixed_four, fixed_five);
     }
 
     #[test]

@@ -411,6 +411,82 @@
       "notChecked": "Not checked",
       "catalog": "Catalog",
       "noCatalog": "No catalog",
+      "fidelity": {
+        "title": "Transcription fidelity",
+        "regionLabel": {
+          "active": "Active provider transcription fidelity",
+          "selectedCapability": "Selected {{provider}} capability transcription fidelity"
+        },
+        "summary": {
+          "full": "Full transcript detail",
+          "reduced": "Reduced transcript detail",
+          "incomplete": "Fidelity details incomplete"
+        },
+        "note": "These limits describe the selected provider configuration. No action is required.",
+        "noteIncomplete": "Some typed fields are missing or use a different contract version. No action is required.",
+        "limitationsLabel": "Transcription fidelity limitations",
+        "field": {
+          "revisions": "Revision updates",
+          "timing": "Timing",
+          "confidence": "Confidence",
+          "turns": "Turns",
+          "speakers": "Speaker labels",
+          "channels": "Channels",
+          "turnDetection": {
+            "speechStart": "Speech-start events",
+            "speechFinal": "Speech-final events",
+            "endpointing": "Endpointing",
+            "utteranceEnd": "Utterance-end events",
+            "endOfTurn": "End-of-turn events",
+            "eagerEndOfTurn": "Eager end-of-turn",
+            "turnResume": "Turn-resume events"
+          }
+        },
+        "value": {
+          "unknown": "Not reported",
+          "revision": {
+            "final_only": "Final results only",
+            "partial_and_final": "Interim and final results"
+          },
+          "timing": {
+            "unavailable": "Not available",
+            "app_estimated": "Estimated by AudioGraph",
+            "provider_coarse": "Provider-reported, coarse",
+            "provider_exact": "Provider-reported, exact",
+            "unverified": "Not verified"
+          },
+          "evidence": {
+            "unavailable": "Not available",
+            "app": "Derived by AudioGraph",
+            "provider": "Provider-reported",
+            "unverified": "Not verified"
+          },
+          "state": {
+            "enabled": "Enabled",
+            "disabled": "Disabled",
+            "providerDefault": "Provider default"
+          },
+          "speaker": {
+            "disabledByConfiguration": "Disabled in settings",
+            "unavailableForModel": "Not available for the selected model",
+            "remappedByConfiguration": "Adjusted by AudioGraph settings"
+          }
+        },
+        "degradation": {
+          "final_only_revisions": "Interim transcript updates are unavailable; text appears with final results.",
+          "app_estimated_timing": "Transcript timing is estimated by AudioGraph.",
+          "timing_unavailable": "Transcript timing is unavailable.",
+          "confidence_unavailable": "Confidence values are unavailable.",
+          "turn_unavailable": "Provider turn boundaries are unavailable.",
+          "speaker_unavailable": "Speaker labels are unavailable.",
+          "speaker_disabled_by_configuration": "Speaker labels are disabled by the selected settings.",
+          "speaker_unavailable_for_selected_model": "Speaker labels are unavailable for the selected model.",
+          "speaker_remapped_by_configuration": "Speaker labels are adjusted by AudioGraph settings.",
+          "channel_unavailable": "Channel attribution is unavailable.",
+          "capability_unverified": "Some transcription capabilities are not verified.",
+          "unknown": "Some transcription detail is reduced."
+        }
+      },
       "roadmap": "Roadmap",
       "notSelectableReasonLabel": "Not selectable:",
       "runtime": "Runtime",

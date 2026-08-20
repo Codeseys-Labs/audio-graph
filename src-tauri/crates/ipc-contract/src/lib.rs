@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod endpoint_credential_routing;
 pub mod session_data_movement;
+pub mod speech_span_revision;
 
 /// Audio source information emitted by the backend source discovery path.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
