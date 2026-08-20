@@ -25,7 +25,8 @@
     "notes": [
       "Source component WAVs are 3-second excerpts converted to 16 kHz mono PCM.",
       "Overlap fixture starts speaker B at 800 ms over speaker A.",
-      "Turn-taking fixture concatenates speaker A, 400 ms silence, then speaker B."
+      "Turn-taking fixture concatenates speaker A, 400 ms silence, speaker B, then a 400 ms trailing silence.",
+      "audio-graph-1ee3/653a: the 400ms trailing silence (6400-6800ms) after speaker B was added so Deepgram's own in-stream endpointing gets the same in-stream silence cue that already finalizes speaker A via the pre-existing 400ms A/B gap — speaker B was previously the LAST audio in the file with no such cue. This is byte-identical to fixtures/audio_signal/audio/turn-taking-speech.wav's own recomposition of the same recipe (see that manifest's derivation.segments); it is a mitigation for the symptom (b_words=0 in the live Deepgram smoke), not a fix for the separately-tracked product defect in 653a (the client's Stop-path abandons the read side before it can observe any close-triggered flush)."
     ]
   },
   "speakers": [
@@ -110,7 +111,10 @@
       "id": "two-speaker-turn-taking-001",
       "kind": "turn_taking",
       "audio_path": "audio/two-speaker-turn-taking-librispeech.wav",
-      "duration_ms": 6400,
+      "duration_ms": 6800,
+      "notes": [
+        "audio-graph-1ee3/653a: extended from 6400ms to 6800ms by appending a 400ms trailing silence after speaker B's segment (which still ends at 6400ms below), mirroring the pre-existing 400ms A/B gap so B gets the same in-stream Deepgram endpointing cue A already gets."
+      ],
       "expected_speaker_count": 2,
       "segments": [
         {

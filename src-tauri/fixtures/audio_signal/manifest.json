@@ -67,14 +67,15 @@
       "id": "turn-taking-speech",
       "kind": "turn_taking",
       "audio_path": "audio/turn-taking-speech.wav",
-      "duration_ms": 6400,
-      "sha256": "50c7d5be7ac6b79f7e8aea79b94b2da411cb7a2f25c85f79822b1f81a1c36ae9",
-      "byte_length": 204844,
+      "duration_ms": 6800,
+      "sha256": "62decbb1b197c3e230e0dc802865e107ff6ff213b9ef1aff554c64766f844f3a",
+      "byte_length": 217644,
       "derivation": {
         "method": "concatenation_with_silence_gap",
         "notes": [
           "Recomposed at test time from the existing checked-in source_separation component WAVs — no new recording, no new dataset.",
-          "Mirrors the segment timing of source_separation's own two-speaker-turn-taking-001 fixture (speaker A 0-3000ms, 400ms gap, speaker B 3400-6400ms) for a well-understood, already-reviewed shape."
+          "Mirrors the segment timing of source_separation's own two-speaker-turn-taking-001 fixture (speaker A 0-3000ms, 400ms gap, speaker B 3400-6400ms, 400ms trailing gap 6400-6800ms) for a well-understood, already-reviewed shape.",
+          "audio-graph-1ee3/653a: added the 6400-6800ms trailing silence gap after speaker B, mirroring the proven-sufficient 400ms A/B gap (that gap is exactly what already lets Deepgram's own in-stream endpointing finalize speaker A live — a_words=7 in the 2026-08-20 protected-provider-smoke run). Speaker B was the LAST audio in the file before this change, so it had no same-stream silence cue to finalize on and no chance to be flushed before the client's own Stop-path abandons the read side (audio-graph-653a: run_io's AudioCmd::Stop arm sends the close frame and returns immediately, never reading whatever Deepgram sends back). This gives B the identical in-stream cue A already gets, entirely during normal audio delivery and before disconnect() is ever reached — independent of whether 653a's close-path defect gets fixed."
         ],
         "segments": [
           {
@@ -93,6 +94,11 @@
             "source_path": "fixtures/source_separation/audio/librispeech-1320-122617-0022-3s.wav",
             "start_ms": 3400,
             "end_ms": 6400
+          },
+          {
+            "role": "silence_gap",
+            "start_ms": 6400,
+            "end_ms": 6800
           }
         ]
       },
@@ -111,7 +117,7 @@
         "rms_floor": 600.0,
         "rms_ceiling": 20000.0,
         "max_clipping_rate": 0.01,
-        "_rms_floor_note": "The strict live-audio-smoke test measures RMS over a 2500ms window at an arbitrary phase of this looping 6400ms fixture, not the whole-file RMS. Computed the circular 2.5s-window RMS across every 50ms-offset alignment of the checked-in WAV: min 818.55 (at offset ~1.10s, inside speaker A's low-energy opening plus the silence gap). 600.0 sits comfortably below that worst case (leaving ~27% margin) while staying far above silence (RMS 0), so the floor still fails a captured-silence run without spuriously failing a healthy one at an unlucky loop phase."
+        "_rms_floor_note": "The strict live-audio-smoke test measures RMS over a 2500ms window at an arbitrary phase of this looping fixture, not the whole-file RMS. Computed the circular 2.5s-window RMS across every 50ms-offset alignment of the checked-in WAV: min 818.55 (at offset ~1.10s, inside speaker A's low-energy opening plus the silence gap). 600.0 sits comfortably below that worst case (leaving ~27% margin) while staying far above silence (RMS 0), so the floor still fails a captured-silence run without spuriously failing a healthy one at an unlucky loop phase. Re-verified after audio-graph-1ee3/653a extended the loop to 6800ms (added a 400ms trailing silence gap after speaker B, 6400-6800ms): the global worst-case window is UNCHANGED at 818.55/1.10s — the new trailing-silence region's own worst window (912.99 at offset ~6.40s, wrapping partway into speaker A's next loop iteration) is higher than the pre-existing worst case, so 600.0 remains a valid floor with no numeric change needed."
       }
     }
   ]
