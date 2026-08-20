@@ -55,6 +55,7 @@ import NotesPanel from "./components/NotesPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
+import ReviewFinalizationPanel from "./components/ReviewFinalizationPanel";
 import SeekTimeline from "./components/SeekTimeline";
 import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
@@ -914,6 +915,13 @@ function App() {
                 <SeekTimeline />
               </section>
             )}
+            {/* Low-fidelity Finalizing / Finalization Blocked prototype
+                (audio-graph-1d92, ADR-0036). Renders nothing for a session
+                with no finalization data — see ReviewFinalizationPanel's
+                module doc. Sample previews have no `loadedSessionId`, so
+                this only ever activates for a session loaded from
+                SessionsBrowser. */}
+            <ReviewFinalizationPanel sessionId={loadedSessionId} />
           </main>
         )}
         {workspaceView === "analysis" && (
