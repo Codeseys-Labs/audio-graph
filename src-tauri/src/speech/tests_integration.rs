@@ -412,6 +412,8 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
         mistralrs_engine,
         llm_executor,
         pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+        projection_job_workers: Arc::new(Mutex::new(Vec::new())),
+        projection_lane_stopping: Arc::new(AtomicBool::new(false)),
     };
     let config = SpeechConfig {
         models_dir: models_dir.clone(),
