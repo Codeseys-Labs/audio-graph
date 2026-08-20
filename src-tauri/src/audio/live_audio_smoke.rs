@@ -391,14 +391,35 @@ mod strict_signal {
         use rsac::{AudioCaptureBuilder, CaptureTarget};
 
         let fmt = first_supported_default_format()?;
-        let mut capture = AudioCaptureBuilder::new()
+        // No `.sample_format(...)`: rsac's own green Linux CI
+        // (tests/ci_audio/system_capture.rs at the pinned v0.4.4 rev) builds
+        // SystemDefault captures with rate + channels only, and its PipeWire
+        // path delivers f32 buffers regardless of the device's advisory
+        // format — requesting the advisory I16 here is what the first live
+        // nightly run died on, silently, because both failure arms were
+        // `.ok()?`. Every arm now names its error in the evidence log.
+        let mut capture = match AudioCaptureBuilder::new()
             .with_target(CaptureTarget::SystemDefault)
             .sample_rate(fmt.sample_rate)
             .channels(fmt.channels)
-            .sample_format(fmt.sample_format)
             .build()
-            .ok()?;
-        capture.start().ok()?;
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                log_line(
+                    "strict-signal.log",
+                    &format!("capture build failed: {error:?} (advisory fmt {fmt:?})"),
+                );
+                return None;
+            }
+        };
+        if let Err(error) = capture.start() {
+            log_line(
+                "strict-signal.log",
+                &format!("capture start failed: {error:?} (advisory fmt {fmt:?})"),
+            );
+            return None;
+        }
 
         let mut samples_i16 = Vec::new();
         let mut buffer_count = 0usize;
