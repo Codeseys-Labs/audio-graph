@@ -1,0 +1,11 @@
+# The workflows SHA-pin every third-party action with a trailing `# vN`
+# comment on the premise that Dependabot keeps the pins current (ci.yml
+# header). This file is what makes that premise true: without it, GitHub
+# raises no update PRs for the github-actions ecosystem and every pinned
+# SHA is frozen indefinitely, security fixes included.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

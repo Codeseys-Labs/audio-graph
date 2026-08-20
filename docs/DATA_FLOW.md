@@ -208,11 +208,12 @@ All `crossbeam-channel` unless noted. Created in `AppState::new()`
 Everything before the dispatcher is strictly sequential per stage, but
 **multiple capture threads run in parallel** — one per selected source.
 
-All desktop targets resolve rsac v0.4.1 from Git revision
-`7956e6ef24a44672d502e72b0500efb27530e3b9`, with default features disabled
+All desktop targets resolve rsac v0.4.4 from Git revision
+`ea2019bba217cab695d45696bc2ca25430b23dc2`, with default features disabled
 and only the target OS backend enabled. A sibling checkout is not part of the
-default dependency graph. The regenerated lockfile is present and resolves this
-revision, but is not yet integrated/committed in the current working slice.
+dependency graph. The committed `src-tauri/Cargo.lock` resolves exactly this
+revision, and CI verifies the resolution against the manifest pin under
+`--locked`.
 
 ```mermaid
 sequenceDiagram

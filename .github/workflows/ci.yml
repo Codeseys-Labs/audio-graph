@@ -69,12 +69,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --format-version 1 --locked | jq -e '
-            [.packages[] | select(.name == "rsac")] as $rsac
-            | ($rsac | length) == 1
-              and $rsac[0].version == "0.4.4"
-              and $rsac[0].source == "git+https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git?rev=ea2019bba217cab695d45696bc2ca25430b23dc2#ea2019bba217cab695d45696bc2ca25430b23dc2"
-          '
+          # The manifest pin is the source of truth, so the next rsac upgrade
+          # needs no edit here; a trip names expected vs resolved instead of
+          # printing a bare jq boolean.
+          expected_rev=$(sed -n 's/^rsac = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | sort -u)
+          if [ "$(printf '%s' "$expected_rev" | wc -w)" -ne 1 ]; then
+            echo "::error::the per-target rsac pins in Cargo.toml are missing or disagree: [${expected_rev}]"
+            exit 1
+          fi
+          metadata=$(cargo metadata --format-version 1 --locked)
+          count=$(printf '%s' "$metadata" | jq '[.packages[] | select(.name == "rsac")] | length')
+          resolved=$(printf '%s' "$metadata" | jq -r '[.packages[] | select(.name == "rsac")] | map(.version + " @ " + .source) | join("; ")')
+          if [ "$count" -ne 1 ] || [[ "$resolved" != *"rev=${expected_rev}#${expected_rev}"* ]]; then
+            echo "::error::Cargo resolved rsac [${resolved}] (count ${count}) but Cargo.toml pins rev ${expected_rev}"
+            exit 1
+          fi
+          echo "rsac resolved: ${resolved}"
 
       - name: Clippy
         working-directory: audio-graph/src-tauri
@@ -820,7 +830,7 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/evidence"
           start=$(date +%s)
-          cargo build --release --features surrealkv 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
+          cargo build --locked --release --features surrealkv 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
           end=$(date +%s)
           {
             echo "=== kv-surrealkv (${{ matrix.os }}) ==="
@@ -836,7 +846,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/evidence" | Out-Null
           $start = Get-Date
-          cargo build --release --features surrealkv 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
+          cargo build --locked --release --features surrealkv 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $elapsed = [int]((Get-Date) - $start).TotalSeconds
           $summary = @(
@@ -851,14 +861,14 @@ jobs:
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
-          cargo tree --features surrealkv > "$GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt" 2>&1 || true
+          cargo tree --locked --features surrealkv > "$GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt" 2>&1 || true
 
       - name: Native-dep inventory (kv-surrealkv, Windows)
         if: matrix.os == 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: pwsh
         run: |
-          cargo tree --features surrealkv *> "$env:GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt"
+          cargo tree --locked --features surrealkv *> "$env:GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt"
           exit 0
 
       - name: Build + link + size kv-rocksdb (release)
@@ -868,7 +878,7 @@ jobs:
         shell: bash
         run: |
           start=$(date +%s)
-          cargo build --release --features rocksdb 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
+          cargo build --locked --release --features rocksdb 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
           end=$(date +%s)
           {
             echo "=== kv-rocksdb (${{ matrix.os }}) ==="
@@ -883,7 +893,7 @@ jobs:
         shell: pwsh
         run: |
           $start = Get-Date
-          cargo build --release --features rocksdb 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
+          cargo build --locked --release --features rocksdb 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $elapsed = [int]((Get-Date) - $start).TotalSeconds
           $summary = @(
@@ -898,14 +908,14 @@ jobs:
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
-          cargo tree --features rocksdb > "$GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt" 2>&1 || true
+          cargo tree --locked --features rocksdb > "$GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt" 2>&1 || true
 
       - name: Native-dep inventory (kv-rocksdb, Windows)
         if: matrix.os == 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: pwsh
         run: |
-          cargo tree --features rocksdb *> "$env:GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt"
+          cargo tree --locked --features rocksdb *> "$env:GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt"
           exit 0
 
       - name: Durability probe (best-effort, kill/restart across processes)
@@ -923,10 +933,10 @@ jobs:
             dir="$(mktemp -d)/${engine}-store"
             echo "=== durability probe: ${engine} (best-effort) ===" | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
             # Writer process: write 5 rows, then exit (process death = the kill proxy).
-            cargo run --release --features "${feature}" --bin durability-probe -- write "${dir}" 5 \
+            cargo run --locked --release --features "${feature}" --bin durability-probe -- write "${dir}" 5 \
               2>&1 | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
             # Reader process (fresh invocation = "restart"): assert the 5 rows survived.
-            cargo run --release --features "${feature}" --bin durability-probe -- read "${dir}" 5 \
+            cargo run --locked --release --features "${feature}" --bin durability-probe -- read "${dir}" 5 \
               2>&1 | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
             echo "durability ${engine} exit: $?" | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
           }
@@ -948,10 +958,10 @@ jobs:
             $dir = Join-Path $dir "$engine-store"
             "=== durability probe: $engine (best-effort) ===" | Tee-Object -FilePath $log -Append
             # Writer process: write 5 rows, then exit (process death = the kill proxy).
-            cargo run --release --features "$feature" --bin durability-probe -- write "$dir" 5 2>&1 |
+            cargo run --locked --release --features "$feature" --bin durability-probe -- write "$dir" 5 2>&1 |
               Tee-Object -FilePath $log -Append
             # Reader process (fresh invocation = "restart"): assert the 5 rows survived.
-            cargo run --release --features "$feature" --bin durability-probe -- read "$dir" 5 2>&1 |
+            cargo run --locked --release --features "$feature" --bin durability-probe -- read "$dir" 5 2>&1 |
               Tee-Object -FilePath $log -Append
             "durability $engine exit: $LASTEXITCODE" | Tee-Object -FilePath $log -Append
           }
