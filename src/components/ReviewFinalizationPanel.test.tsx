@@ -83,6 +83,23 @@ describe("ReviewFinalizationPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows STT interim vs. confirmed text as a per-lane confirmation summary and per-line badges", async () => {
+    mockStatusFor(FX_FINALIZING.id);
+    render(<ReviewFinalizationPanel sessionId={FX_FINALIZING.id} />);
+
+    const section = await screen.findByTestId(
+      "finalization-transcript-confirmation",
+    );
+    expect(within(section).getByText(/176 confirmed/i)).toBeInTheDocument();
+    expect(within(section).getByText(/4 interim/i)).toBeInTheDocument();
+    // Interim lines carry a distinct "not yet confirmed" badge — this is the
+    // STT interim-vs-confirmed distinction the seed asks Review to surface.
+    const interimBadges = within(section).getAllByText(
+      /interim.*not yet confirmed/i,
+    );
+    expect(interimBadges.length).toBe(4);
+  });
+
   it("Finalization Blocked (external_uncertain) is non-dismissable and needs explicit cost/egress authorization", async () => {
     mockStatusFor(FX_BLOCKED_EXTERNAL.id);
     const user = userEvent.setup();
