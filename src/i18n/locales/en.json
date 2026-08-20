@@ -1274,6 +1274,7 @@
     "followUps": "Follow-ups",
     "coalesced": "Coalesced",
     "coalescedSpans": "Coalesced spans",
+    "oldestPendingSince": "Oldest pending",
     "schedulerState": {
       "inFlight": "In flight",
       "pending": "Pending",

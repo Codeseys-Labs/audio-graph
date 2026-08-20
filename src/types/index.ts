@@ -2225,6 +2225,24 @@ export interface ProjectionSchedulerTelemetry {
   in_flight_age_ms: number;
   in_flight_span_count: number;
   pending_span_count: number;
+  /**
+   * Queue-onset timestamp (unix millis): stamped the first time this lane's
+   * basis goes pending, cleared on a successful completion. `null` means the
+   * lane is idle. Spans retries/follow-ups/repairs, so it reflects how long
+   * the lane has had *any* unresolved work, not just the in-flight job's age.
+   */
+  oldest_pending_since_ms?: number | null;
+  /**
+   * Age (ms) derived from `oldest_pending_since_ms` at the moment the
+   * backend produced this snapshot. Render this directly — never subtract
+   * `Date.now()` from `oldest_pending_since_ms`: this snapshot is fetched
+   * once and can be re-rendered long after the lane drained, at which point
+   * a live-clock subtraction grows forever against a since-timestamp the
+   * backend already cleared. `null` iff `oldest_pending_since_ms` is
+   * `null`.
+   */
+  oldest_pending_age_ms?: number | null;
+  failed_attempts: number;
   metrics: ProjectionSchedulerMetrics;
 }
 

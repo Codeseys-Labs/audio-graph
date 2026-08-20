@@ -75,6 +75,31 @@ pub struct ProjectionSchedulerTelemetry {
     pub in_flight_age_ms: u64,
     pub in_flight_span_count: usize,
     pub pending_span_count: usize,
+    /// Queue-onset timestamp: stamped in `start_job` the first time this
+    /// lane's basis goes pending, cleared on a successful completion in
+    /// `complete_in_flight`. Spans retries/follow-ups/repairs, so it reports
+    /// how long the lane has had *any* unresolved work, not just the
+    /// in-flight job's age. `None` means the lane is idle (no unresolved
+    /// basis). See `ProjectionScheduler::pending_since_ms` for the full
+    /// contract this mirrors.
+    pub oldest_pending_since_ms: Option<u64>,
+    /// Age (in ms, relative to the `now_ms` the caller passed to
+    /// `telemetry_at`) derived from `oldest_pending_since_ms` at the moment
+    /// this snapshot was produced. Frontends must render this instead of
+    /// subtracting a live clock from `oldest_pending_since_ms`: the snapshot
+    /// this struct comes from is fetched once and may be held (and
+    /// re-rendered against other state changes) long after the lane it
+    /// describes has drained, at which point a live-clock subtraction would
+    /// keep growing against a since-timestamp the backend already cleared.
+    /// Computed exactly like `in_flight_age_ms` — same pattern, same
+    /// `now_ms` snapshot semantics — `None` iff `oldest_pending_since_ms` is
+    /// `None`.
+    pub oldest_pending_age_ms: Option<u64>,
+    /// Consecutive same-basis failure count, meaningful only while the lane
+    /// has an unresolved failed basis; zeroed on successful completion. See
+    /// `ProjectionScheduler::failed_attempts` for the full contract this
+    /// mirrors.
+    pub failed_attempts: u8,
     pub metrics: ProjectionSchedulerMetrics,
 }
 
@@ -384,6 +409,11 @@ impl ProjectionScheduler {
                 .as_ref()
                 .map(|basis| basis.span_revisions.len())
                 .unwrap_or(0),
+            oldest_pending_since_ms: self.pending_since_ms,
+            oldest_pending_age_ms: self
+                .pending_since_ms
+                .map(|since_ms| now_ms.saturating_sub(since_ms)),
+            failed_attempts: self.failed_attempts,
             metrics: self.metrics.clone(),
         }
     }
@@ -1123,6 +1153,16 @@ mod tests {
         assert!(telemetry.in_flight_job_id.is_some());
         assert_eq!(telemetry.in_flight_span_count, 3);
         assert_eq!(telemetry.pending_span_count, 0);
+        // The follow-up job's `start_job` call re-stamps the queue-onset
+        // timestamp (cleared by the preceding success) at the same `now_ms`
+        // (30) `complete_in_flight` was called with — the lane never
+        // actually went idle, it moved straight to the mandatory follow-up.
+        assert_eq!(telemetry.oldest_pending_since_ms, Some(30));
+        // `telemetry()` samples at `now_ms = 0`, which is before the
+        // queue-onset stamp (30) — `saturating_sub` floors the derived age
+        // at 0 rather than underflowing.
+        assert_eq!(telemetry.oldest_pending_age_ms, Some(0));
+        assert_eq!(telemetry.failed_attempts, 0);
     }
 
     #[test]
@@ -1435,6 +1475,10 @@ mod tests {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected start job, got {other:?}"),
         };
+        // Pin that the queue-onset stamp is actually live going into the
+        // completion below — otherwise the post-completion `None` assertion
+        // would be vacuous.
+        assert_eq!(scheduler.telemetry().oldest_pending_since_ms, Some(10));
         assert_eq!(
             scheduler.complete_in_flight(&job_id, "session-1", &ledger, 20),
             ProjectionSchedulerDecision::CompletedCurrent {
@@ -1445,6 +1489,16 @@ mod tests {
         assert_eq!(scheduler.metrics().last_job_lag_ms, 10);
         assert_eq!(scheduler.metrics().max_job_lag_ms, 10);
         assert!(scheduler.telemetry().in_flight_job_id.is_none());
+        // Drain-to-idle must clear the queue-onset stamp (the `Current` arm
+        // of `complete_in_flight`, projection_scheduler.rs's
+        // `self.pending_since_ms = None`): a graph lane with zero unresolved
+        // work must not keep reporting a stale stall signal in Review
+        // (ADR-0045 decision 4). This is the regression a dropped clear on
+        // that arm would slip through every other test in this module.
+        let idled_telemetry = scheduler.telemetry();
+        assert_eq!(idled_telemetry.oldest_pending_since_ms, None);
+        assert_eq!(idled_telemetry.oldest_pending_age_ms, None);
+        assert_eq!(idled_telemetry.failed_attempts, 0);
         assert_eq!(
             scheduler.observe_ledger(&ledger, 30),
             ProjectionSchedulerDecision::Idle
@@ -1589,6 +1643,57 @@ mod tests {
             scheduler.metrics().jobs_started,
             u64::from(PROJECTION_LANE_ATTEMPT_BUDGET) + 1
         );
+    }
+
+    // Pins the wire shape `commands.rs::get_projection_runtime_status_cmd`
+    // sends the frontend (audio-graph-1e1e): all three fields are plain
+    // accessors over ff10's `pending_since_ms`/`failed_attempts` scheduler
+    // state (`oldest_pending_age_ms` is derived from `pending_since_ms` and
+    // the `now_ms` passed to `telemetry_at`, exactly like `in_flight_age_ms`
+    // derives from the in-flight job's `queued_at_ms`), and the frontend's
+    // `ProjectionSchedulerTelemetry` TS type (`src/types/index.ts`) expects
+    // `oldest_pending_since_ms`/`oldest_pending_age_ms` as bare
+    // number-or-null (not a nested `Option` encoding) and `failed_attempts`
+    // as a bare number. The frontend must render `oldest_pending_age_ms`
+    // verbatim rather than computing `Date.now() - oldest_pending_since_ms`
+    // itself: the latter keeps growing on a snapshot held past the point the
+    // backend clears `pending_since_ms`.
+    #[test]
+    fn telemetry_serializes_oldest_pending_since_and_failed_attempts_for_the_frontend() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+
+        // Idle: no basis has ever gone pending -> null, zero attempts.
+        let idle = serde_json::to_value(scheduler.telemetry_at(0)).expect("serialize idle");
+        assert_eq!(idle["oldest_pending_since_ms"], serde_json::Value::Null);
+        assert_eq!(idle["oldest_pending_age_ms"], serde_json::Value::Null);
+        assert_eq!(idle["failed_attempts"], serde_json::json!(0));
+
+        // Pending: the queue-onset timestamp surfaces as a bare JSON number,
+        // and the age is derived from the `now_ms` this particular snapshot
+        // was requested at (150 - 100 = 50), not the caller's wall clock.
+        let job_id = match scheduler.observe_ledger(&ledger, 100) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let pending = serde_json::to_value(scheduler.telemetry_at(150)).expect("serialize pending");
+        assert_eq!(pending["oldest_pending_since_ms"], serde_json::json!(100));
+        assert_eq!(pending["oldest_pending_age_ms"], serde_json::json!(50));
+        assert_eq!(pending["failed_attempts"], serde_json::json!(0));
+
+        // A failed attempt bumps the counter the frontend reads verbatim,
+        // while the queue-onset timestamp survives the failure unchanged
+        // (it is only cleared on a successful completion), and the age keeps
+        // tracking whatever `now_ms` a later snapshot is requested at
+        // (200 - 100 = 100).
+        scheduler.fail_in_flight(&job_id, "session-1", &ledger, 110);
+        let failed = serde_json::to_value(scheduler.telemetry_at(200)).expect("serialize failed");
+        assert_eq!(failed["oldest_pending_age_ms"], serde_json::json!(100));
+        assert_eq!(failed["oldest_pending_since_ms"], serde_json::json!(100));
+        assert_eq!(failed["failed_attempts"], serde_json::json!(1));
     }
 
     #[test]

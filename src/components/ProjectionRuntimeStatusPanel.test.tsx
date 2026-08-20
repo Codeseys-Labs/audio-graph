@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
@@ -26,6 +26,9 @@ function scheduler(
     in_flight_age_ms: 0,
     in_flight_span_count: 0,
     pending_span_count: 0,
+    oldest_pending_since_ms: null,
+    oldest_pending_age_ms: null,
+    failed_attempts: 0,
     metrics: {
       jobs_started: 0,
       completed_jobs: 0,
@@ -351,6 +354,103 @@ describe("ProjectionRuntimeStatusPanel", () => {
     expect(within(notes).getAllByText("2").length).toBeGreaterThanOrEqual(2);
     expect(within(notes).getByText("Stale")).toBeInTheDocument();
     expect(within(notes).getByText("3")).toBeInTheDocument();
+  });
+
+  it("shows the graph lane's oldest-pending-since lag while it has a pending basis (ADR-0045 decision 4)", async () => {
+    // `oldest_pending_age_ms` is rendered verbatim — it is the backend's own
+    // age-at-snapshot-time computation (`telemetry_at`, mirroring
+    // `in_flight_age_ms`), not something this component derives from
+    // `Date.now()`. No clock stubbing needed.
+    mockedInvoke.mockResolvedValueOnce(
+      status({
+        schedulers: {
+          notes: scheduler("notes", {
+            oldest_pending_since_ms: null,
+            oldest_pending_age_ms: null,
+          }),
+          graph: scheduler("graph", {
+            pending_span_count: 2,
+            oldest_pending_since_ms: 1_700_000_035_000,
+            oldest_pending_age_ms: 65_000, // 1m 5s
+          }),
+        },
+      }),
+    );
+
+    render(<ProjectionRuntimeStatusPanel />);
+
+    const graph = await screen.findByRole("article", { name: /graph queue/i });
+    expect(within(graph).getByText(/oldest pending/i)).toBeInTheDocument();
+    expect(within(graph).getByText("1m 5s")).toBeInTheDocument();
+
+    // The notes lane never gets this affordance — decision 4 scopes the
+    // unbounded-lag visibility obligation to the graph lane only.
+    const notes = await screen.findByRole("article", { name: /notes queue/i });
+    expect(
+      within(notes).queryByText(/oldest pending/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not grow the oldest-pending-since lag on re-render after the lane has drained", async () => {
+    // Regression for a false-stall bug: the panel used to compute
+    // `Date.now() - oldest_pending_since_ms` against a `status` snapshot
+    // fetched once on mount. Any later re-render (e.g. a fresh
+    // `sessionProjectionEvents` patch or `pipelineLatencies` update, both of
+    // which this component subscribes to) would then re-evaluate
+    // `Date.now()` and show the lag growing forever, even for a lane that
+    // had already drained and whose backend-side `pending_since_ms` was long
+    // since cleared. Fetching `oldest_pending_age_ms` from the backend
+    // instead means a re-render with no new fetch must render the exact same
+    // value every time.
+    mockedInvoke.mockResolvedValueOnce(
+      status({
+        schedulers: {
+          notes: scheduler("notes"),
+          graph: scheduler("graph", {
+            pending_span_count: 2,
+            oldest_pending_since_ms: 1_700_000_035_000,
+            oldest_pending_age_ms: 65_000, // 1m 5s
+          }),
+        },
+      }),
+    );
+
+    render(<ProjectionRuntimeStatusPanel />);
+
+    const graph = await screen.findByRole("article", { name: /graph queue/i });
+    expect(within(graph).getByText("1m 5s")).toBeInTheDocument();
+
+    // Simulate the lane draining server-side and a store event (not a
+    // refetch) driving a re-render, the same way `sessionProjectionEvents`
+    // is replaced wholesale on every PROJECTION_PATCH.
+    act(() => {
+      useAudioGraphStore.setState({
+        sessionProjectionEvents: [],
+        pipelineLatencies: {
+          asr: { stage: "asr", latency_ms: 999, timestamp_ms: Date.now() },
+        },
+      });
+    });
+
+    expect(within(graph).getByText("1m 5s")).toBeInTheDocument();
+  });
+
+  it("hides the graph lane's oldest-pending-since lag when the lane is idle", async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      status({
+        schedulers: {
+          notes: scheduler("notes"),
+          graph: scheduler("graph", { oldest_pending_since_ms: null }),
+        },
+      }),
+    );
+
+    render(<ProjectionRuntimeStatusPanel />);
+
+    const graph = await screen.findByRole("article", { name: /graph queue/i });
+    expect(
+      within(graph).queryByText(/oldest pending/i),
+    ).not.toBeInTheDocument();
   });
 
   it("warns when projection patch persistence is unavailable", async () => {

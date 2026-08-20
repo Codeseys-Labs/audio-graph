@@ -1274,6 +1274,7 @@
     "followUps": "Continuações",
     "coalesced": "Coalescidos",
     "coalescedSpans": "Spans coalescidos",
+    "oldestPendingSince": "Pendente há mais tempo",
     "schedulerState": {
       "inFlight": "Em andamento",
       "pending": "Pendente",

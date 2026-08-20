@@ -38,6 +38,23 @@ function averageMs(total: number, count: number): number {
   return total / count;
 }
 
+// Mirrors the h/m/s convention SessionsBrowser's `formatDuration` already
+// uses for session length, adapted for a millisecond input: the graph lane's
+// oldest-pending-since lag is unbounded by design (ADR-0045 decision 4), so
+// `formatMs`'s "###.#s" shape (fine for sub-minute latencies elsewhere in
+// this panel) would stay legible but unreadable once the lag crosses a
+// minute.
+function formatAgeMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "0s";
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function ttftSourceLabel(
   source: ProjectionSchedulerTelemetry["ttft_estimate_source"],
   t: (key: string) => string,
@@ -508,9 +525,17 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
 interface SchedulerCardProps {
   title: string;
   scheduler: ProjectionSchedulerTelemetry;
+  // ADR-0045 decision 4: the graph lane's queue-onset lag is unbounded by
+  // design and must be visible; the notes lane has no such visibility
+  // obligation, so this stays opt-in per card rather than always-on.
+  showOldestPendingSince?: boolean;
 }
 
-function SchedulerCard({ title, scheduler }: SchedulerCardProps) {
+function SchedulerCard({
+  title,
+  scheduler,
+  showOldestPendingSince,
+}: SchedulerCardProps) {
   const { t } = useTranslation();
   const state = schedulerState(scheduler);
   const badgeClass =
@@ -620,6 +645,20 @@ function SchedulerCard({ title, scheduler }: SchedulerCardProps) {
           label={t("projectionDiagnostics.coalescedSpans")}
           value={formatCount(scheduler.metrics.coalesced_span_count)}
         />
+        {showOldestPendingSince && scheduler.oldest_pending_age_ms != null && (
+          <Metric
+            label={t("projectionDiagnostics.oldestPendingSince")}
+            // Rendered straight from the backend-computed age (stamped at
+            // fetch time in `telemetry_at`), never from `Date.now()`: this
+            // component re-renders on every store event
+            // (`sessionProjectionEvents` / `pipelineLatencies`) between
+            // fetches, and the `status` snapshot supplying this value is
+            // only refetched on mount or manual Refresh, so a live-clock
+            // subtraction would keep growing even after the lane drained
+            // and the backend cleared its queue-onset stamp.
+            value={formatAgeMs(scheduler.oldest_pending_age_ms)}
+          />
+        )}
       </dl>
     </article>
   );
@@ -797,6 +836,7 @@ export default function ProjectionRuntimeStatusPanel() {
             <SchedulerCard
               title={t("projectionDiagnostics.graphScheduler")}
               scheduler={status.schedulers.graph}
+              showOldestPendingSince
             />
           </div>
         </div>
