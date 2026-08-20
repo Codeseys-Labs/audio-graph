@@ -848,12 +848,14 @@ mod tests {
                 title: "Summary".to_string(),
                 body: format!("{} span(s)", job.basis.span_revisions.len()),
                 tags: vec!["offline".to_string()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             ProjectionKind::Graph => vec![ProjectionOperation::UpsertGraphNode {
                 id: "topic:offline-replay".to_string(),
                 name: "Offline replay".to_string(),
                 entity_type: "topic".to_string(),
                 description: Some(format!("{} span basis", job.basis.span_revisions.len())),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         };
         ProjectionPatch {
@@ -1497,6 +1499,7 @@ mod tests {
                 title: "Speaker note".to_string(),
                 body: "cites the provisional speaker span".to_string(),
                 tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.9,
             provenance: default_fixture_provenance(),

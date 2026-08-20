@@ -37,6 +37,7 @@ pub mod analytics;
 pub mod asr;
 pub mod audio;
 pub mod aws_util;
+pub mod claim_evidence;
 pub mod commands;
 pub mod config;
 pub mod converse;

@@ -796,6 +796,7 @@ fn run_projection_patch_on_route(
     match projection_outcome_from_output(
         &output,
         job,
+        ledger,
         sequence,
         created_at_ms,
         PROJECTION_PATCH_PROMPT_ID,
@@ -818,6 +819,7 @@ fn run_projection_patch_on_route(
             let mut outcome = projection_outcome_from_output(
                 &repair_output,
                 job,
+                ledger,
                 sequence,
                 created_at_ms,
                 PROJECTION_PATCH_REPAIR_PROMPT_ID,
@@ -868,6 +870,7 @@ fn ensure_usable_completion(output: &ProjectionBackendOutput) -> Result<(), Stri
 fn projection_outcome_from_output(
     output: &ProjectionBackendOutput,
     job: &ProjectionJob,
+    ledger: &TranscriptLedger,
     sequence: u64,
     created_at_ms: u64,
     prompt_id: &str,
@@ -889,6 +892,7 @@ fn projection_outcome_from_output(
     let patch = trusted_projection_patch_from_model_json(
         &output.raw_json,
         job,
+        ledger,
         ProjectionPatchBuildContext {
             sequence,
             llm_request_id,
@@ -1695,7 +1699,8 @@ mod tests {
                 "id": "note:alice-bob",
                 "title": "Alice and Bob",
                 "body": "Alice met Bob.",
-                "tags": ["people"]
+                "tags": ["people"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.8
         })
@@ -1812,7 +1817,8 @@ mod tests {
                 "id": "person:alice",
                 "name": "Alice",
                 "entity_type": "person",
-                "description": "Met Bob."
+                "description": "Met Bob.",
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.9
         })
@@ -2021,7 +2027,8 @@ mod tests {
                 "id": "note:alice-bob",
                 "title": "Alice and Bob",
                 "body": "Alice met Bob.",
-                "tags": ["people"]
+                "tags": ["people"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.8
         })
@@ -2571,6 +2578,70 @@ mod tests {
         );
     }
 
+    /// ADR-0037 x ADR-0038: a draft rejected for MISSING CLAIM EVIDENCE
+    /// repairs on the SAME route and never appears as a second-provider
+    /// dispatch — the evidence-specific instance of the same-route repair
+    /// proof above (`a_validator_rejected_draft_repairs_on_the_same_provider_only`
+    /// covers `WrongOperationKind`; this covers `ClaimEvidenceRefused`). Before
+    /// `audio-graph-3624` removed automatic cross-provider fallback, every
+    /// validator rejection escalated to the next provider in the chain — the
+    /// exact amplification ADR-0037's sequencing precondition exists to rule
+    /// out for evidence rejections specifically.
+    #[test]
+    fn a_missing_evidence_rejection_repairs_on_the_same_provider_only() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let missing_evidence = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Decision\",\"body\":\"Alice met Bob.\",\
+        \"tags\":[]}],\"confidence\":0.8}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let with_evidence = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Decision\",\"body\":\"Alice met Bob.\",\
+        \"tags\":[],\"evidence\":{\"claim_class\":\"grounded_inference\",\
+        \"span_id\":\"span-1\"}}],\"confidence\":0.8}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base, request_count) =
+            rt.block_on(spawn_counting_mock(vec![missing_evidence, with_evidence]));
+
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let outcome = std::thread::spawn(move || {
+            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+        })
+        .join()
+        .expect("worker thread panic")
+        .outcome
+        .expect("the same-route repair supplies the missing evidence");
+
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one draft + one SAME-route repair, and no third attempt"
+        );
+        assert_eq!(
+            outcome.patch.provenance.route_id.as_deref(),
+            Some("route.openai_compatible")
+        );
+        assert!(matches!(
+            outcome.patch.operations.first(),
+            Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:decision"
+        ));
+    }
+
     #[test]
     fn served_model_echo_is_recorded_as_served_not_requested() {
         // ADR-0038 defect 3, end to end on the generic blocking path: the request
@@ -2580,7 +2651,9 @@ mod tests {
         let body = serde_json::json!({
             "choices": [{
                 "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
-        \"id\":\"note:a\",\"title\":\"T\",\"body\":\"B\",\"tags\":[]}],\"confidence\":0.7}" },
+        \"id\":\"note:a\",\"title\":\"T\",\"body\":\"B\",\"tags\":[],\
+        \"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"span-1\"}}],\
+        \"confidence\":0.7}" },
                 "finish_reason": "stop"
             }],
             "model": "probe-model-turbo"

@@ -189,7 +189,7 @@ pub fn build_session_timeline(
 /// `transcript_segment_id` when present, else the immutable `span_id`) followed
 /// by the raw `span_id`. Order is significant (segment id preferred); duplicates
 /// are dropped so an equal pair collapses to one key.
-fn candidate_keys(transcript_segment_id: Option<&str>, span_id: &str) -> Vec<String> {
+pub(crate) fn candidate_keys(transcript_segment_id: Option<&str>, span_id: &str) -> Vec<String> {
     let segment_key = transcript_segment_id.unwrap_or(span_id);
     let mut keys = vec![segment_key.to_string()];
     if span_id != segment_key {
@@ -208,7 +208,12 @@ fn candidate_keys(transcript_segment_id: Option<&str>, span_id: &str) -> Vec<Str
 /// matching the ledger's per-span latest-wins rule. `SpeakerTimeline::latest_spans`
 /// is already the materialized (latest-per-`span_id`) set, so no prior
 /// materialization pass is needed.
-fn speaker_attribution_index(
+///
+/// `pub(crate)` so `projections::resolve_claim_evidence_basis_events` (ADR-0037
+/// per-item claim evidence) can reuse the SAME latest-wins join this module's
+/// own `build_session_timeline` uses, instead of re-deriving a second,
+/// possibly-divergent notion of "the canonical speaker for this span".
+pub(crate) fn speaker_attribution_index(
     speakers: &SpeakerTimeline,
 ) -> HashMap<String, &DiarizationSpanRevision> {
     let mut winners: HashMap<String, &DiarizationSpanRevision> = HashMap::new();

@@ -32,6 +32,27 @@ pub const PROJECTION_PATCH_REPAIR_PROMPT_ID: &str = "projection_patch_repair_v1"
 /// leading messages for cache-capable providers.
 pub const PROJECTION_STABLE_PREFIX_MESSAGE_COUNT: usize = 2;
 
+/// ADR-0037: every content-creating operation's `evidence` field is judged
+/// against this prompt's transcript window, never trusted
+/// (`claim_evidence::judge_claim_evidence`). Before this text existed, the
+/// system prompt never mentioned evidence, claim classes, or span ids at all
+/// — the ONLY hint a schema-obeying model had was an optional field with a
+/// `knowledge_gap` default (the class the judge always refuses), so a model
+/// on any non-strict route either omitted `evidence` outright or fabricated
+/// a class that happened to bypass the check. This is part of the system
+/// message (the byte-stable prefix, `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`),
+/// so the repair prompt (`projection_patch_repair_prompt_messages`, which
+/// extends this same message list) inherits it without needing its own copy.
+const EVIDENCE_GUIDANCE: &str = "Every upsert_note, upsert_graph_node, and upsert_graph_edge \
+     operation requires an `evidence` object anchoring the claim to a span in this prompt's \
+     transcript window (see `span_id` in the transcript JSON below). `claim_class` is one of: \
+     `verified_quote` (set `span_id` to one of those span ids and `quote` to a literal, verbatim \
+     substring of that span's text), `grounded_inference` (set `span_id` to one of those span \
+     ids; no quote needed), or `unavailable_evidence` (set `span_id` to the closest relevant span \
+     id AND `note` to a short explanation of what deeper evidence is missing, e.g. audio was not \
+     retained for that span). Never use `knowledge_gap` — it is never admitted. A `span_id` \
+     outside the transcript window below is refused.";
+
 /// Max characters of a single older turn kept in the rolling summary digest.
 /// Bounds each folded turn's contribution so the summary stays far smaller than
 /// the full transcript JSON it replaces.
@@ -195,6 +216,22 @@ pub enum ProjectionPatchDraftError {
         id: String,
         replacement_id: String,
     },
+    /// ADR-0037: `operation`'s `EvidenceAnchor` did not satisfy its declared
+    /// `ClaimClass`'s evidence minimum. Fails the WHOLE patch, through the
+    /// same all-or-nothing per-patch validation loop every other structural
+    /// check here already uses.
+    ClaimEvidenceRefused {
+        operation: &'static str,
+        id: String,
+        deficiency: crate::claim_evidence::ClaimEvidenceDeficiency,
+    },
+    /// ADR-0037 part 4: "corrections and retractions are derived, not
+    /// model-authored". `operation` is only ever legitimate coming from
+    /// trusted, ADR-0031-derived code — never from a model-submitted draft.
+    /// Fails the WHOLE patch, same as every other structural check here.
+    DerivedOnlyOperation {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for ProjectionPatchDraftError {
@@ -247,6 +284,18 @@ impl fmt::Display for ProjectionPatchDraftError {
                 f,
                 "split_graph_node for {id} repeats replacement node id {replacement_id}"
             ),
+            Self::ClaimEvidenceRefused {
+                operation,
+                id,
+                deficiency,
+            } => write!(
+                f,
+                "{operation} {id} refused claim evidence admission: {deficiency}"
+            ),
+            Self::DerivedOnlyOperation { operation } => write!(
+                f,
+                "{operation} may only be derived by trusted code, never model-authored (ADR-0037 part 4)"
+            ),
         }
     }
 }
@@ -254,8 +303,64 @@ impl fmt::Display for ProjectionPatchDraftError {
 impl std::error::Error for ProjectionPatchDraftError {}
 
 pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String> {
-    serde_json::to_value(schemars::schema_for!(ProjectionPatchDraft))
-        .map_err(|e| format!("failed to build projection patch draft JSON schema: {e}"))
+    let mut schema = serde_json::to_value(schemars::schema_for!(ProjectionPatchDraft))
+        .map_err(|e| format!("failed to build projection patch draft JSON schema: {e}"))?;
+    require_evidence_on_content_creating_operation_variants(&mut schema);
+    Ok(schema)
+}
+
+/// `schemars` marks `evidence` OPTIONAL on the three content-creating
+/// `ProjectionOperation` variants, with a `"default": {"claim_class":
+/// "knowledge_gap"}` — exactly the one class `judge_claim_evidence` refuses
+/// unconditionally (ADR-0037). This is `#[serde(default)]`'s doing
+/// (schemars_derive-1.2.1 schema_exprs.rs:726-740: the DESERIALIZE-contract
+/// `is_optional` expression ORs in `has_default` unconditionally, so even a
+/// `#[schemars(required)]` override cannot win), and `#[serde(default)]`
+/// itself cannot be removed from `ProjectionOperation` — it is the backward-
+/// compat fallback `pre_contract_projection_patch_fixture_still_deserializes`
+/// pins for a `ProjectionPatch` persisted before this contract, with no
+/// `evidence` key at all. This schema, not the Rust type, is what actually
+/// reaches the model — it is pasted into every projection prompt
+/// (`projection_patch_prompt_messages`) and sent as the vLLM/mistral.rs
+/// structured-decoding grammar (`llm::executor::projection_api`) — so
+/// post-processing it here is the only seam that tightens the model-facing
+/// contract without weakening historical-deserialization tolerance.
+fn require_evidence_on_content_creating_operation_variants(schema: &mut serde_json::Value) {
+    let Some(variants) = schema
+        .get_mut("$defs")
+        .and_then(|defs| defs.get_mut("ProjectionOperation"))
+        .and_then(|operation| operation.get_mut("oneOf"))
+        .and_then(|one_of| one_of.as_array_mut())
+    else {
+        return;
+    };
+
+    for variant in variants {
+        let carries_evidence = variant
+            .get("properties")
+            .and_then(|properties| properties.get("evidence"))
+            .is_some();
+        if !carries_evidence {
+            continue;
+        }
+
+        if let Some(evidence) = variant
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut("evidence"))
+            .and_then(|evidence| evidence.as_object_mut())
+        {
+            // Advertising `knowledge_gap` as the field's default is exactly
+            // the always-refused fallback a schema-obeying model should
+            // never be nudged toward.
+            evidence.remove("default");
+        }
+
+        if let Some(required) = variant.get_mut("required").and_then(|r| r.as_array_mut())
+            && !required.iter().any(|field| field == "evidence")
+        {
+            required.push(serde_json::Value::String("evidence".to_string()));
+        }
+    }
 }
 
 /// Human-authored, provider-strict JSON schema for a projection patch draft,
@@ -265,7 +370,7 @@ pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String>
 /// (`response_format: json_schema, strict: true`) so a schema-capable model is
 /// constrained at generation time. It differs from
 /// [`projection_patch_draft_json_schema`] (the `schemars`-derived shape the
-/// vLLM/mistral.rs paths use) in three deliberate ways that make it a good fit
+/// vLLM/mistral.rs paths use) in four deliberate ways that make it a good fit
 /// for OpenAI/OpenRouter strict mode and **at least as strict as the runtime
 /// validator** ([`validate_projection_patch_draft`]):
 ///
@@ -291,6 +396,17 @@ pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String>
 ///    request into a 400. They stay the validator's job (and the repair path's).
 ///    That makes the schema marginally looser than the validator on ranges only
 ///    — never on structure or kind, which is where the failures were.
+/// 4. **The claim-evidence class is an unconstrained string, not an inlined
+///    `enum` (ADR-0037).** `upsert_note` / `upsert_graph_node` /
+///    `upsert_graph_edge` each gain an `evidence` object whose `claim_class`
+///    is typed `string`, not `{"enum": [...]}` — the same "ranges/kind-lists
+///    stay the validator's job" posture as point 3, applied to a new field
+///    instead of an existing one. `judge_claim_evidence` is the sole judge of
+///    whether a class is recognized and satisfied; the schema only pins the
+///    anchor's shape. This is scoped to the three content-creating Upsert*
+///    variants ONLY — the seven delete/remove/invalidate/strengthen/weaken/
+///    merge/split variants are untouched, so their budget is not spent on a
+///    field they have no evidence requirement for.
 pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json::Value {
     use serde_json::json;
 
@@ -305,6 +421,31 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
     }
     fn number() -> serde_json::Value {
         json!({ "type": "number" })
+    }
+
+    // Compact evidence-anchor object (ADR-0037), added ONLY to the three
+    // content-creating Upsert* variants below — the seven delete/remove/
+    // invalidate/strengthen/weaken/merge/split variants are untouched, so
+    // their existing per-variant budget is not spent on a field they have no
+    // evidence requirement for. Every `EvidenceAnchor` field is listed in
+    // `required` (nullable where optional) to satisfy strict mode exactly
+    // like every other variant field here; `claim_class` is NOT restricted
+    // to an inlined `enum` list, matching this schema's existing posture of
+    // staying "marginally looser than the validator … never on structure or
+    // kind" (see the doc comment above) — `judge_claim_evidence` is what
+    // actually rejects an unrecognized or unsatisfied class, not the schema.
+    fn evidence() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "claim_class": string(),
+                "span_id": nullable_string(),
+                "quote": nullable_string(),
+                "note": nullable_string(),
+            },
+            "required": ["claim_class", "span_id", "quote", "note"],
+            "additionalProperties": false,
+        })
     }
 
     // One internally-tagged operation variant: a closed object whose `type` is
@@ -349,9 +490,15 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
                     ("title", string()),
                     ("body", string()),
                     ("tags", string_array()),
+                    ("evidence", evidence()),
                 ],
             ),
             variant("delete_note", &[("id", string())]),
+            // `invalidate_note` is deliberately NOT offered here (ADR-0037
+            // part 4: corrections/retractions are derived, not
+            // model-authored) — `validate_operation` refuses it wholesale if
+            // a non-strict route's model emits it anyway; see
+            // `ProjectionOperation::InvalidateNote`'s doc comment.
             variant(
                 "reorder_note",
                 &[("id", string()), ("after_id", nullable_string())],
@@ -365,6 +512,7 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
                     ("name", string()),
                     ("entity_type", string()),
                     ("description", nullable_string()),
+                    ("evidence", evidence()),
                 ],
             ),
             variant("remove_graph_node", &[("id", string())]),
@@ -378,6 +526,7 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
                     ("relation_type", string()),
                     ("label", nullable_string()),
                     ("weight", number()),
+                    ("evidence", evidence()),
                 ],
             ),
             variant("remove_graph_edge", &[("id", string())]),
@@ -421,24 +570,40 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
     })
 }
 
+/// `basis` is the basis-covered `TranscriptEvent` map (ADR-0037) each
+/// content-creating operation's `EvidenceAnchor` is judged against — build it
+/// once via [`basis_events`] and share it across the whole draft. Callers
+/// with nothing evidence-anchored to validate (or no ledger available) may
+/// pass an empty map.
 pub fn parse_projection_patch_draft(
     raw: &str,
     expected_kind: &ProjectionKind,
+    basis: &BTreeMap<&str, &TranscriptEvent>,
 ) -> Result<ProjectionPatchDraft, ProjectionPatchDraftError> {
     let draft: ProjectionPatchDraft =
         serde_json::from_str(raw).map_err(|error| ProjectionPatchDraftError::InvalidJson {
             error: error.to_string(),
         })?;
-    validate_projection_patch_draft(&draft, expected_kind)?;
+    validate_projection_patch_draft(&draft, expected_kind, basis)?;
     Ok(draft)
 }
 
 pub fn trusted_projection_patch_from_model_json(
     raw: &str,
     job: &ProjectionJob,
+    ledger: &TranscriptLedger,
     context: ProjectionPatchBuildContext,
 ) -> Result<ProjectionPatch, ProjectionPatchDraftError> {
-    let draft = parse_projection_patch_draft(raw, &job.kind)?;
+    // The SAME basis-covered set the repair prompt (`projection_patch_repair_prompt_messages`)
+    // and the original draft prompt (`projection_patch_prompt_messages`) were
+    // built from — resolving evidence against anything else would let a
+    // `Revised` span (ADR-0031) launder a stale claim into a proof.
+    let events = basis_events(job, ledger)?;
+    let basis: BTreeMap<&str, &TranscriptEvent> = events
+        .iter()
+        .map(|event| (event.span_id.as_str(), event))
+        .collect();
+    let draft = parse_projection_patch_draft(raw, &job.kind, &basis)?;
     Ok(ProjectionPatch {
         sequence: context.sequence,
         kind: job.kind.clone(),
@@ -554,7 +719,7 @@ pub fn projection_patch_prompt_messages(
             content: format!(
                 "You generate AudioGraph projection patch drafts. Return strict JSON only, with no markdown. \
                  Do not include trusted metadata such as sequence, basis, provenance, session_id, or llm_request_id; \
-                 the backend stamps those fields. {operation_guidance}\n\n\
+                 the backend stamps those fields. {operation_guidance} {EVIDENCE_GUIDANCE}\n\n\
                  Output JSON schema:\n{schema}"
             ),
         },
@@ -654,6 +819,7 @@ pub fn projection_patch_repair_prompt_messages(
 fn validate_projection_patch_draft(
     draft: &ProjectionPatchDraft,
     expected_kind: &ProjectionKind,
+    basis: &BTreeMap<&str, &TranscriptEvent>,
 ) -> Result<(), ProjectionPatchDraftError> {
     if let Some(confidence) = draft.confidence
         && (!confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
@@ -663,7 +829,7 @@ fn validate_projection_patch_draft(
 
     let mut seen_ids = BTreeSet::new();
     for operation in &draft.operations {
-        validate_operation(operation, expected_kind)?;
+        validate_operation(operation, expected_kind, basis)?;
         let (namespace, id) = operation_identity(operation);
         if !seen_ids.insert((namespace, id)) {
             return Err(ProjectionPatchDraftError::DuplicateOperationId {
@@ -679,6 +845,7 @@ fn validate_projection_patch_draft(
 fn validate_operation(
     operation: &ProjectionOperation,
     expected_kind: &ProjectionKind,
+    basis: &BTreeMap<&str, &TranscriptEvent>,
 ) -> Result<(), ProjectionPatchDraftError> {
     let actual_kind = operation_kind(operation);
     if &actual_kind != expected_kind {
@@ -690,23 +857,37 @@ fn validate_operation(
 
     match operation {
         ProjectionOperation::UpsertNote {
-            id, title, body, ..
+            id,
+            title,
+            body,
+            evidence,
+            ..
         } => {
             require_non_empty(operation, "id", id)?;
             require_non_empty(operation, "title", title)?;
-            require_non_empty(operation, "body", body)
+            require_non_empty(operation, "body", body)?;
+            judge_operation_evidence(operation, id, evidence, basis)
         }
         ProjectionOperation::DeleteNote { id } => require_non_empty(operation, "id", id),
+        // ADR-0037 part 4 (see `ProjectionOperation::InvalidateNote`'s doc):
+        // never admissible from a model-submitted draft, regardless of `id`.
+        ProjectionOperation::InvalidateNote { .. } => {
+            Err(ProjectionPatchDraftError::DerivedOnlyOperation {
+                operation: operation_name(operation),
+            })
+        }
         ProjectionOperation::ReorderNote { id, .. } => require_non_empty(operation, "id", id),
         ProjectionOperation::UpsertGraphNode {
             id,
             name,
             entity_type,
+            evidence,
             ..
         } => {
             require_non_empty(operation, "id", id)?;
             require_non_empty(operation, "name", name)?;
-            require_non_empty(operation, "entity_type", entity_type)
+            require_non_empty(operation, "entity_type", entity_type)?;
+            judge_operation_evidence(operation, id, evidence, basis)
         }
         ProjectionOperation::RemoveGraphNode { id } => require_non_empty(operation, "id", id),
         ProjectionOperation::InvalidateGraphNode { id } => require_non_empty(operation, "id", id),
@@ -716,6 +897,7 @@ fn validate_operation(
             target,
             relation_type,
             weight,
+            evidence,
             ..
         } => {
             require_non_empty(operation, "id", id)?;
@@ -728,7 +910,7 @@ fn validate_operation(
                     weight: *weight,
                 });
             }
-            Ok(())
+            judge_operation_evidence(operation, id, evidence, basis)
         }
         ProjectionOperation::RemoveGraphEdge { id } => require_non_empty(operation, "id", id),
         ProjectionOperation::InvalidateGraphEdge { id } => require_non_empty(operation, "id", id),
@@ -750,6 +932,32 @@ fn validate_operation(
         } => {
             require_non_empty(operation, "id", id)?;
             validate_graph_split_replacements(id, replacement_nodes)
+        }
+    }
+}
+
+/// The claim-evidence admission call (ADR-0037) for the three content-
+/// creating Upsert* operations: resolves `evidence` against `basis` — the
+/// SAME basis-covered `TranscriptEvent` set [`basis_events`] built for this
+/// job — and turns a [`ClaimAdmission::Refused`] into the SAME
+/// all-or-nothing per-patch validation failure every other structural check
+/// in [`validate_operation`] already produces (one bad operation already
+/// fails the whole patch today; this is additive to that, not a new
+/// asymmetry).
+fn judge_operation_evidence(
+    operation: &ProjectionOperation,
+    id: &str,
+    evidence: &crate::claim_evidence::EvidenceAnchor,
+    basis: &BTreeMap<&str, &TranscriptEvent>,
+) -> Result<(), ProjectionPatchDraftError> {
+    match crate::claim_evidence::judge_claim_evidence(evidence, basis) {
+        crate::claim_evidence::ClaimAdmission::Admitted(_) => Ok(()),
+        crate::claim_evidence::ClaimAdmission::Refused(deficiency) => {
+            Err(ProjectionPatchDraftError::ClaimEvidenceRefused {
+                operation: operation_name(operation),
+                id: id.to_string(),
+                deficiency,
+            })
         }
     }
 }
@@ -833,6 +1041,7 @@ fn operation_kind(operation: &ProjectionOperation) -> ProjectionKind {
     match operation {
         ProjectionOperation::UpsertNote { .. }
         | ProjectionOperation::DeleteNote { .. }
+        | ProjectionOperation::InvalidateNote { .. }
         | ProjectionOperation::ReorderNote { .. } => ProjectionKind::Notes,
         ProjectionOperation::UpsertGraphNode { .. }
         | ProjectionOperation::RemoveGraphNode { .. }
@@ -851,6 +1060,7 @@ fn operation_name(operation: &ProjectionOperation) -> &'static str {
     match operation {
         ProjectionOperation::UpsertNote { .. } => "upsert_note",
         ProjectionOperation::DeleteNote { .. } => "delete_note",
+        ProjectionOperation::InvalidateNote { .. } => "invalidate_note",
         ProjectionOperation::ReorderNote { .. } => "reorder_note",
         ProjectionOperation::UpsertGraphNode { .. } => "upsert_graph_node",
         ProjectionOperation::RemoveGraphNode { .. } => "remove_graph_node",
@@ -869,6 +1079,7 @@ fn operation_identity(operation: &ProjectionOperation) -> (&'static str, &str) {
     match operation {
         ProjectionOperation::UpsertNote { id, .. }
         | ProjectionOperation::DeleteNote { id }
+        | ProjectionOperation::InvalidateNote { id }
         | ProjectionOperation::ReorderNote { id, .. } => ("note", id.as_str()),
         ProjectionOperation::UpsertGraphNode { id, .. }
         | ProjectionOperation::RemoveGraphNode { id }
@@ -1006,14 +1217,15 @@ mod tests {
                 "id": "note:graphql",
                 "title": "GraphQL",
                 "body": "Alice mentioned GraphQL.",
-                "tags": ["topic"]
+                "tags": ["topic"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.82
         })
         .to_string();
 
-        let patch =
-            trusted_projection_patch_from_model_json(&raw, &job, context()).expect("valid patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect("valid patch");
 
         assert_eq!(patch.sequence, 7);
         assert_eq!(patch.kind, ProjectionKind::Notes);
@@ -1078,7 +1290,8 @@ mod tests {
                 "id": "note:alice-bob",
                 "title": "Alice and Bob",
                 "body": "Alice met Bob.",
-                "tags": []
+                "tags": [],
+                "evidence": {"claim_class": "unavailable_evidence", "note": "fixture"}
             }],
             "confidence": 0.5,
             "provenance": {
@@ -1095,7 +1308,7 @@ mod tests {
         // `ProjectionPatchDraft` is `deny_unknown_fields`, so the draft is rejected
         // outright rather than partially honored — the new `route_id` / `route`
         // fields inherit that boundary instead of widening it.
-        let error = trusted_projection_patch_from_model_json(&raw, &job, context())
+        let error = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
             .expect_err("a draft carrying trusted route metadata must be rejected");
         assert!(
             matches!(
@@ -1124,7 +1337,7 @@ mod tests {
         })
         .to_string();
 
-        let err = trusted_projection_patch_from_model_json(&raw, &job, context())
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
             .expect_err("wrong operation kind");
 
         assert_eq!(
@@ -1147,8 +1360,8 @@ mod tests {
         })
         .to_string();
 
-        let draft =
-            parse_projection_patch_draft(&raw, &ProjectionKind::Notes).expect("reorder note");
+        let draft = parse_projection_patch_draft(&raw, &ProjectionKind::Notes, &BTreeMap::new())
+            .expect("reorder note");
 
         assert!(matches!(
             draft.operations.first(),
@@ -1171,14 +1384,16 @@ mod tests {
                     "id": "person:alice",
                     "name": "Alice",
                     "entity_type": "person",
-                    "description": null
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 },
                 {
                     "type": "upsert_graph_node",
                     "id": "person:bob",
                     "name": "Bob",
                     "entity_type": "person",
-                    "description": null
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 },
                 {
                     "type": "upsert_graph_edge",
@@ -1187,15 +1402,16 @@ mod tests {
                     "target": "person:bob",
                     "relation_type": "works_with",
                     "label": "works with",
-                    "weight": 0.7
+                    "weight": 0.7,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 }
             ],
             "confidence": 0.76
         })
         .to_string();
 
-        let patch =
-            trusted_projection_patch_from_model_json(&raw, &job, context()).expect("graph patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect("graph patch");
 
         assert_eq!(patch.kind, ProjectionKind::Graph);
         assert_eq!(patch.operations.len(), 3);
@@ -1251,8 +1467,8 @@ mod tests {
         })
         .to_string();
 
-        let draft =
-            parse_projection_patch_draft(&raw, &ProjectionKind::Graph).expect("retcon draft");
+        let draft = parse_projection_patch_draft(&raw, &ProjectionKind::Graph, &BTreeMap::new())
+            .expect("retcon draft");
 
         assert_eq!(draft.operations.len(), 6);
         assert!(matches!(
@@ -1267,6 +1483,7 @@ mod tests {
         let err = parse_projection_patch_draft(
             "Alice and Bob are connected. This should be a note.",
             &ProjectionKind::Notes,
+            &BTreeMap::new(),
         )
         .expect_err("replacement prose is not JSON");
 
@@ -1282,7 +1499,7 @@ mod tests {
         })
         .to_string();
 
-        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Notes)
+        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Notes, &BTreeMap::new())
             .expect_err("model cannot supply trusted metadata");
 
         assert!(matches!(err, ProjectionPatchDraftError::InvalidJson { .. }));
@@ -1303,7 +1520,7 @@ mod tests {
         })
         .to_string();
 
-        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Graph)
+        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Graph, &BTreeMap::new())
             .expect_err("edge weight must be bounded");
 
         assert_eq!(
@@ -1325,8 +1542,9 @@ mod tests {
             }]
         })
         .to_string();
-        let err = parse_projection_patch_draft(&invalid_delta, &ProjectionKind::Graph)
-            .expect_err("weight delta must be bounded");
+        let err =
+            parse_projection_patch_draft(&invalid_delta, &ProjectionKind::Graph, &BTreeMap::new())
+                .expect_err("weight delta must be bounded");
         assert_eq!(
             err,
             ProjectionPatchDraftError::InvalidGraphEdgeWeightDelta {
@@ -1349,8 +1567,12 @@ mod tests {
             }]
         })
         .to_string();
-        let err = parse_projection_patch_draft(&underspecified_split, &ProjectionKind::Graph)
-            .expect_err("split needs at least two replacements");
+        let err = parse_projection_patch_draft(
+            &underspecified_split,
+            &ProjectionKind::Graph,
+            &BTreeMap::new(),
+        )
+        .expect_err("split needs at least two replacements");
         assert_eq!(
             err,
             ProjectionPatchDraftError::InvalidGraphSplitReplacementCount {
@@ -1362,6 +1584,9 @@ mod tests {
 
     #[test]
     fn duplicate_graph_node_identity_is_rejected_before_materialization() {
+        let fixture_event = event("span-1", 1, "Alice met Bob.");
+        let basis: BTreeMap<&str, &TranscriptEvent> =
+            [("span-1", &fixture_event)].into_iter().collect();
         let raw = serde_json::json!({
             "operations": [
                 {
@@ -1369,20 +1594,22 @@ mod tests {
                     "id": "person:alice",
                     "name": "Alice",
                     "entity_type": "person",
-                    "description": null
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 },
                 {
                     "type": "upsert_graph_node",
                     "id": "person:alice",
                     "name": "Alice A.",
                     "entity_type": "person",
-                    "description": "duplicate in same patch"
+                    "description": "duplicate in same patch",
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 }
             ]
         })
         .to_string();
 
-        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Graph)
+        let err = parse_projection_patch_draft(&raw, &ProjectionKind::Graph, &basis)
             .expect_err("duplicate graph node id");
 
         assert_eq!(
@@ -1407,12 +1634,13 @@ mod tests {
                 "id": "note:provider-choice",
                 "title": "Provider choice",
                 "body": "Alice chose Soniox.",
-                "tags": ["provider"]
+                "tags": ["provider"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }]
         })
         .to_string();
         let first_patch =
-            trusted_projection_patch_from_model_json(&first_raw, &first_job, context())
+            trusted_projection_patch_from_model_json(&first_raw, &first_job, &ledger, context())
                 .expect("first note patch");
 
         ledger
@@ -1431,14 +1659,19 @@ mod tests {
                 "id": "note:provider-choice",
                 "title": "Provider choice",
                 "body": "Alice chose Soniox for realtime tests, not production.",
-                "tags": ["provider", "correction"]
+                "tags": ["provider", "correction"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.78
         })
         .to_string();
-        let second_patch =
-            trusted_projection_patch_from_model_json(&second_raw, &second_job, second_context)
-                .expect("retcon note patch");
+        let second_patch = trusted_projection_patch_from_model_json(
+            &second_raw,
+            &second_job,
+            &ledger,
+            second_context,
+        )
+        .expect("retcon note patch");
 
         assert!(matches!(
             first_patch.operations.first(),
@@ -1468,12 +1701,13 @@ mod tests {
                 "id": "provider:soniox",
                 "name": "Soniox",
                 "entity_type": "provider",
-                "description": "Candidate provider."
+                "description": "Candidate provider.",
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }]
         })
         .to_string();
         let first_patch =
-            trusted_projection_patch_from_model_json(&first_raw, &first_job, context())
+            trusted_projection_patch_from_model_json(&first_raw, &first_job, &ledger, context())
                 .expect("first graph patch");
 
         ledger
@@ -1492,14 +1726,19 @@ mod tests {
                 "id": "provider:soniox",
                 "name": "Soniox",
                 "entity_type": "provider",
-                "description": "Realtime STT candidate with speaker labels."
+                "description": "Realtime STT candidate with speaker labels.",
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.83
         })
         .to_string();
-        let second_patch =
-            trusted_projection_patch_from_model_json(&second_raw, &second_job, second_context)
-                .expect("updated graph patch");
+        let second_patch = trusted_projection_patch_from_model_json(
+            &second_raw,
+            &second_job,
+            &ledger,
+            second_context,
+        )
+        .expect("updated graph patch");
 
         assert!(matches!(
             first_patch.operations.first(),
@@ -1586,6 +1825,39 @@ mod tests {
                 .content
                 .contains("Do not include trusted metadata")
         );
+    }
+
+    /// ADR-0037: the system prompt must actually teach a model what
+    /// `evidence` is, or a schema-obeying model on any non-strict route has
+    /// no way to learn the contract (finding: prompt text never mentioned
+    /// evidence, claim classes, or that `span_id` must come from the
+    /// transcript window). Repair prompts extend this same base prompt, so
+    /// they inherit the guidance without a separate copy.
+    #[test]
+    fn system_prompt_teaches_the_evidence_contract() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+        let messages = projection_patch_prompt_messages(&job, &ledger).expect("prompt");
+
+        let system = &messages[0].content;
+        for term in [
+            "evidence",
+            "claim_class",
+            "verified_quote",
+            "grounded_inference",
+            "unavailable_evidence",
+            "knowledge_gap",
+            "span_id",
+            "quote",
+        ] {
+            assert!(
+                system.contains(term),
+                "system prompt must teach `{term}`, got: {system}"
+            );
+        }
     }
 
     /// The rolling-summary window feeds only the last K turns verbatim; older
@@ -1765,7 +2037,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        for field in ["type", "id", "title", "body", "tags"] {
+        for field in ["type", "id", "title", "body", "tags", "evidence"] {
             assert!(
                 required.contains(field),
                 "upsert_note must require `{field}`, required = {required:?}"
@@ -1778,6 +2050,54 @@ mod tests {
         );
     }
 
+    /// The `schemars`-derived DRAFT schema (vLLM/mistral.rs/generic
+    /// OpenAI-compatible routes, and the fallback every strict-schema
+    /// rejection downgrades to) must require `evidence` on every
+    /// content-creating variant too — not just the hand-authored strict
+    /// schema `strict_schema_requires_every_operation_field` already pins.
+    /// Before `require_evidence_on_content_creating_operation_variants`,
+    /// `#[serde(default)]`'s backward-compat fallback made schemars omit
+    /// `evidence` from `required` and advertise `knowledge_gap` — the one
+    /// class `judge_claim_evidence` always refuses — as its default.
+    #[test]
+    fn draft_schema_requires_evidence_on_content_creating_operations() {
+        let schema = projection_patch_draft_json_schema().expect("draft schema builds");
+        let variants = schema["$defs"]["ProjectionOperation"]["oneOf"]
+            .as_array()
+            .expect("ProjectionOperation is a oneOf");
+
+        let mut checked_evidence_bearing_variants = 0;
+        for variant in variants {
+            let Some(evidence) = variant.get("properties").and_then(|p| p.get("evidence")) else {
+                continue;
+            };
+            checked_evidence_bearing_variants += 1;
+            let type_const = variant["properties"]["type"]["const"]
+                .as_str()
+                .expect("variant pins its type const");
+            let required: Vec<&str> = variant["required"]
+                .as_array()
+                .expect("variant lists required fields")
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(
+                required.contains(&"evidence"),
+                "{type_const} must require `evidence`, required = {required:?}"
+            );
+            assert!(
+                evidence.get("default").is_none(),
+                "{type_const}'s evidence field must not advertise a default \
+                 (the always-refused knowledge_gap fallback)"
+            );
+        }
+        assert_eq!(
+            checked_evidence_bearing_variants, 3,
+            "expected exactly the three content-creating variants \
+             (upsert_note / upsert_graph_node / upsert_graph_edge) to carry evidence"
+        );
+    }
+
     /// The load-bearing strictness claim: a patch that OBEYS the strict schema
     /// (all required fields present, correct kind) also PASSES the runtime
     /// validator. If the schema were looser than the validator on structure or
@@ -1785,6 +2105,10 @@ mod tests {
     /// does not, for a representative notes and graph patch (audio-graph-a324).
     #[test]
     fn schema_valid_fixture_passes_the_runtime_validator() {
+        let fixture_event = event("span-1", 1, "Alice met Bob.");
+        let basis: BTreeMap<&str, &TranscriptEvent> =
+            [("span-1", &fixture_event)].into_iter().collect();
+
         // Notes: every upsert_note field present.
         let notes_fixture = serde_json::json!({
             "operations": [{
@@ -1792,12 +2116,13 @@ mod tests {
                 "id": "note:alice-bob",
                 "title": "Alice and Bob",
                 "body": "Alice met Bob.",
-                "tags": ["people"]
+                "tags": ["people"],
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
             }],
             "confidence": 0.8
         })
         .to_string();
-        parse_projection_patch_draft(&notes_fixture, &ProjectionKind::Notes)
+        parse_projection_patch_draft(&notes_fixture, &ProjectionKind::Notes, &basis)
             .expect("a schema-obeying notes patch must pass the validator");
 
         // Graph: node + edge, every field present, weight in range.
@@ -1808,7 +2133,8 @@ mod tests {
                     "id": "person:alice",
                     "name": "Alice",
                     "entity_type": "person",
-                    "description": null
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 },
                 {
                     "type": "upsert_graph_edge",
@@ -1817,13 +2143,14 @@ mod tests {
                     "target": "person:bob",
                     "relation_type": "met",
                     "label": null,
-                    "weight": 0.5
+                    "weight": 0.5,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
                 }
             ],
             "confidence": null
         })
         .to_string();
-        parse_projection_patch_draft(&graph_fixture, &ProjectionKind::Graph)
+        parse_projection_patch_draft(&graph_fixture, &ProjectionKind::Graph, &basis)
             .expect("a schema-obeying graph patch must pass the validator");
     }
 
@@ -1843,5 +2170,339 @@ mod tests {
             required.contains(&"confidence"),
             "strict mode requires every top-level property to be listed, including the nullable confidence"
         );
+    }
+
+    // ----- audio-graph-2cf9 / ADR-0037: claim-class evidence admission ------
+
+    /// A schema-obeying `UpsertNote` / `UpsertGraphNode` / `UpsertGraphEdge`
+    /// WITH a satisfying evidence anchor (`VerifiedQuote`, containment-
+    /// checked against a real basis span) passes end to end — the positive
+    /// mirror of `schema_valid_fixture_passes_the_runtime_validator`, which
+    /// deliberately used the evidence-light `UnavailableEvidence` class so it
+    /// stayed focused on structural strictness.
+    #[test]
+    fn evidence_annotated_upsert_operations_pass_end_to_end() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox for the pilot."))
+            .unwrap();
+        let notes_job = job(ProjectionKind::Notes, &ledger);
+        let notes_raw = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:decision",
+                "title": "Provider decision",
+                "body": "Alice chose Soniox for the pilot.",
+                "tags": ["decision"],
+                "evidence": {
+                    "claim_class": "verified_quote",
+                    "span_id": "span-1",
+                    "quote": "chose Soniox"
+                }
+            }],
+            "confidence": 0.9
+        })
+        .to_string();
+        let notes_patch =
+            trusted_projection_patch_from_model_json(&notes_raw, &notes_job, &ledger, context())
+                .expect("verified-quote note admits");
+        assert_eq!(notes_patch.operations.len(), 1);
+
+        let graph_job = job(ProjectionKind::Graph, &ledger);
+        let graph_raw = serde_json::json!({
+            "operations": [
+                {
+                    "type": "upsert_graph_node",
+                    "id": "provider:soniox",
+                    "name": "Soniox",
+                    "entity_type": "provider",
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                },
+                {
+                    "type": "upsert_graph_edge",
+                    "id": "edge:alice-soniox",
+                    "source": "provider:soniox",
+                    "target": "provider:soniox",
+                    "relation_type": "self",
+                    "label": null,
+                    "weight": 0.5,
+                    "evidence": {
+                        "claim_class": "verified_quote",
+                        "span_id": "span-1",
+                        "quote": "Alice chose Soniox"
+                    }
+                }
+            ],
+            "confidence": 0.85
+        })
+        .to_string();
+        let graph_patch =
+            trusted_projection_patch_from_model_json(&graph_raw, &graph_job, &ledger, context())
+                .expect("evidence-annotated graph ops admit");
+        assert_eq!(graph_patch.operations.len(), 2);
+    }
+
+    /// NEGATIVE: an `UpsertNote` whose claim class requires a `span_id`
+    /// (`grounded_inference`) but whose anchor is empty fails the WHOLE
+    /// patch, surfaced as `ProjectionPatchDraftError::ClaimEvidenceRefused`
+    /// (all-or-nothing, the same posture every other structural check here
+    /// already has).
+    #[test]
+    fn upsert_note_missing_required_evidence_refuses_the_whole_patch() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+        let raw = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:decision",
+                "title": "Provider decision",
+                "body": "Alice chose Soniox.",
+                "tags": ["decision"],
+                "evidence": {"claim_class": "grounded_inference"}
+            }],
+            "confidence": 0.9
+        })
+        .to_string();
+
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect_err("missing span_id must refuse the whole patch");
+
+        assert_eq!(
+            err,
+            ProjectionPatchDraftError::ClaimEvidenceRefused {
+                operation: "upsert_note",
+                id: "note:decision".to_string(),
+                deficiency: crate::claim_evidence::ClaimEvidenceDeficiency::MissingSpanId {
+                    class: crate::claim_evidence::ClaimClass::GroundedInference,
+                },
+            }
+        );
+    }
+
+    /// NEGATIVE: an `UpsertGraphEdge`'s evidence anchor points at a span that
+    /// is real (it is in the ledger) but is NOT part of THIS job's pinned
+    /// basis — e.g. it arrived after this job was queued, or belongs to a
+    /// different job's window. This proves cross-basis laundering is
+    /// impossible: `basis_events` only resolves spans in `job.basis`, so a
+    /// span outside it is invisible to `judge_claim_evidence` regardless of
+    /// whether it exists elsewhere in the ledger (ADR-0031/ADR-0037).
+    #[test]
+    fn upsert_graph_edge_evidence_anchored_outside_the_job_basis_is_rejected() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        // The job's basis is pinned BEFORE span-2 exists.
+        let job = job(ProjectionKind::Graph, &ledger);
+        ledger
+            .apply_event(event("span-2", 1, "Bob prefers Deepgram."))
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "operations": [
+                {
+                    "type": "upsert_graph_node",
+                    "id": "provider:soniox",
+                    "name": "Soniox",
+                    "entity_type": "provider",
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                },
+                {
+                    "type": "upsert_graph_node",
+                    "id": "provider:deepgram",
+                    "name": "Deepgram",
+                    "entity_type": "provider",
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                },
+                {
+                    "type": "upsert_graph_edge",
+                    "id": "edge:soniox-deepgram",
+                    "source": "provider:soniox",
+                    "target": "provider:deepgram",
+                    "relation_type": "competes_with",
+                    "label": null,
+                    "weight": 0.4,
+                    // span-2 is real (just applied to the ledger above) but is
+                    // NOT in `job.basis` — this is the laundering attempt.
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-2"}
+                }
+            ]
+        })
+        .to_string();
+
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect_err("a span outside the job's basis must be rejected");
+
+        assert_eq!(
+            err,
+            ProjectionPatchDraftError::ClaimEvidenceRefused {
+                operation: "upsert_graph_edge",
+                id: "edge:soniox-deepgram".to_string(),
+                deficiency: crate::claim_evidence::ClaimEvidenceDeficiency::SpanNotInBasis {
+                    span_id: "span-2".to_string(),
+                },
+            }
+        );
+    }
+
+    /// `InvalidateNote` is REFUSED from a model-submitted draft (ADR-0037
+    /// part 4: "corrections and retractions are derived, not
+    /// model-authored") — unlike `InvalidateGraphNode`/`Edge`, its
+    /// materialization is a hard delete with no `valid_until_ms` trace, so a
+    /// model-authored one would be an unrecoverable hallucination rather
+    /// than an auditable soft-invalidate. Deliberately NOT parity with
+    /// `invalidate_graph_node`, which the strict schema still offers.
+    #[test]
+    fn invalidate_note_is_refused_as_a_derived_only_operation() {
+        let raw = serde_json::json!({
+            "operations": [{
+                "type": "invalidate_note",
+                "id": "note:retracted"
+            }]
+        })
+        .to_string();
+
+        let error = parse_projection_patch_draft(&raw, &ProjectionKind::Notes, &BTreeMap::new())
+            .expect_err("invalidate_note must never be admitted from a model draft");
+        assert_eq!(
+            error,
+            ProjectionPatchDraftError::DerivedOnlyOperation {
+                operation: "invalidate_note",
+            }
+        );
+
+        // The strict schema does not even offer the variant, so a
+        // schema-obeying model cannot emit it at all.
+        let schema = projection_patch_strict_json_schema(&ProjectionKind::Notes);
+        let variant_types: Vec<&str> = schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["properties"]["type"]["enum"][0].as_str().unwrap())
+            .collect();
+        assert!(!variant_types.contains(&"invalidate_note"));
+    }
+
+    /// Permanent regression: the strict schema (both kinds) stays under the
+    /// hard 5,000-character strict-mode ceiling after the evidence field was
+    /// added, with the per-variant char count LOGGED so a future variant
+    /// addition sees the actual remaining headroom instead of the ADR's now-
+    /// stale 237-char/variant estimate (ADR-0037's own probe was a throwaway
+    /// that got reverted — this test is what replaces re-losing that number).
+    #[test]
+    fn strict_schema_char_budget_regression_with_per_variant_measurement() {
+        const HARD_CEILING: usize = 5_000;
+
+        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+            let schema = projection_patch_strict_json_schema(&kind);
+            let total_len = schema.to_string().len();
+            assert!(
+                total_len < HARD_CEILING,
+                "{kind:?} strict schema is {total_len} chars, at or over the hard \
+                 {HARD_CEILING}-char strict-mode ceiling"
+            );
+
+            let variants = schema["properties"]["operations"]["items"]["anyOf"]
+                .as_array()
+                .expect("operation variants are an anyOf array");
+            let mut per_variant = Vec::new();
+            for variant in variants {
+                let type_const = variant["properties"]["type"]["enum"][0]
+                    .as_str()
+                    .expect("each variant pins its type const")
+                    .to_string();
+                let variant_len = variant.to_string().len();
+                per_variant.push((type_const, variant_len));
+            }
+            // A number in the repository, not a claim reasoned about: log every
+            // variant's actual serialized size so a future variant addition can
+            // read the real remaining headroom off this test's output.
+            eprintln!(
+                "strict schema char budget — {kind:?}: total={total_len}/{HARD_CEILING}, \
+                 per-variant={per_variant:?}"
+            );
+            assert!(
+                !per_variant.is_empty(),
+                "{kind:?} strict schema offers no operation variants"
+            );
+        }
+    }
+
+    /// Backward-compat: a `ProjectionPatch` JSON fixture written before this
+    /// contract (no `evidence` key on its `upsert_note` operation) still
+    /// deserializes — `EvidenceAnchor`'s `Default` fills the gap rather than
+    /// failing the whole record, and that default is never re-validated for
+    /// an already-materialized historical patch.
+    #[test]
+    fn pre_contract_projection_patch_fixture_still_deserializes() {
+        let legacy_patch_json = serde_json::json!({
+            "sequence": 1,
+            "kind": "notes",
+            "llm_request_id": "req-legacy-1",
+            "basis": {
+                "span_revisions": [],
+                "diarization_span_revisions": [],
+                "transcript_hash": "fnv1a64:0000000000000000"
+            },
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:legacy",
+                "title": "Legacy note",
+                "body": "Written before ADR-0037.",
+                "tags": []
+            }],
+            "confidence": 0.5,
+            "provenance": {
+                "provider": "llm.api",
+                "model": "legacy-model",
+                "prompt_id": "legacy-v1"
+            },
+            "created_at_ms": 1_000
+        })
+        .to_string();
+
+        let patch: ProjectionPatch =
+            serde_json::from_str(&legacy_patch_json).expect("pre-contract patch deserializes");
+        assert!(matches!(
+            patch.operations.first(),
+            Some(ProjectionOperation::UpsertNote { evidence, .. })
+                if *evidence == crate::claim_evidence::EvidenceAnchor::default()
+        ));
+    }
+
+    /// Backward-compat: a `MaterializedNote` JSON fixture written before this
+    /// contract (no `evidence` field at all) still deserializes, with
+    /// `evidence: None` — never confused with a class-satisfying absence.
+    #[test]
+    fn pre_contract_materialized_note_fixture_deserializes_with_no_evidence() {
+        let legacy_note_json = serde_json::json!({
+            "id": "note:legacy",
+            "title": "Legacy note",
+            "body": "Written before ADR-0037.",
+            "tags": [],
+            "updated_by_sequence": 1,
+            "updated_at_ms": 1_000,
+            "basis": {
+                "span_revisions": [],
+                "diarization_span_revisions": [],
+                "transcript_hash": "fnv1a64:0000000000000000"
+            },
+            "provenance": {
+                "provider": "llm.api",
+                "model": "legacy-model",
+                "prompt_id": "legacy-v1"
+            }
+        })
+        .to_string();
+
+        let note: crate::projections::MaterializedNote =
+            serde_json::from_str(&legacy_note_json).expect("pre-contract note deserializes");
+        assert!(note.evidence.is_none());
     }
 }

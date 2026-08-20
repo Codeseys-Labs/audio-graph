@@ -7565,6 +7565,7 @@ mod tests_status {
                     job.basis.span_revisions.len()
                 ),
                 tags: vec!["test".to_string()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             ProjectionKind::Graph => vec![ProjectionOperation::UpsertGraphNode {
                 id: format!("node-{}", job.basis.transcript_hash),
@@ -7574,6 +7575,7 @@ mod tests_status {
                     "Projected {} transcript span(s).",
                     job.basis.span_revisions.len()
                 )),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         };
         ProjectionPatch {

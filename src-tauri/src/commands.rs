@@ -3403,6 +3403,56 @@ fn existing_live_assist_card(
         .find(|card| card.proposal.id == proposal_id)
 }
 
+/// Build the honest [`crate::claim_evidence::EvidenceAnchor`] for an approved
+/// live-assist proposal (ADR-0037).
+///
+/// This path is locally generated from an approved live-assist card, not LLM
+/// output, so it never goes through `validate_projection_patch_draft`/
+/// `judge_claim_evidence` at draft time — but the proposal DOES carry a real
+/// citation, `proposal.source_segment_id`, which is validated when the card
+/// itself is admitted (`persistence/mod.rs`'s OR-citation rule). `EvidenceAnchor::
+/// default()` (⇒ `KnowledgeGap`, the one class the judge always refuses)
+/// mislabels every approved card as an absence-shaped gap, which is wrong for
+/// a positive assertion and misleads every reader of the canonical
+/// `ProjectionOperation` log (typed-gap reports, evidence inspection,
+/// `SessionExportBundle`), independent of whatever `apply_validated_patch`
+/// later re-derives. `source_segment_id` may be the provider's
+/// `transcript_segment_id` OR the immutable `span_id`
+/// (`derive_legacy_transcript_segments`'s same fallback), so this resolves it
+/// against the ledger's `latest_spans` by either field before anchoring —
+/// `judge_claim_evidence`'s basis map is keyed by the literal `span_id` only.
+fn live_assist_evidence_anchor(
+    ledger: &crate::projections::TranscriptLedger,
+    source_segment_id: &str,
+) -> crate::claim_evidence::EvidenceAnchor {
+    let resolved_span_id = ledger
+        .latest_spans
+        .iter()
+        .find(|event| {
+            event.span_id == source_segment_id
+                || event.transcript_segment_id.as_deref() == Some(source_segment_id)
+        })
+        .map(|event| event.span_id.clone());
+
+    match resolved_span_id {
+        Some(span_id) => crate::claim_evidence::EvidenceAnchor {
+            claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+            span_id: Some(span_id),
+            quote: None,
+            note: None,
+        },
+        None => crate::claim_evidence::EvidenceAnchor {
+            claim_class: crate::claim_evidence::ClaimClass::UnavailableEvidence,
+            span_id: None,
+            quote: None,
+            note: Some(format!(
+                "Live-assist proposal cited transcript segment {source_segment_id}, which is no \
+                 longer present in this session's transcript ledger at approval time."
+            )),
+        },
+    }
+}
+
 fn approved_agent_projection_patch(
     state: &AppState,
     proposal: &events::AgentProposalPayload,
@@ -3412,6 +3462,7 @@ fn approved_agent_projection_patch(
     let ledger = runtime.transcript_ledger_snapshot();
     let basis = ledger.current_basis();
     let now_ms = unix_millis();
+    let evidence = live_assist_evidence_anchor(&ledger, &proposal.source_segment_id);
 
     let (kind, operations, prompt_id) = match &proposal.kind {
         events::AgentProposalKind::Note => (
@@ -3421,6 +3472,7 @@ fn approved_agent_projection_patch(
                 title: proposal.title.clone(),
                 body: proposal.body.clone(),
                 tags: vec!["live-assist".to_string(), "approved".to_string()],
+                evidence: evidence.clone(),
             }],
             "live-assist-note-approval",
         ),
@@ -3433,6 +3485,7 @@ fn approved_agent_projection_patch(
                     name: question,
                     entity_type: "Question".to_string(),
                     description: Some(proposal.body.clone()),
+                    evidence: evidence.clone(),
                 }],
                 "live-assist-question-approval",
             )
@@ -3444,6 +3497,7 @@ fn approved_agent_projection_patch(
                 name: proposal.title.clone(),
                 entity_type: "LiveAssistSuggestion".to_string(),
                 description: Some(proposal.body.clone()),
+                evidence,
             }],
             "live-assist-graph-suggestion-approval",
         ),
@@ -6356,6 +6410,7 @@ fn projection_replay_evaluation_metrics(
             match operation {
                 crate::projections::ProjectionOperation::UpsertNote { .. }
                 | crate::projections::ProjectionOperation::DeleteNote { .. }
+                | crate::projections::ProjectionOperation::InvalidateNote { .. }
                 | crate::projections::ProjectionOperation::ReorderNote { .. } => {
                     note_operation_count += 1;
                 }
@@ -10594,6 +10649,84 @@ mod tests {
     use super::*;
     use tauri::Listener;
 
+    fn transcript_event_fixture(
+        span_id: &str,
+        transcript_segment_id: &str,
+    ) -> crate::projections::TranscriptEvent {
+        crate::projections::TranscriptEvent {
+            span_id: span_id.to_string(),
+            provider: "test".to_string(),
+            source_id: "source-1".to_string(),
+            provider_item_id: None,
+            transcript_segment_id: Some(transcript_segment_id.to_string()),
+            speaker_id: Some("speaker-1".to_string()),
+            speaker_label: Some("Speaker 1".to_string()),
+            channel: None,
+            text: "Ana owns the migration.".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: crate::projections::TranscriptEventStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// ADR-0037: an approved live-assist proposal must anchor to its cited
+    /// span, never `EvidenceAnchor::default()` (KnowledgeGap, an
+    /// absence-shaped claim wrong for a positive assertion) — regardless of
+    /// whether `source_segment_id` is the provider's `transcript_segment_id`
+    /// or the raw `span_id` (`derive_legacy_transcript_segments`'s same
+    /// fallback), since `judge_claim_evidence`'s basis map is keyed by the
+    /// literal `span_id` only.
+    #[test]
+    fn live_assist_evidence_anchor_resolves_segment_id_or_span_id_to_grounded_inference() {
+        let mut ledger = crate::projections::TranscriptLedger::new("session-1");
+        ledger
+            .latest_spans
+            .push(transcript_event_fixture("span-1", "segment-1"));
+
+        for citation in ["segment-1", "span-1"] {
+            let anchor = live_assist_evidence_anchor(&ledger, citation);
+            assert_eq!(
+                anchor,
+                crate::claim_evidence::EvidenceAnchor {
+                    claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+                    span_id: Some("span-1".to_string()),
+                    quote: None,
+                    note: None,
+                },
+                "citation {citation:?} must resolve to the literal span_id"
+            );
+        }
+    }
+
+    /// A citation that no longer resolves in the ledger degrades to
+    /// `UnavailableEvidence` with an explanatory note — still honest (never
+    /// `KnowledgeGap`), even though it will not carry a resolved span.
+    #[test]
+    fn live_assist_evidence_anchor_degrades_to_unavailable_evidence_for_an_unresolvable_citation() {
+        let ledger = crate::projections::TranscriptLedger::new("session-1");
+        let anchor = live_assist_evidence_anchor(&ledger, "segment-gone");
+        assert_eq!(
+            anchor.claim_class,
+            crate::claim_evidence::ClaimClass::UnavailableEvidence
+        );
+        assert_eq!(anchor.span_id, None);
+        assert!(
+            anchor
+                .note
+                .is_some_and(|note| note.contains("segment-gone"))
+        );
+    }
+
     #[test]
     fn session_content_policy_blocks_cloud_but_not_loopback_or_local() {
         let local_only = crate::settings::AppSettings {
@@ -11083,6 +11216,7 @@ mod tests {
                 title: "Private title".to_string(),
                 body: note_body.to_string(),
                 tags: vec!["private".to_string()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
@@ -11114,6 +11248,7 @@ mod tests {
                 name: "Private Node".to_string(),
                 entity_type: "PrivateEntity".to_string(),
                 description: Some("Private graph description".to_string()),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.86,
             provenance: crate::projections::ProjectionProvenance {
@@ -11149,6 +11284,7 @@ mod tests {
                 relation_type: "mentions".to_string(),
                 label: Some("Private edge label".to_string()),
                 weight: 0.5,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.5,
             provenance: crate::projections::ProjectionProvenance {
@@ -11206,6 +11342,7 @@ mod tests {
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
+            evidence: None,
         });
         notes
     }
@@ -11235,6 +11372,7 @@ mod tests {
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
             },
+            evidence: None,
         });
         graph
     }
@@ -11268,6 +11406,7 @@ mod tests {
                 updated_at_ms: 99,
                 basis: basis.clone(),
                 provenance: provenance.clone(),
+                evidence: None,
             });
         state.graph.last_sequence = 99;
         state
@@ -11287,6 +11426,7 @@ mod tests {
                 updated_at_ms: 99,
                 basis,
                 provenance,
+                evidence: None,
             });
         state
     }
@@ -12879,18 +13019,21 @@ mod tests {
                     name: "Alice".to_string(),
                     entity_type: "person".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 crate::projections::ProjectionOperation::UpsertGraphNode {
                     id: "person:alicia".to_string(),
                     name: "Alicia".to_string(),
                     entity_type: "person".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 crate::projections::ProjectionOperation::UpsertGraphNode {
                     id: "project:audio-graph".to_string(),
                     name: "AudioGraph".to_string(),
                     entity_type: "project".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 crate::projections::ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alice:owns".to_string(),
@@ -12899,6 +13042,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: None,
                     weight: 0.8,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 crate::projections::ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alicia:owns".to_string(),
@@ -12907,6 +13051,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: None,
                     weight: 0.6,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             confidence: 0.9,

@@ -1207,15 +1207,20 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 title: _,
                 body: _,
                 tags,
+                evidence,
             } => f
                 .debug_struct("UpsertNote")
                 .field("id", id)
                 .field("title", &REDACTED_DEBUG_VALUE)
                 .field("body", &REDACTED_DEBUG_VALUE)
                 .field("tags", tags)
+                .field("evidence", &DebugEvidenceAnchor(evidence))
                 .finish(),
             ProjectionOperation::DeleteNote { id } => {
                 f.debug_struct("DeleteNote").field("id", id).finish()
+            }
+            ProjectionOperation::InvalidateNote { id } => {
+                f.debug_struct("InvalidateNote").field("id", id).finish()
             }
             ProjectionOperation::ReorderNote { id, after_id } => f
                 .debug_struct("ReorderNote")
@@ -1227,6 +1232,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 name: _,
                 entity_type: _,
                 description,
+                evidence,
             } => f
                 .debug_struct("UpsertGraphNode")
                 .field("id", id)
@@ -1236,6 +1242,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                     "description",
                     &description.as_ref().map(|_| REDACTED_DEBUG_VALUE),
                 )
+                .field("evidence", &DebugEvidenceAnchor(evidence))
                 .finish(),
             ProjectionOperation::RemoveGraphNode { id } => {
                 f.debug_struct("RemoveGraphNode").field("id", id).finish()
@@ -1251,6 +1258,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 relation_type: _,
                 label,
                 weight,
+                evidence,
             } => f
                 .debug_struct("UpsertGraphEdge")
                 .field("id", id)
@@ -1259,6 +1267,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 .field("relation_type", &REDACTED_DEBUG_VALUE)
                 .field("label", &label.as_ref().map(|_| REDACTED_DEBUG_VALUE))
                 .field("weight", weight)
+                .field("evidence", &DebugEvidenceAnchor(evidence))
                 .finish(),
             ProjectionOperation::RemoveGraphEdge { id } => {
                 f.debug_struct("RemoveGraphEdge").field("id", id).finish()
@@ -1297,6 +1306,28 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                     .finish()
             }
         }
+    }
+}
+
+/// Redacts an [`EvidenceAnchor`](crate::claim_evidence::EvidenceAnchor)'s
+/// content-bearing fields for debug logs, mirroring the `title`/`body`/`name`
+/// redaction above. `claim_class` and `span_id` are never redacted: they are
+/// structural metadata (a class tag and an id), not transcript content, and
+/// `judge_claim_evidence`'s span-resolution and basis-laundering checks are
+/// exactly what a debugger needs to see when a patch is rejected.
+struct DebugEvidenceAnchor<'a>(&'a crate::claim_evidence::EvidenceAnchor);
+
+impl fmt::Debug for DebugEvidenceAnchor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvidenceAnchor")
+            .field("claim_class", &self.0.claim_class)
+            .field("span_id", &self.0.span_id)
+            .field(
+                "quote",
+                &self.0.quote.as_ref().map(|_| REDACTED_DEBUG_VALUE),
+            )
+            .field("note", &self.0.note.as_ref().map(|_| REDACTED_DEBUG_VALUE))
+            .finish()
     }
 }
 
@@ -1356,8 +1387,38 @@ pub enum ProjectionOperation {
         title: String,
         body: String,
         tags: Vec<String>,
+        /// Untrusted claim-class evidence anchor (ADR-0037 part 2). `#[serde(default)]`
+        /// is the backward-compat fallback for a `ProjectionOperation` persisted
+        /// before this contract (ADR-0027) — see `EvidenceAnchor`'s `Default` impl,
+        /// which lands on the one class `judge_claim_evidence` always refuses, so a
+        /// FRESH draft that omits this field is refused rather than silently
+        /// admitted.
+        #[serde(default)]
+        evidence: crate::claim_evidence::EvidenceAnchor,
     },
     DeleteNote {
+        id: String,
+    },
+    /// Parity with `InvalidateGraphNode` / `InvalidateGraphEdge` (ADR-0037 part
+    /// 4) — notes previously had only a hard `DeleteNote`, with no
+    /// history-preserving retraction. Materialization currently treats this the
+    /// same as `DeleteNote` (`MaterializedNotes` carries no `valid_until_ms`
+    /// the way the graph structs do); giving notes that same soft-invalidate
+    /// temporal tracking is a separate, unscoped change (flagged, not decided
+    /// here — see audio-graph-2cf9's open questions).
+    ///
+    /// ADR-0037 part 4: "corrections and retractions are derived, not
+    /// model-authored" — ADR-0031's pinned-revision advance is the mechanical
+    /// trigger, not free-form model judgement. Because this variant's
+    /// materialization is a hard delete with no `valid_until_ms` trace (the
+    /// unscoped gap above), a model-authored one would be an UNRECOVERABLE
+    /// hallucination rather than the auditable, reversible soft-invalidate
+    /// `InvalidateGraphNode`/`Edge` give. `projection_llm::validate_operation`
+    /// therefore refuses this variant in every model-submitted draft
+    /// (`ProjectionPatchDraftError::DerivedOnlyOperation`); the variant stays
+    /// defined here for a future ADR-0031-derived (trusted-code-only) caller,
+    /// not for the LLM-facing draft path.
+    InvalidateNote {
         id: String,
     },
     ReorderNote {
@@ -1369,6 +1430,9 @@ pub enum ProjectionOperation {
         name: String,
         entity_type: String,
         description: Option<String>,
+        /// See `UpsertNote::evidence`.
+        #[serde(default)]
+        evidence: crate::claim_evidence::EvidenceAnchor,
     },
     RemoveGraphNode {
         id: String,
@@ -1383,6 +1447,9 @@ pub enum ProjectionOperation {
         relation_type: String,
         label: Option<String>,
         weight: f32,
+        /// See `UpsertNote::evidence`.
+        #[serde(default)]
+        evidence: crate::claim_evidence::EvidenceAnchor,
     },
     RemoveGraphEdge {
         id: String,
@@ -1418,6 +1485,20 @@ pub struct MaterializedNote {
     pub updated_at_ms: u64,
     pub basis: ProjectionBasis,
     pub provenance: ProjectionProvenance,
+    /// Admitted per-item claim evidence (ADR-0037), re-judged at apply time
+    /// via [`resolve_admitted_claim_evidence`] against the SAME basis-covered
+    /// `TranscriptEvent`s the source operation's `EvidenceAnchor` was already
+    /// judged `Admitted` against once, at draft-admission time
+    /// (`projection_llm::trusted_projection_patch_from_model_json`) — the
+    /// ledger's basis-validation check just before materialization
+    /// (`apply_validated_patch_with_speaker_timeline_opt`) proves those two
+    /// resolutions read the identical, immutable transcript content, so this
+    /// is a deterministic re-read, not a second judgement. `None` on notes
+    /// materialized before this contract, or on the replay path (no ledger
+    /// snapshot at this patch's exact basis) — never confused with a
+    /// class-satisfying absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::claim_evidence::AdmittedClaimEvidence>,
 }
 
 impl fmt::Debug for MaterializedNote {
@@ -1431,6 +1512,7 @@ impl fmt::Debug for MaterializedNote {
             .field("updated_at_ms", &self.updated_at_ms)
             .field("basis", &self.basis)
             .field("provenance", &self.provenance)
+            .field("evidence", &self.evidence)
             .finish()
     }
 }
@@ -1468,7 +1550,16 @@ impl MaterializedNotes {
         }
     }
 
-    pub fn apply_patch(&mut self, patch: &ProjectionPatch) -> Result<(), ProjectionApplyError> {
+    /// `evidence_basis` is the basis-covered `TranscriptEvent` map to
+    /// re-judge each `UpsertNote`'s `EvidenceAnchor` against (ADR-0037);
+    /// `None` for callers with no ledger snapshot at this patch's exact basis
+    /// (replay — see [`MaterializedProjectionState::apply_replayed_patch`]),
+    /// in which case every note materializes with `evidence: None`.
+    pub fn apply_patch(
+        &mut self,
+        patch: &ProjectionPatch,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+    ) -> Result<(), ProjectionApplyError> {
         if patch.kind != ProjectionKind::Notes {
             return Err(ProjectionApplyError::WrongKind {
                 expected: ProjectionKind::Notes,
@@ -1490,8 +1581,18 @@ impl MaterializedNotes {
                     title,
                     body,
                     tags,
-                } => next.upsert_note(id, title, body, tags, patch),
-                ProjectionOperation::DeleteNote { id } => {
+                    evidence,
+                } => next.upsert_note(id, title, body, tags, evidence, evidence_basis, patch),
+                // InvalidateNote is applied identically to DeleteNote today:
+                // `MaterializedNote` carries no `valid_until_ms` the way
+                // `MaterializedGraphNode`/`Edge` do, so there is no
+                // history-preserving state to set. The variant exists for
+                // typed-operation parity with `InvalidateGraphNode`/
+                // `InvalidateGraphEdge` (ADR-0037 part 4); giving notes that
+                // same soft-invalidate temporal tracking is a separate,
+                // unscoped change (flagged, not decided here).
+                ProjectionOperation::DeleteNote { id }
+                | ProjectionOperation::InvalidateNote { id } => {
                     next.notes.retain(|note| note.id != *id);
                 }
                 ProjectionOperation::ReorderNote { id, after_id } => {
@@ -1519,12 +1620,15 @@ impl MaterializedNotes {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_note(
         &mut self,
         id: &str,
         title: &str,
         body: &str,
         tags: &[String],
+        evidence: &crate::claim_evidence::EvidenceAnchor,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
         patch: &ProjectionPatch,
     ) {
         let next = MaterializedNote {
@@ -1536,6 +1640,7 @@ impl MaterializedNotes {
             updated_at_ms: patch.created_at_ms,
             basis: patch.basis.clone(),
             provenance: patch.provenance.clone(),
+            evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
 
         if let Some(existing) = self.notes.iter_mut().find(|note| note.id == id) {
@@ -1592,6 +1697,9 @@ pub struct MaterializedGraphNode {
     pub updated_at_ms: u64,
     pub basis: ProjectionBasis,
     pub provenance: ProjectionProvenance,
+    /// See [`MaterializedNote::evidence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::claim_evidence::AdmittedClaimEvidence>,
 }
 
 impl fmt::Debug for MaterializedGraphNode {
@@ -1611,6 +1719,7 @@ impl fmt::Debug for MaterializedGraphNode {
             .field("updated_at_ms", &self.updated_at_ms)
             .field("basis", &self.basis)
             .field("provenance", &self.provenance)
+            .field("evidence", &self.evidence)
             .finish()
     }
 }
@@ -1633,6 +1742,9 @@ pub struct MaterializedGraphEdge {
     pub updated_at_ms: u64,
     pub basis: ProjectionBasis,
     pub provenance: ProjectionProvenance,
+    /// See [`MaterializedNote::evidence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::claim_evidence::AdmittedClaimEvidence>,
 }
 
 impl fmt::Debug for MaterializedGraphEdge {
@@ -1651,6 +1763,7 @@ impl fmt::Debug for MaterializedGraphEdge {
             .field("updated_at_ms", &self.updated_at_ms)
             .field("basis", &self.basis)
             .field("provenance", &self.provenance)
+            .field("evidence", &self.evidence)
             .finish()
     }
 }
@@ -1692,7 +1805,13 @@ impl MaterializedGraph {
         }
     }
 
-    pub fn apply_patch(&mut self, patch: &ProjectionPatch) -> Result<(), ProjectionApplyError> {
+    /// See [`MaterializedNotes::apply_patch`] for what `evidence_basis` means
+    /// and when it is `None`.
+    pub fn apply_patch(
+        &mut self,
+        patch: &ProjectionPatch,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+    ) -> Result<(), ProjectionApplyError> {
         if patch.kind != ProjectionKind::Graph {
             return Err(ProjectionApplyError::WrongKind {
                 expected: ProjectionKind::Graph,
@@ -1714,7 +1833,16 @@ impl MaterializedGraph {
                     name,
                     entity_type,
                     description,
-                } => next.upsert_node(id, name, entity_type, description.clone(), patch),
+                    evidence,
+                } => next.upsert_node(
+                    id,
+                    name,
+                    entity_type,
+                    description.clone(),
+                    evidence,
+                    evidence_basis,
+                    patch,
+                ),
                 ProjectionOperation::RemoveGraphNode { id } => {
                     next.nodes.retain(|node| node.id != *id);
                     next.edges
@@ -1730,6 +1858,7 @@ impl MaterializedGraph {
                     relation_type,
                     label,
                     weight,
+                    evidence,
                 } => {
                     if !next.has_active_node(source) {
                         return Err(ProjectionApplyError::MissingGraphNode {
@@ -1750,6 +1879,8 @@ impl MaterializedGraph {
                         relation_type,
                         label.clone(),
                         *weight,
+                        evidence,
+                        evidence_basis,
                         patch,
                     );
                 }
@@ -1779,6 +1910,7 @@ impl MaterializedGraph {
                 }
                 ProjectionOperation::UpsertNote { .. }
                 | ProjectionOperation::DeleteNote { .. }
+                | ProjectionOperation::InvalidateNote { .. }
                 | ProjectionOperation::ReorderNote { .. } => {
                     return Err(ProjectionApplyError::UnsupportedOperation {
                         kind: "note_operation_in_graph_patch",
@@ -1798,12 +1930,15 @@ impl MaterializedGraph {
             .any(|node| node.id == id && node.valid_until_ms.is_none())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_node(
         &mut self,
         id: &str,
         name: &str,
         entity_type: &str,
         description: Option<String>,
+        evidence: &crate::claim_evidence::EvidenceAnchor,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
         patch: &ProjectionPatch,
     ) {
         let next = MaterializedGraphNode {
@@ -1818,6 +1953,7 @@ impl MaterializedGraph {
             updated_at_ms: patch.created_at_ms,
             basis: patch.basis.clone(),
             provenance: patch.provenance.clone(),
+            evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
 
         if let Some(existing) = self.nodes.iter_mut().find(|node| node.id == id) {
@@ -1836,6 +1972,8 @@ impl MaterializedGraph {
         relation_type: &str,
         label: Option<String>,
         weight: f32,
+        evidence: &crate::claim_evidence::EvidenceAnchor,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
         patch: &ProjectionPatch,
     ) {
         let next = MaterializedGraphEdge {
@@ -1852,6 +1990,7 @@ impl MaterializedGraph {
             updated_at_ms: patch.created_at_ms,
             basis: patch.basis.clone(),
             provenance: patch.provenance.clone(),
+            evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
 
         if let Some(existing) = self.edges.iter_mut().find(|edge| edge.id == id) {
@@ -2017,12 +2156,21 @@ impl MaterializedGraph {
                 self.invalidate_edge_at(edge_index, patch);
             }
         }
+        // `SplitGraphNode`'s synthesized replacement nodes carry no evidence
+        // anchor of their own (`GraphNodeDraft` has no `evidence` field) —
+        // per this ticket's scope, evidence is required only for the three
+        // pure content-creating Upsert* operations, not the structural/
+        // derived-adjacent graph ops (`Strengthen`/`Weaken`/`Merge`/`Split`).
+        // `EvidenceAnchor::default()` + no basis is therefore correct here,
+        // not a shortcut: there is nothing to resolve.
         for replacement in replacement_nodes {
             self.upsert_node(
                 &replacement.id,
                 &replacement.name,
                 &replacement.entity_type,
                 replacement.description.clone(),
+                &crate::claim_evidence::EvidenceAnchor::default(),
+                None,
                 patch,
             );
         }
@@ -2168,20 +2316,39 @@ impl MaterializedProjectionState {
     /// stale. Historical basis validation needs the full transcript-event
     /// history and event ordering, so this path trusts the accepted log and
     /// replays materializer operations deterministically.
+    ///
+    /// `evidence_basis` is the SAME kind of basis-covered, speaker-corrected
+    /// event map [`resolve_claim_evidence_basis_events`] builds for the live
+    /// apply path (ADR-0037). [`Self::replay_accepted_patches_with_history`]
+    /// reconstructs a per-patch `TranscriptLedger` (and, when available,
+    /// `SpeakerTimeline`) at each patch's exact `created_at_ms` precisely so
+    /// it can pass one here — this used to be an unconditional `None` on
+    /// every replayed item, silently dropping ADR-0037's per-item evidence
+    /// (and ADR-0031's per-item pinned revision) on every rebuild from the
+    /// canonical log, and making "canonical history remains replayable"
+    /// false for any fixture with real evidence (see
+    /// `state.rs`'s `historical_replay_matches_live_materialized_state`,
+    /// whose fixture previously only passed because it used the one anchor
+    /// class that always refuses). `None` stays legitimate for
+    /// [`Self::replay_accepted_patches`], which has no transcript history at
+    /// all to reconstruct a basis from — every item there still materializes
+    /// with `evidence: None`, but that caller has no other option, not a
+    /// deliberately-skipped one.
     pub fn apply_replayed_patch(
         &mut self,
         patch: &ProjectionPatch,
+        evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
     ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
         match patch.kind {
             ProjectionKind::Notes => {
-                self.notes.apply_patch(patch)?;
+                self.notes.apply_patch(patch, evidence_basis)?;
                 Ok(MaterializedProjectionApplyOutcome::Notes {
                     last_sequence: self.notes.last_sequence,
                     note_count: self.notes.notes.len(),
                 })
             }
             ProjectionKind::Graph => {
-                self.graph.apply_patch(patch)?;
+                self.graph.apply_patch(patch, evidence_basis)?;
                 Ok(MaterializedProjectionApplyOutcome::Graph {
                     last_sequence: self.graph.last_sequence,
                     node_count: self.graph.nodes.len(),
@@ -2197,7 +2364,7 @@ impl MaterializedProjectionState {
     ) -> Result<Self, ProjectionApplyError> {
         let mut state = Self::new(session_id);
         for patch in patches {
-            state.apply_replayed_patch(&patch)?;
+            state.apply_replayed_patch(&patch, None)?;
         }
         Ok(state)
     }
@@ -2293,7 +2460,25 @@ impl MaterializedProjectionState {
                 continue;
             }
 
-            state.apply_replayed_patch(&patch)?;
+            // `ledger` (and, when present, `speaker_timeline`) above just
+            // proved this patch's basis still resolves at ITS exact
+            // historical point in the transcript/diarization streams — the
+            // identical proof `apply_validated_patch_with_speaker_timeline_opt`
+            // relies on for the live path — so re-deriving claim evidence
+            // against them here reproduces what `judge_claim_evidence` saw
+            // at draft-admission time, instead of the `None` this path used
+            // to hardcode.
+            let evidence_events = resolve_claim_evidence_basis_events(
+                &patch.basis,
+                &ledger,
+                speaker_timeline.as_ref(),
+            );
+            let evidence_basis: BTreeMap<&str, &TranscriptEvent> = evidence_events
+                .iter()
+                .map(|event| (event.span_id.as_str(), event))
+                .collect();
+
+            state.apply_replayed_patch(&patch, Some(&evidence_basis))?;
         }
 
         Ok(HistoricalProjectionReplay { state, validation })
@@ -2328,22 +2513,139 @@ impl MaterializedProjectionState {
             .validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline)
             .map_err(|staleness| ProjectionApplyError::StaleBasis { staleness })?;
 
+        // The basis check just above proves `ledger` still holds every span
+        // this patch's basis pinned, at the pinned revision — so resolving
+        // claim evidence against `ledger` HERE reproduces the same
+        // basis-covered set `judge_claim_evidence` saw at draft-admission
+        // time (ADR-0037/ADR-0031: never launder a `Revised` span into an
+        // evidence proof).
+        let evidence_events =
+            resolve_claim_evidence_basis_events(&patch.basis, ledger, speaker_timeline);
+        let evidence_basis: BTreeMap<&str, &TranscriptEvent> = evidence_events
+            .iter()
+            .map(|event| (event.span_id.as_str(), event))
+            .collect();
+
         match patch.kind {
             ProjectionKind::Notes => {
-                self.notes.apply_patch(patch)?;
+                self.notes.apply_patch(patch, Some(&evidence_basis))?;
                 Ok(MaterializedProjectionApplyOutcome::Notes {
                     last_sequence: self.notes.last_sequence,
                     note_count: self.notes.notes.len(),
                 })
             }
             ProjectionKind::Graph => {
-                self.graph.apply_patch(patch)?;
+                self.graph.apply_patch(patch, Some(&evidence_basis))?;
                 Ok(MaterializedProjectionApplyOutcome::Graph {
                     last_sequence: self.graph.last_sequence,
                     node_count: self.graph.nodes.len(),
                     edge_count: self.graph.edges.len(),
                 })
             }
+        }
+    }
+}
+
+/// Resolve the basis-covered `TranscriptEvent`s for `patch_basis` against
+/// `ledger`, for claim-evidence re-judging at apply time (ADR-0037). Mirrors
+/// `projection_llm::basis_events`'s `(span_id, revision_number)` lookup
+/// exactly, but is local to this module so `MaterializedNotes`/
+/// `MaterializedGraph` can call it without a dependency on `projection_llm`
+/// (which itself depends on `projections`). Spans the ledger no longer holds
+/// at the pinned revision are simply absent from the returned set — callers
+/// that need "this basis is still valid" as a hard precondition (e.g.
+/// [`TranscriptLedger::validate_basis_with_speaker_timeline`]) check that
+/// separately, before calling this.
+///
+/// Returns OWNED events, not borrows into `ledger`, because `speaker_timeline`
+/// (when supplied) overrides each resolved event's `speaker_id`/`speaker_label`
+/// with the canonical [`SpeakerTimeline`] latest-wins attribution — the same
+/// join `timeline::build_session_timeline` uses — before the caller ever hands
+/// the event to [`crate::claim_evidence::judge_claim_evidence`]. Without this,
+/// `ResolvedSpanEvidence::speaker_ref` (claim_evidence.rs) would read straight
+/// off the untrusted inline ASR label the diarization override exists
+/// precisely to supersede (ADR-0026 §3/§4). `None` means no diarization
+/// history is available for this call (e.g. a repository that does not
+/// support durable diarization storage, or a replay with no speaker-revision
+/// log); every event then keeps its inline speaker fields unchanged, exactly
+/// as before this override existed.
+pub(crate) fn resolve_claim_evidence_basis_events(
+    patch_basis: &ProjectionBasis,
+    ledger: &TranscriptLedger,
+    speaker_timeline: Option<&SpeakerTimeline>,
+) -> Vec<TranscriptEvent> {
+    let latest_by_span: BTreeMap<(&str, u64), &TranscriptEvent> = ledger
+        .latest_spans
+        .iter()
+        .map(|event| ((event.span_id.as_str(), event.revision_number), event))
+        .collect();
+    let attribution = speaker_timeline.map(crate::timeline::speaker_attribution_index);
+
+    patch_basis
+        .span_revisions
+        .iter()
+        .filter_map(|span| {
+            latest_by_span
+                .get(&(span.span_id.as_str(), span.revision_number))
+                .map(|event| {
+                    let mut event = (*event).clone();
+                    if let Some(attribution) = attribution.as_ref() {
+                        let keys = crate::timeline::candidate_keys(
+                            event.transcript_segment_id.as_deref(),
+                            event.span_id.as_str(),
+                        );
+                        if let Some(winner) =
+                            keys.iter().find_map(|key| attribution.get(key.as_str()))
+                        {
+                            event.speaker_id = winner.speaker_id.clone();
+                            event.speaker_label = winner.speaker_label.clone();
+                        }
+                    }
+                    event
+                })
+        })
+        .collect()
+}
+
+/// Re-judge one operation's untrusted [`EvidenceAnchor`](crate::claim_evidence::EvidenceAnchor)
+/// at apply time, for the `Materialized*.evidence` field.
+///
+/// `basis` is `None` when the caller has no ledger snapshot for this patch's
+/// exact basis (replay); the anchor was already judged once, correctly,
+/// against the SAME basis at draft-admission time
+/// (`projection_llm::trusted_projection_patch_from_model_json`), so a
+/// `Refused` judgement here — which should be unreachable on the live path,
+/// since `apply_validated_patch_with_speaker_timeline_opt` just proved this
+/// basis still resolves — is logged and treated as `None` rather than
+/// failing the whole apply. Materializing the note/node/edge itself is not
+/// contingent on its evidence badge.
+fn resolve_admitted_claim_evidence(
+    anchor: &crate::claim_evidence::EvidenceAnchor,
+    basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+) -> Option<crate::claim_evidence::AdmittedClaimEvidence> {
+    let basis = basis?;
+    match crate::claim_evidence::judge_claim_evidence(anchor, basis) {
+        crate::claim_evidence::ClaimAdmission::Admitted(evidence) => Some(evidence),
+        // `CoverageMarkerUnavailable` is `KnowledgeGap`'s UNCONDITIONAL,
+        // by-design refusal (ADR-0037) — locally-generated operations that
+        // never went through `validate_projection_patch_draft` at all (e.g.
+        // `commands::approved_agent_projection_patch`) deliberately anchor
+        // with `EvidenceAnchor::default()`, which is this class, so refusing
+        // here is expected on every application, not an anomaly worth a log
+        // line. Every OTHER deficiency reaching this point is unexpected: the
+        // operation's anchor was already judged `Admitted` once, against the
+        // same basis, at validation time.
+        crate::claim_evidence::ClaimAdmission::Refused(deficiency) => {
+            if !matches!(
+                deficiency,
+                crate::claim_evidence::ClaimEvidenceDeficiency::CoverageMarkerUnavailable
+            ) {
+                log::warn!(
+                    "claim evidence anchor refused at apply time after having been admitted at \
+                     validation time (basis drift?): {deficiency}"
+                );
+            }
+            None
         }
     }
 }
@@ -2432,6 +2734,21 @@ fn update_hash(hash: &mut u64, value: &str) {
     }
     *hash ^= 0x1f;
     *hash = hash.wrapping_mul(1_099_511_628_211);
+}
+
+/// Deterministic per-event content fingerprint for claim-evidence resolution
+/// (ADR-0037): the same FNV-1a64 family and `"fnv1a64:…"` format as
+/// [`transcript_events_hash_v1`], scoped to ONE resolved span instead of a
+/// whole ordered ledger. `claim_evidence::judge_claim_evidence` needs a
+/// content hash for the single event a `span_id` resolved to, not a basis-wide
+/// hash, so this is a distinct (smaller) hashed byte sequence, not a reuse of
+/// the ledger-wide hash's exact bytes.
+pub(crate) fn transcript_event_content_hash(event: &TranscriptEvent) -> String {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    update_hash(&mut hash, &event.span_id);
+    update_hash(&mut hash, &event.text);
+    update_hash(&mut hash, &event.revision_number.to_string());
+    format!("fnv1a64:{hash:016x}")
 }
 
 /// Frozen v1 deterministic FNV-1a hash over canonical transcript revision fields.
@@ -2556,6 +2873,28 @@ mod tests {
         assert_eq!(event.stability, TranscriptEventStability::Final);
         assert_eq!(event.revision_number, 2);
         assert_eq!(event.supersedes.as_deref(), Some("span-1@rev1"));
+    }
+
+    /// `transcript_event_content_hash` (ADR-0037's claim-evidence content
+    /// fingerprint) is deterministic per (span_id, text, revision_number) and
+    /// changes when any of those three change — the exact sensitivity
+    /// `judge_claim_evidence`'s `ResolvedSpanEvidence.content_hash` needs.
+    #[test]
+    fn transcript_event_content_hash_is_deterministic_and_content_sensitive() {
+        let event_a = TranscriptEvent::from(asr_payload("span-1", 2, "hello world"));
+        let event_a_again = TranscriptEvent::from(asr_payload("span-1", 2, "hello world"));
+        let event_different_text = TranscriptEvent::from(asr_payload("span-1", 2, "goodbye"));
+        let event_different_revision =
+            TranscriptEvent::from(asr_payload("span-1", 3, "hello world"));
+
+        let hash_a = transcript_event_content_hash(&event_a);
+        assert_eq!(hash_a, transcript_event_content_hash(&event_a_again));
+        assert!(hash_a.starts_with("fnv1a64:"));
+        assert_ne!(hash_a, transcript_event_content_hash(&event_different_text));
+        assert_ne!(
+            hash_a,
+            transcript_event_content_hash(&event_different_revision)
+        );
     }
 
     #[test]
@@ -3160,6 +3499,7 @@ mod tests {
                 title: "Decision".to_string(),
                 body: "Ship the event-sourced projection model.".to_string(),
                 tags: vec!["decision".to_string()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.86,
             provenance: ProjectionProvenance {
@@ -3215,12 +3555,14 @@ mod tests {
                     title: "Decision".to_string(),
                     body: "SENSITIVE NOTE BODY".to_string(),
                     tags: vec!["decision".to_string()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "node-1".to_string(),
                     name: "SECRET NAME".to_string(),
                     entity_type: "SECRET TYPE".to_string(),
                     description: Some("SECRET DESCRIPTION".to_string()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-1".to_string(),
@@ -3229,6 +3571,7 @@ mod tests {
                     relation_type: "SECRET RELATION".to_string(),
                     label: Some("SECRET LABEL".to_string()),
                     weight: 0.9,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             confidence: 0.8,
@@ -3270,7 +3613,10 @@ mod tests {
     fn materialized_notes_debug_redacts_note_body_but_serialization_keeps_it() {
         let mut notes = MaterializedNotes::new("session-1");
         notes
-            .apply_patch(&notes_patch(1, "note-1", "Decision", "SENSITIVE NOTE BODY"))
+            .apply_patch(
+                &notes_patch(1, "note-1", "Decision", "SENSITIVE NOTE BODY"),
+                None,
+            )
             .expect("insert note patch");
 
         let json = serde_json::to_value(&notes).expect("serialize notes");
@@ -3289,31 +3635,37 @@ mod tests {
     fn materialized_graph_debug_redacts_node_and_edge_attributes_but_serialization_keeps_them() {
         let mut graph = MaterializedGraph::new("session-1");
         graph
-            .apply_patch(&graph_patch(
-                1,
-                vec![
-                    ProjectionOperation::UpsertGraphNode {
-                        id: "node-a".to_string(),
-                        name: "Node A".to_string(),
-                        entity_type: "PERSON".to_string(),
-                        description: Some("SENSITIVE DESCRIPTION".to_string()),
-                    },
-                    ProjectionOperation::UpsertGraphNode {
-                        id: "node-b".to_string(),
-                        name: "Node B".to_string(),
-                        entity_type: "TOPIC".to_string(),
-                        description: None,
-                    },
-                    ProjectionOperation::UpsertGraphEdge {
-                        id: "edge-ab".to_string(),
-                        source: "node-a".to_string(),
-                        target: "node-b".to_string(),
-                        relation_type: "SENSITIVE RELATION".to_string(),
-                        label: Some("SENSITIVE LABEL".to_string()),
-                        weight: 0.4,
-                    },
-                ],
-            ))
+            .apply_patch(
+                &graph_patch(
+                    1,
+                    vec![
+                        ProjectionOperation::UpsertGraphNode {
+                            id: "node-a".to_string(),
+                            name: "Node A".to_string(),
+                            entity_type: "PERSON".to_string(),
+                            description: Some("SENSITIVE DESCRIPTION".to_string()),
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                        ProjectionOperation::UpsertGraphNode {
+                            id: "node-b".to_string(),
+                            name: "Node B".to_string(),
+                            entity_type: "TOPIC".to_string(),
+                            description: None,
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                        ProjectionOperation::UpsertGraphEdge {
+                            id: "edge-ab".to_string(),
+                            source: "node-a".to_string(),
+                            target: "node-b".to_string(),
+                            relation_type: "SENSITIVE RELATION".to_string(),
+                            label: Some("SENSITIVE LABEL".to_string()),
+                            weight: 0.4,
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                    ],
+                ),
+                None,
+            )
             .expect("insert graph patch");
 
         let json = serde_json::to_value(&graph).expect("serialize graph");
@@ -3339,39 +3691,43 @@ mod tests {
     fn materialized_projection_state_debug_redacts_nested_notes_and_graph_sensitive_content() {
         let mut state = MaterializedProjectionState::new("session-1");
         state
-            .apply_replayed_patch(&notes_patch(
-                1,
-                "note-1",
-                "Decision",
-                "SENSITIVE NOTE IN STATE",
-            ))
+            .apply_replayed_patch(
+                &notes_patch(1, "note-1", "Decision", "SENSITIVE NOTE IN STATE"),
+                None,
+            )
             .expect("apply state note patch");
         state
-            .apply_replayed_patch(&graph_patch(
-                2,
-                vec![
-                    ProjectionOperation::UpsertGraphNode {
-                        id: "node-a".to_string(),
-                        name: "Node A".to_string(),
-                        entity_type: "PERSON".to_string(),
-                        description: Some("SENSITIVE DESC".to_string()),
-                    },
-                    ProjectionOperation::UpsertGraphNode {
-                        id: "node-b".to_string(),
-                        name: "Node B".to_string(),
-                        entity_type: "TOPIC".to_string(),
-                        description: None,
-                    },
-                    ProjectionOperation::UpsertGraphEdge {
-                        id: "edge-ab".to_string(),
-                        source: "node-a".to_string(),
-                        target: "node-b".to_string(),
-                        relation_type: "SENSITIVE RELATION".to_string(),
-                        label: Some("SENSITIVE LABEL".to_string()),
-                        weight: 0.4,
-                    },
-                ],
-            ))
+            .apply_replayed_patch(
+                &graph_patch(
+                    2,
+                    vec![
+                        ProjectionOperation::UpsertGraphNode {
+                            id: "node-a".to_string(),
+                            name: "Node A".to_string(),
+                            entity_type: "PERSON".to_string(),
+                            description: Some("SENSITIVE DESC".to_string()),
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                        ProjectionOperation::UpsertGraphNode {
+                            id: "node-b".to_string(),
+                            name: "Node B".to_string(),
+                            entity_type: "TOPIC".to_string(),
+                            description: None,
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                        ProjectionOperation::UpsertGraphEdge {
+                            id: "edge-ab".to_string(),
+                            source: "node-a".to_string(),
+                            target: "node-b".to_string(),
+                            relation_type: "SENSITIVE RELATION".to_string(),
+                            label: Some("SENSITIVE LABEL".to_string()),
+                            weight: 0.4,
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        },
+                    ],
+                ),
+                None,
+            )
             .expect("apply state graph patch");
 
         let debug = format!("{state:?}");
@@ -3405,6 +3761,7 @@ mod tests {
                 title: title.to_string(),
                 body: body.to_string(),
                 tags: vec!["decision".to_string()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.86,
             provenance: ProjectionProvenance {
@@ -3449,7 +3806,7 @@ mod tests {
     fn materialized_notes_apply_insert_update_reorder_and_delete_patches() {
         let mut notes = MaterializedNotes::new("session-1");
         let first = notes_patch(1, "note-1", "Decision", "Ship projection events.");
-        notes.apply_patch(&first).expect("insert patch");
+        notes.apply_patch(&first, None).expect("insert patch");
 
         assert_eq!(notes.last_sequence, 1);
         assert_eq!(notes.notes.len(), 1);
@@ -3462,7 +3819,7 @@ mod tests {
         );
 
         let update = notes_patch(2, "note-1", "Decision", "Ship materialized notes.");
-        notes.apply_patch(&update).expect("update patch");
+        notes.apply_patch(&update, None).expect("update patch");
 
         assert_eq!(notes.last_sequence, 2);
         assert_eq!(notes.notes.len(), 1);
@@ -3470,7 +3827,7 @@ mod tests {
         assert_eq!(notes.notes[0].updated_by_sequence, 2);
 
         let second = notes_patch(3, "note-2", "Follow-up", "Keep stable note ids.");
-        notes.apply_patch(&second).expect("second note patch");
+        notes.apply_patch(&second, None).expect("second note patch");
         assert_eq!(
             notes
                 .notes
@@ -3497,7 +3854,7 @@ mod tests {
             created_at_ms: 1_700_000_000_104,
             route: None,
         };
-        notes.apply_patch(&reorder).expect("reorder patch");
+        notes.apply_patch(&reorder, None).expect("reorder patch");
         assert_eq!(notes.last_sequence, 4);
         assert_eq!(
             notes
@@ -3524,7 +3881,7 @@ mod tests {
             created_at_ms: 1_700_000_000_105,
             route: None,
         };
-        notes.apply_patch(&delete).expect("delete patch");
+        notes.apply_patch(&delete, None).expect("delete patch");
 
         assert_eq!(notes.last_sequence, 5);
         assert_eq!(notes.notes.len(), 1);
@@ -3535,12 +3892,12 @@ mod tests {
     fn materialized_notes_reject_stale_or_wrong_kind_patches() {
         let mut notes = MaterializedNotes::new("session-1");
         notes
-            .apply_patch(&notes_patch(2, "note-1", "Decision", "Ship notes."))
+            .apply_patch(&notes_patch(2, "note-1", "Decision", "Ship notes."), None)
             .expect("first patch");
 
         let stale = notes_patch(2, "note-2", "Duplicate", "Should be rejected.");
         assert_eq!(
-            notes.apply_patch(&stale),
+            notes.apply_patch(&stale, None),
             Err(ProjectionApplyError::StaleSequence {
                 current: 2,
                 incoming: 2,
@@ -3550,7 +3907,7 @@ mod tests {
         let mut graph_patch = notes_patch(3, "note-3", "Graph", "Wrong kind.");
         graph_patch.kind = ProjectionKind::Graph;
         assert_eq!(
-            notes.apply_patch(&graph_patch),
+            notes.apply_patch(&graph_patch, None),
             Err(ProjectionApplyError::WrongKind {
                 expected: ProjectionKind::Notes,
                 actual: ProjectionKind::Graph,
@@ -3581,7 +3938,7 @@ mod tests {
             created_at_ms: 1_700_000_000_103,
         };
         assert_eq!(
-            notes.apply_patch(&missing_reorder),
+            notes.apply_patch(&missing_reorder, None),
             Err(ProjectionApplyError::MissingNoteForReorder {
                 id: "note-missing".to_string(),
             })
@@ -3599,12 +3956,14 @@ mod tests {
                     name: "AudioGraph".to_string(),
                     entity_type: "Product".to_string(),
                     description: Some("Speech knowledge graph app.".to_string()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "node-b".to_string(),
                     name: "Soniox".to_string(),
                     entity_type: "Provider".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-1".to_string(),
@@ -3613,10 +3972,11 @@ mod tests {
                     relation_type: "evaluates".to_string(),
                     label: Some("evaluates as streaming STT".to_string()),
                     weight: 0.7,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
         );
-        graph.apply_patch(&first).expect("graph insert patch");
+        graph.apply_patch(&first, None).expect("graph insert patch");
 
         assert_eq!(graph.last_sequence, 1);
         assert_eq!(graph.nodes.len(), 2);
@@ -3643,6 +4003,7 @@ mod tests {
                     name: "Soniox".to_string(),
                     entity_type: "Provider".to_string(),
                     description: Some("Realtime STT candidate.".to_string()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-1".to_string(),
@@ -3651,10 +4012,13 @@ mod tests {
                     relation_type: "shortlists".to_string(),
                     label: Some("shortlisted provider".to_string()),
                     weight: 0.9,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
         );
-        graph.apply_patch(&update).expect("graph update patch");
+        graph
+            .apply_patch(&update, None)
+            .expect("graph update patch");
 
         assert_eq!(graph.last_sequence, 2);
         assert_eq!(graph.nodes.len(), 2);
@@ -3678,7 +4042,9 @@ mod tests {
                 id: "edge-1".to_string(),
             }],
         );
-        graph.apply_patch(&remove_edge).expect("remove edge patch");
+        graph
+            .apply_patch(&remove_edge, None)
+            .expect("remove edge patch");
         assert!(graph.edges.is_empty());
 
         let restore = graph_patch(
@@ -3690,9 +4056,12 @@ mod tests {
                 relation_type: "tracks".to_string(),
                 label: None,
                 weight: 0.6,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
-        graph.apply_patch(&restore).expect("restore edge patch");
+        graph
+            .apply_patch(&restore, None)
+            .expect("restore edge patch");
         assert_eq!(graph.edges.len(), 1);
 
         let remove_node = graph_patch(
@@ -3701,7 +4070,9 @@ mod tests {
                 id: "node-b".to_string(),
             }],
         );
-        graph.apply_patch(&remove_node).expect("remove node patch");
+        graph
+            .apply_patch(&remove_node, None)
+            .expect("remove node patch");
         assert_eq!(graph.nodes.len(), 1);
         assert!(graph.nodes.iter().all(|node| node.id != "node-b"));
         assert!(
@@ -3721,24 +4092,28 @@ mod tests {
                     name: "Alice".to_string(),
                     entity_type: "person".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "person:alicia".to_string(),
                     name: "Alicia".to_string(),
                     entity_type: "person".to_string(),
                     description: Some("Duplicate mention of Alice.".to_string()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "project:audio-graph".to_string(),
                     name: "AudioGraph".to_string(),
                     entity_type: "project".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "topic:provider-work".to_string(),
                     name: "Provider work".to_string(),
                     entity_type: "topic".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alicia:owns".to_string(),
@@ -3747,6 +4122,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: Some("owns".to_string()),
                     weight: 0.4,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alice:owns".to_string(),
@@ -3755,6 +4131,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: Some("owns".to_string()),
                     weight: 0.8,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:project:topic".to_string(),
@@ -3763,10 +4140,11 @@ mod tests {
                     relation_type: "tracks".to_string(),
                     label: None,
                     weight: 0.5,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
         );
-        graph.apply_patch(&first).expect("seed graph");
+        graph.apply_patch(&first, None).expect("seed graph");
 
         let weights = graph_patch(
             2,
@@ -3781,7 +4159,9 @@ mod tests {
                 },
             ],
         );
-        graph.apply_patch(&weights).expect("adjust edge weights");
+        graph
+            .apply_patch(&weights, None)
+            .expect("adjust edge weights");
         assert_eq!(
             graph
                 .edges
@@ -3805,7 +4185,9 @@ mod tests {
                 target_id: "person:alice".to_string(),
             }],
         );
-        graph.apply_patch(&merge).expect("merge duplicate nodes");
+        graph
+            .apply_patch(&merge, None)
+            .expect("merge duplicate nodes");
         assert_eq!(
             graph
                 .nodes
@@ -3847,7 +4229,7 @@ mod tests {
                 ],
             }],
         );
-        graph.apply_patch(&split).expect("split topic node");
+        graph.apply_patch(&split, None).expect("split topic node");
         assert_eq!(
             graph
                 .nodes
@@ -3891,7 +4273,7 @@ mod tests {
             }],
         );
         graph
-            .apply_patch(&invalidate_edge)
+            .apply_patch(&invalidate_edge, None)
             .expect("invalidate merged edge");
         assert_eq!(
             graph
@@ -3909,7 +4291,7 @@ mod tests {
             }],
         );
         graph
-            .apply_patch(&invalidate_node)
+            .apply_patch(&invalidate_node, None)
             .expect("invalidate project node");
         assert_eq!(
             graph
@@ -3930,10 +4312,11 @@ mod tests {
                 name: "AudioGraph".to_string(),
                 entity_type: "Product".to_string(),
                 description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
         let mut graph = MaterializedGraph::new("session-1");
-        graph.apply_patch(&graph_patch).expect("graph patch");
+        graph.apply_patch(&graph_patch, None).expect("graph patch");
         let mut value = serde_json::to_value(&graph.nodes[0]).expect("node value");
         let object = value.as_object_mut().expect("node object");
         object.remove("confidence");
@@ -3952,15 +4335,19 @@ mod tests {
     fn materialized_graph_rejects_stale_wrong_kind_note_ops_and_dangling_edges() {
         let mut graph = MaterializedGraph::new("session-1");
         graph
-            .apply_patch(&graph_patch(
-                2,
-                vec![ProjectionOperation::UpsertGraphNode {
-                    id: "node-a".to_string(),
-                    name: "AudioGraph".to_string(),
-                    entity_type: "Product".to_string(),
-                    description: None,
-                }],
-            ))
+            .apply_patch(
+                &graph_patch(
+                    2,
+                    vec![ProjectionOperation::UpsertGraphNode {
+                        id: "node-a".to_string(),
+                        name: "AudioGraph".to_string(),
+                        entity_type: "Product".to_string(),
+                        description: None,
+                        evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    }],
+                ),
+                None,
+            )
             .expect("first patch");
 
         let stale = graph_patch(
@@ -3970,10 +4357,11 @@ mod tests {
                 name: "Duplicate".to_string(),
                 entity_type: "Topic".to_string(),
                 description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
         assert_eq!(
-            graph.apply_patch(&stale),
+            graph.apply_patch(&stale, None),
             Err(ProjectionApplyError::StaleSequence {
                 current: 2,
                 incoming: 2,
@@ -3982,7 +4370,7 @@ mod tests {
 
         let wrong_kind = notes_patch(3, "note-1", "Decision", "Wrong kind.");
         assert_eq!(
-            graph.apply_patch(&wrong_kind),
+            graph.apply_patch(&wrong_kind, None),
             Err(ProjectionApplyError::WrongKind {
                 expected: ProjectionKind::Graph,
                 actual: ProjectionKind::Notes,
@@ -3996,10 +4384,11 @@ mod tests {
                 title: "Decision".to_string(),
                 body: "Wrong operation.".to_string(),
                 tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
         assert_eq!(
-            graph.apply_patch(&note_op),
+            graph.apply_patch(&note_op, None),
             Err(ProjectionApplyError::UnsupportedOperation {
                 kind: "note_operation_in_graph_patch",
             })
@@ -4013,6 +4402,7 @@ mod tests {
                     name: "Half Applied".to_string(),
                     entity_type: "Topic".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-missing".to_string(),
@@ -4021,11 +4411,12 @@ mod tests {
                     relation_type: "mentions".to_string(),
                     label: None,
                     weight: 0.5,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
         );
         assert_eq!(
-            graph.apply_patch(&dangling),
+            graph.apply_patch(&dangling, None),
             Err(ProjectionApplyError::MissingGraphNode {
                 edge_id: "edge-missing".to_string(),
                 node_id: "node-missing".to_string(),
@@ -4044,6 +4435,7 @@ mod tests {
                     name: "Should not persist".to_string(),
                     entity_type: "Topic".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::MergeGraphNodes {
                     source_id: "node-missing".to_string(),
@@ -4052,7 +4444,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            graph.apply_patch(&missing_retcon),
+            graph.apply_patch(&missing_retcon, None),
             Err(ProjectionApplyError::MissingGraphNodeForOperation {
                 operation: "merge_graph_nodes",
                 node_id: "node-missing".to_string(),
@@ -4096,6 +4488,7 @@ mod tests {
                 name: "AudioGraph".to_string(),
                 entity_type: "Product".to_string(),
                 description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
         assert_eq!(
@@ -4199,6 +4592,137 @@ mod tests {
         assert_eq!(replayed.validation.invalid_patch_count, 0);
         assert_eq!(replayed.state.notes.last_sequence, accepted_patch.sequence);
         assert_eq!(replayed.state.notes.notes[0].id, "note-1");
+    }
+
+    /// The exact invariant the finding pinned as broken: replay must
+    /// re-derive per-item claim evidence (ADR-0037) from the reconstructed
+    /// per-patch ledger, not hardcode `None`. Live apply and replay of the
+    /// SAME accepted patch, with a REAL (non-default) evidence anchor, must
+    /// produce byte-identical `Some(..)` evidence — not just agree by both
+    /// being `None`, which is all `historical_replay_matches_live_
+    /// materialized_state` (state.rs) pinned before this fix, because its
+    /// fixture used `EvidenceAnchor::default()` (the one class
+    /// `judge_claim_evidence` always refuses).
+    #[test]
+    fn replay_rederives_claim_evidence_identically_to_the_live_apply_path() {
+        let transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Alice chose Soniox."));
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-1",
+            "Provider choice",
+            "Alice chose Soniox.",
+        );
+        patch.operations = vec![ProjectionOperation::UpsertNote {
+            id: "note-1".to_string(),
+            title: "Provider choice".to_string(),
+            body: "Alice chose Soniox.".to_string(),
+            tags: vec!["decision".to_string()],
+            evidence: crate::claim_evidence::EvidenceAnchor {
+                claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+                span_id: Some("span-1".to_string()),
+                quote: None,
+                note: None,
+            },
+        }];
+
+        // Live path.
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(transcript.clone()).unwrap();
+        let mut live_state = MaterializedProjectionState::new("session-1");
+        live_state
+            .apply_validated_patch(&ledger, &patch)
+            .expect("live apply");
+        let live_evidence = live_state.notes.notes[0]
+            .evidence
+            .clone()
+            .expect("live apply must admit GroundedInference evidence");
+
+        // Replay path — same accepted patch, same transcript history.
+        let replayed =
+            MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+                "session-1",
+                [transcript],
+                [patch],
+            )
+            .expect("replay");
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        let replayed_evidence = replayed.state.notes.notes[0]
+            .evidence
+            .clone()
+            .expect("replay must re-derive the SAME evidence as the live path, not None");
+
+        assert_eq!(live_evidence, replayed_evidence);
+        assert_eq!(
+            live_evidence.claim_class(),
+            crate::claim_evidence::ClaimClass::GroundedInference
+        );
+        assert_eq!(
+            live_evidence.span().map(|span| span.span_id.as_str()),
+            Some("span-1")
+        );
+    }
+
+    /// ADR-0026 §3/§4: a diarization span's latest-wins attribution overrides
+    /// the transcript event's untrusted inline ASR speaker label. Before
+    /// `resolve_claim_evidence_basis_events` existed, `judge_claim_evidence`
+    /// stamped `speaker_ref` straight from `event.speaker_id`/`speaker_label`
+    /// — the label diarization exists to supersede — even when the session's
+    /// canonical `SpeakerTimeline` disagreed.
+    #[test]
+    fn apply_validated_patch_stamps_the_canonical_speaker_not_the_inline_asr_label() {
+        // Inline ASR (untrusted) says "speaker-1"; the transcript segment id
+        // is the fixed "segment-1" `asr_payload` always sets.
+        let transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ana owns the migration."));
+        assert_eq!(transcript.speaker_id.as_deref(), Some("speaker-1"));
+
+        // Diarization attributes that SAME segment id to "speaker-2" — the
+        // canonical, backend-derived override.
+        let mut diarization_span = DiarizationSpanRevision::from(diarization_payload(
+            "dia-1",
+            "deepgram",
+            1,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        diarization_span.basis_transcript_segment_ids = vec!["segment-1".to_string()];
+
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(transcript.clone()).unwrap();
+        let speaker_timeline =
+            SpeakerTimeline::replay("session-1", [diarization_span]).expect("speaker timeline");
+
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-1",
+            "Ownership",
+            "Ana owns the migration.",
+        );
+        patch.operations = vec![ProjectionOperation::UpsertNote {
+            id: "note-1".to_string(),
+            title: "Ownership".to_string(),
+            body: "Ana owns the migration.".to_string(),
+            tags: vec!["decision".to_string()],
+            evidence: crate::claim_evidence::EvidenceAnchor {
+                claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+                span_id: Some("span-1".to_string()),
+                quote: None,
+                note: None,
+            },
+        }];
+
+        let mut state = MaterializedProjectionState::new("session-1");
+        state
+            .apply_validated_patch_with_speaker_timeline(&ledger, &speaker_timeline, &patch)
+            .expect("apply with speaker timeline");
+
+        let evidence = state.notes.notes[0].evidence.as_ref().expect("admitted");
+        assert_eq!(
+            evidence.span().and_then(|span| span.speaker_ref.as_deref()),
+            Some("speaker-2"),
+            "speaker_ref must read the canonical diarization attribution, not the inline ASR label"
+        );
     }
 
     #[test]
@@ -4770,24 +5294,28 @@ mod tests {
                     name: "Alice".to_string(),
                     entity_type: "person".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "person:alicia".to_string(),
                     name: "Alicia".to_string(),
                     entity_type: "person".to_string(),
                     description: Some("Early duplicate mention.".to_string()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "project:audio-graph".to_string(),
                     name: "AudioGraph".to_string(),
                     entity_type: "project".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "topic:providers".to_string(),
                     name: "Providers".to_string(),
                     entity_type: "topic".to_string(),
                     description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alice:owns".to_string(),
@@ -4796,6 +5324,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: Some("owns".to_string()),
                     weight: 0.8,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:alicia:owns".to_string(),
@@ -4804,6 +5333,7 @@ mod tests {
                     relation_type: "owns".to_string(),
                     label: Some("owns".to_string()),
                     weight: 0.5,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge:project:providers".to_string(),
@@ -4812,6 +5342,7 @@ mod tests {
                     relation_type: "tracks".to_string(),
                     label: None,
                     weight: 0.6,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
         );
@@ -4931,6 +5462,7 @@ mod tests {
                 name: "AudioGraph".to_string(),
                 entity_type: "Product".to_string(),
                 description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
         );
 

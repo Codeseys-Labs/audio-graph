@@ -3222,6 +3222,7 @@ mod shutdown_tests {
                 title: "Decision".into(),
                 body: "Persist projection patches.".into(),
                 tags: vec!["decision".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
@@ -3650,6 +3651,7 @@ mod local_memory_repository_tests {
                 title: "Decision".into(),
                 body: "Persist the memory repository boundary.".into(),
                 tags: vec!["architecture".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
@@ -3682,6 +3684,7 @@ mod local_memory_repository_tests {
                 name: "LocalMemoryRepository".into(),
                 entity_type: "architecture_component".into(),
                 description: Some("Backend-owned local memory boundary".into()),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.88,
             provenance: crate::projections::ProjectionProvenance {
@@ -3770,12 +3773,14 @@ mod local_memory_repository_tests {
                     title: "Launch owner".into(),
                     body: "Alice owns the launch plan.".into(),
                     tags: vec!["launch".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-b".into(),
                     title: "Temporary note".into(),
                     body: "This should be removed by a later diff.".into(),
                     tags: vec!["temporary".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             3_000,
@@ -3790,12 +3795,14 @@ mod local_memory_repository_tests {
                     title: "Launch owner".into(),
                     body: "Alice owns the revised launch plan.".into(),
                     tags: vec!["launch".into(), "revised".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-c".into(),
                     title: "Follow up".into(),
                     body: "Confirm launch readiness next week.".into(),
                     tags: vec!["follow-up".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::DeleteNote {
                     id: "note-b".into(),
@@ -3817,12 +3824,14 @@ mod local_memory_repository_tests {
                     name: "Alice".into(),
                     entity_type: "Person".into(),
                     description: Some("Launch owner".into()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "project-launch".into(),
                     name: "Launch".into(),
                     entity_type: "Project".into(),
                     description: Some("Revised launch plan".into()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-owns".into(),
@@ -3831,6 +3840,7 @@ mod local_memory_repository_tests {
                     relation_type: "owns".into(),
                     label: Some("owns launch".into()),
                     weight: 0.82,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             5_000,
@@ -4466,6 +4476,7 @@ mod local_memory_repository_tests {
                 body: "Materialized notes can be rebuilt from transcript and projection events."
                     .into(),
                 tags: vec!["persistence".into(), "projection".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             3_000,
         );
@@ -4479,12 +4490,14 @@ mod local_memory_repository_tests {
                     name: "Alice".into(),
                     entity_type: "Person".into(),
                     description: Some("Confirmed the repository boundary".into()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "task-restore".into(),
                     name: "Projection replay restore".into(),
                     entity_type: "Task".into(),
                     description: Some("Verify restore after materialized artifact loss".into()),
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertGraphEdge {
                     id: "edge-alice-restore".into(),
@@ -4493,6 +4506,7 @@ mod local_memory_repository_tests {
                     relation_type: "confirmed".into(),
                     label: Some("confirmed restore work".into()),
                     weight: 0.84,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             4_000,
@@ -4509,12 +4523,14 @@ mod local_memory_repository_tests {
                         "Transcript events plus projection patches rebuild notes and graph state."
                             .into(),
                     tags: vec!["persistence".into(), "projection".into(), "replay".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-restore-risk".into(),
                     title: "Remaining command gap".into(),
                     body: "load_session state isolation still needs command-level coverage.".into(),
                     tags: vec!["follow-up".into()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
                 },
             ],
             5_000,
@@ -4635,6 +4651,7 @@ mod local_memory_repository_tests {
                 title: "Stale patch".into(),
                 body: "This patch was based on a superseded transcript revision.".into(),
                 tags: vec!["stale".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             3_000,
         );
@@ -4647,6 +4664,7 @@ mod local_memory_repository_tests {
                 title: "Current patch".into(),
                 body: "This patch uses the corrected transcript revision.".into(),
                 tags: vec!["current".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             4_000,
         );

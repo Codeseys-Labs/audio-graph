@@ -1319,6 +1319,7 @@ mod rotation_tests {
                 title: "Decision".into(),
                 body: body.into(),
                 tags: vec!["decision".into()],
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
@@ -1347,6 +1348,7 @@ mod rotation_tests {
                 name: "AudioGraph".into(),
                 entity_type: "Product".into(),
                 description: Some("Streaming speech knowledge graph app.".into()),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
             }],
             confidence: 0.87,
             provenance: crate::projections::ProjectionProvenance {
