@@ -1,4 +1,6 @@
-// @ts-expect-error Test-only Node API; the browser bundle intentionally omits @types/node.
+// Node types are ambient here only because the E2E devDependency chain
+// (seed audio-graph-f9e0) transitively pulls in @types/node — the browser
+// bundle itself still never imports "node:fs" outside test-only code.
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 

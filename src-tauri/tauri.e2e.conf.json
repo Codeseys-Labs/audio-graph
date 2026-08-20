@@ -1,0 +1,17 @@
+{
+    "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/refs/heads/main/nicegui/templates/tauri_conf_v2_schema.json",
+    "app": {
+        "withGlobalTauri": true,
+        "security": {
+            "capabilities": [
+                "default",
+                {
+                    "identifier": "wdio-e2e",
+                    "description": "CI-ONLY: WebDriverIO shell E2E permissions (seed audio-graph-f9e0, Wave 3). Grants `browser.tauri.execute()`/`mock()` and the wdio plugin's debug/log/window-inspection commands. Deliberately INLINED here rather than shipped as a file under `src-tauri/capabilities/` -- tauri-build's `acl.rs::build()` globs and permission-validates every file matching `./capabilities/**/*` at COMPILE TIME, unconditionally, regardless of `app.security.capabilities`, which only filters at codegen time. A standalone `capabilities/wdio-e2e.json` file referencing `wdio:default` would therefore fail to compile on every build that does not also enable the `wdio-e2e` Cargo feature (i.e. every normal build). An inlined `CapabilityEntry::Inlined` config entry bypasses that file-glob/validate step entirely (see `tauri_utils::acl::get_capabilities`), so this permission only exists at all when this overlay config is merged in via `--config src-tauri/tauri.e2e.conf.json` (which the `tauri-shell-e2e.yml` workflow does exclusively for its `wdio-e2e`-featured, `--no-bundle` app-under-test build). Never move this into `capabilities/default.json` or a new `capabilities/*.json` file.",
+                    "windows": ["main"],
+                    "permissions": ["wdio:default"]
+                }
+            ]
+        }
+    }
+}

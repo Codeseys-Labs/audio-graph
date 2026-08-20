@@ -1,0 +1,199 @@
+# Tauri portable desktop shell E2E (seed audio-graph-f9e0, Wave 3).
+#
+# STANDALONE workflow, not a job inside ci.yml: this wave's task scope leaves
+# ci.yml (and its `ci-required` aggregator) off-limits, so this file cannot be
+# gated into that PR-required check yet. It builds its own app-under-test per
+# OS (the `rust-cloud-smoke`/`tauri-default-smoke` jobs in ci.yml build a
+# *different* binary — one without the `wdio-e2e` feature — so there is
+# nothing to `needs:` across workflow files here) using
+# `--no-default-features --features cloud,wdio-e2e` plus the CI-only
+# `tauri.e2e.conf.json` `--config` overlay, then drives that exact binary with
+# WebdriverIO's `@wdio/tauri-service` embedded provider.
+#
+# Runs on push-to-master, a daily schedule, and manual dispatch — deliberately
+# NOT on pull_request, since it is not (yet) wired into branch protection and
+# a non-required, always-red-on-PR check is just noise. Promoting the Linux
+# leg into `ci-required` (and, separately, adding a `pull_request` trigger) is
+# a later step once this has repeated green runs on the exact runner labels
+# below (see docs/research/ci-build-test-architecture-2026-08-19.md's
+# Promotion Gates: "do not promote a job to required until it has passed
+# repeatedly on the exact runner label and artifact profile").
+#
+# Third-party actions are SHA-pinned with a trailing `# vN` comment, copied
+# from the exact pins already used elsewhere in this repo's workflows
+# (ci.yml, release.yml) so Dependabot can keep them current without losing
+# reproducibility.
+
+name: Tauri shell E2E
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "43 11 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Build the app-under-test once per OS ────────────────────────────
+  # Cloud profile (no local-ml compile cost) + the `wdio-e2e` Cargo feature,
+  # which links the embedded WebDriver server + execute/mock bridge (see
+  # src-tauri/Cargo.toml). `--config` layers in the wdio-e2e capability +
+  # `withGlobalTauri` — never present in a default/release build.
+  build-e2e-artifact:
+    name: Build E2E artifact (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: macos
+            runner: blacksmith-6vcpu-macos-15
+          - os: windows
+            runner: blacksmith-4vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev pkg-config
+
+      - name: Install macOS system dependencies
+        if: matrix.os == 'macos'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        if: matrix.os == 'windows'
+
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build app-under-test (cloud profile + wdio-e2e feature, no bundle)
+        env:
+          # Gates the frontend's `import('@wdio/tauri-plugin')` in
+          # src/main.tsx — only ever set by this build.
+          VITE_WDIO_E2E: "1"
+        run: |
+          bun run tauri build --no-bundle --ci \
+            --config src-tauri/tauri.e2e.conf.json -- \
+            --locked --no-default-features --features cloud,wdio-e2e
+
+      - name: Upload E2E app artifact (linux/macos)
+        if: matrix.os != 'windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tauri-e2e-${{ matrix.os }}-x64-cloud-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: src-tauri/target/release/audio-graph
+
+      - name: Upload E2E app artifact (windows)
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tauri-e2e-${{ matrix.os }}-x64-cloud-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: src-tauri/target/release/audio-graph.exe
+
+  # ── Drive the exact built artifact with WebdriverIO ─────────────────
+  # Linux is the hard-gated quality bar (no continue-on-error): promotion of
+  # macOS/Windows to a hard gate is a separate, later step once repeated
+  # green runs exist on those exact runner labels — a timeout must not read
+  # as green, so `continue-on-error` reports the failure, it does not hide it.
+  tauri-shell-e2e:
+    name: Tauri shell E2E (${{ matrix.os }})
+    needs: build-e2e-artifact
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.continue-on-error }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+            continue-on-error: false
+          - os: macos
+            runner: blacksmith-6vcpu-macos-15
+            continue-on-error: true
+          - os: windows
+            runner: blacksmith-4vcpu-windows-2025
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # The embedded @wdio/tauri-service provider needs NO webkit2gtk-driver
+      # package (that's only for driverProvider:'external'/'official') — but
+      # the real WebKitGTK window still needs a display server even so.
+      - name: Install Linux display + WebKitGTK runtime
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb
+
+      - name: Download app-under-test artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tauri-e2e-${{ matrix.os }}-x64-cloud-${{ github.sha }}
+          path: dist-bin
+
+      - name: Make binary executable (linux/macos)
+        if: matrix.os != 'windows'
+        run: chmod +x dist-bin/audio-graph
+
+      - name: Run WDIO shell E2E (linux, under Xvfb)
+        if: matrix.os == 'linux'
+        env:
+          APP_BINARY_PATH: ${{ github.workspace }}/dist-bin/audio-graph
+        run: xvfb-run -a npx wdio run e2e/wdio.conf.ts
+
+      - name: Run WDIO shell E2E (macos)
+        if: matrix.os == 'macos'
+        env:
+          APP_BINARY_PATH: ${{ github.workspace }}/dist-bin/audio-graph
+        run: npx wdio run e2e/wdio.conf.ts
+
+      - name: Run WDIO shell E2E (windows)
+        if: matrix.os == 'windows'
+        env:
+          APP_BINARY_PATH: ${{ github.workspace }}\dist-bin\audio-graph.exe
+        run: npx wdio run e2e/wdio.conf.ts
+
+      - name: Upload WDIO logs + spec report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wdio-shell-e2e-${{ matrix.os }}-${{ github.sha }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: e2e/logs/**

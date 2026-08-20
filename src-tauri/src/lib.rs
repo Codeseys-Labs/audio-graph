@@ -407,7 +407,7 @@ pub fn run() {
         is_openai_realtime_active: app_state.is_openai_realtime_active.clone(),
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // BUG-3: single-instance guard MUST be the first plugin registered
         // (plugins run in registration order). A second launch hands its argv
         // here instead of spawning a process that fails WebView2 creation with
@@ -420,7 +420,21 @@ pub fn run() {
                 let _ = win.show();
                 let _ = win.set_focus();
             }
-        }))
+        }));
+
+    // Portable desktop shell E2E (seed audio-graph-f9e0, Wave 3): the embedded
+    // `@wdio/tauri-service` provider needs these two plugins registered inside
+    // the compiled app — an in-process WebDriver HTTP server plus the
+    // `browser.tauri.execute()`/`mock()` bridge. Gated on the `wdio-e2e`
+    // Cargo feature (see Cargo.toml), which is off by default and only turned
+    // on by the CI-only `tauri-shell-e2e.yml` build. Never present in a
+    // default/release binary.
+    #[cfg(feature = "wdio-e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .manage(app_state)
         // Hide-to-tray on window close while capture is running (audio-graph-a156):
         // intercept CloseRequested and, if capture is active AND the tray exists,
