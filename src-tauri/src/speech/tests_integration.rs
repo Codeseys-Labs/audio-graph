@@ -269,6 +269,8 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(
                 "test-session",
             ),
+            projection_job_workers: Arc::new(Mutex::new(Vec::new())),
+            projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             active_session_id: Arc::new(RwLock::new("test-session".to_string())),
             pipeline_status: pipeline_status.clone(),
             app_handle,
@@ -536,6 +538,8 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         speaker_timeline,
         projection_schedulers: projection_schedulers.clone(),
         projection_runtime: ProjectionRuntimeHandle::in_memory_for_tests(session_id),
+        projection_job_workers: Arc::new(Mutex::new(Vec::new())),
+        projection_lane_stopping: Arc::new(AtomicBool::new(false)),
         pipeline_status,
         app_handle,
         llm_engine,

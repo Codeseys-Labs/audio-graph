@@ -1611,6 +1611,12 @@ pub(crate) struct TranscriptProcessingContext {
     pub speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
     pub projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     pub projection_runtime: ProjectionRuntimeHandle,
+    /// Live projection job thread registry (audio-graph-9cc1 / ADR-0045
+    /// decision 4). See `AppState::projection_job_workers`.
+    pub projection_job_workers: crate::state::ProjectionJobRegistry,
+    /// Set at Stop before the registry above is drained. See
+    /// `AppState::projection_lane_stopping`.
+    pub projection_lane_stopping: Arc<std::sync::atomic::AtomicBool>,
     pub pipeline_status: Arc<RwLock<PipelineStatus>>,
     pub app_handle: AppHandle,
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
@@ -1645,6 +1651,22 @@ struct ProjectionDispatchContext {
     transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
     projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     projection_runtime: ProjectionRuntimeHandle,
+    /// Live projection job thread registry (audio-graph-9cc1 / ADR-0045
+    /// decision 4, drain half). `spawn_projection_job` registers into it;
+    /// `run_projection_job` self-deregisters on every exit path. See
+    /// `AppState::projection_job_workers` for the full rationale.
+    projection_job_workers: crate::state::ProjectionJobRegistry,
+    /// Set at Stop before the registry above is drained. See
+    /// `AppState::projection_lane_stopping`.
+    ///
+    /// Not yet read anywhere in the dispatch path — this seed (audio-graph-9cc1)
+    /// only wires the flag through and sets it at Stop. The intended reader is
+    /// the deferred-retry lane (ADR-0045 decision 3): a scheduled
+    /// `projection-retry-<kind>` thread polls this so it wakes and exits
+    /// instead of firing after Stop has already begun tearing the session
+    /// down.
+    #[allow(dead_code)]
+    projection_lane_stopping: Arc<std::sync::atomic::AtomicBool>,
     event_sink: Arc<dyn ProjectionRuntimeEventSink>,
     patch_generator: Arc<dyn ProjectionPatchGenerator>,
     /// Configured LLM provider for this session — the *intended* projection
@@ -1765,6 +1787,8 @@ impl TranscriptProcessingContext {
             transcript_ledger: self.transcript_ledger.clone(),
             projection_schedulers: self.projection_schedulers.clone(),
             projection_runtime: self.projection_runtime.clone(),
+            projection_job_workers: self.projection_job_workers.clone(),
+            projection_lane_stopping: self.projection_lane_stopping.clone(),
             event_sink: Arc::new(TauriProjectionRuntimeEventSink {
                 app_handle: self.app_handle.clone(),
             }),
@@ -1799,6 +1823,8 @@ fn shared_to_transcript_context(
         speaker_timeline: shared.speaker_timeline,
         projection_schedulers: shared.projection_schedulers,
         projection_runtime: shared.projection_runtime,
+        projection_job_workers: shared.projection_job_workers,
+        projection_lane_stopping: shared.projection_lane_stopping,
         pipeline_status: shared.pipeline_status,
         app_handle: shared.app_handle,
         llm_engine: shared.llm_engine,
@@ -1997,6 +2023,34 @@ fn dispatch_projection_decision(
         | ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair { job, .. }
         | ProjectionSchedulerDecision::FailedAndStartedFollowUp { job, .. }
         | ProjectionSchedulerDecision::FailedStaleAndStartedRepair { job, .. } => {
+            // ADR-0045 decision 4 (audio-graph-9cc1, adversarial-review fix):
+            // this is the ONLY call site of `spawn_projection_job`, reached
+            // both from a fresh ASR-triggered dispatch AND from a completing
+            // job's own tail (`finish_projection_scheduler_job` ->
+            // `dispatch_projection_decision`, running ON the completing
+            // job's thread). `stop_capture_impl` sets
+            // `projection_lane_stopping` BEFORE it joins sp/asr and drains
+            // this registry, so checking it here — synchronously, before the
+            // thread that would carry the job is ever spawned — closes the
+            // race where a job completing mid-drain chains a mandatory
+            // follow-up (`CompletedAndStartedFollowUp` on an
+            // `AppendOnlyStale` completion is unconditional) AFTER the
+            // drain's registry snapshot has already been taken. The
+            // scheduler has already recorded `job` as its new in-flight
+            // job by this point (`start_job` runs before the decision is
+            // returned); leaving it un-spawned is intentional — Stop means
+            // this basis is abandoned for now, and `rotate_session` resets
+            // scheduler in-flight state on the next session regardless. The
+            // deferred-retry lane (ADR-0045 decision 3) is the designed
+            // future consumer for resuming abandoned bases like this one.
+            if dispatch.projection_lane_stopping.load(Ordering::SeqCst) {
+                log::debug!(
+                    "projection_lane_stopping set; discarding dispatch instead of spawning job_id={} kind={:?}",
+                    job.id,
+                    job.kind
+                );
+                return;
+            }
             spawn_projection_job(dispatch, job);
         }
         ProjectionSchedulerDecision::Idle
@@ -2018,16 +2072,88 @@ enum ProjectionJobCompletion {
     Failed,
 }
 
+/// Remove the `(kind, job_id)` entry from the live projection-job registry,
+/// if present.
+///
+/// Matches by BOTH `kind` and `job_id` — never by kind alone or by vec
+/// position — so a same-kind entry belonging to a DIFFERENT job (e.g. a
+/// chained follow-up job registered before the finishing job's own
+/// self-deregistration runs) is never removed by mistake. A `job_id` that
+/// does not match any registered entry is a no-op: nothing is removed, and
+/// in particular no [`std::thread::JoinHandle`] is ever joined here (this is
+/// always called with the registry's own handles still owned by the vec —
+/// dropping is the only thing that happens to a matched entry, never a join,
+/// since the caller may itself be running ON the thread the removed handle
+/// refers to, where a self-join would deadlock).
+fn deregister_projection_job(
+    registry: &crate::state::ProjectionJobRegistry,
+    kind: &ProjectionKind,
+    job_id: &str,
+) {
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pos) = guard
+        .iter()
+        .position(|(entry_kind, entry_job_id, _)| entry_kind == kind && entry_job_id == job_id)
+    {
+        guard.remove(pos);
+    }
+}
+
+/// RAII guard that self-deregisters a projection job's own registry entry on
+/// drop (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
+///
+/// `run_projection_job` has several early-return points (superseded-job
+/// discards) plus the normal completion/failure tail; holding this guard for
+/// the whole function body means every exit path — including an unexpected
+/// panic — deregisters exactly once, via [`deregister_projection_job`]'s
+/// kind+job_id match.
+struct ProjectionJobRegistrationGuard {
+    registry: crate::state::ProjectionJobRegistry,
+    kind: ProjectionKind,
+    job_id: String,
+}
+
+impl Drop for ProjectionJobRegistrationGuard {
+    fn drop(&mut self) {
+        deregister_projection_job(&self.registry, &self.kind, &self.job_id);
+    }
+}
+
 fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let failure_dispatch = dispatch.clone();
     let failure_job = job.clone();
     let job_id = job.id.clone();
+    let job_kind = job.kind.clone();
+    let registry = dispatch.projection_job_workers.clone();
     let thread_name = format!("projection-{}", projection_kind_key(&job.kind));
+    // The child cannot be handed its own `JoinHandle` (that only exists once
+    // `.spawn()` returns to the PARENT), so registration necessarily happens
+    // after the thread starts running. A job fast enough to finish and
+    // self-deregister before the parent's registry push would land would
+    // otherwise leave a permanent phantom entry (never removed — the guard
+    // only fires once). This one-shot channel makes registration
+    // happens-before any work the job can do, closing that race.
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
     match std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || run_projection_job(dispatch, job))
-    {
-        Ok(_) => {}
+        .spawn(move || {
+            let _ = registered_rx.recv();
+            run_projection_job(dispatch, job)
+        }) {
+        Ok(handle) => {
+            // Register the live handle instead of discarding it (previously
+            // `Ok(_) => {}`), so `stop_capture_impl` can drain and join it at
+            // Stop instead of leaving it running unbounded in the background.
+            {
+                let mut guard = registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.push((job_kind, job_id, handle));
+            }
+            let _ = registered_tx.send(());
+        }
         Err(error) => {
             log::error!(
                 "Failed to spawn projection job thread job_id={} error={}",
@@ -2243,6 +2369,16 @@ fn projection_movement_facts(
 }
 
 fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
+    // Self-deregister on every exit path (normal completion, the two
+    // superseded-job early returns, or an unexpected panic) — see
+    // `ProjectionJobRegistrationGuard`. Held for the whole function body so
+    // there is exactly one removal site regardless of which branch below is
+    // taken.
+    let _registration_guard = ProjectionJobRegistrationGuard {
+        registry: dispatch.projection_job_workers.clone(),
+        kind: job.kind.clone(),
+        job_id: job.id.clone(),
+    };
     let sequence = dispatch
         .projection_runtime
         .next_projection_sequence(&job.kind);
@@ -4505,6 +4641,8 @@ pub(crate) fn run_speech_processor_diarization_only(
         transcript_ledger: shared.transcript_ledger.clone(),
         projection_schedulers: shared.projection_schedulers.clone(),
         projection_runtime: shared.projection_runtime.clone(),
+        projection_job_workers: shared.projection_job_workers.clone(),
+        projection_lane_stopping: shared.projection_lane_stopping.clone(),
         event_sink: Arc::new(TauriProjectionRuntimeEventSink {
             app_handle: shared.app_handle.clone(),
         }),
@@ -7243,14 +7381,15 @@ mod tests_status {
         ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
         SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
         aws_error_for_diagnostic_event, cloud_error_code, current_unix_millis,
-        diarization_span_revision_for_transcript, emit_and_dispatch_diarization_span_revision,
+        deregister_projection_job, diarization_span_revision_for_transcript,
+        emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
         provider_start_span_id, record_asr_span_revision_event,
         record_asr_span_revision_event_and_observe_projection, revision_ref,
         run_agent_proposal_task, run_moonshine_speech_processor_with_worker, run_projection_job,
-        set_asr_status, speech_error_diagnostic,
+        set_asr_status, spawn_projection_job, speech_error_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -7599,6 +7738,8 @@ mod tests_status {
                 transcript_ledger: app.transcript_ledger.clone(),
                 projection_schedulers: app.projection_schedulers.clone(),
                 projection_runtime: app.projection_runtime_handle(),
+                projection_job_workers: app.projection_job_workers.clone(),
+                projection_lane_stopping: app.projection_lane_stopping.clone(),
                 event_sink: Arc::new(event_sink.clone()),
                 patch_generator: Arc::new(generator),
                 llm_provider,
@@ -7715,6 +7856,8 @@ mod tests_status {
             speaker_timeline: app.speaker_timeline.clone(),
             projection_schedulers: app.projection_schedulers.clone(),
             projection_runtime: app.projection_runtime_handle(),
+            projection_job_workers: app.projection_job_workers.clone(),
+            projection_lane_stopping: app.projection_lane_stopping.clone(),
             pipeline_status: app.pipeline_status.clone(),
             app_handle,
             knowledge_graph: app.knowledge_graph.clone(),
@@ -9455,6 +9598,285 @@ mod tests_status {
             "superseded worker must not append a projection event"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-9cc1 / ADR-0045 decision 4 (drain half) acceptance: a
+    /// projection job thread registers itself in `projection_job_workers` when
+    /// spawned and self-deregisters on normal completion, leaving the registry
+    /// empty — proven for BOTH kinds, since the graph lane previously had no
+    /// tracked handle at all (spawn_projection_job discarded it).
+    #[test]
+    fn spawn_projection_job_registers_and_self_deregisters_on_normal_completion_for_both_kinds() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-job-registry-self-deregister");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let observation = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "registry-self-deregister-span",
+                        1,
+                        "Both projection lanes must self-deregister.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            schedulers.observe_ledger(&ledger, 10)
+        };
+        let notes_job = match observation.notes {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected notes job, got {other:?}"),
+        };
+        let graph_job = match observation.graph {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected graph job, got {other:?}"),
+        };
+
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        for job in [notes_job, graph_job] {
+            let job_kind = job.kind.clone();
+            spawn_projection_job(dispatch.clone(), job);
+
+            // Poll for self-deregistration rather than asserting immediately —
+            // the job runs on its own thread, so the only durable guarantee is
+            // "eventually empty", proven within a generous test budget.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let empty = app
+                    .projection_job_workers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty();
+                if empty {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{job_kind:?} projection job did not self-deregister within the test budget"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both the notes and the graph job must have actually run"
+        );
+        assert_eq!(event_sink.patch_count(), 2);
+        assert!(
+            app.projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "registry must be empty after both jobs self-deregister"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-9cc1 / ADR-0045 decision 4 (adversarial-review fix): a job
+    /// that completes WHILE Stop is draining the registry must not chain a
+    /// follow-up job past Stop. `complete_graph_in_flight`'s `AppendOnlyStale`
+    /// arm starts a follow-up job UNCONDITIONALLY on exactly this shape of
+    /// completion — a final ASR revision landed while the job was in flight,
+    /// which is the seed's own motivating continuous-speech scenario.
+    /// Reproduces the exact interleaving from the finding: while job A is
+    /// generating, a new final span lands (moving the ledger past A's basis)
+    /// AND Stop begins (`projection_lane_stopping` set) — both before A's own
+    /// completion tail (running on A's thread) reaches
+    /// `dispatch_projection_decision` and decides whether to chain B. Without
+    /// gating that dispatch on the flag, B is spawned and registered strictly
+    /// after any single `mem::take` drain snapshot could have already been
+    /// taken, so it outlives Stop unbounded and unfenced.
+    #[test]
+    fn dispatch_projection_decision_refuses_a_follow_up_job_once_stopping() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-lane-stopping-refuses-follow-up");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let job_a = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "stopping-race-span-1",
+                        1,
+                        "First utterance before Stop races the drain.",
+                        true,
+                    ),
+                ))
+                .expect("seed first span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).graph {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected graph StartJob, got {other:?}"),
+            }
+        };
+
+        // Mid-generation, mimic the race: a final ASR revision lands (a NEW
+        // span, so job A's completed basis classifies as `AppendOnlyStale`,
+        // not `Revised`) and Stop begins — both BEFORE job A's own tail
+        // dispatches the mandatory follow-up. `span_appended` bounds the
+        // cascade to at most one extra hop even if the gate under test were
+        // ever reverted, so this test cannot hang.
+        let ledger_handle = app.transcript_ledger.clone();
+        let stopping_flag = app.projection_lane_stopping.clone();
+        let span_appended = Arc::new(AtomicBool::new(false));
+        let span_appended_in_closure = span_appended.clone();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+                if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
+                    ledger_handle
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .apply_event(crate::projections::TranscriptEvent::from(
+                            projection_asr_payload(
+                                "stopping-race-span-2",
+                                1,
+                                "Second utterance lands while A is mid-generation.",
+                                true,
+                            ),
+                        ))
+                        .expect("append second span mid-generation");
+                    stopping_flag.store(true, Ordering::SeqCst);
+                }
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        spawn_projection_job(dispatch, job_a);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let empty = app
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job A did not self-deregister within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // A chained follow-up job would register into the SAME registry we
+        // just observed empty; give it a further window to appear before
+        // asserting it never did. This is the discriminating check: a
+        // reverted gate spawns and runs a second (follow-up) job here.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a follow-up job must never be spawned once projection_lane_stopping is set, even \
+             though the completing job's AppendOnlyStale basis unconditionally asks the \
+             scheduler to start one"
+        );
+        assert!(
+            app.projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "registry must stay empty — no follow-up thread should ever have been registered"
+        );
+        assert_eq!(
+            event_sink.patch_count(),
+            1,
+            "only job A's patch should ever have applied"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-9cc1 acceptance: removal from the live projection-job
+    /// registry must match BOTH `kind` and `job_id`. A mismatched id (or a
+    /// matching id under the wrong kind) must never remove — and therefore
+    /// never join or drop — a different, still-registered handle. A handle
+    /// left sitting in the registry (never removed) is, by this registry's
+    /// design, provably never joined: the ONLY thing that happens to a
+    /// registered handle is removal (self-deregister or the stop-time drain),
+    /// and removal is the sole path to a join/drop.
+    #[test]
+    fn deregister_projection_job_never_removes_a_mismatched_kind_or_job_id() {
+        let registry: crate::state::ProjectionJobRegistry = Arc::new(Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        registry.lock().unwrap_or_else(|p| p.into_inner()).push((
+            ProjectionKind::Graph,
+            "real-job".to_string(),
+            wedged,
+        ));
+
+        // Wrong job_id, correct kind: must be a no-op.
+        deregister_projection_job(&registry, &ProjectionKind::Graph, "wrong-job-id");
+        assert_eq!(
+            registry.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1,
+            "a mismatched job_id must never remove the real entry"
+        );
+
+        // Correct job_id, wrong kind: must also be a no-op.
+        deregister_projection_job(&registry, &ProjectionKind::Notes, "real-job");
+        assert_eq!(
+            registry.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1,
+            "a mismatched kind must never remove the real entry, even with the right job_id"
+        );
+
+        // Both match: this is the only call that may remove (and thus drop,
+        // never join) the entry.
+        deregister_projection_job(&registry, &ProjectionKind::Graph, "real-job");
+        assert!(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "an exact kind+job_id match must remove the entry"
+        );
+
+        // Let the now-detached thread exit; nothing left to join it, which is
+        // exactly the point — it was dropped, never joined.
+        let _ = release_tx.send(());
     }
 
     /// Every projection LLM submission appears in the data-movement ledger, and

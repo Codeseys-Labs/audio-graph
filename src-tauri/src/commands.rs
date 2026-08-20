@@ -944,6 +944,95 @@ fn ensure_session_workers_quiesced(state: &AppState) -> AppResult<()> {
     }
 }
 
+/// Bounded per-job wait for a registered projection job thread to exit at
+/// Stop (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
+///
+/// Current value (20s) is a first-cut, TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT-style:
+/// long enough for a realistic LLM round-trip (notes/graph patch generation)
+/// plus a materializer save to finish, short enough that a wedged provider
+/// call doesn't hang the Stop command indefinitely. A timed-out handle spills
+/// into `retired_workers` via `join_worker_with_timeout` — the SAME vec Start
+/// and New Session already fence rotation on, so no new fence logic is
+/// needed here.
+///
+/// Tuning procedure: every drain logs `projection_job.flush elapsed_ms=…` at
+/// INFO. After a couple of weeks of field data, grep for that key, compute
+/// p50/p95/p99 across real sessions, and set this constant to
+/// `p99 + ~1s safety margin`, documented with a "Chosen because: …" comment
+/// (see `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` for the precedent).
+const PROJECTION_JOB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Drain every registered live projection job thread at Stop.
+///
+/// Loops taking snapshots of the registry (`std::mem::take`) rather than
+/// locking it for the whole drain, so a job's own self-deregistration (on the
+/// job's own thread, via its RAII guard) never contends with this loop. Each
+/// handle is joined through the existing [`join_worker_with_timeout`] idiom —
+/// same spill into `retired_workers` on timeout — wrapped with elapsed-time
+/// instrumentation under the `projection_job.flush` log key so the timeout
+/// above can be retuned from real data.
+///
+/// The loop (not a single pass) is the provable half of "no projection
+/// thread outlives stop" (ADR-0045 decision 4 / audio-graph-9cc1
+/// adversarial-review fix): `dispatch_projection_decision` refuses to spawn
+/// once `projection_lane_stopping` is set, which is the primary defense
+/// against a completing job chaining a mandatory follow-up mid-drain, but
+/// this loop re-observes the registry after every pass and keeps joining
+/// until it is actually empty (or the overall `timeout` budget below is
+/// exhausted) instead of trusting a single `mem::take` snapshot never to
+/// miss a late registration.
+///
+/// `timeout` bounds the WHOLE drain (all passes, all handles), not each
+/// handle individually — a handle joined late in the drain gets whatever
+/// time remains before the shared deadline, not a fresh `timeout`. It is a
+/// parameter (not hard-coded to `PROJECTION_JOB_FLUSH_TIMEOUT` internally)
+/// purely so tests can exercise the timeout/spill branch on a millisecond
+/// budget instead of the real 20s; the only production caller passes
+/// `PROJECTION_JOB_FLUSH_TIMEOUT`.
+fn drain_projection_job_workers(
+    registry: &crate::state::ProjectionJobRegistry,
+    timeout: std::time::Duration,
+    retired_workers: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let drained: Vec<(
+            crate::projections::ProjectionKind,
+            String,
+            std::thread::JoinHandle<()>,
+        )> = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if drained.is_empty() {
+            break;
+        }
+        for (kind, job_id, handle) in drained {
+            let started = std::time::Instant::now();
+            let name = format!("projection job (kind={kind:?} job_id={job_id})");
+            let now = std::time::Instant::now();
+            let remaining = if now >= deadline {
+                std::time::Duration::ZERO
+            } else {
+                deadline - now
+            };
+            join_worker_with_timeout(handle, remaining, &name, retired_workers);
+            log::info!(
+                "projection_job.flush elapsed_ms={} kind={:?} job_id={} timeout_ms={}",
+                started.elapsed().as_millis(),
+                kind,
+                job_id,
+                timeout.as_millis()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
 fn register_runtime_processed_audio_consumer(
     registry: &Arc<crate::audio::ProcessedAudioConsumerRegistry>,
     id: &str,
@@ -1767,6 +1856,14 @@ async fn stop_capture_impl(
             .ok()
             .and_then(|mut guard| guard.take());
         let retired_speech_workers = state.retired_session_workers.clone();
+        // ADR-0045 decision 4 (drain half, audio-graph-9cc1): flag first, then
+        // join sp/asr so no new final ASR revision can dispatch another
+        // projection job after this point, then drain every projection job
+        // thread (Notes and Graph) still registered — a graph-lane job can
+        // otherwise run arbitrarily long past Stop, since the graph lane's
+        // backlog is unbounded by design during continuous speech.
+        state.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let projection_job_workers = state.projection_job_workers.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(handle) = sp {
                 join_worker_with_timeout(
@@ -1784,6 +1881,11 @@ async fn stop_capture_impl(
                     &retired_speech_workers,
                 );
             }
+            drain_projection_job_workers(
+                &projection_job_workers,
+                PROJECTION_JOB_FLUSH_TIMEOUT,
+                &retired_speech_workers,
+            );
         })
         .await;
         // Also stop Gemini notes if running.
@@ -2304,6 +2406,8 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let speaker_timeline = state.speaker_timeline.clone();
             let projection_schedulers = state.projection_schedulers.clone();
             let projection_runtime = state.projection_runtime_handle();
+            let projection_job_workers = state.projection_job_workers.clone();
+            let projection_lane_stopping = state.projection_lane_stopping.clone();
             let active_session_id = state.session_id.clone();
 
             let handle = std::thread::Builder::new()
@@ -2321,6 +2425,8 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         speaker_timeline,
                         projection_schedulers,
                         projection_runtime,
+                        projection_job_workers,
+                        projection_lane_stopping,
                         active_session_id,
                         pipeline_status,
                         app_handle,
@@ -2357,6 +2463,16 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 
     // 3. Update state flags.
     state.is_transcribing.store(true, Ordering::SeqCst);
+    // ADR-0045 decision 4 (audio-graph-9cc1, adversarial-review fix): pair
+    // this with the `store(true)` at Stop (`stop_capture_impl`), the same way
+    // `is_transcribing` is paired above. Without this, `projection_lane_stopping`
+    // is a process-lifetime latch — every session after the first Stop would
+    // read as "stopping" to the deferred-retry lane (ADR-0045 decision 3)
+    // this flag is documented to feed, silently disabling retries for the
+    // rest of the process.
+    state
+        .projection_lane_stopping
+        .store(false, Ordering::SeqCst);
     if let Ok(mut status) = state.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
         status.diarization = StageStatus::Running { processed_count: 0 };
@@ -12696,6 +12812,159 @@ mod tests {
         drain_test_writers(&state);
     }
 
+    /// audio-graph-9cc1 / ADR-0045 decision 4 (drain half) acceptance: no
+    /// projection job thread outlives Stop, proven for BOTH kinds — the graph
+    /// lane previously had no tracked handle at all, so a graph projection
+    /// could run arbitrarily long past Stop. A handle that finishes within the
+    /// flush timeout is joined outright and never spills into the rotation
+    /// fence.
+    ///
+    /// Adversarial-review fix: registry emptiness alone is vacuous — it holds
+    /// even if the drain detaches the handle instead of waiting for it. Each
+    /// fake thread sleeps briefly, then flips its OWN `AtomicBool`; asserting
+    /// the flag is `true` immediately after `drain_projection_job_workers`
+    /// returns is the only check that proves the drain actually waited
+    /// (a `drop(handle)` regression leaves the registry empty too, but the
+    /// flag would still be `false` right after the call).
+    #[test]
+    fn drain_projection_job_workers_joins_finished_threads_of_both_kinds() {
+        let state = AppState::new();
+        let notes_finished = Arc::new(AtomicBool::new(false));
+        let graph_finished = Arc::new(AtomicBool::new(false));
+        let notes_flag = notes_finished.clone();
+        let graph_flag = graph_finished.clone();
+        let notes_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            notes_flag.store(true, Ordering::SeqCst);
+        });
+        let graph_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            graph_flag.store(true, Ordering::SeqCst);
+        });
+        {
+            let mut registry = state
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.push((
+                crate::projections::ProjectionKind::Notes,
+                "notes-job-1".to_string(),
+                notes_handle,
+            ));
+            registry.push((
+                crate::projections::ProjectionKind::Graph,
+                "graph-job-1".to_string(),
+                graph_handle,
+            ));
+        }
+
+        drain_projection_job_workers(
+            &state.projection_job_workers,
+            std::time::Duration::from_secs(1),
+            &state.retired_session_workers,
+        );
+
+        assert!(
+            notes_finished.load(Ordering::SeqCst),
+            "drain must actually wait for the notes thread to run to completion, not just \
+             forget its handle"
+        );
+        assert!(
+            graph_finished.load(Ordering::SeqCst),
+            "drain must actually wait for the graph thread to run to completion, not just \
+             forget its handle"
+        );
+        assert!(
+            state
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "drain must remove every registered entry"
+        );
+        assert!(
+            state
+                .retired_session_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "both kinds finished promptly and must not be spilled into the rotation fence"
+        );
+        drain_test_writers(&state);
+    }
+
+    /// audio-graph-9cc1 acceptance: a projection job that outlives the flush
+    /// timeout spills into `retired_session_workers` — the SAME vec Start/New
+    /// Session already fence rotation on (zero new fence logic) — and
+    /// rotation stays blocked until that handle is actually joined.
+    #[test]
+    fn wedged_projection_job_spills_into_retired_workers_and_fences_rotation_until_joined() {
+        let state = AppState::new();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        state
+            .projection_job_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((
+                crate::projections::ProjectionKind::Graph,
+                "wedged-graph-job".to_string(),
+                wedged,
+            ));
+
+        drain_projection_job_workers(
+            &state.projection_job_workers,
+            std::time::Duration::from_millis(5),
+            &state.retired_session_workers,
+        );
+
+        assert!(
+            state
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "drain always removes the entry from the live registry, timeout or not"
+        );
+        assert_eq!(
+            state
+                .retired_session_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "a job that outlives the flush timeout must spill into retired_session_workers"
+        );
+        assert!(matches!(
+            ensure_session_idle_for_rotation(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+
+        release_tx.send(()).expect("release wedged job");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if ensure_session_idle_for_rotation(&state).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released projection job should be reaped within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            state
+                .retired_session_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "reaped handles must not accumulate"
+        );
+        drain_test_writers(&state);
+    }
+
     #[test]
     fn missing_canonical_writer_blocks_capture_preflight() {
         let state = AppState::new();
@@ -16959,6 +17228,46 @@ mod tests {
             );
         }
 
+        // Pin ADR-0045 decision 4's Stop-side wiring against the actual
+        // `stop_capture_impl` path (adversarial-review fix — audio-graph-9cc1):
+        // without this, deleting/reordering the `projection_lane_stopping` store
+        // or the `drain_projection_job_workers` call inside `stop_capture_impl`
+        // leaves the whole suite green. The fake job sleeps briefly, then flips
+        // its OWN `AtomicBool` — checked synchronously right after
+        // `stop_capture_impl` returns below, the same non-vacuous technique as
+        // `drain_projection_job_workers_joins_finished_threads_of_both_kinds`. If
+        // the drain call were ever deleted, `stop_capture_impl` would return well
+        // before the fake job's sleep elapses, and the flag/registry assertions
+        // below would fail.
+        state
+            .projection_lane_stopping
+            .store(false, Ordering::SeqCst);
+        let fake_projection_job_finished = Arc::new(AtomicBool::new(false));
+        {
+            let flag = fake_projection_job_finished.clone();
+            // 750ms, not the 100ms used by the pure-unit-test sibling
+            // (`drain_projection_job_workers_joins_finished_threads_of_both_kinds`):
+            // this test drives the FULL async `stop_capture_impl`, which does
+            // real (if normally sub-10ms) work — audio pipeline reset,
+            // consumer teardown, etc. — before reaching the drain. A margin
+            // this wide over that baseline, and over ordinary parallel-test
+            // scheduling jitter, is what keeps the assertion below from
+            // passing by timing accident when the drain is skipped.
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(750));
+                flag.store(true, Ordering::SeqCst);
+            });
+            state
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    crate::projections::ProjectionKind::Graph,
+                    "stop-wiring-pin-job".to_string(),
+                    handle,
+                ));
+        }
+
         let (status_tx, status_rx) = std::sync::mpsc::channel();
         let listener_id = app_handle.listen_any(events::PIPELINE_STATUS_EVENT, move |event| {
             if let Ok(payload) = serde_json::from_str::<PipelineStatus>(event.payload()) {
@@ -16970,6 +17279,23 @@ mod tests {
             .await
             .expect("final source stop should succeed");
 
+        assert!(
+            state.projection_lane_stopping.load(Ordering::SeqCst),
+            "Stop must set projection_lane_stopping before/while draining the registry"
+        );
+        assert!(
+            fake_projection_job_finished.load(Ordering::SeqCst),
+            "Stop must actually wait for the registered projection job thread to run to \
+             completion (drain_projection_job_workers), not just forget its handle"
+        );
+        assert!(
+            state
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "Stop must drain every registered projection job thread from the registry"
+        );
         assert!(
             state
                 .capture_manager

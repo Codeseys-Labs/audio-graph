@@ -69,6 +69,14 @@ pub struct SpeakerInfo {
     pub segment_count: u32,
 }
 
+/// Live projection job thread handles, keyed by `(kind, job_id)`
+/// (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
+///
+/// Named alias for `clippy::type_complexity` — see
+/// [`AppState::projection_job_workers`] for the full rationale.
+pub type ProjectionJobRegistry =
+    Arc<Mutex<Vec<(ProjectionKind, String, std::thread::JoinHandle<()>)>>>;
+
 /// Central application state, shared across Tauri commands and worker threads.
 pub struct AppState {
     /// Unique session ID for the currently-active session (UUID v4).
@@ -104,6 +112,35 @@ pub struct AppState {
 
     /// Async projection event writer (appends replayable notes/graph patches to JSONL).
     pub projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
+
+    /// Live projection job thread handles, keyed by `(kind, job_id)`
+    /// (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
+    ///
+    /// `spawn_projection_job` registers `(kind, job_id, handle)` here instead
+    /// of discarding the handle; `run_projection_job` self-deregisters its own
+    /// entry on every exit path via an RAII guard, matched by BOTH `kind` and
+    /// `job_id` — a same-kind follow-up job spawned before the finishing job's
+    /// guard runs must never be mistaken for it and joined/dropped early.
+    /// `stop_capture_impl` drains this registry at Stop (see
+    /// `PROJECTION_JOB_FLUSH_TIMEOUT` in `commands.rs`), so a projection job
+    /// thread — Notes or Graph — can no longer outlive Stop the way the prior
+    /// fire-and-forget spawn allowed. This specifically closes the drain gap
+    /// for the Graph lane, whose backlog is unbounded by design during
+    /// continuous speech (ADR-0045 decision 4).
+    ///
+    /// Kept separate from `retired_session_workers`: that vec fences
+    /// Start/New Session while non-empty, but a live (not-yet-timed-out)
+    /// projection job is ordinary in-flight work, not a stop-time straggler.
+    /// Only handles that exceed the flush timeout spill into
+    /// `retired_session_workers`.
+    pub projection_job_workers: ProjectionJobRegistry,
+
+    /// Set at Stop, before the projection job registry above is drained
+    /// (ADR-0045 decision 4). This seed only sets the flag; the deferred-retry
+    /// lane (ADR-0045 decision 3) is the intended reader — a scheduled retry
+    /// thread polls this so it wakes and exits instead of firing after Stop
+    /// has already begun tearing the session down.
+    pub projection_lane_stopping: Arc<AtomicBool>,
 
     /// Current knowledge graph snapshot.
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -741,6 +778,8 @@ impl AppState {
             materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
             projection_schedulers: Arc::new(Mutex::new(projection_schedulers)),
             projection_event_writer: Arc::new(Mutex::new(projection_event_writer)),
+            projection_job_workers: Arc::new(Mutex::new(Vec::new())),
+            projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
             pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
@@ -968,6 +1007,13 @@ impl AppState {
             crate::persistence::save_scheduler_queue_state(&prev, &schedulers.snapshot_queue());
             schedulers.reset(new_session_id);
         }
+        // ADR-0045 decision 4 (audio-graph-9cc1, adversarial-review fix): a
+        // rotated session starts with a clean projection lane, same as the
+        // scheduler reset just above. Without this, a rotation that follows
+        // a Stop would carry the latched `true` forward into the new
+        // session, permanently disabling the deferred-retry lane (ADR-0045
+        // decision 3) that is documented to poll this flag.
+        self.projection_lane_stopping.store(false, Ordering::SeqCst);
         {
             let mut transcript = match self.transcript_buffer.write() {
                 Ok(guard) => guard,

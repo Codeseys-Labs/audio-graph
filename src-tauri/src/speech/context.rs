@@ -21,7 +21,7 @@ use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::settings::LlmProvider;
-use crate::state::{ProjectionRuntimeHandle, TranscriptSegment};
+use crate::state::{ProjectionJobRegistry, ProjectionRuntimeHandle, TranscriptSegment};
 
 /// Input/output channels and the cooperative-shutdown flag.
 ///
@@ -49,6 +49,13 @@ pub(crate) struct SpeechShared {
     pub speaker_timeline: Arc<Mutex<crate::projections::SpeakerTimeline>>,
     pub projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     pub projection_runtime: ProjectionRuntimeHandle,
+    /// Live projection job thread registry (audio-graph-9cc1 / ADR-0045
+    /// decision 4). See `AppState::projection_job_workers` for the full
+    /// rationale; this is the same `Arc`, cloned down to the worker.
+    pub projection_job_workers: ProjectionJobRegistry,
+    /// Set at Stop before the registry above is drained. See
+    /// `AppState::projection_lane_stopping`.
+    pub projection_lane_stopping: Arc<AtomicBool>,
     pub pipeline_status: Arc<RwLock<PipelineStatus>>,
     pub app_handle: AppHandle,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
