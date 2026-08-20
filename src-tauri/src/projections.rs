@@ -1121,6 +1121,21 @@ pub enum BasisCurrency {
     Revised(ProjectionBasisStaleness),
 }
 
+/// What the apply gate proved about a patch's basis at the moment it applied.
+///
+/// Both variants reach the materializer because [`BasisCurrency::Current`]
+/// and [`BasisCurrency::AppendOnlyStale`] both prove every span the basis
+/// pinned still resolves at its pinned revision — only [`BasisCurrency::Revised`]
+/// breaks that proof, and it never reaches this type. Callers that need to
+/// split applied-append-only telemetry from the ordinary current-basis path
+/// (audio-graph-caad) read this instead of re-deriving [`BasisCurrency`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AppliedBasisCurrency {
+    Current,
+    AppendedTail { staleness: ProjectionBasisStaleness },
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionKind {
@@ -2296,6 +2311,53 @@ pub enum HistoricalProjectionValidationError {
     },
 }
 
+/// Reconstruct the transcript ledger and (when the speaker stream is
+/// present) the speaker timeline from the canonical replay streams, folding
+/// in every event received at or before `bound_ms`.
+///
+/// Used by [`MaterializedProjectionState::replay_accepted_patches_with_history`]
+/// to widen the basis-currency check past a patch's `created_at_ms` toward
+/// the live apply gate's actual apply-time view (audio-graph-f3d4 review
+/// fix). Unlike the `created_at_ms`-bounded evidence ledger built alongside
+/// it, a failure to fold an event here degrades to whatever was already
+/// folded rather than invalidating the patch: the authoritative validity
+/// check for the accepted transcript/speaker streams already happened while
+/// building that `created_at_ms`-bounded ledger, and every event considered
+/// here was already folded there too (or arrived later in the same
+/// monotonic, pre-sorted stream) — this reconstruction only ever extends
+/// coverage, so it degrades safely, not lossily, for a currency
+/// determination that solely needs to prove the basis-covered spans still
+/// resolve.
+fn replay_ledger_and_timeline_up_to(
+    session_id: &str,
+    transcript_events: &[TranscriptEvent],
+    speaker_events: &[DiarizationSpanRevision],
+    speaker_history_present: bool,
+    bound_ms: u64,
+) -> (TranscriptLedger, Option<SpeakerTimeline>) {
+    let mut ledger = TranscriptLedger::new(session_id);
+    for event in transcript_events
+        .iter()
+        .take_while(|event| event.received_at_ms <= bound_ms)
+    {
+        if ledger.apply_event(event.clone()).is_err() {
+            break;
+        }
+    }
+    let mut timeline = speaker_history_present.then(|| SpeakerTimeline::new(session_id));
+    if let Some(timeline) = timeline.as_mut() {
+        for event in speaker_events
+            .iter()
+            .take_while(|event| event.received_at_ms <= bound_ms)
+        {
+            if timeline.apply_event(event.clone()).is_err() {
+                break;
+            }
+        }
+    }
+    (ledger, timeline)
+}
+
 impl MaterializedProjectionState {
     pub fn new(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
@@ -2309,13 +2371,23 @@ impl MaterializedProjectionState {
     /// Apply a projection patch that was already accepted into the durable
     /// projection event log.
     ///
-    /// Live runtime calls should use [`Self::apply_validated_patch`] so stale
-    /// LLM responses are rejected before they become accepted events. Replay
-    /// cannot validate old accepted patches against the final transcript
-    /// ledger: a later transcript span would make an earlier valid patch look
-    /// stale. Historical basis validation needs the full transcript-event
-    /// history and event ordering, so this path trusts the accepted log and
-    /// replays materializer operations deterministically.
+    /// This method does no basis classification of its own — it trusts the
+    /// accepted log and replays materializer operations deterministically.
+    /// Live runtime calls go through
+    /// [`Self::apply_validated_patch_reporting_currency`] (the sole caller is
+    /// `state.rs`), which classifies a patch's basis three ways *before* the
+    /// patch is accepted: `Current` and a proven append-only tail
+    /// (`AppliedBasisCurrency::AppendedTail`) both apply, while `Revised` —
+    /// content the patch covered was itself superseded — is rejected as
+    /// `ProjectionApplyError::StaleBasis` and never reaches the accepted log.
+    /// [`Self::replay_accepted_patches_with_history`] re-derives that same
+    /// three-way classification against each patch's `created_at_ms`-bounded
+    /// history immediately before calling this method, so a later
+    /// append-only transcript span still applies here instead of being
+    /// mistaken for staleness — only a genuinely `Revised` span is rejected
+    /// before reaching this method. [`Self::replay_accepted_patches`] has no
+    /// transcript history to classify against at all, so it calls this
+    /// method unconditionally and trusts the log outright.
     ///
     /// `evidence_basis` is the SAME kind of basis-covered, speaker-corrected
     /// event map [`resolve_claim_evidence_basis_events`] builds for the live
@@ -2326,8 +2398,8 @@ impl MaterializedProjectionState {
     /// every replayed item, silently dropping ADR-0037's per-item evidence
     /// (and ADR-0031's per-item pinned revision) on every rebuild from the
     /// canonical log, and making "canonical history remains replayable"
-    /// false for any fixture with real evidence (see
-    /// `state.rs`'s `historical_replay_matches_live_materialized_state`,
+    /// false for any fixture with real evidence (see `state.rs`'s
+    /// `runtime_projection_patch_applies_append_only_basis_and_replays_identically`,
     /// whose fixture previously only passed because it used the one anchor
     /// class that always refuses). `None` stays legitimate for
     /// [`Self::replay_accepted_patches`], which has no transcript history at
@@ -2380,6 +2452,13 @@ impl MaterializedProjectionState {
     /// Replay accepted patches against the transcript and optional speaker
     /// histories that were visible when each patch was created.
     ///
+    /// Claim evidence is resolved against exactly that `created_at_ms`
+    /// snapshot (draft-time visibility). The basis-currency classification
+    /// that gates acceptance instead widens to `created_at_ms +
+    /// generation_latency_ms` so it agrees with the live apply gate, which
+    /// re-checks against a fresh snapshot taken after generation completes,
+    /// not the draft-time one (see `replay_ledger_and_timeline_up_to`).
+    ///
     /// `None` means the canonical speaker stream is unavailable. `Some(vec![])`
     /// means that stream is present and authoritatively empty.
     pub fn replay_accepted_patches_with_history(
@@ -2409,12 +2488,12 @@ impl MaterializedProjectionState {
 
         'patches: for patch in patches {
             validation.checked_patch_count += 1;
-            let mut ledger = TranscriptLedger::new(&session_id);
+            let mut evidence_ledger = TranscriptLedger::new(&session_id);
             for event in transcript_events
                 .iter()
                 .take_while(|event| event.received_at_ms <= patch.created_at_ms)
             {
-                if let Err(error) = ledger.apply_event(event.clone()) {
+                if let Err(error) = evidence_ledger.apply_event(event.clone()) {
                     validation.invalid_patch_count += 1;
                     validation
                         .errors
@@ -2426,9 +2505,9 @@ impl MaterializedProjectionState {
                 }
             }
 
-            let mut speaker_timeline =
+            let mut evidence_speaker_timeline =
                 speaker_history_present.then(|| SpeakerTimeline::new(&session_id));
-            if let Some(timeline) = speaker_timeline.as_mut() {
+            if let Some(timeline) = evidence_speaker_timeline.as_mut() {
                 for event in speaker_events
                     .iter()
                     .take_while(|event| event.received_at_ms <= patch.created_at_ms)
@@ -2446,32 +2525,76 @@ impl MaterializedProjectionState {
                 }
             }
 
-            if let Err(staleness) =
-                ledger.validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline.as_ref())
-            {
-                validation.invalid_patch_count += 1;
-                validation
-                    .errors
-                    .push(HistoricalProjectionValidationError::StaleBasis {
-                        sequence: patch.sequence,
-                        kind: patch.kind.clone(),
-                        staleness,
-                    });
-                continue;
+            // The live gate (`apply_validated_patch_with_speaker_timeline_opt`)
+            // classifies basis currency against a snapshot taken at actual
+            // apply time (`state.rs`'s `transcript_ledger_snapshot`), not at
+            // `patch.created_at_ms` — LLM generation can take seconds, during
+            // which a boundary-correcting revision can legitimately move a
+            // span from inside the covered prefix (as of `created_at_ms`) to
+            // a proven append-only tail (as of apply time). Reclassifying
+            // here against only the `created_at_ms`-bounded
+            // `evidence_ledger` above would derive `Revised` for a patch the
+            // live gate correctly accepted as `AppendOnlyStale`, and
+            // `commands.rs`'s `invalid_patch_count`-gated refusal would make
+            // the session unopenable (audio-graph-f3d4 review finding).
+            // `generation_latency_ms` is stamped from the same wall-clock
+            // source as `created_at_ms` (`speech/mod.rs`'s
+            // `run_projection_job`) and brackets the live apply's fresh
+            // snapshot almost exactly — the only remaining gap is the
+            // sub-millisecond scheduling window between generation finishing
+            // and that snapshot, not the multi-second LLM call this guards.
+            // Extend a *separate* ledger/timeline to that bound instead of
+            // reusing `evidence_ledger` so `resolve_claim_evidence_basis_events`
+            // below keeps reconstructing exactly what the LLM saw at draft
+            // time (unaffected by revisions that arrived after generation
+            // started). `None` degrades to the unextended `created_at_ms`
+            // bound for patches persisted before this field existed.
+            let classify_bound_ms = patch
+                .created_at_ms
+                .saturating_add(patch.generation_latency_ms.unwrap_or(0));
+            let (ledger, speaker_timeline) = replay_ledger_and_timeline_up_to(
+                &session_id,
+                &transcript_events,
+                &speaker_events,
+                speaker_history_present,
+                classify_bound_ms,
+            );
+
+            match ledger.classify_basis_currency(&patch.basis, speaker_timeline.as_ref()) {
+                BasisCurrency::Current | BasisCurrency::AppendOnlyStale(_) => {}
+                BasisCurrency::Revised(staleness) => {
+                    validation.invalid_patch_count += 1;
+                    validation
+                        .errors
+                        .push(HistoricalProjectionValidationError::StaleBasis {
+                            sequence: patch.sequence,
+                            kind: patch.kind.clone(),
+                            staleness,
+                        });
+                    continue;
+                }
             }
 
-            // `ledger` (and, when present, `speaker_timeline`) above just
-            // proved this patch's basis still resolves at ITS exact
-            // historical point in the transcript/diarization streams — the
-            // identical proof `apply_validated_patch_with_speaker_timeline_opt`
-            // relies on for the live path — so re-deriving claim evidence
-            // against them here reproduces what `judge_claim_evidence` saw
-            // at draft-admission time, instead of the `None` this path used
-            // to hardcode.
+            // The classification just above proves every span this patch's
+            // basis pinned still resolves at the pinned revision as of
+            // `classify_bound_ms` — true for both `Current` and a proven
+            // append-only tail. Only a `Revised` span breaks that proof, and
+            // it is rejected above before reaching here. Because revisions
+            // are monotonic (a span's revision only ever moves forward),
+            // that same proof holds transitively at the earlier
+            // `created_at_ms` bound: no basis-pinned span could have been
+            // revised between `created_at_ms` and `classify_bound_ms`
+            // without also tripping the check above. So re-deriving claim
+            // evidence against the `created_at_ms`-bounded
+            // `evidence_ledger`/`evidence_speaker_timeline` HERE reproduces
+            // what `judge_claim_evidence` saw at draft-admission time,
+            // instead of the `None` this path used to hardcode — and stays
+            // pinned to draft-time visibility rather than picking up
+            // revisions the LLM never saw.
             let evidence_events = resolve_claim_evidence_basis_events(
                 &patch.basis,
-                &ledger,
-                speaker_timeline.as_ref(),
+                &evidence_ledger,
+                evidence_speaker_timeline.as_ref(),
             );
             let evidence_basis: BTreeMap<&str, &TranscriptEvent> = evidence_events
                 .iter()
@@ -2490,6 +2613,7 @@ impl MaterializedProjectionState {
         patch: &ProjectionPatch,
     ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
         self.apply_validated_patch_with_speaker_timeline_opt(ledger, None, patch)
+            .map(|(outcome, _currency)| outcome)
     }
 
     /// Like [`Self::apply_validated_patch`] but also validates the patch's
@@ -2501,6 +2625,21 @@ impl MaterializedProjectionState {
         patch: &ProjectionPatch,
     ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
         self.apply_validated_patch_with_speaker_timeline_opt(ledger, Some(speaker_timeline), patch)
+            .map(|(outcome, _currency)| outcome)
+    }
+
+    /// Like [`Self::apply_validated_patch`] but also reports the
+    /// [`AppliedBasisCurrency`] the gate classified the patch's basis as, so
+    /// the one live runtime caller (`state.rs`) can split its
+    /// applied-append-only telemetry from the ordinary current-basis path
+    /// without re-deriving [`BasisCurrency`] itself (audio-graph-caad).
+    pub fn apply_validated_patch_reporting_currency(
+        &mut self,
+        ledger: &TranscriptLedger,
+        patch: &ProjectionPatch,
+    ) -> Result<(MaterializedProjectionApplyOutcome, AppliedBasisCurrency), ProjectionApplyError>
+    {
+        self.apply_validated_patch_with_speaker_timeline_opt(ledger, None, patch)
     }
 
     fn apply_validated_patch_with_speaker_timeline_opt(
@@ -2508,16 +2647,26 @@ impl MaterializedProjectionState {
         ledger: &TranscriptLedger,
         speaker_timeline: Option<&SpeakerTimeline>,
         patch: &ProjectionPatch,
-    ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
-        ledger
-            .validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline)
-            .map_err(|staleness| ProjectionApplyError::StaleBasis { staleness })?;
+    ) -> Result<(MaterializedProjectionApplyOutcome, AppliedBasisCurrency), ProjectionApplyError>
+    {
+        let currency = match ledger.classify_basis_currency(&patch.basis, speaker_timeline) {
+            BasisCurrency::Current => AppliedBasisCurrency::Current,
+            BasisCurrency::AppendOnlyStale(staleness) => {
+                AppliedBasisCurrency::AppendedTail { staleness }
+            }
+            BasisCurrency::Revised(staleness) => {
+                return Err(ProjectionApplyError::StaleBasis { staleness });
+            }
+        };
 
-        // The basis check just above proves `ledger` still holds every span
-        // this patch's basis pinned, at the pinned revision — so resolving
-        // claim evidence against `ledger` HERE reproduces the same
-        // basis-covered set `judge_claim_evidence` saw at draft-admission
-        // time (ADR-0037/ADR-0031: never launder a `Revised` span into an
+        // The classification just above proves `ledger` still holds every
+        // span this patch's basis pinned, at the pinned revision, whether
+        // the basis is `Current` or a proven append-only tail
+        // (`AppendedTail`) — only a `Revised` span breaks that proof, and it
+        // is rejected above before reaching here. So resolving claim
+        // evidence against `ledger` HERE reproduces the same basis-covered
+        // set `judge_claim_evidence` saw at draft-admission time
+        // (ADR-0037/ADR-0031: never launder a `Revised` span into an
         // evidence proof).
         let evidence_events =
             resolve_claim_evidence_basis_events(&patch.basis, ledger, speaker_timeline);
@@ -2526,23 +2675,24 @@ impl MaterializedProjectionState {
             .map(|event| (event.span_id.as_str(), event))
             .collect();
 
-        match patch.kind {
+        let outcome = match patch.kind {
             ProjectionKind::Notes => {
                 self.notes.apply_patch(patch, Some(&evidence_basis))?;
-                Ok(MaterializedProjectionApplyOutcome::Notes {
+                MaterializedProjectionApplyOutcome::Notes {
                     last_sequence: self.notes.last_sequence,
                     note_count: self.notes.notes.len(),
-                })
+                }
             }
             ProjectionKind::Graph => {
                 self.graph.apply_patch(patch, Some(&evidence_basis))?;
-                Ok(MaterializedProjectionApplyOutcome::Graph {
+                MaterializedProjectionApplyOutcome::Graph {
                     last_sequence: self.graph.last_sequence,
                     node_count: self.graph.nodes.len(),
                     edge_count: self.graph.edges.len(),
-                })
+                }
             }
-        }
+        };
+        Ok((outcome, currency))
     }
 }
 
@@ -4505,11 +4655,16 @@ mod tests {
     #[test]
     fn materialized_projection_state_replays_accepted_patches_without_final_ledger_staleness() {
         let first = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
-        let second = TranscriptEvent::from(asr_payload("span-2", 1, "Later context."));
+        // A REVISION of the accepted patch's covered span, not a mere
+        // append — an append-only tail now applies live too (audio-graph-caad
+        // / audio-graph-f3d4), so this test needs a genuinely `Revised` basis
+        // to keep demonstrating that the final ledger is too strict for an
+        // older accepted patch while blind replay is not.
+        let revised = TranscriptEvent::from(asr_payload("span-1", 2, "Ship the corrected notes."));
         let mut final_ledger = TranscriptLedger::new("session-1");
         final_ledger.apply_event(first).expect("first event");
         let accepted_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
-        final_ledger.apply_event(second).expect("second event");
+        final_ledger.apply_event(revised).expect("revised event");
 
         let mut live_state = MaterializedProjectionState::new("session-1");
         assert!(
@@ -4517,7 +4672,7 @@ mod tests {
                 live_state.apply_validated_patch(&final_ledger, &accepted_patch),
                 Err(ProjectionApplyError::StaleBasis { .. })
             ),
-            "the final ledger should be too strict for an older accepted patch"
+            "the final ledger should still reject an accepted patch whose covered span was revised"
         );
 
         let replayed = MaterializedProjectionState::replay_accepted_patches(
@@ -5170,12 +5325,247 @@ mod tests {
 
         let state_source = include_str!("state.rs");
         assert!(
-            state_source.contains(".apply_validated_patch(ledger, &patch)"),
+            state_source.contains(".apply_validated_patch_reporting_currency(ledger, &patch)"),
             "live runtime apply must retain the transcript-only validation seam"
         );
         assert!(
             !state_source.contains(".apply_validated_patch_with_speaker_timeline("),
             "live runtime apply must not enable speaker-bearing patches in this replay-only wave"
+        );
+
+        // REVERT-PIN (audio-graph-caad / audio-graph-f3d4): both apply gates
+        // must classify the basis three ways and must never call the two-way
+        // validator on a patch basis directly — a revert to the two-way call
+        // at either site would silently reopen the caad discard bug. Every
+        // needle below is assembled from two literals that never appear
+        // contiguous in source, because `include_str!` here pulls in this
+        // very test — a needle written as one contiguous literal would
+        // match itself and never fail, no matter what the gates do.
+        let this_source = include_str!("projections.rs");
+        let live_gate_needle = format!(
+            "{}{}",
+            "ledger.classify_basis_currency(&patch.basis, speaker_timeline", ")"
+        );
+        let replay_gate_needle = format!(
+            "{}{}",
+            "ledger.classify_basis_currency(&patch.basis, speaker_timeline.as_ref(", ")"
+        );
+        let two_way_patch_basis_needle = format!(
+            "{}{}",
+            "validate_basis_with_speaker_timeline(&patch.", "basis"
+        );
+        assert!(
+            this_source.contains(&live_gate_needle),
+            "the live apply gate must classify the basis three ways, not two"
+        );
+        assert!(
+            this_source.contains(&replay_gate_needle),
+            "the replay gate must classify the basis three ways, not two"
+        );
+        assert!(
+            !this_source.contains(&two_way_patch_basis_needle),
+            "neither gate may call the two-way validator on a patch basis; \
+             only classify_basis_currency may distinguish AppendOnlyStale from Revised"
+        );
+
+        // REVERT-PIN (audio-graph-caad / audio-graph-f3d4): splitting the
+        // applied-append-only-tail telemetry from the ordinary current-basis
+        // apply log is a named ticket deliverable, not incidental logging —
+        // deleting the `AppendedTail` INFO arm in `speech/mod.rs`, or
+        // widening its guard so it also matches `Current`, would silently
+        // fold that signal back into the ordinary apply log line and leave
+        // the rest of this suite green.
+        let speech_source = include_str!("speech/mod.rs");
+        assert!(
+            speech_source.contains(
+                "Projection job applied append-only tail job_id={} kind={:?} staleness={:?}"
+            ),
+            "the AppendedTail INFO arm's distinctive log line must stay in place"
+        );
+        assert!(
+            speech_source.contains(
+                "Projection job apply failed job_id={} kind={:?} stale_apply={} error={:?}"
+            ),
+            "the stale_apply warn telemetry must stay in place"
+        );
+    }
+
+    /// The live apply gate and the replay gate must classify a given
+    /// (ledger, basis) pair identically to `classify_basis_currency` — the
+    /// two sites cannot silently diverge on what "safe to apply" means
+    /// (grafted from Design 2's `gate_arms_agree_with_classify_basis_currency`).
+    #[test]
+    fn gate_arms_agree_with_classify_basis_currency() {
+        // Current: nothing changed since the patch's basis was captured.
+        let current_event = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let current_ledger =
+            TranscriptLedger::replay("session-1", [current_event.clone()]).expect("ledger");
+        let current_patch = notes_patch(1, "note-current", "Decision", "Ship notes.");
+        assert_eq!(
+            current_ledger.classify_basis_currency(&current_patch.basis, None),
+            BasisCurrency::Current
+        );
+        let (_, currency) = MaterializedProjectionState::new("session-1")
+            .apply_validated_patch_reporting_currency(&current_ledger, &current_patch)
+            .expect("current basis must apply");
+        assert_eq!(currency, AppliedBasisCurrency::Current);
+        let current_replay =
+            MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+                "session-1",
+                [current_event],
+                [current_patch],
+            )
+            .expect("current replay");
+        assert_eq!(current_replay.validation.invalid_patch_count, 0);
+
+        // AppendOnlyStale: a new span arrived after the basis was captured
+        // but before the patch's `created_at_ms` — the live gate re-checks
+        // against the final ledger; the replay gate reconstructs the ledger
+        // at `created_at_ms`. Both must agree with `classify_basis_currency`
+        // and both must apply, not discard, the patch (audio-graph-caad).
+        let old_event = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let appended_event = TranscriptEvent::from(asr_payload("span-2", 1, "New context."));
+        let mut append_only_ledger = TranscriptLedger::new("session-1");
+        append_only_ledger
+            .apply_event(old_event.clone())
+            .expect("seed old event");
+        let append_only_patch = notes_patch(1, "note-append-only", "Decision", "Ship notes.");
+        append_only_ledger
+            .apply_event(appended_event.clone())
+            .expect("seed appended event");
+        assert!(matches!(
+            append_only_ledger.classify_basis_currency(&append_only_patch.basis, None),
+            BasisCurrency::AppendOnlyStale(_)
+        ));
+        let (_, currency) = MaterializedProjectionState::new("session-1")
+            .apply_validated_patch_reporting_currency(&append_only_ledger, &append_only_patch)
+            .expect("an append-only basis must apply, not be discarded as stale");
+        assert!(matches!(
+            currency,
+            AppliedBasisCurrency::AppendedTail { .. }
+        ));
+        let append_only_replay =
+            MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+                "session-1",
+                [old_event, appended_event],
+                [append_only_patch],
+            )
+            .expect("append-only replay");
+        assert_eq!(append_only_replay.validation.invalid_patch_count, 0);
+
+        // Revised: the patch's covered span was itself revised — both gates
+        // must still refuse to launder it into an evidence proof.
+        let stale_event = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let revised_event =
+            TranscriptEvent::from(asr_payload("span-1", 2, "Ship the corrected notes."));
+        let mut revised_ledger = TranscriptLedger::new("session-1");
+        revised_ledger
+            .apply_event(stale_event.clone())
+            .expect("seed stale event");
+        let revised_patch = notes_patch(1, "note-revised", "Decision", "Ship notes.");
+        revised_ledger
+            .apply_event(revised_event.clone())
+            .expect("seed revised event");
+        assert!(matches!(
+            revised_ledger.classify_basis_currency(&revised_patch.basis, None),
+            BasisCurrency::Revised(_)
+        ));
+        assert!(matches!(
+            MaterializedProjectionState::new("session-1")
+                .apply_validated_patch_reporting_currency(&revised_ledger, &revised_patch),
+            Err(ProjectionApplyError::StaleBasis { .. })
+        ));
+        let revised_replay =
+            MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+                "session-1",
+                [stale_event, revised_event],
+                [revised_patch],
+            )
+            .expect("revised replay");
+        assert_eq!(revised_replay.validation.invalid_patch_count, 1);
+        assert!(matches!(
+            revised_replay.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::StaleBasis { .. })
+        ));
+    }
+
+    /// audio-graph-f3d4 review fix: a boundary-correcting revision that
+    /// arrives *during* LLM generation (after `created_at_ms`, before the
+    /// live apply gate's fresh snapshot) must not make the live gate and
+    /// the replay gate disagree. The live gate accepts this patch as
+    /// `AppendOnlyStale` against the ledger it actually sees at apply time
+    /// (which already includes the corrected revision); replaying the
+    /// session must reach the same verdict, or `load_session_impl` would
+    /// refuse to open it (`invalid_patch_count > 0` -> `SessionInvalid`).
+    #[test]
+    fn replay_gate_agrees_with_live_gate_on_boundary_correction_during_generation() {
+        // The basis pins only span-B, an audio span at 5-6s.
+        let mut span_b = TranscriptEvent::from(asr_payload("span-b", 1, "Later context."));
+        span_b.start_time = 5.0;
+        span_b.end_time = 6.0;
+        span_b.received_at_ms = 1_000;
+
+        // span-C rev1 arrives between basis capture and `created_at_ms`,
+        // audio-positioned *before* span-B (inside the covered prefix).
+        let mut span_c_rev1 = TranscriptEvent::from(asr_payload("span-c", 1, "Early context."));
+        span_c_rev1.start_time = 0.5;
+        span_c_rev1.end_time = 1.5;
+        span_c_rev1.received_at_ms = 1_500;
+
+        // span-C rev2 is a boundary-corrected FINAL revision of the same
+        // span, arriving *during generation* (after `created_at_ms`),
+        // audio-repositioned to a proven tail after span-B.
+        let mut span_c_rev2 = TranscriptEvent::from(asr_payload("span-c", 2, "Late context."));
+        span_c_rev2.start_time = 7.0;
+        span_c_rev2.end_time = 8.0;
+        span_c_rev2.received_at_ms = 2_500;
+
+        let mut patch = notes_patch_for_basis(
+            1,
+            &[span_b.clone()],
+            "note-boundary",
+            "Decision",
+            "Ship it.",
+        );
+        patch.created_at_ms = 2_000;
+        patch.generation_latency_ms = Some(600); // classify_bound_ms = 2_600, covers rev2 at 2_500.
+
+        // Live apply gate: sees the fresh ledger with span-C already at
+        // rev2 (the corrected, tail position) and must accept it as an
+        // append-only tail, not discard it.
+        let mut live_ledger = TranscriptLedger::new("session-1");
+        live_ledger.apply_event(span_b.clone()).expect("span-b");
+        live_ledger
+            .apply_event(span_c_rev1.clone())
+            .expect("span-c rev1");
+        live_ledger
+            .apply_event(span_c_rev2.clone())
+            .expect("span-c rev2");
+        assert!(matches!(
+            live_ledger.classify_basis_currency(&patch.basis, None),
+            BasisCurrency::AppendOnlyStale(_)
+        ));
+        let (_, currency) = MaterializedProjectionState::new("session-1")
+            .apply_validated_patch_reporting_currency(&live_ledger, &patch)
+            .expect("the live gate must apply the boundary-corrected append-only tail");
+        assert!(matches!(
+            currency,
+            AppliedBasisCurrency::AppendedTail { .. }
+        ));
+
+        // Reopen replay must reach the same verdict, or the session
+        // becomes permanently unopenable via commands.rs's
+        // invalid_patch_count-gated SessionInvalid refusal.
+        let replay = MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+            "session-1",
+            [span_b, span_c_rev1, span_c_rev2],
+            [patch],
+        )
+        .expect("replay must not error");
+        assert_eq!(
+            replay.validation.invalid_patch_count, 0,
+            "replay diverged from the live gate's AppendOnlyStale acceptance: {:?}",
+            replay.validation.errors
         );
     }
 
@@ -5478,22 +5868,96 @@ mod tests {
         assert_eq!(replayed.graph.nodes[0].id, "node-a");
     }
 
+    /// audio-graph-caad / audio-graph-f3d4: an append-only tail must apply,
+    /// not be silently discarded as stale, and the gate must report the
+    /// currency it proved so callers can split applied-append-only telemetry
+    /// from the ordinary current-basis path.
     #[test]
-    fn materialized_projection_state_rejects_stale_basis_before_mutation() {
+    fn materialized_projection_state_applies_append_only_basis_after_check() {
         let first = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
         let second = TranscriptEvent::from(asr_payload("span-2", 1, "New context."));
         let mut ledger = TranscriptLedger::new("session-1");
         ledger.apply_event(first).expect("first event");
-        let old_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
+        let append_only_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
         ledger.apply_event(second).expect("second event");
+
+        let mut state = MaterializedProjectionState::new("session-1");
+        let (outcome, currency) = state
+            .apply_validated_patch_reporting_currency(&ledger, &append_only_patch)
+            .expect("an append-only basis must apply, not be discarded as stale");
+        assert_eq!(
+            outcome,
+            MaterializedProjectionApplyOutcome::Notes {
+                last_sequence: 1,
+                note_count: 1,
+            }
+        );
+        assert!(matches!(
+            currency,
+            AppliedBasisCurrency::AppendedTail { .. }
+        ));
+        assert_eq!(state.notes.notes[0].id, "note-1");
+    }
+
+    /// audio-graph-f3d4 review fix: `AppliedBasisCurrency` and
+    /// `ProjectionBasisStaleness` both derive `#[serde(tag = "type")]`. A
+    /// tuple variant wrapping the inner enum directly
+    /// (`AppendedTail(ProjectionBasisStaleness)`) flattens the inner enum's
+    /// tag into the SAME JSON object as the outer tag, producing two
+    /// competing `"type"` keys on one object, which serde_json's internally
+    /// tagged deserializer rejects with "duplicate field `type`" — this
+    /// guards the named-field shape (`AppendedTail { staleness }`) that
+    /// nests the inner enum under its own `staleness` key instead (so its
+    /// `"type"` tag lives on a nested object, not the outer one), matching
+    /// every other staleness-carrying enum in this module
+    /// (`ProjectionApplyError::StaleBasis { staleness }`,
+    /// `HistoricalProjectionValidationError::StaleBasis { .. }`).
+    #[test]
+    fn applied_basis_currency_appended_tail_serde_round_trips() {
+        let currency = AppliedBasisCurrency::AppendedTail {
+            staleness: ProjectionBasisStaleness::MissingCurrentSpan {
+                span_id: "span-2".to_string(),
+                current_revision: 1,
+            },
+        };
+        let json = serde_json::to_string(&currency).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let object = value.as_object().expect("top-level JSON object");
+        assert_eq!(
+            object.get("type").and_then(|v| v.as_str()),
+            Some("appended_tail"),
+            "outer tag must not be shadowed by the inner enum's tag: {json}"
+        );
+        let staleness = object
+            .get("staleness")
+            .and_then(|v| v.as_object())
+            .expect("staleness must nest under its own key, not flatten into the outer object");
+        assert_eq!(
+            staleness.get("type").and_then(|v| v.as_str()),
+            Some("missing_current_span")
+        );
+        let round_tripped: AppliedBasisCurrency =
+            serde_json::from_str(&json).expect("deserialize back");
+        assert_eq!(round_tripped, currency);
+    }
+
+    #[test]
+    fn materialized_projection_state_rejects_revised_basis_before_mutation() {
+        let first = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let revised = TranscriptEvent::from(asr_payload("span-1", 2, "Ship the corrected notes."));
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(first).expect("first event");
+        let old_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
+        ledger.apply_event(revised).expect("revised event");
 
         let mut state = MaterializedProjectionState::new("session-1");
         assert_eq!(
             state.apply_validated_patch(&ledger, &old_patch),
             Err(ProjectionApplyError::StaleBasis {
-                staleness: ProjectionBasisStaleness::MissingCurrentSpan {
-                    span_id: "span-2".to_string(),
-                    current_revision: 1,
+                staleness: ProjectionBasisStaleness::StaleSpanRevision {
+                    span_id: "span-1".to_string(),
+                    current_revision: 2,
+                    basis_revision: 1,
                 },
             })
         );

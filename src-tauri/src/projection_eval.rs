@@ -963,29 +963,34 @@ mod tests {
             },
         );
 
+        // audio-graph-caad / audio-graph-f3d4: an append-only tail applies
+        // instead of being discarded as stale, so every patch generated
+        // against it is accepted rather than counted as an apply failure —
+        // the scheduler still starts exactly one Background follow-up either
+        // way (`follow_up_jobs_started` below is unaffected).
         assert_eq!(report.metrics.accepted_transcript_event_count, 2);
         assert_eq!(report.metrics.rejected_transcript_event_count, 0);
         assert_eq!(report.metrics.generated_patch_count, 4);
-        assert_eq!(report.metrics.applied_patch_count, 2);
-        assert_eq!(report.metrics.apply_failure_count, 2);
+        assert_eq!(report.metrics.applied_patch_count, 4);
+        assert_eq!(report.metrics.apply_failure_count, 0);
 
         assert_eq!(report.latency.completed_job_count, 4);
-        assert_eq!(report.latency.accepted_job_count, 2);
-        assert_eq!(report.latency.rejected_job_count, 2);
+        assert_eq!(report.latency.accepted_job_count, 4);
+        assert_eq!(report.latency.rejected_job_count, 0);
         assert_eq!(report.latency.max_asr_event_to_job_queued_ms, 100);
         assert_eq!(report.latency.max_projection_queue_lag_ms, 200);
         assert_eq!(report.latency.total_generation_latency_ms, 150);
         assert_eq!(report.latency.total_apply_latency_ms, 20);
         assert_eq!(report.latency.notes.completed_job_count, 2);
-        assert_eq!(report.latency.notes.accepted_job_count, 1);
-        assert_eq!(report.latency.notes.rejected_job_count, 1);
+        assert_eq!(report.latency.notes.accepted_job_count, 2);
+        assert_eq!(report.latency.notes.rejected_job_count, 0);
         assert_eq!(report.latency.notes.tokens_used, 22);
         assert_eq!(report.latency.notes.total_generation_latency_ms, 60);
         assert_eq!(report.latency.notes.total_apply_latency_ms, 10);
         assert_eq!(report.latency.notes.max_projection_queue_lag_ms, 200);
         assert_eq!(report.latency.graph.completed_job_count, 2);
-        assert_eq!(report.latency.graph.accepted_job_count, 1);
-        assert_eq!(report.latency.graph.rejected_job_count, 1);
+        assert_eq!(report.latency.graph.accepted_job_count, 2);
+        assert_eq!(report.latency.graph.rejected_job_count, 0);
         assert_eq!(report.latency.graph.tokens_used, 34);
         assert_eq!(report.latency.graph.total_generation_latency_ms, 90);
         assert_eq!(report.latency.graph.total_apply_latency_ms, 10);
@@ -1025,10 +1030,10 @@ mod tests {
         assert_eq!(report.schedulers.graph.metrics.repair_jobs_started, 0);
         assert_eq!(report.schedulers.notes.metrics.follow_up_jobs_started, 1);
         assert_eq!(report.schedulers.graph.metrics.follow_up_jobs_started, 1);
-        assert_eq!(report.schedulers.notes.metrics.accepted_patches, 1);
-        assert_eq!(report.schedulers.graph.metrics.accepted_patches, 1);
-        assert_eq!(report.schedulers.notes.metrics.apply_failures, 1);
-        assert_eq!(report.schedulers.graph.metrics.apply_failures, 1);
+        assert_eq!(report.schedulers.notes.metrics.accepted_patches, 2);
+        assert_eq!(report.schedulers.graph.metrics.accepted_patches, 2);
+        assert_eq!(report.schedulers.notes.metrics.apply_failures, 0);
+        assert_eq!(report.schedulers.graph.metrics.apply_failures, 0);
         assert_eq!(report.schedulers.notes.metrics.tokens_used, 22);
         assert_eq!(report.schedulers.graph.metrics.tokens_used, 34);
         assert_eq!(
@@ -1169,12 +1174,15 @@ mod tests {
         assert_eq!(report.session_id, "session-fixture");
         assert_eq!(report.metrics.accepted_transcript_event_count, 2);
         assert_eq!(report.metrics.generated_patch_count, 4);
-        assert_eq!(report.metrics.applied_patch_count, 2);
-        assert_eq!(report.metrics.apply_failure_count, 2);
+        // audio-graph-caad / audio-graph-f3d4: an append-only tail applies
+        // instead of being discarded as stale, so every patch generated
+        // against it is accepted rather than counted as an apply failure.
+        assert_eq!(report.metrics.applied_patch_count, 4);
+        assert_eq!(report.metrics.apply_failure_count, 0);
 
         assert_eq!(report.latency.completed_job_count, 4);
-        assert_eq!(report.latency.accepted_job_count, 2);
-        assert_eq!(report.latency.rejected_job_count, 2);
+        assert_eq!(report.latency.accepted_job_count, 4);
+        assert_eq!(report.latency.rejected_job_count, 0);
         assert_eq!(report.latency.max_asr_event_to_job_queued_ms, 100);
         assert_eq!(report.latency.max_projection_queue_lag_ms, 200);
         assert_eq!(report.latency.total_generation_latency_ms, 146);
@@ -1245,8 +1253,11 @@ mod tests {
         let report = run_offline_projection_fixture(fixture);
 
         assert_eq!(report.metrics.generated_patch_count, 4);
-        assert_eq!(report.metrics.applied_patch_count, 2);
-        assert_eq!(report.metrics.apply_failure_count, 2);
+        // audio-graph-caad / audio-graph-f3d4: an append-only tail applies
+        // instead of being discarded as stale, so every patch generated
+        // against it is accepted rather than counted as an apply failure.
+        assert_eq!(report.metrics.applied_patch_count, 4);
+        assert_eq!(report.metrics.apply_failure_count, 0);
         assert_eq!(report.latency.total_generation_latency_ms, 146);
         assert_eq!(report.latency.total_apply_latency_ms, 22);
         assert_eq!(report.latency.notes.tokens_used, 30);

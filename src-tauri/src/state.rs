@@ -33,7 +33,7 @@ use crate::persistence::{
 };
 use crate::projection_scheduler::ProjectionSchedulers;
 use crate::projections::{
-    MaterializedGraph, MaterializedNotes, MaterializedProjectionApplyOutcome,
+    AppliedBasisCurrency, MaterializedGraph, MaterializedNotes, MaterializedProjectionApplyOutcome,
     MaterializedProjectionState, ProjectionApplyError, ProjectionBasis, ProjectionKind,
     ProjectionPatch, SpeakerTimeline, TranscriptLedger,
 };
@@ -358,6 +358,12 @@ pub struct ProjectionRuntimeApplyResult {
     /// value means the canonical patch was accepted and live state advanced,
     /// but restart must rebuild the snapshot from the event stream.
     pub materialized_snapshot_saved: bool,
+    /// What the gate proved about the patch's basis when it applied —
+    /// `Current` or a proven append-only tail (audio-graph-caad /
+    /// audio-graph-f3d4). Telemetry substrate: callers split
+    /// applied-append-only from the ordinary current-basis path without
+    /// re-deriving the classification themselves.
+    pub basis_currency_at_apply: AppliedBasisCurrency,
 }
 
 /// Why a runtime projection patch was rejected before becoming active state.
@@ -563,8 +569,8 @@ impl ProjectionRuntimeHandle {
 
         let apply_started = Instant::now();
         let mut next_materialized = materialized_guard.clone();
-        let outcome = next_materialized
-            .apply_validated_patch(ledger, &patch)
+        let (outcome, basis_currency_at_apply) = next_materialized
+            .apply_validated_patch_reporting_currency(ledger, &patch)
             .map_err(|error| ProjectionRuntimeApplyError::Apply { error })?;
 
         patch.apply_latency_ms.get_or_insert(
@@ -633,6 +639,7 @@ impl ProjectionRuntimeHandle {
             outcome,
             projection_event_enqueued,
             materialized_snapshot_saved,
+            basis_currency_at_apply,
         })
     }
 }
@@ -1767,12 +1774,14 @@ mod rotation_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// audio-graph-caad / audio-graph-f3d4: an append-only tail must apply
+    /// live, not be silently discarded as stale.
     #[test]
-    fn runtime_projection_patch_rejects_stale_basis_without_persistence() {
+    fn runtime_projection_patch_applies_append_only_basis_with_persistence() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("projection-stale");
+        let dir = unique_tempdir("projection-append-only");
         let _g = HomeGuard::set(&dir);
 
         let app = AppState::new();
@@ -1788,11 +1797,80 @@ mod rotation_tests {
                 .expect("seed newer transcript event");
             basis
         };
-        let patch = runtime_note_patch(1, old_basis.clone(), "note-stale", "Outdated note.");
+        let patch = runtime_note_patch(1, old_basis.clone(), "note-append-only", "Still current.");
+
+        let result = app
+            .apply_runtime_projection_patch(&session_id, &old_basis, patch)
+            .expect("an append-only basis must apply, not be discarded as stale");
+        assert_eq!(
+            result.outcome,
+            MaterializedProjectionApplyOutcome::Notes {
+                last_sequence: 1,
+                note_count: 1,
+            }
+        );
+        assert!(matches!(
+            result.basis_currency_at_apply,
+            AppliedBasisCurrency::AppendedTail { .. }
+        ));
+        assert!(result.projection_event_enqueued);
+        assert_eq!(
+            app.materialized_projection_state
+                .lock()
+                .unwrap()
+                .notes
+                .notes[0]
+                .id,
+            "note-append-only"
+        );
+
+        drain_writers(&app);
+
+        let repository = FileMemoryRepository::user_data();
+        let notes = repository
+            .load_materialized_notes(&session_id)
+            .expect("load notes")
+            .expect("notes artifact exists");
+        assert_eq!(notes.notes[0].body, "Still current.");
+
+        let events = repository
+            .load_projection_patches(&session_id)
+            .expect("load projection events");
+        assert_eq!(
+            events.len(),
+            1,
+            "the append-only apply must enqueue its projection event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_projection_patch_rejects_revised_basis_without_persistence() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-revised");
+        let _g = HomeGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let old_basis = {
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event("span-1", 1, "Old context."))
+                .expect("seed first transcript event");
+            let basis = ledger.current_basis();
+            ledger
+                .apply_event(projection_transcript_event("span-1", 2, "Revised context."))
+                .expect("seed revised transcript event");
+            basis
+        };
+        let patch = runtime_note_patch(1, old_basis.clone(), "note-revised", "Outdated note.");
 
         let error = app
             .apply_runtime_projection_patch(&session_id, &old_basis, patch)
-            .expect_err("stale basis must be rejected");
+            .expect_err("a revised basis must be rejected");
         assert!(matches!(
             error,
             ProjectionRuntimeApplyError::Apply {
@@ -1806,7 +1884,7 @@ mod rotation_tests {
                 .notes
                 .notes
                 .is_empty(),
-            "stale patch must not mutate materialized notes"
+            "revised patch must not mutate materialized notes"
         );
 
         drain_writers(&app);
@@ -1817,15 +1895,100 @@ mod rotation_tests {
                 .load_projection_patches(&session_id)
                 .expect("load projection events")
                 .is_empty(),
-            "stale patch must not enqueue a projection event"
+            "revised patch must not enqueue a projection event"
         );
         assert!(
             repository
                 .load_materialized_notes(&session_id)
                 .expect("load notes")
                 .is_none(),
-            "stale patch must not write a materialized notes artifact"
+            "revised patch must not write a materialized notes artifact"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-trip guard for the `load_session_impl` (`commands.rs`) derived-
+    /// cache refusal: an accepted append-only patch must replay through
+    /// `replay_accepted_patches_with_history` to the SAME materialized state
+    /// the live gate produced, with `invalid_patch_count == 0` — otherwise
+    /// the first persisted append-only patch would make reopening this
+    /// session refuse to load its derived caches.
+    #[test]
+    fn runtime_projection_patch_applies_append_only_basis_and_replays_identically() {
+        let dir = unique_tempdir("projection-append-only-replay");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let repository: Arc<dyn LocalMemoryRepository> = repo.clone();
+        let session_id = "runtime-append-only-replay";
+        let runtime = ProjectionRuntimeHandle::in_memory_for_tests(session_id);
+
+        let old_event = projection_transcript_event("span-1", 1, "Old context.");
+        let new_event = projection_transcript_event("span-2", 1, "New context.");
+        let old_basis = {
+            let mut ledger = runtime.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(old_event.clone())
+                .expect("seed old transcript event");
+            let basis = ledger.current_basis();
+            ledger
+                .apply_event(new_event.clone())
+                .expect("seed newer transcript event");
+            basis
+        };
+        {
+            let mut writer = runtime.projection_event_writer.lock().unwrap();
+            *writer = ProjectionEventWriter::repository(session_id, repository);
+        }
+
+        let patch = runtime_note_patch(
+            1,
+            old_basis.clone(),
+            "note-append-only-replay",
+            "Still current.",
+        );
+        let notes_repo = repo.clone();
+        let graph_repo = repo.clone();
+        let result = runtime
+            .apply_runtime_projection_patch_with_savers(
+                session_id,
+                &old_basis,
+                patch,
+                move |session_id, notes| notes_repo.save_materialized_notes(session_id, notes),
+                move |session_id, graph| graph_repo.save_materialized_graph(session_id, graph),
+            )
+            .expect("an append-only basis must apply live");
+        assert!(matches!(
+            result.basis_currency_at_apply,
+            AppliedBasisCurrency::AppendedTail { .. }
+        ));
+        let live_state = runtime.materialized_projection_snapshot();
+
+        let writer = runtime
+            .projection_event_writer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("repository projection writer");
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(2)));
+
+        let events = repo
+            .load_projection_patches(session_id)
+            .expect("load persisted projection events");
+        assert_eq!(events.len(), 1);
+
+        let replay = MaterializedProjectionState::replay_accepted_patches_with_history(
+            session_id,
+            vec![old_event, new_event],
+            None,
+            events,
+        )
+        .expect("an accepted append-only patch must replay");
+        assert_eq!(
+            replay.validation.invalid_patch_count, 0,
+            "an accepted append-only patch must not be rejected on replay — this is the \
+             invariant load_session_impl relies on to load derived caches"
+        );
+        assert_eq!(replay.state, live_state);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

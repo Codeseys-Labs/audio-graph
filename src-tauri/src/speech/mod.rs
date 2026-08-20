@@ -72,8 +72,9 @@ use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulersObservation};
 use crate::projections::{
-    DiarizationSpanRevision, MaterializedGraph, MaterializedNotes, ProjectionApplyError,
-    ProjectionJob, ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptLedger,
+    AppliedBasisCurrency, DiarizationSpanRevision, MaterializedGraph, MaterializedNotes,
+    ProjectionApplyError, ProjectionJob, ProjectionKind, ProjectionPatch, SpeakerTimeline,
+    TranscriptLedger,
 };
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{
@@ -2364,6 +2365,20 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         job.kind,
                         result.outcome
                     );
+                    // audio-graph-caad / audio-graph-f3d4: the gate now applies a
+                    // proven append-only tail instead of discarding it as stale —
+                    // split that telemetry from the ordinary current-basis apply
+                    // above so it stays distinguishable in logs.
+                    if let AppliedBasisCurrency::AppendedTail { ref staleness } =
+                        result.basis_currency_at_apply
+                    {
+                        log::info!(
+                            "Projection job applied append-only tail job_id={} kind={:?} staleness={:?}",
+                            job.id,
+                            job.kind,
+                            staleness
+                        );
+                    }
                     emit_projection_runtime_events(&dispatch, &emitted_patch);
                     finish_projection_scheduler_job(
                         dispatch,
@@ -2378,6 +2393,11 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         current_unix_millis().saturating_sub(apply_started_ms),
                         false,
                     );
+                    // A proven append-only tail now applies above instead of
+                    // reaching this branch, so `StaleBasis` here is
+                    // Revised-only by construction: content this apply
+                    // covered was actually superseded, not merely trailed by
+                    // a later append.
                     let stale_apply = matches!(
                         &error,
                         ProjectionRuntimeApplyError::Apply {
@@ -7212,8 +7232,8 @@ mod tests_status {
         ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchAttempt,
         ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
         SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
-        aws_error_for_diagnostic_event, cloud_error_code, diarization_span_revision_for_transcript,
-        emit_and_dispatch_diarization_span_revision,
+        aws_error_for_diagnostic_event, cloud_error_code, current_unix_millis,
+        diarization_span_revision_for_transcript, emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
@@ -10234,6 +10254,10 @@ mod tests_status {
             run_projection_job(dispatch.clone(), notes_job);
         }
 
+        // audio-graph-caad / audio-graph-f3d4: the append-only apply above
+        // must not be discarded as stale — it materializes its own note over
+        // the original 1-span basis — and the scheduler still starts exactly
+        // one Background follow-up over the now-current 2-span basis.
         wait_until("append-only projection follow-up completes", || {
             let materialized = app
                 .materialized_projection_state
@@ -10243,8 +10267,7 @@ mod tests_status {
                 .projection_schedulers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            materialized.notes.notes.len() == 1
-                && materialized.notes.notes[0].basis.span_revisions.len() == 2
+            materialized.notes.notes.len() == 2
                 && schedulers.notes().metrics().stale_discards == 0
                 && schedulers.notes().metrics().repair_jobs_started == 0
                 && schedulers.notes().metrics().follow_up_jobs_started == 1
@@ -10252,13 +10275,51 @@ mod tests_status {
                 && schedulers.notes().in_flight_job().is_none()
         });
 
+        {
+            let materialized = app
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut basis_lengths: Vec<usize> = materialized
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.basis.span_revisions.len())
+                .collect();
+            basis_lengths.sort_unstable();
+            assert_eq!(
+                basis_lengths,
+                vec![1, 2],
+                "the append-only apply must materialize its own note over the original \
+                 1-span basis, alongside the follow-up's note over the full 2-span basis"
+            );
+        }
+
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
             "append-only apply should generate the original and one background follow-up"
         );
-        assert_eq!(event_sink.patch_count(), 1);
-        assert_eq!(event_sink.notes_count(), 1);
+        assert_eq!(event_sink.patch_count(), 2);
+        assert_eq!(event_sink.notes_count(), 2);
         assert_eq!(event_sink.graph_count(), 0);
+
+        // Idle next tick: the follow-up's basis is now current, so observing
+        // the ledger again must not start further work.
+        {
+            let ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let observation = schedulers.observe_ledger(&ledger, current_unix_millis());
+            assert!(matches!(
+                observation.notes,
+                ProjectionSchedulerDecision::Idle
+            ));
+        }
 
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
