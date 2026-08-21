@@ -9,7 +9,7 @@
   position: fixed;
   inset: 0;
   background: var(--scrim-color);
-  z-index: 1000;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -410,11 +410,11 @@
 }
 
 .settings-mode-card__provider-link:hover {
-  background: var(--bg-hover, rgba(127, 127, 127, 0.12));
+  background: var(--hover-overlay);
 }
 
 .settings-mode-card__provider-link:focus-visible {
-  outline: 2px solid var(--accent-color, #4c8bf5);
+  outline: 2px solid var(--focus-ring-color);
   outline-offset: 1px;
 }
 
@@ -851,7 +851,7 @@
 }
 
 .settings-credential-health__chip--unused {
-  background: var(--surface-muted, rgba(127, 127, 127, 0.16));
+  background: var(--hover-overlay);
   color: var(--text-muted);
 }
 
@@ -878,7 +878,7 @@
   padding: 6px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: var(--surface-raised, var(--surface, #fff));
+  background: var(--bg-elevated);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
 }
 

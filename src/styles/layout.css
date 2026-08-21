@@ -319,7 +319,7 @@
   flex-shrink: 0;
   background: transparent;
   transition: background-color 0.12s ease;
-  z-index: 2;
+  z-index: var(--z-divider);
 }
 .resize-divider:hover,
 .resize-divider:active {

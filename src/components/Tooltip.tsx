@@ -6,7 +6,7 @@
  * direction. Radix ships NO styles and assumes NO reset/Preflight, so this slots
  * cleanly behind `styles.css` (the single source of truth) and the audited token
  * system: surfaces/borders/text use semantic-token utilities, elevation uses
- * `shadow-2`, and it sits at the `--z-popover` tier (z-[40]).
+ * `shadow-2`, and it sits at the `--z-popover` tier (`z-[var(--z-popover)]`).
  *
  * Why this over a native `title=`:
  *   - Keyboard-focus + hover + touch parity (WCAG 1.4.13 / 4.1.2), not hover-only.
@@ -46,7 +46,7 @@ export default function Tooltip({
           <RadixTooltip.Content
             side={side}
             sideOffset={6}
-            className="z-[40] max-w-[260px] py-(--space-2) px-(--space-4) rounded-md bg-bg-elevated border border-border-color text-text-secondary text-xs leading-[1.4] shadow-2 select-none"
+            className="z-[var(--z-popover)] max-w-[260px] py-(--space-2) px-(--space-4) rounded-md bg-bg-elevated border border-border-color text-text-secondary text-xs leading-[1.4] shadow-2 select-none"
           >
             {content}
             <RadixTooltip.Arrow className="fill-bg-elevated" />

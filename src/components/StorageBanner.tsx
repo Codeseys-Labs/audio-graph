@@ -83,7 +83,7 @@ function StorageBanner() {
 
   return (
     <div
-      className="banner-on-accent flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-banner-storage text-white text-md shadow-1 z-[1100]"
+      className="banner-on-accent flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-banner-storage text-white text-md shadow-1 z-[var(--z-banner)]"
       role="alert"
       aria-live="assertive"
       data-testid="storage-banner"
