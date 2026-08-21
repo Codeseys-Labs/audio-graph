@@ -15,8 +15,17 @@ import { DEFAULT_SHELL_NAV } from "../store/shellNav";
 // every test file) rather than asking each test file's own store-reset
 // helper to know about a slice it didn't introduce (several, including
 // `App.contract.test.tsx`, must stay untouched — seed audio-graph-59fb).
+//
+// `pendingFinalizingSession` (SHELL-R2, audio-graph-e0c4) joins the same
+// beforeEach for the same reason: `stopCapture` writes it directly (not
+// through a named flag setter a per-file reset helper would already know
+// about), so a test that exercises Stop in one `it()` must not leak an
+// optimistic row into an unrelated one later in the same file.
 beforeEach(() => {
-  useAudioGraphStore.setState({ nav: DEFAULT_SHELL_NAV });
+  useAudioGraphStore.setState({
+    nav: DEFAULT_SHELL_NAV,
+    pendingFinalizingSession: null,
+  });
 });
 
 // jsdom does not implement ResizeObserver, which Radix UI primitives (e.g.

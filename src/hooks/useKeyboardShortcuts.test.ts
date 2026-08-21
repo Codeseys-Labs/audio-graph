@@ -135,13 +135,16 @@ describe("useKeyboardShortcuts", () => {
     document.body.removeChild(input);
   });
 
-  it("Escape closes sessions browser when it is the open modal", () => {
+  it("Escape does NOT swallow the keystroke when sessionsBrowserOpen is stale (SHELL-R2: Sessions is a destination, not a modal — regression guard for the dead-keystroke bug)", () => {
     const closeSessionsBrowser = vi.fn();
     const closeSettings = vi.fn();
     useAudioGraphStore.setState({
       closeSessionsBrowser,
       closeSettings,
       settingsOpen: false,
+      // `sessionsBrowserOpen` latches true on open and has no remaining
+      // reader (see useKeyboardShortcuts.ts's module doc) — Escape must be
+      // a true no-op here, not a preventDefaulted early return.
       sessionsBrowserOpen: true,
     });
 
@@ -151,7 +154,7 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
 
-    expect(closeSessionsBrowser).toHaveBeenCalledTimes(1);
+    expect(closeSessionsBrowser).not.toHaveBeenCalled();
     expect(closeSettings).not.toHaveBeenCalled();
   });
 

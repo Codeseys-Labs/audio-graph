@@ -13,7 +13,7 @@
  */
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import { formatDuration } from "../utils/format";
+import { formatDurationHoursAware } from "../utils/format";
 
 function SpeakerPanel() {
   const { t } = useTranslation();
@@ -49,7 +49,9 @@ function SpeakerPanel() {
                 </span>
                 <span className="text-xs text-text-muted">
                   {t("speakers.talkTime", {
-                    duration: formatDuration(speaker.total_speaking_time),
+                    duration: formatDurationHoursAware(
+                      speaker.total_speaking_time,
+                    ),
                     count: speaker.segment_count,
                   })}
                 </span>

@@ -77,7 +77,7 @@ describe("SpeakerPanel", () => {
     });
     render(<SpeakerPanel />);
     const item = screen.getByRole("listitem");
-    // formatDuration(125) === "2m 5s"
+    // formatDurationHoursAware(125) === "2m 5s"
     expect(within(item).getByText(/2m 5s · 7 segments/)).toBeInTheDocument();
     // The trailing badge shows the bare count.
     expect(

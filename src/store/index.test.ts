@@ -939,6 +939,45 @@ describe("AudioGraphStore", () => {
     );
   });
 
+  it("clears a stale pendingFinalizingSession once it successfully loads a DIFFERENT session (R2 adversary finding #1: the pending row's resident-data premise dies the moment its data is overwritten)", async () => {
+    useAudioGraphStore.setState({
+      pendingFinalizingSession: {
+        id: "just-stopped-session",
+        title: null,
+        created_at: 1_700_000_000_000,
+        ended_at: 1_700_000_060_000,
+        duration_seconds: 60,
+        status: "active",
+        segment_count: 2,
+        speaker_count: 1,
+        entity_count: 0,
+        transcript_path: "",
+        graph_path: "",
+        deleted: false,
+        deleted_at: null,
+        optimistic: true,
+      },
+    });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "load_session") {
+        return {
+          transcript: [],
+          graph: {
+            nodes: [],
+            links: [],
+            stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+          },
+        };
+      }
+      if (command === "build_session_timeline_cmd") return [];
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().loadSession("a-different-session");
+
+    expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
+  });
+
   it("invalidates an in-flight historical load when capture starts", async () => {
     let resolveHistorical: (value: unknown) => void = () => {};
     const pendingHistorical = new Promise((resolve) => {
@@ -2291,6 +2330,33 @@ describe("AudioGraphStore", () => {
     ]);
   });
 
+  it("clears a stale pendingFinalizingSession when a fresh capture starts (R2 adversary finding #1: a prior stop's resident-data premise is void once a new capture overwrites the store)", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["system-default"],
+      pendingFinalizingSession: {
+        id: "prior-stop-session",
+        title: null,
+        created_at: 1_700_000_000_000,
+        ended_at: 1_700_000_060_000,
+        duration_seconds: 60,
+        status: "active",
+        segment_count: 2,
+        speaker_count: 1,
+        entity_count: 0,
+        transcript_path: "",
+        graph_path: "",
+        deleted: false,
+        deleted_at: null,
+        optimistic: true,
+      },
+    });
+
+    await useAudioGraphStore.getState().startCapture();
+
+    expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
+  });
+
   it("keeps legacy start_capture arguments when no descriptor matches", async () => {
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:stale"],
@@ -2976,6 +3042,194 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().error).toMatch(
       /converse teardown failed/i,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SHELL-R2 (audio-graph-e0c4, plan §R2, ADR-0046): "stop lands you on your own
+// session" — `stopCapture` reads the active session id before stopping and
+// routes `nav` to it directly, plus writes the optimistic "finalizing" row
+// for the 1d92 gap (`sessions.json` may not have the just-ended session's
+// entry yet).
+// ---------------------------------------------------------------------------
+describe("stopCapture — SHELL-R2 session routing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["system-default"],
+      isCapturing: true,
+      isTranscribing: true,
+      captureStartTime: 1_700_000_000_000,
+      transcriptSegments: [],
+      speakers: [],
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      nav: { dest: "capture", sessionId: null, lens: "notes" },
+      pendingFinalizingSession: null,
+      sessions: [],
+      error: null,
+    });
+  });
+
+  it("routes nav to the Sessions destination on the just-ended session, Notes lens", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_session_id") return "session-abc";
+      if (cmd === "stop_capture") return null;
+      if (cmd === "list_sessions") return [];
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().stopCapture();
+
+    expect(useAudioGraphStore.getState().nav).toEqual({
+      dest: "sessions",
+      sessionId: "session-abc",
+      lens: "notes",
+    });
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+  });
+
+  it("writes the optimistic finalizing row from in-memory capture state, before listSessions() is refreshed", async () => {
+    useAudioGraphStore.setState({
+      transcriptSegments: [
+        {
+          id: "seg-1",
+          source_id: "system-default",
+          speaker_id: null,
+          speaker_label: null,
+          text: "hi",
+          start_time: 0,
+          end_time: 1,
+          confidence: 0.9,
+        },
+      ],
+      speakers: [
+        {
+          id: "spk-1",
+          label: "Speaker 1",
+          color: "#000",
+          total_speaking_time: 1,
+          segment_count: 1,
+        },
+      ],
+    });
+    let listSessionsCalls = 0;
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_session_id") return "session-abc";
+      if (cmd === "stop_capture") return null;
+      if (cmd === "list_sessions") {
+        listSessionsCalls += 1;
+        // The 1d92 gap: the index hasn't caught up yet.
+        return [];
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().stopCapture();
+
+    const pending = useAudioGraphStore.getState().pendingFinalizingSession;
+    expect(pending).toMatchObject({
+      id: "session-abc",
+      optimistic: true,
+      segment_count: 1,
+      speaker_count: 1,
+      created_at: 1_700_000_000_000,
+    });
+    expect(listSessionsCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not route or write an optimistic row when the session id read fails, but still stops capture", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_session_id") throw new Error("no active session");
+      if (cmd === "stop_capture") return null;
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().stopCapture();
+
+    expect(useAudioGraphStore.getState().nav).toEqual({
+      dest: "capture",
+      sessionId: null,
+      lens: "notes",
+    });
+    expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+  });
+
+  it("clears a PRIOR stop's pending row when this stop's own session id read fails (R2 adversary finding #1: a failed id read voids the resident-data premise, it doesn't inherit a stale one)", async () => {
+    useAudioGraphStore.setState({
+      pendingFinalizingSession: {
+        id: "earlier-stopped-session",
+        title: null,
+        created_at: 1_690_000_000_000,
+        ended_at: 1_690_000_060_000,
+        duration_seconds: 60,
+        status: "active",
+        segment_count: 3,
+        speaker_count: 1,
+        entity_count: 0,
+        transcript_path: "",
+        graph_path: "",
+        deleted: false,
+        deleted_at: null,
+        optimistic: true,
+      },
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_session_id") throw new Error("no active session");
+      if (cmd === "stop_capture") return null;
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().stopCapture();
+
+    expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
+  });
+
+  it("does not route to or create a pending row for the sample-preview sentinel id (getSessionId degrades to the truthy SAMPLE_SESSION_ID during sample preview rather than throwing — R2 adversary finding #4)", async () => {
+    useAudioGraphStore.getState().loadSampleSessionPreview();
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_session_id") {
+        throw new Error(
+          "getSessionId() should short-circuit on samplePreviewActive and never invoke the backend",
+        );
+      }
+      if (cmd === "stop_capture") return null;
+      if (cmd === "list_sessions") return [];
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().stopCapture();
+
+    expect(useAudioGraphStore.getState().nav).toEqual({
+      dest: "capture",
+      sessionId: null,
+      lens: "notes",
+    });
+    expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+  });
+});
+
+describe("openSessionsBrowser — SHELL-R2 navigates instead of opening a modal", () => {
+  it("sets sessionsBrowserOpen (untouched, per SHELL-R1) AND navigates to the Sessions destination", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_sessions") return [];
+      if (cmd === "purge_expired_sessions") return [];
+      return undefined;
+    });
+    useAudioGraphStore.setState({
+      nav: { dest: "capture", sessionId: null, lens: "notes" },
+      sessionsBrowserOpen: false,
+    });
+
+    useAudioGraphStore.getState().openSessionsBrowser();
+
+    expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(true);
+    expect(useAudioGraphStore.getState().nav.dest).toBe("sessions");
   });
 });
 

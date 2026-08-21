@@ -55,8 +55,16 @@ import NotesPanel from "./components/NotesPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
-import SeekTimeline from "./components/SeekTimeline";
 import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
+// SHELL-R2 (plan §R2, ADR-0046): SessionsBrowser stops being lazy — it is no
+// longer a conditionally-rendered modal but the "after"/Sessions panel's
+// always-composed content whenever that tab is active. Its own Graph lens
+// re-declares the deferred `KnowledgeGraphViewer` import (this file's
+// `analysis` tab keeps its own, per the plan's deliberate interim
+// duplication) — Rollup dedupes the vendor chunk by module specifier, so
+// this does not re-bundle react-force-graph-2d into the main chunk; verified
+// via `bun run build:analyze`.
+import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
 import TokenUsagePanel from "./components/TokenUsagePanel";
@@ -68,7 +76,6 @@ const KnowledgeGraphViewer = lazy(
   () => import("./components/KnowledgeGraphViewer"),
 );
 const SettingsPage = lazy(() => import("./components/SettingsPage"));
-const SessionsBrowser = lazy(() => import("./components/SessionsBrowser"));
 const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 
 import DemoModeBanner from "./components/DemoModeBanner";
@@ -580,32 +587,17 @@ function ShellRailContentAside({
           </main>
         ))}
       {workspaceView === "after" && (
+        // SHELL-R2 (plan §R2, ADR-0046): the Sessions destination — SessionsBrowser
+        // stopped being a modal and IS this panel's content now (rail→detail
+        // with lens tabs). Ids/role/label stay byte-identical; R4 is the unit
+        // that renames `after` → `sessions`.
         <main
           id="workspace-panel-after"
           role="tabpanel"
           aria-labelledby="workspace-tab-after"
-          className="workspace-panel workspace-panel--after"
+          className="workspace-panel"
         >
-          <section
-            className="workspace-panel__review-notes"
-            aria-label={t("workspace.afterNotes")}
-          >
-            <NotesPanel />
-          </section>
-          <section
-            className="workspace-panel__review-transcript"
-            aria-label={t("workspace.afterTranscript")}
-          >
-            <LiveTranscript />
-          </section>
-          {(samplePreviewActive || loadedSessionId) && (
-            <section
-              className="workspace-panel__seek"
-              aria-label={t("seekTimeline.label")}
-            >
-              <SeekTimeline />
-            </section>
-          )}
+          <SessionsBrowser />
         </main>
       )}
       {workspaceView === "analysis" && (
@@ -663,7 +655,6 @@ function App() {
   const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
-  const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const hasAgentActivity = useAudioGraphStore(
@@ -1127,13 +1118,6 @@ function App() {
       {settingsOpen && (
         <Suspense fallback={null}>
           <SettingsPage />
-        </Suspense>
-      )}
-
-      {/* Sessions browser modal */}
-      {sessionsBrowserOpen && (
-        <Suspense fallback={null}>
-          <SessionsBrowser />
         </Suspense>
       )}
 

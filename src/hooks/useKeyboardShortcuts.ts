@@ -9,12 +9,23 @@ import { useAudioGraphStore } from "../store";
  *   - Cmd/Ctrl+R         → toggle capture (start/stop)
  *   - Cmd/Ctrl+,         → open Settings
  *   - Cmd/Ctrl+Shift+S   → open SessionsBrowser
- *   - Escape             → close any open modal (Settings / SessionsBrowser)
+ *   - Escape             → close the Settings modal
  *
  * Typing-context guard: shortcuts are ignored when the event target is an
  * `<input>`, `<textarea>`, or any element with `contenteditable`. Escape is
- * still honored for closing modals so users can bail out without losing focus
- * awkwardly mid-edit.
+ * still honored for closing Settings so users can bail out without losing
+ * focus awkwardly mid-edit.
+ *
+ * SHELL-R2 (plan §R2, ADR-0046) note: Escape no longer has a SessionsBrowser
+ * branch. Sessions stopped being a modal in R2 — it's the "sessions"
+ * destination, always rendered, with nothing to "close" — so an Escape
+ * branch keyed on `sessionsBrowserOpen` would just swallow the keystroke
+ * (preventDefault + early-return with zero visible effect) for the rest of
+ * the session once that flag latches true. `sessionsBrowserOpen` itself
+ * stays wired in the store (SHELL-R1's explicit "state/actions untouched"
+ * decision, and `App.contract.test.tsx`/`App.test.tsx` set it directly and
+ * must stay byte-identical per R2's own acceptance criteria) — it simply
+ * has no remaining reader anywhere in the app now that this branch is gone.
  */
 export function useKeyboardShortcuts(): void {
   useEffect(() => {
@@ -29,18 +40,14 @@ export function useKeyboardShortcuts(): void {
       const state = useAudioGraphStore.getState();
       const mod = e.metaKey || e.ctrlKey;
 
-      // Escape closes any open modal. Intentionally works even inside inputs
-      // so you can back out of a field without reaching for the mouse.
+      // Escape closes the Settings modal. Intentionally works even inside
+      // inputs so you can back out of a field without reaching for the
+      // mouse. Sessions is a destination, not a modal (SHELL-R2) — see the
+      // module doc — so there is no second branch here anymore.
       if (e.key === "Escape") {
         if (state.settingsOpen) {
           e.preventDefault();
           state.closeSettings();
-          return;
-        }
-        if (state.sessionsBrowserOpen) {
-          e.preventDefault();
-          state.closeSessionsBrowser();
-          return;
         }
         return;
       }

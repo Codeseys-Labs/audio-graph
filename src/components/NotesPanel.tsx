@@ -17,7 +17,7 @@
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
 // this call site's error handling is unchanged (audio-graph-3e71).
 
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useSessionView } from "../session/SessionViewProvider";
@@ -44,26 +44,37 @@ interface SynthesisResult {
   segmentCount: number;
 }
 
-export default function NotesPanel() {
-  const { t, i18n } = useTranslation();
-  const {
-    transcriptSegments: segments,
-    graphSnapshot: graph,
-    materializedNotes,
-    sessionProjectionEvents: projectionEvents,
-  } = useSessionView();
+/**
+ * Manual whole-session synthesis, extracted from NotesPanel's body (SHELL-R2,
+ * plan §R2, ADR-0046) so its trigger can live somewhere other than NotesPanel's own
+ * header without forking the state two renderers would otherwise disagree
+ * about. In the Capture/During workspace NotesPanel calls this itself
+ * (uncontrolled — see the `synthesis` prop below); in the Sessions detail's
+ * Notes lens, the detail chrome that owns the "Generate prose summary"
+ * overflow item calls it and hands the SAME controller instance to
+ * `<NotesPanel synthesis={...} headerActions={false} />` so the result/error
+ * NotesPanel renders is the run the overflow item actually triggered.
+ */
+export interface NotesSynthesisController {
+  loading: boolean;
+  error: string | null;
+  result: SynthesisResult | null;
+  handleSynthesize: () => Promise<void>;
+  clearError: () => void;
+}
+
+export function useNotesSynthesis(): NotesSynthesisController {
+  const { t } = useTranslation();
+  const { transcriptSegments: segments, graphSnapshot: graph } =
+    useSessionView();
   const settings = useAudioGraphStore((s) => s.settings);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
-  const loadSampleSessionPreview = useAudioGraphStore(
-    (s) => s.loadSampleSessionPreview,
-  );
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SynthesisResult | null>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
 
-  const handleSynthesize = async () => {
+  const handleSynthesize = useCallback(async () => {
     if (loading) return;
     if (loadedSessionId) {
       setError(t("notes.reviewSynthesisBlocked"));
@@ -101,7 +112,59 @@ export default function NotesPanel() {
     } finally {
       setLoading(false);
     }
+  }, [graph, loadedSessionId, loading, segments, settings, t]);
+
+  return {
+    loading,
+    error,
+    result,
+    handleSynthesize,
+    clearError: () => setError(null),
   };
+}
+
+export interface NotesPanelProps {
+  /**
+   * Controlled synthesis state. Omit for the default, uncontrolled behavior
+   * (NotesPanel owns its own `useNotesSynthesis()` instance and renders the
+   * trigger in its header — the Capture/During and Analysis usages). Pass a
+   * shared controller (and `headerActions={false}`) when the trigger lives
+   * elsewhere — the Sessions detail's Notes lens.
+   */
+  synthesis?: NotesSynthesisController;
+  /**
+   * Whether NotesPanel renders its own header "Synthesize notes" trigger.
+   * Defaults to `true`. The Sessions detail's Notes lens sets this `false`
+   * and renders "Generate prose summary" in its own overflow instead (19c7
+   * acceptance) — `data-notes-synthesize` and the header button leave
+   * NotesPanel's header only in that one context.
+   */
+  headerActions?: boolean;
+}
+
+export default function NotesPanel({
+  synthesis: externalSynthesis,
+  headerActions = true,
+}: NotesPanelProps = {}) {
+  const { t, i18n } = useTranslation();
+  const {
+    transcriptSegments: segments,
+    graphSnapshot: graph,
+    materializedNotes,
+    sessionProjectionEvents: projectionEvents,
+  } = useSessionView();
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  const loadSampleSessionPreview = useAudioGraphStore(
+    (s) => s.loadSampleSessionPreview,
+  );
+
+  // Rules-of-hooks-safe: always call the internal controller (mirrors
+  // `useSessionView`'s own "unconditionally call, conditionally prefer"
+  // convention) and pick whichever the caller actually wants rendered.
+  const internalSynthesis = useNotesSynthesis();
+  const { loading, error, result, handleSynthesize, clearError } =
+    externalSynthesis ?? internalSynthesis;
+  const panelRef = useRef<HTMLDivElement>(null);
 
   // Stale when the graph or transcript has grown since the captured snapshot.
   const isStale =
@@ -115,7 +178,11 @@ export default function NotesPanel() {
   );
 
   const dismissError = () => {
-    setError(null);
+    clearError();
+    // Focus-restoration to the trigger only applies when NotesPanel itself
+    // renders one (see `headerActions` doc) — the Sessions-detail overflow
+    // case has no `[data-notes-synthesize]` descendant to find.
+    if (!headerActions) return;
     requestAnimationFrame(() => {
       panelRef.current
         ?.querySelector<HTMLButtonElement>("[data-notes-synthesize]")
@@ -180,27 +247,29 @@ export default function NotesPanel() {
         <span className="text-sm font-bold tracking-wide uppercase text-text-secondary">
           <Icon name="notes" size={16} /> {t("notes.title")}
         </span>
-        <Button
-          variant="secondary"
-          size="sm"
-          icon="refresh"
-          loading={loading}
-          onClick={handleSynthesize}
-          disabled={loadedSessionId !== null}
-          aria-describedby={
-            loadedSessionId ? "notes-review-synthesis-help" : undefined
-          }
-          data-notes-synthesize
-          aria-label={
-            result ? t("notes.refreshLabel") : t("notes.synthesizeLabel")
-          }
-        >
-          {loading
-            ? t("notes.synthesizing")
-            : result
-              ? t("notes.refresh")
-              : t("notes.synthesize")}
-        </Button>
+        {headerActions && (
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="refresh"
+            loading={loading}
+            onClick={handleSynthesize}
+            disabled={loadedSessionId !== null}
+            aria-describedby={
+              loadedSessionId ? "notes-review-synthesis-help" : undefined
+            }
+            data-notes-synthesize
+            aria-label={
+              result ? t("notes.refreshLabel") : t("notes.synthesizeLabel")
+            }
+          >
+            {loading
+              ? t("notes.synthesizing")
+              : result
+                ? t("notes.refresh")
+                : t("notes.synthesize")}
+          </Button>
+        )}
       </div>
 
       {loadedSessionId && (

@@ -24,6 +24,7 @@ import {
   ChevronRight,
   CircleAlert,
   CircleCheck,
+  Clock,
   Download,
   FileText,
   FlaskConical,
@@ -35,10 +36,12 @@ import {
   MessageSquare,
   Mic,
   Monitor,
+  MoreVertical,
   NotebookPen,
   Package,
   Play,
   RefreshCw,
+  Route,
   Search,
   Send,
   Settings,
@@ -86,6 +89,10 @@ export const ICONS = {
   info: Info,
   success: CircleCheck,
   error: CircleAlert,
+  // SHELL-R2 (plan §R2, ADR-0046): Sessions detail lens tabs + row overflow menu.
+  more: MoreVertical,
+  timeline: Clock,
+  route: Route,
 } satisfies Record<string, LucideIcon>;
 
 export type IconName = keyof typeof ICONS;

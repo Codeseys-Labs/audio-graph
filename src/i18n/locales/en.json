@@ -793,7 +793,29 @@
     },
     "trashedOn": "Trashed on {{date}}",
     "export": "Export",
-    "exporting": "Exporting…"
+    "exporting": "Exporting…",
+    "rail": "Sessions",
+    "detail": "Session detail",
+    "detailEmpty": "Select a session to view its notes, transcript, and graph.",
+    "lensTabs": "Session views",
+    "lens": {
+      "notes": "Notes",
+      "transcript": "Transcript",
+      "timeline": "Timeline",
+      "graph": "Graph",
+      "route": "Route"
+    },
+    "ask": "Ask",
+    "rowActionsLabel": "Actions for {{title}}",
+    "detailActionsLabel": "More actions",
+    "generateProseSummary": "Generate prose summary",
+    "status": {
+      "active": "Active",
+      "complete": "Complete",
+      "crashed": "Crashed",
+      "finalizing": "Finalizing…"
+    },
+    "samplePreviewLabel": "Sample preview"
   },
   "dataRoute": {
     "title": "Data route & privacy",

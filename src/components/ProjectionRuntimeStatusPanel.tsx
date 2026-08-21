@@ -15,6 +15,7 @@ import type {
   ProjectionSchedulerTelemetry,
 } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
+import { formatDurationHoursAware } from "../utils/format";
 import HumanizedError from "./HumanizedError";
 import Icon from "./Icon";
 
@@ -38,21 +39,15 @@ function averageMs(total: number, count: number): number {
   return total / count;
 }
 
-// Mirrors the h/m/s convention SessionsBrowser's `formatDuration` already
-// uses for session length, adapted for a millisecond input: the graph lane's
-// oldest-pending-since lag is unbounded by design (ADR-0045 decision 4), so
-// `formatMs`'s "###.#s" shape (fine for sub-minute latencies elsewhere in
-// this panel) would stay legible but unreadable once the lag crosses a
-// minute.
+// Delegates to the shared h/m/s convention (SHELL-R2, `utils/format.ts`),
+// adapted for a millisecond input: the graph lane's oldest-pending-since lag
+// is unbounded by design (ADR-0045 decision 4), so `formatMs`'s "###.#s"
+// shape (fine for sub-minute latencies elsewhere in this panel) would stay
+// legible but unreadable once the lag crosses a minute. This used to
+// re-derive the same three properties SessionsBrowser's local
+// `formatDuration` did; both now fold onto one implementation (seed e7e5).
 function formatAgeMs(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return "0s";
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
+  return formatDurationHoursAware(ms / 1000);
 }
 
 function ttftSourceLabel(

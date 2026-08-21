@@ -1740,6 +1740,23 @@ export interface SessionRecoveryReport {
   errors: string[];
 }
 
+/**
+ * The optimistic Sessions-rail row `stopCapture` synthesizes for the
+ * just-ended session before `sessions.json` is confirmed to contain it
+ * (SHELL-R2, plan §R2, ADR-0046 — the "1d92 gap": the just-stopped session must be
+ * visible immediately, not only after the next successful `listSessions()`
+ * happens to include it). Never returned by the backend — a client-only
+ * shape built from in-memory capture state at the moment of Stop.
+ *
+ * `optimistic: true` is the rendering signal SessionsBrowser uses to (a)
+ * show the "Finalizing…" chip tone instead of a real `status`, and (b) skip
+ * it once a real `listSessions()` result contains a row with this `id` (the
+ * self-clearing merge — see `SessionsBrowser.tsx`).
+ */
+export interface PendingFinalizingSession extends SessionMetadata {
+  readonly optimistic: true;
+}
+
 export type TranscriptEventStability = "partial" | "final";
 
 export interface TranscriptEvent {
@@ -2977,6 +2994,21 @@ export interface AudioGraphStore {
    * ledger. Set by `loadSession`, cleared when a fresh live capture starts.
    */
   loadedSessionId: string | null;
+  /**
+   * The optimistic "finalizing" row for the just-stopped session (SHELL-R2,
+   * plan §R2, ADR-0046), or `null` when no capture has stopped yet this session
+   * (or the pending id has already been superseded by a fresher stop). Set
+   * by `stopCapture`; cleared implicitly by the Sessions rail's own merge
+   * check once `sessions` contains a matching real entry — see
+   * `SessionsBrowser.tsx`'s `mergeSessionRows`. Also cleared explicitly by
+   * `startCapture` (a fresh capture invalidates the prior stop's
+   * resident-data premise), by `stopCapture` itself when the session-id
+   * read fails or resolves to the sample-preview sentinel (no id to
+   * protect), and by `loadSession` once it successfully loads a session
+   * other than the pending one (the prior resident data has since been
+   * overwritten).
+   */
+  pendingFinalizingSession: PendingFinalizingSession | null;
   openSessionsBrowser: () => void;
   closeSessionsBrowser: () => void;
   listSessions: (limit?: number) => Promise<SessionMetadata[]>;

@@ -45,6 +45,22 @@
  *     the System drawer (R3). `ShellDrawerState` below documents that target
  *     shape so R3 has a name to land on, without this unit faking a
  *     synchronized mirror that could silently drift from the real flags.
+ *
+ * R2 UPDATE (SHELL-R2, seed audio-graph-e0c4): `sessionsBrowserOpen`'s
+ * dissolution landed partially, not fully, and that's deliberate rather
+ * than an oversight. Its last remaining reader — the Escape handler in
+ * `useKeyboardShortcuts.ts` — is retired (Sessions is a real destination
+ * now, with nothing left to "close"), which is the behavioral fix that
+ * mattered: before this, the flag latching `true` on open silently
+ * swallowed the next Escape keystroke for the rest of the session. The
+ * flag ITSELF (state + `openSessionsBrowser`/`closeSessionsBrowser`
+ * writes) stays wired, unread by anything now, because `App.contract.
+ * test.tsx` and `App.test.tsx` both set it directly via `setState` and
+ * R2's own acceptance criteria requires both to stay byte-identical —
+ * removing the field would force edits there. Deleting the now-inert
+ * field/actions outright is left to R4 (which already owns the
+ * during/after/analysis tab-id deletion those two test files are pinned
+ * against, so it's the natural point to revisit their fixtures too).
  */
 
 /** The two ADR-0046 destinations. Still not what `App.tsx` renders this

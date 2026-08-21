@@ -2101,6 +2101,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // Starting a fresh live capture leaves any historical session view, so
       // the data-route report should follow the live session, not the old one.
       loadedSessionId: null,
+      // A prior stop's optimistic "finalizing" row claims the store still
+      // holds that session's resident in-memory data (SessionsBrowser's
+      // `handleSelect` uses `optimistic` to skip a redundant `loadSession`).
+      // Starting a fresh capture immediately below clears/overwrites every
+      // one of those session-scoped fields for the NEW session, so that
+      // premise is void — clear the pending row rather than let it outlive
+      // the data it described.
+      pendingFinalizingSession: null,
       // Historical Review and Live currently share one frontend view store.
       // Clear every session-scoped projection before live listeners resume so
       // the first new event cannot append to or overwrite historical data.
@@ -2158,14 +2166,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: errorToMessage(e) });
     }
   },
+  // SHELL-R2 (plan §R2, ADR-0046): "stop lands you on your own session". Read the
+  // active session id BEFORE stopping — once `stop_capture` tears the
+  // session down there is no other way to learn which session it was — then
+  // route `nav` to it directly (a store action, unlike the old App-local
+  // `workspaceView` `useState`, can do this). `getSessionId()` never throws
+  // for sample preview — it degrades to the truthy `SAMPLE_SESSION_ID`
+  // sentinel instead (see `getSessionId` above), so that case is filtered
+  // out explicitly below rather than via the catch. A genuine invoke error
+  // still degrades to "stay put, stop capture as before" rather than
+  // crashing the stop flow.
   stopCapture: async () => {
-    const { selectedSourceIds } = get();
+    const { selectedSourceIds, getSessionId } = get();
     if (selectedSourceIds.length === 0) return;
+    let sessionId: string | null = null;
+    try {
+      const id = await getSessionId();
+      sessionId = id !== SAMPLE_SESSION_ID ? id : null;
+    } catch {
+      sessionId = null;
+    }
     try {
       for (const sourceId of selectedSourceIds) {
         await invoke("stop_capture", { sourceId });
       }
-      set({
+      set((state) => ({
         isCapturing: false,
         isTranscribing: false,
         isGeminiActive: false,
@@ -2174,7 +2199,52 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         backpressuredSources: [],
         persistenceQueueBackpressure: {},
         error: null,
-      });
+        nav: sessionId
+          ? { dest: "sessions", sessionId, lens: "notes" }
+          : state.nav,
+        // The 1d92 gap: `sessions.json` may not have this session's finished
+        // entry yet. Snapshot enough of the in-memory capture state right
+        // now (before `captureStartTime` above is cleared) to render an
+        // optimistic "Finalizing…" row immediately; SessionsBrowser's merge
+        // check drops it the instant a real `listSessions()` result contains
+        // a row with this id (see `mergeSessionRows`) — no explicit clear
+        // action needed.
+        //
+        // A failed/filtered id read (`sessionId` null above) means there is
+        // no id whose resident data this stop could vouch for — retaining a
+        // PRIOR stop's pending row here would be stale by definition (this
+        // stop's own in-memory snapshot, taken below, has nothing to do with
+        // whatever session that older row named), so it clears to `null`
+        // rather than falling back to `state.pendingFinalizingSession`.
+        pendingFinalizingSession: sessionId
+          ? {
+              id: sessionId,
+              title: null,
+              created_at: state.captureStartTime ?? Date.now(),
+              ended_at: Date.now(),
+              duration_seconds: state.captureStartTime
+                ? Math.max(
+                    0,
+                    Math.round((Date.now() - state.captureStartTime) / 1000),
+                  )
+                : null,
+              status: "active",
+              segment_count: state.transcriptSegments.length,
+              speaker_count: state.speakers.length,
+              entity_count: state.graphSnapshot.nodes.length,
+              transcript_path: "",
+              graph_path: "",
+              deleted: false,
+              deleted_at: null,
+              optimistic: true,
+            }
+          : null,
+      }));
+      // Best-effort refresh so the rail picks up the real entry (and the
+      // optimistic row above clears itself) as soon as the index catches
+      // up; a failure here is not fatal — the rail's own mount effect
+      // re-fetches too.
+      if (sessionId) void get().listSessions(200);
     } catch (e) {
       set({ error: errorToMessage(e) });
     }
@@ -2868,9 +2938,23 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   sessions: [],
   sessionsLoading: false,
   loadedSessionId: null,
+  pendingFinalizingSession: null,
+  // SHELL-R2 (plan §R2, ADR-0046): the Sessions browser stopped being a modal —
+  // it is the "sessions" destination, always rendered inside
+  // `#workspace-panel-after`. `sessionsBrowserOpen` itself is left wired
+  // (per SHELL-R1: state/actions untouched, only the call sites' *effect*
+  // changes) so every existing caller (the ControlBar icon, the
+  // Cmd/Ctrl+Shift+S shortcut) keeps working — this action now ALSO
+  // navigates there instead of toggling a modal flag nothing renders on
+  // anymore. The flag now genuinely has zero readers anywhere in the app
+  // (useKeyboardShortcuts.ts's Escape branch — its last one — was retired
+  // in this same unit, since it was silently swallowing Escape once this
+  // flag latched true; see shellNav.ts's "R2 UPDATE" note for why the flag
+  // itself stays rather than being deleted outright here).
   openSessionsBrowser: () => {
     set({ sessionsBrowserOpen: true });
-    const { listSessions, purgeExpiredSessions } = get();
+    const { listSessions, purgeExpiredSessions, setWorkspaceView } = get();
+    setWorkspaceView("after");
     // Lazy cleanup of expired trash on every open. Fire-and-forget —
     // purge failures must not block the browser from rendering.
     void purgeExpiredSessions().catch(() => {});
@@ -2983,6 +3067,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         approvingAgentProposalIds: [],
         loadedSessionId: sessionId,
         error: null,
+        // Loading a session OTHER than the pending row's own id just
+        // overwrote the in-memory data that row's "skip loadSession, the
+        // store still holds it resident" premise depends on — clear it so
+        // a later re-select of that id goes through `loadSession` instead
+        // of trusting now-stale resident data. (SessionsBrowser's
+        // `handleSelect` never reaches this call for the pending row's OWN
+        // id while it's still `optimistic`, so the branch below is
+        // effectively "always clear" in production; it stays conditional
+        // as a no-op-safe guard rather than an unconditional `null`.)
+        pendingFinalizingSession:
+          state.pendingFinalizingSession?.id === sessionId
+            ? state.pendingFinalizingSession
+            : null,
       }));
       // Fire-and-forget the timeline fold: a failure sets an empty timeline +
       // error inside loadSessionTimeline, never rejects, so it can't blank the

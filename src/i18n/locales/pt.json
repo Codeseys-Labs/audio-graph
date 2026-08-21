@@ -793,7 +793,29 @@
     },
     "trashedOn": "Enviado para lixeira em {{date}}",
     "export": "Exportar",
-    "exporting": "Exportando…"
+    "exporting": "Exportando…",
+    "rail": "Sessões",
+    "detail": "Detalhe da sessão",
+    "detailEmpty": "Selecione uma sessão para ver notas, transcrição e grafo.",
+    "lensTabs": "Visualizações da sessão",
+    "lens": {
+      "notes": "Notas",
+      "transcript": "Transcrição",
+      "timeline": "Linha do tempo",
+      "graph": "Grafo",
+      "route": "Rota"
+    },
+    "ask": "Perguntar",
+    "rowActionsLabel": "Ações para {{title}}",
+    "detailActionsLabel": "Mais ações",
+    "generateProseSummary": "Gerar resumo em texto",
+    "status": {
+      "active": "Ativa",
+      "complete": "Concluída",
+      "crashed": "Falhou",
+      "finalizing": "Finalizando…"
+    },
+    "samplePreviewLabel": "Prévia de exemplo"
   },
   "dataRoute": {
     "title": "Rota de dados e privacidade",

@@ -282,7 +282,12 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: /review/i })).toHaveFocus(),
     );
-    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    // SHELL-R2: the Review/"after" panel's content is SessionsBrowser now
+    // (rail→detail), not NotesPanel/LiveTranscript directly — it's mocked
+    // wholesale like every other heavy/lazy child in this file (see the
+    // file-level `vi.mock` block), so `sessions-stub` is the fact to pin.
+    expect(screen.getByTestId("sessions-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("agent-stub")).not.toBeInTheDocument();
   });
@@ -621,8 +626,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
         "true",
       ),
     );
-    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    // SHELL-R2: the Review/"after" panel's content is SessionsBrowser now
+    // (rail→detail), not NotesPanel/LiveTranscript directly — it's mocked
+    // wholesale like every other heavy/lazy child in this file (see the
+    // file-level `vi.mock` block), so `sessions-stub` is the fact to pin.
+    expect(screen.getByTestId("sessions-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
     expect(
       screen.queryByTestId("projection-runtime-stub"),
