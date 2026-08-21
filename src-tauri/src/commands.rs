@@ -6390,6 +6390,13 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.pid.cmp(&b.pid))
     });
+    // Diagnostic (audio-graph-4c16): this command previously had no log line
+    // at all, so log silence proved nothing about whether it was even being
+    // called during the field-reported "sources disappear" investigation.
+    log::info!(
+        "list_running_processes called -> {} processes",
+        processes.len()
+    );
     processes
 }
 

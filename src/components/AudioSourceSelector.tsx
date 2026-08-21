@@ -916,7 +916,29 @@ export default function AudioSourceSelector() {
                   </span>
                 </button>
                 {!collapsed.has("Running Processes") && (
-                  <div className="list-none m-0 p-0">
+                  // Containment fix (audio-graph-4c16): "All processes" scope
+                  // can surface 500+ rows. Without a bounded height here, that
+                  // list grows the whole `.left-panel` scroll region (SHELL-R7,
+                  // layout.css) unboundedly with process count, and scrolling
+                  // through it carries the System / Devices / Applications
+                  // groups above right off the top of the viewport — reported
+                  // by the field as the groups "disappearing". Capping height
+                  // + scrolling internally (house pattern: AgentProposalsPanel
+                  // .tsx's `max-h-[240px] overflow-y-auto`) removes process
+                  // count as a variable: reaching the process rows no longer
+                  // costs hundreds or thousands of px of scroll. This is a
+                  // mitigation, not a guarantee — `.left-panel` is still one
+                  // shared scroll region (with SpeakerPanel below), so on a
+                  // short viewport with many audio groups the panel can still
+                  // need scrolling. That residual is a general responsive-
+                  // list concern that predates this fix and isn't specific to
+                  // the scope toggle; it's tracked separately rather than
+                  // folded into this selector-local containment fix. The
+                  // max-h clamps to the shorter of a fixed budget or a
+                  // viewport fraction (house pattern: layout.css's
+                  // `.workspace-panel__assist { max-height: min(260px, 38vh) }`)
+                  // so the cap itself doesn't dominate a short window.
+                  <div className="list-none m-0 p-0 max-h-[min(320px,38vh)] overflow-y-auto">
                     {filteredProcesses.map((proc) => {
                       const processId = processCaptureId(proc.pid);
                       const processTreeId = processTreeCaptureId(proc.pid);

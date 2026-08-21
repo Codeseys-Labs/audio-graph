@@ -792,6 +792,105 @@ describe("AudioSourceSelector", () => {
     );
   });
 
+  it("keeps the audio source groups rendered after switching to All-processes scope (seed audio-graph-4c16)", () => {
+    // Field report: expanding "All processes" made System/Devices/
+    // Applications vanish. Seed with a mixed set of audio groups PLUS a
+    // running-processes list, flip to "all" scope, and assert every audio
+    // group is still present in the DOM. (This assertion already passed
+    // pre-fix — the store/render state was never wrong, see the next test
+    // for the actual mechanism — but it's kept as a state-correctness
+    // regression guard.)
+    resetStore({
+      audioSources: [
+        systemSource(),
+        deviceSource("device:mic", "Microphone", "{0.0.1.001}"),
+        applicationNameSource("Spotify"),
+      ],
+      processes: Array.from({ length: 40 }, (_, i) =>
+        proc(1000 + i, `proc${i}.exe`),
+      ),
+    });
+    render(<AudioSourceSelector />);
+
+    // Sanity: groups are present in the default "audio" scope.
+    expect(screen.getByText("System")).toBeInTheDocument();
+    expect(screen.getByText("Input Devices")).toBeInTheDocument();
+    expect(screen.getByText("Applications")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /all processes/i }));
+
+    // After switching scope, the audio groups must still be in the DOM.
+    expect(screen.getByText("System")).toBeInTheDocument();
+    expect(screen.getByText("Input Devices")).toBeInTheDocument();
+    expect(screen.getByText("Applications")).toBeInTheDocument();
+    expect(screen.getByText("System Audio")).toBeInTheDocument();
+    expect(screen.getByText("Microphone")).toBeInTheDocument();
+    expect(screen.getByText("Spotify")).toBeInTheDocument();
+    // And the Running Processes section is now revealed too.
+    expect(screen.getByText("Running Processes")).toBeInTheDocument();
+  });
+
+  it("confines the Running Processes row list to its own scrollable region so a large list can't carry the audio groups out of view (seed audio-graph-4c16)", () => {
+    // Root cause: rendering was always correct (state test above), but the
+    // process-rows list had no height cap, so switching to "all" scope with
+    // 500+ processes grows the *entire* `.left-panel` scroll region
+    // (layout.css) — scrolling through processes drags the System/Devices/
+    // Applications groups above off the top of the viewport, which reads to
+    // a user as those groups "disappearing". The fix bounds the process rows
+    // in their own overflow-y-auto region (house pattern:
+    // AgentProposalsPanel.tsx's `max-h-[240px] overflow-y-auto`) so the
+    // groups above stay put no matter how many processes are listed.
+    resetStore({
+      audioSources: [systemSource()],
+      processes: Array.from({ length: 60 }, (_, i) =>
+        proc(2000 + i, `proc${i}.exe`),
+      ),
+    });
+    render(<AudioSourceSelector />);
+    fireEvent.click(screen.getByRole("tab", { name: /all processes/i }));
+
+    const firstRow = screen
+      .getByText("proc0.exe")
+      .closest('[role="checkbox"]') as HTMLElement;
+    // The rows list is the row's immediate parent (see the
+    // `filteredProcesses.map` container in AudioSourceSelector.tsx).
+    const rowsList = firstRow.parentElement as HTMLElement;
+    expect(rowsList.className).toMatch(/overflow-y-auto/);
+    expect(rowsList.className).toMatch(/max-h-\[/);
+  });
+
+  it("also confines the process row list when a search query surfaces it in the default 'audio' scope (seed audio-graph-4c16)", () => {
+    // The Running Processes section is gated on `processScope === "all" ||
+    // filterText` (line ~885), so a search query reveals matched process
+    // rows even while the scope tab is still "audio" (the default). The
+    // containment class on the rows list is unconditional on scope, so it
+    // must apply on this path too — otherwise a search with many matching
+    // processes could reproduce the original unbounded-growth symptom
+    // without the user ever touching the "All processes" tab.
+    resetStore({
+      audioSources: [systemSource()],
+      searchFilter: "proc",
+      processes: Array.from({ length: 60 }, (_, i) =>
+        proc(3000 + i, `proc${i}.exe`),
+      ),
+    });
+    render(<AudioSourceSelector />);
+
+    // Still in the default "audio" scope tab.
+    expect(screen.getByRole("tab", { name: /audio apps/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Running Processes")).toBeInTheDocument();
+
+    const firstRow = screen
+      .getByText("proc0.exe")
+      .closest('[role="checkbox"]') as HTMLElement;
+    const rowsList = firstRow.parentElement as HTMLElement;
+    expect(rowsList.className).toMatch(/overflow-y-auto/);
+    expect(rowsList.className).toMatch(/max-h-\[/);
+  });
+
   it("shows a translated clear-search control when a query is active (seed 4f2e)", () => {
     // `searchFilter` lives in the Zustand store and `resetStore` mocks
     // `setSearchFilter`, so typing via fireEvent cannot flip the conditional —
