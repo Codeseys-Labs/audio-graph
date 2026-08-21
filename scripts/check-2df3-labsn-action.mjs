@@ -18,6 +18,7 @@ const cargoLock = readFileSync(new URL("../src-tauri/Cargo.lock", import.meta.ur
 
 const ACTION_PIN =
     "LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf";
+const [LABSN_REPO, LABSN_PINNED_SHA] = ACTION_PIN.split("@");
 const LICENSE_CONDITION =
     "matrix.os == 'windows' && inputs.confirm_vb_cable_professional_license == true";
 
@@ -286,8 +287,29 @@ function rustTest(source, name) {
         `duplicate Rust test: ${name}`,
     );
     const nextTest = source.indexOf("\n    #[", functionStart + marker.length);
+    const searchEnd = nextTest < 0 ? source.length : nextTest;
+    // The next `#[` attribute marks the start of the NEXT item, but any doc
+    // comment (and the blank line before it) that introduces that next item
+    // trails the target function's closing brace and belongs to the next
+    // item, not this one. Trim those lines off so this test's body never
+    // bleeds into unrelated prose that happens to share a substring with one
+    // of this function's own invariants.
+    let body = source.slice(functionStart, searchEnd);
+    while (true) {
+        const lastNewline = body.lastIndexOf("\n");
+        const lastLine = (lastNewline < 0 ? body : body.slice(lastNewline + 1)).trim();
+        if (lastLine !== "" && !lastLine.startsWith("///")) {
+            break;
+        }
+        if (lastNewline < 0) {
+            body = "";
+            break;
+        }
+        body = body.slice(0, lastNewline);
+    }
+    const trimmedEnd = functionStart + body.length;
     const prefixStart = Math.max(0, functionStart - 180);
-    return source.slice(prefixStart, nextTest < 0 ? source.length : nextTest);
+    return source.slice(prefixStart, trimmedEnd);
 }
 
 function mutateRustTest(source, name, search, replacement) {
@@ -310,8 +332,9 @@ function rustFunction(source, name) {
 }
 
 function validate(source, canonicalSource = canonicalDurability, manifestSource = sessionArtifactManifest) {
+    const checkoutName = "Check out pinned LABSN Windows helper assets";
     const prestateName = "Record LABSN Windows prestate";
-    const actionName = "Install Windows virtual audio baseline with pinned LABSN action";
+    const actionName = "Install verified Windows virtual-device enumeration baseline";
     const cleanupName = "Restore LABSN TrustedPublisher state";
     const canaryName = "Record bounded allowlisted Windows endpoint inventory";
     const durabilityName = "Run canonical durability filter (Windows)";
@@ -319,6 +342,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     const cc9aWindowsName = "Run cc9a native qualification filter (Windows)";
     const macosDiagnosticsName = "Record macOS mount diagnostics";
 
+    const checkout = stepBody(source, checkoutName);
     const prestate = stepBody(source, prestateName);
     const action = stepBody(source, actionName);
     const cleanup = stepBody(source, cleanupName);
@@ -331,12 +355,17 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     const unixSummary = stepBody(source, "Summarize and enforce native exits (Unix)");
     const windowsSummary = stepBody(source, "Summarize and enforce native exits (Windows)");
 
-    const positions = [prestateName, actionName, cleanupName, canaryName, durabilityName].map(
-        (name) => source.indexOf(`      - name: ${name}\n`),
-    );
+    const positions = [
+        checkoutName,
+        prestateName,
+        actionName,
+        cleanupName,
+        canaryName,
+        durabilityName,
+    ].map((name) => source.indexOf(`      - name: ${name}\n`));
     invariant(
         positions.every((position, index) => index === 0 || position > positions[index - 1]),
-        "LABSN prestate, action, cleanup, endpoint canary, and Windows tests must stay ordered",
+        "LABSN checkout, prestate, install, cleanup, endpoint canary, and Windows tests must stay ordered",
     );
 
     invariant(prestate.includes(`if: \${{ ${LICENSE_CONDITION} }}`), "prestate license gate drift");
@@ -362,19 +391,90 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "prestate evidence file is required",
     );
 
-    invariant(action.includes(`uses: ${ACTION_PIN}`), "LABSN action must use the reviewed commit");
-    invariant(action.includes("id: labsn_virtual_audio"), "LABSN action must expose its outcome");
-    invariant(action.includes("continue-on-error: true"), "LABSN action must allow cleanup to run");
-    invariant(!action.includes("with:"), "the pinned LABSN action has no inputs");
+    invariant(checkout.includes(`if: \${{ ${LICENSE_CONDITION} }}`), "LABSN checkout license gate drift");
+    invariant(
+        checkout.includes(`repository: ${LABSN_REPO}`) &&
+            checkout.includes(`ref: ${LABSN_PINNED_SHA}`) &&
+            checkout.includes("path: sound-ci-helpers") &&
+            checkout.includes("persist-credentials: false"),
+        "LABSN checkout must pin the reviewed repository, commit, and disable credential persistence",
+    );
+
+    invariant(action.includes("id: verified_virtual_audio_install"), "verified install step must expose its outcome");
+    invariant(action.includes(`if: \${{ ${LICENSE_CONDITION} }}`), "verified install license gate drift");
+    invariant(
+        action.includes("$actualSha256 -ne $env:VBCABLE_ARCHIVE_SHA256") &&
+            action.includes(
+                'throw "VB-CABLE archive SHA-256 mismatch; refusing certificate import and driver installation."',
+            ),
+        "verified install must reject an archive hash mismatch against the pinned VB-CABLE archive",
+    );
+    invariant(
+        action.includes("Test-Path $requiredPath -PathType Leaf") &&
+            action.includes('throw "Required verified VB-CABLE installation input is absent."'),
+        "verified install must refuse to proceed without every verified installation input",
+    );
+    invariant(
+        action.includes("$actualCertificateSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256 -or") &&
+            action.includes("$actualDevconSha256 -ne $env:LABSN_DEVCON_SHA256") &&
+            action.includes(
+                'throw "Pinned LABSN Windows helper asset digest mismatch; refusing privileged installation."',
+            ),
+        "verified install must reject a pinned LABSN helper-asset digest mismatch",
+    );
+    invariant(
+        action.includes("& $signTool verify /kp /v $driverCatalog") &&
+            action.includes('throw "VB-CABLE catalog kernel-policy signature verification failed."') &&
+            action.includes("$catalogSignerSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256") &&
+            action.includes(
+                'throw "VB-CABLE catalog signer does not match the pinned Vincent Burel certificate."',
+            ),
+        "verified install must verify the catalog's kernel-policy signature and pinned signer",
+    );
+    invariant(
+        action.includes("& $signTool verify /kp /v /c $driverCatalog $catalogMember") &&
+            action.includes('throw "VB-CABLE catalog membership verification failed."'),
+        "verified install must verify each catalog member against the catalog",
+    );
+    invariant(
+        action.includes(
+            "$devconSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid",
+        ) &&
+            action.includes("$devconSignature.SignerCertificate.Subject -notmatch 'Microsoft'") &&
+            action.includes(
+                'throw "Pinned LABSN DevCon helper lacks a valid Microsoft Authenticode signature."',
+            ),
+        "verified install must require a valid Microsoft-signed DevCon helper",
+    );
+    invariant(
+        action.includes("if (-not $publisherWasPresent)") &&
+            action.includes("$publisherStateRestored = $publisherPresentAfterCleanup -eq $publisherWasPresent") &&
+            action.includes(
+                'throw "VB-CABLE publisher certificate cleanup did not restore the original store state."',
+            ),
+        "verified install must import the publisher certificate only when absent and prove it is restored",
+    );
+    invariant(
+        action.includes("& $devcon install $driverInf 'VBAudioVACWDM'") &&
+            action.includes('throw "VB-CABLE device installation failed or requires a reboot."'),
+        "verified install must check the devcon install exit code",
+    );
+    invariant(
+        action.includes("'status=VERIFIED_INSTALL_COMPLETE'") &&
+            action.includes("'catalog_signature_verified=true'") &&
+            action.includes("'devcon_exit=0'") &&
+            action.includes("trusted_publisher_state_restored=$($publisherStateRestored"),
+        "verified install evidence must honestly record the checks it performed",
+    );
 
     invariant(
         cleanup.includes(`if: \${{ always() && ${LICENSE_CONDITION} }}`),
         "TrustedPublisher restoration must run under always()",
     );
     invariant(
-        cleanup.includes("steps.labsn_virtual_audio.outcome") &&
+        cleanup.includes("steps.verified_virtual_audio_install.outcome") &&
             cleanup.includes("steps.labsn_prestate.outputs.publisher_match_count"),
-        "cleanup must bind the action outcome and pre-action target state",
+        "cleanup must bind the verified install outcome and pre-install target state",
     );
     invariant(
         cleanup.includes("LABSN_VBCABLE_CERT_SHA256") &&
@@ -399,9 +499,9 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
 
     invariant(canary.includes(`if: \${{ ${LICENSE_CONDITION} }}`), "endpoint canary license gate drift");
     invariant(
-        canary.includes("steps.labsn_virtual_audio.outcome") &&
-            canary.includes("if ($env:LABSN_ACTION_OUTCOME -ne 'success')"),
-        "endpoint canary must independently reject action failure",
+        canary.includes("steps.verified_virtual_audio_install.outcome") &&
+            canary.includes("if ($env:VERIFIED_INSTALL_OUTCOME -ne 'success')"),
+        "endpoint canary must independently reject a failed verified install",
     );
     invariant(
         canary.includes("$cableEndpoints.Count -lt 2") &&
@@ -423,15 +523,18 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "missing PnP hardware-ID properties must be a safe empty observation",
     );
     invariant(
-        canary.includes("archive_integrity_verified_by_caller=false") &&
-            canary.includes("catalog_signature_verified_by_caller=false") &&
-            canary.includes("catalog_members_verified_by_caller=false") &&
-            canary.includes("devcon_signature_verified_by_caller=false"),
-        "supply-chain evidence must not claim checks the direct action does not perform",
+        canary.includes("archive_integrity_verified_by_caller=true") &&
+            canary.includes("catalog_signature_verified_by_caller=true") &&
+            canary.includes("catalog_members_verified_by_caller=true") &&
+            canary.includes("devcon_signature_verified_by_caller=true") &&
+            canary.includes("archive_hash_verified_before_certificate_import=true"),
+        "supply-chain evidence must honestly claim only the checks the caller itself performs",
     );
     invariant(
-        canary.includes("action_inputs=none") && canary.includes("action_outputs=none"),
-        "evidence must describe the pinned action interface honestly",
+        canary.includes("helper_use=pinned_checkout_assets_only") &&
+            canary.includes("archive_url_is_mutable=true") &&
+            canary.includes("installer_exit_alone_is_installation_proof=false"),
+        "evidence must describe the pinned-asset install interface honestly",
     );
     invariant(
         canary.includes("setup_proof_claimed=false") &&
@@ -468,18 +571,13 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "observed endpoint/device inventory must be written before validation throws",
     );
 
-    const forbidden = [
-        "Check out pinned LABSN Windows helper assets",
-        "VBCABLE_ARCHIVE_SHA256",
-        "LABSN_DEVCON_SHA256",
-        "Invoke-WebRequest",
-        "Expand-Archive",
-        "& $devcon install",
-        "catalog_signature_verified=true",
-        "archive_hash_verified_before_certificate_import=true",
-    ];
+    // The pinned LABSN commit is checked out for its verified helper assets
+    // (certificate + devcon) only; it must never be invoked as an opaque
+    // action again, since that would reintroduce an unverified kernel-mode
+    // driver download that the caller cannot audit.
+    const forbidden = [`uses: ${ACTION_PIN}`, "uses: LABSN/sound-ci-helpers@"];
     for (const token of forbidden) {
-        invariant(!source.includes(token), `forbidden manual/provenance token remains: ${token}`);
+        invariant(!source.includes(token), `forbidden opaque LABSN action invocation remains: ${token}`);
     }
 
     invariant(
@@ -873,12 +971,84 @@ validate(workflow);
 
 const mutations = [
     [
-        "floating LABSN ref",
-        (source) => source.replace(`uses: ${ACTION_PIN}`, "uses: LABSN/sound-ci-helpers@v1"),
+        "checkout ref floated",
+        (source) => mutateStep(source, checkoutName, `ref: ${LABSN_PINNED_SHA}`, "ref: v1.0.4"),
     ],
-    ["fictitious action input", (source) => source.replace(`uses: ${ACTION_PIN}`, `uses: ${ACTION_PIN}\n        with:\n          device: vbcable`)],
-    ["cleanup loses always", (source) => source.replace(`if: \${{ always() && ${LICENSE_CONDITION} }}`, `if: \${{ ${LICENSE_CONDITION} }}`)],
-    ["cleanup removal omitted", (source) => source.replace("certutil.exe -delstore 'TrustedPublisher'", "Write-Output 'skip cleanup'")],
+    [
+        "checkout persists credentials",
+        (source) => mutateStep(source, checkoutName, "persist-credentials: false", "persist-credentials: true"),
+    ],
+    [
+        "checkout license gate dropped",
+        (source) => mutateStep(source, checkoutName, `if: \${{ ${LICENSE_CONDITION} }}`, "if: ${{ true }}"),
+    ],
+    [
+        "verified install id renamed",
+        (source) => mutateStep(source, actionName, "id: verified_virtual_audio_install", "id: renamed_install"),
+    ],
+    [
+        "verified install archive hash check removed",
+        (source) => mutateStep(source, actionName, "$actualSha256 -ne $env:VBCABLE_ARCHIVE_SHA256", "$false"),
+    ],
+    [
+        "verified install devcon hash check removed",
+        (source) => mutateStep(source, actionName, "$actualDevconSha256 -ne $env:LABSN_DEVCON_SHA256", "$false"),
+    ],
+    [
+        "verified install catalog kernel-policy check removed",
+        (source) => mutateStep(
+            source,
+            actionName,
+            "& $signTool verify /kp /v $driverCatalog",
+            "Write-Output 'skip catalog verify'",
+        ),
+    ],
+    [
+        "verified install catalog signer pin removed",
+        (source) => mutateStep(source, actionName, "$catalogSignerSha256 -ne $env:LABSN_VBCABLE_CERT_SHA256", "$false"),
+    ],
+    [
+        "verified install catalog membership check removed",
+        (source) => mutateStep(
+            source,
+            actionName,
+            "& $signTool verify /kp /v /c $driverCatalog $catalogMember",
+            "Write-Output 'skip member verify'",
+        ),
+    ],
+    [
+        "verified install devcon signature check removed",
+        (source) => mutateStep(
+            source,
+            actionName,
+            "$devconSignature.SignerCertificate.Subject -notmatch 'Microsoft'",
+            "$false",
+        ),
+    ],
+    [
+        "verified install publisher restore proof removed",
+        (source) => mutateStep(
+            source,
+            actionName,
+            "$publisherStateRestored = $publisherPresentAfterCleanup -eq $publisherWasPresent",
+            "$publisherStateRestored = $true",
+        ),
+    ],
+    [
+        "verified install devcon exit ignored",
+        (source) => mutateStep(
+            source,
+            actionName,
+            'throw "VB-CABLE device installation failed or requires a reboot."',
+            "Write-Output 'ignored'",
+        ),
+    ],
+    [
+        "verified install evidence overclaimed",
+        (source) => mutateStep(source, actionName, "'catalog_signature_verified=true'", "'catalog_signature_verified=unknown'"),
+    ],
+    ["cleanup loses always", (source) => mutateStep(source, cleanupName, `if: \${{ always() && ${LICENSE_CONDITION} }}`, `if: \${{ ${LICENSE_CONDITION} }}`)],
+    ["cleanup removal omitted", (source) => mutateStep(source, cleanupName, "certutil.exe -delstore 'TrustedPublisher'", "Write-Output 'skip cleanup'")],
     [
         "cleanup target branch unreachable",
         (source) => source.replace("if ($before -eq '0')", "if ($false)"),
@@ -919,13 +1089,13 @@ const mutations = [
         (source) => source.replace("$audioService.Status -ne 'Running'", "$false"),
     ],
     [
-        "action outcome admitted",
+        "install outcome admitted",
         (source) => source.replaceAll(
-            "$env:LABSN_ACTION_OUTCOME -ne 'success'",
+            "$env:VERIFIED_INSTALL_OUTCOME -ne 'success'",
             "$false",
         ),
     ],
-    ["caller archive verification overclaimed", (source) => source.replace("archive_integrity_verified_by_caller=false", "archive_integrity_verified_by_caller=true")],
+    ["caller archive verification claim revoked", (source) => source.replace("archive_integrity_verified_by_caller=true", "archive_integrity_verified_by_caller=false")],
     [
         "pre-canary proof overclaimed",
         (source) => source.replace(
@@ -940,7 +1110,7 @@ const mutations = [
             'Set-Content -Path "$env:EVIDENCE_DIR/windows-installation-canary-removed.txt"',
         ),
     ],
-    ["manual installer reintroduced", (source) => `${source}\n# Invoke-WebRequest\n`],
+    ["opaque LABSN action reintroduced", (source) => `${source}\n# uses: ${ACTION_PIN}\n`],
 ];
 
 for (const [label, mutate] of mutations) {
