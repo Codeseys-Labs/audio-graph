@@ -21,10 +21,13 @@
   overflow: hidden;
 }
 
+/* SHELL-R4 (plan §R4, ADR-0046): now just the Capture/Sessions destination
+   tablist — `.workspace-switcher__state` moved onto NowStrip, so there is no
+   second child to space apart from the tabs any more. */
 .workspace-switcher {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: var(--space-5);
   min-height: 44px;
   padding: 6px var(--space-6);
@@ -101,15 +104,6 @@
   overflow: auto;
 }
 
-.center-panel {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  position: relative;
-}
-
 .workspace-panel {
   flex: 1;
   min-width: 0;
@@ -119,7 +113,7 @@
   background: var(--bg-primary);
 }
 
-.workspace-panel--during {
+.workspace-panel--capture {
   display: grid;
   grid-template-columns: minmax(300px, 1.08fr) minmax(280px, 0.92fr);
   grid-template-rows: minmax(0, 1fr) auto;
@@ -147,82 +141,17 @@
   background: var(--bg-secondary);
 }
 
-.workspace-panel--after {
-  display: grid;
-  grid-template-columns: minmax(300px, 1.12fr) minmax(280px, 0.88fr);
-  grid-template-rows: minmax(0, 1fr) auto;
-}
-
-.workspace-panel__review-notes,
-.workspace-panel__review-transcript {
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.workspace-panel__review-notes {
-  border-right: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-}
-
-.workspace-panel__review-transcript {
-  background: var(--bg-secondary);
-}
-
-/* Seek-timeline strip (audio-graph-3b3f): a full-width lane rail beneath the
-   notes/transcript columns, bounded so it never crowds the review surfaces. */
-.workspace-panel__seek {
-  grid-column: 1 / -1;
-  min-height: 0;
-  max-height: min(240px, 34vh);
-  overflow: hidden;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
-}
-
-.workspace-panel--analysis {
-  background: var(--bg-primary);
-}
-
-/* Center split: graph on top (flexes), notes pinned-height on the bottom. */
-.center-panel__graph {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  display: flex;
-}
-.center-panel__notes {
-  flex-shrink: 0;
-  min-height: 0;
-  overflow: auto;
-  border-top: 1px solid var(--border-color);
-  background-color: var(--bg-secondary);
-}
-
-.right-panel {
-  width: 340px;
-  min-width: 260px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--border-color);
-  background-color: var(--bg-secondary);
-  overflow: hidden;
-}
-
 @media (max-width: 1120px) {
   .workspace-switcher {
     padding-inline: var(--space-5);
   }
 
-  .workspace-panel--during,
-  .workspace-panel--after {
+  .workspace-panel--capture {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(280px, 0.95fr) minmax(280px, 1.05fr);
   }
 
-  .workspace-panel__primary,
-  .workspace-panel__review-notes {
+  .workspace-panel__primary {
     border-right: 0;
     border-bottom: 1px solid var(--border-color);
   }
@@ -298,16 +227,14 @@
     overflow: auto;
   }
 
-  .left-panel,
-  .right-panel {
+  .left-panel {
     width: auto !important;
     min-width: 0;
     max-height: 280px;
     border-inline: 0;
   }
 
-  .workspace-panel,
-  .center-panel {
+  .workspace-panel {
     min-height: 560px;
   }
 

@@ -61,26 +61,39 @@
  * field/actions outright is left to R4 (which already owns the
  * during/after/analysis tab-id deletion those two test files are pinned
  * against, so it's the natural point to revisit their fixtures too).
+ *
+ * R4 UPDATE (SHELL-R4, plan §R4, ADR-0046): the collapse this file's module
+ * doc has been narrating as a future event has now happened — `App.tsx`
+ * deletes the `analysis` tab (and its right-rail composition) outright and
+ * renders only the two ADR-0046 destinations. The "reconciling two
+ * destinations with three legacy tabs during the interim" section above (and
+ * the `lens === "graph"` disambiguation it describes) was, in its own words,
+ * "forward-compatible scaffolding, not product intent" — it is retired
+ * outright here, not merely extended. `LegacyWorkspaceView` is deleted;
+ * `deriveWorkspaceView`/`navForWorkspaceView`/`setWorkspaceView` keep their
+ * names (App.tsx and `store/index.ts`'s `openSessionsBrowser` still call
+ * them under these names) but their bodies collapse to a trivial
+ * `ShellDest`-only mapping — `dest` now literally IS the workspace view,
+ * with no lens-based disambiguation left to perform. One direct consequence:
+ * the R1-documented "`setNavDest` alone does not renormalize `lens`" sharp
+ * edge is gone too — there is no more `analysis` value for a stale `lens`
+ * to accidentally resolve to.
  */
 
-/** The two ADR-0046 destinations. Still not what `App.tsx` renders this
- * unit — see the module doc for the during/after/analysis reconciliation. */
+/** The two ADR-0046 destinations. SHELL-R4: this is now literally what
+ * `App.tsx` renders — no more during/after/analysis reconciliation. */
 export type ShellDest = "capture" | "sessions";
 
-/** The R2 lens set (Notes/Transcript/Timeline/Graph/Route). Unused for
- * rendering until R2; `"graph"` is load-bearing THIS unit only as the
- * legacy-`analysis` disambiguator (module doc above). */
+/** The R2 lens set (Notes/Transcript/Timeline/Graph/Route), selectable
+ * within the Sessions destination. `"graph"` was load-bearing pre-R4 as the
+ * legacy-`analysis` disambiguator; SHELL-R4 retires that role — it is now
+ * just an ordinary lens value like the other four. */
 export type SessionLens =
   | "notes"
   | "transcript"
   | "timeline"
   | "graph"
   | "route";
-
-/** The legacy three-tab shell's view, kept structurally identical to
- * `App.tsx`'s local `WorkspaceView` type so the two are interchangeable
- * without an import — R4 deletes this union's `"analysis"` member. */
-export type LegacyWorkspaceView = "during" | "after" | "analysis";
 
 /** One typed nav object replacing App-local `workspaceView`. */
 export interface ShellNav {
@@ -114,58 +127,54 @@ export const DEFAULT_SHELL_NAV: ShellNav = {
 };
 
 /**
- * Derive the legacy three-tab `workspaceView` from `nav`. Pure function —
- * exported so `App.tsx` (and this file's own action below) share one
- * mapping. `dest === "capture"` ⇒ `during`; `dest === "sessions"` splits on
- * `lens` (see module doc for why `"graph"` means `analysis`).
+ * Derive the workspace view from `nav`. Pure function — exported so
+ * `App.tsx` (and this file's own action below) share one mapping. SHELL-R4:
+ * `dest` IS the workspace view now; this is a trivial passthrough, kept
+ * (rather than inlined at App.tsx's one call site) only so `setWorkspaceView`
+ * below can round-trip through the same name App.tsx already imports.
  */
-export function deriveWorkspaceView(nav: ShellNav): LegacyWorkspaceView {
-  if (nav.dest === "capture") return "during";
-  return nav.lens === "graph" ? "analysis" : "after";
+export function deriveWorkspaceView(nav: ShellNav): ShellDest {
+  return nav.dest;
 }
 
 /**
- * Inverse of `deriveWorkspaceView`: compute the `nav` patch a legacy tab
+ * Inverse of `deriveWorkspaceView`: compute the `nav` patch a destination-tab
  * click/keyboard-nav/programmatic `setWorkspaceView(view)` call should
- * produce, given the current `nav` (so an unrelated field, e.g. a future
- * `sessionId`, is preserved rather than clobbered).
+ * produce, given the current `nav` (so an unrelated field, e.g. `sessionId`,
+ * is preserved rather than clobbered).
  *
  * Same-value bailout: if `current` already derives to `view`, return
  * `current` by reference unchanged. The old App-local `useState` setter got
  * this for free from React's `Object.is` bailout; a plain store `set()`
  * doesn't, so without this check every redundant `setWorkspaceView(view)`
- * call (e.g. the `isCapturing` effect re-firing `setWorkspaceView("during")`
+ * call (e.g. the `isCapturing` effect re-firing `setWorkspaceView("capture")`
  * on an unrelated re-render) would write a fresh `nav` object and force an
  * extra `App()` re-render for a no-op transition.
  */
 export function navForWorkspaceView(
-  view: LegacyWorkspaceView,
+  view: ShellDest,
   current: ShellNav,
 ): ShellNav {
-  if (deriveWorkspaceView(current) === view) return current;
-  switch (view) {
-    case "during":
-      return { ...current, dest: "capture" };
-    case "analysis":
-      return { ...current, dest: "sessions", lens: "graph" };
-    case "after":
-      return {
-        ...current,
-        dest: "sessions",
-        // Leaving a lens-disambiguated analysis view for "after" must not
-        // silently keep pointing at the graph lens.
-        lens: current.lens === "graph" ? "notes" : current.lens,
-      };
-  }
+  if (current.dest === view) return current;
+  return { ...current, dest: view };
 }
 
 /** The slice of `AudioGraphStore` this file owns. */
 export interface ShellNavSlice {
   nav: ShellNav;
   /** Store-owned replacement for `App.tsx`'s old
-   * `setWorkspaceView` local setter — same three-way input, same derived
-   * rendering, now reachable from store actions (R2's `stopCapture`). */
-  setWorkspaceView: (view: LegacyWorkspaceView) => void;
+   * `setWorkspaceView` local setter — same two-way input, same derived
+   * rendering, now reachable from store actions (R2's `stopCapture`). Prefer
+   * this over the blunter `setNavDest` below: it carries the same-value
+   * bailout `setNavDest` deliberately does not (see that action's doc). */
+  setWorkspaceView: (view: ShellDest) => void;
+  /** Raw dest write — no same-value bailout, unlike `setWorkspaceView`. At
+   * HEAD this has NO production call site (App.tsx/SessionsBrowser use
+   * `setWorkspaceView`, `setNavSessionId`, `setNavLens` instead; the only
+   * callers are `shellNav.test.ts`'s direct slice tests). Retained for a
+   * caller that needs to set `dest` without touching `lens`/`sessionId` —
+   * plausibly the deferred SessionsBrowser/`nav.lens` unification (see
+   * `SessionsBrowser.tsx`'s module doc) — rather than deleted speculatively. */
   setNavDest: (dest: ShellDest) => void;
   setNavSessionId: (sessionId: string | null) => void;
   setNavLens: (lens: SessionLens) => void;

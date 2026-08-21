@@ -1,11 +1,11 @@
 /**
  * Sessions destination — list→detail (SHELL-R2, seed audio-graph-e0c4,
- * plan §R2, ADR-0046). Rendered unconditionally inside `#workspace-panel-after`
- * (the legacy "Review" tab id/role/label — byte-identical; R4 is the unit
- * that renames it). No longer a modal: the Sessions browser IS this
- * destination's content now, not an overlay toggled by `sessionsBrowserOpen`
- * (that flag/action still exist per SHELL-R1 — `openSessionsBrowser` now
- * navigates here instead of opening anything).
+ * plan §R2, ADR-0046). Rendered unconditionally inside
+ * `#workspace-panel-sessions` (renamed from the legacy "Review" tab's
+ * `#workspace-panel-after` by SHELL-R4). No longer a modal: the Sessions
+ * browser IS this destination's content now, not an overlay toggled by
+ * `sessionsBrowserOpen` (that flag/action still exist per SHELL-R1 —
+ * `openSessionsBrowser` now navigates here instead of opening anything).
  *
  * Composition: a rail (search + sort + trash filter + one row per
  * `SessionMetadata`) on the left, a detail pane on the right. Selecting a
@@ -26,15 +26,17 @@
  * persisted to `localStorage` under `audiograph:sessionsBrowser:sort`.
  *
  * Detail lenses (Notes default / Transcript / Timeline / Graph / Route) are
- * deliberately NOT stored on `nav.lens` — `nav.lens === "graph"` is already
- * load-bearing this run as the legacy `after`/`analysis` tab disambiguator
- * (`store/shellNav.ts`'s module doc), so routing the Graph LENS through the
- * same field would flip the whole shell to the legacy `analysis` tab instead
- * of showing the Graph lens inside this destination — R1's own documented
- * `setNavDest`/lens footgun, generalized. Lens selection here is local
- * component state instead, reset per session via `key={selectedId}` on
- * `<SessionDetail>`. R4 (which deletes the `analysis` tab and retires the
- * disambiguation need) is the natural unit to unify the two.
+ * still deliberately NOT stored on `nav.lens`, even after SHELL-R4 deleted
+ * the `analysis` tab and retired the `nav.lens === "graph"` legacy-tab
+ * disambiguation this doc used to warn about (`store/shellNav.ts`'s "R4
+ * UPDATE" note): unifying the two remains a real behavioral change (wiring
+ * this component's lens tabs to read/write the global `nav.lens`, auditing
+ * what happens when a stale lens value meets no active session) rather than
+ * a rename, so it's left as a follow-up rather than folded into R4's
+ * near-pure deletion+rename. The `graphEdgeFocus` bridge (`App.tsx`) does set
+ * `nav.lens = "graph"` on a "→N" focus request, but this component does not
+ * yet read that field — lens selection here stays local component state,
+ * reset per session via `key={selectedId}` on `<SessionDetail>`.
  */
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -53,10 +55,14 @@ import SessionDataRoutePanel from "./SessionDataRoutePanel";
 
 // Same code-split rationale as the old App.tsx-owned import (ADR-0016 /
 // modernization-audit 2.3): react-force-graph-2d stays a deferred chunk.
-// Rollup dedupes by module specifier, so this second `lazy()` call (App.tsx's
-// "analysis" tab keeps its own, per the plan's deliberate interim
-// duplication) does not double-bundle the vendor chunk — verified via
-// `bun run build:analyze` (see the PR body / final report for the numbers).
+// SHELL-R4 deleted App.tsx's own duplicate `lazy()` call along with the
+// "analysis" tab it belonged to (App.tsx no longer imports
+// `KnowledgeGraphViewer` at all) — this is now the ONLY `lazy()` call for
+// this module in the tree, so the "Rollup dedupes duplicate specifiers"
+// concern this comment used to describe no longer applies. Verified via
+// `bun run build:analyze`: the force-graph vendor chunk still stays its own
+// deferred chunk, confirming the graph doesn't get pulled into the eager
+// bundle now that it's loaded from a single site.
 const KnowledgeGraphViewer = lazy(() => import("./KnowledgeGraphViewer"));
 
 /** Sort modes. Values double as i18n keys under `sessions.sort.*`. */

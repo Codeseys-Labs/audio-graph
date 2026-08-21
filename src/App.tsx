@@ -1,17 +1,21 @@
 /**
  * Root React component for the AudioGraph Tauri window.
  *
- * Layout (desktop-first):
+ * Layout (desktop-first; SHELL-R4, ADR-0046 collapses the shell to two
+ * destinations — Capture and Sessions — deleting the old three-tab
+ * during/after/analysis shell and its "Inspect" peer tab):
  *   - Top: `StorageBanner` (ENOSPC retry) + `DemoModeBanner` (first-launch
  *     local-only hint) + `NowStrip` (Start/Stop, elapsed, durability, planned
- *     route, composite health, settings/sessions — SHELL-R3, ADR-0046;
+ *     route, composite health, settings/sessions, and the destination
+ *     `.workspace-switcher__state` live region — SHELL-R3/R4, ADR-0046;
  *     replaces the old `ControlBar`).
- *   - Workspace switcher: Ready/Live now / Review / Inspect phases.
+ *   - Destination bar: Capture / Sessions.
  *   - Middle flex:
  *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
- *       - Main: phase-specific notes/transcript/graph workspace
- *       - Right aside: `LiveTranscript` / `ChatSidebar` (tabbed), with
- *                      diagnostics shown only in the Inspect phase
+ *       - Main: destination-specific notes/transcript workspace (Capture) or
+ *         `SessionsBrowser`'s list→detail + lenses (Sessions) — the old
+ *         Inspect tab's graph/diagnostics reach now lives in the Sessions
+ *         Graph/Route lenses (R2) and the NowStrip System drawer (R3)
  *   - Bottom: `PipelineStatusBar` (per-stage status dots; collapses to the
  *     composite health state during healthy capture, SHELL-R3 folds 50e3).
  *   - Overlays: error toast, `SettingsPage` modal, `SessionsBrowser` modal,
@@ -53,35 +57,29 @@ import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "./analytics/safeInvoke";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
-import ChatSidebar from "./components/ChatSidebar";
-import Icon from "./components/Icon";
 import LiveTranscript from "./components/LiveTranscript";
 import NotesPanel from "./components/NotesPanel";
 // SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip (restyle + one Start
 // + composite health chip; see NowStrip.tsx's doc comment).
 import NowStrip from "./components/NowStrip";
 import PipelineStatusBar from "./components/PipelineStatusBar";
-import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
-import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
 // SHELL-R2 (plan §R2, ADR-0046): SessionsBrowser stops being lazy — it is no
-// longer a conditionally-rendered modal but the "after"/Sessions panel's
+// longer a conditionally-rendered modal but the Sessions panel's
 // always-composed content whenever that tab is active. Its own Graph lens
-// re-declares the deferred `KnowledgeGraphViewer` import (this file's
-// `analysis` tab keeps its own, per the plan's deliberate interim
-// duplication) — Rollup dedupes the vendor chunk by module specifier, so
-// this does not re-bundle react-force-graph-2d into the main chunk; verified
-// via `bun run build:analyze`.
+// carries its own deferred `KnowledgeGraphViewer` import — this file no
+// longer has one of its own (SHELL-R4 deleted the `analysis` tab's
+// duplicate, per the plan's "deliberate interim duplication... is what
+// makes R4 pure deletion") — Rollup still dedupes the vendor chunk by module
+// specifier, so this doesn't re-bundle react-force-graph-2d into the main
+// chunk; verified via `bun run build:analyze`.
 import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
 
-// Code-split (ADR-0016 / modernization-audit 2.3): the graph viewer pulls the
-// heavy react-force-graph-2d dependency, and these modals/first-run flows are
-// rendered conditionally — lazy-loading them keeps the initial bundle lean.
-const KnowledgeGraphViewer = lazy(
-  () => import("./components/KnowledgeGraphViewer"),
-);
+// Code-split (ADR-0016 / modernization-audit 2.3): these modals/first-run
+// flows are rendered conditionally — lazy-loading them keeps the initial
+// bundle lean.
 const SettingsPage = lazy(() => import("./components/SettingsPage"));
 const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 
@@ -98,8 +96,9 @@ import { useTauriEvents } from "./hooks/useTauriEvents";
 import { SessionViewProvider } from "./session/SessionViewProvider";
 import { useAudioGraphStore } from "./store";
 // ShellNav (SHELL-R1, ADR-0046): `deriveWorkspaceView` is the pure function
-// that replaces the old App-local `workspaceView` `useState` — see
-// `store/shellNav.ts` for the full during/after/analysis rationale.
+// that replaces the old App-local `workspaceView` `useState`. SHELL-R4
+// retired its three-view during/after/analysis mapping outright — see
+// `store/shellNav.ts` for the current two-destination shape.
 import { deriveWorkspaceView } from "./store/shellNav";
 import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 // SHELL-R3 (plan §R3, ADR-0046): moved out of this file so NowStrip's
@@ -151,7 +150,12 @@ function saveNum(key: string, v: number) {
   }
 }
 
-const WORKSPACE_VIEWS = ["during", "after", "analysis"] as const;
+// SHELL-R4 (plan §R4, ADR-0046): collapses the shell to the two ADR-0046
+// destinations. The legacy `during`/`after`/`analysis` three-view shell (and
+// the `analysis` tab's separate graph/diagnostics panel) is deleted outright
+// — every occupant already has a home (Graph/Route/Ask lenses from R2;
+// diagnostics in the R3 System drawer).
+const WORKSPACE_VIEWS = ["capture", "sessions"] as const;
 type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
 
 // Post-Express hand-off nudge: shown once after the first-run quickstart is
@@ -288,20 +292,19 @@ function ShellChrome({
 interface ShellDestinationBarProps {
   workspaceView: WorkspaceView;
   isCapturing: boolean;
-  samplePreviewActive: boolean;
-  loadedSessionId: string | null;
   onSelectView: (view: WorkspaceView) => void;
   onTabKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) => void;
 }
 
-/** Region 2: destination bar — the workspace phase tablist + live state
- * region. Named "destination bar" ahead of R4's Capture/Sessions rename;
- * today it still renders the three legacy tabs, byte-identical. */
+/** Region 2: destination bar — the Capture/Sessions tablist (SHELL-R4,
+ * ADR-0046). The live `.workspace-switcher__state` region that used to live
+ * here moved onto `NowStrip` this unit — class name and
+ * `workspace.stateLive` text stayed byte-identical (E2E test 4 needed zero
+ * edits), only its position in the tree changed, so `samplePreviewActive`/
+ * `loadedSessionId` are no longer read here. */
 function ShellDestinationBar({
   workspaceView,
   isCapturing,
-  samplePreviewActive,
-  loadedSessionId,
   onSelectView,
   onTabKeyDown,
 }: ShellDestinationBarProps) {
@@ -326,22 +329,11 @@ function ShellDestinationBar({
             onClick={() => onSelectView(view)}
             onKeyDown={onTabKeyDown}
           >
-            {view === "during" && isCapturing
+            {view === "capture" && isCapturing
               ? t("workspace.liveNow")
               : t(`workspace.${view}`)}
           </button>
         ))}
-      </div>
-      <div className="workspace-switcher__state" aria-live="polite">
-        {isCapturing ? (
-          <span>{t("workspace.stateLive")}</span>
-        ) : samplePreviewActive ? (
-          <span>{t("workspace.stateSample")}</span>
-        ) : loadedSessionId ? (
-          <span>{t("workspace.stateLoaded")}</span>
-        ) : (
-          <span>{t("workspace.stateIdle")}</span>
-        )}
       </div>
     </nav>
   );
@@ -358,21 +350,14 @@ interface ShellRailContentAsideProps {
   probeRetrying: boolean;
   probeUnreadable: boolean;
   hasAgentActivity: boolean;
-  samplePreviewActive: boolean;
-  loadedSessionId: string | null;
-  rightWidth: number;
-  resizeRight: (dx: number) => void;
-  resizeNotes: (dy: number) => void;
-  notesHeight: number;
-  rightPanelTab: "transcript" | "chat";
-  setRightPanelTab: (tab: "transcript" | "chat") => void;
-  handleTabKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) => void;
 }
 
-/** Region 3: rail + content + aside — the left source rail, the active
- * workspace panel's main content, and (Analysis only) the right transcript/
- * chat aside. The session-scoped readers under here (`NotesPanel`,
- * `LiveTranscript`, `KnowledgeGraphViewer`, `SeekTimeline`) are wrapped in
+/** Region 3: rail + content + aside — the left source rail and the active
+ * destination's main content (SHELL-R4, ADR-0046: the old Analysis-only
+ * right transcript/chat aside — `analysisContextPanel` — is deleted outright
+ * along with the `analysis` tab it belonged to; every occupant already has a
+ * home in R2's Sessions lenses / R3's System drawer). The session-scoped
+ * readers under here (`NotesPanel`, `LiveTranscript`) are wrapped in
  * `SessionViewProvider` by the caller. */
 function ShellRailContentAside({
   workspaceView,
@@ -385,76 +370,8 @@ function ShellRailContentAside({
   probeRetrying,
   probeUnreadable,
   hasAgentActivity,
-  samplePreviewActive,
-  loadedSessionId,
-  rightWidth,
-  resizeRight,
-  resizeNotes,
-  notesHeight,
-  rightPanelTab,
-  setRightPanelTab,
-  handleTabKeyDown,
 }: ShellRailContentAsideProps) {
   const { t } = useTranslation();
-
-  const graphPanel = (
-    <Suspense fallback={null}>
-      <KnowledgeGraphViewer />
-    </Suspense>
-  );
-
-  const analysisContextPanel = (
-    <aside className="right-panel" style={{ width: rightWidth }}>
-      <div
-        className="flex border-b border-(--edge) bg-bg-secondary shrink-0"
-        role="tablist"
-        aria-label={t("app.rightPanelViews")}
-      >
-        <button
-          type="button"
-          role="tab"
-          id="right-tab-transcript"
-          aria-selected={rightPanelTab === "transcript"}
-          aria-controls="right-tabpanel"
-          tabIndex={rightPanelTab === "transcript" ? 0 : -1}
-          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-          onClick={() => setRightPanelTab("transcript")}
-          onKeyDown={handleTabKeyDown}
-        >
-          <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          id="right-tab-chat"
-          aria-selected={rightPanelTab === "chat"}
-          aria-controls="right-tabpanel"
-          tabIndex={rightPanelTab === "chat" ? 0 : -1}
-          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-          onClick={() => setRightPanelTab("chat")}
-          onKeyDown={handleTabKeyDown}
-        >
-          <Icon name="chat" size={16} /> {t("app.tabChat")}
-        </button>
-      </div>
-      <div
-        id="right-tabpanel"
-        role="tabpanel"
-        className="flex-1 min-h-0 flex flex-col overflow-hidden"
-        aria-labelledby={
-          rightPanelTab === "transcript"
-            ? "right-tab-transcript"
-            : "right-tab-chat"
-        }
-      >
-        {rightPanelTab === "transcript" ? <LiveTranscript /> : <ChatSidebar />}
-      </div>
-      {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
-      {!samplePreviewActive && loadedSessionId && (
-        <SessionDataRoutePanel sessionId={loadedSessionId} />
-      )}
-    </aside>
-  );
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
@@ -467,12 +384,12 @@ function ShellRailContentAside({
         onResize={resizeLeft}
         ariaLabel={t("app.resizeSources")}
       />
-      {workspaceView === "during" &&
+      {workspaceView === "capture" &&
         (showGetStartedFallback ? (
           <main
-            id="workspace-panel-during"
+            id="workspace-panel-capture"
             role="tabpanel"
-            aria-labelledby="workspace-tab-during"
+            aria-labelledby="workspace-tab-capture"
             className="workspace-panel"
           >
             <GetStartedFallback
@@ -485,10 +402,10 @@ function ShellRailContentAside({
           </main>
         ) : (
           <main
-            id="workspace-panel-during"
+            id="workspace-panel-capture"
             role="tabpanel"
-            aria-labelledby="workspace-tab-during"
-            className="workspace-panel workspace-panel--during"
+            aria-labelledby="workspace-tab-capture"
+            className="workspace-panel workspace-panel--capture"
           >
             <section
               className="workspace-panel__primary"
@@ -512,47 +429,19 @@ function ShellRailContentAside({
             )}
           </main>
         ))}
-      {workspaceView === "after" && (
-        // SHELL-R2 (plan §R2, ADR-0046): the Sessions destination — SessionsBrowser
-        // stopped being a modal and IS this panel's content now (rail→detail
-        // with lens tabs). Ids/role/label stay byte-identical; R4 is the unit
-        // that renames `after` → `sessions`.
+      {workspaceView === "sessions" && (
+        // SHELL-R2 (plan §R2, ADR-0046): the Sessions destination —
+        // SessionsBrowser stopped being a modal and IS this panel's content
+        // now (rail→detail with lens tabs). SHELL-R4 renames the id/aria
+        // pair from `after` to `sessions`.
         <main
-          id="workspace-panel-after"
+          id="workspace-panel-sessions"
           role="tabpanel"
-          aria-labelledby="workspace-tab-after"
+          aria-labelledby="workspace-tab-sessions"
           className="workspace-panel"
         >
           <SessionsBrowser />
         </main>
-      )}
-      {workspaceView === "analysis" && (
-        <main
-          id="workspace-panel-analysis"
-          role="tabpanel"
-          aria-labelledby="workspace-tab-analysis"
-          className="center-panel workspace-panel--analysis"
-        >
-          <div className="center-panel__graph">{graphPanel}</div>
-          <ResizeDivider
-            orientation="horizontal"
-            onResize={resizeNotes}
-            ariaLabel={t("app.resizeNotes")}
-          />
-          <div className="center-panel__notes" style={{ height: notesHeight }}>
-            <NotesPanel />
-          </div>
-        </main>
-      )}
-      {workspaceView === "analysis" && (
-        <>
-          <ResizeDivider
-            orientation="vertical"
-            onResize={resizeRight}
-            ariaLabel={t("app.resizeTranscriptChat")}
-          />
-          {analysisContextPanel}
-        </>
       )}
     </div>
   );
@@ -578,7 +467,12 @@ function App() {
 
   const { t, i18n } = useTranslation();
 
-  const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
+  // SHELL-R4 (plan §R4, ADR-0046): the VALUE side of `rightPanelTab` has no
+  // reader left in this file — its only renderer, `analysisContextPanel`
+  // (the Analysis-only transcript/chat toggle), is deleted along with the
+  // `analysis` tab. `setRightPanelTab` alone survives as a write-only
+  // binding (see the `isCapturing` effect below) for the same reason
+  // `setAgentOverlayOpen` does above.
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
@@ -615,10 +509,12 @@ function App() {
   // ShellNav (SHELL-R1, ADR-0046): nav now lives in the store (not App-local
   // useState) because R2's `stopCapture` — a store action — must be able to
   // route to it directly. `workspaceView` stays a derived local const so
-  // every read site below is unchanged; see `store/shellNav.ts` for the
-  // during/after/analysis mapping this derivation preserves byte-identical.
+  // every read site below is unchanged; see `store/shellNav.ts` — SHELL-R4
+  // retired the three-view during/after/analysis mapping this derivation
+  // used to preserve, in favor of the two ADR-0046 destinations directly.
   const nav = useAudioGraphStore((s) => s.nav);
   const setWorkspaceView = useAudioGraphStore((s) => s.setWorkspaceView);
+  const setNavLens = useAudioGraphStore((s) => s.setNavLens);
   const workspaceView = deriveWorkspaceView(nav);
 
   // Assertive recording-state announcement (seed audio-graph-4f2e / WCAG
@@ -640,10 +536,10 @@ function App() {
     }
   }, [isCapturing, t]);
 
-  // Phase-transition announcement (critique B7). Switching Ready / Review /
-  // Inspect is a keyboard/pointer action whose only prior signal was the
-  // visual panel swap; announce the entered phase politely for SR users. We
-  // skip the initial mount so it doesn't fire on first paint.
+  // Destination-transition announcement (critique B7). Switching Capture /
+  // Sessions is a keyboard/pointer action whose only prior signal was the
+  // visual panel swap; announce the entered destination politely for SR
+  // users. We skip the initial mount so it doesn't fire on first paint.
   const [phaseAnnouncement, setPhaseAnnouncement] = useState("");
   const prevWorkspaceViewRef = useRef<WorkspaceView | null>(null);
   useEffect(() => {
@@ -654,7 +550,7 @@ function App() {
         setPhaseAnnouncement(
           t("app.a11y.phaseEntered", {
             phase:
-              workspaceView === "during" && isCapturing
+              workspaceView === "capture" && isCapturing
                 ? t("workspace.liveNow")
                 : t(`workspace.${workspaceView}`),
           }),
@@ -663,14 +559,34 @@ function App() {
     }
   }, [isCapturing, workspaceView, t]);
 
-  // Graph-edge focus bridge (audio-graph-a2a7). Activating a Review
-  // seek-timeline utterance's "→N" related-edges badge sets `graphEdgeFocus`
-  // (edge ids + a monotonic nonce). The graph lives in the Inspect workspace,
-  // so surface it here whenever a NEW focus request arrives — keyed on the
-  // nonce so re-activating the same badge re-navigates, but an unrelated
-  // re-render (or the initial mount, where the ref starts unset) never yanks
-  // the user off their current phase. The `KnowledgeGraphViewer` reads the same
-  // `graphEdgeFocus` from the store and paints the emphasis itself.
+  // Graph-edge focus bridge (audio-graph-a2a7; retargeted SHELL-R4, plan §R4,
+  // ADR-0046). Activating a Sessions seek-timeline utterance's "→N"
+  // related-edges badge sets `graphEdgeFocus` (edge ids + a monotonic
+  // nonce). Before R4 this forced `setWorkspaceView("analysis")` — a full
+  // destination navigation, since the graph only lived on the now-deleted
+  // Analysis tab. The graph now lives on the Sessions destination's own
+  // Graph lens, so the bridge only needs the strictly smaller side effect of
+  // pointing `nav.lens` at "graph" *within the same session* — it never
+  // forces `nav.dest` away from wherever the user already is. Keyed on the
+  // nonce so re-activating the same badge re-fires, but an unrelated
+  // re-render (or the initial mount, where the ref starts unset) never
+  // re-fires spuriously.
+  //
+  // KNOWN GAP (disclosed, not silently dropped): `nav.lens` currently has
+  // ZERO production readers. `SessionsBrowser`'s own detail-lens selection
+  // is local `useState<DetailLens>`, not wired to `nav.lens` (see its doc
+  // comment) — unifying the two is real controlled-prop work (stale-lens /
+  // no-active-session edge cases) that is out of this near-pure
+  // deletion+rename unit's scope. Until that follow-up lands, activating
+  // "→N" writes `nav.lens = "graph"` but produces NO visible effect unless
+  // the user happens to already be on the Graph lens; the pre-R4 behavior
+  // (jump to the Analysis tab and paint the edge emphasis) is regressed to a
+  // no-op. Tracked as a follow-up seed candidate: wire SessionsBrowser's
+  // lens tabs to read/write `nav.lens` so this bridge becomes observable
+  // again. The `KnowledgeGraphViewer` itself still reads the same
+  // `graphEdgeFocus` from the store and paints the emphasis whenever it IS
+  // mounted — the gap is purely that nothing currently switches to the lens
+  // that mounts it.
   const prevEdgeFocusNonceRef = useRef<number | null>(null);
   useEffect(() => {
     const nonce = graphEdgeFocus?.nonce ?? null;
@@ -680,9 +596,9 @@ function App() {
     }
     if (prevEdgeFocusNonceRef.current !== nonce) {
       prevEdgeFocusNonceRef.current = nonce;
-      setWorkspaceView("analysis");
+      setNavLens("graph");
     }
-  }, [graphEdgeFocus?.nonce, setWorkspaceView]);
+  }, [graphEdgeFocus?.nonce, setNavLens]);
 
   // First-time setup: on mount, probe non-secret credential presence for a
   // complete durable notes/graph cloud path. Partial configs keep Express Setup
@@ -716,13 +632,13 @@ function App() {
   };
   const previewSampleSession = useCallback(() => {
     loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language);
-    setWorkspaceView("after");
+    setWorkspaceView("sessions");
     setAgentOverlayOpen(false);
     setExpressSetupVisible(false);
     setHandoffVisible(false);
     // Clear the probe-failure fallback too — the sample flow can be launched
-    // from it, and once a sample is loaded the During workspace should never
-    // fall back to the Get-started card.
+    // from it, and once a sample is loaded the Capture workspace should
+    // never fall back to the Get-started card.
     setProbeFailed(false);
     setProbeUnreadable(false);
     saveHandoffSeen();
@@ -762,12 +678,20 @@ function App() {
   }, [handoffVisible, dismissHandoff]);
   useEffect(() => {
     if (isCapturing) {
-      setWorkspaceView("during");
+      setWorkspaceView("capture");
+      // `rightPanelTab` drove the now-deleted Analysis-only transcript/chat
+      // toggle (SHELL-R4 removed its last renderer, `analysisContextPanel`).
+      // The write itself stays — same precedent as `sessionsBrowserOpen`/
+      // `agentOverlayOpen` elsewhere in this file: it's still a real store
+      // field several fixtures assert on directly, and resetting it here on
+      // every capture-start remains harmless even with zero remaining UI
+      // consumers. Purging the now-fully-inert field is a follow-up, not
+      // this near-pure deletion+rename unit's job.
       setRightPanelTab("transcript");
       return;
     }
     if (samplePreviewActive || loadedSessionId) {
-      setWorkspaceView("after");
+      setWorkspaceView("sessions");
     }
   }, [
     isCapturing,
@@ -781,7 +705,7 @@ function App() {
     const becameActive =
       samplePreviewActive && !prevSamplePreviewActiveRef.current;
     prevSamplePreviewActiveRef.current = samplePreviewActive;
-    if (becameActive) focusWorkspaceTab("after");
+    if (becameActive) focusWorkspaceTab("sessions");
   }, [samplePreviewActive]);
   // Credential-presence probe. Extracted so both the mount effect and the
   // fallback's Retry button share one code path. On success it clears any prior
@@ -890,34 +814,19 @@ function App() {
     return () => window.removeEventListener("storage", onStorage);
   }, [reEvaluateHandoff]);
 
-  // Resizable layout sizes (px), persisted across sessions.
+  // Resizable layout size (px), persisted across sessions. SHELL-R4 deletes
+  // the Analysis-only right-rail/notes-height resize state (`rightWidth`/
+  // `resizeRight`, `notesHeight`/`resizeNotes`) along with the tab that was
+  // their only consumer — `ag.rightWidth`/`ag.notesHeight` are not read
+  // anywhere else in the codebase (verified this run), so a previously
+  // saved value simply becomes an orphaned, harmless localStorage key.
   const [leftWidth, setLeftWidth] = useState(() =>
     loadNum("ag.leftWidth", 260),
-  );
-  const [rightWidth, setRightWidth] = useState(() =>
-    loadNum("ag.rightWidth", 340),
-  );
-  const [notesHeight, setNotesHeight] = useState(() =>
-    loadNum("ag.notesHeight", 220),
   );
   const resizeLeft = (dx: number) =>
     setLeftWidth((w) => {
       const n = clamp(w + dx, 200, 520);
       saveNum("ag.leftWidth", n);
-      return n;
-    });
-  const resizeRight = (dx: number) =>
-    setRightWidth((w) => {
-      // Divider is on the right panel's left edge: dragging right shrinks it.
-      const n = clamp(w - dx, 260, 640);
-      saveNum("ag.rightWidth", n);
-      return n;
-    });
-  const resizeNotes = (dy: number) =>
-    setNotesHeight((h) => {
-      // Divider sits above the notes pane: dragging up grows notes.
-      const n = clamp(h - dy, 0, 560);
-      saveNum("ag.notesHeight", n);
       return n;
     });
 
@@ -945,35 +854,11 @@ function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  // Roving-tabindex keyboard nav for the right-panel tablist (WCAG 4.1.2 /
-  // ARIA Authoring Practices): Arrow/Home/End move between tabs and move
-  // focus to the newly-selected tab so keyboard users don't get stranded.
-  const handleTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    const NAV = [
-      "ArrowRight",
-      "ArrowLeft",
-      "ArrowUp",
-      "ArrowDown",
-      "Home",
-      "End",
-    ];
-    if (!NAV.includes(e.key)) return;
-    e.preventDefault();
-    const next: "transcript" | "chat" =
-      e.key === "Home"
-        ? "transcript"
-        : e.key === "End"
-          ? "chat"
-          : rightPanelTab === "transcript"
-            ? "chat"
-            : "transcript";
-    setRightPanelTab(next);
-    const tablist = e.currentTarget.parentElement;
-    const tabs = tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
-    tabs?.[next === "transcript" ? 0 : 1]?.focus();
-  };
-
-  // APG-style roving tabindex for the top-level workspace phase tabs.
+  // APG-style roving tabindex for the top-level Capture/Sessions destination
+  // tabs. Already length-generic (SHELL-R4, plan §R4): it derives every
+  // index off `WORKSPACE_VIEWS.length`, so collapsing from three legacy
+  // views to the two ADR-0046 destinations needed no changes to this
+  // handler's own logic, only to the array it derives from.
   const handleWorkspaceViewKeyDown = (
     e: React.KeyboardEvent<HTMLButtonElement>,
   ) => {
@@ -1004,7 +889,7 @@ function App() {
     tabs?.[nextIndex]?.focus();
   };
 
-  // Show the Get-started fallback only on a genuinely idle first-run During
+  // Show the Get-started fallback only on a genuinely idle first-run Capture
   // surface: the probe threw AND there's no capture, sample preview, or loaded
   // session that would otherwise fill the panels with real content. This keeps
   // the fallback to the exact "empty cockpit" case it exists to prevent.
@@ -1026,8 +911,6 @@ function App() {
       <ShellDestinationBar
         workspaceView={workspaceView}
         isCapturing={isCapturing}
-        samplePreviewActive={samplePreviewActive}
-        loadedSessionId={loadedSessionId}
         onSelectView={setWorkspaceView}
         onTabKeyDown={handleWorkspaceViewKeyDown}
       />
@@ -1048,15 +931,6 @@ function App() {
           probeRetrying={probeRetrying}
           probeUnreadable={probeUnreadable}
           hasAgentActivity={hasAgentActivity}
-          samplePreviewActive={samplePreviewActive}
-          loadedSessionId={loadedSessionId}
-          rightWidth={rightWidth}
-          resizeRight={resizeRight}
-          resizeNotes={resizeNotes}
-          notesHeight={notesHeight}
-          rightPanelTab={rightPanelTab}
-          setRightPanelTab={setRightPanelTab}
-          handleTabKeyDown={handleTabKeyDown}
         />
       </SessionViewProvider>
       <ShellFooter />

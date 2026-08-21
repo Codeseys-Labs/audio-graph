@@ -55,20 +55,16 @@
   "workspace": {
     "navigation": "Workspace navigation",
     "label": "Workspace",
-    "during": "Ready",
+    "capture": "Ready",
+    "sessions": "Review",
     "liveNow": "Live now",
-    "after": "Review",
-    "analysis": "Inspect",
     "stateLive": "Live session",
     "stateSample": "Sample preview",
     "stateLoaded": "Loaded session",
     "stateIdle": "Ready",
     "liveAssist": "Live assist",
     "duringNotes": "Live notes",
-    "duringTranscript": "Live transcript",
-    "afterNotes": "Review notes",
-    "afterTranscript": "Review transcript",
-    "afterGraph": "Review graph"
+    "duringTranscript": "Live transcript"
   },
   "seekTimeline": {
     "label": "Session seek-timeline",
@@ -1086,12 +1082,7 @@
     "lastTurnTooltip": "Total tokens reported on the most recent turn_complete"
   },
   "app": {
-    "rightPanelViews": "Right panel views",
-    "tabTranscript": "Transcript",
-    "tabChat": "Chat",
     "resizeSources": "Resize sources panel",
-    "resizeNotes": "Resize notes panel",
-    "resizeTranscriptChat": "Resize transcript and chat panel",
     "a11y": {
       "skipToMain": "Skip to main content",
       "recordingStarted": "Recording started",

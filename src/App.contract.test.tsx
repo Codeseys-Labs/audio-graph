@@ -20,7 +20,7 @@
  *   `role="tabpanel"` on the workspace panel, `aria-checked` on source rows,
  *   the true wraparound boundary-cross, the exact `workspace.stateIdle`
  *   copy) that go beyond what `shell.e2e.ts` itself asserts. `shell.e2e.ts`'s
- *   own panel assertion, for example, is only `toBeDisplayed()` (line 257) —
+ *   own panel assertion, for example, is only `toBeDisplayed()` (line 264) —
  *   it never checks `aria-labelledby` or `role`, so that fact is NOT
  *   e2e-pinned even though it lives in the same `it()` as ones that are.
  *   These extensions are worth keeping (they catch real regressions this
@@ -133,7 +133,7 @@ const MOCK_SOURCE: AudioSourceInfo = {
 };
 
 /** Tracks `start_capture` call count so the 2nd call rejects, mirroring the
- * e2e mock sequence at lines 302-306 (`mockResolvedValueOnce` then
+ * e2e mock sequence at lines 311-314 (`mockResolvedValueOnce` then
  * `mockRejectedValueOnce`). */
 let startCaptureCalls = 0;
 
@@ -209,7 +209,7 @@ async function waitForStartupProbeToSettle() {
 }
 
 /** Finds the mocked source's `role="checkbox"` row the way the e2e suite
- * does (lines 319-329): scan every checkbox row's text, not an aria-label —
+ * does (lines 330-337): scan every checkbox row's text, not an aria-label —
  * the row has no accessible name of its own, only visible text content. */
 async function findMockSourceRow(): Promise<HTMLElement> {
   return await waitFor(() => {
@@ -236,37 +236,38 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
     localStorage.clear();
   });
 
-  // ── shell.e2e.ts test 3, lines 253-258: clicking each tab by id flips
+  // ── shell.e2e.ts test 3, lines 257-265 (rewritten SHELL-R4, plan §R4,
+  // ADR-0046 for the 2-tab destination bar): clicking each tab by id flips
   // aria-selected and displays its panel. E2E-pinned: the tab ids, the
   // aria-selected flip, and the panel's `toBeDisplayed()` (the ONE fact the
   // spec actually asserts about the panel — it never checks the panel's
   // `aria-labelledby` or `role`).
   //
   // jsdom-only extensions in the same test: `aria-labelledby` and
-  // `role="tabpanel"` on the panel, and that the other two tabs deselect.
-  // None of these three appear in shell.e2e.ts; they are real accessibility
-  // invariants this file additionally chooses to guard, not e2e-traced ones.
-  it("wires #workspace-tab-{during,after,analysis} to #workspace-panel-* via aria-labelledby, flipping aria-selected on click", async () => {
+  // `role="tabpanel"` on the panel, and that the other tab deselects. Neither
+  // appears in shell.e2e.ts; they are real accessibility invariants this
+  // file additionally chooses to guard, not e2e-traced ones.
+  it("wires #workspace-tab-{capture,sessions} to #workspace-panel-* via aria-labelledby, flipping aria-selected on click", async () => {
     render(<App />);
     await waitForStartupProbeToSettle();
 
-    for (const view of ["during", "after", "analysis"] as const) {
+    for (const view of ["capture", "sessions"] as const) {
       const tab = document.getElementById(`workspace-tab-${view}`);
       expect(tab).not.toBeNull();
       fireEvent.click(tab as HTMLElement);
 
-      // E2E-pinned (line 256).
+      // E2E-pinned (line 263).
       expect(tab).toHaveAttribute("aria-selected", "true");
       const panel = document.getElementById(`workspace-panel-${view}`);
-      // E2E-pinned (line 257: `toBeDisplayed()`) — existence + visibility.
+      // E2E-pinned (line 264: `toBeDisplayed()`) — existence + visibility.
       expect(panel).not.toBeNull();
       // jsdom-only extensions below: shell.e2e.ts never asserts these.
       expect(panel).toHaveAttribute("aria-labelledby", `workspace-tab-${view}`);
       expect(panel).toHaveAttribute("role", "tabpanel");
 
-      // jsdom-only extension: the other two tabs must be deselected — a real
+      // jsdom-only extension: the other tab must be deselected — a real
       // flip, not a sticky one. Not asserted by the spec.
-      for (const other of ["during", "after", "analysis"] as const) {
+      for (const other of ["capture", "sessions"] as const) {
         if (other === view) continue;
         expect(
           document.getElementById(`workspace-tab-${other}`),
@@ -278,103 +279,86 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
   // ── jsdom-only extension: roving tabindex (only the selected tab is 0).
   // shell.e2e.ts never asserts a `tabindex` attribute directly; it only
   // relies on roving tabindex being correctly implemented as the reason its
-  // `browser.execute()` focus-emulation (lines 260-269) is a faithful stand-in
+  // `browser.execute()` focus-emulation (lines 267-277) is a faithful stand-in
   // for real Tab-key navigation. This test pins the underlying mechanism the
   // spec's own comment depends on, but not a literal spec assertion.
   it("keeps roving tabindex on the workspace tablist — exactly one tab has tabIndex 0", async () => {
     render(<App />);
     await waitForStartupProbeToSettle();
 
-    const during = document.getElementById(
-      "workspace-tab-during",
+    const capture = document.getElementById(
+      "workspace-tab-capture",
     ) as HTMLElement;
-    const after = document.getElementById("workspace-tab-after") as HTMLElement;
-    const analysis = document.getElementById(
-      "workspace-tab-analysis",
+    const sessions = document.getElementById(
+      "workspace-tab-sessions",
     ) as HTMLElement;
 
-    expect(during).toHaveAttribute("tabindex", "0");
-    expect(after).toHaveAttribute("tabindex", "-1");
-    expect(analysis).toHaveAttribute("tabindex", "-1");
+    expect(capture).toHaveAttribute("tabindex", "0");
+    expect(sessions).toHaveAttribute("tabindex", "-1");
 
-    fireEvent.click(after);
-    expect(during).toHaveAttribute("tabindex", "-1");
-    expect(after).toHaveAttribute("tabindex", "0");
-    expect(analysis).toHaveAttribute("tabindex", "-1");
+    fireEvent.click(sessions);
+    expect(capture).toHaveAttribute("tabindex", "-1");
+    expect(sessions).toHaveAttribute("tabindex", "0");
   });
 
-  // ── shell.e2e.ts test 3, lines 250-294: the exact wraparound path the
-  // embedded WebKitGTK driver exercises (Home/End are dropped there, so the
-  // real suite substitutes two ArrowLefts / two ArrowRights from "analysis").
-  it("wraps ArrowLeft/ArrowRight around the 3-tab workspace list the same way the embedded e2e driver does", async () => {
+  // ── shell.e2e.ts test 3, lines 249-302 (rewritten SHELL-R4 for the 2-tab
+  // destination bar): the exact wraparound path the embedded WebKitGTK
+  // driver exercises. With only two tabs, ArrowLeft from the last-clicked
+  // tab ("sessions") to "capture" is a plain adjacent decrement — it does
+  // NOT distinguish modulo-wrap from index-clamping (both produce the same
+  // result for that one step). The SECOND ArrowLeft (capture -> sessions) is
+  // the step that does: modulo wraps to "sessions", clamping would stick at
+  // "capture". That means this test's own wraparound step now covers
+  // exactly the case the old 3-tab suite needed a SEPARATE "boundary cross"
+  // jsdom-only extension test to isolate — with only two tabs the two cases
+  // collapse into one, so that separate test is retired here rather than
+  // kept as a literal duplicate. An ArrowRight leg mirrors the same
+  // distinction in the other direction, matching the pre-R4 test's
+  // both-directions coverage.
+  it("wraps ArrowLeft/ArrowRight around the 2-tab workspace list the same way the embedded e2e driver does", async () => {
     render(<App />);
     await waitForStartupProbeToSettle();
 
-    // Mirror the click-through-all-three-tabs step (lines 253-258) before the
+    // Mirror the click-through-both-tabs step (lines 260-265) before the
     // keyboard portion.
-    for (const view of ["during", "after", "analysis"] as const) {
+    for (const view of ["capture", "sessions"] as const) {
       fireEvent.click(
         document.getElementById(`workspace-tab-${view}`) as HTMLElement,
       );
     }
 
-    const analysis = document.getElementById(
-      "workspace-tab-analysis",
+    const sessions = document.getElementById(
+      "workspace-tab-sessions",
     ) as HTMLElement;
-    analysis.focus();
-    expect(analysis).toHaveFocus();
+    sessions.focus();
+    expect(sessions).toHaveFocus();
 
-    // Two ArrowLefts from "analysis" (index 2) wrap through "after" (1) to
-    // "during" (0) — shell.e2e.ts lines 279-288.
-    fireEvent.keyDown(analysis, { key: "ArrowLeft" });
-    const after = document.getElementById("workspace-tab-after") as HTMLElement;
-    fireEvent.keyDown(after, { key: "ArrowLeft" });
-
-    const during = document.getElementById(
-      "workspace-tab-during",
+    // One ArrowLeft from "sessions" (index 1) lands on "capture" (index 0)
+    // — shell.e2e.ts's rewritten 2-tab wraparound block.
+    fireEvent.keyDown(sessions, { key: "ArrowLeft" });
+    const capture = document.getElementById(
+      "workspace-tab-capture",
     ) as HTMLElement;
-    expect(during).toHaveAttribute("aria-selected", "true");
-    expect(during).toHaveFocus();
+    expect(capture).toHaveAttribute("aria-selected", "true");
+    expect(capture).toHaveFocus();
 
-    // Two ArrowRights back from "during" return to "analysis" — lines
-    // 289-293.
-    fireEvent.keyDown(during, { key: "ArrowRight" });
-    fireEvent.keyDown(after, { key: "ArrowRight" });
+    // A second ArrowLeft wraps back around to "sessions" — the
+    // distinguishing modulo-vs-clamp step (see this test's doc comment).
+    fireEvent.keyDown(capture, { key: "ArrowLeft" });
+    expect(sessions).toHaveAttribute("aria-selected", "true");
+    expect(sessions).toHaveFocus();
 
-    expect(analysis).toHaveAttribute("aria-selected", "true");
-    expect(analysis).toHaveFocus();
+    // ArrowRight mirrors the same round-trip in the other direction.
+    fireEvent.keyDown(sessions, { key: "ArrowRight" });
+    expect(capture).toHaveAttribute("aria-selected", "true");
+    expect(capture).toHaveFocus();
+
+    fireEvent.keyDown(capture, { key: "ArrowRight" });
+    expect(sessions).toHaveAttribute("aria-selected", "true");
+    expect(sessions).toHaveFocus();
   });
 
-  // ── jsdom-only extension (NOT pinned to shell.e2e.ts): a true boundary
-  // cross. The e2e path above only ever walks index 2 -> 1 -> 0 and back —
-  // it never asks the handler to wrap AROUND an end of the list, so a
-  // regression that replaces modulo-wrap with index clamping (in which
-  // ArrowLeft from index 0 would stick at "during" instead of wrapping to
-  // "analysis") would leave every e2e-pinned assertion (and the wrap test
-  // above) green. This assertion exercises exactly that missing case: one
-  // ArrowLeft from the FIRST tab ("during", index 0) must land on the LAST
-  // tab ("analysis", index 2).
-  it("wraps ArrowLeft from the first tab to the last tab (boundary cross the e2e path never exercises)", async () => {
-    render(<App />);
-    await waitForStartupProbeToSettle();
-
-    const during = document.getElementById(
-      "workspace-tab-during",
-    ) as HTMLElement;
-    during.focus();
-    expect(during).toHaveFocus();
-    expect(during).toHaveAttribute("aria-selected", "true");
-
-    fireEvent.keyDown(during, { key: "ArrowLeft" });
-
-    const analysis = document.getElementById(
-      "workspace-tab-analysis",
-    ) as HTMLElement;
-    expect(analysis).toHaveAttribute("aria-selected", "true");
-    expect(analysis).toHaveFocus();
-  });
-
-  // ── shell.e2e.ts test 4, lines 298-339 + 348-364: real Start/Stop button +
+  // ── shell.e2e.ts test 4, lines 306-347: real Start/Stop button +
   // "Refresh sources" aria-labels, and role=checkbox source rows.
   // jsdom-only extension in this test: the spec finds the source row via
   // `[role="checkbox"]` + text match and clicks it, but never asserts
@@ -386,7 +370,7 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
 
     // shell.e2e.ts queries these by ATTRIBUTE, not accessible name
     // (`$('button[aria-label="Refresh sources"]')` / `$('button[aria-label="Start"]')`
-    // at lines 317/338). ControlBar/AudioSourceSelector render both an
+    // at lines 325/346). ControlBar/AudioSourceSelector render both an
     // aria-label AND matching visible text, so a `getByRole(..., { name })`
     // query alone stays green even if the aria-label the e2e binary actually
     // selects on is deleted — pin the attribute itself too.
@@ -414,7 +398,7 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
     expect(useAudioGraphStore.getState().selectedSourceIds.length).toBe(1);
   });
 
-  // ── shell.e2e.ts test 4, lines 338-364: Start flips `.workspace-switcher__
+  // ── shell.e2e.ts test 4, lines 346-372: Start flips `.workspace-switcher__
   // state` to "Live session"; Stop flips it back; a mocked rejection on the
   // 2nd Start surfaces `.notifications .notification--error`, not a hang.
   it("flips .workspace-switcher__state to 'Live session' on Start, back on Stop, and shows .notification--error on a rejected re-Start", async () => {
@@ -439,7 +423,7 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
 
     const stopButton = await screen.findByRole("button", { name: "Stop" });
     // shell.e2e.ts selects Stop by attribute too
-    // (`$('button[aria-label="Stop"]')`, line 348) — pin it the same way as
+    // (`$('button[aria-label="Stop"]')`, line 356) — pin it the same way as
     // Start/Refresh above.
     expect(container.querySelector('button[aria-label="Stop"]')).not.toBeNull();
     fireEvent.click(stopButton);
@@ -450,7 +434,7 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
     );
 
     // Second Start (mocked rejection) must surface via Notifications, not
-    // hang the renderer — shell.e2e.ts lines 354-364.
+    // hang the renderer — shell.e2e.ts lines 362-372.
     const restartButton = await screen.findByRole("button", { name: "Start" });
     fireEvent.click(restartButton);
 
@@ -465,10 +449,10 @@ describe("App shell contract — pins e2e/specs/shell.e2e.ts facts (audio-graph-
   // on. Verified by grepping every quoted literal in the spec file: only
   // "Start" (controlBar.start), "Stop" (controlBar.stop), and "Live session"
   // (workspace.stateLive, asserted verbatim via `toHaveText` at lines
-  // 344-345) are real i18n dependencies.
+  // 352-353) are real i18n dependencies.
   //
   // `workspace.stateIdle` is a narrower case: the spec's own negative
-  // assertion after Stop (lines 350-351: state must NOT contain "Live
+  // assertion after Stop (lines 358-359: state must NOT contain "Live
   // session") is only meaningful because idle text differs from live text —
   // that's the actual, implicit e2e-pinned fact, and it only requires
   // inequality, not any specific idle string. `expect(...).toBe("Ready")`

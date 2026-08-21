@@ -2989,7 +2989,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   pendingFinalizingSession: null,
   // SHELL-R2 (plan §R2, ADR-0046): the Sessions browser stopped being a modal —
   // it is the "sessions" destination, always rendered inside
-  // `#workspace-panel-after`. `sessionsBrowserOpen` itself is left wired
+  // `#workspace-panel-sessions` (renamed from `#workspace-panel-after` by
+  // SHELL-R4). `sessionsBrowserOpen` itself is left wired
   // (per SHELL-R1: state/actions untouched, only the call sites' *effect*
   // changes) so every existing caller (the ControlBar icon, the
   // Cmd/Ctrl+Shift+S shortcut) keeps working — this action now ALSO
@@ -3002,7 +3003,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   openSessionsBrowser: () => {
     set({ sessionsBrowserOpen: true });
     const { listSessions, purgeExpiredSessions, setWorkspaceView } = get();
-    setWorkspaceView("after");
+    setWorkspaceView("sessions");
     // Lazy cleanup of expired trash on every open. Fire-and-forget —
     // purge failures must not block the browser from rendering.
     void purgeExpiredSessions().catch(() => {});

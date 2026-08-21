@@ -68,6 +68,14 @@ Structural consequences, stated explicitly because they are contract changes:
   only when session-scoped data-movement evidence exists (ADR-0034) — until
   the audio-graph-70a3/51e0 ledger surfaces active-route state, the live chip
   stays planned-labeled.
+- The NOW STRIP also owns the destination-state live region
+  (`.workspace-switcher__state`, narrating idle vs. "Live session" —
+  recomposition plan §R4 item 2). It moved onto the strip keeping its class
+  name and `workspace.stateLive` copy byte-identical, so `shell.e2e.ts`'s
+  `.workspace-switcher__state` selector needed no edit; the previously
+  separate `workspace.stateIdle` prefix on the strip's own idle text was
+  dropped to avoid rendering "Ready" twice once the two regions shared one
+  home.
 - One Start on the strip composes the existing gated actions
   (`start_capture`, then transcribe only where ADR-0033's enablement gate
   already permits). It claims no atomicity; ADR-0028's coordinated Start

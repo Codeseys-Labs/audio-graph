@@ -11,12 +11,16 @@ import App from "./App";
 import i18n from "./i18n";
 import { useAudioGraphStore } from "./store";
 
-// App mounts several heavy/async children (the force-graph viewer, settings &
-// sessions modals) that are irrelevant to the B20 hand-off orchestration under
-// test. Stub them so the render stays synchronous and dependency-light.
-vi.mock("./components/KnowledgeGraphViewer", () => ({
-  default: () => <div data-testid="graph-stub" />,
-}));
+// App mounts several heavy/async children (settings & sessions modals) that
+// are irrelevant to the B20 hand-off orchestration under test. Stub them so
+// the render stays synchronous and dependency-light. (SHELL-R4: this file no
+// longer mocks `KnowledgeGraphViewer`/`ProjectionRuntimeStatusPanel`/
+// `ChatSidebar` — App.tsx doesn't import any of them post-R4, and
+// `SessionsBrowser` (their only remaining importer) is itself mocked
+// wholesale below as `sessions-stub`, so none of the three can ever mount in
+// this file regardless; keeping their mocks around asserted a fact that had
+// already gone permanently true, see the follow-up fix that removed the
+// corresponding `queryByTestId` checks.)
 vi.mock("./components/SettingsPage", () => ({
   default: () => <div data-testid="settings-stub" />,
 }));
@@ -35,9 +39,6 @@ vi.mock("./components/SpeakerPanel", () => ({
 vi.mock("./components/LiveTranscript", () => ({
   default: () => <div data-testid="transcript-stub" />,
 }));
-vi.mock("./components/ChatSidebar", () => ({
-  default: () => <div data-testid="chat-stub" />,
-}));
 vi.mock("./components/TokenUsagePanel", () => ({
   default: () => <div data-testid="tokens-stub" />,
 }));
@@ -46,9 +47,6 @@ vi.mock("./components/NotesPanel", () => ({
 }));
 vi.mock("./components/PipelineStatusBar", () => ({
   default: () => <div data-testid="pipeline-stub" />,
-}));
-vi.mock("./components/ProjectionRuntimeStatusPanel", () => ({
-  default: () => <div data-testid="projection-runtime-stub" />,
 }));
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
@@ -248,9 +246,6 @@ describe("App — post-Express hand-off nudge (B20)", () => {
 
   it("loads the sample session preview from Express Setup without showing the hand-off nudge", async () => {
     render(<App />);
-    expect(
-      screen.queryByTestId("projection-runtime-stub"),
-    ).not.toBeInTheDocument();
     const preview = await screen.findByRole("button", {
       name: /preview sample session/i,
     });
@@ -287,9 +282,6 @@ describe("App — post-Express hand-off nudge (B20)", () => {
         ].includes(cmd),
       ),
     ).toBe(false);
-    expect(
-      screen.queryByTestId("projection-runtime-stub"),
-    ).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /review/i })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -303,7 +295,6 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     // file-level `vi.mock` block), so `sessions-stub` is the fact to pin.
     expect(screen.getByTestId("sessions-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("agent-stub")).not.toBeInTheDocument();
   });
 
@@ -622,7 +613,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
   });
 
-  it("starts in the Ready workspace with notes and transcript ahead of graph diagnostics", async () => {
+  it("starts in the Ready workspace with notes and transcript", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
@@ -636,27 +627,18 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
     expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
     expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
-    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
-    expect(
-      screen.queryByTestId("projection-runtime-stub"),
-    ).not.toBeInTheDocument();
   });
 
-  it("reveals graph and runtime diagnostics only after switching to Inspect", async () => {
-    mockCredentialPresence("openai_api_key");
-    render(<App />);
+  // SHELL-R4 (plan §R4, ADR-0046) deleted the "Inspect" tab and its
+  // App.tsx-owned graph/diagnostics panel outright — every occupant already
+  // has a home (Graph/Route lenses on SessionsBrowser's own Sessions
+  // destination, R2; diagnostics in the NowStrip System drawer, R3), both
+  // covered by their own component test files. There is no more App-level
+  // "switch to Inspect" case to test, so this test is removed rather than
+  // rewritten (a design signal explicitly anticipated by the plan, not an
+  // oversight).
 
-    fireEvent.click(screen.getByRole("tab", { name: /inspect/i }));
-
-    expect(screen.getByRole("tab", { name: /inspect/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(await screen.findByTestId("graph-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("projection-runtime-stub")).toBeInTheDocument();
-  });
-
-  it("routes loaded historical sessions to Review without showing graph diagnostics", async () => {
+  it("routes loaded historical sessions to Review", async () => {
     mockCredentialPresence("openai_api_key");
     useAudioGraphStore.setState({ loadedSessionId: "session-1" });
 
@@ -675,19 +657,23 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(screen.getByTestId("sessions-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
-    expect(
-      screen.queryByTestId("projection-runtime-stub"),
-    ).not.toBeInTheDocument();
   });
 
-  it("returns to Live now and restores transcript focus when capture starts from Inspect", async () => {
+  // SHELL-R4: rewritten to navigate away via the Sessions tab (formerly
+  // "Review", the same visible label) instead of the deleted Inspect tab.
+  // The "Live session" text this test used to also assert on lived in the
+  // (unmocked, pre-R4) destination bar; SHELL-R4 relocated that region onto
+  // `NowStrip`, which this file mocks wholesale (line ~57) — that fact is
+  // now covered by `App.contract.test.tsx` (where NowStrip is real) and
+  // `shell.e2e.ts`, not here, so it is intentionally dropped rather than
+  // rewritten against the stub.
+  it("returns to the capture destination and restores transcript focus when capture starts from Sessions", async () => {
     mockCredentialPresence("openai_api_key");
     useAudioGraphStore.setState({ rightPanelTab: "chat" });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("tab", { name: /inspect/i }));
-    expect(screen.getByRole("tab", { name: /inspect/i })).toHaveAttribute(
+    fireEvent.click(screen.getByRole("tab", { name: /review/i }));
+    expect(screen.getByRole("tab", { name: /review/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -702,27 +688,46 @@ describe("App — post-Express hand-off nudge (B20)", () => {
         "true",
       ),
     );
-    expect(screen.getByText("Live session")).toBeInTheDocument();
+    // `rightPanelTab`'s reset-to-"transcript" write survives SHELL-R4 as a
+    // now-UI-orphaned store field (see App.tsx's `isCapturing` effect
+    // comment) — still real, testable store behavior even with no renderer
+    // left to observe it.
     expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
   });
 
-  it("supports roving keyboard navigation across workspace tabs", async () => {
+  // SHELL-R4: rewritten for the 2-tab destination bar. `handleWorkspaceViewKeyDown`
+  // is length-generic (App.tsx), so ArrowRight (forward), Home (jump to
+  // first), and End (jump to last) each still exercise a distinct branch of
+  // its switch even with only two tabs — the sequence below lands each key
+  // where it's the only one that could produce that transition (Home from
+  // "sessions" and End from "capture" both move, so neither is a same-tab
+  // no-op): ArrowRight covers the forward branch, Home covers the
+  // jump-to-first branch, and the trailing End (from "capture", the
+  // already-first tab) covers the jump-to-last branch that no other suite
+  // exercises — `shell.e2e.ts` cannot cover it, since its own comment
+  // documents that the embedded WebKitGTK provider silently drops Home/End
+  // key events.
+  it("supports roving keyboard navigation across the capture/sessions destination tabs", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
-    const during = screen.getByRole("tab", { name: /ready/i });
-    during.focus();
-    fireEvent.keyDown(during, { key: "ArrowRight" });
+    const capture = screen.getByRole("tab", { name: /ready/i });
+    capture.focus();
+    fireEvent.keyDown(capture, { key: "ArrowRight" });
 
-    const after = screen.getByRole("tab", { name: /review/i });
-    expect(after).toHaveAttribute("aria-selected", "true");
-    expect(after).toHaveFocus();
+    const sessions = screen.getByRole("tab", { name: /review/i });
+    expect(sessions).toHaveAttribute("aria-selected", "true");
+    expect(sessions).toHaveFocus();
 
-    fireEvent.keyDown(after, { key: "End" });
+    fireEvent.keyDown(sessions, { key: "Home" });
 
-    const analysis = screen.getByRole("tab", { name: /inspect/i });
-    expect(analysis).toHaveAttribute("aria-selected", "true");
-    expect(analysis).toHaveFocus();
+    expect(capture).toHaveAttribute("aria-selected", "true");
+    expect(capture).toHaveFocus();
+
+    fireEvent.keyDown(capture, { key: "End" });
+
+    expect(sessions).toHaveAttribute("aria-selected", "true");
+    expect(sessions).toHaveFocus();
   });
 
   it("renders live assist inline in the During workspace when agent activity exists", async () => {
@@ -1070,10 +1075,11 @@ describe("App — a11y batch (seed 4f2e)", () => {
     render(<App />);
     const skip = screen.getByRole("link", { name: /skip to main content/i });
     expect(skip).toHaveClass("skip-to-main");
-    // Default phase is During; the link points at that panel's id, and the
-    // panel is a <main> landmark with the matching id.
-    expect(skip).toHaveAttribute("href", "#workspace-panel-during");
-    const main = document.getElementById("workspace-panel-during");
+    // Default destination is Capture (SHELL-R4, plan §R4, ADR-0046 renamed
+    // the id from `#workspace-panel-during`); the link points at that
+    // panel's id, and the panel is a <main> landmark with the matching id.
+    expect(skip).toHaveAttribute("href", "#workspace-panel-capture");
+    const main = document.getElementById("workspace-panel-capture");
     expect(main?.tagName).toBe("MAIN");
   });
 

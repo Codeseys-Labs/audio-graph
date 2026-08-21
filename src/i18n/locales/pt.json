@@ -55,20 +55,16 @@
   "workspace": {
     "navigation": "Navegação do espaço de trabalho",
     "label": "Espaço de trabalho",
-    "during": "Pronto",
+    "capture": "Pronto",
+    "sessions": "Revisão",
     "liveNow": "Ao vivo",
-    "after": "Revisão",
-    "analysis": "Inspecionar",
     "stateLive": "Sessão ao vivo",
     "stateSample": "Prévia de exemplo",
     "stateLoaded": "Sessão carregada",
     "stateIdle": "Pronto",
     "liveAssist": "Assistência ao vivo",
     "duringNotes": "Notas ao vivo",
-    "duringTranscript": "Transcrição ao vivo",
-    "afterNotes": "Notas de revisão",
-    "afterTranscript": "Transcrição de revisão",
-    "afterGraph": "Grafo de revisão"
+    "duringTranscript": "Transcrição ao vivo"
   },
   "seekTimeline": {
     "label": "Linha do tempo de navegação da sessão",
@@ -1086,12 +1082,7 @@
     "lastTurnTooltip": "Total de tokens reportados no último turn_complete"
   },
   "app": {
-    "rightPanelViews": "Visões do painel direito",
-    "tabTranscript": "Transcrição",
-    "tabChat": "Chat",
     "resizeSources": "Redimensionar painel de fontes",
-    "resizeNotes": "Redimensionar painel de notas",
-    "resizeTranscriptChat": "Redimensionar painel de transcrição e chat",
     "a11y": {
       "skipToMain": "Pular para o conteúdo principal",
       "recordingStarted": "Gravação iniciada",

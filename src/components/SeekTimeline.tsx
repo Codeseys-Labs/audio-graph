@@ -23,14 +23,19 @@
  *
  * Provenance affordance: an utterance that produced live graph edges shows a
  * small "→ N" badge (`related_edge_ids.length`). Activating the badge dispatches
- * `focusGraphEdges(related_edge_ids)`, which `App` observes to surface the
- * Analysis workspace where the `KnowledgeGraphViewer` emphasizes those edges and
- * dims the rest (audio-graph-a2a7). The badge is a distinct button sibling to the
- * seek block — its activation focuses the graph and never scrolls the transcript.
+ * `focusGraphEdges(related_edge_ids)`, which `App` observes and (post SHELL-R4)
+ * writes `nav.lens = "graph"` instead of forcing a full destination switch —
+ * there is no Analysis workspace to surface anymore. KNOWN GAP: `nav.lens` has
+ * no reader yet (`SessionsBrowser`'s detail lens is local state), so this badge
+ * is currently a no-op unless the Graph lens is already open; see `App.tsx`'s
+ * graph-edge-focus-bridge comment and `SessionsBrowser.tsx`'s module doc. The
+ * badge is a distinct button sibling to the seek block — its activation focuses
+ * the graph and never scrolls the transcript.
  *
  * Privacy: never logs transcript text or speaker labels to the console.
  *
- * Parent: `App.tsx` After workspace panel. No props.
+ * Parent: `SessionsBrowser`'s Timeline lens (post SHELL-R4; the legacy "After
+ * workspace panel" it used to live under was deleted). No props.
  */
 import { Fragment, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";

@@ -15,8 +15,10 @@
  * `isGeminiActive` to distinguish the "not started" vs "listening" empty
  * states (the same flags ControlBar / PipelineStatusBar drive).
  *
- * Parent: `App.tsx` right-panel tab. Rendered only when `rightPanelTab`
- * equals `"transcript"`. No props.
+ * Parent: two sites post SHELL-R4 (the legacy `App.tsx` right-panel tab,
+ * gated on the now-write-only `rightPanelTab` slice, was deleted) —
+ * `App.tsx`'s Capture panel (always mounted there) and `SessionsBrowser`'s
+ * Transcript lens. No props.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";

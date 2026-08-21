@@ -39,12 +39,7 @@ import type {
 // `navForWorkspaceView`) the store's own slice creator and `App.tsx` both
 // need — re-exported below so store consumers can import the type from
 // `../types` like every other `AudioGraphStore` field type.
-import type {
-  LegacyWorkspaceView,
-  SessionLens,
-  ShellDest,
-  ShellNav,
-} from "../store/shellNav";
+import type { SessionLens, ShellDest, ShellNav } from "../store/shellNav";
 
 export type {
   AudioChannelProvenanceKind,
@@ -94,7 +89,7 @@ export type {
   PrivacyMode as LedgerPrivacyMode,
   RetentionClass,
 } from "../generated/sessionDataMovement";
-export type { LegacyWorkspaceView, SessionLens, ShellDest, ShellNav };
+export type { SessionLens, ShellDest, ShellNav };
 
 export type SegmentId = string;
 
@@ -267,8 +262,11 @@ export interface TranscriptSeekTarget {
  * `related_edge_ids` — the live graph edges that utterance produced; the
  * `KnowledgeGraphViewer` matches its rendered links by `id` against this set and
  * dims the rest. `nonce` increments on every request so re-activating the same
- * badge re-fires the view-switch effect that surfaces the Analysis workspace
- * (a plain id list would be structurally equal and a `useEffect` would skip it).
+ * badge re-fires the bridge effect in `App.tsx` (a plain id list would be
+ * structurally equal and a `useEffect` would skip it). Post SHELL-R4 that
+ * effect writes `nav.lens = "graph"` rather than switching to the (now-deleted)
+ * Analysis workspace — see `App.tsx`'s graph-edge-focus-bridge comment for the
+ * disclosed gap (`nav.lens` currently has no reader).
  */
 export interface GraphEdgeFocus {
   edgeIds: string[];
@@ -2690,12 +2688,14 @@ export interface NotifyOptions {
 
 /** Shape of the Zustand audio-graph store. */
 export interface AudioGraphStore {
-  // ── Shell navigation (SHELL-R1, ADR-0046) ───────────────────────────────
+  // ── Shell navigation (SHELL-R1/R4, ADR-0046) ────────────────────────────
   // One typed nav object, store-owned so R2's `stopCapture` (a store action)
-  // can route to it — see `store/shellNav.ts` for the full rationale and the
-  // during/after/analysis derivation this unit keeps byte-identical.
+  // can route to it — see `store/shellNav.ts` for the full rationale.
+  // SHELL-R4 collapsed the shell to the two ADR-0046 destinations, so
+  // `setWorkspaceView` now takes `ShellDest` directly (the legacy
+  // during/after/analysis derivation is retired outright).
   nav: ShellNav;
-  setWorkspaceView: (view: LegacyWorkspaceView) => void;
+  setWorkspaceView: (view: ShellDest) => void;
   setNavDest: (dest: ShellDest) => void;
   setNavSessionId: (sessionId: string | null) => void;
   setNavLens: (lens: SessionLens) => void;
@@ -2796,7 +2796,9 @@ export interface AudioGraphStore {
   /**
    * Focus/highlight the knowledge-graph edges `edgeIds` (a timeline
    * utterance's `related_edge_ids`). Bumps `graphEdgeFocus.nonce` so
-   * re-activating the same badge re-fires the Analysis view-switch effect.
+   * re-activating the same badge re-fires `App.tsx`'s bridge effect, which
+   * (post SHELL-R4) writes `nav.lens = "graph"` — currently a disclosed no-op
+   * until `SessionsBrowser` reads `nav.lens` (see `App.tsx`'s comment).
    * An empty array or `null` clears the focus (teardown / background click).
    */
   focusGraphEdges: (edgeIds: string[] | null) => void;

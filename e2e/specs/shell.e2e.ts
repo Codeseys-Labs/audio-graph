@@ -215,10 +215,13 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
 
   // ── 1. Launch + title/selector ──────────────────────────────────────────
   // Proves React mounted, i18n resolved, and first paint completed inside the
-  // real WebView — not jsdom.
+  // real WebView — not jsdom. Selector rewritten SHELL-R4 (plan §R4,
+  // ADR-0046): `#workspace-tab-during` → `#workspace-tab-capture` (the
+  // during/after/analysis three-tab shell is deleted outright in favor of
+  // the two Capture/Sessions destinations).
   it("mounts the real shell with the expected window title and first tab", async () => {
     await expect(browser).toHaveTitle(APP_TITLE);
-    await expect($("#workspace-tab-during")).toBeDisplayed();
+    await expect($("#workspace-tab-capture")).toBeDisplayed();
   });
 
   // ── 2. Renderer-to-Rust IPC round trip (settings) ───────────────────────
@@ -243,12 +246,16 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     );
   });
 
-  // ── 3. Navigation across the shell's main views ─────────────────────────
+  // ── 3. Navigation across the shell's main destinations ──────────────────
   // Mirrors handleWorkspaceViewKeyDown's arrow-key contract (via wraparound,
   // since this driver doesn't deliver Home/End -- see comment below) as well
-  // as plain clicks.
-  it("navigates during -> after -> analysis via click and keyboard, toggling aria-selected", async () => {
-    const views = ["during", "after", "analysis"] as const;
+  // as plain clicks. Rewritten SHELL-R4 (plan §R4, ADR-0046): the
+  // during/after/analysis three-tab shell is deleted outright in favor of
+  // the two Capture/Sessions destinations -- every occupant of the deleted
+  // `analysis` tab already has a home (Graph/Route lenses on the Sessions
+  // destination, R2; diagnostics in the NowStrip System drawer, R3).
+  it("navigates capture -> sessions via click and keyboard, toggling aria-selected", async () => {
+    const views = ["capture", "sessions"] as const;
 
     for (const view of views) {
       const tab = await $(`#workspace-tab-${view}`);
@@ -262,10 +269,11 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     // (App.tsx's tabs already carry the correct roving tabindex: only the
     // selected tab has tabIndex 0). A real keyboard-only user reaches the
     // tablist via Tab, landing on whichever tab currently has tabIndex 0 (the
-    // one just selected above); emulate that explicitly so the arrow-key
-    // presses below land on `handleWorkspaceViewKeyDown` instead of nothing.
+    // one just selected above, "sessions"); emulate that explicitly so the
+    // arrow-key presses below land on `handleWorkspaceViewKeyDown` instead of
+    // nothing.
     await browser.execute(() => {
-      document.getElementById("workspace-tab-analysis")?.focus();
+      document.getElementById("workspace-tab-sessions")?.focus();
     });
 
     // `Home`/`End` are silently dropped by this embedded WebKitGTK provider
@@ -276,18 +284,18 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     // handler and move focus via its own `tabs?.[nextIndex]?.focus()` call.
     // Exercise the identical `handleWorkspaceViewKeyDown` switch (Home/End
     // and the arrows share one function; only the target index differs) via
-    // arrow-key wraparound instead, which this driver actually delivers: two
-    // ArrowLefts from "analysis" (index 2) wrap through "after" (1) to
-    // "during" (0) -- the same destination Home would reach; two ArrowRights
-    // back from "during" return to "analysis" -- the same destination End
-    // would reach.
-    await browser.keys(["ArrowLeft", "ArrowLeft"]);
-    await expect($("#workspace-tab-during")).toHaveAttribute(
+    // arrow-key wraparound instead, which this driver actually delivers --
+    // the 2-tab equivalent of the old 3-tab wraparound block: one ArrowLeft
+    // from "sessions" (index 1) lands on "capture" (index 0) -- the same
+    // destination Home would reach; a second ArrowLeft wraps back around to
+    // "sessions" -- the same destination End would reach with only two tabs.
+    await browser.keys(["ArrowLeft"]);
+    await expect($("#workspace-tab-capture")).toHaveAttribute(
       "aria-selected",
       "true",
     );
-    await browser.keys(["ArrowRight", "ArrowRight"]);
-    await expect($("#workspace-tab-analysis")).toHaveAttribute(
+    await browser.keys(["ArrowLeft"]);
+    await expect($("#workspace-tab-sessions")).toHaveAttribute(
       "aria-selected",
       "true",
     );

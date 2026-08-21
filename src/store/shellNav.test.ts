@@ -3,7 +3,6 @@ import { useAudioGraphStore } from "./index";
 import {
   DEFAULT_SHELL_NAV,
   deriveWorkspaceView,
-  type LegacyWorkspaceView,
   navForWorkspaceView,
   type SessionLens,
   type ShellDest,
@@ -19,7 +18,6 @@ const ALL_LENSES: SessionLens[] = [
 ];
 const ALL_DESTS: ShellDest[] = ["capture", "sessions"];
 const ALL_SESSION_IDS: Array<string | null> = [null, "session-1"];
-const ALL_VIEWS: LegacyWorkspaceView[] = ["during", "after", "analysis"];
 
 /** Every combination of dest x lens x sessionId — the grid the "20-nav-state"
  * exhaustive check from the review referred to (2 dests x 5 lenses x 2
@@ -38,126 +36,89 @@ function allNavStates(): ShellNav[] {
 
 describe("store: shellNav pure helpers", () => {
   describe("deriveWorkspaceView", () => {
-    it("maps dest:capture to during regardless of lens/sessionId", () => {
+    // SHELL-R4 (plan §R4, ADR-0046): the three-view during/after/analysis
+    // mapping (and its `lens === "graph"` disambiguation) is retired
+    // outright — `dest` IS the workspace view now, regardless of `lens` or
+    // `sessionId`.
+    it("maps dest:capture to capture regardless of lens/sessionId", () => {
       for (const lens of ALL_LENSES) {
         for (const sessionId of ALL_SESSION_IDS) {
           expect(
             deriveWorkspaceView({ dest: "capture", lens, sessionId }),
-          ).toBe("during");
+          ).toBe("capture");
         }
       }
     });
 
-    it("maps dest:sessions + lens:graph to analysis", () => {
-      for (const sessionId of ALL_SESSION_IDS) {
-        expect(
-          deriveWorkspaceView({ dest: "sessions", lens: "graph", sessionId }),
-        ).toBe("analysis");
-      }
-    });
-
-    it("maps dest:sessions + any non-graph lens to after", () => {
-      for (const lens of ALL_LENSES.filter((l) => l !== "graph")) {
+    it("maps dest:sessions to sessions regardless of lens/sessionId", () => {
+      for (const lens of ALL_LENSES) {
         for (const sessionId of ALL_SESSION_IDS) {
           expect(
             deriveWorkspaceView({ dest: "sessions", lens, sessionId }),
-          ).toBe("after");
+          ).toBe("sessions");
         }
       }
     });
   });
 
   describe("navForWorkspaceView", () => {
-    it("during: switches dest to capture, preserves lens and sessionId", () => {
+    it("switches dest to the requested view, preserving lens and sessionId", () => {
       const current: ShellNav = {
         dest: "sessions",
         lens: "transcript",
         sessionId: "s1",
       };
-      expect(navForWorkspaceView("during", current)).toEqual({
+      expect(navForWorkspaceView("capture", current)).toEqual({
         dest: "capture",
         lens: "transcript",
         sessionId: "s1",
       });
     });
 
-    it("analysis: switches dest to sessions and lens to graph, preserves sessionId", () => {
+    it("preserves a graph lens untouched when switching dest (no more legacy disambiguation)", () => {
       const current: ShellNav = {
         dest: "capture",
-        lens: "notes",
+        lens: "graph",
         sessionId: "s2",
       };
-      expect(navForWorkspaceView("analysis", current)).toEqual({
+      expect(navForWorkspaceView("sessions", current)).toEqual({
         dest: "sessions",
         lens: "graph",
         sessionId: "s2",
-      });
-    });
-
-    it("after: switches dest to sessions and resets lens:graph to notes", () => {
-      const current: ShellNav = {
-        dest: "sessions",
-        lens: "graph",
-        sessionId: "s3",
-      };
-      expect(navForWorkspaceView("after", current)).toEqual({
-        dest: "sessions",
-        lens: "notes",
-        sessionId: "s3",
-      });
-    });
-
-    it("after: preserves a non-graph lens untouched", () => {
-      const current: ShellNav = {
-        dest: "capture",
-        lens: "timeline",
-        sessionId: null,
-      };
-      expect(navForWorkspaceView("after", current)).toEqual({
-        dest: "sessions",
-        lens: "timeline",
-        sessionId: null,
       });
     });
 
     it("same-value bailout: returns the exact current reference when already at the requested view", () => {
-      const duringNav: ShellNav = {
+      const captureNav: ShellNav = {
         dest: "capture",
         lens: "graph",
         sessionId: "s4",
       };
-      expect(navForWorkspaceView("during", duringNav)).toBe(duringNav);
+      expect(navForWorkspaceView("capture", captureNav)).toBe(captureNav);
 
-      const analysisNav: ShellNav = {
-        dest: "sessions",
-        lens: "graph",
-        sessionId: null,
-      };
-      expect(navForWorkspaceView("analysis", analysisNav)).toBe(analysisNav);
-
-      const afterNav: ShellNav = {
+      const sessionsNav: ShellNav = {
         dest: "sessions",
         lens: "route",
-        sessionId: "s5",
+        sessionId: null,
       };
-      expect(navForWorkspaceView("after", afterNav)).toBe(afterNav);
+      expect(navForWorkspaceView("sessions", sessionsNav)).toBe(sessionsNav);
     });
 
     it("round-trip: deriveWorkspaceView(navForWorkspaceView(view, current)) === view for every state x view", () => {
       for (const current of allNavStates()) {
-        for (const view of ALL_VIEWS) {
+        for (const view of ALL_DESTS) {
           const next = navForWorkspaceView(view, current);
           expect(deriveWorkspaceView(next)).toBe(view);
         }
       }
     });
 
-    it("never touches sessionId across any state x view combination", () => {
+    it("never touches lens or sessionId across any state x view combination", () => {
       for (const current of allNavStates()) {
-        for (const view of ALL_VIEWS) {
-          expect(navForWorkspaceView(view, current).sessionId).toBe(
-            current.sessionId,
-          );
+        for (const view of ALL_DESTS) {
+          const next = navForWorkspaceView(view, current);
+          expect(next.lens).toBe(current.lens);
+          expect(next.sessionId).toBe(current.sessionId);
         }
       }
     });
@@ -173,32 +134,32 @@ describe("store: shellNav slice (wired into useAudioGraphStore)", () => {
     expect(useAudioGraphStore.getState().nav).toEqual(DEFAULT_SHELL_NAV);
   });
 
-  it("setWorkspaceView drives nav through during -> analysis -> after", () => {
+  it("setWorkspaceView drives nav through capture -> sessions -> capture", () => {
     const { setWorkspaceView } = useAudioGraphStore.getState();
 
-    setWorkspaceView("during");
+    setWorkspaceView("capture");
     expect(useAudioGraphStore.getState().nav.dest).toBe("capture");
 
-    setWorkspaceView("analysis");
+    setWorkspaceView("sessions");
     expect(useAudioGraphStore.getState().nav).toEqual({
       dest: "sessions",
-      lens: "graph",
+      lens: "notes",
       sessionId: null,
     });
 
-    setWorkspaceView("after");
+    setWorkspaceView("capture");
     expect(useAudioGraphStore.getState().nav).toEqual({
-      dest: "sessions",
+      dest: "capture",
       lens: "notes",
       sessionId: null,
     });
   });
 
   it("setWorkspaceView is a same-value no-op: redundant calls don't replace the nav reference", () => {
-    useAudioGraphStore.getState().setWorkspaceView("during");
+    useAudioGraphStore.getState().setWorkspaceView("capture");
     const navBefore = useAudioGraphStore.getState().nav;
 
-    useAudioGraphStore.getState().setWorkspaceView("during");
+    useAudioGraphStore.getState().setWorkspaceView("capture");
     expect(useAudioGraphStore.getState().nav).toBe(navBefore);
   });
 
@@ -240,32 +201,31 @@ describe("store: shellNav slice (wired into useAudioGraphStore)", () => {
     });
   });
 
-  it("footgun (documented, not a bug): setNavDest('sessions') while lens is still 'graph' silently derives to analysis, not after", () => {
-    // Reachable today: the graph-edge-focus effect sets
-    // {dest:'sessions', lens:'graph'}; a later setNavDest('capture') then
-    // setNavDest('sessions') (bypassing setWorkspaceView's lens-aware
-    // normalization) would land back on Analysis, not Review/"after". This
-    // test pins the current, intentional (if sharp-edged) behavior so a
-    // future caller of setNavDest doesn't discover it via a UI regression.
+  // SHELL-R4 retires the R1-documented "setNavDest alone does not
+  // renormalize lens" footgun outright: there is no more `analysis` value
+  // for a stale `lens` to accidentally resolve to, so setNavDest round-trips
+  // (capture -> sessions) no longer change what `deriveWorkspaceView` reports
+  // regardless of the lens left over from an earlier graph-edge focus.
+  it("setNavDest round-trips (capture -> sessions) do not disturb deriveWorkspaceView, even with a leftover graph lens", () => {
     useAudioGraphStore.setState({
       nav: { dest: "sessions", lens: "graph", sessionId: "s10" },
     });
     useAudioGraphStore.getState().setNavDest("capture");
     useAudioGraphStore.getState().setNavDest("sessions");
     expect(deriveWorkspaceView(useAudioGraphStore.getState().nav)).toBe(
-      "analysis",
+      "sessions",
     );
   });
 
   it("action identity is stable across nav writes (load-bearing for App.tsx's dependency arrays)", () => {
     const before = useAudioGraphStore.getState().setWorkspaceView;
-    useAudioGraphStore.getState().setWorkspaceView("analysis");
+    useAudioGraphStore.getState().setWorkspaceView("sessions");
     useAudioGraphStore.getState().setNavLens("notes");
     useAudioGraphStore.getState().setNavSessionId("s11");
     const after = useAudioGraphStore.getState().setWorkspaceView;
     // If this identity ever becomes unstable (e.g. a wrapper or curried
     // selector), the isCapturing effect in App.tsx
-    // (`if (isCapturing) setWorkspaceView("during")`) would re-fire on every
+    // (`if (isCapturing) setWorkspaceView("capture")`) would re-fire on every
     // render it appears in a dependency array for, because a fresh nav write
     // would produce a fresh function reference -> re-render -> effect
     // re-runs -> infinite loop.

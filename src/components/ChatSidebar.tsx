@@ -10,8 +10,10 @@
  * Store bindings: `chatMessages`, `isChatLoading`, `sendChatMessage`,
  * `clearChatHistory`, `graphSnapshot`.
  *
- * Parent: `App.tsx` right-panel tab. No props — rendered only when the
- * `rightPanelTab` store slice equals `"chat"`.
+ * Parent: `SessionsBrowser`'s "Ask" aside lens (post SHELL-R4; the legacy
+ * `App.tsx` right-panel tab it used to live under, gated on the
+ * `rightPanelTab` store slice, was deleted — that slice is now write-only).
+ * No props.
  */
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";

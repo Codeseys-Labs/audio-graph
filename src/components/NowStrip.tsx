@@ -18,18 +18,22 @@
  * action, so the button and the hotkey never silently diverge.
  *
  * IDLE vs LIVE:
- *   - Idle collapses to one line: Start, "Ready", the selected-source count,
- *     the planned-route chip, and a neutral-tone "System status" chip
- *     (opens `SystemDrawer` — SAME action as the live health chip below,
- *     just without a health-tone claim, since nothing has run yet to
- *     classify; keeps the drawer's per-stage/token detail one click away
- *     even before capture starts, the 50e3 fold's "no regression to
- *     diagnostics" half). Start is the ONLY saturated (accent-colored)
- *     element among those five — everything else is neutral text or a
- *     `.ag-chip[data-tone="neutral"]` (screenshot evidence lives in the
- *     landing PR body).
- *   - Live adds the elapsed timer (tabular-nums), a durability readout
- *     ("notes saved · Ns ago", derived from the most recent "notes"
+ *   - Idle collapses to one line: Start, the `.workspace-switcher__state`
+ *     destination-state region ("Ready" — SHELL-R4, plan §R4, ADR-0046
+ *     relocated this region here from the destination bar, class name and
+ *     `workspace.stateLive` text kept byte-identical so `shell.e2e.ts` test 4
+ *     needed zero edits), the selected-source count, the planned-route chip,
+ *     and a neutral-tone "System status" chip (opens `SystemDrawer` — SAME
+ *     action as the live health chip below, just without a health-tone
+ *     claim, since nothing has run yet to classify; keeps the drawer's
+ *     per-stage/token detail one click away even before capture starts, the
+ *     50e3 fold's "no regression to diagnostics" half). Start is the ONLY
+ *     saturated (accent-colored) element among those five — everything else
+ *     is neutral text or a `.ag-chip[data-tone="neutral"]` (screenshot
+ *     evidence lives in the landing PR body).
+ *   - Live adds the same `.workspace-switcher__state` region (now reading
+ *     "Live session"), the elapsed timer (tabular-nums), a durability
+ *     readout ("notes saved · Ns ago", derived from the most recent "notes"
  *     projection patch already in `sessionProjectionEvents` — no new
  *     backend read), and swaps the neutral idle chip for the composite
  *     health chip (same `setSystemDrawerOpen` action, now tone/label-coded
@@ -97,6 +101,11 @@ function NowStrip() {
   const { t } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
+  // SHELL-R4 (plan §R4, ADR-0046): read alongside `isCapturing` so the
+  // relocated `.workspace-switcher__state` region below can reproduce the
+  // exact 4-way ternary the destination bar used to render.
+  const samplePreviewActive = useAudioGraphStore((s) => s.samplePreviewActive);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
   const settings = useAudioGraphStore((s) => s.settings);
@@ -305,6 +314,23 @@ function NowStrip() {
           )}
         </button>
 
+        {/* SHELL-R4 (plan §R4, ADR-0046): relocated verbatim from the
+            destination bar's `ShellDestinationBar` — class name and the
+            `workspace.stateLive` text stay byte-identical (`shell.e2e.ts`
+            test 4 and its `.workspace-switcher__state` selector needed zero
+            edits), only the position in the tree changed. */}
+        <div className="workspace-switcher__state" aria-live="polite">
+          {isCapturing ? (
+            <span>{t("workspace.stateLive")}</span>
+          ) : samplePreviewActive ? (
+            <span>{t("workspace.stateSample")}</span>
+          ) : loadedSessionId ? (
+            <span>{t("workspace.stateLoaded")}</span>
+          ) : (
+            <span>{t("workspace.stateIdle")}</span>
+          )}
+        </div>
+
         {isCapturing ? (
           <>
             <span
@@ -336,7 +362,6 @@ function NowStrip() {
         ) : (
           <>
             <span className="text-sm text-text-secondary whitespace-nowrap">
-              {t("workspace.stateIdle")} ·{" "}
               {t("controlBar.sourcesSummary", {
                 count: selectedSourceIds.length,
               })}

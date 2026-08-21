@@ -85,6 +85,13 @@ function resetStore(overrides: Partial<StoreState> = {}) {
     isCapturing: false,
     isTranscribing: false,
     isGeminiActive: false,
+    // SHELL-R4 (plan §R4, ADR-0046): NowStrip now reads these two directly
+    // to reproduce the relocated `.workspace-switcher__state` region's
+    // 4-way ternary — reset explicitly so this file's assumption of the
+    // "Ready" idle state doesn't depend on Vitest's per-file module
+    // isolation leaving the store's own defaults untouched.
+    samplePreviewActive: false,
+    loadedSessionId: null,
     selectedSourceIds: [],
     audioSources: [],
     processes: [],
