@@ -92,7 +92,7 @@ function ProviderTransferRow({ transfer }: ProviderTransferRowProps) {
   const { t } = useTranslation();
   return (
     <li
-      className="rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+      className="rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)"
       data-testid="data-route-transfer"
     >
       <div className="mb-(--space-1) flex items-center justify-between gap-(--space-2)">
@@ -168,7 +168,7 @@ function CredentialRow({ credential }: CredentialRowProps) {
         ? t("dataRoute.credentialReady")
         : t("dataRoute.credentialNotReady");
   return (
-    <li className="rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)">
+    <li className="rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)">
       <div className="flex items-center justify-between gap-(--space-2)">
         <span className="min-w-0 text-xs font-semibold text-text-primary [overflow-wrap:anywhere]">
           {credential.providerId ??
@@ -196,7 +196,7 @@ interface SectionProps {
 function Section({ title, icon, children, label }: SectionProps) {
   return (
     <article
-      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
+      className="border border-(--edge) rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={label ?? title}
     >
       <h4 className="m-0 mb-(--space-3) flex items-center gap-(--space-2) text-xs font-semibold text-text-primary">
@@ -260,7 +260,7 @@ export default function SessionDataRoutePanel({
 
   return (
     <section
-      className="flex-shrink-0 border-t border-border-color bg-bg-tertiary py-(--space-4) px-(--space-5)"
+      className="flex-shrink-0 border-t border-(--edge) bg-bg-tertiary py-(--space-4) px-(--space-5)"
       aria-label={t("dataRoute.label")}
       aria-busy={loadState === "loading"}
     >
@@ -272,7 +272,7 @@ export default function SessionDataRoutePanel({
         {sessionId && (
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) rounded-md border border-border-color bg-(--hover-overlay) px-(--space-4) py-[3px] text-2xs font-semibold uppercase tracking-[0.4px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-4) py-[3px] text-2xs font-semibold uppercase tracking-[0.4px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
             disabled={loadState === "loading"}
             onClick={() => void load(sessionId)}
             aria-label={t("dataRoute.refreshLabel")}

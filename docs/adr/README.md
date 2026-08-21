@@ -22,7 +22,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0013] | Conversation Modes — Notes/Graph vs Converse (native + pipelined S2S) | accepted | — | 2026-05-29 |
 | [0014] | On-demand Notes Synthesis (narrative parallel to the graph) | superseded | Superseded by ADR-0024 | 2026-05-29 |
 | [0015] | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn | superseded | Superseded by ADR-0016 | 2026-05-29 |
-| [0016] | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally | accepted | — | 2026-05-29 |
+| [0016] | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally | accepted | 2026-06-29 "two channels only" clause amended by ADR-0047 (third channel: `.ag-*` recipes) | 2026-05-29 |
 | [0017] | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering | accepted | Engine, worker, downloads, and pipeline wiring landed; multi-speaker accuracy gate pending | 2026-05-30 |
 | [0018] | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC | accepted | Supersedes interim echo guard `172edbf` | 2026-05-30 |
 | [0019] | Credential And Config Storage Migration | proposed | — | 2026-06-25 |
@@ -53,6 +53,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0044] | Keep the Session Control Plane in the Flat Artifact Root | accepted | Refines ADR-0027 and ADR-0041; relates to ADR-0043; item 3 scoped by ADR-0039 and item 5 narrowed by ADR-0040; supersedes none | 2026-08-16 |
 | [0045] | Schedule Projections on Per-Kind Coalescing Slots with Derived Coverage Heads | accepted | Refines ADR-0024, ADR-0027, ADR-0031; relates to ADR-0029/0035/0036/0042; maintainer-decided via grilling; seed `audio-graph-3b48` | 2026-08-20 |
 | [0046] | Collapse the Shell to Capture and Sessions with a Persistent Active-Session Strip | accepted | Amends ADR-0030's workspace structure; preserves ADR-0028/0033/0034; ratified 2026-08-20 via the design panel; seed `audio-graph-19c7` | 2026-08-20 |
+| [0047] | A Tier-3 `.ag-*` Recipe Layer in `@layer components`, and `--edge`/`--edge-subtle` Non-Text Contrast Tokens | accepted | Amends ADR-0016's 2026-06-29 "two channels only" convention clause; extends ADR-0009's surface/border tokens; seed `audio-graph-b9dc` | 2026-08-20 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -100,6 +101,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0044]: 0044-keep-session-control-plane-in-the-flat-artifact-root.md
 [0045]: 0045-schedule-projections-on-per-kind-coalescing-slots-with-derived-coverage-heads.md
 [0046]: 0046-collapse-shell-to-capture-and-sessions.md
+[0047]: 0047-tier-3-recipe-layer-and-non-text-contrast-edge-tokens.md
 
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036

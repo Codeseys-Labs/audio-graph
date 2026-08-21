@@ -232,7 +232,7 @@ function ReplayArtifactRow({ label, artifact }: ReplayArtifactRowProps) {
         : "text-accent-yellow bg-(--tint-warning)";
 
   return (
-    <div className="rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)">
+    <div className="rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)">
       <div className="mb-(--space-1) flex items-center justify-between gap-(--space-2)">
         <span className="min-w-0 text-xs font-semibold text-text-primary">
           {label}
@@ -272,7 +272,7 @@ function ReplayReportCard({
 
   return (
     <article
-      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
+      className="border border-(--edge) rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={t("projectionDiagnostics.replayTitle")}
     >
       <div className="mb-(--space-3) flex items-center justify-between gap-(--space-3)">
@@ -282,7 +282,7 @@ function ReplayReportCard({
         </h4>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) rounded-md border border-border-color bg-(--hover-overlay) px-(--space-3) py-[2px] text-2xs font-semibold uppercase tracking-[0.3px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
+          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-3) py-[2px] text-2xs font-semibold uppercase tracking-[0.3px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
           disabled={loadState === "loading"}
           onClick={onRun}
           aria-label={t("projectionDiagnostics.replayCheckLabel")}
@@ -362,7 +362,7 @@ function ReplayReportCard({
           </div>
 
           <dl
-            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)"
             aria-label={t("projectionDiagnostics.evalMetricsTitle")}
           >
             <Metric
@@ -416,7 +416,7 @@ function ReplayReportCard({
           </dl>
 
           <dl
-            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)"
             aria-label={t("projectionDiagnostics.latencyBreakdownTitle")}
           >
             <Metric
@@ -482,7 +482,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
 
   return (
     <article
-      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
+      className="border border-(--edge) rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={t("projectionDiagnostics.graphOperationsTitle")}
     >
       <div className="mb-(--space-3) flex items-center justify-between gap-(--space-3)">
@@ -500,7 +500,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
         {operations.map((operation) => (
           <li
             key={operation.key}
-            className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-(--space-3) rounded-sm border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-(--space-3) rounded-sm border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)"
           >
             <span className="font-mono text-[10px] font-semibold text-text-muted">
               {t("projectionDiagnostics.graphOperationSequence", {
@@ -547,7 +547,7 @@ function SchedulerCard({
 
   return (
     <article
-      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
+      className="border border-(--edge) rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={title}
     >
       <div className="flex items-center justify-between gap-(--space-3) mb-(--space-3)">
@@ -723,7 +723,7 @@ export default function ProjectionRuntimeStatusPanel() {
 
   return (
     <section
-      className="flex-shrink-0 border-t border-border-color bg-bg-tertiary py-(--space-4) px-(--space-5)"
+      className="flex-shrink-0 border-t border-(--edge) bg-bg-tertiary py-(--space-4) px-(--space-5)"
       aria-label={t("projectionDiagnostics.label")}
       aria-busy={loadState === "loading"}
     >
@@ -734,7 +734,7 @@ export default function ProjectionRuntimeStatusPanel() {
         </h3>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) rounded-md border border-border-color bg-(--hover-overlay) px-(--space-4) py-[3px] text-2xs font-semibold uppercase tracking-[0.4px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
+          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-4) py-[3px] text-2xs font-semibold uppercase tracking-[0.4px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
           disabled={loadState === "loading"}
           onClick={() => void load()}
           aria-label={t("projectionDiagnostics.refreshLabel")}

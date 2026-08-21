@@ -205,7 +205,7 @@ function PipelineStatusBar() {
 
   return (
     <nav
-      className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-border-color gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-(--edge) gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       aria-label={t("pipeline.label")}
       role="status"
     >
@@ -268,8 +268,12 @@ function PipelineStatusBar() {
       })}
       {turnLabel && (
         <>
+          {/* --edge-subtle, not --edge (WCAG 1.4.11, ADR-0047): this glyph is
+              a section-rhythm separator between peer stage groups in one
+              status bar, not a boundary between components the user needs
+              to locate. */}
           <span
-            className="text-border-color text-[14px] mx-(--space-2) opacity-60"
+            className="text-(--edge-subtle) text-[14px] mx-(--space-2) opacity-60"
             aria-hidden="true"
           >
             |
@@ -290,8 +294,10 @@ function PipelineStatusBar() {
       )}
       {consumerSummary && (
         <>
+          {/* --edge-subtle, not --edge (WCAG 1.4.11, ADR-0047): see the
+              rationale on the turnLabel separator above. */}
           <span
-            className="text-border-color text-[14px] mx-(--space-2) opacity-60"
+            className="text-(--edge-subtle) text-[14px] mx-(--space-2) opacity-60"
             aria-hidden="true"
           >
             |
@@ -339,8 +345,10 @@ function PipelineStatusBar() {
       )}
       {persistenceQueueSummary && (
         <>
+          {/* --edge-subtle, not --edge (WCAG 1.4.11, ADR-0047): see the
+              rationale on the turnLabel separator above. */}
           <span
-            className="text-border-color text-[14px] mx-(--space-2) opacity-60"
+            className="text-(--edge-subtle) text-[14px] mx-(--space-2) opacity-60"
             aria-hidden="true"
           >
             |

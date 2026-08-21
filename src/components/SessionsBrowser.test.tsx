@@ -169,16 +169,17 @@ describe("SessionsBrowser component", () => {
 
     const item = await screen.findByTestId("session-tokens-1");
     // Migrated from inline style={{ border: "1px solid var(--border,#333)" }}
-    // to the ADR-0016 token-bridged Tailwind border utility.
-    expect(item).toHaveClass("border-border-color");
+    // to the ADR-0016 token-bridged Tailwind border utility, then swept onto
+    // --edge (ADR-0047, WCAG 1.4.11 non-text contrast).
+    expect(item).toHaveClass("border-(--edge)");
     expect(item.getAttribute("style")).toBeFalsy();
 
     const searchBox = screen.getByRole("searchbox");
-    expect(searchBox).toHaveClass("border-border-color");
+    expect(searchBox).toHaveClass("border-(--edge)");
     expect(searchBox.getAttribute("style")).toBeFalsy();
 
     const sortSelect = screen.getByLabelText(/sort by/i);
-    expect(sortSelect).toHaveClass("border-border-color");
+    expect(sortSelect).toHaveClass("border-(--edge)");
 
     // No element in the modal may carry a ghost #333 border fallback anymore.
     const modal = screen.getByRole("dialog");

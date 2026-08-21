@@ -294,7 +294,7 @@ function SessionsBrowser() {
           <div className="sessions-browser__toolbar flex flex-wrap items-center gap-(--space-4) mb-(--space-5)">
             <input
               type="search"
-              className="sessions-browser__search flex-[1_1_200px] min-w-0 py-(--space-3) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
+              className="sessions-browser__search flex-[1_1_200px] min-w-0 py-(--space-3) px-(--space-4) rounded-md border border-(--edge) bg-transparent text-[inherit]"
               aria-label={t("sessions.searchLabel")}
               placeholder={t("sessions.searchPlaceholder")}
               value={search}
@@ -308,7 +308,7 @@ function SessionsBrowser() {
                 onChange={(e) =>
                   handleSortChange(e.target.value as SessionSortMode)
                 }
-                className="py-(--space-2) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
+                className="py-(--space-2) px-(--space-4) rounded-md border border-(--edge) bg-transparent text-[inherit]"
               >
                 {SORT_MODES.map((m) => (
                   <option key={m} value={m}>
@@ -367,7 +367,7 @@ function SessionsBrowser() {
               {visible.map((s) => (
                 <li
                   key={s.id}
-                  className={`sessions-browser__item flex flex-col gap-(--space-3) rounded-md border border-border-color py-[10px] px-(--space-5) ${
+                  className={`sessions-browser__item flex flex-col gap-(--space-3) rounded-md border border-(--edge) py-[10px] px-(--space-5) ${
                     s.deleted ? "opacity-70" : "opacity-100"
                   }`}
                   data-testid={`session-${s.id}`}

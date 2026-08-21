@@ -107,6 +107,21 @@
   --divider-color: #2f3a4c;
   --divider-hover: #4a6cf7;
 
+  /* ---- Semantic: non-text contrast (WCAG 1.4.11, ADR-0047) ------------
+     --border-color measured 1.11-1.48:1 against the four surfaces
+     (--bg-primary/-secondary/-tertiary/-elevated) — well under the 3:1
+     floor for "visual information required to identify UI components".
+     Two new roles replace it going forward for that purpose:
+       --edge         component boundaries (cards, inputs, rows, panel
+                       seams) — computed >=3:1 against ALL FOUR surfaces.
+       --edge-subtle  decorative-only rules (section rhythm, not an object
+                       boundary) — WCAG 1.4.11 exempts these, so ~1.5:1 is
+                       an intentional design choice, not a compliance floor.
+     --border-color itself is untouched (still consumed by the
+     not-yet-migrated CSS modules) and is not part of the 1.4.11 contract. */
+  --edge: #6b7a92;
+  --edge-subtle: #37455a;
+
   /* ---- Semantic: text ------------------------------------------------- */
   --text-primary: #e7ebf2;
   --text-secondary: #aeb7c6;
@@ -238,14 +253,23 @@
   :root:not([data-theme="dark"]):not([data-theme="light"]) {
     color-scheme: light;
 
-    /* Surfaces & borders — ascending elevation from page → raised. */
+    /* Surfaces & borders — ascending elevation from page → raised.
+       --bg-elevated used to duplicate --bg-primary (#ffffff, 1.00:1 —
+       indistinguishable). It now sits a hair below pure white so raised
+       surfaces (modals, popovers, tooltips) read as the crispest layer
+       against the tertiary/secondary wells (93.6/96.8 L*) instead of
+       tying with the page canvas (ADR-0047). */
     --bg-primary: #ffffff;
     --bg-secondary: #f4f6fa;
     --bg-tertiary: #e9edf3;
-    --bg-elevated: #ffffff;
+    --bg-elevated: #fafbfd;
     --border-color: #d4dae3;
     --divider-color: #c4ccd8;
     --divider-hover: #3a5bd9;
+
+    /* Non-text contrast (WCAG 1.4.11, ADR-0047) — see the :root comment. */
+    --edge: #7285a1;
+    --edge-subtle: #b6bfce;
 
     /* Text — primary 16.5:1, secondary >=6.9:1, muted >=4.9:1 on all surfaces. */
     --text-primary: #1a1f29;
@@ -327,10 +351,14 @@
   --bg-primary: #ffffff;
   --bg-secondary: #f4f6fa;
   --bg-tertiary: #e9edf3;
-  --bg-elevated: #ffffff;
+  --bg-elevated: #fafbfd;
   --border-color: #d4dae3;
   --divider-color: #c4ccd8;
   --divider-hover: #3a5bd9;
+
+  /* Non-text contrast (WCAG 1.4.11, ADR-0047) — see the :root comment. */
+  --edge: #7285a1;
+  --edge-subtle: #b6bfce;
 
   --text-primary: #1a1f29;
   --text-secondary: #475063;
@@ -615,4 +643,237 @@ body {
   --text-xl: var(--font-size-xl);
   --text-2xl: var(--font-size-2xl);
   --text-3xl: var(--font-size-3xl);
+}
+
+/* --------------------------------------------------------------------------
+   Tier-3 recipe layer (ADR-0047)
+   --------------------------------------------------------------------------
+   Populates the `components` layer declared in the `@layer` order at the top
+   of this file (previously declared, never populated). This is a THIRD
+   styling channel alongside ADR-0016's two ("utilities-via-token-bridge" for
+   migrated components, "semantic BEM" for deep data-layout trees and the
+   not-yet-migrated remainder): a small, closed set of `.ag-*` recipes for
+   visual primitives that recur across many components — a status chip, a
+   card, a micro label — generalizing the pattern `settings/Badge.tsx`
+   established for one such primitive (a closed `tone` union with a
+   guaranteed-styled fallback) into plain CSS with attribute-selector
+   variants, so components using it need zero extra runtime/JS.
+
+   ZERO adoption ships in this change — these recipes land unused. Component
+   migration onto them is a separate, later ticket (see ADR-0047).
+
+   Every recipe below draws color exclusively from :root's semantic token
+   layer (ADR-0009), so both themes are automatic — no per-theme overrides
+   live here.
+   -------------------------------------------------------------------------- */
+@layer components {
+  /* ---- .ag-label — micro section label -------------------------------
+     11px/600/0.04em uppercase, the shared shape behind `.panel-title` /
+     `.settings-rail-group__label` / dt terms in the data-layout trees, so
+     future adopters (SessionDataRoutePanel/ProjectionRuntimeStatusPanel/
+     TokenUsagePanel dt, LiveTranscript speaker names, SeekTimeline ticks)
+     converge on one rule instead of re-deriving the same three properties. */
+  .ag-label {
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    line-height: var(--line-height-tight);
+  }
+
+  /* ---- .ag-chip[data-tone] — closed-set status chip -------------------
+     Generalizes `settings/Badge.tsx`'s `Record<BadgeTone, string>` map into
+     an attribute-selector recipe. The base rule is the neutral tint, so a
+     chip with a missing `data-tone` OR an unrecognized value (a future
+     backend status this file doesn't know about yet) still renders styled
+     — never blank — exactly mirroring Badge's `default: return "neutral"`
+     fallback. Known tones override the base. "info" is new here (Badge's
+     tone union doesn't have it); it reuses the existing --tint-info /
+     --text-on-tint-info pair already defined for Test-Connection chips. */
+  .ag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-4);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    line-height: 1.4;
+    white-space: nowrap;
+    /* Neutral fallback — see the comment above. */
+    background: var(--hover-overlay);
+    color: var(--text-muted);
+  }
+
+  .ag-chip[data-tone="success"] {
+    background: var(--tint-success);
+    color: var(--text-on-tint-success);
+  }
+
+  .ag-chip[data-tone="warning"] {
+    background: var(--tint-warning);
+    color: var(--text-on-tint-warning);
+  }
+
+  .ag-chip[data-tone="danger"] {
+    background: var(--tint-danger);
+    color: var(--text-on-tint-danger);
+  }
+
+  .ag-chip[data-tone="info"] {
+    background: var(--tint-info);
+    color: var(--text-on-tint-info);
+  }
+
+  .ag-chip[data-tone="neutral"] {
+    background: var(--hover-overlay);
+    color: var(--text-muted);
+  }
+
+  .ag-chip[data-tone="accent"] {
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+
+  /* ---- .ag-card[data-elevation] — surface card ------------------------
+     Three closed states, ascending lift. "flat" sits flush against the
+     panel it lives in — its frame is a rhythm cue, not an object boundary
+     the user needs to locate, so it deliberately takes --edge-subtle
+     (justification for the one --edge-subtle recipe use in this layer).
+     "raised" and "overlay" are actually lifted off the surface beneath
+     them (a card standing away from its panel, or a floating
+     modal/popover/tooltip) — that IS a boundary a low-vision user needs to
+     perceive, so both take --edge. The inset top highlight + demoted
+     "ambient" shadow (--shadow-1 instead of --shadow-2/3) is the dark
+     elevation model from the 1.4.11 pass: a literal, theme-independent
+     rgba(255,255,255,0.06) bevel reads as a highlight on the dark surfaces
+     it was tuned for and is a harmless no-op on the near-white light
+     surfaces (nothing to highlight against). */
+  .ag-card {
+    border-radius: var(--radius-lg);
+    padding: var(--space-6);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--edge-subtle);
+  }
+
+  .ag-card[data-elevation="raised"] {
+    background: var(--bg-elevated);
+    border-color: var(--edge);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      var(--shadow-1);
+  }
+
+  .ag-card[data-elevation="overlay"] {
+    background: var(--bg-elevated);
+    border-color: var(--edge);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      var(--shadow-overlay);
+  }
+
+  /* ---- .ag-btn-micro — ghost micro button ------------------------------
+     The tiny text/icon ghost button used for inline row actions (ADR-0047
+     names LiveTranscript's per-line actions as the first intended
+     adopter). Transparent by default; hover promotes it to a visible
+     control without permanently competing with primary actions. Focus
+     ring comes from the global `:focus-visible` rule above — not
+     redefined here. */
+  .ag-btn-micro {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-medium);
+    cursor: pointer;
+    transition:
+      background-color var(--motion-fast) var(--ease-standard),
+      color var(--motion-fast) var(--ease-standard),
+      border-color var(--motion-fast) var(--ease-standard);
+  }
+
+  .ag-btn-micro:hover:not(:disabled) {
+    background: var(--hover-overlay);
+    color: var(--text-primary);
+    border-color: var(--edge-subtle);
+  }
+
+  .ag-btn-micro:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  /* ---- .ag-field — labeled control -------------------------------------
+     Generalizes `.settings-input`/`.settings-field` (settings.css) into a
+     token-first recipe with two closed layouts: the default stacked
+     label-above-control shape for a form field, and
+     `data-layout="row"` for a label-left/status-right checklist row (the
+     preflight card's Sources/Route/Storage pass-fail rows). The border on
+     the control is a real component boundary (an input the user needs to
+     locate and target), so it takes --edge, not --edge-subtle. */
+  .ag-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .ag-field[data-layout="row"] {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+
+  .ag-field > input,
+  .ag-field > select,
+  .ag-field > textarea,
+  .ag-field__control {
+    width: 100%;
+    padding: var(--space-4) var(--space-5);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--edge);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: var(--font-size-base);
+    box-sizing: border-box;
+    transition: border-color var(--motion-base) var(--ease-standard);
+  }
+
+  .ag-field > input:focus,
+  .ag-field > select:focus,
+  .ag-field > textarea:focus {
+    border-color: var(--accent);
+    outline: none;
+  }
+
+  /* ---- .ag-panel-head — panel header bar -------------------------------
+     One header per panel (NotesPanel's intended first adopter): a title on
+     the left, room for header actions on the right. The bottom rule
+     separates the header region from the panel body — a structural
+     boundary, so --edge. */
+  .ag-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--edge);
+    background: var(--bg-tertiary);
+  }
+
+  .ag-panel-head > h1,
+  .ag-panel-head > h2,
+  .ag-panel-head > h3,
+  .ag-panel-head__title {
+    margin: 0;
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+    color: var(--text-primary);
+  }
 }

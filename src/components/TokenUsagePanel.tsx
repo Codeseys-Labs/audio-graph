@@ -480,7 +480,7 @@ function TokenUsagePanel() {
 
   return (
     <section
-      className="flex-shrink-0 pt-(--space-4) px-(--space-5) pb-[10px] border-t border-border-color bg-bg-tertiary"
+      className="flex-shrink-0 pt-(--space-4) px-(--space-5) pb-[10px] border-t border-(--edge) bg-bg-tertiary"
       aria-label={t("tokens.title")}
     >
       <div className="flex items-center justify-between mb-(--space-3) gap-(--space-4)">
@@ -504,7 +504,7 @@ function TokenUsagePanel() {
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleNewSession}
             disabled={newSessionLocked}
             aria-label={t("tokens.newSession")}
@@ -522,7 +522,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleReset}
             disabled={!hasSession}
             aria-label={t("tokens.reset")}
@@ -532,7 +532,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleClearAll}
             disabled={!hasAny}
             aria-label={t("tokens.clearAll")}
@@ -602,8 +602,11 @@ function TokenUsagePanel() {
         )}
       </fieldset>
 
+      {/* --edge-subtle, not --edge (WCAG 1.4.11, ADR-0047): this dashed rule
+          is a section-rhythm divider inside one panel, not a boundary
+          between two components the user needs to locate. */}
       <fieldset
-        className="mt-[10px] pt-(--space-4) border-0 border-t border-dashed border-border-color opacity-90 px-0 pb-0 m-0 min-w-0"
+        className="mt-[10px] pt-(--space-4) border-0 border-t border-dashed border-(--edge-subtle) opacity-90 px-0 pb-0 m-0 min-w-0"
         aria-label={t("tokens.lifetime")}
       >
         <h4 className={scopeLabel}>

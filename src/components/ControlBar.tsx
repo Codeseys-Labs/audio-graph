@@ -236,7 +236,7 @@ function ControlBar() {
 
   return (
     <header
-      className="control-bar flex items-center justify-between px-(--space-6) bg-bg-tertiary border-b border-border-color h-[52px] flex-shrink-0 gap-(--space-6)"
+      className="control-bar flex items-center justify-between px-(--space-6) bg-bg-tertiary border-b border-(--edge) h-[52px] flex-shrink-0 gap-(--space-6)"
       role="toolbar"
       aria-label={t("controlBar.toolbarLabel")}
     >

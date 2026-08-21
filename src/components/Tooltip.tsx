@@ -46,7 +46,7 @@ export default function Tooltip({
           <RadixTooltip.Content
             side={side}
             sideOffset={6}
-            className="z-[var(--z-popover)] max-w-[260px] py-(--space-2) px-(--space-4) rounded-md bg-bg-elevated border border-border-color text-text-secondary text-xs leading-[1.4] shadow-2 select-none"
+            className="z-[var(--z-popover)] max-w-[260px] py-(--space-2) px-(--space-4) rounded-md bg-bg-elevated border border-(--edge) text-text-secondary text-xs leading-[1.4] shadow-2 select-none"
           >
             {content}
             <RadixTooltip.Arrow className="fill-bg-elevated" />

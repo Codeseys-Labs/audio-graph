@@ -570,10 +570,10 @@ export default function AudioSourceSelector() {
   const sourceItem =
     "flex items-center gap-(--space-4) py-(--space-3) px-(--space-4) rounded-sm transition-[background-color] duration-[120ms] ease-[ease] text-md text-text-primary";
   const sectionEmpty =
-    "border border-border-color rounded-sm py-(--space-3) px-(--space-4) text-text-muted text-sm leading-[1.35]";
+    "border border-(--edge) rounded-sm py-(--space-3) px-(--space-4) text-text-muted text-sm leading-[1.35]";
 
   return (
-    <div ref={selectorRef} className="border-b border-border-color">
+    <div ref={selectorRef} className="border-b border-(--edge)">
       <div className="flex items-center justify-between mb-[10px]">
         <span className="audio-source-selector__title">Audio Sources</span>
         <IconButton
@@ -655,7 +655,7 @@ export default function AudioSourceSelector() {
         <input
           ref={searchInputRef}
           type="text"
-          className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-border-color rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
+          className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-(--edge) rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
           aria-label={t("settings.audioSources.searchLabel")}
           placeholder={t("settings.audioSources.searchPlaceholder")}
           value={searchFilter}
@@ -681,7 +681,7 @@ export default function AudioSourceSelector() {
           type="button"
           role="tab"
           aria-selected={processScope === "audio"}
-          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "audio" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
+          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "audio" ? "bg-bg-elevated text-accent border-accent" : "border-(--edge) bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("audio")}
           title={t("settings.audioSources.scopeAudioHint")}
         >
@@ -691,7 +691,7 @@ export default function AudioSourceSelector() {
           type="button"
           role="tab"
           aria-selected={processScope === "all"}
-          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "all" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
+          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "all" ? "bg-bg-elevated text-accent border-accent" : "border-(--edge) bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("all")}
           title={t("settings.audioSources.scopeAllHint")}
         >
@@ -1002,7 +1002,7 @@ export default function AudioSourceSelector() {
                           </span>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={processDisabled}
                             title={processTitle}
                             aria-pressed={selected}
@@ -1019,7 +1019,7 @@ export default function AudioSourceSelector() {
                           </span>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={treeDisabled}
                             title={treeTitle}
                             aria-pressed={treeSelected}

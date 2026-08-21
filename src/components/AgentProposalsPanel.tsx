@@ -41,7 +41,7 @@ function statusClass(status: LiveAssistCardRecord["status"]): string {
     case "approved":
       return `${base} border-accent-green text-accent-green`;
     case "dismissed":
-      return `${base} border-border-color text-text-muted`;
+      return `${base} border-(--edge) text-text-muted`;
     case "pending":
       return `${base} border-accent-blue text-accent-blue`;
   }
@@ -128,7 +128,7 @@ function AgentProposalsPanel() {
 
   return (
     <section
-      className="border-t border-border-color py-[10px] px-(--space-5) max-h-[240px] overflow-y-auto shrink-0"
+      className="border-t border-(--edge) py-[10px] px-(--space-5) max-h-[240px] overflow-y-auto shrink-0"
       aria-label={t("agent.label")}
     >
       <div className="flex items-center justify-between gap-(--space-4) mb-(--space-4)">
@@ -136,7 +136,7 @@ function AgentProposalsPanel() {
         {pendingCount > 0 ? (
           <button
             type="button"
-            className="border border-border-color rounded-sm bg-transparent text-text-secondary text-xs leading-[20px] py-0 px-(--space-4) cursor-pointer hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+            className="border border-(--edge) rounded-sm bg-transparent text-text-secondary text-xs leading-[20px] py-0 px-(--space-4) cursor-pointer hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
             disabled={approving.size > 0}
             onClick={() => void clearAgentProposals()}
           >
@@ -165,7 +165,7 @@ function AgentProposalsPanel() {
           return (
             <li
               key={proposal.id}
-              className="border border-border-color rounded-md p-(--space-4) bg-bg-tertiary"
+              className="border border-(--edge) rounded-md p-(--space-4) bg-bg-tertiary"
             >
               <div className="flex justify-between text-text-muted text-xs mb-(--space-2)">
                 <div className="flex min-w-0 flex-wrap items-center gap-(--space-2)">
@@ -220,7 +220,7 @@ function AgentProposalsPanel() {
                     </button>
                     <button
                       type="button"
-                      className="border border-border-color rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+                      className="border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
                       onClick={() => void dismissAgentProposal(proposal.id)}
                     >
                       {t("agent.dismiss")}
@@ -239,7 +239,7 @@ function AgentProposalsPanel() {
                   </button>
                   <button
                     type="button"
-                    className="border border-border-color rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+                    className="border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
                     disabled={isApproving}
                     onClick={() => void dismissAgentProposal(proposal.id)}
                   >

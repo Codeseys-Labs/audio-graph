@@ -68,7 +68,7 @@ function ChatSidebar() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      <div className="flex items-center justify-between py-[10px] px-(--space-5) border-b border-border-color shrink-0">
+      <div className="flex items-center justify-between py-[10px] px-(--space-5) border-b border-(--edge) shrink-0">
         <h3 className="m-0 text-[0.95rem] font-semibold text-text-primary">
           <Icon name="chat" size={16} /> {t("chat.title")}
         </h3>
@@ -127,7 +127,7 @@ function ChatSidebar() {
               className={
                 msg.role === "user"
                   ? `${messageContentBase} bg-accent-blue text-(--on-accent-blue) rounded-br-sm`
-                  : `${messageContentBase} bg-bg-tertiary text-text-primary border border-border-color rounded-bl-sm`
+                  : `${messageContentBase} bg-bg-tertiary text-text-primary border border-(--edge) rounded-bl-sm`
               }
             >
               {msg.content}
@@ -141,7 +141,7 @@ function ChatSidebar() {
               {t("chat.roleAssistant")}
             </div>
             <div
-              className="flex gap-(--space-2) py-(--space-4) px-(--space-5) bg-bg-tertiary border border-border-color rounded-xl rounded-bl-sm"
+              className="flex gap-(--space-2) py-(--space-4) px-(--space-5) bg-bg-tertiary border border-(--edge) rounded-xl rounded-bl-sm"
               role="status"
             >
               <span className="sr-only">{t("chat.thinking")}</span>
@@ -164,7 +164,7 @@ function ChatSidebar() {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="flex flex-col gap-(--space-3) py-[10px] px-(--space-5) border-t border-border-color bg-bg-secondary shrink-0">
+      <div className="flex flex-col gap-(--space-3) py-[10px] px-(--space-5) border-t border-(--edge) bg-bg-secondary shrink-0">
         {historicalReview && (
           <p
             id="chat-review-send-help"
@@ -178,7 +178,7 @@ function ChatSidebar() {
           <input
             ref={inputRef}
             type="text"
-            className="flex-1 py-(--space-4) px-(--space-5) border border-border-color rounded-lg bg-bg-primary text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
+            className="flex-1 py-(--space-4) px-(--space-5) border border-(--edge) rounded-lg bg-bg-primary text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
             placeholder={t("chat.inputPlaceholder")}
             aria-label={t("chat.inputLabel")}
             aria-describedby={

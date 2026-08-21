@@ -166,7 +166,7 @@ export default function NotesPanel() {
   const sectionTitle =
     "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
   const chipBase =
-    "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-border-color";
+    "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-(--edge)";
 
   return (
     <div
@@ -237,7 +237,7 @@ export default function NotesPanel() {
               {t("notes.synthesizedAt", { time: synthesizedTime })}
             </span>
           </div>
-          <div className="text-sm leading-[1.5] text-text-primary whitespace-pre-wrap break-words py-(--space-4) px-(--space-5) rounded-lg bg-bg-tertiary border border-border-color">
+          <div className="text-sm leading-[1.5] text-text-primary whitespace-pre-wrap break-words py-(--space-4) px-(--space-5) rounded-lg bg-bg-tertiary border border-(--edge)">
             {result.markdown}
           </div>
           {isStale && (
@@ -373,7 +373,7 @@ function MaterializedNoteItem({
   return (
     <li
       data-note-id={note.id}
-      className="rounded-md border border-border-color bg-bg-tertiary py-(--space-3) px-(--space-4)"
+      className="rounded-md border border-(--edge) bg-bg-tertiary py-(--space-3) px-(--space-4)"
     >
       <div className="flex items-start justify-between gap-(--space-3)">
         <h5 className="m-0 text-sm font-semibold text-text-primary [overflow-wrap:anywhere]">
@@ -396,7 +396,7 @@ function MaterializedNoteItem({
           {note.tags.map((tag) => (
             <span
               key={tag}
-              className="text-[11px] py-[1px] px-(--space-2) rounded-sm bg-bg-elevated text-text-muted border border-border-color"
+              className="text-[11px] py-[1px] px-(--space-2) rounded-sm bg-bg-elevated text-text-muted border border-(--edge)"
             >
               {tag}
             </span>

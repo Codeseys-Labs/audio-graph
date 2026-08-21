@@ -23,12 +23,12 @@ import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 // conversation-mode.css module. Colors/radii/fonts resolve through design
 // tokens via the @theme bridge; spacing uses the token shorthand.
 const SEGMENTS =
-  "inline-flex bg-bg-tertiary border border-border-color rounded-md p-px";
+  "inline-flex bg-bg-tertiary border border-(--edge) rounded-md p-px";
 const SEG =
   "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border-none bg-transparent text-text-secondary text-sm font-medium rounded-sm cursor-pointer transition-colors duration-[120ms] hover:text-text-primary";
 const SEG_ACTIVE = "bg-bg-elevated text-text-primary";
 const ENGINE =
-  "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border border-border-color bg-transparent text-text-secondary text-xs rounded-full cursor-pointer hover:text-text-primary hover:border-divider-color";
+  "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border border-(--edge) bg-transparent text-text-secondary text-xs rounded-full cursor-pointer hover:text-text-primary hover:border-divider-color";
 const ENGINE_ACTIVE = "text-accent border-accent bg-(--tint-accent)";
 const BADGE =
   "ml-(--space-2) py-0 px-(--space-2) text-2xs rounded-sm bg-bg-tertiary text-text-muted border-none";

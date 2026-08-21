@@ -31,7 +31,7 @@ interface PopoverOverlayProps {
 export default function PopoverOverlay({
   label,
   onClose,
-  className = "fixed top-[52px] right-[12px] z-[var(--z-popover)] w-[360px] max-w-[calc(100vw-24px)] max-h-[calc(100vh-80px)] overflow-auto bg-bg-secondary border border-border-color rounded-xl shadow-(--shadow-overlay) p-(--space-4)",
+  className = "fixed top-[52px] right-[12px] z-[var(--z-popover)] w-[360px] max-w-[calc(100vw-24px)] max-h-[calc(100vh-80px)] overflow-auto bg-bg-secondary border border-(--edge) rounded-xl shadow-(--shadow-overlay) p-(--space-4)",
   children,
 }: PopoverOverlayProps) {
   const ref = useFocusTrap<HTMLDivElement>();

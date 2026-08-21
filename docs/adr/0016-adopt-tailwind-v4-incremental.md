@@ -15,6 +15,23 @@ explicit owner decision to adopt a utility framework.
 > incremental component migration (13 modules) per the Implementation section
 > below. Status drift corrected per backlog audit 2026-05-30 (B05).
 
+> **Status note (2026-08-20):** the "Conventions clause (token consolidation,
+> 2026-06-29)" section's **"Two channels only... there is no third
+> channel"** rule is **amended by [ADR-0047](0047-tier-3-recipe-layer-and-non-text-contrast-edge-tokens.md)**,
+> which opens a third channel — a closed set of `.ag-*` recipes in the
+> `components` layer already declared in the `@layer` order below (line ~25)
+> but never populated. The same clause's **"Closed, typed variant sets for
+> badges/chips"** bullet is also amended in mechanism only: `.ag-chip[data-tone]`
+> displaces the typed `Badge` React component for the recipe-layer path (CSS
+> attribute selectors, no component), but keeps the same guarantee — a
+> missing/unrecognized tone renders styled neutral, never an unstyled
+> modifier. `Badge` itself is not removed by this note; ADR-0047 schedules
+> its eventual absorption as a later adoption ticket. Everything else in this
+> record — Tailwind v4 itself, no-Preflight, the token bridge, the
+> two-channel split for already-migrated vs. not-yet-migrated components — is
+> unaffected and remains in force. Read ADR-0047 for the third channel's
+> scope and boundary.
+
 ## Context
 
 ADR-0015 (proposed earlier today) recommended staying on vanilla, modularized CSS

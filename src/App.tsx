@@ -680,7 +680,7 @@ function App() {
   const analysisContextPanel = (
     <aside className="right-panel" style={{ width: rightWidth }}>
       <div
-        className="flex border-b border-b-border-color bg-bg-secondary shrink-0"
+        className="flex border-b border-(--edge) bg-bg-secondary shrink-0"
         role="tablist"
         aria-label={t("app.rightPanelViews")}
       >
