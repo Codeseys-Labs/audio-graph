@@ -532,6 +532,365 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
     let _ = fs::remove_dir_all(&models_dir);
 }
 
+/// Load the raw wire message at `messages[index]` from a `fixtures/asr/`
+/// event fixture and replay it through the real Deepgram message handler,
+/// so a test drives the exact same parsing path production does instead of
+/// hand-building a `DeepgramEvent` literal that can drift from the fixture
+/// it claims to mirror.
+fn load_deepgram_fixture_event(
+    relative_path: &str,
+    index: usize,
+) -> crate::asr::deepgram::DeepgramEvent {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("asr")
+        .join(relative_path);
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read fixture {}: {error}", path.display()));
+    let fixture: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("failed to parse fixture {}: {error}", path.display()));
+    let raw = fixture["messages"][index]["raw"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: messages[{index}].raw missing/not a string",
+                path.display()
+            )
+        });
+    let (tx, rx) = crossbeam_channel::unbounded::<crate::asr::deepgram::DeepgramEvent>();
+    crate::asr::deepgram::handle_server_message(raw, &tx);
+    rx.try_recv()
+        .unwrap_or_else(|_| panic!("{}: messages[{index}] produced no event", path.display()))
+}
+
+/// audio-graph-4aed: production diarization discarded per-word speaker
+/// indices. `run_deepgram_event_receiver` derived a final's speaker from
+/// `words.first()` alone, so a final whose words evidence a mid-final turn
+/// change (Deepgram sets a per-WORD `speaker`, not a per-final one) was
+/// attributed entirely to whichever speaker uttered the first word —
+/// field-measured: ~18% turn recall, 97.6% of speech time collapsed onto one
+/// speaker on a 2-person podcast.
+///
+/// Three checks, each driven through the real `run_deepgram_event_receiver`
+/// thread:
+///
+/// 1. The exact multi-speaker final already covered by the
+///    diarization-ledger normalizer fixture (message index 1 of
+///    `fixtures/asr/deepgram/diarization_revisions.json` — the "hello world"
+///    final, `hello` on speaker 0 followed by `world` on speaker 1) gets
+///    replayed from that fixture file through the real Deepgram message
+///    parser, not a hand-built literal, and must land as two segments with
+///    coherent per-run span ids/revisions instead of one segment carrying
+///    only `words.first()`'s speaker.
+/// 2. A final whose words carry a `punctuated_word` (production sets
+///    `punctuate=true`, so real words always do) must keep that
+///    punctuation/capitalization in each split run's text, not fall back to
+///    the raw lowercase `word` token.
+/// 3. A final whose runs' word-starts round to the same span-id millisecond
+///    must still get distinct span ids — group (1)'s and (2)'s span ids are
+///    always naturally far enough apart in this fixture data to skip this
+///    guard, so it needs its own crafted timestamps.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_multi_speaker_final_splits_into_per_run_segments() {
+    let data_dir = unique_tempdir("deepgram-multi-speaker-final");
+    let _guard = DataDirGuard::set(&data_dir);
+    let app_handle = super::shared_test_app_handle();
+    let session_id = "deepgram-multi-speaker-final-session";
+    let models_dir = std::env::temp_dir().join(format!(
+        "audio-graph-deepgram-multi-speaker-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&models_dir).expect("create temp models dir");
+
+    let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
+        Arc::new(RwLock::new(VecDeque::new()));
+    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
+    let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+    let graph_extractor = Arc::new(RuleBasedExtractor::new());
+    let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
+    let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
+    let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+    let openrouter_client: Arc<Mutex<Option<OpenRouterClient>>> = Arc::new(Mutex::new(None));
+    let llm_executor = LlmExecutor::new(
+        llm_engine.clone(),
+        api_client.clone(),
+        openrouter_client.clone(),
+        mistralrs_engine.clone(),
+    );
+    let transcript_event_writer = Arc::new(Mutex::new(TranscriptEventWriter::spawn(session_id)));
+    assert!(
+        transcript_event_writer.lock().unwrap().is_some(),
+        "integration fixture requires an accepting canonical writer"
+    );
+
+    let projection_job_workers: crate::state::ProjectionJobRegistry =
+        Arc::new(Mutex::new(Vec::new()));
+    let projection_lane_stopping = Arc::new(AtomicBool::new(false));
+    let transcript_ledger = Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
+        session_id,
+    )));
+    let shared = SpeechShared {
+        transcript_buffer: transcript_buffer.clone(),
+        transcript_writer: Arc::new(Mutex::new(None)),
+        transcript_event_writer,
+        transcript_ledger: transcript_ledger.clone(),
+        speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+            session_id,
+        ))),
+        projection_schedulers: Arc::new(Mutex::new(
+            crate::projection_scheduler::ProjectionSchedulers::new(session_id),
+        )),
+        projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(session_id),
+        active_session_id: Arc::new(RwLock::new(session_id.to_string())),
+        pipeline_status: pipeline_status.clone(),
+        app_handle,
+        knowledge_graph,
+        graph_snapshot,
+        graph_extractor,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_executor,
+        pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+        projection_job_workers: projection_job_workers.clone(),
+        projection_lane_stopping: projection_lane_stopping.clone(),
+    };
+    let config = SpeechConfig {
+        models_dir: models_dir.clone(),
+        llm_provider: LlmProvider::default(),
+        llm_allow_cloud_fallbacks: true,
+        provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+    };
+    let source_id = "integration-source".to_string();
+    let source_id_hint = Arc::new(RwLock::new(Some(source_id.clone())));
+
+    let (event_tx, event_rx) =
+        crossbeam_channel::bounded::<crate::asr::deepgram::DeepgramEvent>(16);
+    // max_speakers = 0 ("no cap") so the raw Deepgram speaker indices pass
+    // through unchanged (0 -> "Speaker 0", 1 -> "Speaker 1").
+    let receiver_thread = std::thread::spawn(move || {
+        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0);
+    });
+
+    // --- Check 1: fixture-sourced multi-speaker final --------------------
+    // `messages[1]` in the diarization-ledger normalizer fixture is the
+    // "hello world" final: start=1.0, duration=1.5, hello@[1.0,1.5) speaker
+    // 0, world@[1.5,2.5) speaker 1, confidence=0.75. Loaded from the fixture
+    // file and replayed through the real parser (`handle_server_message`),
+    // not hand-built, so this test tracks fixture drift instead of a
+    // manual copy of it.
+    let fixture_event = load_deepgram_fixture_event("deepgram/diarization_revisions.json", 1);
+    event_tx
+        .send(fixture_event)
+        .expect("send fixture multi-speaker final");
+
+    wait_until(
+        "fixture multi-speaker final to split into two segments",
+        || {
+            transcript_buffer
+                .read()
+                .map(|buf| buf.len() == 2)
+                .unwrap_or(false)
+        },
+    );
+
+    {
+        let buffer = transcript_buffer.read().expect("transcript buffer lock");
+        let segments: Vec<&TranscriptSegment> = buffer.iter().collect();
+        assert_eq!(
+            segments.len(),
+            2,
+            "a mid-final speaker change must split into two segments, not collapse onto \
+             words.first()'s speaker"
+        );
+
+        assert_eq!(segments[0].text, "hello");
+        assert_eq!(segments[0].speaker_label.as_deref(), Some("Speaker 0"));
+        assert_eq!(segments[0].start_time, 1.0);
+        assert_eq!(segments[0].end_time, 1.5);
+
+        assert_eq!(segments[1].text, "world");
+        assert_eq!(
+            segments[1].speaker_label.as_deref(),
+            Some("Speaker 1"),
+            "run 1's words must not be silently attributed to run 0's speaker"
+        );
+        assert_eq!(segments[1].start_time, 1.5);
+        assert_eq!(segments[1].end_time, 2.5);
+    }
+
+    // Span-id / revision coherence: two independent spans, not one span
+    // silently overwritten by the second run. Run 0 keeps the
+    // `provider_start_span_id` convention keyed on the final's own start
+    // (so a live interim at that span would have been closed out exactly as
+    // the single-run path does); run 1 is a brand-new span keyed on its own
+    // later start time. Both are first revisions with nothing superseded,
+    // since no interim ever announced either span before this final.
+    {
+        let ledger = transcript_ledger.lock().expect("ledger lock");
+        assert_eq!(
+            ledger.latest_spans.len(),
+            2,
+            "two split runs must produce two independently addressable ledger spans"
+        );
+        let by_span_id = |id: &str| {
+            ledger
+                .latest_spans
+                .iter()
+                .find(|span| span.span_id == id)
+                .unwrap_or_else(|| panic!("ledger missing expected span_id {id}"))
+        };
+        let run0_span_id = super::provider_start_span_id("deepgram", &source_id, 1.0);
+        let run1_span_id = super::provider_start_span_id("deepgram", &source_id, 1.5);
+        assert_ne!(
+            run0_span_id, run1_span_id,
+            "split runs must never collide on the same span_id"
+        );
+
+        let run0 = by_span_id(&run0_span_id);
+        assert_eq!(run0.revision_number, 1);
+        assert_eq!(run0.supersedes, None);
+        assert_eq!(run0.speaker_label.as_deref(), Some("Speaker 0"));
+
+        let run1 = by_span_id(&run1_span_id);
+        assert_eq!(run1.revision_number, 1);
+        assert_eq!(run1.supersedes, None);
+        assert_eq!(run1.speaker_label.as_deref(), Some("Speaker 1"));
+    }
+
+    // --- Check 2: punctuated_word fidelity across a split -----------------
+    // Production connects with `punctuate=true`, so real words always carry
+    // a `punctuated_word`. Reuses the same "hello"/"world" tokens as check 1
+    // (capitalized/punctuated, not new transcript content) at a distinct
+    // start so its span ids can't collide with check 1's.
+    let punctuated_word = |word: &str, punctuated: &str, start: f64, end: f64, speaker: u32| {
+        crate::asr::deepgram::DeepgramWord {
+            word: word.to_string(),
+            punctuated_word: Some(punctuated.to_string()),
+            start,
+            end,
+            confidence: 0.75,
+            speaker: Some(speaker),
+        }
+    };
+    event_tx
+        .send(crate::asr::deepgram::DeepgramEvent::Transcript {
+            text: "Hello world.".to_string(),
+            confidence: 0.75,
+            is_final: true,
+            speech_final: false,
+            start: 10.0,
+            duration: 1.0,
+            words: vec![
+                punctuated_word("hello", "Hello", 10.0, 10.5, 0),
+                punctuated_word("world", "world.", 10.5, 11.0, 1),
+            ],
+        })
+        .expect("send punctuated multi-speaker final");
+
+    wait_until("punctuated final to split into two more segments", || {
+        transcript_buffer
+            .read()
+            .map(|buf| buf.len() == 4)
+            .unwrap_or(false)
+    });
+
+    {
+        let buffer = transcript_buffer.read().expect("transcript buffer lock");
+        let segments: Vec<&TranscriptSegment> = buffer.iter().collect();
+        assert_eq!(
+            segments[2].text, "Hello",
+            "split-run text must use punctuated_word, not the raw lowercase word token"
+        );
+        assert_eq!(
+            segments[3].text, "world.",
+            "split-run text must use punctuated_word, not the raw lowercase word token"
+        );
+    }
+
+    // --- Check 3: millisecond-quantization span-id collision guard -------
+    // `hello` ends at 20.0002 and `world` starts at 20.0004 — both round to
+    // the same span-id millisecond (20000) as the final's own `start`
+    // (20.0), which run 0 already claims. Without a guard, run 1's naive
+    // `provider_start_span_id` would collide with run 0's and silently
+    // supersede it in the ledger.
+    event_tx
+        .send(crate::asr::deepgram::DeepgramEvent::Transcript {
+            text: "hello world".to_string(),
+            confidence: 0.75,
+            is_final: true,
+            speech_final: false,
+            start: 20.0,
+            duration: 0.01,
+            words: vec![
+                punctuated_word("hello", "hello", 20.0, 20.0002, 0),
+                punctuated_word("world", "world", 20.0004, 20.01, 1),
+            ],
+        })
+        .expect("send millisecond-tied multi-speaker final");
+
+    wait_until(
+        "millisecond-tied final to split into two more segments",
+        || {
+            transcript_buffer
+                .read()
+                .map(|buf| buf.len() == 6)
+                .unwrap_or(false)
+        },
+    );
+
+    {
+        let ledger = transcript_ledger.lock().expect("ledger lock");
+        let naive_run1_span_id = super::provider_start_span_id("deepgram", &source_id, 20.0004);
+        let run0_span_id = super::provider_start_span_id("deepgram", &source_id, 20.0);
+        assert_eq!(
+            naive_run1_span_id, run0_span_id,
+            "test setup sanity check: both runs must quantize to the same millisecond \
+             for this to actually exercise the collision guard"
+        );
+
+        let matching: Vec<_> = ledger
+            .latest_spans
+            .iter()
+            .filter(|span| span.span_id == run0_span_id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "run 1 must not silently overwrite run 0's ledger span when their \
+             millisecond-quantized starts collide"
+        );
+        assert_eq!(matching[0].revision_number, 1);
+        assert_eq!(matching[0].supersedes, None);
+
+        let bumped_run1 = ledger
+            .latest_spans
+            .iter()
+            .find(|span| span.span_id != run0_span_id && span.start_time > 20.0003)
+            .expect("run 1 must land on a distinct, disambiguated span_id");
+        assert_eq!(bumped_run1.revision_number, 1);
+        assert_eq!(bumped_run1.supersedes, None);
+    }
+
+    drop(event_tx);
+    let (join_done_tx, join_done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = join_done_tx.send(receiver_thread.join());
+    });
+    join_done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("event receiver thread must exit within 3s of the channel disconnecting")
+        .expect("event receiver thread must exit cleanly once the channel disconnects");
+
+    stop_and_drain_projection_lane(&projection_lane_stopping, &projection_job_workers);
+    let _ = fs::remove_dir_all(&models_dir);
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",

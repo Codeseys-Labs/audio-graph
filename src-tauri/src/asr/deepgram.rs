@@ -108,10 +108,33 @@ pub enum DeepgramTurnKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepgramWord {
     pub word: String,
+    /// The punctuated/capitalized form of `word`, when Deepgram's response
+    /// includes it. Production connects with `punctuate=true` (see the
+    /// socket URL builder), so `alternatives[].transcript` is punctuated
+    /// while `word` is always the raw lowercase token — `punctuated_word` is
+    /// the per-word field that carries the same punctuation/capitalization
+    /// (audio-graph-4aed review). `None` on fixtures/messages that omit the
+    /// key. Read [`DeepgramWord::display_word`] rather than `word` directly
+    /// when reconstructing user-facing text from words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub punctuated_word: Option<String>,
     pub start: f64,
     pub end: f64,
     pub confidence: f32,
     pub speaker: Option<u32>,
+}
+
+impl DeepgramWord {
+    /// The punctuated/capitalized form when Deepgram provided one, falling
+    /// back to the raw token otherwise. Multi-speaker finals reconstruct
+    /// each split run's text by joining these (audio-graph-4aed) — joining
+    /// `word` instead would silently drop punctuation/capitalization for
+    /// every split run even though `punctuate=true` is set on production
+    /// connections (single-speaker finals never hit this because they keep
+    /// the provider's already-punctuated `transcript` string verbatim).
+    pub fn display_word(&self) -> &str {
+        self.punctuated_word.as_deref().unwrap_or(&self.word)
+    }
 }
 
 /// Configuration for a Deepgram streaming session.
@@ -1516,7 +1539,7 @@ async fn run_io_with_keepalive_interval(
 
 /// Parse a single Deepgram server JSON message and emit appropriate events.
 #[cfg(test)]
-pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
     handle_server_message_with_key(text, tx, "");
 }
 
@@ -1595,6 +1618,10 @@ fn handle_server_message_with_key(
                             .iter()
                             .filter_map(|w| {
                                 let word = w.get("word")?.as_str()?.to_string();
+                                let punctuated_word = w
+                                    .get("punctuated_word")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
                                 let word_start =
                                     w.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1605,6 +1632,7 @@ fn handle_server_message_with_key(
                                     w.get("speaker").and_then(|v| v.as_u64()).map(|s| s as u32);
                                 Some(DeepgramWord {
                                     word,
+                                    punctuated_word,
                                     start: word_start,
                                     end,
                                     confidence: conf,
@@ -1882,6 +1910,35 @@ pub struct DeepgramDiarizationSpec {
     pub speaker_labels: std::collections::HashMap<String, String>,
 }
 
+/// Group a final's words into contiguous runs that share the same `speaker`
+/// index (including runs of words with no speaker at all). This is the seam
+/// shared by [`normalize_deepgram_diarization`] (diarization-ledger spans)
+/// and the production per-word-speaker final splitter in
+/// `crate::speech::run_deepgram_event_receiver` (audio-graph-4aed) — both need
+/// to answer the same question ("where does the speaker change inside this
+/// one final?"), so the grouping lives here once instead of drifting between
+/// two ad hoc copies.
+///
+/// Returns borrowed slices into `words`, so callers that also need per-word
+/// text (unlike the ledger normalizer, which only needs the run's time
+/// bounds) can join `word.word` themselves without an extra allocation here.
+pub(crate) fn group_words_by_speaker(
+    words: &[DeepgramWord],
+) -> Vec<(Option<u32>, &[DeepgramWord])> {
+    let mut runs = Vec::new();
+    let mut run_start = 0usize;
+    for i in 1..words.len() {
+        if words[i].speaker != words[run_start].speaker {
+            runs.push((words[run_start].speaker, &words[run_start..i]));
+            run_start = i;
+        }
+    }
+    if !words.is_empty() {
+        runs.push((words[run_start].speaker, &words[run_start..]));
+    }
+    runs
+}
+
 /// Normalize a stream of Deepgram events into provider-neutral speaker-timeline
 /// span revisions.
 ///
@@ -1932,17 +1989,11 @@ where
         }
 
         // Group contiguous same-speaker words into runs (mixed-speaker spans).
-        let mut runs: Vec<(Option<u32>, f64, f64)> = Vec::new();
-        for word in &words {
-            match runs.last_mut() {
-                Some((spk, _run_start, run_end)) if *spk == word.speaker => {
-                    *run_end = word.end;
-                }
-                _ => runs.push((word.speaker, word.start, word.end)),
-            }
-        }
-
-        for (run_index, (speaker, run_start, run_end)) in runs.into_iter().enumerate() {
+        for (run_index, (speaker, run_words)) in
+            group_words_by_speaker(&words).into_iter().enumerate()
+        {
+            let run_start = run_words.first().map(|w| w.start).unwrap_or(0.0);
+            let run_end = run_words.last().map(|w| w.end).unwrap_or(0.0);
             // Quantize the start to whole milliseconds for a stable span key
             // independent of float jitter across re-attributions.
             let start_key = (run_start * 1000.0).round() as u64;
@@ -2754,6 +2805,7 @@ mod tests {
                 duration: 1.0,
                 words: vec![DeepgramWord {
                     word: "hello".into(),
+                    punctuated_word: None,
                     start: 0.0,
                     end: 0.5,
                     confidence: 0.95,

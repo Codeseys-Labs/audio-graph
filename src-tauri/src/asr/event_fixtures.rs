@@ -187,13 +187,23 @@ fn assert_diarization_revisions(fixture: &EventFixture, relative_path: &str) {
 
 /// Normalize the fixture's Deepgram transcript events into provider-neutral
 /// speaker-timeline span revisions by re-replaying the raw messages into typed
-/// [`DeepgramEvent`]s and handing them to the PRODUCTION normalizer
+/// [`DeepgramEvent`]s and handing them to
 /// [`deepgram::normalize_deepgram_diarization`].
 ///
 /// The retcon/supersede semantics, provider-id/label separation, and channel
-/// capability gate all live in production now; this shim only bridges the
-/// fixture's declarative [`DiarizationNormalizationSpec`] to the production
+/// capability gate live only on THIS diarization-ledger side path; this shim
+/// bridges the fixture's declarative [`DiarizationNormalizationSpec`] to
 /// [`deepgram::DeepgramDiarizationSpec`] and drives the raw-message replay.
+/// `normalize_deepgram_diarization` itself is not wired into any production
+/// emission path — production's transcript-row splitting
+/// (`crate::speech::run_deepgram_event_receiver`, audio-graph-4aed) and its
+/// diarization-span emission (`emit_diarization_span_revision_for_transcript`,
+/// which keys spans on `provider:timeline:startms-endms:speaker` rather than
+/// this normalizer's `deepgram:{timeline_id}:{start_key}:{provider_speaker_id}`)
+/// only reuse this normalizer's extracted [`deepgram::group_words_by_speaker`]
+/// grouping, not the normalizer itself — so this fixture proves the grouping
+/// and the ledger-payload shape, not that any production code path emits
+/// through `normalize_deepgram_diarization`.
 fn normalize_deepgram_diarization(
     fixture: &EventFixture,
     spec: &DiarizationNormalizationSpec,

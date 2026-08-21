@@ -719,8 +719,8 @@ fn emit_asr_partial_with_meta(
         source_id: source_id.clone(),
         provider_item_id: meta.provider_item_id,
         transcript_segment_id: None,
-        speaker_id: None,
-        speaker_label: None,
+        speaker_id: meta.speaker_id,
+        speaker_label: meta.speaker_label,
         channel: meta.channel,
         text: text.clone(),
         start_time,
@@ -5717,13 +5717,25 @@ fn run_deepgram_event_receiver(
                 if !is_final {
                     let (revision_number, supersedes) =
                         next_span_revision(&mut revision_numbers_by_span, &span_id);
+                    // Provider-raw speaker id only (`deepgram-{n}`, NOT the
+                    // remapped "Speaker N" display label) — audio-graph-4aed
+                    // review: interims are provisional/revisable, so this
+                    // deliberately does not consume a `speaker_map` remap
+                    // slot the way the final path's `remap_deepgram_speaker`
+                    // does; it exists purely so the persisted revision ledger
+                    // carries SOME speaker evidence for interims instead of
+                    // always `None` (previously true for every interim).
+                    let interim_speaker_id = words
+                        .first()
+                        .and_then(|w| w.speaker)
+                        .map(|raw| format!("deepgram-{raw}"));
                     log::debug!(
                         "Deepgram: interim transcript metadata provider=deepgram span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
                         span_id,
                         revision_number,
                         text.chars().count(),
                         confidence,
-                        words.iter().any(|word| word.speaker.is_some())
+                        interim_speaker_id.is_some()
                     );
                     emit_asr_partial_with_meta(
                         &ctx,
@@ -5737,6 +5749,7 @@ fn run_deepgram_event_receiver(
                             span_id: Some(span_id),
                             revision_number: Some(revision_number),
                             supersedes,
+                            speaker_id: interim_speaker_id,
                             raw_event_ref: Some("deepgram.results.interim".to_string()),
                             ..AsrRevisionMeta::default()
                         },
@@ -5744,88 +5757,262 @@ fn run_deepgram_event_receiver(
                     continue;
                 }
 
-                asr_count += 1;
-                let (final_revision_number, supersedes) =
-                    final_span_revision(&mut revision_numbers_by_span, &span_id);
+                // Group the final's words into contiguous same-speaker runs
+                // (audio-graph-4aed): Deepgram attaches a per-WORD speaker
+                // index, so a final that crosses a turn boundary yields 2+
+                // runs, split below into one TranscriptSegment per run so
+                // each speaker only claims the words actually attributed to
+                // them. A final whose words all share one speaker (or carry
+                // no speaker at all) yields exactly one run.
+                //
+                // A word with no speaker (`None`) starts its own run rather
+                // than merging into a neighboring speaker's run — with
+                // `diarize=true` Deepgram tags every word, so this only
+                // fires on partially-tagged finals, and that run falls
+                // through to the same empty-audio diarization-fallback path
+                // as an undiarized single-run final (below) rather than
+                // inheriting a neighbor's speaker with no evidence for it.
+                let runs = crate::asr::deepgram::group_words_by_speaker(&words);
 
-                // Determine speaker from word-level diarization if available.
-                let speaker_from_deepgram = words.first().and_then(|w| w.speaker).map(|raw| {
-                    let id = remap_deepgram_speaker(
-                        raw,
-                        max_speakers,
-                        &mut speaker_map,
-                        &mut last_speaker,
-                    );
-                    format!("Speaker {}", id)
-                });
+                if runs.len() <= 1 {
+                    asr_count += 1;
+                    let (final_revision_number, supersedes) =
+                        final_span_revision(&mut revision_numbers_by_span, &span_id);
 
-                let segment = TranscriptSegment {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    source_id,
-                    speaker_id: speaker_from_deepgram.clone(),
-                    speaker_label: speaker_from_deepgram,
-                    text: text.clone(),
-                    start_time: start,
-                    end_time,
-                    confidence,
-                };
+                    // Determine speaker from word-level diarization if available.
+                    let speaker_from_deepgram = words.first().and_then(|w| w.speaker).map(|raw| {
+                        let id = remap_deepgram_speaker(
+                            raw,
+                            max_speakers,
+                            &mut speaker_map,
+                            &mut last_speaker,
+                        );
+                        format!("Speaker {}", id)
+                    });
 
-                // If Deepgram provides speaker labels, use them directly.
-                // Otherwise, run through local diarization (needs audio, which
-                // we don't have in the event path — so we skip diarization
-                // and use the segment as-is).
-                let final_segment = if segment.speaker_label.is_some() {
-                    // Deepgram diarization provided speaker labels.
-                    diarization_count += 1;
-                    segment.clone()
-                } else {
-                    // No speaker from Deepgram; create a minimal diarization input
-                    // with empty audio (the Simple diarization backend will
-                    // assign a speaker based on signal heuristics, but with
-                    // empty audio it will just assign a default speaker).
-                    let input = DiarizationInput {
-                        transcript: segment.clone(),
-                        speech_audio: vec![],
-                        speech_start_time: Duration::from_secs_f64(start),
-                        speech_end_time: Duration::from_secs_f64(end_time),
+                    let segment = TranscriptSegment {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source_id: source_id.clone(),
+                        speaker_id: speaker_from_deepgram.clone(),
+                        speaker_label: speaker_from_deepgram,
+                        text: text.clone(),
+                        start_time: start,
+                        end_time,
+                        confidence,
                     };
-                    let diarized = diarization_worker.process_input(input);
-                    diarization_count += 1;
 
-                    let _ = ctx
-                        .app_handle
-                        .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                    diarized.segment
-                };
+                    // If Deepgram provides speaker labels, use them directly.
+                    // Otherwise, run through local diarization (needs audio, which
+                    // we don't have in the event path — so we skip diarization
+                    // and use the segment as-is).
+                    let final_segment = if segment.speaker_label.is_some() {
+                        // Deepgram diarization provided speaker labels.
+                        diarization_count += 1;
+                        segment.clone()
+                    } else {
+                        // No speaker from Deepgram; create a minimal diarization input
+                        // with empty audio (the Simple diarization backend will
+                        // assign a speaker based on signal heuristics, but with
+                        // empty audio it will just assign a default speaker).
+                        let input = DiarizationInput {
+                            transcript: segment.clone(),
+                            speech_audio: vec![],
+                            speech_start_time: Duration::from_secs_f64(start),
+                            speech_end_time: Duration::from_secs_f64(end_time),
+                        };
+                        let diarized = diarization_worker.process_input(input);
+                        diarization_count += 1;
 
-                log::debug!(
-                    "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
-                    asr_count,
-                    span_id,
-                    final_revision_number,
-                    final_segment.text.chars().count(),
-                    final_segment.confidence,
-                    final_segment.speaker_label.is_some(),
-                );
+                        let _ = ctx
+                            .app_handle
+                            .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                        diarized.segment
+                    };
 
-                // SPEAKER_DETECTED was already emitted above (if needed) — pass
-                // `None` here so the shared helper doesn't double-emit.
-                emit_transcript_and_extract_with_meta(
-                    final_segment,
-                    None,
-                    &ctx,
-                    asr_count,
-                    diarization_count,
-                    &extraction_count,
-                    &graph_update_count,
-                    AsrRevisionMeta {
-                        span_id: Some(span_id),
-                        revision_number: Some(final_revision_number),
-                        supersedes,
-                        raw_event_ref: Some("deepgram.results.final".to_string()),
-                        ..AsrRevisionMeta::default()
-                    },
-                );
+                    log::debug!(
+                        "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+                        asr_count,
+                        span_id,
+                        final_revision_number,
+                        final_segment.text.chars().count(),
+                        final_segment.confidence,
+                        final_segment.speaker_label.is_some(),
+                    );
+
+                    // SPEAKER_DETECTED was already emitted above (if needed) — pass
+                    // `None` here so the shared helper doesn't double-emit.
+                    emit_transcript_and_extract_with_meta(
+                        final_segment,
+                        None,
+                        &ctx,
+                        asr_count,
+                        diarization_count,
+                        &extraction_count,
+                        &graph_update_count,
+                        AsrRevisionMeta {
+                            span_id: Some(span_id),
+                            revision_number: Some(final_revision_number),
+                            supersedes,
+                            raw_event_ref: Some("deepgram.results.final".to_string()),
+                            ..AsrRevisionMeta::default()
+                        },
+                    );
+                } else {
+                    // Multi-speaker final: emit one TranscriptSegment per
+                    // same-speaker run. Run 0 keeps the final's own `span_id`
+                    // (computed above from `start`, the same key any live
+                    // interims for this final used) so it inherits/closes out
+                    // those interim revisions exactly like the single-run
+                    // path; later runs are keyed on their own first word's
+                    // start via `provider_start_span_id`. Word starts are
+                    // strictly increasing, so those keys are strictly
+                    // increasing too and will not collide UNLESS two runs'
+                    // starts round to the same millisecond
+                    // (`millis_from_secs` quantizes for span-key stability) —
+                    // `used_span_ids` below closes that gap explicitly rather
+                    // than leaving it as an unguarded assumption (review
+                    // finding: this was previously asserted in comments only,
+                    // with no guard/test).
+                    //
+                    // NOT handled here: a re-sent/corrected final for the
+                    // same `start` whose run *shape* changes (e.g. was 2 runs,
+                    // now 1) can orphan a previously emitted later-run span at
+                    // its old revision with nothing to supersede it — the
+                    // same class of cross-final retcon gap as the
+                    // pre-existing `final_span_revision` drop-on-reattribution
+                    // issue, just visible here across a run boundary instead
+                    // of within one span. Left as a follow-up; reconciling it
+                    // needs tracking which span_ids a given final `start` has
+                    // previously emitted, not just per-span revision counters.
+                    let run_count = runs.len();
+                    let mut used_span_ids: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(run_count);
+                    used_span_ids.insert(span_id.clone());
+                    for (run_index, (speaker, run_words)) in runs.into_iter().enumerate() {
+                        let is_first_run = run_index == 0;
+                        let is_last_run = run_index + 1 == run_count;
+                        let run_start = if is_first_run {
+                            start
+                        } else {
+                            run_words.first().map(|w| w.start).unwrap_or(start)
+                        };
+                        let run_end = if is_last_run {
+                            end_time
+                        } else {
+                            run_words.last().map(|w| w.end).unwrap_or(end_time)
+                        };
+                        // Join the punctuated form of each word so a split
+                        // run keeps the same punctuation/capitalization a
+                        // single-speaker final gets for free from the
+                        // provider's `text` (audio-graph-4aed review: joining
+                        // raw `word` tokens instead would silently lowercase
+                        // and de-punctuate every multi-speaker final).
+                        let run_text = run_words
+                            .iter()
+                            .map(|w| w.display_word())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let run_span_id = if is_first_run {
+                            span_id.clone()
+                        } else {
+                            let mut candidate =
+                                provider_start_span_id("deepgram", &source_id, run_start);
+                            let mut ms_bump: i64 = 0;
+                            while used_span_ids.contains(&candidate) {
+                                ms_bump += 1;
+                                candidate = provider_start_span_id(
+                                    "deepgram",
+                                    &source_id,
+                                    run_start + (ms_bump as f64) / 1000.0,
+                                );
+                            }
+                            candidate
+                        };
+                        used_span_ids.insert(run_span_id.clone());
+
+                        asr_count += 1;
+                        let (run_revision_number, run_supersedes) =
+                            final_span_revision(&mut revision_numbers_by_span, &run_span_id);
+
+                        // The speaker-cap remap applies per split run (in word
+                        // order), so max_speakers/speaker_map/last_speaker
+                        // collapse extra speakers exactly as they would if
+                        // these runs had arrived as separate finals.
+                        let speaker_from_deepgram = speaker.map(|raw| {
+                            let id = remap_deepgram_speaker(
+                                raw,
+                                max_speakers,
+                                &mut speaker_map,
+                                &mut last_speaker,
+                            );
+                            format!("Speaker {}", id)
+                        });
+
+                        let run_segment = TranscriptSegment {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            source_id: source_id.clone(),
+                            speaker_id: speaker_from_deepgram.clone(),
+                            speaker_label: speaker_from_deepgram,
+                            text: run_text,
+                            start_time: run_start,
+                            end_time: run_end,
+                            confidence,
+                        };
+
+                        let final_run_segment = if run_segment.speaker_label.is_some() {
+                            diarization_count += 1;
+                            run_segment.clone()
+                        } else {
+                            let input = DiarizationInput {
+                                transcript: run_segment.clone(),
+                                speech_audio: vec![],
+                                speech_start_time: Duration::from_secs_f64(run_start),
+                                speech_end_time: Duration::from_secs_f64(run_end),
+                            };
+                            let diarized = diarization_worker.process_input(input);
+                            diarization_count += 1;
+
+                            let _ = ctx
+                                .app_handle
+                                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                            diarized.segment
+                        };
+
+                        log::debug!(
+                            "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={} run={}/{}",
+                            asr_count,
+                            run_span_id,
+                            run_revision_number,
+                            final_run_segment.text.chars().count(),
+                            final_run_segment.confidence,
+                            final_run_segment.speaker_label.is_some(),
+                            run_index + 1,
+                            run_count,
+                        );
+
+                        // SPEAKER_DETECTED was already emitted above (if needed)
+                        // — pass `None` here so the shared helper doesn't
+                        // double-emit.
+                        emit_transcript_and_extract_with_meta(
+                            final_run_segment,
+                            None,
+                            &ctx,
+                            asr_count,
+                            diarization_count,
+                            &extraction_count,
+                            &graph_update_count,
+                            AsrRevisionMeta {
+                                span_id: Some(run_span_id),
+                                revision_number: Some(run_revision_number),
+                                supersedes: run_supersedes,
+                                raw_event_ref: Some(format!(
+                                    "deepgram.results.final:run{run_index}"
+                                )),
+                                ..AsrRevisionMeta::default()
+                            },
+                        );
+                    }
+                }
             }
             DeepgramEvent::Turn {
                 kind,
