@@ -332,6 +332,28 @@ function isStaleAsrRevision(
   );
 }
 
+/**
+ * Reduces a revision history down to the single revision per `span_id` that
+ * actually won `applyAsrRevisionToTranscriptSegments`'s stale check (highest
+ * `revision_number`, same tie-break as `deriveTimelineFromTranscriptEvents`).
+ * A *stale* revision (superseded by a same-span revision with an equal or
+ * higher `revision_number`) is buffered into `asrSpanRevisions` for history
+ * but never materializes a `transcriptSegments` row — so it must not be
+ * treated as proof that its `transcript_segment_id` is already on screen.
+ */
+function winningAsrRevisionsBySpan(
+  revisions: AsrSpanRevisionEvent[],
+): Map<string, AsrSpanRevisionEvent> {
+  const winners = new Map<string, AsrSpanRevisionEvent>();
+  for (const revision of revisions) {
+    const current = winners.get(revision.span_id);
+    if (!current || revision.revision_number >= current.revision_number) {
+      winners.set(revision.span_id, revision);
+    }
+  }
+  return winners;
+}
+
 function applyAsrRevisionToTranscriptSegments(
   segments: TranscriptSegment[],
   revisions: AsrSpanRevisionEvent[],
@@ -1472,9 +1494,35 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       const transcriptSegments = state.samplePreviewActive
         ? []
         : state.transcriptSegments;
+      const existingRevisions = state.samplePreviewActive
+        ? []
+        : state.asrSpanRevisions;
+      // audio-graph-a35a: every finalized utterance is emitted by the Rust
+      // ASR pipeline as BOTH `asr-span-revision` (final) and
+      // `transcript-update`, synchronously, in that order
+      // (speech/mod.rs `emit_transcript_and_extract_with_meta` and the
+      // local-diarization worker tail both emit ASR_SPAN_REVISION
+      // immediately before TRANSCRIPT_UPDATE for the identical segment).
+      // `addAsrSpanRevision` already folds this utterance into
+      // `transcriptSegments` under its stable `span_id`; a blind append here
+      // would add a second row for the same utterance keyed by
+      // `segment.id`. Skip the append when the *winning* revision for some
+      // span already claims this segment id as its `transcript_segment_id`
+      // — the revision-derived row already carries the identical (or newer)
+      // text/metadata. Checking against every buffered revision (rather than
+      // only the winner) would be wrong: a stale/superseded revision (e.g. a
+      // reconnect-induced span-id collision) is still appended to
+      // `asrSpanRevisions` for history even though it never materialized a
+      // row, so keying off it would silently drop a live utterance whose
+      // `transcript_segment_id` happens to collide with that dead revision.
+      const alreadyFoldedByRevision = [
+        ...winningAsrRevisionsBySpan(existingRevisions).values(),
+      ].some((revision) => revision.transcript_segment_id === segment.id);
       return {
         ...exitSamplePreviewState(state.samplePreviewActive),
-        transcriptSegments: [...transcriptSegments.slice(-499), segment],
+        transcriptSegments: alreadyFoldedByRevision
+          ? transcriptSegments
+          : [...transcriptSegments.slice(-499), segment],
         asrPartial: null,
       };
     }),

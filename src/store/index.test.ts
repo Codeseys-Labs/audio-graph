@@ -1555,6 +1555,208 @@ describe("AudioGraphStore", () => {
     ]);
   });
 
+  it("dedupes one live-transcript row when asr-span-revision (final) arrives before transcript-update for the same utterance (audio-graph-a35a)", () => {
+    // This is the ACTUAL emission order on the Rust side: every ASR worker's
+    // `emit_transcript_and_extract_with_meta` / local-diarization tail emits
+    // `ASR_SPAN_REVISION` (final) and THEN `TRANSCRIPT_UPDATE` for the same
+    // segment, synchronously, in the same handler.
+    const store = useAudioGraphStore.getState();
+    store.setAsrPartial({
+      provider: "deepgram",
+      source_id: "system-default",
+      text: "hel",
+      start_time: 0,
+      end_time: 0.3,
+      confidence: 0.6,
+      timestamp_ms: 1_700_000_000_000,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        span_id: "deepgram:system-default:0-500",
+        transcript_segment_id: "seg-a35a-1",
+        text: "hello world",
+        confidence: 0.93,
+        is_final: true,
+        stability: "final",
+        speaker_id: "speaker-0",
+        speaker_label: "Speaker 0",
+        end_of_turn: true,
+      }),
+    );
+    store.addTranscriptSegment({
+      id: "seg-a35a-1",
+      source_id: "system-default",
+      speaker_id: "speaker-0",
+      speaker_label: "Speaker 0",
+      text: "hello world",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.93,
+    });
+
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toHaveLength(1);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "hello world",
+      }),
+    ]);
+  });
+
+  it("dedupes one live-transcript row when transcript-update arrives before asr-span-revision (final) for the same utterance — the other event order (audio-graph-a35a)", () => {
+    const store = useAudioGraphStore.getState();
+    store.setAsrPartial({
+      provider: "deepgram",
+      source_id: "system-default",
+      text: "hel",
+      start_time: 0,
+      end_time: 0.3,
+      confidence: 0.6,
+      timestamp_ms: 1_700_000_000_000,
+    });
+    store.addTranscriptSegment({
+      id: "seg-a35a-2",
+      source_id: "system-default",
+      speaker_id: "speaker-0",
+      speaker_label: "Speaker 0",
+      text: "hello world",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.93,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        span_id: "deepgram:system-default:0-501",
+        transcript_segment_id: "seg-a35a-2",
+        text: "hello world",
+        confidence: 0.93,
+        is_final: true,
+        stability: "final",
+        speaker_id: "speaker-0",
+        speaker_label: "Speaker 0",
+        end_of_turn: true,
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toHaveLength(1);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-501",
+        text: "hello world",
+      }),
+    ]);
+  });
+
+  it("still appends a live utterance whose transcript_segment_id collides with a stale/superseded ASR revision on the same span (audio-graph-a35a)", () => {
+    const store = useAudioGraphStore.getState();
+    // The winning (non-stale) final revision for this span materializes a
+    // row and claims its own transcript_segment_id.
+    store.addAsrSpanRevision(
+      asrSpanRevision(2, {
+        span_id: "deepgram:system-default:0-500",
+        transcript_segment_id: "seg-a35a-3-current",
+        text: "current final",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+    // A later revision for the SAME span with a lower revision_number (e.g.
+    // a reconnect-induced span-id collision) is stale: it is still buffered
+    // into asrSpanRevisions for history, but
+    // applyAsrRevisionToTranscriptSegments leaves transcriptSegments
+    // untouched because isStaleAsrRevision rejects it — no row is ever
+    // materialized under its transcript_segment_id.
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        span_id: "deepgram:system-default:0-500",
+        transcript_segment_id: "seg-a35a-3-stale",
+        text: "stale revision text",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+    expect(useAudioGraphStore.getState().transcriptSegments).toHaveLength(1);
+
+    // A live transcript-update whose id happens to match the STALE
+    // revision's transcript_segment_id is a genuinely new utterance —
+    // nothing materialized that id — and must still be appended.
+    store.addTranscriptSegment({
+      id: "seg-a35a-3-stale",
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: "genuinely new utterance",
+      start_time: 1,
+      end_time: 1.5,
+      confidence: 0.9,
+    });
+
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toHaveLength(2);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "current final",
+      }),
+      expect.objectContaining({
+        id: "seg-a35a-3-stale",
+        text: "genuinely new utterance",
+      }),
+    ]);
+  });
+
+  it("does not let a stale sample-preview ASR revision suppress a live segment when the preview exits (audio-graph-a35a)", () => {
+    useAudioGraphStore.setState({
+      samplePreviewActive: true,
+      transcriptSegments: [
+        {
+          id: "sample-segment-3",
+          source_id: "system-default",
+          speaker_id: null,
+          speaker_label: null,
+          text: "sample preview text",
+          start_time: 0,
+          end_time: 1,
+          confidence: 1,
+        },
+      ],
+      asrSpanRevisions: [
+        asrSpanRevision(1, {
+          span_id: "sample-span-3",
+          // Collides with the live segment id added below — proves the
+          // `state.samplePreviewActive ? [] : state.asrSpanRevisions` guard
+          // (not just the transcriptSegments guard) is load-bearing.
+          transcript_segment_id: "seg-live-collide",
+          text: "sample preview text",
+          is_final: true,
+          stability: "final",
+        }),
+      ],
+    });
+
+    useAudioGraphStore.getState().addTranscriptSegment({
+      id: "seg-live-collide",
+      source_id: "system-default",
+      speaker_id: "speaker-0",
+      speaker_label: "Speaker 0",
+      text: "live utterance",
+      start_time: 5,
+      end_time: 5.5,
+      confidence: 0.9,
+    });
+
+    const state = useAudioGraphStore.getState();
+    expect(state.samplePreviewActive).toBe(false);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "seg-live-collide",
+        text: "live utterance",
+      }),
+    ]);
+  });
+
   it("applies notes projection patches directly to materialized notes state", () => {
     const store = useAudioGraphStore.getState();
     store.addProjectionPatch(
