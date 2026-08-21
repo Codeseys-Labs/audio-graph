@@ -156,6 +156,24 @@ pub enum ProjectionSchedulerDecision {
     },
     FailedCurrent {
         failed_job_id: String,
+        /// Which lane failed — carried here (unlike the other job-bearing
+        /// variants, which get it from `job.kind`) because this variant
+        /// starts no job. `dispatch_projection_decision` reads it to name
+        /// and register the one-shot clock thread below.
+        kind: ProjectionKind,
+        /// ADR-0045 decision 3 (audio-graph-bf5d): `Some(at_ms)` exactly
+        /// when this failure armed a deferred retry (`last_failed_basis`'s
+        /// `failed_attempts`, just incremented, is still under
+        /// `PROJECTION_LANE_ATTEMPT_BUDGET`) — the absolute
+        /// [`current_unix_millis`]-style timestamp `observe_ledger`'s
+        /// same-basis branch requires before it will retry. `None` when
+        /// this same failure exhausted the budget: no retry is left to
+        /// arm, so no clock thread should be spawned for it.
+        /// `dispatch_projection_decision` is the sole reader; it spawns
+        /// `spawn_deferred_lane_observation` (`speech/mod.rs`) — the single
+        /// clock source that fires the retry even if no further final ASR
+        /// revision ever arrives to drive it event-driven.
+        deferred_retry_at_ms: Option<u64>,
     },
     FailedAndStartedFollowUp {
         failed_job_id: String,
@@ -225,6 +243,38 @@ pub enum ProjectionSchedulerDecision {
 /// `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` in `state.rs` was.
 pub const PROJECTION_LANE_ATTEMPT_BUDGET: u8 = 3;
 
+/// ADR-0045 decision 3 (audio-graph-bf5d): exactly one deferred retry after a
+/// same-basis `Current` failure, fired ~60s later if nothing else has
+/// resolved the lane by then. Not a backoff ladder — the memo's Option B
+/// (2s/8s/30s timer-driven schedule) was explicitly rejected; this constant
+/// exists once, and firing it never re-arms a second, longer wait for the
+/// SAME failure (the retry job's own eventual failure re-arms a fresh
+/// `PROJECTION_LANE_ATTEMPT_BUDGET`-bounded deferral instead, via the same
+/// code path, not a lengthened one).
+///
+/// Current value (60_000ms) is a first-cut, `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT`-style
+/// (`state.rs:1112-1128`) choice: long enough that a transient provider hiccup
+/// (rate limit, brief network blip) has a real chance to clear before the
+/// retry fires, short enough that a lane genuinely stuck on a failing basis
+/// does not sit silent for minutes between attempts. `PROJECTION_LANE_ATTEMPT_BUDGET`
+/// retries at this fixed spacing before `AttemptBudgetExhausted` (emit-only)
+/// takes over — worst case, a fully wedged lane through this ticket's
+/// mechanism alone burns `(PROJECTION_LANE_ATTEMPT_BUDGET - 1) * PROJECTION_DEFERRED_RETRY_DELAY_MS`
+/// (~2 minutes) of silence before that signal fires, not unbounded silence.
+/// The `- 1` is not incidental: only attempts 1 and 2 arm a deferral —
+/// attempt 3 (the budget-exhausting failure) arms none (see the `else None`
+/// branch in `fail_in_flight` below, pinned by
+/// `scheduler_emits_attempt_budget_exhausted_after_three_failed_attempts`),
+/// so there are only `PROJECTION_LANE_ATTEMPT_BUDGET - 1` deferred waits
+/// between the 3 attempts, not `PROJECTION_LANE_ATTEMPT_BUDGET`.
+///
+/// Tuning procedure: mirrors `PROJECTION_LANE_ATTEMPT_BUDGET`'s — once field
+/// telemetry accumulates (the `projection_scheduler.attempt_budget_exhausted`
+/// log key plus how often a deferred retry's OWN generation attempt
+/// succeeds vs. re-fails), retune with a "Chosen because: …" comment the
+/// same way `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` was.
+pub const PROJECTION_DEFERRED_RETRY_DELAY_MS: u64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct ProjectionScheduler {
     session_id: String,
@@ -244,9 +294,16 @@ pub struct ProjectionScheduler {
     // left over from a prior basis is otherwise indistinguishable from a
     // live count.
     failed_attempts: u8,
-    // Wired by the deferred-retry ticket (ADR-0045); this ticket only tracks
-    // the attempt budget, not a retry clock.
-    #[allow(dead_code)]
+    // ADR-0045 decision 3 (audio-graph-bf5d), wired: `Some(at_ms)` while a
+    // deferred retry is armed and not yet fired for `last_failed_basis`;
+    // `None` whenever no retry is outstanding (no failure yet, the budget
+    // was already exhausted by the failure that would have armed it, or a
+    // prior arm was already consumed). Set in `fail_in_flight`'s `Current`
+    // arm; cleared unconditionally by `start_job` (any job start — the due
+    // retry firing, a genuine basis change taking the event-driven
+    // fallthrough, or a follow-up/repair job — consumes or supersedes it).
+    // Like `failed_attempts`, only meaningful while `last_failed_basis` is
+    // `Some`; `observe_ledger`'s same-basis branch is the only reader.
     deferred_retry_at_ms: Option<u64>,
     // Contract (shared with the render ticket, audio-graph-1e1e): stamped in
     // `start_job` the first time a basis goes pending (only when currently
@@ -457,6 +514,28 @@ impl ProjectionScheduler {
         }
         if self.last_failed_basis.as_ref() == Some(&basis) {
             if self.failed_attempts < PROJECTION_LANE_ATTEMPT_BUDGET {
+                // ADR-0045 decision 3 (audio-graph-bf5d): a same-basis
+                // re-observation under budget no longer retries
+                // unconditionally — it must wait for the deferred retry to
+                // become due. In production this branch is reached ONLY by
+                // the one-shot `projection-retry-<kind>` clock thread
+                // (`spawn_deferred_lane_observation`, speech/mod.rs):
+                // nothing else calls `observe_ledger` with an unchanged
+                // basis, since any real final ASR revision changes the
+                // basis and takes the "any basis change" fallthrough below
+                // instead (which is exactly how "clears the deferral on any
+                // basis change" is enforced — that fallthrough calls
+                // `start_job`, which unconditionally clears
+                // `deferred_retry_at_ms`). `None` is treated as due
+                // (defense-in-depth only — every `Current` failure that
+                // reaches this branch armed a deferral, so a live `None`
+                // here should not occur in practice).
+                let due = self
+                    .deferred_retry_at_ms
+                    .is_none_or(|deferred_at| now_ms >= deferred_at);
+                if !due {
+                    return ProjectionSchedulerDecision::Idle;
+                }
                 let job = self.start_job(basis.clone(), ProjectionPriority::Realtime, now_ms);
                 // Load-bearing ordering: `start_job` just cleared
                 // `last_failed_basis` to `None` (it clears it on every job
@@ -607,8 +686,24 @@ impl ProjectionScheduler {
                     self.failed_attempts = 1;
                 }
                 self.last_failed_basis = Some(failed.basis);
+                // ADR-0045 decision 3 (audio-graph-bf5d): arm exactly one
+                // deferred retry while this basis still has budget left.
+                // `dispatch_projection_decision` (speech/mod.rs) reads this
+                // field to spawn the single one-shot clock thread that
+                // fires the retry even if no further final ever arrives.
+                // Exhausting the budget on THIS failure arms nothing — an
+                // exhausted basis never retries again, deferred or
+                // otherwise (`AttemptBudgetExhausted` stays emit-only).
+                self.deferred_retry_at_ms = if self.failed_attempts < PROJECTION_LANE_ATTEMPT_BUDGET
+                {
+                    Some(now_ms.saturating_add(PROJECTION_DEFERRED_RETRY_DELAY_MS))
+                } else {
+                    None
+                };
                 ProjectionSchedulerDecision::FailedCurrent {
                     failed_job_id: failed.id,
+                    kind: self.kind.clone(),
+                    deferred_retry_at_ms: self.deferred_retry_at_ms,
                 }
             }
             BasisCurrency::AppendOnlyStale(_) => {
@@ -666,6 +761,13 @@ impl ProjectionScheduler {
         };
         self.metrics.jobs_started += 1;
         self.last_failed_basis = None;
+        // ADR-0045 decision 3 (audio-graph-bf5d): every job start — the due
+        // retry firing, a genuine basis change taking the event-driven
+        // fallthrough in `observe_ledger`, or a follow-up/repair job —
+        // consumes or supersedes any outstanding deferral. This is the
+        // enforcement point for "clears the deferral on any basis change";
+        // `fail_in_flight`'s `Current` arm is the only place that re-arms it.
+        self.deferred_retry_at_ms = None;
         // The new job's basis is the current ledger basis, which subsumes any
         // queued pending work. Clear it so the coalescing baseline restarts
         // from this job.
@@ -744,6 +846,23 @@ impl ProjectionScheduler {
     /// clobber real work. Every production caller constructs a fresh
     /// `ProjectionSchedulers` before calling this, so the guard is defense in
     /// depth, not the primary contract.
+    ///
+    /// Deferrals and coverage heads do not need a separate guard clause to
+    /// avoid fighting (ADR-0045 decision 3, audio-graph-bf5d): a live
+    /// deferral (`deferred_retry_at_ms.is_some()`) is only ever set
+    /// alongside `last_failed_basis` — `fail_in_flight`'s `Current` arm sets
+    /// both together, and `start_job` clears both together — so the
+    /// `last_failed_basis.is_some()` check above already refuses to reseed
+    /// over a lane with a live deferral, with no additional field to check.
+    /// Pinned in isolation (not merely by inspection of the set/clear
+    /// pairing above) by
+    /// `reseed_coverage_heads_is_a_no_op_when_the_lane_has_only_a_live_deferred_retry`,
+    /// which fails the job first (so `in_flight` is `None` and
+    /// `last_failed_basis` is the ONLY disjunct standing between the reseed
+    /// and a clobber) — unlike the sibling
+    /// `reseed_coverage_heads_is_a_no_op_when_the_lane_already_has_live_state`
+    /// test, whose lane still has `in_flight.is_some()` and so never
+    /// exercises this disjunct as the deciding condition.
     fn reseed_coverage_head(&mut self, head: Option<ProjectionBasis>) {
         let Some(head) = head else {
             return;
@@ -1328,6 +1447,8 @@ mod tests {
             scheduler.fail_in_flight(&job_id, "session-1", &ledger, 20),
             ProjectionSchedulerDecision::FailedCurrent {
                 failed_job_id: job_id,
+                kind: ProjectionKind::Graph,
+                deferred_retry_at_ms: Some(20 + PROJECTION_DEFERRED_RETRY_DELAY_MS),
             }
         );
         assert!(scheduler.in_flight_job().is_none());
@@ -1584,6 +1705,11 @@ mod tests {
         ));
     }
 
+    /// ADR-0045 decision 3 (audio-graph-bf5d): a same-basis failure under
+    /// budget now waits for its deferred retry to become due (does not
+    /// retry immediately), while a genuine basis change still unwedges the
+    /// lane immediately regardless of how far off either deferral is —
+    /// "then purely event-driven" holds even mid-deferral.
     fn assert_failure_retries_under_budget_then_basis_change_unwedges(now_offset: u64) {
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
@@ -1596,10 +1722,13 @@ mod tests {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected start job, got {other:?}"),
         };
+        let first_failed_at = now_offset + 25;
         assert_eq!(
-            scheduler.fail_in_flight(&job_id, "session-1", &ledger, now_offset + 25),
+            scheduler.fail_in_flight(&job_id, "session-1", &ledger, first_failed_at),
             ProjectionSchedulerDecision::FailedCurrent {
                 failed_job_id: job_id.clone(),
+                kind: ProjectionKind::Notes,
+                deferred_retry_at_ms: Some(first_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS),
             }
         );
         assert_eq!(scheduler.metrics().failed_jobs, 1);
@@ -1607,28 +1736,48 @@ mod tests {
         assert_eq!(scheduler.metrics().max_job_lag_ms, 15);
         assert!(scheduler.in_flight_job().is_none());
 
-        // Same failed basis, still under budget: retries instead of idling
-        // forever.
-        let retry_job_id = match scheduler.observe_ledger(&ledger, now_offset + 30) {
+        // Same failed basis, still under budget, but the deferred retry is
+        // not due yet: must wait, not retry immediately.
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, now_offset + 30),
+            ProjectionSchedulerDecision::Idle,
+            "a same-basis re-observation before the deferred retry is due must not retry"
+        );
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            1,
+            "waiting for the deferral must not start a job"
+        );
+
+        // The deferred retry becomes due: retries instead of idling forever.
+        let due_at = first_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+        let retry_job_id = match scheduler.observe_ledger(&ledger, due_at) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => {
-                panic!("same failed basis under budget must retry, not idle forever, got {other:?}")
+                panic!(
+                    "due deferred retry under budget must retry, not idle forever, got {other:?}"
+                )
             }
         };
         assert_ne!(retry_job_id, job_id);
+        let second_failed_at = due_at + 5;
         assert_eq!(
-            scheduler.fail_in_flight(&retry_job_id, "session-1", &ledger, now_offset + 35),
+            scheduler.fail_in_flight(&retry_job_id, "session-1", &ledger, second_failed_at),
             ProjectionSchedulerDecision::FailedCurrent {
                 failed_job_id: retry_job_id,
+                kind: ProjectionKind::Notes,
+                deferred_retry_at_ms: Some(second_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS),
             }
         );
         assert_eq!(scheduler.metrics().failed_jobs, 2);
 
+        // A real basis change unwedges the lane immediately — it does not
+        // wait for the second deferral to become due either.
         ledger
             .apply_event(event("span-2", 1, "second"))
             .expect("second event");
         assert!(matches!(
-            scheduler.observe_ledger(&ledger, now_offset + 40),
+            scheduler.observe_ledger(&ledger, second_failed_at + 10),
             ProjectionSchedulerDecision::StartJob { .. }
         ));
         assert_eq!(scheduler.metrics().jobs_started, 3);
@@ -1648,14 +1797,23 @@ mod tests {
             .expect("first event");
         let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
 
-        let mut now = 0;
+        let mut now = 0u64;
         let mut previous_job_id: Option<String> = None;
         // Queue-onset timestamp: stamped once, when the very first attempt's
         // job starts (not when it later fails). It must survive every retry
         // unchanged, since the lane never succeeds in this test.
-        let mut queue_onset_ms = 0;
+        let mut queue_onset_ms = 0u64;
+        // ADR-0045 decision 3 (audio-graph-bf5d): every retry but the last is
+        // deferred now, so each attempt after the first must be observed
+        // exactly AT its predecessor's due time — an earlier `now` would
+        // idle instead of retrying (see the dedicated due-gating tests for
+        // that case in isolation; this test's job is the budget interaction).
+        let mut next_due_at: Option<u64> = None;
         for attempt in 1..=PROJECTION_LANE_ATTEMPT_BUDGET {
-            now += 10;
+            now = match next_due_at {
+                Some(due_at) => due_at,
+                None => now + 10,
+            };
             if attempt == 1 {
                 queue_onset_ms = now;
             }
@@ -1667,12 +1825,24 @@ mod tests {
                 assert_ne!(job_id, previous, "each retry must mint a new job id");
             }
             now += 15;
+            // Every attempt but the last still has budget left after it
+            // fails, so it arms a fresh deferral; the budget-exhausting
+            // final attempt arms none.
+            let expected_deferred_retry_at_ms = if attempt < PROJECTION_LANE_ATTEMPT_BUDGET {
+                Some(now + PROJECTION_DEFERRED_RETRY_DELAY_MS)
+            } else {
+                None
+            };
             assert_eq!(
                 scheduler.fail_in_flight(&job_id, "session-1", &ledger, now),
                 ProjectionSchedulerDecision::FailedCurrent {
                     failed_job_id: job_id.clone(),
-                }
+                    kind: ProjectionKind::Notes,
+                    deferred_retry_at_ms: expected_deferred_retry_at_ms,
+                },
+                "attempt {attempt}"
             );
+            next_due_at = expected_deferred_retry_at_ms;
             previous_job_id = Some(job_id);
         }
         assert_eq!(
@@ -1697,8 +1867,9 @@ mod tests {
         );
         assert_eq!(scheduler.metrics().attempts_exhausted, 1);
 
-        // No retry timer exists in this ticket: elapsed wall-clock time alone
-        // never changes the outcome, only a basis change does.
+        // No retry is armed for an EXHAUSTED basis (the final failure above
+        // set `deferred_retry_at_ms` to `None`), so elapsed wall-clock time
+        // alone never changes the outcome, only a basis change does.
         now += 5_000_000;
         assert_eq!(scheduler.observe_ledger(&ledger, now), exhausted);
 
@@ -1776,55 +1947,342 @@ mod tests {
         let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
 
         // Basis X fails twice — two of the three attempts in its budget.
+        // Each retry fires exactly at its predecessor's deferred-retry due
+        // time (ADR-0045 decision 3), never earlier.
         let job1 = match scheduler.observe_ledger(&ledger, 10) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected start job, got {other:?}"),
         };
-        scheduler.fail_in_flight(&job1, "session-1", &ledger, 20);
-        let job2 = match scheduler.observe_ledger(&ledger, 30) {
+        let job1_failed_at = 20;
+        scheduler.fail_in_flight(&job1, "session-1", &ledger, job1_failed_at);
+        let job1_due_at = job1_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+        let job2 = match scheduler.observe_ledger(&ledger, job1_due_at) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected retry job under budget, got {other:?}"),
         };
-        scheduler.fail_in_flight(&job2, "session-1", &ledger, 40);
+        let job2_failed_at = job1_due_at + 10;
+        scheduler.fail_in_flight(&job2, "session-1", &ledger, job2_failed_at);
         assert_eq!(scheduler.metrics().failed_jobs, 2);
 
-        // A real basis change (new revision) starts a fresh job for basis Y;
-        // basis X's two prior failures must not carry over.
+        // A real basis change (new revision) starts a fresh job for basis Y
+        // BEFORE basis X's second deferral would have become due, proving
+        // the event-driven path does not wait for it. Basis X's two prior
+        // failures must not carry over.
         ledger
             .apply_event(event("span-2", 1, "second"))
             .expect("second event");
-        let job3 = match scheduler.observe_ledger(&ledger, 50) {
+        let job3_started_at = job2_failed_at + 5;
+        let job3 = match scheduler.observe_ledger(&ledger, job3_started_at) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => panic!("expected start job for the new basis, got {other:?}"),
         };
+        let job3_failed_at = job3_started_at + 10;
         assert_eq!(
-            scheduler.fail_in_flight(&job3, "session-1", &ledger, 60),
+            scheduler.fail_in_flight(&job3, "session-1", &ledger, job3_failed_at),
             ProjectionSchedulerDecision::FailedCurrent {
                 failed_job_id: job3,
+                kind: ProjectionKind::Graph,
+                deferred_retry_at_ms: Some(job3_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS),
             }
         );
 
-        // Basis Y gets its own full budget: two more retries before it
+        // Basis Y gets its own full budget: two more DUE retries before it
         // exhausts, proving its counter restarted at one, not three.
-        let job4 = match scheduler.observe_ledger(&ledger, 70) {
+        let job3_due_at = job3_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+        let job4 = match scheduler.observe_ledger(&ledger, job3_due_at) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => {
                 panic!("basis Y's first retry should still be under its own budget, got {other:?}")
             }
         };
-        scheduler.fail_in_flight(&job4, "session-1", &ledger, 80);
-        let job5 = match scheduler.observe_ledger(&ledger, 90) {
+        let job4_failed_at = job3_due_at + 10;
+        scheduler.fail_in_flight(&job4, "session-1", &ledger, job4_failed_at);
+        let job4_due_at = job4_failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+        let job5 = match scheduler.observe_ledger(&ledger, job4_due_at) {
             ProjectionSchedulerDecision::StartJob { job } => job.id,
             other => {
                 panic!("basis Y's second retry should still be under its own budget, got {other:?}")
             }
         };
-        scheduler.fail_in_flight(&job5, "session-1", &ledger, 100);
+        let job5_failed_at = job4_due_at + 10;
+        scheduler.fail_in_flight(&job5, "session-1", &ledger, job5_failed_at);
 
         assert!(matches!(
-            scheduler.observe_ledger(&ledger, 110),
+            scheduler.observe_ledger(&ledger, job5_failed_at + 10),
             ProjectionSchedulerDecision::AttemptBudgetExhausted { attempts: 3, .. }
         ));
+    }
+
+    /// ADR-0045 decision 3 acceptance (a) (audio-graph-bf5d): for an
+    /// unchanged failing basis, `observe_ledger` starts exactly ONE extra
+    /// job when the deferred retry becomes due (+60s from the failure) and
+    /// zero more at +120s — pure `now_ms` injection, no real sleeps. The
+    /// "zero at +120s" half holds because the retry job started at +60s is
+    /// still in flight (never completed or failed in this test): capacity-one
+    /// (the `in_flight` guard at the top of `observe_ledger`) refuses a
+    /// second job regardless of how the deferral timestamp compares to
+    /// `now_ms` — this test does not depend on `deferred_retry_at_ms` having
+    /// been cleared to prove that half.
+    #[test]
+    fn scheduler_fires_exactly_one_deferred_retry_at_the_due_time_and_none_later() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+
+        let job1 = match scheduler.observe_ledger(&ledger, 0) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let failed_at = 10;
+        scheduler.fail_in_flight(&job1, "session-1", &ledger, failed_at);
+        let due_at = failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+
+        // Before +60s: no extra job, at any of several probe points.
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, failed_at + 1),
+            ProjectionSchedulerDecision::Idle
+        );
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, due_at - 1),
+            ProjectionSchedulerDecision::Idle,
+            "one millisecond before the due time must still not retry"
+        );
+        assert_eq!(scheduler.metrics().jobs_started, 1);
+
+        // Exactly at +60s: the one extra job.
+        let job2 = match scheduler.observe_ledger(&ledger, due_at) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected the deferred retry to fire at its due time, got {other:?}"),
+        };
+        assert_ne!(job2, job1);
+        assert_eq!(scheduler.metrics().jobs_started, 2);
+
+        // At +120s (roughly): zero more, because job2 is still occupying the
+        // capacity-one slot — no second job, deferred or otherwise.
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, due_at + PROJECTION_DEFERRED_RETRY_DELAY_MS),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            2,
+            "no third job must start at +120s"
+        );
+    }
+
+    /// Strengthens the "none later" half above (review fix,
+    /// adr0045/bf5d-deferred-retry): that probe returns `Coalesced` purely
+    /// because the +60s retry job is still occupying the capacity-one slot,
+    /// which says nothing about whether the deferral itself was cleared.
+    /// This variant COMPLETES the retry before probing again at what would
+    /// have been the second due time, freeing the slot, so capacity-one can
+    /// no longer be the reason a third job fails to start — what's left
+    /// refusing it is `start_job` having genuinely set `last_completed_basis`.
+    ///
+    /// Honest limitation (same one already disclosed on
+    /// `scheduler_intervening_final_revision_cancels_the_deferral_and_runs_event_driven`
+    /// below): this still does NOT pin `start_job` clearing
+    /// `deferred_retry_at_ms` itself. `observe_ledger`'s FIRST check
+    /// (`last_completed_basis == Some(&basis)`) short-circuits before the
+    /// same-basis/deferral branch is ever reached, so a mutant that leaves
+    /// `deferred_retry_at_ms` stale in `start_job` (while still setting
+    /// `last_completed_basis` on the later completion) is unobservable here
+    /// too — confirmed by mutation: disabling that line leaves this test
+    /// green. What this DOES newly pin is that the "none later" guarantee
+    /// survives with the slot free, i.e. it is not solely a capacity
+    /// artifact.
+    #[test]
+    fn scheduler_completed_deferred_retry_leaves_the_lane_genuinely_idle_not_primed_to_retry_again()
+    {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+
+        let job1 = match scheduler.observe_ledger(&ledger, 0) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let failed_at = 10;
+        scheduler.fail_in_flight(&job1, "session-1", &ledger, failed_at);
+        let due_at = failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+
+        let job2 = match scheduler.observe_ledger(&ledger, due_at) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected the deferred retry to fire at its due time, got {other:?}"),
+        };
+
+        // Complete it — unlike the sibling test above, which leaves it in
+        // flight — so the slot is free and capacity-one can no longer mask
+        // whether the deferral was actually cleared.
+        let completed_at = due_at + 5;
+        match scheduler.complete_in_flight(&job2, "session-1", &ledger, completed_at) {
+            ProjectionSchedulerDecision::CompletedCurrent { completed_job_id } => {
+                assert_eq!(completed_job_id, job2);
+            }
+            other => panic!("expected the retry job to complete cleanly, got {other:?}"),
+        }
+        assert_eq!(scheduler.metrics().jobs_started, 2);
+
+        // At what would have been the SECOND due time (+120s from the
+        // original failure), on the unchanged basis, with the slot free:
+        // this must return `Idle` via `last_completed_basis`, not merely
+        // fail to retry because something else is occupying the lane.
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, due_at + PROJECTION_DEFERRED_RETRY_DELAY_MS),
+            ProjectionSchedulerDecision::Idle,
+            "a completed deferred retry must leave the lane genuinely idle, not primed to \
+             retry again"
+        );
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            2,
+            "no third job must start once the retry has completed"
+        );
+    }
+
+    /// ADR-0045 decision 3 acceptance (c) (audio-graph-bf5d): an intervening
+    /// final revision (a real basis change) makes `observe_ledger` start the
+    /// new job immediately via the event-driven fallthrough, WELL BEFORE the
+    /// still-outstanding deferral's due time — proving that path does not
+    /// wait on the deferral.
+    ///
+    /// Review note (adr0045/bf5d-deferred-retry): despite this test's name,
+    /// it does NOT prove `start_job` clears `deferred_retry_at_ms` on the
+    /// OLD basis — that field is not exposed through any
+    /// `ProjectionSchedulerDecision` or telemetry, and the one code path
+    /// that reads it (`observe_ledger`'s same-basis branch) requires
+    /// `last_failed_basis` to still match the old basis first. `start_job`
+    /// clears `last_failed_basis` unconditionally on every start, so once
+    /// job2 starts, that branch is permanently unreachable for the old
+    /// basis regardless of what `deferred_retry_at_ms` holds — a mutant that
+    /// leaves `deferred_retry_at_ms` set (while still clearing
+    /// `last_failed_basis`) is provably unobservable through any decision
+    /// this test — or any other black-box test — could inspect. What IS
+    /// pinned here is only "the event-driven path does not wait for the
+    /// deferral"; the field-clearing half of the set-together/cleared-together
+    /// invariant (`fail_in_flight` doc comment above) is verified by
+    /// inspection, not by this test.
+    #[test]
+    fn scheduler_intervening_final_revision_cancels_the_deferral_and_runs_event_driven() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+
+        let job1 = match scheduler.observe_ledger(&ledger, 0) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let failed_at = 10;
+        let decision = scheduler.fail_in_flight(&job1, "session-1", &ledger, failed_at);
+        let due_at = match decision {
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: Some(due_at),
+                ..
+            } => due_at,
+            other => panic!("expected an armed deferral, got {other:?}"),
+        };
+        assert_eq!(due_at, failed_at + PROJECTION_DEFERRED_RETRY_DELAY_MS);
+
+        // A real final revision lands long before the deferral is due.
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        let intervening_at = failed_at + 5;
+        assert!(
+            intervening_at < due_at,
+            "the intervening observation must land before the deferral's due time"
+        );
+        let job2 = match scheduler.observe_ledger(&ledger, intervening_at) {
+            ProjectionSchedulerDecision::StartJob { job } => {
+                assert_eq!(
+                    job.basis.span_revisions.len(),
+                    2,
+                    "the event-driven job covers the grown ledger"
+                );
+                job.id
+            }
+            other => panic!(
+                "an intervening final revision must start a fresh job immediately, not wait \
+                 for the deferral, got {other:?}"
+            ),
+        };
+        assert_ne!(job2, job1);
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            2,
+            "the event-driven path must not also fire a separate deferred retry"
+        );
+    }
+
+    /// ADR-0045 decision 3 acceptance (d) (audio-graph-bf5d): a due retry
+    /// never double-dispatches into an occupied slot. Simulates a stale
+    /// clock-thread trigger (one that captured the OLD failure's due time)
+    /// firing an `observe_ledger` call after a genuine basis change has
+    /// already started a different job for the new basis — capacity-one
+    /// (the `in_flight` guard, checked before the same-basis/deferral logic)
+    /// must win regardless.
+    #[test]
+    fn scheduler_due_retry_never_double_dispatches_into_an_occupied_slot() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+
+        let job1 = match scheduler.observe_ledger(&ledger, 0) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let failed_at = 10;
+        let due_at = match scheduler.fail_in_flight(&job1, "session-1", &ledger, failed_at) {
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: Some(due_at),
+                ..
+            } => due_at,
+            other => panic!("expected an armed deferral, got {other:?}"),
+        };
+
+        // A genuine basis change occupies the slot before the OLD deferral
+        // is due.
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        let job2 = match scheduler.observe_ledger(&ledger, failed_at + 5) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected the new basis to start a job, got {other:?}"),
+        };
+        assert_eq!(scheduler.metrics().jobs_started, 2);
+
+        // A stale trigger fires `observe_ledger` exactly at the OLD due
+        // time, on the SAME (unchanged since job2 started) ledger. The slot
+        // is occupied by job2, so this must coalesce, never start a third
+        // job — capacity-one preserved even against a due-but-stale retry.
+        assert_eq!(
+            scheduler.observe_ledger(&ledger, due_at),
+            ProjectionSchedulerDecision::Coalesced {
+                in_flight_job_id: job2,
+                queued_span_count: 2,
+                coalesced_span_delta: 0,
+                // Default config: `ttft_estimate_ms` 1_200,
+                // `coalesce_span_threshold` 2 — `queued_span_count` (2) hits
+                // that threshold, so the reason is `PendingSpanThreshold`
+                // regardless of `in_flight_age_ms`.
+                ttft_estimate_ms: 1_200,
+                in_flight_age_ms: due_at - (failed_at + 5),
+                reason: ProjectionCoalescingReason::PendingSpanThreshold,
+            }
+        );
+        assert_eq!(
+            scheduler.metrics().jobs_started,
+            2,
+            "a stale due-time trigger must never start a second job while one is in flight"
+        );
     }
 
     #[test]
@@ -2309,6 +2767,59 @@ mod tests {
             schedulers.notes().in_flight_job().is_some(),
             "a reseed call must not clobber a lane that already has live in-flight work"
         );
+    }
+
+    /// Review fix (adr0045/bf5d-deferred-retry): `reseed_coverage_head`'s doc
+    /// comment claims the `last_failed_basis.is_some()` disjunct alone
+    /// refuses to reseed over a lane with a live deferred retry, and that the
+    /// no-op test above "already covers" it. It does not — that test's lane
+    /// has `in_flight.is_some()`, which short-circuits the guard's FIRST
+    /// disjunct, so `last_failed_basis` is never the deciding condition
+    /// there. This test isolates the deferral: fail the job first (moving it
+    /// OUT of `in_flight`, arming `last_failed_basis` +
+    /// `deferred_retry_at_ms`, the ONLY live state left on the lane), then
+    /// reseed with the exact basis that just failed. If the
+    /// `last_failed_basis.is_some()` disjunct were ever dropped from the
+    /// guard, this reseed would wrongly seed `last_completed_basis` with
+    /// that same basis, and the due retry below would observe `Idle` instead
+    /// of starting a fresh job.
+    #[test]
+    fn reseed_coverage_heads_is_a_no_op_when_the_lane_has_only_a_live_deferred_retry() {
+        let session_id = "reopen-session-deferred-retry";
+        let mut ledger = TranscriptLedger::new(session_id);
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let failed_head = ledger.current_projection_basis();
+
+        let mut schedulers = ProjectionSchedulers::new(session_id);
+        let job = match schedulers.observe_ledger(&ledger, 10).notes {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected notes StartJob, got {other:?}"),
+        };
+        match schedulers.fail_notes_in_flight(&job.id, &job.session_id, &ledger, 20) {
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: Some(_),
+                ..
+            } => {}
+            other => panic!("expected an armed deferral, got {other:?}"),
+        }
+        assert!(
+            schedulers.notes().in_flight_job().is_none(),
+            "the failed job must have left in_flight, unlike the sibling no-op test above"
+        );
+
+        schedulers.reseed_coverage_heads((Some(failed_head), None));
+
+        let due_at = 20 + PROJECTION_DEFERRED_RETRY_DELAY_MS;
+        match schedulers.observe_ledger(&ledger, due_at).notes {
+            ProjectionSchedulerDecision::StartJob { .. } => {}
+            other => panic!(
+                "a reseed call must not clobber a lane whose only live state is a deferred \
+                 retry; expected the due retry to start a fresh job once last_completed_basis \
+                 stayed unseeded, got {other:?}"
+            ),
+        }
     }
 
     /// Code-generated session fixture for the ADR-0045 decision-5 replay

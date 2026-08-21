@@ -2053,11 +2053,35 @@ fn dispatch_projection_decision(
             }
             spawn_projection_job(dispatch, job);
         }
+        // ADR-0045 decision 3 (audio-graph-bf5d): a same-basis `Current`
+        // failure under budget armed exactly one deferred retry
+        // (`deferred_retry_at_ms`). Spawn the single one-shot clock thread
+        // that fires it even if no further final ASR revision ever arrives
+        // — mirrors the stopping check above, at the analogous point (before
+        // any thread exists), so a lane already stopping never gets a
+        // pointless clock armed for it. `None` means this same failure
+        // exhausted the budget: nothing to arm.
+        ProjectionSchedulerDecision::FailedCurrent {
+            failed_job_id,
+            kind,
+            deferred_retry_at_ms: Some(deferred_retry_at_ms),
+        } => {
+            if dispatch.projection_lane_stopping.load(Ordering::SeqCst) {
+                log::debug!(
+                    "projection_lane_stopping set; not arming deferred retry clock for failed_job_id={failed_job_id} kind={kind:?}"
+                );
+                return;
+            }
+            spawn_deferred_lane_observation(dispatch, kind, failed_job_id, deferred_retry_at_ms);
+        }
         ProjectionSchedulerDecision::Idle
         | ProjectionSchedulerDecision::Coalesced { .. }
         | ProjectionSchedulerDecision::CompletedCurrent { .. }
         | ProjectionSchedulerDecision::DiscardedStaleNoCurrentBasis { .. }
-        | ProjectionSchedulerDecision::FailedCurrent { .. }
+        | ProjectionSchedulerDecision::FailedCurrent {
+            deferred_retry_at_ms: None,
+            ..
+        }
         | ProjectionSchedulerDecision::FailedStaleNoCurrentBasis { .. }
         | ProjectionSchedulerDecision::IgnoredSupersededCompletion { .. }
         // Emit-only (audio-graph-ff10 / ADR-0045): no consumer is wired here.
@@ -2167,6 +2191,180 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
             );
         }
     }
+}
+
+/// One-shot clock thread for ADR-0045 decision 3's single deferred retry
+/// (audio-graph-bf5d): the sole real-time source that fires a same-basis
+/// retry when NO further final ASR revision ever arrives to drive it
+/// event-driven. `dispatch_projection_decision` spawns exactly one of these
+/// per armed deferral (`FailedCurrent`'s `deferred_retry_at_ms` was `Some`);
+/// a same-basis failure that already exhausted the attempt budget arms
+/// none, so no clock thread is spawned for it.
+///
+/// `deferred_retry_at_ms` is an absolute [`current_unix_millis`]-epoch
+/// timestamp, not a duration — the SAME value `fail_in_flight` computed and
+/// the SAME clock `current_unix_millis` reads, so the thread's own
+/// wall-clock comparisons need no conversion. This is also the seam tests
+/// use to shorten the delay: nothing here reads
+/// `PROJECTION_DEFERRED_RETRY_DELAY_MS` directly, so a test can pass any
+/// near-future timestamp instead of a real ~60s deadline (mirrors
+/// `drain_projection_job_workers` taking its flush `timeout` as a parameter
+/// rather than hard-coding `PROJECTION_JOB_FLUSH_TIMEOUT` internally).
+///
+/// Registered in the SAME `projection_job_workers` registry
+/// `spawn_projection_job` uses (audio-graph-9cc1), under a synthetic id
+/// (`projection-retry:<failed_job_id>`) that can never collide with a real
+/// projection job id, so `stop_capture_impl`'s drain sees and joins this
+/// thread exactly like a real projection job thread. Registration
+/// happens-before the thread does any work, via the SAME one-shot channel
+/// handshake `spawn_projection_job` uses — load-bearing here because tests
+/// legitimately pass a near-immediate deadline (see above), where the race
+/// `spawn_projection_job`'s own comment describes (a thread fast enough to
+/// finish before the parent's registry push lands, leaving a permanent
+/// phantom entry) is real, not merely theoretical.
+///
+/// Polls `projection_lane_stopping` every 250ms so it never sleeps past a
+/// Stop — bounding how long `drain_projection_job_workers`'s
+/// `PROJECTION_JOB_FLUSH_TIMEOUT` budget can be spent waiting on this
+/// thread — and re-checks the flag immediately before firing, so a Stop
+/// that begins in the final poll window (after the deadline check passed
+/// but before the retry is triggered) still wins: no retry fires after
+/// `projection_lane_stopping` is observed set, at either check point.
+fn spawn_deferred_lane_observation(
+    dispatch: ProjectionDispatchContext,
+    kind: ProjectionKind,
+    failed_job_id: String,
+    deferred_retry_at_ms: u64,
+) {
+    let registry_id = format!("projection-retry:{failed_job_id}");
+    let registry = dispatch.projection_job_workers.clone();
+    let stopping = dispatch.projection_lane_stopping.clone();
+    let thread_name = format!("projection-retry-{}", projection_kind_key(&kind));
+    let thread_kind = kind.clone();
+    let thread_registry_id = registry_id.clone();
+    let thread_registry = registry.clone();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
+    match std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let _ = registered_rx.recv();
+            // Self-deregisters on every exit path below (due-and-fired,
+            // stopping-observed, or an unexpected panic) — mirrors
+            // `run_projection_job`'s `ProjectionJobRegistrationGuard` usage.
+            let _registration_guard = ProjectionJobRegistrationGuard {
+                registry: thread_registry,
+                kind: thread_kind,
+                job_id: thread_registry_id,
+            };
+            loop {
+                if stopping.load(Ordering::SeqCst) {
+                    log::debug!(
+                        "projection_lane_stopping set; deferred retry clock exiting without firing failed_job_id={failed_job_id}"
+                    );
+                    return;
+                }
+                if current_unix_millis() >= deferred_retry_at_ms {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            // Re-check immediately before firing: closes the race where Stop
+            // begins during the final poll window, after the deadline check
+            // above passed but before this thread acts on it.
+            if stopping.load(Ordering::SeqCst) {
+                log::debug!(
+                    "projection_lane_stopping set at the due time; deferred retry clock exiting without firing failed_job_id={failed_job_id}"
+                );
+                return;
+            }
+            trigger_deferred_projection_retry(&dispatch, &failed_job_id);
+        }) {
+        Ok(handle) => {
+            {
+                let mut guard = registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.push((kind, registry_id, handle));
+            }
+            let _ = registered_tx.send(());
+        }
+        Err(error) => {
+            // Review note (adr0045/bf5d-deferred-retry): unlike
+            // `spawn_projection_job`'s `Err` arm (which calls
+            // `finish_projection_scheduler_job(Failed)` to keep scheduler
+            // state truthful), this arm does NOT clear the scheduler's
+            // already-armed `deferred_retry_at_ms` — there is deliberately no
+            // scheduler-mutating fallback here. The failure mode is
+            // liveness-only, identical to the stop/restart-without-rotation
+            // gap documented at `state.projection_lane_stopping`'s Start-path
+            // reset in `commands.rs`: the deferral stays live with no clock
+            // to fire it, and the lane reverts to event-driven-only for that
+            // basis until a new final ASR revision supersedes it via
+            // `start_job`. Not corrective (no phantom in-flight job, no
+            // double-dispatch risk) — just silent. Deliberately not adding a
+            // scheduler-clearing fallback here: doing so would need a new
+            // mutating entry point into `ProjectionSchedulers` reachable
+            // from OUTSIDE the `observe_ledger`/`fail_in_flight` dispatch
+            // tail, for a trigger (thread spawn failure, i.e. OOM or a
+            // thread-limit) that is already exceedingly rare, and getting
+            // its match-by-kind-and-basis race-safety wrong would risk
+            // clearing a deferral a NEWER failure had legitimately re-armed
+            // concurrently. Thread-spawn exhaustion severe enough to hit
+            // this arm is a whole-process concern well beyond one retry
+            // clock in practice.
+            log::error!(
+                "Failed to spawn deferred projection retry clock thread registry_id={registry_id} error={error}"
+            );
+        }
+    }
+}
+
+/// The clock thread's fire action (audio-graph-bf5d): re-observe the ledger
+/// exactly like a final ASR revision would, then dispatch the result through
+/// the SAME `dispatch_projection_observation` tail — no separate dispatch
+/// logic to keep in sync. Reads the CURRENT ledger/scheduler state rather
+/// than anything captured at arm-time, so a stale/late fire (e.g. a
+/// deferral that outlived its usefulness because the basis moved on) is
+/// self-healing by construction: `observe_ledger` decides purely from what
+/// is true now, never from what was true when this clock thread was armed.
+fn trigger_deferred_projection_retry(dispatch: &ProjectionDispatchContext, failed_job_id: &str) {
+    let observation = {
+        let ledger = match dispatch.transcript_ledger.lock() {
+            Ok(ledger) => ledger,
+            Err(poisoned) => {
+                log::warn!(
+                    "Transcript ledger lock poisoned during deferred projection retry; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let mut schedulers = match dispatch.projection_schedulers.lock() {
+            Ok(schedulers) => schedulers,
+            Err(poisoned) => {
+                log::warn!(
+                    "Projection scheduler lock poisoned during deferred projection retry; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let now_ms = current_unix_millis();
+        let observation = schedulers.observe_ledger(&ledger, now_ms);
+        log::debug!(
+            "projection_schedulers.observe_deferred_retry failed_job_id={failed_job_id} notes={:?} graph={:?}",
+            observation.notes,
+            observation.graph
+        );
+        log_attempt_budget_exhausted(
+            &observation.notes,
+            schedulers.notes().metrics().attempts_exhausted,
+        );
+        log_attempt_budget_exhausted(
+            &observation.graph,
+            schedulers.graph().metrics().attempts_exhausted,
+        );
+        observation
+    };
+    dispatch_projection_observation(dispatch.clone(), observation);
 }
 
 /// Which backend identity a projection data-movement event should record
@@ -7382,14 +7580,15 @@ mod tests_status {
         SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
         aws_error_for_diagnostic_event, cloud_error_code, current_unix_millis,
         deregister_projection_job, diarization_span_revision_for_transcript,
-        emit_and_dispatch_diarization_span_revision,
+        dispatch_projection_decision, emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
         provider_start_span_id, record_asr_span_revision_event,
         record_asr_span_revision_event_and_observe_projection, revision_ref,
         run_agent_proposal_task, run_moonshine_speech_processor_with_worker, run_projection_job,
-        set_asr_status, spawn_projection_job, speech_error_diagnostic,
+        set_asr_status, spawn_deferred_lane_observation, spawn_projection_job,
+        speech_error_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -7800,7 +7999,47 @@ mod tests_status {
         }
     }
 
+    /// ADR-0045 decision 3 (audio-graph-bf5d) test-cleanup fix: stop the
+    /// projection lane and wait for every registered projection job AND
+    /// deferred-retry clock thread (`spawn_deferred_lane_observation`) to
+    /// self-deregister, mirroring `stop_capture_impl`'s real Stop path.
+    ///
+    /// Without this, any test that drives a same-basis `Current` failure
+    /// under budget through the real dispatch tail arms a REAL
+    /// wall-clock-scheduled (~60s) clock thread that this function never
+    /// used to know about. `projection_lane_stopping` was never set for such
+    /// a test, so nothing shortened that thread's wait: it outlived the
+    /// test, `drain_app_writers`'s writer shutdown below, the test's own
+    /// `DataDirGuard` drop, and the temp-dir removal that follows it, then
+    /// fired minutes later against already-torn-down state (re-locking the
+    /// ledger/schedulers and potentially resolving `AUDIOGRAPH_DATA_DIR` to
+    /// the developer's real `~/.audiograph` once the guard's directory
+    /// override was gone). Setting the flag first makes the clock thread's
+    /// own 250ms poll exit promptly instead of waiting out its real deadline;
+    /// looping on the registry (rather than trusting one snapshot) covers a
+    /// still-running clock thread firing a real retry job that registers a
+    /// NEW entry after an earlier pass. Runs before the writer shutdown below
+    /// so a retry that was already past its point of no return finishes
+    /// emitting through a live writer instead of a torn-down one.
     fn drain_app_writers(app: &AppState) {
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let empty = app
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < drain_deadline,
+                "projection job/clock threads did not drain within the test timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         let timeout = std::time::Duration::from_secs(3);
         if let Some(writer) = app
             .transcript_writer
@@ -9820,6 +10059,452 @@ mod tests_status {
             event_sink.patch_count(),
             1,
             "only job A's patch should ever have applied"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0045 decision 3 (audio-graph-bf5d) positive control: a `FailedCurrent`
+    /// decision with an armed deferral spawns exactly one clock thread, which
+    /// — with no further final ASR revision ever arriving — is the sole
+    /// reason the retry fires at all. Uses a near-immediate deadline
+    /// (`current_unix_millis() + 60`) rather than the real ~60s
+    /// `PROJECTION_DEFERRED_RETRY_DELAY_MS`, the same "pass the deadline as a
+    /// parameter" seam `drain_projection_job_workers`'s tests use to avoid a
+    /// real-time wait.
+    #[test]
+    fn deferred_retry_clock_thread_fires_the_retry_when_not_stopping() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("deferred-retry-fires-when-not-stopping");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        let failed_job_id = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "deferred-retry-fires-span-1",
+                        1,
+                        "Failing basis armed for a deferred retry.",
+                        true,
+                    ),
+                ))
+                .expect("seed span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes StartJob, got {other:?}"),
+            };
+            match schedulers.fail_notes_in_flight(&job.id, &job.session_id, &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id,
+                    deferred_retry_at_ms: Some(_),
+                    ..
+                } => failed_job_id,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            }
+        };
+
+        // Test-shortened deadline: a near-future real wall-clock timestamp
+        // instead of the real ~60s delay. The scheduler above armed its OWN
+        // `deferred_retry_at_ms` using fake `now_ms` (10/20); that value is
+        // intentionally NOT what is passed to the clock thread here — the
+        // thread's own clock is always real wall time, so its deadline
+        // parameter must be too (mirrors `drain_projection_job_workers`'s
+        // tests passing a short `timeout` instead of the real
+        // `PROJECTION_JOB_FLUSH_TIMEOUT`).
+        let short_deadline = current_unix_millis() + 60;
+        spawn_deferred_lane_observation(
+            dispatch,
+            ProjectionKind::Notes,
+            failed_job_id,
+            short_deadline,
+        );
+
+        // Poll on the applied patch, not merely the generator call count:
+        // `calls` increments the instant `generate_projection_patch` is
+        // entered, before the retry job's own thread has applied and
+        // emitted the patch — the discriminating signal for "the retry
+        // actually ran to completion" is the event sink.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if event_sink.patch_count() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred retry never fired within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(event_sink.patch_count(), 1);
+
+        let empty_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let empty = app
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < empty_deadline,
+                "both the clock thread and the retry job it spawned must self-deregister"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0045 decision 3 acceptance (b) (audio-graph-bf5d): no retry fires
+    /// after `projection_lane_stopping` is set — even one already armed with
+    /// a deadline that would otherwise have fired. `projection_lane_stopping`
+    /// is set BEFORE the clock thread is spawned, so this exercises the
+    /// thread's very first poll-loop check (the strongest form: the thread's
+    /// entire lifetime happens while stopping is already true). The
+    /// discriminating assertion is `calls == 0` — the generator (and
+    /// therefore any real retry job thread) must never run — not merely
+    /// "the registry ends up empty", which a reverted check would also
+    /// eventually satisfy once the (wrongly fired) retry job itself
+    /// self-deregisters.
+    #[test]
+    fn deferred_retry_clock_thread_never_fires_after_projection_lane_stopping_is_set() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("deferred-retry-never-fires-once-stopping");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
+
+        let failed_job_id = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "deferred-retry-never-fires-span-1",
+                        1,
+                        "Failing basis armed for a deferred retry that Stop must cancel.",
+                        true,
+                    ),
+                ))
+                .expect("seed span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = match schedulers.observe_ledger(&ledger, 10).graph {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected graph StartJob, got {other:?}"),
+            };
+            match schedulers.fail_graph_in_flight(&job.id, &job.session_id, &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id,
+                    deferred_retry_at_ms: Some(_),
+                    ..
+                } => failed_job_id,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            }
+        };
+
+        // Stop begins before the clock thread is even spawned — the
+        // strongest ordering: the thread's entire life happens under
+        // `projection_lane_stopping = true`.
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+
+        let short_deadline = current_unix_millis() + 200;
+        spawn_deferred_lane_observation(
+            dispatch,
+            ProjectionKind::Graph,
+            failed_job_id,
+            short_deadline,
+        );
+
+        // Poll well past the deadline the thread was armed with: a reverted
+        // stopping-check would still fire the retry once `short_deadline`
+        // elapses, so this window must be long enough to catch that mutant,
+        // not just long enough to observe a prompt correct exit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let empty = app
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clock thread must self-deregister promptly (bounded by its 250ms poll), \
+                 stopping or not"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no retry job must ever run once projection_lane_stopping is set"
+        );
+        assert!(
+            app.projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .graph()
+                .in_flight_job()
+                .is_none(),
+            "a cancelled deferred retry must not leave a phantom in-flight job"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review fix (adr0045/bf5d-deferred-retry): pins `dispatch_projection_decision`'s
+    /// new `FailedCurrent { deferred_retry_at_ms: Some(_), .. }` arm ITSELF,
+    /// not merely `spawn_deferred_lane_observation` (which every other test
+    /// in this file calls directly). Feeds a `FailedCurrent` decision
+    /// straight into `dispatch_projection_decision` — the production
+    /// dispatcher every real caller (`finish_projection_scheduler_job`,
+    /// `trigger_deferred_projection_retry`) actually goes through — and
+    /// proves it is the arm's own dispatch that spawns the clock thread and
+    /// carries the retry to completion. Gutting the arm to `{ .. } => {}`
+    /// makes this test time out waiting for a patch that never arrives;
+    /// removing the arm entirely fails to compile (a fresh regression this
+    /// test alone cannot catch, but the exhaustive match in
+    /// `dispatch_projection_decision` already guards that).
+    #[test]
+    fn dispatch_projection_decision_spawns_and_fires_the_deferred_retry_clock_for_an_armed_failed_current()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("dispatch-decision-arms-deferred-retry");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        // Arm a real deferral through the scheduler's own `fail_in_flight`
+        // (fake `now_ms` values, same idiom every scheduler-level unit test
+        // uses) so `failed_job_id` refers to a genuine failed job the
+        // eventual `observe_ledger` re-check inside the fired retry can
+        // legitimately act on.
+        let failed_job_id = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "dispatch-decision-arms-deferred-retry-span-1",
+                        1,
+                        "Failing basis fed straight into dispatch_projection_decision.",
+                        true,
+                    ),
+                ))
+                .expect("seed span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes StartJob, got {other:?}"),
+            };
+            match schedulers.fail_notes_in_flight(&job.id, &job.session_id, &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id,
+                    deferred_retry_at_ms: Some(_),
+                    ..
+                } => failed_job_id,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            }
+        };
+
+        // The decision fed to `dispatch_projection_decision` here is built
+        // BY THIS TEST, not returned by the scheduler above — the point is
+        // to exercise the dispatcher's own arm with a real near-future wall
+        // clock deadline (the same test-shortened-delay seam
+        // `spawn_deferred_lane_observation`'s other tests use), rather than
+        // whatever fake epoch the scheduler recorded internally from `now_ms
+        // = 20` above.
+        let decision = ProjectionSchedulerDecision::FailedCurrent {
+            failed_job_id,
+            kind: ProjectionKind::Notes,
+            deferred_retry_at_ms: Some(current_unix_millis() + 60),
+        };
+        dispatch_projection_decision(dispatch, decision);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if event_sink.patch_count() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dispatch_projection_decision's FailedCurrent arm never fired the deferred \
+                 retry within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(event_sink.patch_count(), 1);
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review fix (adr0045/bf5d-deferred-retry): unlike every other clock-
+    /// related test in this file, this one feeds a `FailedCurrent { .. }`
+    /// decision straight into `dispatch_projection_decision` (never touching
+    /// `spawn_deferred_lane_observation` directly) with
+    /// `projection_lane_stopping` already set — proving the dispatcher's
+    /// overall behavior at this call boundary is safe: no retry job ever
+    /// runs and the registry ends up empty, closing the coverage gap the
+    /// review named ("the dispatch-level gate at :2069 is likewise
+    /// unpinned").
+    ///
+    /// Honest limitation: this test cannot, by itself, distinguish "the
+    /// dispatch-level check refused to spawn" from "the check was bypassed,
+    /// a clock thread spawned, and that thread's OWN first poll check (the
+    /// identical `stopping.load` guard, evaluated moments later on the
+    /// child) caught it instead" — both are observably identical here
+    /// (`calls == 0`, registry empty), for the same reason the review
+    /// separately flagged for
+    /// `deferred_retry_clock_thread_never_fires_after_projection_lane_stopping_is_set`:
+    /// the two checks guard the exact same ordering (stopping set before the
+    /// decision/spawn), so a mutant that removes ONLY the dispatch-level
+    /// check is functionally caught by the thread's own check regardless,
+    /// with no test-observable difference short of instrumenting thread
+    /// creation itself. That duplication is intentional defense in depth
+    /// (see the `FailedCurrent` arm's own comment), not a bug.
+    #[test]
+    fn dispatch_projection_decision_refuses_to_arm_a_deferred_retry_clock_once_stopping() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("dispatch-decision-refuses-deferred-retry-once-stopping");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
+
+        let failed_job_id = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "dispatch-decision-refuses-deferred-retry-span-1",
+                        1,
+                        "Failing basis that Stop must keep the dispatcher from arming.",
+                        true,
+                    ),
+                ))
+                .expect("seed span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = match schedulers.observe_ledger(&ledger, 10).graph {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected graph StartJob, got {other:?}"),
+            };
+            match schedulers.fail_graph_in_flight(&job.id, &job.session_id, &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id,
+                    deferred_retry_at_ms: Some(_),
+                    ..
+                } => failed_job_id,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            }
+        };
+
+        // Set BEFORE the decision ever reaches `dispatch_projection_decision`
+        // — the ordering production always produces when Stop begins before
+        // a same-basis failure's own dispatch tail runs.
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+
+        let decision = ProjectionSchedulerDecision::FailedCurrent {
+            failed_job_id,
+            kind: ProjectionKind::Graph,
+            deferred_retry_at_ms: Some(current_unix_millis() + 60),
+        };
+        dispatch_projection_decision(dispatch, decision);
+
+        // Give a spawned-but-shouldn't-be-spawned clock thread ample time to
+        // fire on its near-immediate deadline; the discriminating assertion
+        // is `calls == 0` below, not merely registry emptiness (which a
+        // wrongly-fired, already-completed retry would also satisfy).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert!(
+            app.projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the dispatch-level stopping gate must refuse to register any clock thread"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no retry job must ever run once projection_lane_stopping is set before the \
+             FailedCurrent decision reaches the dispatcher"
         );
 
         drain_app_writers(&app);

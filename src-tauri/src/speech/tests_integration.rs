@@ -69,6 +69,44 @@ fn unique_tempdir(label: &str) -> PathBuf {
     dir
 }
 
+/// Review fix (adr0045/bf5d-deferred-retry): this file builds `SpeechShared`/
+/// `TranscriptProcessingContext` inline, with real (non-mocked) LLM executor
+/// state and a real `TranscriptEventWriter` — a genuine final ASR revision
+/// driven through here reaches the SAME real dispatch tail production uses,
+/// including `finish_projection_scheduler_job` -> `fail_*_in_flight`, which
+/// arms a REAL wall-clock (~60s) deferred-retry clock thread
+/// (`spawn_deferred_lane_observation`, ADR-0045 decision 3) on the very first
+/// under-budget failure. With no LLM engine configured, generation always
+/// fails here, so any test in this file that reaches a final revision arms
+/// one. Unlike `speech::tests_status`'s `drain_app_writers`, this file has no
+/// `AppState` to hang a shared cleanup helper off of — each test builds its
+/// own fresh `projection_lane_stopping`/`projection_job_workers` Arcs inline.
+/// Call this at the end of any such test with those two Arcs: it mirrors
+/// `stop_capture_impl`'s real Stop path (set the flag, then wait for
+/// self-deregistration) so a clock thread this test armed cannot outlive it
+/// waiting out a real ~60s deadline against already-torn-down temp-dir state.
+fn stop_and_drain_projection_lane(
+    projection_lane_stopping: &Arc<AtomicBool>,
+    projection_job_workers: &crate::state::ProjectionJobRegistry,
+) {
+    projection_lane_stopping.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let empty = projection_job_workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        if empty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "projection job/clock threads did not drain within the test timeout"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 struct DataDirGuard {
     prev_data_dir: Option<std::ffi::OsString>,
     prev_home: Option<std::ffi::OsString>,
@@ -387,6 +425,9 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
         "integration fixture requires an accepting canonical writer"
     );
 
+    let projection_job_workers: crate::state::ProjectionJobRegistry =
+        Arc::new(Mutex::new(Vec::new()));
+    let projection_lane_stopping = Arc::new(AtomicBool::new(false));
     let shared = SpeechShared {
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),
@@ -412,8 +453,8 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
         mistralrs_engine,
         llm_executor,
         pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
-        projection_job_workers: Arc::new(Mutex::new(Vec::new())),
-        projection_lane_stopping: Arc::new(AtomicBool::new(false)),
+        projection_job_workers: projection_job_workers.clone(),
+        projection_lane_stopping: projection_lane_stopping.clone(),
     };
     let config = SpeechConfig {
         models_dir: models_dir.clone(),
@@ -487,6 +528,7 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
         .expect("event receiver thread must exit within 3s of the channel disconnecting")
         .expect("event receiver thread must exit cleanly once the channel disconnects");
 
+    stop_and_drain_projection_lane(&projection_lane_stopping, &projection_job_workers);
     let _ = fs::remove_dir_all(&models_dir);
 }
 
@@ -530,6 +572,9 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         transcript_event_writer.lock().unwrap().is_some(),
         "integration fixture requires an accepting canonical writer"
     );
+    let projection_job_workers: crate::state::ProjectionJobRegistry =
+        Arc::new(Mutex::new(Vec::new()));
+    let projection_lane_stopping = Arc::new(AtomicBool::new(false));
     let ctx = TranscriptProcessingContext {
         asr_provider: "assemblyai",
         active_session_id,
@@ -540,8 +585,8 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         speaker_timeline,
         projection_schedulers: projection_schedulers.clone(),
         projection_runtime: ProjectionRuntimeHandle::in_memory_for_tests(session_id),
-        projection_job_workers: Arc::new(Mutex::new(Vec::new())),
-        projection_lane_stopping: Arc::new(AtomicBool::new(false)),
+        projection_job_workers: projection_job_workers.clone(),
+        projection_lane_stopping: projection_lane_stopping.clone(),
         pipeline_status,
         app_handle,
         llm_engine,
@@ -705,6 +750,7 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         assert!(writer.shutdown_with_timeout(Duration::from_secs(2)));
     }
 
+    stop_and_drain_projection_lane(&projection_lane_stopping, &projection_job_workers);
     let _ = fs::remove_dir_all(&data_dir);
 }
 

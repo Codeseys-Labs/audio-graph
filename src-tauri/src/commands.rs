@@ -2504,6 +2504,25 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // read as "stopping" to the deferred-retry lane (ADR-0045 decision 3)
     // this flag is documented to feed, silently disabling retries for the
     // rest of the process.
+    //
+    // Review note (adr0045/bf5d-deferred-retry): this reset does NOT re-arm a
+    // clock for a deferral that was already live in the scheduler when Stop
+    // happened. A same-basis `Current` failure arms `deferred_retry_at_ms`
+    // (decision 3) unconditionally in `fail_in_flight`; if Stop's flag was
+    // already set by the time `dispatch_projection_decision` saw the
+    // resulting `FailedCurrent`, no clock thread was ever spawned for it, and
+    // any clock thread already running exits without firing. Restarting
+    // capture on the SAME session (no `rotate_session`, which is the only
+    // path that clears `last_failed_basis`/`deferred_retry_at_ms`) leaves
+    // that deferral live with no clock source: the lane silently reverts to
+    // pre-bf5d event-driven-only behaviour for that basis until a new final
+    // ASR revision changes it via `start_job`. No wedge results (the 5fd1
+    // reseed guard still refuses via `last_failed_basis`), but the "retry
+    // fires even with no further finals" guarantee does not hold across this
+    // stop/restart path. Closing this gap would mean re-arming a clock here
+    // when `last_failed_basis`/`deferred_retry_at_ms` are already live —
+    // deliberately not done in this fix, which only wires the clock's first
+    // source (out of scope per the ticket).
     state
         .projection_lane_stopping
         .store(false, Ordering::SeqCst);
