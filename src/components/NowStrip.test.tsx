@@ -10,10 +10,13 @@ import { useAudioGraphStore } from "../store";
 import type { AppSettings, AudioSourceInfo, ProjectionPatch } from "../types";
 import NowStrip from "./NowStrip";
 
-// NowStrip renders <ConversationModeControl/> unconditionally (B20 /
-// ADR-0016 — idle AND capturing), so the conversation-mode store fields must
-// be populated too. Only `gemini.auth` and `llm_provider` gate the branches
-// NowStrip/ConversationModeControl read.
+// SHELL-R5 (plan §R5, ADR-0046): NowStrip no longer renders
+// <ConversationModeControl/> or the Gemini toggle at all — both relocated
+// into `PreflightCard`. `conversationMode`/`converseEngine`/
+// `converseRealtimeAgentProvider` and the Gemini action mocks below are kept
+// in this file's fixtures only so the "never renders X" regression test can
+// seed a conversationMode/engine combination that WOULD have rendered them
+// pre-R5 and assert it still doesn't.
 function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
     asr_provider: {
@@ -152,13 +155,15 @@ describe("NowStrip", () => {
     for (const chip of container.querySelectorAll(".ag-chip")) {
       expect(chip).toHaveAttribute("data-tone", "neutral");
     }
-    // B20 / ADR-0016: pipeline controls stay discoverable pre-capture.
-    // `ConversationModeControl` renders (demoted, not gated behind
-    // `isCapturing`) even while idle — see this file's NAMED TRANSITIONAL
-    // STATE doc comment.
+    // SHELL-R5 (plan §R5, ADR-0046): `ConversationModeControl` no longer
+    // renders here at all — it relocated into `PreflightCard` as a
+    // preflight choice (see that file's own tests). This was previously a
+    // positive assertion (demoted, but present) per SHELL-R3's "NAMED
+    // TRANSITIONAL STATE, R5 owns the follow-up" doc comment; R5 is that
+    // follow-up.
     expect(
       container.querySelector('[aria-label="Conversation mode"]'),
-    ).not.toBeNull();
+    ).toBeNull();
   });
 
   // 50e3's "no regression to diagnostics" half: `SystemDrawer` (per-stage
@@ -347,64 +352,58 @@ describe("NowStrip", () => {
     ).toHaveAttribute("data-tone", "danger");
   });
 
-  // ── Gemini (demoted, NAMED TRANSITIONAL STATE) ───────────────────────────
-  it("does not render the Gemini control outside native converse mode", () => {
+  // ── Gemini + ConversationModeControl (SHELL-R5: relocated) ──────────────
+  // SHELL-R3 demoted these into the strip (ghost/muted, unconditional
+  // render) and explicitly named it a transitional state, deferring their
+  // real home to R5 ("do not fix — R5 owns the follow-up"). R5 moved BOTH
+  // into `PreflightCard`. Review correction: this is NOT equivalent
+  // coverage, let alone stronger. `PreflightCard` only mounts while
+  // `!isCapturing`, but `startGemini` hard-requires `isCapturing` — so the
+  // relocated Start-Gemini control is permanently `aria-disabled` there (see
+  // `PreflightCard.tsx`'s KNOWN GAP doc comment), and the Stop-realtime
+  // control this file used to pin ("allows stop for an already-running
+  // deferred native session") has NO live-reachable replacement at all: this
+  // strip is the only chrome that used to render during an active capture,
+  // and it renders neither control in any state now. `PreflightCard.test.tsx`
+  // does still pin the relocated JSX/wiring itself (so it doesn't rot
+  // unnoticed), but that is coverage of code that cannot execute in
+  // production today, not a like-for-like replacement of the reachability
+  // this suite used to prove. NowStrip renders neither control anymore, in
+  // any conversation mode, live or idle — that fact (not "coverage moved") is
+  // what this test still pins.
+  it("never renders ConversationModeControl or the Gemini toggle, live or idle, in any conversation mode", () => {
     resetStore({
       isCapturing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
-      conversationMode: "notes",
+      isGeminiActive: true,
+      conversationMode: "converse",
+      converseEngine: "native",
     });
-    render(<NowStrip />);
+    const { rerender } = render(<NowStrip />);
     expect(
       screen.queryByRole("button", { name: /start gemini/i }),
     ).not.toBeInTheDocument();
-  });
+    expect(
+      screen.queryByRole("button", { name: /stop realtime session/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      document.querySelector('[aria-label="Conversation mode"]'),
+    ).toBeNull();
 
-  it("renders the Gemini control pre-capture too (B20 / ADR-0016), aria-disabled with a start-capture reason", () => {
     resetStore({
       isCapturing: false,
       selectedSourceIds: ["system-default"],
       conversationMode: "converse",
       converseEngine: "native",
     });
-    render(<NowStrip />);
-    const gemini = screen.getByRole("button", { name: /start gemini/i });
-    expect(gemini).toBeInTheDocument();
-    expect(gemini).toHaveAttribute("aria-disabled", "true");
-    fireEvent.click(gemini);
-    expect(actions.startGemini).not.toHaveBeenCalled();
-  });
-
-  it("keeps a persisted deferred native control visible but blocks a new start", () => {
-    resetStore({
-      isCapturing: true,
-      selectedSourceIds: ["system-default"],
-      captureStartTime: Date.now(),
-      conversationMode: "converse",
-      converseEngine: "native",
-    });
-    render(<NowStrip />);
-    const gemini = screen.getByRole("button", { name: /start gemini/i });
-    expect(gemini).toHaveAttribute("aria-disabled", "true");
-    fireEvent.click(gemini);
-    expect(actions.startGemini).not.toHaveBeenCalled();
-  });
-
-  it("allows stop for an already-running deferred native session", async () => {
-    resetStore({
-      isCapturing: true,
-      isGeminiActive: true,
-      selectedSourceIds: ["system-default"],
-      captureStartTime: Date.now(),
-      conversationMode: "converse",
-      converseEngine: "native",
-    });
-    render(<NowStrip />);
-    const stop = screen.getByRole("button", { name: /stop realtime session/i });
-    expect(stop).toHaveAttribute("aria-disabled", "false");
-    fireEvent.click(stop);
-    await waitFor(() => expect(actions.stopGemini).toHaveBeenCalledTimes(1));
+    rerender(<NowStrip />);
+    expect(
+      screen.queryByRole("button", { name: /start gemini/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      document.querySelector('[aria-label="Conversation mode"]'),
+    ).toBeNull();
   });
 
   it("wires the sessions and settings launchers to their store actions", () => {

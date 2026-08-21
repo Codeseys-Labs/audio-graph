@@ -654,6 +654,10 @@ export default function AudioSourceSelector() {
       <div className="relative pt-0 pb-(--space-4) px-(--space-4)">
         <input
           ref={searchInputRef}
+          // SHELL-R5: stable id the preflight card's Sources row "Choose
+          // sources" fix action focuses, so picking a source stays one click
+          // away from the card even before any source is selected.
+          id="audio-source-search"
           type="text"
           className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-(--edge) rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
           aria-label={t("settings.audioSources.searchLabel")}

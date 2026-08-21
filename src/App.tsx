@@ -12,8 +12,12 @@
  *   - Destination bar: Capture / Sessions.
  *   - Middle flex:
  *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
- *       - Main: destination-specific notes/transcript workspace (Capture) or
- *         `SessionsBrowser`'s list→detail + lenses (Sessions) — the old
+ *       - Main: destination-specific content. Capture is a 3-way choice —
+ *         `GetStartedFallback` (the credential-presence probe threw),
+ *         `PreflightCard` (genuinely idle — SHELL-R5, ADR-0046: a pass/fail
+ *         checklist replacing the pre-R5 "empty live cockpit"), or the live/
+ *         reviewing NotesPanel + LiveTranscript + AgentProposalsPanel trio.
+ *         Sessions is `SessionsBrowser`'s list→detail + lenses — the old
  *         Inspect tab's graph/diagnostics reach now lives in the Sessions
  *         Graph/Route lenses (R2) and the NowStrip System drawer (R3)
  *   - Bottom: `PipelineStatusBar` (per-stage status dots; collapses to the
@@ -86,6 +90,9 @@ const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 import DemoModeBanner from "./components/DemoModeBanner";
 import GetStartedFallback from "./components/GetStartedFallback";
 import Notifications from "./components/Notifications";
+// SHELL-R5 (plan §R5, ADR-0046): the Capture destination's idle-state
+// surface — see this file's doc comment on `ShellRailContentAside`.
+import PreflightCard from "./components/PreflightCard";
 import StorageBanner from "./components/StorageBanner";
 import SystemDrawer from "./components/SystemDrawer";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
@@ -344,6 +351,7 @@ interface ShellRailContentAsideProps {
   leftWidth: number;
   resizeLeft: (dx: number) => void;
   showGetStartedFallback: boolean;
+  showPreflightCard: boolean;
   previewSampleSession: () => void;
   retryCredentialProbe: () => Promise<void>;
   openSettings: () => void;
@@ -358,12 +366,20 @@ interface ShellRailContentAsideProps {
  * along with the `analysis` tab it belonged to; every occupant already has a
  * home in R2's Sessions lenses / R3's System drawer). The session-scoped
  * readers under here (`NotesPanel`, `LiveTranscript`) are wrapped in
- * `SessionViewProvider` by the caller. */
+ * `SessionViewProvider` by the caller.
+ *
+ * SHELL-R5 (plan §R5, ADR-0046): the capture branch is now a 3-way choice,
+ * not 2-way — `showGetStartedFallback` (probe threw; unchanged, still
+ * `GetStartedFallback`'s exact role), `showPreflightCard` (genuinely idle —
+ * `PreflightCard` replaces the pre-R5 "empty live cockpit" of rendering
+ * NotesPanel/LiveTranscript with nothing in them yet), or live/reviewing
+ * (the original NotesPanel + LiveTranscript + AgentProposalsPanel trio). */
 function ShellRailContentAside({
   workspaceView,
   leftWidth,
   resizeLeft,
   showGetStartedFallback,
+  showPreflightCard,
   previewSampleSession,
   retryCredentialProbe,
   openSettings,
@@ -399,6 +415,15 @@ function ShellRailContentAside({
               retrying={probeRetrying}
               unreadable={probeUnreadable}
             />
+          </main>
+        ) : showPreflightCard ? (
+          <main
+            id="workspace-panel-capture"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-capture"
+            className="workspace-panel"
+          >
+            <PreflightCard />
           </main>
         ) : (
           <main
@@ -895,6 +920,20 @@ function App() {
   // the fallback to the exact "empty cockpit" case it exists to prevent.
   const showGetStartedFallback =
     probeFailed && !isCapturing && !samplePreviewActive && !loadedSessionId;
+  // SHELL-R5 (plan §R5, ADR-0046): the preflight card replaces the same
+  // "empty cockpit" surface for the non-error idle case — same genuinely-
+  // idle predicate as the fallback above (probe SUCCEEDED this time), minus
+  // one more exclusion: `hasAgentActivity`. Agent proposals/live-assist cards
+  // can outlive a `stopCapture()` that didn't have a session id to route to
+  // (see that action's doc comment in `store/index.ts`), so there IS real
+  // content to review even though `isCapturing` is already false — the
+  // preflight card must not paper over that with an empty checklist.
+  const showPreflightCard =
+    !showGetStartedFallback &&
+    !isCapturing &&
+    !samplePreviewActive &&
+    !loadedSessionId &&
+    !hasAgentActivity;
 
   return (
     <div
@@ -925,6 +964,7 @@ function App() {
           leftWidth={leftWidth}
           resizeLeft={resizeLeft}
           showGetStartedFallback={showGetStartedFallback}
+          showPreflightCard={showPreflightCard}
           previewSampleSession={previewSampleSession}
           retryCredentialProbe={retryCredentialProbe}
           openSettings={openSettings}

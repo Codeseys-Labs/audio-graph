@@ -39,19 +39,25 @@
  *     health chip (same `setSystemDrawerOpen` action, now tone/label-coded
  *     off `utils/pipelineHealth.ts`'s live classification).
  *
- * NAMED TRANSITIONAL STATE (do not "fix" — R5 owns the follow-up):
- * `ConversationModeControl` and the Gemini toggle remain in the strip,
- * demoted (ghost/muted via a wrapping `opacity`+`grayscale` filter, since
- * neither component's own internals are in this unit's scope) until R5
- * relocates them into the preflight card. Per B20 / ADR-0016, they render
- * UNCONDITIONALLY — idle AND live, same as master's `ControlBar` — not
- * gated behind `isCapturing`; `geminiVisible` (unchanged from master) still
- * governs whether the Gemini toggle itself is in the DOM at all, and its own
- * `aria-disabled`/Tooltip reason (`geminiReason`) covers the pre-capture
- * case exactly as before. The standalone Transcribe toggle is REMOVED
- * outright (composed into Start instead — "purple leaves the strip for
- * free" per the recomposition plan); a manual "stop transcription without
- * stopping capture" affordance is not carried forward.
+ * RELOCATED (SHELL-R5, plan §R5, ADR-0046): `ConversationModeControl` and
+ * the Gemini toggle — demoted ghost controls here since SHELL-R3 named them
+ * "NAMED TRANSITIONAL STATE, do not fix — R5 owns the follow-up" — have now
+ * moved into `PreflightCard` as a preflight choice ("Mode: Notes /
+ * Converse"), out of primary chrome per the plan. Neither renders in this
+ * strip anymore, live or idle. FULL STATEMENT (review correction — the
+ * original note here undersold this): this strip was the ONLY chrome that
+ * rendered either control while `isCapturing` was true (it never unmounts on
+ * capture start/stop; `PreflightCard` does the opposite — it only mounts
+ * while idle). So the relocation doesn't just lose "a chrome-level way to
+ * start Gemini mid-capture" — it loses every live-reachable entry point for
+ * BOTH starting a native-converse realtime session and stopping one that's
+ * already running, full stop. See `PreflightCard.tsx`'s KNOWN GAP doc
+ * comment for the complete disclosure and why this is escalated rather than
+ * fixed in this pass. The standalone Transcribe toggle was REMOVED outright
+ * at R3 (composed into Start instead — "purple leaves the strip for free"
+ * per the recomposition plan); a manual "stop transcription without
+ * stopping capture" affordance is not carried forward — that one WAS an
+ * intentional, disclosed simplification, unlike the Gemini gap above.
  *
  * The route chip is passive-read-derived, not settings-alone (`settings` +
  * `credentialPresence` + `modelStatus`, all local/already-in-store per
@@ -76,11 +82,8 @@ import {
   hasConfiguredDurableNotesRoute,
 } from "../utils/durableRoute";
 import { computeCompositeHealth } from "../utils/pipelineHealth";
-import ConversationModeControl from "./ConversationModeControl";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
-import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
-import Tooltip from "./Tooltip";
 
 function formatElapsed(totalSeconds: number): string {
   const clamped = Math.max(0, totalSeconds);
@@ -100,7 +103,6 @@ const HEALTH_TONE: Record<"healthy" | "degraded" | "error", string> = {
 function NowStrip() {
   const { t } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
-  const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
   // SHELL-R4 (plan §R4, ADR-0046): read alongside `isCapturing` so the
   // relocated `.workspace-switcher__state` region below can reproduce the
   // exact 4-way ternary the destination bar used to render.
@@ -115,16 +117,9 @@ function NowStrip() {
     (s) => s.startCaptureAndTranscribe,
   );
   const stopCapture = useAudioGraphStore((s) => s.stopCapture);
-  const startGemini = useAudioGraphStore((s) => s.startGemini);
-  const stopGemini = useAudioGraphStore((s) => s.stopGemini);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
   const openSessionsBrowser = useAudioGraphStore((s) => s.openSessionsBrowser);
   const setSystemDrawerOpen = useAudioGraphStore((s) => s.setSystemDrawerOpen);
-  const conversationMode = useAudioGraphStore((s) => s.conversationMode);
-  const converseEngine = useAudioGraphStore((s) => s.converseEngine);
-  const converseRealtimeAgentProvider = useAudioGraphStore(
-    (s) => s.converseRealtimeAgentProvider,
-  );
   const sessionProjectionEvents = useAudioGraphStore(
     (s) => s.sessionProjectionEvents,
   );
@@ -149,7 +144,6 @@ function NowStrip() {
   }, [isCapturing]);
 
   const [capturePending, setCapturePending] = useState(false);
-  const [geminiPending, setGeminiPending] = useState(false);
 
   const elapsed =
     isCapturing && captureStartTime !== null
@@ -186,19 +180,6 @@ function NowStrip() {
       setCapturePending(false);
     }
   }, [isCapturing, startCaptureAndTranscribe, stopCapture]);
-
-  const handleToggleGemini = useCallback(async () => {
-    setGeminiPending(true);
-    try {
-      if (isGeminiActive) {
-        await stopGemini();
-      } else {
-        await startGemini();
-      }
-    } finally {
-      setGeminiPending(false);
-    }
-  }, [isGeminiActive, startGemini, stopGemini]);
 
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
 
@@ -237,39 +218,6 @@ function NowStrip() {
     persistenceQueueBackpressure,
     backpressuredSourceCount: backpressuredSources.length,
   });
-
-  // Gemini gating — unchanged from the old ControlBar (ADR-0013 sibling
-  // mode; demoted here, not removed, per this file's NAMED TRANSITIONAL
-  // STATE doc comment above).
-  const hasGeminiKey =
-    settings?.gemini?.auth?.type === "api_key" ||
-    settings?.gemini?.auth?.type === "vertex_ai";
-  const realtimeAgentProviderId =
-    converseRealtimeAgentProvider === "openai"
-      ? "realtime_agent.openai_realtime"
-      : "realtime_agent.gemini_live";
-  const realtimeAgentSelectable =
-    PROVIDER_DESCRIPTORS.get(realtimeAgentProviderId)?.ui_selectable === true;
-  const hasRealtimeAgentAuth =
-    converseRealtimeAgentProvider === "openai" ? true : hasGeminiKey;
-  const canGemini =
-    isCapturing &&
-    !isGeminiActive &&
-    hasRealtimeAgentAuth &&
-    realtimeAgentSelectable;
-  const geminiVisible =
-    isGeminiActive ||
-    (conversationMode === "converse" && converseEngine === "native");
-  const geminiDisabled = (!canGemini && !isGeminiActive) || geminiPending;
-  const geminiReason = isGeminiActive
-    ? t("controlBar.stopRealtimeHint")
-    : !realtimeAgentSelectable
-      ? t("controlBar.engineNotInMvp")
-      : !hasRealtimeAgentAuth
-        ? t("controlBar.geminiNeedsKey")
-        : !isCapturing
-          ? t("controlBar.geminiNeedsCapture")
-          : t("controlBar.geminiHint");
 
   return (
     <header
@@ -393,46 +341,6 @@ function NowStrip() {
             </button>
           </>
         )}
-
-        {/* NAMED TRANSITIONAL STATE — see file doc comment. Rendered
-            unconditionally (B20 / ADR-0016: pipeline controls stay
-            discoverable pre-capture, `aria-disabled` rather than gated out
-            of the DOM), demoted via a wrapping filter rather than by
-            editing ConversationModeControl/the Gemini button's own
-            internals (out of this unit's file scope). */}
-        <div className="flex items-center gap-(--space-3) opacity-75 grayscale-[35%]">
-          <ConversationModeControl />
-          {geminiVisible && (
-            <>
-              <Tooltip content={geminiReason}>
-                <button
-                  type="button"
-                  className={`py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer transition-[background-color,border-color,color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-2) aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:border-text-muted aria-disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-(--on-accent-gemini) border-(--accent-gemini) hover:bg-(--accent-gemini-hover) hover:border-(--accent-gemini-hover)" : "border-(--accent-gemini) text-(--accent-gemini) hover:bg-(--tint-gemini)"}`}
-                  onClick={() => {
-                    if (geminiDisabled) return;
-                    void handleToggleGemini();
-                  }}
-                  aria-disabled={geminiDisabled}
-                  aria-label={
-                    isGeminiActive
-                      ? t("controlBar.stopRealtimeLabel")
-                      : t("controlBar.startGeminiLabel")
-                  }
-                  aria-describedby="now-strip-gemini-reason"
-                  aria-pressed={isGeminiActive}
-                  aria-busy={geminiPending}
-                >
-                  {isGeminiActive
-                    ? t("controlBar.stopRealtime")
-                    : t("controlBar.gemini")}
-                </button>
-              </Tooltip>
-              <span id="now-strip-gemini-reason" className="sr-only">
-                {geminiReason}
-              </span>
-            </>
-          )}
-        </div>
       </div>
 
       <div className="now-strip__actions flex items-center justify-end min-w-[140px]">

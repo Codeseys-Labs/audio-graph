@@ -1,4 +1,9 @@
-import type { AudioSourceType, SourceId } from "../types";
+import type {
+  AudioSourceInfo,
+  AudioSourceType,
+  ProcessInfo,
+  SourceId,
+} from "../types";
 
 export type CaptureTargetKind =
   | "system_default"
@@ -132,4 +137,64 @@ export function captureTargetModeLabel(id: SourceId): string | null {
     case "unknown":
       return null;
   }
+}
+
+/**
+ * Resolves each selected source id to a human-readable label, e.g.
+ * "Zoom application" or "Built-in Microphone device".
+ *
+ * SHELL-R5 (fold of seed audio-graph-4a22): this is the pre-SHELL-R3
+ * `ControlBar`'s `selectedLabels` resolution recovered VERBATIM from git
+ * history (`git show d12b754^:src/components/ControlBar.tsx`) — SHELL-R3
+ * dropped it when `ControlBar` became `NowStrip` (the strip only ever needed
+ * a bare count, not the resolved name). The preflight card's Sources row is
+ * the first R5+ consumer to need the name again.
+ *
+ * Two resolution paths, in order:
+ *   1. The id matches a live `AudioSourceInfo` from the last `fetchSources()`
+ *      — use its `name` + a source-type suffix.
+ *   2. It doesn't (source list not yet fetched, or a persisted selection from
+ *      a source that's since disappeared) — fall back to parsing the id
+ *      itself via `parseCaptureTargetId`, resolving a process/process-tree
+ *      pid against the last `fetchProcesses()` list when possible, else
+ *      falling back further to the bare pid or the raw id string so the UI
+ *      never renders blank.
+ */
+export function describeSelectedSourceLabels(
+  selectedSourceIds: readonly SourceId[],
+  sources: readonly AudioSourceInfo[],
+  processes: readonly ProcessInfo[],
+): string[] {
+  return selectedSourceIds.map((id) => {
+    const source = sources.find((s) => s.id === id);
+    if (source) {
+      if (source.source_type.type === "SystemDefault")
+        return `${source.name} system`;
+      if (source.source_type.type === "Device") return `${source.name} device`;
+      if (source.source_type.type === "Application")
+        return `${source.name} application`;
+      if (source.source_type.type === "ApplicationName")
+        return `${source.name} application`;
+      if (source.source_type.type === "ProcessTree")
+        return `${source.name} process tree`;
+      return source.name;
+    }
+
+    const target = parseCaptureTargetId(id);
+    if (target.kind === "process_tree" && target.pid !== undefined) {
+      const proc = processes.find((p) => p.pid === target.pid);
+      return proc
+        ? `${proc.name} process tree`
+        : `PID ${target.pid} process tree`;
+    }
+    if (target.kind === "process" && target.pid !== undefined) {
+      const proc = processes.find((p) => p.pid === target.pid);
+      return proc ? `${proc.name} process` : `PID ${target.pid} process`;
+    }
+    if (target.kind === "application_name" && target.name) {
+      return `${target.name} application`;
+    }
+
+    return id;
+  });
 }

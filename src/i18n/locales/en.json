@@ -47,6 +47,20 @@
     "routePlanned": "planned: {{route}}",
     "routeUnconfigured": "planned: not configured"
   },
+  "preflight": {
+    "title": "Ready to start?",
+    "sourcesLabel": "Sources",
+    "sourcesEmpty": "No source selected yet",
+    "sourcesFixAction": "Choose sources",
+    "routeLabel": "Route",
+    "storageLabel": "Storage",
+    "storageOk": "Storage is ready",
+    "storageFixAction": "Resolve",
+    "statusPass": "Ready",
+    "statusFail": "Needs attention",
+    "modeLabel": "Mode",
+    "startSession": "Start session"
+  },
   "systemDrawer": {
     "title": "System status",
     "close": "Close",

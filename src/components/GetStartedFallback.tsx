@@ -19,6 +19,22 @@ import Icon from "./Icon";
  * Styling mirrors the Audio Sources / Live Transcript empty states (the
  * quality bar called out in the review): a muted glyph, a positive-framing
  * title, a single explanatory line, then the actions.
+ *
+ * SHELL-R5 (plan §R5, ADR-0046): this component's role is UNCHANGED — it
+ * still owns exactly the probe-failure error state, still the same props,
+ * still `data-testid="get-started-fallback"`. The only change is cosmetic:
+ * the root section now carries `.ag-card` (ADR-0047's tier-3 recipe layer).
+ * Review correction: this does NOT make the two read as the same card
+ * silhouette — `PreflightCard` sets `data-elevation="raised"` (a distinct
+ * `--bg-elevated`/`--edge` treatment with an inset bevel + shadow) and is
+ * width-capped/centered, while this section stays full-bleed `flex-1` with
+ * `bg-bg-secondary`; they are visually unrelated surfaces, just both
+ * mutually-exclusive renders of the Capture destination's idle slot in
+ * `App.tsx`. `.ag-card`'s own padding/background here lose the cascade to
+ * this section's pre-existing Tailwind utility classes (utilities layer >
+ * components layer, see `styles.css`'s `@layer` order) — only the border +
+ * corner radius show through, which is the entire effect of this change: a
+ * shared low-level frame primitive, not shared elevation/silhouette.
  */
 interface GetStartedFallbackProps {
   /** Launch the existing sample-session preview (parent-owned handoff). */
@@ -58,7 +74,7 @@ function GetStartedFallback({
 
   return (
     <section
-      className="flex-1 min-w-0 min-h-0 flex flex-col items-center justify-center gap-(--space-5) p-(--space-6) text-center bg-bg-secondary overflow-auto"
+      className="ag-card flex-1 min-w-0 min-h-0 flex flex-col items-center justify-center gap-(--space-5) p-(--space-6) text-center bg-bg-secondary overflow-auto"
       aria-label={title}
       data-testid="get-started-fallback"
     >

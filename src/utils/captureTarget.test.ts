@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import type { AudioSourceInfo, ProcessInfo } from "../types";
 import {
   captureTargetModeLabel,
   captureTargetPeerId,
+  describeSelectedSourceLabels,
   parseCaptureTargetId,
   processCaptureId,
   processTreeCaptureId,
@@ -125,5 +127,131 @@ describe("captureTarget utilities", () => {
         capture_target: "device:backend-canonical",
       }),
     ).toBe("device:backend-canonical");
+  });
+
+  // SHELL-R5 (fold of seed audio-graph-4a22): `describeSelectedSourceLabels`
+  // is the pre-SHELL-R3 `ControlBar`'s `selectedLabels` resolution recovered
+  // verbatim from git history — the preflight card's Sources row is its
+  // first R5+ consumer.
+  describe("describeSelectedSourceLabels", () => {
+    function src(overrides: Partial<AudioSourceInfo> = {}): AudioSourceInfo {
+      return {
+        id: "system-default",
+        name: "System Audio",
+        source_type: { type: "SystemDefault" },
+        is_active: false,
+        ...overrides,
+      };
+    }
+    function proc(overrides: Partial<ProcessInfo> = {}): ProcessInfo {
+      return { pid: 100, name: "zoom", exe_path: null, ...overrides };
+    }
+
+    it("suffixes a matched source's name with its source-type kind", () => {
+      expect(
+        describeSelectedSourceLabels(
+          ["system-default"],
+          [src({ id: "system-default", name: "Built-in" })],
+          [],
+        ),
+      ).toEqual(["Built-in system"]);
+
+      expect(
+        describeSelectedSourceLabels(
+          ["device:mic-1"],
+          [
+            src({
+              id: "device:mic-1",
+              name: "USB Mic",
+              source_type: { type: "Device", device_id: "mic-1" },
+            }),
+          ],
+          [],
+        ),
+      ).toEqual(["USB Mic device"]);
+
+      expect(
+        describeSelectedSourceLabels(
+          ["app:100"],
+          [
+            src({
+              id: "app:100",
+              name: "Zoom",
+              source_type: { type: "Application", pid: 100, app_name: "zoom" },
+            }),
+          ],
+          [],
+        ),
+      ).toEqual(["Zoom application"]);
+
+      expect(
+        describeSelectedSourceLabels(
+          ["name:Spotify"],
+          [
+            src({
+              id: "name:Spotify",
+              name: "Spotify",
+              source_type: { type: "ApplicationName", app_name: "Spotify" },
+            }),
+          ],
+          [],
+        ),
+      ).toEqual(["Spotify application"]);
+
+      expect(
+        describeSelectedSourceLabels(
+          ["tree:100"],
+          [
+            src({
+              id: "tree:100",
+              name: "Zoom",
+              source_type: { type: "ProcessTree", pid: 100 },
+            }),
+          ],
+          [],
+        ),
+      ).toEqual(["Zoom process tree"]);
+    });
+
+    it("falls back to parsing the raw id + a process lookup when no source list entry matches", () => {
+      expect(
+        describeSelectedSourceLabels(["tree:100"], [], [proc({ pid: 100 })]),
+      ).toEqual(["zoom process tree"]);
+      expect(
+        describeSelectedSourceLabels(["app:100"], [], [proc({ pid: 100 })]),
+      ).toEqual(["zoom process"]);
+      expect(describeSelectedSourceLabels(["name:Spotify"], [], [])).toEqual([
+        "Spotify application",
+      ]);
+    });
+
+    it("degrades to a PID placeholder when the process list hasn't caught up either, and to the raw id as the last resort", () => {
+      expect(describeSelectedSourceLabels(["app:999"], [], [])).toEqual([
+        "PID 999 process",
+      ]);
+      expect(describeSelectedSourceLabels(["tree:999"], [], [])).toEqual([
+        "PID 999 process tree",
+      ]);
+      expect(describeSelectedSourceLabels(["mystery-id"], [], [])).toEqual([
+        "mystery-id",
+      ]);
+    });
+
+    it("resolves each selected id independently and preserves order", () => {
+      expect(
+        describeSelectedSourceLabels(
+          ["system-default", "device:mic-1"],
+          [
+            src({ id: "system-default", name: "Built-in" }),
+            src({
+              id: "device:mic-1",
+              name: "USB Mic",
+              source_type: { type: "Device", device_id: "mic-1" },
+            }),
+          ],
+          [],
+        ),
+      ).toEqual(["Built-in system", "USB Mic device"]);
+    });
   });
 });

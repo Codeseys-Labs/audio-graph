@@ -613,7 +613,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
   });
 
-  it("starts in the Ready workspace with notes and transcript", async () => {
+  // SHELL-R5 (plan §R5, ADR-0046): rewritten. The genuinely-idle Capture
+  // surface no longer renders the live Notes/Transcript panels with nothing
+  // in them yet (the "empty live cockpit" this unit fixes) — it renders
+  // `PreflightCard` instead. `PreflightCard.test.tsx` owns the card's own
+  // pass/fail row logic; this test only pins that App.tsx actually mounts
+  // it here, not the stubbed live panels.
+  it("starts in the Ready workspace showing the preflight card, not empty notes/transcript panels", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
@@ -625,6 +631,31 @@ describe("App — post-Express hand-off nudge (B20)", () => {
       "aria-selected",
       "true",
     );
+    expect(screen.getByTestId("preflight-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
+  });
+
+  // Review fix (mutation-probe finding, SHELL-R5): `showPreflightCard`'s
+  // `!isCapturing` conjunct had no test pinning it — a mutant that dropped
+  // that leg left the ENTIRE suite green, because every other test either
+  // stays idle (never flips `isCapturing`) or is the "renders live assist
+  // inline" test below, which only pins `!hasAgentActivity`. Without this
+  // leg, a LIVE capture session would render the preflight checklist instead
+  // of the NotesPanel/LiveTranscript cockpit — the exact inverse of the
+  // empty-cockpit bug SHELL-R5 exists to fix.
+  it("swaps the preflight card for the live Notes/Transcript workspace once capture starts (mutation-probe: showPreflightCard's !isCapturing leg)", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+    expect(screen.getByTestId("preflight-card")).toBeInTheDocument();
+
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    expect(screen.queryByTestId("preflight-card")).not.toBeInTheDocument();
     expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
     expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
   });
@@ -883,14 +914,17 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
 
-    // Fallback clears; the real During panels render again.
+    // Fallback clears; the real idle workspace renders again — SHELL-R5:
+    // that's the preflight card now, not the live Notes/Transcript panels
+    // (there's no capture running yet, just a now-runnable route).
     await waitFor(() =>
       expect(
         screen.queryByTestId("get-started-fallback"),
       ).not.toBeInTheDocument(),
     );
-    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("preflight-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     // A runnable saved pair keeps ExpressSetup suppressed.
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),

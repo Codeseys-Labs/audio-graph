@@ -12,7 +12,14 @@
  *
  * Availability is computed honestly from settings so we never offer a control
  * that silently no-ops: Native needs a Gemini key; Pipelined needs an LLM.
- * Always visible (even before capture) so the value proposition isn't hidden.
+ *
+ * SHELL-R5 (plan §R5, ADR-0046): relocated from `NowStrip` (which rendered
+ * this unconditionally, live or idle) into `PreflightCard`, a preflight-only
+ * surface (`App.tsx`'s `showPreflightCard` mounts it exclusively while
+ * `!isCapturing`). The pre-R5 invariant this doc comment used to state —
+ * "always visible, even before capture" — no longer holds: this control now
+ * renders ONLY before capture, never during it. Mode switching mid-session is
+ * not supported today (a future unit's call, not this file's).
  */
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";

@@ -47,6 +47,20 @@
     "routePlanned": "planejado: {{route}}",
     "routeUnconfigured": "planejado: não configurado"
   },
+  "preflight": {
+    "title": "Pronto para começar?",
+    "sourcesLabel": "Fontes",
+    "sourcesEmpty": "Nenhuma fonte selecionada ainda",
+    "sourcesFixAction": "Escolher fontes",
+    "routeLabel": "Rota",
+    "storageLabel": "Armazenamento",
+    "storageOk": "Armazenamento pronto",
+    "storageFixAction": "Resolver",
+    "statusPass": "Pronto",
+    "statusFail": "Requer atenção",
+    "modeLabel": "Modo",
+    "startSession": "Iniciar sessão"
+  },
   "systemDrawer": {
     "title": "Status do sistema",
     "close": "Fechar",
