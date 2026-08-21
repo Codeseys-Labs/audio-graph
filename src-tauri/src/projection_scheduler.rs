@@ -739,6 +739,115 @@ impl ProjectionScheduler {
         }
     }
 
+    /// Release a discarded dispatch's phantom `in_flight` entry
+    /// (audio-graph-1609). `start_job` runs — and records `job` as this
+    /// lane's `in_flight` — INSIDE `observe_ledger`/`complete_in_flight`/
+    /// `fail_in_flight`, before the resulting decision is ever handed to
+    /// `dispatch_projection_decision` (speech/mod.rs). When that dispatcher
+    /// discards the decision instead of spawning the job (the
+    /// `projection_lane_stopping` check), no thread will ever call
+    /// `complete_in_flight`/`fail_in_flight` for it — without this call, the
+    /// lane sees `in_flight.is_some()` forever and every subsequent
+    /// `observe_ledger` returns `Coalesced` behind a job that is not
+    /// actually running (the phantom wedge).
+    ///
+    /// Matches by `(job_id, session_id)` via `owns_in_flight`, exactly like
+    /// `take_expected_in_flight`, so an abandon call that lost a race
+    /// against a legitimate completion/failure for the SAME job is a no-op
+    /// rather than clobbering whatever replaced it. In production this race
+    /// cannot actually happen — the discard is decided synchronously, before
+    /// any thread that could complete or fail the job is ever spawned — but
+    /// the match keeps the method honest under any future caller.
+    ///
+    /// Deliberately does NOT touch `failed_attempts` (a discarded dispatch
+    /// never ran — it is not a failed generation, and charging ff10's
+    /// attempt budget for it would exhaust a lane's retries for work it
+    /// never attempted) and does NOT touch `pending_since_ms` (the
+    /// queue-onset contract — audio-graph-a3a8 history — is cleared only by
+    /// a successful completion; abandoning a dispatch does not resolve the
+    /// lane's outstanding work, so the onset timestamp must survive).
+    /// `last_failed_basis`/`deferred_retry_at_ms` are also left untouched:
+    /// whatever `start_job` set them to (cleared, or — for a due deferred
+    /// retry firing — restored to continue the attempt count) is already
+    /// correct bookkeeping independent of whether THIS dispatch is spawned.
+    pub fn abandon_in_flight(&mut self, job_id: &str, session_id: &str) {
+        if self.owns_in_flight(job_id, session_id) {
+            self.in_flight = None;
+        }
+    }
+
+    /// Release a discarded `FailedCurrent` deferral (audio-graph-1609's
+    /// fold-in of the bf5d orphan). `fail_in_flight`'s `Current` arm arms
+    /// `deferred_retry_at_ms` unconditionally when under budget, before the
+    /// resulting decision reaches `dispatch_projection_decision`
+    /// (speech/mod.rs), which spawns the ONE clock thread
+    /// (`spawn_deferred_lane_observation`) that fires it. When that spawn is
+    /// discarded instead (the `projection_lane_stopping` check), no clock
+    /// thread is ever registered — without this call, the lane sits with
+    /// `deferred_retry_at_ms` set and no clock source, silently degrading to
+    /// event-driven-only for that basis with no active signal that it did.
+    ///
+    /// Matches by the EXACT `deferred_retry_at_ms` value the caller observed
+    /// in the `FailedCurrent` decision, not merely "is a deferral armed" —
+    /// so a discard that raced a NEWER failure's re-arm (which overwrote the
+    /// value) is a no-op rather than clobbering the newer deferral this lane
+    /// now legitimately owns.
+    ///
+    /// Deliberately does not clear `last_failed_basis`/`failed_attempts` —
+    /// the failure this deferral was armed for already happened and is
+    /// already correctly counted; abandoning the RETRY does not un-fail the
+    /// JOB. Clearing only `deferred_retry_at_ms` preserves the bf5d
+    /// invariant (`deferred_retry_at_ms.is_some()` implies
+    /// `last_failed_basis.is_some()`) — this method only ever moves `Some`
+    /// to `None`, never the reverse — and makes the next `observe_ledger`
+    /// re-observation of this basis (under budget) treat the retry as
+    /// immediately due (`deferred_retry_at_ms: None` is already handled as
+    /// due, defense-in-depth, by the same-basis branch above) instead of
+    /// waiting on a clock that will never fire.
+    pub fn abandon_deferred_retry(&mut self, deferred_retry_at_ms: u64) {
+        if self.deferred_retry_at_ms == Some(deferred_retry_at_ms) {
+            self.deferred_retry_at_ms = None;
+        }
+    }
+
+    /// Unconditionally clear a still-armed deferred retry — the restart-time
+    /// half of audio-graph-1609's deferral-orphan fix, invoked by
+    /// [`ProjectionSchedulers::clear_orphaned_deferred_retries`]. Unlike
+    /// [`Self::abandon_deferred_retry`], this does not match a specific
+    /// deadline value: on the `stop_capture_impl` → `start_transcribe`
+    /// restart route, ALL `projection-retry-<kind>` clock threads for the
+    /// PRIOR Stop have already been joined by `stop_capture_impl`'s drain
+    /// before this can run, so any `deferred_retry_at_ms` still set at this
+    /// point has no clock behind it no matter how it got there — whether
+    /// `dispatch_projection_decision` discarded the clock-spawn before it
+    /// ever started, or the clock thread itself spawned and then quit early
+    /// on its own `projection_lane_stopping` check
+    /// (`spawn_deferred_lane_observation`'s two self-exit points, neither of
+    /// which mutates scheduler state).
+    ///
+    /// That "no clock alive" invariant does NOT hold on the
+    /// `stop_transcribe` → `start_transcribe` route: `stop_transcribe` joins
+    /// only the sp/asr threads, never drains `projection_job_workers`, and
+    /// never sets `projection_lane_stopping`, so a still-armed deferred
+    /// retry's clock can legitimately be alive when this sweep runs and
+    /// clears the deadline out from under it. That is still safe — the
+    /// clock fires at its original deadline regardless, and
+    /// `deferred_retry_at_ms: None` is already treated as immediately due
+    /// by the same-basis branch in `observe_ledger` (defense-in-depth,
+    /// documented on `abandon_deferred_retry` above) — but the safety here
+    /// rests on that None-is-due handling plus observing against current
+    /// truth, not on no clock existing. Do not simplify this method (e.g. by
+    /// also clearing `last_failed_basis`, or by treating the same-basis
+    /// branch as unreachable) on the assumption that no clock can be alive
+    /// when it runs.
+    ///
+    /// Same field-touching contract as `abandon_deferred_retry`: only
+    /// `deferred_retry_at_ms` moves, `last_failed_basis`/`failed_attempts`
+    /// stay exactly as the last real failure left them.
+    fn clear_orphaned_deferred_retry(&mut self) {
+        self.deferred_retry_at_ms = None;
+    }
+
     fn start_job(
         &mut self,
         basis: ProjectionBasis,
@@ -1014,6 +1123,41 @@ impl ProjectionSchedulers {
     ) -> ProjectionSchedulerDecision {
         self.graph
             .fail_in_flight(expected_job_id, expected_session_id, ledger, now_ms)
+    }
+
+    /// Kind-dispatching wrapper over [`ProjectionScheduler::abandon_in_flight`]
+    /// (audio-graph-1609) — the sole entry point `dispatch_projection_decision`
+    /// (speech/mod.rs) uses to release a phantom `in_flight` job on the
+    /// `projection_lane_stopping` discard path.
+    pub fn abandon_in_flight(&mut self, kind: &ProjectionKind, job_id: &str, session_id: &str) {
+        match kind {
+            ProjectionKind::Notes => self.notes.abandon_in_flight(job_id, session_id),
+            ProjectionKind::Graph => self.graph.abandon_in_flight(job_id, session_id),
+        }
+    }
+
+    /// Kind-dispatching wrapper over
+    /// [`ProjectionScheduler::abandon_deferred_retry`] (audio-graph-1609) —
+    /// the sole entry point `dispatch_projection_decision` uses to release an
+    /// armed-but-never-clocked deferral on the same discard path.
+    pub fn abandon_deferred_retry(&mut self, kind: &ProjectionKind, deferred_retry_at_ms: u64) {
+        match kind {
+            ProjectionKind::Notes => self.notes.abandon_deferred_retry(deferred_retry_at_ms),
+            ProjectionKind::Graph => self.graph.abandon_deferred_retry(deferred_retry_at_ms),
+        }
+    }
+
+    /// Restart-time sweep for BOTH lanes (audio-graph-1609 fold-in of the
+    /// bf5d orphaned-deferral gap) — see
+    /// [`ProjectionScheduler::clear_orphaned_deferred_retry`] for why this is
+    /// sound to call unconditionally. `start_transcribe` calls this once,
+    /// alongside clearing `projection_lane_stopping`, before the speech
+    /// thread that drives these schedulers spawns, so a same-session
+    /// restart never inherits a deferral with no clock source from the
+    /// prior Stop.
+    pub fn clear_orphaned_deferred_retries(&mut self) {
+        self.notes.clear_orphaned_deferred_retry();
+        self.graph.clear_orphaned_deferred_retry();
     }
 
     pub fn notes(&self) -> &ProjectionScheduler {
@@ -2367,6 +2511,268 @@ mod tests {
         assert_eq!(scheduler.metrics().stale_discards, 1);
         assert_eq!(scheduler.metrics().repair_jobs_started, 1);
         assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
+    }
+
+    /// audio-graph-1609 acceptance (b), positive control: abandoning a
+    /// phantom `in_flight` job releases exactly that field and lets the lane
+    /// project again on the next observation — WITHOUT charging the
+    /// ff10 attempt budget or re-stamping the queue-onset timestamp.
+    #[test]
+    fn abandon_in_flight_releases_the_phantom_without_touching_attempts_or_pending_since() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+
+        let job = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        assert!(scheduler.in_flight_job().is_some());
+        let pending_since_before = scheduler.pending_since_ms;
+        assert_eq!(pending_since_before, Some(10));
+        let failed_attempts_before = scheduler.failed_attempts;
+
+        // The dispatcher discards this job before ever spawning it (the
+        // `projection_lane_stopping` check) — this is the abandon call it
+        // makes on that path.
+        scheduler.abandon_in_flight(&job.id, &job.session_id);
+
+        assert!(
+            scheduler.in_flight_job().is_none(),
+            "abandon must clear the phantom in_flight entry"
+        );
+        assert_eq!(
+            scheduler.failed_attempts, failed_attempts_before,
+            "a discarded dispatch is not a failed generation — abandon must not touch \
+             failed_attempts"
+        );
+        assert_eq!(
+            scheduler.pending_since_ms, pending_since_before,
+            "abandon must not re-stamp the queue-onset timestamp"
+        );
+
+        // The lane projects again on the very next observation instead of
+        // being wedged behind Coalesced forever.
+        match scheduler.observe_ledger(&ledger, 20) {
+            ProjectionSchedulerDecision::StartJob { job: new_job } => {
+                assert_ne!(
+                    new_job.id, job.id,
+                    "the fresh job must not reuse the abandoned job's identity"
+                );
+                assert_eq!(new_job.basis, ledger.current_projection_basis());
+            }
+            other => panic!(
+                "abandoning the phantom must let the lane start a fresh job, not idle behind \
+                 it, got {other:?}"
+            ),
+        }
+    }
+
+    /// audio-graph-1609 acceptance (b), negative control: an abandon call
+    /// that does not match the CURRENT in-flight job (job id or session id
+    /// differs) must be a no-op — it never clobbers a real, still-live job.
+    #[test]
+    fn abandon_in_flight_is_a_no_op_when_the_job_id_or_session_id_does_not_match() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+        let job = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        scheduler.abandon_in_flight("some-other-job-id", &job.session_id);
+        assert!(
+            scheduler.in_flight_job().is_some(),
+            "a job-id mismatch must never release a different job's in_flight entry"
+        );
+
+        scheduler.abandon_in_flight(&job.id, "some-other-session");
+        assert!(
+            scheduler.in_flight_job().is_some(),
+            "a session-id mismatch must never release a different session's in_flight entry"
+        );
+    }
+
+    /// audio-graph-1609 acceptance (d): a `FailedCurrent` deferral whose
+    /// clock-spawn was discarded must not survive as an orphan — abandoning
+    /// it clears `deferred_retry_at_ms` so the next same-basis observation
+    /// treats the retry as immediately due (the existing `None`-is-due
+    /// defense-in-depth) instead of waiting on a clock that will never fire.
+    #[test]
+    fn abandon_deferred_retry_clears_an_armed_deferral_so_it_does_not_orphan() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+        let job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let failed_at = 20;
+        let deferred_retry_at_ms =
+            match scheduler.fail_in_flight(&job_id, "session-1", &ledger, failed_at) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    deferred_retry_at_ms: Some(at),
+                    ..
+                } => at,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            };
+        assert_eq!(scheduler.deferred_retry_at_ms, Some(deferred_retry_at_ms));
+        assert!(scheduler.last_failed_basis.is_some());
+
+        // The dispatcher never spawned the clock thread for this deferral
+        // (the `projection_lane_stopping` check) — this is the abandon call
+        // it makes on that path.
+        scheduler.abandon_deferred_retry(deferred_retry_at_ms);
+
+        assert_eq!(
+            scheduler.deferred_retry_at_ms, None,
+            "abandon must clear the orphaned deferral"
+        );
+        assert!(
+            scheduler.last_failed_basis.is_some(),
+            "abandon must not un-fail the job the deferral was armed for"
+        );
+
+        // Immediately due now (long before the real deferred deadline would
+        // have elapsed) — no clock source is needed to unwedge this lane.
+        assert!(
+            matches!(
+                scheduler.observe_ledger(&ledger, failed_at + 1),
+                ProjectionSchedulerDecision::StartJob { .. }
+            ),
+            "a same-basis re-observation must retry immediately once the deferral is abandoned, \
+             not wait on a clock that was never spawned"
+        );
+    }
+
+    /// audio-graph-1609 acceptance (d), negative control: an abandon call
+    /// racing a NEWER failure's re-arm (a different `deferred_retry_at_ms`
+    /// value) must be a no-op — it never clobbers a deferral this lane
+    /// legitimately owns now.
+    #[test]
+    fn abandon_deferred_retry_is_a_no_op_when_a_newer_failure_already_rearmed_it() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+        let job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        let stale_deferred_retry_at_ms =
+            match scheduler.fail_in_flight(&job_id, "session-1", &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    deferred_retry_at_ms: Some(at),
+                    ..
+                } => at,
+                other => panic!("expected an armed deferral, got {other:?}"),
+            };
+        let current_deferred_retry_at_ms = stale_deferred_retry_at_ms + 1;
+        scheduler.deferred_retry_at_ms = Some(current_deferred_retry_at_ms);
+
+        scheduler.abandon_deferred_retry(stale_deferred_retry_at_ms);
+
+        assert_eq!(
+            scheduler.deferred_retry_at_ms,
+            Some(current_deferred_retry_at_ms),
+            "abandoning a STALE deferred_retry_at_ms value must not clear a newer, still-live \
+             deferral"
+        );
+    }
+
+    /// audio-graph-1609 acceptance (d), restart-time sweep half: unlike
+    /// `abandon_deferred_retry` (called from `dispatch_projection_decision`'s
+    /// discard-before-spawn branch), `clear_orphaned_deferred_retries`
+    /// covers the OTHER orphan sub-case too — a clock thread that WAS
+    /// spawned and then quit early on its own `projection_lane_stopping`
+    /// check (`spawn_deferred_lane_observation`'s self-exit points never
+    /// mutate scheduler state). `start_transcribe` calls this unconditionally
+    /// at restart, for both lanes, regardless of which sub-case produced the
+    /// orphan.
+    #[test]
+    fn clear_orphaned_deferred_retries_sweeps_both_lanes_without_touching_failed_basis_identity() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut schedulers = ProjectionSchedulers::new("session-1");
+
+        // A single `observe_ledger` call advances BOTH lanes at once — a
+        // second call would see the first call's `StartJob` already left
+        // `in_flight` set and return `Coalesced` instead.
+        let observation = schedulers.observe_ledger(&ledger, 10);
+        let notes_job_id = match observation.notes {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected notes start job, got {other:?}"),
+        };
+        let graph_job_id = match observation.graph {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected graph start job, got {other:?}"),
+        };
+        assert!(matches!(
+            schedulers.fail_notes_in_flight(&notes_job_id, "session-1", &ledger, 20),
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            schedulers.fail_graph_in_flight(&graph_job_id, "session-1", &ledger, 20),
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: Some(_),
+                ..
+            }
+        ));
+        assert!(schedulers.notes.deferred_retry_at_ms.is_some());
+        assert!(schedulers.graph.deferred_retry_at_ms.is_some());
+        let notes_failed_basis_before = schedulers.notes.last_failed_basis.clone();
+        let graph_failed_basis_before = schedulers.graph.last_failed_basis.clone();
+        let notes_failed_attempts_before = schedulers.notes.failed_attempts;
+        let graph_failed_attempts_before = schedulers.graph.failed_attempts;
+
+        // Simulates a clock thread that spawned and then quit on its own
+        // `projection_lane_stopping` check WITHOUT dispatch-level abandon
+        // ever running — the sub-case `abandon_deferred_retry` cannot reach.
+        schedulers.clear_orphaned_deferred_retries();
+
+        assert_eq!(
+            schedulers.notes.deferred_retry_at_ms, None,
+            "the notes lane's orphaned deferral must be cleared"
+        );
+        assert_eq!(
+            schedulers.graph.deferred_retry_at_ms, None,
+            "the graph lane's orphaned deferral must be cleared"
+        );
+        assert_eq!(
+            schedulers.notes.last_failed_basis, notes_failed_basis_before,
+            "clearing the deferral must not un-fail the job it was armed for"
+        );
+        assert_eq!(
+            schedulers.graph.last_failed_basis, graph_failed_basis_before,
+            "clearing the deferral must not un-fail the job it was armed for"
+        );
+        assert_eq!(
+            schedulers.notes.failed_attempts,
+            notes_failed_attempts_before
+        );
+        assert_eq!(
+            schedulers.graph.failed_attempts,
+            graph_failed_attempts_before
+        );
+
+        // A no-op call (no lane has a live deferral left) must not panic or
+        // otherwise misbehave.
+        schedulers.clear_orphaned_deferred_retries();
+        assert_eq!(schedulers.notes.deferred_retry_at_ms, None);
+        assert_eq!(schedulers.graph.deferred_retry_at_ms, None);
     }
 
     // The following `scheduler_queue_*` tests exercised

@@ -2355,6 +2355,22 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             .projection_schedulers
             .lock()
             .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
+        // audio-graph-1609 fold-in of the bf5d orphaned-deferral gap: sweep
+        // any deferred retry left armed by the prior Stop before reseeding.
+        // On the stop_capture_impl -> start_transcribe restart route this is
+        // sound because that drain already joined every
+        // `projection-retry-<kind>` clock thread, so no clock can possibly
+        // still be alive for either lane by this point, regardless of
+        // whether the deferral was orphaned by a
+        // `dispatch_projection_decision` discard or by the clock thread's
+        // own graceful stopping-check exit. On the stop_transcribe ->
+        // start_transcribe route (no capture stop in between) that
+        // clock-drain does NOT happen, so a still-armed clock can survive
+        // this sweep — see `ProjectionSchedulers::clear_orphaned_deferred_retries`
+        // for why clearing the deadline out from under a live clock is still
+        // safe (None-is-due handling in `observe_ledger`, not "no clock
+        // exists").
+        schedulers.clear_orphaned_deferred_retries();
         schedulers.reseed_coverage_heads(heads);
     }
 
@@ -2366,6 +2382,37 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             .speech_processor_thread
             .lock()
             .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
+
+        // audio-graph-1609 ordering fix: clear `projection_lane_stopping`
+        // here — strictly BEFORE the speech processor thread actually
+        // spawns below — not after it (where this store used to live,
+        // paired with `is_transcribing`'s reset in step 3).
+        // `dispatch_projection_decision` (speech/mod.rs) reads this flag
+        // synchronously on every projection dispatch, including one that
+        // could in principle be produced by a final ASR revision the
+        // JUST-spawned speech thread processes almost immediately. Clearing
+        // it only after the thread was already spawned left a real window
+        // — however small — where that first post-restart dispatch could
+        // still observe the flag set from the PRIOR Stop and get discarded
+        // into the same phantom-in-flight state ADR-0045 decision 4
+        // (audio-graph-9cc1) already causes if left un-abandoned (see
+        // `abandon_discarded_projection_job`). Moving the clear ahead of the
+        // spawn closes that window structurally: nothing that could
+        // dispatch a projection decision for this run exists yet at this
+        // line, so there is no dispatch left to race.
+        //
+        // Placed here — after every fallible step earlier in this function
+        // (provider pre-flight, the `projection_patches` load, the
+        // schedulers lock) rather than at the top of the function — so an
+        // early `?` return from any of those keeps leaving this flag
+        // untouched, exactly as it did before this fix. Only the ordering
+        // relative to the speech-thread spawn changed; an `Err` path that
+        // never reaches the spawn should not observably change this flag
+        // either.
+        state
+            .projection_lane_stopping
+            .store(false, Ordering::SeqCst);
+
         if sp_handle.is_none() {
             // Bug 1 fix: read from per-consumer channel, not shared processed_rx
             let speech_rx = state.speech_audio_rx.clone();
@@ -2497,35 +2544,30 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 
     // 3. Update state flags.
     state.is_transcribing.store(true, Ordering::SeqCst);
-    // ADR-0045 decision 4 (audio-graph-9cc1, adversarial-review fix): pair
-    // this with the `store(true)` at Stop (`stop_capture_impl`), the same way
-    // `is_transcribing` is paired above. Without this, `projection_lane_stopping`
-    // is a process-lifetime latch — every session after the first Stop would
-    // read as "stopping" to the deferred-retry lane (ADR-0045 decision 3)
-    // this flag is documented to feed, silently disabling retries for the
-    // rest of the process.
+    // `projection_lane_stopping` is reset earlier in this function now
+    // (audio-graph-1609 ordering fix — see the comment there), strictly
+    // before the speech thread above spawns, not paired with
+    // `is_transcribing` here. It used to live at this point, after the
+    // spawn; that ordering is exactly what left the post-restart
+    // first-dispatch race this fix closes.
     //
-    // Review note (adr0045/bf5d-deferred-retry): this reset does NOT re-arm a
-    // clock for a deferral that was already live in the scheduler when Stop
-    // happened. A same-basis `Current` failure arms `deferred_retry_at_ms`
-    // (decision 3) unconditionally in `fail_in_flight`; if Stop's flag was
-    // already set by the time `dispatch_projection_decision` saw the
-    // resulting `FailedCurrent`, no clock thread was ever spawned for it, and
-    // any clock thread already running exits without firing. Restarting
-    // capture on the SAME session (no `rotate_session`, which is the only
-    // path that clears `last_failed_basis`/`deferred_retry_at_ms`) leaves
-    // that deferral live with no clock source: the lane silently reverts to
-    // pre-bf5d event-driven-only behaviour for that basis until a new final
-    // ASR revision changes it via `start_job`. No wedge results (the 5fd1
-    // reseed guard still refuses via `last_failed_basis`), but the "retry
-    // fires even with no further finals" guarantee does not hold across this
-    // stop/restart path. Closing this gap would mean re-arming a clock here
-    // when `last_failed_basis`/`deferred_retry_at_ms` are already live —
-    // deliberately not done in this fix, which only wires the clock's first
-    // source (out of scope per the ticket).
-    state
-        .projection_lane_stopping
-        .store(false, Ordering::SeqCst);
+    // The bf5d orphaned-STATE gap this used to document (a deferral live
+    // when Stop began, either never given a clock or whose clock exited
+    // early, surviving into the restart with a lying `deferred_retry_at_ms`
+    // and no clock source) is closed now, via
+    // `ProjectionSchedulers::clear_orphaned_deferred_retries` called
+    // alongside the coverage-head reseed above.
+    //
+    // That is not the same as restoring bf5d's "retry fires even with no
+    // further finals" guarantee ACROSS a same-session restart — it isn't,
+    // and this fix doesn't claim to. Both `abandon_deferred_retry` and this
+    // restart sweep only ever CLEAR an armed deferral, never re-arm a new
+    // clock; a previously-failed basis still under budget retries only
+    // event-driven after a restart (the same-basis `observe_ledger` branch
+    // that would re-arm it is reached only by a clock thread, and none
+    // exists post-restart until a new failure creates one). Re-arming a
+    // clock at restart time for a live, under-budget `last_failed_basis` is
+    // a real follow-up, not something this fix does.
     if let Ok(mut status) = state.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
         status.diarization = StageStatus::Running { processed_count: 0 };
@@ -11169,6 +11211,206 @@ mod tests {
                 "lib.rs registers premature org sync command {command_name}"
             );
         }
+    }
+
+    /// audio-graph-1609 acceptance (c): pins the ordering seam directly
+    /// against `start_transcribe`'s own source, the same `include_str!`
+    /// self-inspection technique `org_knowledge_cloud_sync_ipc_commands_remain_absent`
+    /// uses above. Driving the real function end-to-end would require a
+    /// fully live ASR/model pipeline; this pins the fact that actually
+    /// matters — `projection_lane_stopping` is cleared strictly BEFORE the
+    /// speech processor thread spawns, not after — so a revert of that
+    /// ordering (moving the clear back below the spawn, where it used to
+    /// live paired with `is_transcribing`) fails this test immediately
+    /// instead of only manifesting as an intermittent, hard-to-reproduce
+    /// race in a running app.
+    ///
+    /// Whitespace-insensitive by design (rustfmt may re-wrap either
+    /// statement across lines without changing their relative order), so
+    /// this does not become a formatting-churn tripwire.
+    fn strip_whitespace(source: &str) -> String {
+        source.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Strips `//` line comments and `/* */` block comments (Rust-style
+    /// nesting supported) from `source`, treating `"..."` string literals as
+    /// opaque so a `//` or `/*` inside a string is never mistaken for a
+    /// comment opener. This exists so the source-order pin tests below
+    /// cannot be satisfied by a comment that merely *mentions* the
+    /// statement being pinned — e.g. deleting the real call and leaving
+    /// `// schedulers.clear_orphaned_deferred_retries(); // removed` behind
+    /// must make the marker vanish, not silently keep matching.
+    fn strip_comments(source: &str) -> String {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0;
+        let mut block_depth: usize = 0;
+        let mut in_string = false;
+        while i < chars.len() {
+            if in_string {
+                let c = chars[i];
+                out.push(c);
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    block_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    block_depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if chars[i] == '"' {
+                in_string = true;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Comment-stripped, whitespace-stripped body text of `start_transcribe`,
+    /// for the `include_str!` self-inspection pin tests below. Sliced up to
+    /// (not including) `stop_transcribe`, the function that immediately
+    /// follows it in `commands.rs`.
+    fn start_transcribe_body_whitespace_stripped() -> String {
+        let commands_source = include_str!("commands.rs");
+        let body_start = commands_source
+            .find("pub async fn start_transcribe(")
+            .expect("start_transcribe must exist in commands.rs");
+        let body_end = commands_source[body_start..]
+            .find("pub async fn stop_transcribe(")
+            .map(|relative| body_start + relative)
+            .expect("stop_transcribe must immediately follow start_transcribe in commands.rs");
+        strip_whitespace(&strip_comments(&commands_source[body_start..body_end]))
+    }
+
+    /// Finds `needle` in `haystack`, requiring EXACTLY one occurrence.
+    /// Plain `str::find` (first-occurrence) is not enough here: a marker
+    /// that only needs to exist "somewhere" in the body is trivially
+    /// satisfiable by a stray duplicate, and — before comment stripping was
+    /// added — was satisfiable by a comment that merely names the deleted
+    /// statement. Panics (with `context` in the message) on zero or on
+    /// more than one match, so both failure modes surface as a loud test
+    /// failure instead of a silently-passing pin.
+    fn find_unique_occurrence(haystack: &str, needle: &str, context: &str) -> usize {
+        let count = haystack.matches(needle).count();
+        match count {
+            1 => haystack
+                .find(needle)
+                .expect("matches() counted 1 but find() found none"),
+            0 => panic!("expected to find {needle:?} in {context}, but it is absent"),
+            n => panic!("expected exactly one occurrence of {needle:?} in {context}, found {n}"),
+        }
+    }
+
+    #[test]
+    fn start_transcribe_clears_projection_lane_stopping_before_the_speech_thread_spawns() {
+        let body = start_transcribe_body_whitespace_stripped();
+
+        let flag_clear_marker =
+            strip_whitespace("projection_lane_stopping.store(false, Ordering::SeqCst);");
+        let flag_clear_pos = find_unique_occurrence(
+            &body,
+            &flag_clear_marker,
+            "start_transcribe (projection_lane_stopping clear)",
+        );
+
+        // Anchored on the actual thread-spawn statement's unique `.name(...)`
+        // call, not the `log::info!` line that follows it — the speech
+        // thread is already running (and can already dispatch a projection
+        // decision) for every line between the real `.spawn(...)` call and
+        // that trailing log line, so anchoring on the log line would let a
+        // flag-clear placed anywhere in that gap pass while still reopening
+        // the exact race this test exists to catch.
+        let spawn_marker = strip_whitespace(
+            "let handle = std::thread::Builder::new()\
+             .name(\"speech-processor\".to_string())",
+        );
+        let spawn_pos = find_unique_occurrence(
+            &body,
+            &spawn_marker,
+            "start_transcribe (speech processor thread spawn)",
+        );
+
+        assert!(
+            flag_clear_pos < spawn_pos,
+            "projection_lane_stopping must be cleared BEFORE the speech processor thread \
+             spawns — clearing it after leaves a window where a final ASR revision the \
+             freshly spawned thread processes almost immediately can still observe the flag \
+             set from the prior Stop and get its dispatch discarded into a phantom in-flight \
+             state (audio-graph-1609)"
+        );
+    }
+
+    /// audio-graph-1609 acceptance (d), restart-integration half: pins that
+    /// `start_transcribe` actually calls the restart-time deferral sweep
+    /// (`ProjectionSchedulers::clear_orphaned_deferred_retries`), not merely
+    /// that the method exists and behaves correctly in isolation
+    /// (`clear_orphaned_deferred_retries_sweeps_both_lanes_without_touching_failed_basis_identity`
+    /// in `projection_scheduler.rs` covers that half). Also before the
+    /// speech thread spawns, for the same reason the flag-clear must be:
+    /// nothing that could dispatch a projection decision for this run
+    /// exists yet at that point, so there is nothing left for the sweep to
+    /// race.
+    #[test]
+    fn start_transcribe_sweeps_orphaned_deferred_retries_before_the_speech_thread_spawns() {
+        let body = start_transcribe_body_whitespace_stripped();
+
+        let sweep_marker = strip_whitespace("schedulers.clear_orphaned_deferred_retries();");
+        let sweep_pos = find_unique_occurrence(
+            &body,
+            &sweep_marker,
+            "start_transcribe (orphaned-deferral sweep call)",
+        );
+
+        // Same real-spawn anchor as the test above — see its comment for
+        // why the trailing `log::info!` line is the wrong anchor.
+        let spawn_marker = strip_whitespace(
+            "let handle = std::thread::Builder::new()\
+             .name(\"speech-processor\".to_string())",
+        );
+        let spawn_pos = find_unique_occurrence(
+            &body,
+            &spawn_marker,
+            "start_transcribe (speech processor thread spawn)",
+        );
+
+        assert!(
+            sweep_pos < spawn_pos,
+            "the orphaned-deferral sweep must run BEFORE the speech processor thread spawns \
+             (audio-graph-1609) — same ordering reasoning as the projection_lane_stopping \
+             clear above"
+        );
     }
 
     fn projection_status_test_event(span_id: &str) -> crate::projections::TranscriptEvent {

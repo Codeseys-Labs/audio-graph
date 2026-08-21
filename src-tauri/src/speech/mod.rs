@@ -1659,13 +1659,17 @@ struct ProjectionDispatchContext {
     /// Set at Stop before the registry above is drained. See
     /// `AppState::projection_lane_stopping`.
     ///
-    /// Not yet read anywhere in the dispatch path — this seed (audio-graph-9cc1)
-    /// only wires the flag through and sets it at Stop. The intended reader is
-    /// the deferred-retry lane (ADR-0045 decision 3): a scheduled
-    /// `projection-retry-<kind>` thread polls this so it wakes and exits
+    /// Read in two places: the `projection-retry-<kind>` clock thread
+    /// (`spawn_deferred_lane_observation`) polls it so it wakes and exits
     /// instead of firing after Stop has already begun tearing the session
-    /// down.
-    #[allow(dead_code)]
+    /// down, and `dispatch_projection_decision` checks it synchronously,
+    /// before spawning either a projection job thread or a deferred-retry
+    /// clock thread, so a job/clock that would only start after Stop began
+    /// is discarded instead of outliving the drain unbounded. Cleared by
+    /// `start_transcribe` BEFORE the speech thread that drives the
+    /// schedulers spawns (audio-graph-1609) — see the ordering comment
+    /// there — so no dispatch on a freshly (re)started lane can ever
+    /// observe this still set from a prior Stop.
     projection_lane_stopping: Arc<std::sync::atomic::AtomicBool>,
     event_sink: Arc<dyn ProjectionRuntimeEventSink>,
     patch_generator: Arc<dyn ProjectionPatchGenerator>,
@@ -2035,20 +2039,31 @@ fn dispatch_projection_decision(
             // race where a job completing mid-drain chains a mandatory
             // follow-up (`CompletedAndStartedFollowUp` on an
             // `AppendOnlyStale` completion is unconditional) AFTER the
-            // drain's registry snapshot has already been taken. The
-            // scheduler has already recorded `job` as its new in-flight
-            // job by this point (`start_job` runs before the decision is
-            // returned); leaving it un-spawned is intentional — Stop means
-            // this basis is abandoned for now, and `rotate_session` resets
-            // scheduler in-flight state on the next session regardless. The
-            // deferred-retry lane (ADR-0045 decision 3) is the designed
-            // future consumer for resuming abandoned bases like this one.
+            // drain's registry snapshot has already been taken.
+            //
+            // audio-graph-1609 fix: the scheduler already recorded `job` as
+            // its new in-flight job by this point (`start_job` runs before
+            // the decision is returned) — leaving it un-abandoned here used
+            // to be treated as intentional on the theory that
+            // `rotate_session` resets scheduler in-flight state on the next
+            // session regardless. That theory was false for the common
+            // case: `rotate_session` only runs on an explicit New Session;
+            // restarting capture+transcribe on the SAME session
+            // (`start_capture_impl`/`start_transcribe`) never touches the
+            // schedulers, so the un-abandoned entry became a PHANTOM
+            // in-flight job — no thread will ever complete or fail it, so
+            // every subsequent `observe_ledger` on this lane returned
+            // `Coalesced` behind it forever, and the lane never projected
+            // again for the rest of the session. `abandon_discarded_projection_job`
+            // releases exactly that entry so the lane can start fresh work
+            // on its very next observation.
             if dispatch.projection_lane_stopping.load(Ordering::SeqCst) {
                 log::debug!(
                     "projection_lane_stopping set; discarding dispatch instead of spawning job_id={} kind={:?}",
                     job.id,
                     job.kind
                 );
+                abandon_discarded_projection_job(&dispatch, &job);
                 return;
             }
             spawn_projection_job(dispatch, job);
@@ -2061,6 +2076,13 @@ fn dispatch_projection_decision(
         // any thread exists), so a lane already stopping never gets a
         // pointless clock armed for it. `None` means this same failure
         // exhausted the budget: nothing to arm.
+        //
+        // audio-graph-1609 fold-in: discarding this spawn leaves
+        // `deferred_retry_at_ms` armed with no clock thread ever registered
+        // to fire it (the bf5d orphaned-deferral gap) — `abandon_discarded_deferred_retry`
+        // clears it so the next same-basis observation retries immediately
+        // instead of silently degrading to event-driven-only with no active
+        // signal that it did.
         ProjectionSchedulerDecision::FailedCurrent {
             failed_job_id,
             kind,
@@ -2070,6 +2092,7 @@ fn dispatch_projection_decision(
                 log::debug!(
                     "projection_lane_stopping set; not arming deferred retry clock for failed_job_id={failed_job_id} kind={kind:?}"
                 );
+                abandon_discarded_deferred_retry(&dispatch, &kind, deferred_retry_at_ms);
                 return;
             }
             spawn_deferred_lane_observation(dispatch, kind, failed_job_id, deferred_retry_at_ms);
@@ -2088,6 +2111,44 @@ fn dispatch_projection_decision(
         // Routing a stalled lane onward is ADR-0036 territory.
         | ProjectionSchedulerDecision::AttemptBudgetExhausted { .. } => {}
     }
+}
+
+/// audio-graph-1609: companion to `dispatch_projection_decision`'s
+/// STOPPING discard branch for the job-spawn arm. Re-acquires the scheduler
+/// lock — safe here because both of `dispatch_projection_decision`'s
+/// callers (`observe_projection_schedulers_for_asr_revision` and
+/// `finish_projection_scheduler_job`) release it before ever calling
+/// `dispatch_projection_decision` — and releases exactly the `in_flight`
+/// entry `start_job` recorded for `job`, so this lane is not wedged behind
+/// `Coalesced` for a job that will never actually run. See
+/// `ProjectionScheduler::abandon_in_flight` for the full contract (does not
+/// touch `failed_attempts` or `pending_since_ms`).
+fn abandon_discarded_projection_job(dispatch: &ProjectionDispatchContext, job: &ProjectionJob) {
+    let mut schedulers = dispatch
+        .projection_schedulers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    schedulers.abandon_in_flight(&job.kind, &job.id, &job.session_id);
+}
+
+/// audio-graph-1609 fold-in: companion to `dispatch_projection_decision`'s
+/// STOPPING discard branch for the deferred-retry clock-spawn arm (ADR-0045
+/// decision 3, audio-graph-bf5d). Same re-acquire-the-lock safety as
+/// `abandon_discarded_projection_job` above. Clears `deferred_retry_at_ms`
+/// so this lane's armed retry does not sit orphaned with no clock source —
+/// see `ProjectionScheduler::abandon_deferred_retry` for the full contract
+/// (matches by the exact deadline value; does not touch `last_failed_basis`
+/// or `failed_attempts`).
+fn abandon_discarded_deferred_retry(
+    dispatch: &ProjectionDispatchContext,
+    kind: &ProjectionKind,
+    deferred_retry_at_ms: u64,
+) {
+    let mut schedulers = dispatch
+        .projection_schedulers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    schedulers.abandon_deferred_retry(kind, deferred_retry_at_ms);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10065,6 +10126,170 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// audio-graph-1609 acceptance (a): the exact phantom-wedge construction
+    /// from the sibling test above (`..._refuses_a_follow_up_job_once_stopping`),
+    /// continued past the discard into a same-session restart. Before the
+    /// fix, the discarded follow-up's `start_job` call left it recorded as
+    /// the graph lane's `in_flight` job forever — no thread would ever
+    /// complete or fail it, so restarting on the SAME session (flag
+    /// cleared, no `rotate_session`, exactly what the seed's mechanism
+    /// describes) would see `in_flight.is_some()` on every subsequent
+    /// `observe_ledger` and return `Coalesced` behind a job that was never
+    /// actually running — the lane would never project again for the rest
+    /// of the session. This test drives past that restart and asserts the
+    /// opposite: a new final produces a `StartJob`, not `Coalesced`, and
+    /// dispatching it actually runs and applies a second patch.
+    #[test]
+    fn dispatch_projection_decision_abandon_lets_the_lane_project_again_after_restart() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-lane-stopping-abandon-then-restart");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let job_a = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "abandon-restart-span-1",
+                        1,
+                        "First utterance before Stop races the drain.",
+                        true,
+                    ),
+                ))
+                .expect("seed first span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).graph {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected graph StartJob, got {other:?}"),
+            }
+        };
+
+        // Same race construction as the sibling test: a final ASR revision
+        // lands mid-generation (job A's completion classifies AppendOnlyStale,
+        // starting a mandatory follow-up) AND Stop begins, both before job
+        // A's own completion tail reaches `dispatch_projection_decision`.
+        let ledger_handle = app.transcript_ledger.clone();
+        let stopping_flag = app.projection_lane_stopping.clone();
+        let span_appended = Arc::new(AtomicBool::new(false));
+        let span_appended_in_closure = span_appended.clone();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+                if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
+                    ledger_handle
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .apply_event(crate::projections::TranscriptEvent::from(
+                            projection_asr_payload(
+                                "abandon-restart-span-2",
+                                1,
+                                "Second utterance lands while A is mid-generation.",
+                                true,
+                            ),
+                        ))
+                        .expect("append second span mid-generation");
+                    stopping_flag.store(true, Ordering::SeqCst);
+                }
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        spawn_projection_job(dispatch.clone(), job_a);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let empty = app
+                .projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job A did not self-deregister within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "precondition: the follow-up must have been discarded (constructing the phantom \
+             in-flight job) before this test can meaningfully exercise the restart"
+        );
+
+        // Same-session restart: clear the Stop flag WITHOUT rotating the
+        // session (`rotate_session` is the New Session path and is not
+        // exercised here — this reproduces exactly the same-session
+        // Stop->Start the seed's mechanism describes).
+        app.projection_lane_stopping.store(false, Ordering::SeqCst);
+
+        // A new final ASR revision lands post-restart.
+        app.transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .apply_event(crate::projections::TranscriptEvent::from(
+                projection_asr_payload(
+                    "abandon-restart-span-3",
+                    1,
+                    "Third utterance lands after the same-session restart.",
+                    true,
+                ),
+            ))
+            .expect("append third span after restart");
+
+        let graph_decision = {
+            let ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            schedulers.observe_ledger(&ledger, 1_000).graph
+        };
+        match &graph_decision {
+            ProjectionSchedulerDecision::StartJob { .. } => {}
+            other => panic!(
+                "the phantom in-flight job must have been abandoned at discard time — the \
+                 lane must start a fresh job on the next observation, not stay wedged behind \
+                 Coalesced, got {other:?}"
+            ),
+        }
+
+        dispatch_projection_decision(dispatch, graph_decision);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if event_sink.patch_count() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never projected again after the same-session restart"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ADR-0045 decision 3 (audio-graph-bf5d) positive control: a `FailedCurrent`
     /// decision with an armed deferral spawns exactly one clock thread, which
     /// — with no further final ASR revision ever arriving — is the sole
@@ -10506,6 +10731,141 @@ mod tests_status {
             "no retry job must ever run once projection_lane_stopping is set before the \
              FailedCurrent decision reaches the dispatcher"
         );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-1609 acceptance (d), wiring-level companion to the
+    /// scheduler-level `abandon_deferred_retry_*` unit tests in
+    /// `projection_scheduler.rs`: proves `dispatch_projection_decision`'s
+    /// OWN discard branch actually calls the abandon path, not merely that
+    /// `ProjectionScheduler` supports one in isolation. Reuses the sibling
+    /// test's exact setup above
+    /// (`..._refuses_to_arm_a_deferred_retry_clock_once_stopping`) — a
+    /// `FailedCurrent` decision dispatched with `projection_lane_stopping`
+    /// already set — then continues past it: the deferral must not survive
+    /// as an orphan. A same-basis re-observation, with no clock thread ever
+    /// having been spawned, must retry immediately instead of idling
+    /// forever waiting on one.
+    #[test]
+    fn dispatch_projection_decision_abandons_a_discarded_deferred_retry_once_stopping() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("dispatch-decision-abandons-discarded-deferred-retry");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 5,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        let (failed_job_id, deferred_retry_at_ms) = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "dispatch-decision-abandons-deferred-retry-span-1",
+                        1,
+                        "Failing basis whose deferral must not survive as an orphan.",
+                        true,
+                    ),
+                ))
+                .expect("seed span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = match schedulers.observe_ledger(&ledger, 10).graph {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected graph StartJob, got {other:?}"),
+            };
+            match schedulers.fail_graph_in_flight(&job.id, &job.session_id, &ledger, 20) {
+                ProjectionSchedulerDecision::FailedCurrent {
+                    failed_job_id,
+                    deferred_retry_at_ms: Some(deferred_retry_at_ms),
+                    ..
+                } => (failed_job_id, deferred_retry_at_ms),
+                other => panic!("expected an armed deferral, got {other:?}"),
+            }
+        };
+
+        // Set BEFORE the decision ever reaches `dispatch_projection_decision`
+        // — the ordering production always produces when Stop begins before
+        // a same-basis failure's own dispatch tail runs.
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+
+        // The decision's `deferred_retry_at_ms` must be the SAME value the
+        // scheduler actually armed above — `abandon_deferred_retry` matches
+        // by exact value on purpose (see its doc comment), so a decision
+        // carrying a different value here would exercise the "raced a newer
+        // re-arm" no-op path instead of the orphan this test targets.
+        let decision = ProjectionSchedulerDecision::FailedCurrent {
+            failed_job_id,
+            kind: ProjectionKind::Graph,
+            deferred_retry_at_ms: Some(deferred_retry_at_ms),
+        };
+        dispatch_projection_decision(dispatch.clone(), decision);
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            app.projection_job_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "precondition: no clock thread must have been registered for the discarded deferral"
+        );
+
+        // Same-session restart: clear the Stop flag WITHOUT rotating the
+        // session.
+        app.projection_lane_stopping.store(false, Ordering::SeqCst);
+
+        // A same-basis re-observation, long before the real (~60s-future)
+        // deferred deadline, must retry immediately — no clock thread exists
+        // to wait for.
+        let retry_decision = {
+            let ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            schedulers.observe_ledger(&ledger, 25).graph
+        };
+        match &retry_decision {
+            ProjectionSchedulerDecision::StartJob { .. } => {}
+            other => panic!(
+                "the deferral must have been abandoned at discard time — a same-basis \
+                 re-observation must retry immediately instead of waiting on a clock that \
+                 was never spawned, got {other:?}"
+            ),
+        }
+
+        dispatch_projection_decision(dispatch, retry_decision);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if event_sink.patch_count() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned-then-restarted lane never actually retried"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
