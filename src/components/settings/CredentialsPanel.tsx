@@ -29,7 +29,7 @@ import {
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import SecretCredentialControl from "../SecretCredentialControl";
-import Badge, { type BadgeTone, readinessTone } from "./Badge";
+import { type BadgeTone, readinessTone } from "./badgeTone";
 import ReadinessModelActions from "./ReadinessModelActions";
 import { useSettings } from "./SettingsContext";
 import {
@@ -184,9 +184,12 @@ export default function CredentialsPanel() {
                         {PROVIDER_READINESS_LABELS.get(entry.provider_id) ??
                           entry.provider_id}
                       </span>
-                      <Badge tone={readinessTone(entry.status)}>
+                      <span
+                        className="ag-chip"
+                        data-tone={readinessTone(entry.status)}
+                      >
                         {t(`settings.providerReadiness.status.${entry.status}`)}
-                      </Badge>
+                      </span>
                     </div>
                     {selectedModel && (
                       <p className="settings-readiness__meta">
@@ -296,13 +299,17 @@ export default function CredentialsPanel() {
               return (
                 <div
                   key={credential.key}
-                  className="settings-credential-health__item"
+                  className="ag-card settings-credential-health__item"
+                  data-elevation="flat"
                 >
                   <div className="settings-credential-health__item-main">
                     <code>{credential.key}</code>
-                    <Badge tone={CREDENTIAL_CHIP_TONE[chip]}>
+                    <span
+                      className="ag-chip"
+                      data-tone={CREDENTIAL_CHIP_TONE[chip]}
+                    >
                       {t(`settings.credentialHealth.statusChip.${chip}`)}
-                    </Badge>
+                    </span>
                   </div>
                   <dl className="settings-credential-health__details">
                     <div>

@@ -23,7 +23,7 @@ import {
   providerRoadmapAuthLabel,
   providerStatusLabel,
 } from "../providerRegistryHelpers";
-import Badge, { readinessTone, selectabilityTone } from "./Badge";
+import { readinessTone, selectabilityTone } from "./badgeTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerAudioFormatLabel,
@@ -109,9 +109,10 @@ export default function ProviderCapabilityCard({
 
   return (
     <article
-      className={`settings-provider-capability-card ${
+      className={`ag-card settings-provider-capability-card ${
         selected ? "settings-provider-capability-card--selected" : ""
       } ${nonImplemented ? "settings-provider-capability-card--planned" : ""}`}
+      data-elevation="flat"
       aria-labelledby={`settings-provider-capability-${descriptor.id}`}
     >
       <div className="settings-provider-capability-card__header">
@@ -127,11 +128,20 @@ export default function ProviderCapabilityCard({
           </p>
         </div>
         <div className="settings-provider-capability-card__badges">
-          {selected && <Badge tone="success">Selected</Badge>}
-          <Badge tone={selectabilityTone(selectabilityStatus)}>
+          {selected && (
+            <span className="ag-chip" data-tone="success">
+              Selected
+            </span>
+          )}
+          <span
+            className="ag-chip"
+            data-tone={selectabilityTone(selectabilityStatus)}
+          >
             {selectabilityLabel}
-          </Badge>
-          <Badge tone={readinessTone(readinessStatus)}>{readinessLabel}</Badge>
+          </span>
+          <span className="ag-chip" data-tone={readinessTone(readinessStatus)}>
+            {readinessLabel}
+          </span>
         </div>
       </div>
 

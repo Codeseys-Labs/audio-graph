@@ -25,7 +25,7 @@
    surface now carries. */
 .settings-modal {
   background: var(--bg-secondary);
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   width: 92vw;
   max-width: min(1080px, 92vw);
   max-height: 85vh;
@@ -56,14 +56,14 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 20px 24px;
+  padding: var(--space-7) var(--space-8);
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
 }
 
 .settings-header__title {
-  font-size: 18px;
-  font-weight: 700;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-bold);
   color: var(--text-primary);
   margin: 0;
 }
@@ -73,9 +73,9 @@
   border: none;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 18px;
-  padding: 4px 8px;
-  border-radius: 4px;
+  font-size: var(--font-size-xl);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-sm);
   /* Explicit property list, not `all` (UI-T3/audio-graph-99aa): only color
      and background-color change on :hover below. Motion tokens instead of
      the old bare 0.15s literal. */
@@ -116,46 +116,46 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 48px 24px;
+  padding: var(--space-12) var(--space-8);
   color: var(--text-secondary);
-  font-size: 14px;
+  font-size: var(--font-size-base);
 }
 
 /* Sections */
 .settings-section {
-  padding: 20px 24px;
+  padding: var(--space-7) var(--space-8);
   border-bottom: 1px solid var(--border-color);
 }
 
 .settings-section__title {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
   text-transform: uppercase;
   /* 0.04em — matches the closed-set `tracking-wide` value (UI-T3/
      audio-graph-99aa gate-fix review); this module isn't Tailwind-utility
      styled, so the value is inlined rather than a `tracking-wide` class. */
   letter-spacing: 0.04em;
   color: var(--text-secondary);
-  margin: 0 0 16px;
+  margin: 0 0 var(--space-6);
 }
 
 .settings-section__empty {
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-style: italic;
   margin: 0;
 }
 
 .settings-section__api-fields {
-  margin-top: 16px;
+  margin-top: var(--space-6);
 }
 
 /* Model cards */
 .model-card {
   background: var(--bg-tertiary);
   border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 12px;
+  padding: var(--space-6);
+  margin-bottom: var(--space-5);
   border: 1px solid var(--border-color);
 }
 
@@ -167,40 +167,40 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .model-card__name {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   color: var(--text-primary);
-  margin-right: 8px;
+  margin-right: var(--space-4);
 }
 
 .model-card__size {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text-muted);
   white-space: nowrap;
 }
 
 .model-card__description {
-  font-size: 13px;
+  font-size: var(--font-size-md);
   color: var(--text-secondary);
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   line-height: 1.4;
 }
 
 .model-card__hint {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text-muted);
-  margin: 6px 0 0;
+  margin: var(--space-3) 0 0;
   line-height: 1.4;
   font-style: italic;
 }
 
 .model-card__actions {
   display: flex;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--space-4);
+  margin-top: var(--space-5);
 }
 
 /* Model download/delete actions route through <Button> (ADR-0009/0011) but
@@ -211,8 +211,8 @@
   background-color: var(--accent-blue);
   color: var(--on-accent-blue);
   border-color: var(--accent-blue);
-  font-weight: 500;
-  font-size: 13px;
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-md);
   line-height: 1.4;
 }
 .settings-model-action.btn:hover:not(:disabled) {
@@ -231,10 +231,10 @@
 
 /* Status badges */
 .status-badge {
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 500;
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
   display: inline-block;
   vertical-align: middle;
 }
@@ -256,7 +256,7 @@
 
 /* Product-mode overview cards. */
 .settings-mode-overview {
-  padding: 14px 24px 16px;
+  padding: 14px var(--space-8) var(--space-6);
   border-bottom: 1px solid var(--border-color);
   background: var(--bg-primary);
 }
@@ -265,14 +265,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-6);
 }
 
 .settings-mode-overview__title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 14px;
-  font-weight: 700;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-mode-overview__grid {
@@ -282,16 +282,16 @@
   margin-top: 10px;
 }
 
+/* border/border-radius/padding/background move to the `.ag-card` recipe
+   (audio-graph-4d67 fix pass) -- ProductModeSummaryCards adds the class
+   (data-elevation="flat") in markup. Only the flex layout stays here;
+   .ag-card doesn't set display/gap. */
 .settings-mode-card {
   display: flex;
   min-width: 0;
   min-height: 100%;
   flex-direction: column;
   gap: 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 10px;
-  background: var(--bg-tertiary);
 }
 
 .settings-mode-card--selected {
@@ -309,14 +309,14 @@
 .settings-mode-card__title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 700;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-mode-card__empty {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
@@ -325,63 +325,33 @@
   flex-shrink: 0;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
-.settings-mode-card__badge,
-.settings-mode-card__selected {
-  border-radius: 4px;
-  padding: 2px 7px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.4;
-  white-space: nowrap;
-}
-
-.settings-mode-card__selected {
-  background: var(--accent);
-  color: var(--on-accent);
-}
-
-.settings-mode-card__badge--ready {
-  background: var(--tint-success);
-  color: var(--text-on-tint-success);
-}
-
-.settings-mode-card__badge--missing_credentials,
-.settings-mode-card__badge--blocked,
-.settings-mode-card__badge--unchecked {
-  background: var(--tint-warning);
-  color: var(--text-on-tint-warning);
-}
-
-.settings-mode-card__badge--error {
-  background: var(--tint-danger);
-  color: var(--text-on-tint-danger);
-}
-
+/* Kept as a container-only class now that its children are chips
+   (`.ag-chip[data-tone]`). */
 /* Glanceable density (blueprint §1.1): the data-boundary value rides inline
    under the title as a single muted chip instead of a verbose definition list. */
 .settings-mode-card__meta {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
 }
 
 .settings-mode-card__boundary {
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-mode-card__stage {
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-mode-card__providers,
 .settings-mode-card__blockers ul {
   display: grid;
-  gap: 6px;
+  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -390,7 +360,7 @@
 .settings-mode-card__provider {
   display: grid;
   grid-template-columns: minmax(72px, 0.7fr) minmax(88px, 1fr);
-  gap: 2px 8px;
+  gap: var(--space-1) var(--space-4);
   align-items: start;
   min-width: 0;
 }
@@ -402,14 +372,14 @@
 .settings-mode-card__provider-link {
   display: grid;
   grid-template-columns: minmax(72px, 0.7fr) minmax(88px, 1fr);
-  gap: 2px 8px;
+  gap: var(--space-1) var(--space-4);
   align-items: start;
   width: 100%;
   min-width: 0;
   margin: 0;
-  padding: 4px 6px;
+  padding: var(--space-2) var(--space-3);
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -430,7 +400,7 @@
 .settings-mode-card__model {
   min-width: 0;
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
@@ -442,20 +412,20 @@
 
 .settings-mode-card__blockers li {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
 
 .settings-mode-card__blockers li span {
   color: var(--text-primary);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-mode-card__actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-3);
   margin-top: auto;
 }
 
@@ -468,7 +438,7 @@
 
 /* Registry-backed provider capability cards by stage. */
 .settings-provider-capabilities {
-  padding: 14px 24px 16px;
+  padding: 14px var(--space-8) var(--space-6);
   border-bottom: 1px solid var(--border-color);
   background: var(--bg-primary);
 }
@@ -477,15 +447,15 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-6);
 }
 
 .settings-provider-capabilities__title,
 .settings-provider-capability-stage__title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 14px;
-  font-weight: 700;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-provider-capabilities__help,
@@ -493,16 +463,16 @@
 .settings-provider-capability-card__id,
 .settings-provider-capability-card__readiness,
 .settings-provider-capability-card__planned-note {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
 .settings-provider-capabilities__stages {
   display: grid;
   gap: 14px;
-  margin-top: 12px;
+  margin-top: var(--space-5);
 }
 
 .settings-provider-capability-stage {
@@ -513,8 +483,8 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
+  gap: var(--space-5);
+  margin-bottom: var(--space-4);
 }
 
 .settings-provider-capability-stage__grid {
@@ -523,16 +493,16 @@
   gap: 10px;
 }
 
+/* border/border-radius/padding/background move to the `.ag-card` recipe
+   (audio-graph-4d67 fix pass) -- ProviderCapabilityCard adds the class
+   (data-elevation="flat") in markup. Only the flex layout stays here;
+   .ag-card doesn't set display/gap. */
 .settings-provider-capability-card {
   display: flex;
   min-width: 0;
   min-height: 100%;
   flex-direction: column;
   gap: 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 10px;
-  background: var(--bg-tertiary);
 }
 
 .settings-provider-capability-card--selected {
@@ -554,8 +524,8 @@
 .settings-provider-capability-card__title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 700;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-provider-capability-card__badges {
@@ -563,42 +533,13 @@
   flex-shrink: 0;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 4px;
-}
-
-.settings-provider-capability-card__badge {
-  border-radius: 4px;
-  padding: 2px 7px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.4;
-  white-space: nowrap;
-}
-
-.settings-provider-capability-card__badge--selected,
-.settings-provider-capability-card__badge--selectable,
-.settings-provider-capability-card__badge--ready {
-  background: var(--tint-success);
-  color: var(--text-on-tint-success);
-}
-
-.settings-provider-capability-card__badge--planned,
-.settings-provider-capability-card__badge--setup,
-.settings-provider-capability-card__badge--unchecked,
-.settings-provider-capability-card__badge--missing_credentials {
-  background: var(--tint-warning);
-  color: var(--text-on-tint-warning);
-}
-
-.settings-provider-capability-card__badge--error {
-  background: var(--tint-danger);
-  color: var(--text-on-tint-danger);
+  gap: var(--space-2);
 }
 
 .settings-provider-capability-card__details {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
-  gap: 8px;
+  gap: var(--space-4);
   margin: 0;
 }
 
@@ -608,14 +549,14 @@
 
 .settings-provider-capability-card__details dt {
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-provider-capability-card__details dd {
-  margin: 2px 0 0;
+  margin: var(--space-1) 0 0;
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
@@ -628,7 +569,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   margin-top: auto;
 }
 
@@ -641,7 +582,7 @@
 
 /* Provider readiness strip shown when Settings opens. */
 .settings-readiness {
-  padding: 14px 24px 16px;
+  padding: 14px var(--space-8) var(--space-6);
   border-bottom: 1px solid var(--border-color);
   background: var(--bg-secondary);
 }
@@ -650,14 +591,14 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-6);
 }
 
 .settings-readiness__actions {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 6px;
+  gap: var(--space-3);
   flex-shrink: 0;
 }
 
@@ -667,8 +608,8 @@
 
 .settings-readiness__title {
   margin: 0;
-  font-size: 14px;
-  font-weight: 700;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
 
@@ -677,15 +618,15 @@
 .settings-readiness__meta,
 .settings-readiness__message,
 .settings-readiness__recovery {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
 .settings-readiness__meta {
   color: var(--text-primary);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-readiness__recovery,
@@ -695,37 +636,37 @@
 
 .settings-readiness__recovery span,
 .settings-provider-readiness__recovery span {
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
 }
 
 .settings-readiness__open {
-  margin-top: 8px;
+  margin-top: var(--space-4);
 }
 
 .settings-readiness__loading {
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   white-space: nowrap;
 }
 
 .settings-readiness__list {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   margin-top: 10px;
 }
 
 .settings-readiness__error {
   margin-top: 10px;
   border: 1px solid var(--tint-border-danger);
-  border-radius: 6px;
-  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  padding: var(--space-4) 10px;
   background: var(--tint-danger);
 }
 
 .settings-readiness__item {
   border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  padding: var(--space-4) 10px;
   background: var(--bg-tertiary);
 }
 
@@ -738,37 +679,13 @@
 
 .settings-readiness__provider {
   color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
   min-width: 0;
 }
 
-.settings-readiness__badge {
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
-  white-space: nowrap;
-}
-
-.settings-readiness__badge--ready {
-  background: var(--tint-success);
-  color: var(--text-on-tint-success);
-}
-
-.settings-readiness__badge--missing_credentials,
-.settings-readiness__badge--unchecked {
-  background: var(--tint-warning);
-  color: var(--text-on-tint-warning);
-}
-
-.settings-readiness__badge--error {
-  background: var(--tint-danger);
-  color: var(--text-on-tint-danger);
-}
-
 .settings-credential-health {
-  padding: 14px 24px 16px;
+  padding: 14px var(--space-8) var(--space-6);
   border-bottom: 1px solid var(--border-color);
   background: var(--bg-primary);
 }
@@ -777,37 +694,36 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-6);
 }
 
 .settings-credential-health__title {
   margin: 0;
-  font-size: 14px;
-  font-weight: 700;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
 
 .settings-credential-health__help,
 .settings-credential-health__empty,
 .settings-credential-health__providers {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
 .settings-credential-health__list {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   margin-top: 10px;
 }
 
-.settings-credential-health__item {
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 8px 10px;
-  background: var(--bg-tertiary);
-}
+/* border/border-radius/padding/background moved to the `.ag-card` recipe
+   (audio-graph-4d67 fix pass) -- CredentialsPanel adds the class
+   (data-elevation="flat") on the same element in markup; nothing else
+   distinguishes this BEM class from ag-card's own box model, so the rule
+   itself is retired rather than left empty. */
 
 .settings-credential-health__item-main {
   display: flex;
@@ -818,49 +734,9 @@
 
 .settings-credential-health__item-main code {
   color: var(--text-primary);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
   word-break: break-word;
-}
-
-.settings-credential-health__badge {
-  border-radius: 4px;
-  background: var(--tint-success);
-  color: var(--text-on-tint-success);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
-  white-space: nowrap;
-}
-
-/* Scannable per-credential status chip (Phase 4, blueprint §1.2). Color maps
-   to the linked provider-readiness rollup so the row is glanceable. */
-.settings-credential-health__chip {
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
-  white-space: nowrap;
-}
-
-.settings-credential-health__chip--ready {
-  background: var(--tint-success);
-  color: var(--text-on-tint-success);
-}
-
-.settings-credential-health__chip--needsValidation {
-  background: var(--tint-warning, var(--tint-info, #f5e8c8));
-  color: var(--text-on-tint-warning, var(--text-primary));
-}
-
-.settings-credential-health__chip--failing {
-  background: var(--tint-danger, #f3d2d2);
-  color: var(--text-on-tint-danger, var(--text-primary));
-}
-
-.settings-credential-health__chip--unused {
-  background: var(--hover-overlay);
-  color: var(--text-muted);
 }
 
 /* Destructive Clear behind a ⋯ overflow disclosure (blueprint §1.2 / §4). */
@@ -882,10 +758,10 @@
   position: absolute;
   right: 0;
   z-index: 2;
-  margin-top: 4px;
-  padding: 6px;
+  margin-top: var(--space-2);
+  padding: var(--space-3);
   border: 1px solid var(--border-color);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: var(--bg-elevated);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
 }
@@ -893,8 +769,8 @@
 .settings-credential-health__details {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 8px 12px;
-  margin: 8px 0 0;
+  gap: var(--space-4) var(--space-5);
+  margin: var(--space-4) 0 0;
 }
 
 .settings-credential-health__details div {
@@ -903,14 +779,14 @@
 
 .settings-credential-health__details dt {
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-credential-health__details dd {
-  margin: 2px 0 0;
+  margin: var(--space-1) 0 0;
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
@@ -918,7 +794,7 @@
 .settings-credential-health__actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
   margin-top: 10px;
 }
 
@@ -932,23 +808,23 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
+  gap: var(--space-4);
+  margin-top: var(--space-3);
 }
 
 .settings-provider-deferred-notice {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin: 8px 0 0;
-  font-size: 13px;
+  gap: var(--space-4);
+  margin: var(--space-4) 0 0;
+  font-size: var(--font-size-md);
   line-height: 1.4;
   color: var(--color-warning);
 }
 
 .settings-credential-health__notice {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
@@ -979,11 +855,11 @@
   right: 0;
   left: 0;
   max-height: 220px;
-  margin: 4px 0 0;
-  padding: 4px;
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
   overflow-y: auto;
   border: 1px solid var(--border-color);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: var(--bg-primary);
   box-shadow: var(--shadow-2);
   list-style: none;
@@ -994,11 +870,11 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 4px;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
@@ -1014,22 +890,22 @@
 .settings-model-picker__default {
   flex-shrink: 0;
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-model-picker__hint {
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   line-height: 1.4;
 }
 
 .settings-provider-readiness {
-  margin: 8px 0 14px;
+  margin: var(--space-4) 0 14px;
   border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  padding: var(--space-4) 10px;
   background: var(--bg-tertiary);
 }
 
@@ -1041,12 +917,12 @@
 }
 
 .settings-provider-readiness__label {
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--tint-warning);
   color: var(--text-on-tint-warning);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  padding: var(--space-1) 7px;
   white-space: nowrap;
 }
 
@@ -1062,14 +938,14 @@
 
 .settings-provider-readiness__checking {
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   white-space: nowrap;
 }
 
 .settings-provider-readiness__message,
 .settings-provider-readiness__recovery {
-  margin: 6px 0 0;
-  font-size: 12px;
+  margin: var(--space-3) 0 0;
+  font-size: var(--font-size-sm);
   line-height: 1.4;
 }
 
@@ -1078,11 +954,11 @@
 }
 
 .settings-provider-readiness__fidelity {
-  margin-top: 8px;
+  margin-top: var(--space-4);
   border-top: 1px solid var(--border-color);
-  padding-top: 8px;
+  padding-top: var(--space-4);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   line-height: 1.4;
 }
 
@@ -1093,7 +969,7 @@
 
 .settings-provider-readiness__fidelity-title {
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 .settings-provider-readiness__fidelity-summary {
@@ -1101,26 +977,26 @@
 }
 
 .settings-provider-readiness__fidelity-limitations {
-  margin: 6px 0 0;
+  margin: var(--space-3) 0 0;
   padding-inline-start: 18px;
 }
 
 .settings-provider-readiness__fidelity-limitations li + li {
-  margin-top: 2px;
+  margin-top: var(--space-1);
 }
 
 .settings-provider-readiness__details {
-  margin-top: 8px;
+  margin-top: var(--space-4);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
 }
 
 .settings-provider-readiness__details summary {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
+  min-height: var(--space-8);
   color: var(--text-primary);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   cursor: pointer;
 }
 
@@ -1128,8 +1004,8 @@
 .settings-provider-readiness__credential-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin: 4px 0 0;
+  gap: var(--space-3);
+  margin: var(--space-2) 0 0;
 }
 
 .settings-provider-readiness__detail-grid div,
@@ -1139,8 +1015,8 @@
   gap: 5px;
   max-width: 100%;
   border: 1px solid var(--border-color);
-  border-radius: 4px;
-  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-3);
   background: var(--bg-secondary);
   line-height: 1.4;
 }
@@ -1155,7 +1031,7 @@
 .settings-provider-readiness__detail-grid dt,
 .settings-provider-readiness__credential-list dt {
   color: var(--text-muted);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-provider-readiness__detail-grid dd,
@@ -1166,27 +1042,27 @@
 .settings-provider-readiness__credential-list code {
   color: var(--text-primary);
   font-family: "SF Mono", "Fira Code", "Consolas", monospace;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
 }
 
 .settings-provider-readiness__metadata {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin: 8px 0 0;
+  gap: var(--space-3);
+  margin: var(--space-4) 0 0;
 }
 
 .settings-provider-readiness__metadata div {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   max-width: 100%;
   border: 1px solid var(--border-color);
-  border-radius: 4px;
-  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-3);
   background: var(--bg-secondary);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   line-height: 1.4;
 }
 
@@ -1197,7 +1073,7 @@
 
 .settings-provider-readiness__metadata dt {
   color: var(--text-muted);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-provider-readiness__metadata dd {
@@ -1207,12 +1083,12 @@
 
 /* Buttons */
 .settings-btn {
-  padding: 6px 16px;
-  border-radius: 6px;
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--radius-md);
   border: none;
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
   /* Explicit property list, not `all` (UI-T3/audio-graph-99aa): the
      variant rules below only ever change background-color on :hover and
      opacity on :disabled. */
@@ -1258,10 +1134,10 @@
 /* Inline "Test Connection" result messages (shown right below the button). */
 .settings-test-ok,
 .settings-test-err {
-  margin-top: 6px;
-  padding: 6px 10px;
-  border-radius: 4px;
-  font-size: 12px;
+  margin-top: var(--space-3);
+  padding: var(--space-3) 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
   line-height: 1.4;
   word-break: break-word;
 }
@@ -1281,12 +1157,12 @@
 /* Form inputs */
 .settings-input {
   width: 100%;
-  padding: 8px 12px;
-  border-radius: 6px;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-md);
   border: 1px solid var(--border-color);
   background: var(--bg-tertiary);
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: var(--font-size-base);
   box-sizing: border-box;
   transition: border-color 0.2s;
 }
@@ -1310,15 +1186,15 @@
 .settings-radio-group {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-5);
 }
 
 .settings-radio {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--font-size-base);
   color: var(--text-primary);
 }
 
@@ -1328,7 +1204,7 @@
 
 /* Form field */
 .settings-field {
-  margin-bottom: 12px;
+  margin-bottom: var(--space-5);
 }
 
 .settings-field:last-child {
@@ -1336,7 +1212,7 @@
 }
 
 .settings-advanced {
-  margin: 12px 0;
+  margin: var(--space-5) 0;
   border-top: 1px solid var(--border-color);
   border-bottom: 1px solid var(--border-color);
 }
@@ -1345,8 +1221,8 @@
   cursor: pointer;
   padding: 10px 0;
   color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
 }
 
 .settings-advanced__summary:hover {
@@ -1354,42 +1230,42 @@
 }
 
 .settings-advanced__body {
-  padding: 2px 0 12px;
+  padding: var(--space-1) 0 var(--space-5);
 }
 
 .settings-field__label {
   display: block;
-  font-size: 13px;
+  font-size: var(--font-size-md);
   color: var(--text-secondary);
-  margin-bottom: 4px;
+  margin-bottom: var(--space-2);
 }
 
 /* Muted gray small text for empty-state / helper hints
    (e.g. "No AWS profiles found"). */
 .settings-hint {
-  margin: 6px 0 0;
-  font-size: 12px;
+  margin: var(--space-3) 0 0;
+  font-size: var(--font-size-sm);
   color: var(--text-muted);
   line-height: 1.4;
 }
 
 .settings-error {
-  margin: 6px 0 0;
-  font-size: 12px;
+  margin: var(--space-3) 0 0;
+  font-size: var(--font-size-sm);
   color: var(--color-danger);
   line-height: 1.4;
 }
 
 .settings-hint code {
-  padding: 1px 4px;
+  padding: 1px var(--space-2);
   border-radius: 3px;
   background: var(--hover-overlay);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
 }
 
 .settings-credential-control {
   border: 1px solid var(--border-color);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 10px;
   background: var(--bg-tertiary);
 }
@@ -1398,7 +1274,7 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-5);
 }
 
 .settings-credential-control__copy {
@@ -1408,11 +1284,11 @@
 .settings-credential-control__badge {
   display: inline-flex;
   align-items: center;
-  min-height: 20px;
-  border-radius: 4px;
-  padding: 2px 7px;
-  font-size: 11px;
-  font-weight: 600;
+  min-height: var(--space-7);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) 7px;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
   line-height: 1.2;
   white-space: nowrap;
 }
@@ -1436,13 +1312,13 @@
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .settings-credential-control__actions .settings-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .settings-credential-control__input {
@@ -1462,10 +1338,10 @@
   display: flex;
   flex: 0 0 240px;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   min-height: 0;
   overflow-y: auto;
-  padding: 12px 8px;
+  padding: var(--space-5) var(--space-4);
   border-right: 1px solid var(--border-color);
   background: var(--bg-secondary);
 }
@@ -1474,7 +1350,7 @@
 .settings-rail-group {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .settings-rail-group + .settings-rail-group {
@@ -1482,11 +1358,11 @@
 }
 
 .settings-rail-group__label {
-  margin: 0 0 2px;
-  padding: 0 8px;
+  margin: 0 0 var(--space-1);
+  padding: 0 var(--space-4);
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
   /* 0.04em — matches tracking-wide (UI-T3/audio-graph-99aa gate-fix review). */
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1497,13 +1373,13 @@
   width: 100%;
   border: none;
   border-left: 3px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: none;
   color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
   text-align: left;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-5);
   cursor: pointer;
   white-space: nowrap;
 }
@@ -1517,7 +1393,7 @@
   color: var(--text-primary);
   background: var(--hover-overlay-strong);
   border-left-color: var(--accent);
-  border-radius: 0 6px 6px 0;
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
 }
 
 /* The single scroller (blueprint §1.3). Header/rail/footer stay pinned. */
@@ -1525,7 +1401,7 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 24px;
+  padding: 14px var(--space-8);
 }
 
 /* Cap the readable content column even on a wide dialog (blueprint §1.4 —
@@ -1543,7 +1419,7 @@
    `focusSettingsField`; the animation is suppressed under reduced motion. */
 .settings-landed {
   animation: settings-landed-pulse 1.5s ease-out;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
 }
 
 /* Narrow-width fallback (blueprint §1.4): below ~720px the left rail flips to a
@@ -1558,12 +1434,12 @@
     flex: 0 0 auto;
     flex-direction: row;
     flex-wrap: nowrap;
-    gap: 6px;
+    gap: var(--space-3);
     overflow-x: auto;
     overflow-y: hidden;
     border-right: none;
     border-bottom: 1px solid var(--border-color);
-    padding: 8px 12px;
+    padding: var(--space-4) var(--space-5);
   }
 
   /* Stack the group label above each cluster but keep clusters inline-scrolling. */
@@ -1571,16 +1447,16 @@
     flex: 0 0 auto;
     flex-direction: row;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-2);
   }
 
   .settings-rail-group + .settings-rail-group {
     margin-top: 0;
-    margin-left: 6px;
+    margin-left: var(--space-3);
   }
 
   .settings-rail-group__label {
-    margin: 0 4px 0 0;
+    margin: 0 var(--space-2) 0 0;
     white-space: nowrap;
   }
 
@@ -1588,14 +1464,14 @@
     width: auto;
     border-left: none;
     border-bottom: 3px solid transparent;
-    border-radius: 6px 6px 0 0;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
     white-space: nowrap;
   }
 
   .settings-tab--active {
     border-left-color: transparent;
     border-bottom-color: var(--accent);
-    border-radius: 6px 6px 0 0;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
   }
 }
 
@@ -1612,19 +1488,19 @@
 
 /* Logging settings: log-file list. */
 .settings-log-files {
-  margin: 6px 0 0;
-  padding-left: 16px;
-  font-size: 11px;
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-6);
+  font-size: var(--font-size-xs);
   color: var(--text-muted);
   max-height: 140px;
   overflow-y: auto;
 }
 .settings-log-files li {
-  margin: 2px 0;
+  margin: var(--space-1) 0;
 }
 .settings-log-files code {
   background: var(--hover-overlay);
-  padding: 1px 4px;
+  padding: 1px var(--space-2);
   border-radius: 3px;
 }
 
@@ -1632,7 +1508,7 @@
    (e.g. profile dropdown + Refresh). */
 .settings-inline-row {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
   align-items: stretch;
 }
 
@@ -1643,11 +1519,11 @@
 /* Progress bar */
 .download-progress {
   width: 100%;
-  height: 4px;
+  height: var(--space-2);
   background: var(--bg-primary);
   border-radius: 2px;
   overflow: hidden;
-  margin-top: 8px;
+  margin-top: var(--space-4);
 }
 
 .download-progress__bar {
@@ -1659,10 +1535,10 @@
 
 /* Footer */
 .settings-footer {
-  padding: 16px 24px;
+  padding: var(--space-6) var(--space-8);
   display: flex;
   justify-content: flex-end;
-  gap: 12px;
+  gap: var(--space-5);
   flex-shrink: 0;
   border-top: 1px solid var(--border-color);
 }
@@ -1681,7 +1557,7 @@
 }
 
 .settings-confirm-close__text {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
 }
 
 /* Theme selector — segmented control (ADR-0009, Wave 4).
@@ -1732,9 +1608,9 @@
 .control-bar__settings-btn {
   background: none;
   border: none;
-  font-size: 20px;
+  font-size: var(--font-size-2xl);
   cursor: pointer;
-  padding: 4px 8px;
+  padding: var(--space-2) var(--space-4);
   opacity: 0.7;
   transition: opacity 0.2s;
   line-height: 1;

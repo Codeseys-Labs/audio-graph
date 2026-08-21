@@ -77,7 +77,7 @@ export default function SttPanel() {
           </label>
           <select
             id="diarization-mode"
-            className="settings-input"
+            className="ag-field__control"
             value={diarizationMode}
             onChange={(e) =>
               dispatch(
@@ -114,7 +114,7 @@ export default function SttPanel() {
           </label>
           <select
             id="diarization-speaker-count"
-            className="settings-input"
+            className="ag-field__control"
             value={diarizationSpeakerCount}
             onChange={(e) =>
               dispatch(
@@ -148,7 +148,7 @@ export default function SttPanel() {
             </label>
             <input
               id="diarization-max-speakers"
-              className="settings-input"
+              className="ag-field__control"
               type="number"
               min={1}
               step={1}

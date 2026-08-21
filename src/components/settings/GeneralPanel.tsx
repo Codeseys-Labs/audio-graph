@@ -67,7 +67,7 @@ export default function GeneralPanel() {
           </label>
           <select
             id="app-language-select"
-            className="settings-input"
+            className="ag-field__control"
             // i18n.resolvedLanguage is the actual active language after
             // fallback resolution (e.g. "en-US" → "en"); using it keeps
             // the control in sync with what's rendered.

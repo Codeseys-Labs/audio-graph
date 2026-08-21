@@ -548,14 +548,32 @@
   --graph-overlay-bg: rgba(255, 255, 255, 0.85);
 }
 
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+/* --------------------------------------------------------------------------
+   Universal reset (audio-graph-1d27). Layered on purpose: real cascade-layer
+   semantics let ANY layered rule (including @layer components' .ag-* recipes
+   below and Tailwind's utilities layer) win over an unlayered rule regardless
+   of selector specificity. Left bare, this reset's margin/padding: 0 would
+   outrank every layered recipe/utility in a real browser (dev, via Vite) even
+   though production looked fine — lightningcss flattens layers at build time,
+   masking the bug there. Scoping it to `@layer base` (declared first in the
+   `@layer theme, base, components, utilities;` order at the top of this file)
+   restores the intended precedence: base < components < utilities.
+
+   The adjacent html/body/#root/:focus-visible/scrollbar rules below stay
+   UNLAYERED on purpose — see the one-line justification above each. -------- */
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
 }
 
+/* Unlayered: no @layer components/utilities rule targets html/body itself
+   (components mount inside #root), so there is no override collision for
+   sizing to lose — moving this would change nothing but add ceremony. */
 html,
 body {
   height: 100%;
@@ -563,6 +581,9 @@ body {
   overflow: hidden;
 }
 
+/* Unlayered: no .ag-* recipe or Tailwind utility class is ever applied to
+   the <body> element itself, so there is no layered rule for this to beat
+   or lose to. */
 body {
   background-color: var(--bg-primary);
   color: var(--text-primary);
@@ -573,6 +594,9 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Unlayered: #root is the single Vite mount div; nothing else targets it
+   with a conflicting declaration, so there is nothing for layer order to
+   arbitrate. */
 #root {
   height: 100%;
   width: 100%;
@@ -583,6 +607,12 @@ body {
    Keyboard users get a clear ring on every interactive element. Pointer
    users don't (`:focus-visible` only). Individual components may override
    the color but should not remove the ring.
+
+   Deliberately UNLAYERED: @layer components' .ag-field > input:focus sets
+   `outline: none`. If this ring rule moved into @layer base, the later
+   `components` layer would win that conflict per real cascade-layer order
+   and silently delete the ring the comment above explicitly protects —
+   staying unlayered keeps unconditional priority over any layer.
    -------------------------------------------------------------------------- */
 :focus-visible {
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
@@ -590,7 +620,10 @@ body {
   border-radius: var(--radius-xs);
 }
 
-/* Remove the legacy UA outline only where we provide :focus-visible above. */
+/* Remove the legacy UA outline only where we provide :focus-visible above.
+   Unlayered for the same reason as :focus-visible above: it must keep
+   unconditional priority over any layered rule that might reintroduce an
+   outline on plain (non-keyboard) :focus. */
 :focus:not(:focus-visible) {
   outline: none;
 }
@@ -602,6 +635,8 @@ body {
    below the 3:1 minimum for UI-component focus indicators. Banners carrying
    the `.banner-on-accent` marker re-scope the ring to solid white, which is
    ≥4.9:1 on both banner colors (same white the banner text already uses).
+   Unlayered: no layered rule also sets --focus-ring-color on this class, so
+   there is no cross-layer conflict for it to win or lose.
    -------------------------------------------------------------------------- */
 .banner-on-accent {
   --focus-ring-color: #ffffff;
@@ -610,6 +645,8 @@ body {
 /* --------------------------------------------------------------------------
    Visually-hidden utility (WCAG): content removed from the visual layer but
    kept in the accessibility tree, e.g. labels for icon-only / animated UI.
+   Unlayered: no .ag-* recipe or utility class is ever combined with
+   .sr-only on the same element, so there is nothing to arbitrate.
    -------------------------------------------------------------------------- */
 .sr-only {
   position: absolute;
@@ -628,6 +665,8 @@ body {
    receives keyboard focus, then it slides into the top-left corner so the
    first Tab from page load offers a jump past the banners + control bar to the
    active workspace panel. Uses design tokens (ADR-0016) for surface + focus.
+   Unlayered: this class is standalone (no .ag-* recipe targets it), so
+   layer order has nothing to arbitrate.
    -------------------------------------------------------------------------- */
 .skip-to-main {
   position: absolute;
@@ -655,7 +694,9 @@ body {
    Reduced motion (ADR-0009, WCAG 2.3.3)
    Honor the OS setting: collapse animations/transitions to near-instant.
    This neutralizes the infinite pulse/bounce animations for users who opt out.
-   -------------------------------------------------------------------------- */
+   Unlayered: every declaration here already carries `!important`, which
+   wins over any non-important declaration in any layer regardless of
+   layer order — moving this block into @layer base would change nothing. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -667,6 +708,8 @@ body {
   }
 }
 
+/* Unlayered: no .ag-* recipe or utility styles the scrollbar pseudo-elements,
+   so there is no cross-layer conflict for this family to win or lose. */
 ::-webkit-scrollbar {
   width: 8px;
 }

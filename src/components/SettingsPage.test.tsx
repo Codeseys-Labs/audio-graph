@@ -686,6 +686,11 @@ describe("SettingsPage", () => {
     expect(deepgramCard).toHaveTextContent(/asr\.deepgram/i);
     expect(deepgramCard).toHaveTextContent(/Stage\s*ASR/i);
     expect(deepgramCard).toHaveTextContent(/Selectable/i);
+    // Badge absorption (audio-graph-4d67): pin the selectability chip's
+    // render contract the same way as the mode card's "Selected" chip above.
+    const selectableChip = within(deepgramCard).getByText("Selectable");
+    expect(selectableChip).toHaveClass("ag-chip");
+    expect(selectableChip).toHaveAttribute("data-tone", "success");
     expect(deepgramCard).toHaveTextContent(/Streaming\s*Yes/i);
     expect(deepgramCard).toHaveTextContent(/Partial revisions\s*Yes/i);
     expect(deepgramCard).toHaveTextContent(/Diarization\s*Yes/i);
@@ -1611,7 +1616,13 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
 
     const localCard = await modeOverviewCard(/local private/i);
-    expect(within(localCard).getByText("Selected")).toBeInTheDocument();
+    // Badge absorption (audio-graph-4d67): the mode card's own class stays a
+    // container now that its children are `.ag-chip[data-tone]` spans -- this
+    // pins the render contract so a chip-recipe detachment fails here instead
+    // of only showing up in a screenshot diff.
+    const selectedChip = within(localCard).getByText("Selected");
+    expect(selectedChip).toHaveClass("ag-chip");
+    expect(selectedChip).toHaveAttribute("data-tone", "accent");
     expect(await within(localCard).findAllByText("Not in MVP")).toHaveLength(2);
     expect(within(localCard).queryByText("Ready")).not.toBeInTheDocument();
     expect(within(localCard).getByText("Local only")).toBeInTheDocument();

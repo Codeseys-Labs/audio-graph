@@ -10,7 +10,7 @@
  */
 
 import { useTranslation } from "react-i18next";
-import Badge, { modeReadinessTone } from "./Badge";
+import { modeReadinessTone } from "./badgeTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerSetupBlockerKindLabel,
@@ -56,9 +56,10 @@ export default function ProductModeSummaryCards() {
           return (
             <article
               key={card.id}
-              className={`settings-mode-card ${
+              className={`ag-card settings-mode-card ${
                 card.selected ? "settings-mode-card--selected" : ""
               }`}
+              data-elevation="flat"
               aria-labelledby={`settings-mode-card-${card.id}`}
             >
               <div className="settings-mode-card__header">
@@ -81,14 +82,23 @@ export default function ProductModeSummaryCards() {
                   </p>
                 </div>
                 <div className="settings-mode-card__badges">
-                  {card.selected && <Badge tone="accent">Selected</Badge>}
+                  {card.selected && (
+                    <span className="ag-chip" data-tone="accent">
+                      Selected
+                    </span>
+                  )}
                   {!card.uiSelectable && (
-                    <Badge tone="warning">{t("settings.modes.notInMvp")}</Badge>
+                    <span className="ag-chip" data-tone="warning">
+                      {t("settings.modes.notInMvp")}
+                    </span>
                   )}
                   {card.uiSelectable && (
-                    <Badge tone={modeReadinessTone(card.readinessStatus)}>
+                    <span
+                      className="ag-chip"
+                      data-tone={modeReadinessTone(card.readinessStatus)}
+                    >
                       {providerSetupStatusLabel(card.readinessStatus)}
-                    </Badge>
+                    </span>
                   )}
                 </div>
               </div>
