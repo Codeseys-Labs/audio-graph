@@ -19,7 +19,8 @@ use std::time::Duration;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::http_diag::{diagnostic_path, response_request_id};
 use crate::llm::route::{
-    ConstrainedDecodingGrade, RequestOutputForm, WireOutcome, terminal_status_from_finish_reason,
+    ConstrainedDecodingGrade, RequestOutputForm, TerminalStatus, WireOutcome,
+    terminal_status_from_finish_reason,
 };
 use crate::llm::stream_contract::StreamUsage;
 
@@ -69,6 +70,13 @@ pub struct OpenRouterConfig {
     /// server). Defaults to [`DEFAULT_APP_TITLE`].
     pub app_title: String,
     /// Maximum tokens to generate. Default 512.
+    ///
+    /// Structured-output requests (extraction / projection JSON) do not use
+    /// this value verbatim: [`STRUCTURED_OUTPUT_MIN_MAX_TOKENS`] floors it
+    /// (seed audio-graph-debf). The floor is applied once, up front — ADR-0038
+    /// sub-decision 4 forbids escalating it on a `Truncated` attempt, so
+    /// there is no retry-driven change to this value. Free-form chat still
+    /// uses this value exactly as configured.
     pub max_tokens: u32,
     /// Sampling temperature. Default 0.1 for extraction, 0.7 for chat.
     pub temperature: f32,
@@ -767,9 +775,23 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
+/// A chat-completion choice's message.
+///
+/// `content` is `Option<String>`, not a bare `String`: a reasoning model
+/// (e.g. `openai/gpt-oss-120b` via OpenRouter) that spends its entire
+/// completion budget on hidden reasoning before emitting any visible text
+/// returns `"content": null` rather than omitting the field or sending `""`.
+/// The previous non-optional `String` field made that a hard deserialize
+/// error — surfaced in the field as "OpenRouter chat completion response
+/// decode failed" retried to exhaustion (seed audio-graph-debf). A response
+/// may also carry a top-level `reasoning` field on the message; this struct
+/// does not declare it — unknown/absent fields are already fine without a
+/// declared field since this struct has no `deny_unknown_fields`, and
+/// nothing here ever needs to read it.
 #[derive(Deserialize)]
 struct ChoiceMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 /// Token-usage block from a non-streaming OpenRouter response.
@@ -1660,12 +1682,26 @@ impl OpenRouterClient {
             })
             .collect();
 
-        let request = build_chat_completion_request(
+        // Structured-output forms (JSON mode / JSON schema) are the
+        // extraction + projection routes: the model must emit a complete
+        // machine-parsed JSON object, so a completion budget shared entirely
+        // with hidden reasoning tokens is the failure this floor exists to
+        // avoid. Free-form chat (`Unconstrained`) is untouched — same
+        // request shape as before this seed.
+        let is_structured_output = !matches!(form, RequestOutputForm::Unconstrained);
+        let max_tokens = if is_structured_output {
+            self.config.max_tokens.max(STRUCTURED_OUTPUT_MIN_MAX_TOKENS)
+        } else {
+            self.config.max_tokens
+        };
+
+        let mut request = build_chat_completion_request(
             &self.config,
             api_messages,
             response_format,
             cache_hint.map(|hint| hint.cache_key),
         );
+        request.max_tokens = max_tokens;
 
         let url = format!("{}/chat/completions", self.config.base_url_trimmed());
 
@@ -1678,6 +1714,12 @@ impl OpenRouterClient {
         // retry transient 408/409/429/5xx + timeout/connect transport errors,
         // never auth/validation 4xx. Total added latency is bounded well under
         // ~10s (roughly 0.4s + 1.0s before jitter across the two retries).
+        //
+        // `max_tokens` above is fixed for every attempt in this loop. ADR-0038
+        // sub-decision 4 is explicit that a `Truncated` terminal status must
+        // not auto-spend a larger-budget attempt ("go to Finalization
+        // Blocked"), so unlike the transient-status/transport/decode retries
+        // below, a `Truncated` completion is never a reason to loop here.
         let started = std::time::Instant::now();
         let mut attempt_number: u32 = 1;
         let (completion, request_id): (ChatCompletionResponse, Option<String>) = loop {
@@ -1750,6 +1792,12 @@ impl OpenRouterClient {
                                 attempt_number += 1;
                                 continue;
                             }
+                            // Class-only diagnostic: never the response body,
+                            // never the serde error's field-value text (there
+                            // is none to capture here — `e` carries structural
+                            // position/type info only, e.g. "invalid type:
+                            // null, expected a string at line 1 column 42").
+                            capture_openrouter_decode_diagnostic();
                             return Err(format!("Failed to parse OpenRouter chat response: {}", e));
                         }
                     }
@@ -1800,13 +1848,40 @@ impl OpenRouterClient {
         // the response instead of dropping both. `served_model` /
         // `served_upstream_provider` come from the already-sanitized telemetry, so
         // no unsanitized upstream string can reach provenance.
+        let reported_terminal_status =
+            terminal_status_from_finish_reason(choice.finish_reason.as_deref());
+        // `content` is `None` when a reasoning model spent its entire budget
+        // on hidden reasoning and never reached the visible completion (the
+        // gpt-oss-120b field evidence). A `null`/absent `content` on an
+        // otherwise-`Completed` turn is not a usable completion and must not
+        // read as an empty-string success (mvp-projection-correctness-
+        // 2026-07-09.md items 5-6): reclassify it into `Failed`, the same
+        // honest-unusable bucket `tool_calls`/`function_call` already use in
+        // `terminal_status_from_finish_reason`, and record a class-only
+        // diagnostic — never the response body.
+        let terminal_status = if reported_terminal_status == TerminalStatus::Completed
+            && choice.message.content.is_none()
+        {
+            capture_missing_completion_content_diagnostic();
+            TerminalStatus::Failed
+        } else {
+            reported_terminal_status
+        };
         let wire = WireOutcome {
-            terminal_status: terminal_status_from_finish_reason(choice.finish_reason.as_deref()),
+            terminal_status,
             served_model: telemetry.served_model.clone(),
             served_upstream_provider: telemetry.selected_provider.clone(),
             constrained_decoding: form.achieved_grade(constrained_decoding_ceiling),
         };
-        Ok((choice.message.content.clone(), telemetry, wire))
+        // Rendered as `""`, never fabricated — the caller's own JSON parse /
+        // validator rejects an empty string on its own merits, and
+        // `wire.terminal_status` above already carries the honest
+        // classification for this response.
+        Ok((
+            choice.message.content.clone().unwrap_or_default(),
+            telemetry,
+            wire,
+        ))
     }
 
     /// Extract entities and relationships from a transcript segment via
@@ -1914,6 +1989,87 @@ impl OpenRouterClient {
 /// provider connection (no SSE partial-recovery, no WS reconnect), so a
 /// transient 429/5xx/timeout must not drop an extraction (M4 / audio-graph-7060).
 const CHAT_MAX_ATTEMPTS: u32 = 3;
+
+// ---------------------------------------------------------------------------
+// Structured-output completion-budget floor (audio-graph-debf)
+// ---------------------------------------------------------------------------
+//
+// Field evidence (Windows preview build 3ba9812, live podcast test
+// 2026-08-20, session 1e35b2c4, model openai/gpt-oss-120b): the default
+// completion budget (512 tokens, shared with hidden reasoning on a reasoning
+// model) let reasoning consume nearly the whole budget, truncating the
+// visible JSON at ~514 bytes on every one of 10 attempted graph-projection
+// generations. A separate 2026-08-20 field run showed the same shared
+// 512-token default truncate a gpt-oss-120b EXTRACTION request too —
+// reasoning-model overhead is not Graph-specific, it applies to every
+// structured-output request form equally.
+//
+// docs/research/mvp-projection-correctness-2026-07-09.md's "smallest safe
+// fix" specified a Graph-only floor (2048) and left extraction/Notes at the
+// configured value. This module ships a single FLAT floor for every
+// structured-output form instead, for two reasons:
+//   1. The 2026-08-20 extraction field evidence above extends the same
+//      driver to non-Graph forms, so the doc's narrower floor is superseded.
+//   2. `chat_completion_send` cannot see which projection KIND a request
+//      serves even if it wanted a narrower floor: it receives only a
+//      `RequestOutputForm`, the schema `name` is always `"projection_patch"`
+//      for both Notes and Graph (`executor.rs`'s `projection_openrouter`/
+//      `projection_api` never thread `ProjectionKind` down to the
+//      `OpenRouterClient` call), and a bare extraction request carries no
+//      kind signal at all. A flat floor avoids plumbing a new parameter
+//      through every structured-output entry point for a distinction this
+//      layer cannot otherwise make.
+//
+// The floor is applied ONCE, up front, on every attempt — never escalated.
+// ADR-0038 sub-decision 4 is explicit that a `Truncated` terminal status must
+// not auto-spend a larger-budget attempt ("go to Finalization Blocked"), so
+// there is no retry-driven change to this value.
+
+/// Flat floor for a structured-output request's completion-token budget,
+/// regardless of the configured `OpenRouterConfig::max_tokens` (which may be
+/// tuned for chat, not extraction/projection) and regardless of which
+/// structured-output form or projection kind is in play — see the module
+/// note above for why this is flat rather than kind-aware. This is the
+/// higher of the two figures
+/// docs/research/mvp-projection-correctness-2026-07-09.md measured (2048 for
+/// Graph); the lower 1536 figure that doc proposed for non-Graph structured
+/// forms is superseded by the 2026-08-20 extraction field evidence.
+const STRUCTURED_OUTPUT_MIN_MAX_TOKENS: u32 = 2048;
+
+/// Class-only, content-free diagnostic for a terminal (non-retried) chat-
+/// completion body-decode failure. Never carries the response body or any
+/// provider text — `capture_diagnostic` accepts only the fixed allowlisted
+/// tags in [`crate::analytics::DiagEvent`].
+fn capture_openrouter_decode_diagnostic() {
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: "llm.openrouter.decode_error",
+        category: crate::analytics::Category::Llm,
+        level: sentry::Level::Error,
+        provider: Some("openrouter"),
+        kind: Some("decode_error"),
+        http_status: None,
+        recoverable: Some(false),
+    });
+}
+
+/// Class-only, content-free diagnostic for a completed turn whose visible
+/// `content` was null/absent (mvp-projection-correctness-2026-07-09.md items
+/// 5-6): a reasoning model that spent its whole budget on hidden reasoning
+/// returns `content: null` on an otherwise-`Completed` `finish_reason`, and
+/// that terminal shape must be observable rather than silently rendering as
+/// an empty-string success. Never carries the response body or any provider
+/// text.
+fn capture_missing_completion_content_diagnostic() {
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: "llm.openrouter.missing_completion_content",
+        category: crate::analytics::Category::Llm,
+        level: sentry::Level::Warning,
+        provider: Some("openrouter"),
+        kind: Some("missing_completion_content"),
+        http_status: None,
+        recoverable: Some(false),
+    });
+}
 
 /// Base backoff (milliseconds) for retry attempt `n` (1-based, i.e. the sleep
 /// *before* attempt n+1). Kept small so the total added latency is bounded well
@@ -2482,6 +2638,41 @@ mod tests {
         );
     }
 
+    /// Read one full HTTP/1.1 request off `stream` — headers plus exactly the
+    /// `Content-Length`-declared body — regardless of how the bytes are
+    /// chunked across TCP reads. Used by mocks that need to inspect the
+    /// request BODY (e.g. asserting an escalated `max_tokens`), unlike
+    /// [`spawn_mock`]'s header-only capture.
+    async fn read_full_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buf = vec![0u8; 8192];
+        let mut total = String::new();
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => total.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break,
+            }
+            let Some(header_end) = total.find("\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let declared_len = total[..header_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if total.len() >= body_start + declared_len {
+                break;
+            }
+        }
+        total
+    }
+
     /// Tiny HTTP/1.1 mock server. Reads one request, runs `handler` to produce
     /// a response, writes it, closes. Captures the raw request bytes for the
     /// test to assert on (e.g. attribution headers).
@@ -2612,6 +2803,115 @@ mod tests {
                 "status {code} must NOT be retryable"
             );
         }
+    }
+
+    // ----- audio-graph-debf: structured-output budget floor (wire tests) ---
+    //
+    // These assert against the CAPTURED HTTP request body, not against the
+    // floor constant/`.max()` in isolation — a test that only re-asserts
+    // `u32::max` is a tautology that cannot die under mutation. Mutation-
+    // verified: reverting the floor wiring in `chat_completion_send` (making
+    // `max_tokens` skip the `.max(STRUCTURED_OUTPUT_MIN_MAX_TOKENS)` floor)
+    // fails `structured_output_request_floors_a_small_configured_max_tokens`;
+    // restored afterward.
+
+    /// Send exactly one chat-completion request through the real
+    /// `chat_completion_send` path against a single-response mock, and
+    /// return the raw captured HTTP request (headers + full
+    /// `Content-Length`-declared body) so a test can assert on the actual
+    /// wire shape rather than a helper function in isolation.
+    fn send_one_request_and_capture_body(max_tokens: u32, form: RequestOutputForm) -> String {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let captured_for_task = captured.clone();
+        let base = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let total = read_full_http_request(&mut stream).await;
+                    *captured_for_task.lock().await = total;
+                    let body = serde_json::json!({
+                        "choices": [{
+                            "message": { "content": "{}" },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            format!("http://{}", addr)
+        });
+        let mut config = retry_test_config(base);
+        config.max_tokens = max_tokens;
+        let client = OpenRouterClient::new(config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        std::thread::spawn(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                &form,
+                None,
+            )
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("mock always returns a usable completion");
+        rt.block_on(async { captured.lock().await.clone() })
+    }
+
+    #[test]
+    fn structured_output_request_floors_a_small_configured_max_tokens() {
+        // 512 is the historical field-failure default (mvp-projection-
+        // correctness-2026-07-09.md) and well under the floor.
+        let captured = send_one_request_and_capture_body(512, RequestOutputForm::JsonObject);
+        let sent_max_tokens = request_body_field_u64(&captured, "max_tokens")
+            .expect("attempt 1 must declare max_tokens");
+        assert_eq!(
+            sent_max_tokens,
+            u64::from(STRUCTURED_OUTPUT_MIN_MAX_TOKENS),
+            "a structured request under the floor must be raised to the floor, got:\n{captured}"
+        );
+    }
+
+    #[test]
+    fn structured_output_request_passes_a_large_configured_max_tokens_through_verbatim() {
+        let captured = send_one_request_and_capture_body(8192, RequestOutputForm::JsonObject);
+        let sent_max_tokens = request_body_field_u64(&captured, "max_tokens")
+            .expect("attempt 1 must declare max_tokens");
+        assert_eq!(
+            sent_max_tokens, 8192,
+            "a configured value above the floor must pass through verbatim, never capped, got:\n{captured}"
+        );
+    }
+
+    /// Guards the "free-form chat is byte-identical" claim: `Unconstrained`
+    /// must skip BOTH the structured-output floor and any `reasoning` key.
+    /// Mutation-verified: temporarily forcing `chat_completion_send` to set a
+    /// `reasoning` object unconditionally (even for `Unconstrained`) fails
+    /// this test; reverted afterward.
+    #[test]
+    fn unconstrained_chat_request_carries_no_reasoning_key_and_configured_max_tokens_verbatim() {
+        let captured = send_one_request_and_capture_body(512, RequestOutputForm::Unconstrained);
+        let sent = request_body_json(&captured);
+        assert!(
+            sent.get("reasoning").is_none(),
+            "free-form chat must never carry a reasoning key, got:\n{sent}"
+        );
+        let sent_max_tokens = request_body_field_u64(&captured, "max_tokens")
+            .expect("request must declare max_tokens");
+        assert_eq!(
+            sent_max_tokens, 512,
+            "free-form chat must use the configured max_tokens verbatim, never floored, got:\n{captured}"
+        );
     }
 
     #[test]
@@ -3070,6 +3370,62 @@ mod tests {
             .expect("schema request ok");
         assert_eq!(text, "{\"operations\":[],\"confidence\":null}");
         assert_eq!(tokens, 21);
+    }
+
+    /// Field evidence (audio-graph-debf): a reasoning model (gpt-oss-120b via
+    /// OpenRouter) that spends its whole visible-output turn on hidden
+    /// reasoning returns `"content": null` alongside a populated `reasoning`
+    /// field, instead of an empty string or an omitted key. Before this fix
+    /// `ChoiceMessage.content` was a non-optional `String`, so this exact
+    /// shape was a hard deserialize error — "OpenRouter chat completion
+    /// response decode failed" retried to exhaustion in the field. This test
+    /// uses `finish_reason: "stop"` (not `"length"`) so it isolates decode
+    /// tolerance from actual truncation. The decode must tolerate the shape,
+    /// but per mvp-projection-correctness-2026-07-09.md items 5-6 the null
+    /// content must NOT surface as an empty-string `Completed` success — it
+    /// is reclassified `Failed`, the honest-unusable bucket.
+    #[test]
+    fn chat_completion_decodes_null_content_from_reasoning_only_response() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(spawn_mock(|_| {
+            (
+                200,
+                "OK",
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "reasoning": "internal chain-of-thought, never surfaced"
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+        }));
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let (text, _tokens, wire) = std::thread::spawn(move || {
+            client.chat_completion_with_wire_outcome(
+                vec![("user".to_string(), "hi".to_string())],
+                &RequestOutputForm::JsonObject,
+                None,
+            )
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("a null `content` with a populated `reasoning` field must decode, not error");
+        assert_eq!(
+            text, "",
+            "null content must render as an empty string, never fabricated"
+        );
+        assert_eq!(
+            wire.terminal_status,
+            TerminalStatus::Failed,
+            "a completed turn with null content is not a usable completion and must not \
+             read as an empty Completed success"
+        );
     }
 
     #[tokio::test]
@@ -4174,23 +4530,23 @@ mod tests {
 
     #[test]
     fn blocking_length_finish_reason_is_truncated() {
-        use crate::llm::route::TerminalStatus;
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         // OpenRouter converts some length overruns into HTTP 200 with
-        // finish_reason "length" and a truncated body (ADR-0038:41-43).
-        let (base, _captured) = rt.block_on(spawn_mock(|_| {
-            (
-                200,
-                "OK",
-                serde_json::json!({
-                    "choices": [{
-                        "message": { "content": "{\"operations\":[" },
-                        "finish_reason": "length"
-                    }]
-                })
-                .to_string(),
-            )
-        }));
+        // finish_reason "length" and a truncated body (ADR-0038:41-43). Per
+        // ADR-0038 sub-decision 4 this is terminal on the FIRST attempt —
+        // there is no larger-budget retry to exhaust.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, request_count) = rt.block_on(spawn_scripted_mock(vec![(
+            200,
+            "OK",
+            "",
+            serde_json::json!({
+                "choices": [{
+                    "message": { "content": "{\"operations\":[" },
+                    "finish_reason": "length"
+                }]
+            })
+            .to_string(),
+        )]));
 
         let client = OpenRouterClient::new(retry_test_config(base))
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
@@ -4205,6 +4561,27 @@ mod tests {
         .expect("worker thread panic")
         .expect("a 200 with finish_reason=length still decodes");
         assert_eq!(wire.terminal_status, TerminalStatus::Truncated);
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ADR-0038 sub-decision 4: a Truncated attempt must never auto-spend a \
+             larger-budget retry — exactly one request, no escalation"
+        );
+    }
+
+    /// Parse a captured HTTP request's raw bytes down to its JSON body.
+    fn request_body_json(raw_request: &str) -> serde_json::Value {
+        let body_start = raw_request
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(raw_request.len());
+        serde_json::from_str(raw_request[body_start..].trim()).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Parse a top-level numeric field out of a raw captured HTTP request's
+    /// JSON body.
+    fn request_body_field_u64(raw_request: &str, field: &str) -> Option<u64> {
+        request_body_json(raw_request).get(field)?.as_u64()
     }
 
     #[test]
