@@ -28,15 +28,6 @@
     "realtimeAgentOpenAi": "OpenAI",
     "realtimeAgentOpenAiHint": "Agente de voz OpenAI Realtime (gpt-realtime-2) fala-para-fala nativa.",
     "toolbarLabel": "Controles de captura",
-    "pipelines": "Pipelines",
-    "transcribe": "Transcrever",
-    "stopTranscribe": "Parar transcrição",
-    "startTranscription": "Iniciar transcrição",
-    "stopTranscription": "Parar transcrição",
-    "transcribeHint": "Transmitir o áudio capturado pelos provedores selecionados de fala para notas.",
-    "transcribeNeedsCapture": "Inicie a captura para ativar a transcrição.",
-    "providerSettingsLoading": "As configurações dos provedores ainda estão carregando.",
-    "providerNotInMvp": "{{provider}} não está disponível para novas sessões no MVP atual.",
     "gemini": "Gemini",
     "stopGemini": "Parar Gemini",
     "startGeminiLabel": "Iniciar Gemini",
@@ -47,20 +38,19 @@
     "geminiHint": "Transmitir áudio para o Gemini Live (fala-para-fala nativa).",
     "geminiNeedsKey": "Configure o Gemini nas Configurações.",
     "geminiNeedsCapture": "Inicie a captura para ativar o Gemini.",
-    "comparing": "Comparando…",
-    "comparingHint": "Os pipelines local e Gemini estão ambos em execução.",
-    "backpressure": "Contrapressão",
-    "backpressureHint": "O buffer circular de áudio está descartando blocos de {{count}} fonte(s). O consumidor do pipeline está lento demais — considere desativar o Gemini ou usar um modelo Whisper menor.",
-    "selectSourcesToBegin": "Selecione fontes de áudio para começar",
-    "sourcesSelected": "{{count}} fontes selecionadas",
-    "sourcesSummary": "{{count}} fontes",
-    "agent": "Agente",
-    "agentProposals": "Propostas do agente",
-    "toggleAgentProposals": "Alternar propostas do agente",
-    "tokens": "Tokens",
-    "tokenUsage": "Uso de tokens do Gemini",
-    "toggleTokenUsage": "Alternar uso de tokens",
+    "sourcesSummary_one": "{{count}} fonte",
+    "sourcesSummary_other": "{{count}} fontes",
     "browseSessions": "Navegar pelas sessões recentes"
+  },
+  "nowStrip": {
+    "durabilitySaved": "Notas salvas · há {{seconds}}s",
+    "routePlanned": "planejado: {{route}}",
+    "routeUnconfigured": "planejado: não configurado"
+  },
+  "systemDrawer": {
+    "title": "Status do sistema",
+    "close": "Fechar",
+    "pipelineHeading": "Estágios do pipeline"
   },
   "workspace": {
     "navigation": "Navegação do espaço de trabalho",
@@ -1102,8 +1092,6 @@
     "resizeSources": "Redimensionar painel de fontes",
     "resizeNotes": "Redimensionar painel de notas",
     "resizeTranscriptChat": "Redimensionar painel de transcrição e chat",
-    "agentProposals": "Propostas do agente",
-    "tokenUsage": "Uso de tokens",
     "a11y": {
       "skipToMain": "Pular para o conteúdo principal",
       "recordingStarted": "Gravação iniciada",
@@ -1328,7 +1316,11 @@
     "persistenceQueueCompact": "desc {{dropped}}",
     "persistenceQueueTooltip": "Pressão na fila de persistência: fila de {{writers}} cheia, capacidade {{capacity}}, {{dropped}} eventos descartados. Pause a captura ou reduza o processamento ao vivo.",
     "persistenceWriterTranscript": "transcrição",
-    "persistenceWriterProjection": "notas/grafo"
+    "persistenceWriterProjection": "notas/grafo",
+    "healthy": "Todos os sistemas normais",
+    "degraded": "Degradado",
+    "error": "Erro",
+    "openSystemStatus": "Abrir status do sistema"
   },
   "graph": {
     "empty": "Comece a capturar áudio para construir o grafo de conhecimento",

@@ -3,17 +3,23 @@
  *
  * Layout (desktop-first):
  *   - Top: `StorageBanner` (ENOSPC retry) + `DemoModeBanner` (first-launch
- *     local-only hint) + `ControlBar` (Start/Stop, settings, sessions).
+ *     local-only hint) + `NowStrip` (Start/Stop, elapsed, durability, planned
+ *     route, composite health, settings/sessions — SHELL-R3, ADR-0046;
+ *     replaces the old `ControlBar`).
  *   - Workspace switcher: Ready/Live now / Review / Inspect phases.
  *   - Middle flex:
  *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
  *       - Main: phase-specific notes/transcript/graph workspace
  *       - Right aside: `LiveTranscript` / `ChatSidebar` (tabbed), with
  *                      diagnostics shown only in the Inspect phase
- *   - Bottom: `PipelineStatusBar` (per-stage status dots).
+ *   - Bottom: `PipelineStatusBar` (per-stage status dots; collapses to the
+ *     composite health state during healthy capture, SHELL-R3 folds 50e3).
  *   - Overlays: error toast, `SettingsPage` modal, `SessionsBrowser` modal,
- *     `ShortcutsHelpModal`, first-launch `ExpressSetup` quickstart,
- *     `Notifications` (unified transient feedback + error queue, ADR-0011).
+ *     `SystemDrawer` (projection runtime + token usage + per-stage pipeline
+ *     detail, opened from NowStrip's health chip — replaces the retired
+ *     `PopoverOverlay`), `ShortcutsHelpModal`, first-launch `ExpressSetup`
+ *     quickstart, `Notifications` (unified transient feedback + error queue,
+ *     ADR-0011).
  *
  * Side-effects mounted at the root:
  *   - `useTauriEvents()` subscribes to all backend events exactly once.
@@ -48,10 +54,12 @@ import { safeInvoke as invoke } from "./analytics/safeInvoke";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import ChatSidebar from "./components/ChatSidebar";
-import ControlBar from "./components/ControlBar";
 import Icon from "./components/Icon";
 import LiveTranscript from "./components/LiveTranscript";
 import NotesPanel from "./components/NotesPanel";
+// SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip (restyle + one Start
+// + composite health chip; see NowStrip.tsx's doc comment).
+import NowStrip from "./components/NowStrip";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
@@ -67,7 +75,6 @@ import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
 import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
-import TokenUsagePanel from "./components/TokenUsagePanel";
 
 // Code-split (ADR-0016 / modernization-audit 2.3): the graph viewer pulls the
 // heavy react-force-graph-2d dependency, and these modals/first-run flows are
@@ -81,11 +88,9 @@ const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 import DemoModeBanner from "./components/DemoModeBanner";
 import GetStartedFallback from "./components/GetStartedFallback";
 import Notifications from "./components/Notifications";
-import PopoverOverlay from "./components/PopoverOverlay";
-import { providerDescriptorForSettingsVariant } from "./components/providerRegistryHelpers";
 import StorageBanner from "./components/StorageBanner";
+import SystemDrawer from "./components/SystemDrawer";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
-import { endpointCredentialKey } from "./generated/endpointCredentialRouting";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNativeCapture } from "./hooks/useNativeCapture";
@@ -97,90 +102,11 @@ import { useAudioGraphStore } from "./store";
 // `store/shellNav.ts` for the full during/after/analysis rationale.
 import { deriveWorkspaceView } from "./store/shellNav";
 import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
+// SHELL-R3 (plan §R3, ADR-0046): moved out of this file so NowStrip's
+// planned-route chip can read the SAME predicate this probe uses — see
+// `utils/durableRoute.ts`'s doc comment.
+import { hasConfiguredDurableNotesRoute } from "./utils/durableRoute";
 import "./styles/index.css";
-
-function isLoopbackEndpoint(endpoint: string): boolean {
-  try {
-    const hostname = new URL(endpoint).hostname.toLowerCase();
-    return (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Passive first-run classification for the selected durable notes route.
- *
- * This deliberately does not call provider health/model-catalog endpoints:
- * startup may read local settings, key-presence metadata, and local model
- * status only (ADR-0028). A broad union of saved keys is not enough; each key
- * must belong to the provider/endpoint the user actually selected.
- */
-function hasConfiguredDurableNotesRoute(
-  settings: AppSettings | null | undefined,
-  presence: readonly CredentialPresence[],
-  modelStatus: ModelStatus | null,
-  awsProfiles: readonly string[] = [],
-): boolean {
-  if (!settings) return false;
-  const presentKeys = new Set(
-    presence.filter(({ present }) => present).map(({ key }) => key),
-  );
-  const asr = settings.asr_provider;
-  const asrDescriptor = providerDescriptorForSettingsVariant("asr", asr.type);
-  if (
-    !asrDescriptor?.ui_selectable ||
-    asr.type !== "deepgram" ||
-    !asr.model.trim() ||
-    !asrDescriptor.credential_keys.some((key) => presentKeys.has(key))
-  ) {
-    return false;
-  }
-
-  const llm = settings.llm_provider;
-  const llmDescriptor = providerDescriptorForSettingsVariant("llm", llm.type);
-  if (!llmDescriptor?.ui_selectable) return false;
-
-  switch (llm.type) {
-    case "local_llama":
-      return modelStatus?.llm === "Ready";
-    case "mistralrs":
-      // The aggregate `llm` status currently describes the fixed llama.cpp
-      // artifact, not the selected mistral.rs model id. Stay conservative
-      // until per-provider/model status is available.
-      return false;
-    case "api": {
-      if (!llm.endpoint.trim() || !llm.model.trim()) return false;
-      return (
-        isLoopbackEndpoint(llm.endpoint) ||
-        presentKeys.has(endpointCredentialKey(llm.endpoint))
-      );
-    }
-    case "openrouter":
-      return (
-        Boolean(llm.base_url.trim() && llm.model.trim()) &&
-        presentKeys.has("openrouter_api_key")
-      );
-    case "aws_bedrock":
-      if (!llm.region.trim() || !llm.model_id.trim()) return false;
-      if (llm.credential_source.type === "profile") {
-        const profileName = llm.credential_source.name.trim();
-        return Boolean(profileName) && awsProfiles.includes(profileName);
-      }
-      if (llm.credential_source.type === "access_keys") {
-        return (
-          presentKeys.has("aws_access_key") && presentKeys.has("aws_secret_key")
-        );
-      }
-      // The passive startup check cannot prove that an ambient AWS default
-      // chain resolves; leave setup visible until a scoped audit does.
-      return false;
-  }
-}
 
 // cred-review m6: a rejected `load_credential_presence_cmd` carries a
 // structured `AppError` payload (`{ code, message: { reason } }`). The backend
@@ -287,7 +213,7 @@ interface ShellChromeProps {
 }
 
 /** Region 1: banners + chrome — skip link, live regions, top banners,
- * ControlBar, and the post-onboarding hand-off nudge. */
+ * NowStrip, and the post-onboarding hand-off nudge. */
 function ShellChrome({
   workspaceView,
   recordingAnnouncement,
@@ -316,7 +242,7 @@ function ShellChrome({
       </div>
       <StorageBanner />
       <DemoModeBanner />
-      <ControlBar />
+      <NowStrip />
       {handoffVisible && (
         <aside
           className="flex items-center gap-(--space-5) px-(--space-6) py-(--space-3) bg-(--tint-accent-info) border-b border-(--tint-border-info) text-text-primary"
@@ -668,10 +594,23 @@ function App() {
     (s) => s.loadSampleSessionPreview,
   );
   const samplePreviewActive = useAudioGraphStore((s) => s.samplePreviewActive);
-  const agentOverlayOpen = useAudioGraphStore((s) => s.agentOverlayOpen);
+  // SHELL-R3 (plan §R3, ADR-0046): `agentOverlayOpen`'s BOOLEAN and
+  // `tokenOverlayOpen` (+ its setter) are intentionally NOT read here any
+  // more — the pop-down overlay they drove is retired below (PopoverOverlay
+  // deleted outright). `setAgentOverlayOpen` alone survives as a write-only
+  // binding: `previewSampleSession` below still defensively clears it after
+  // `loadSampleSessionPreview` seeds `agentOverlayOpen: true` as part of its
+  // bundled sample state — `App.test.tsx` pins the post-preview value at
+  // `false`, so this write stays even though nothing renders it. The read
+  // side (both fields, both setters) otherwise stays wired-but-unread in the
+  // store for the same reason `sessionsBrowserOpen` did after R2
+  // (`store/shellNav.ts`'s module doc): `App.test.tsx`/`App.contract.
+  // test.tsx` both `setState` them directly and must stay byte-identical.
+  // Deleting the now-fully-inert remainder is left to R4, which already owns
+  // revisiting those fixtures for the tab-id rename.
   const setAgentOverlayOpen = useAudioGraphStore((s) => s.setAgentOverlayOpen);
-  const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
-  const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
+  const systemDrawerOpen = useAudioGraphStore((s) => s.systemDrawerOpen);
+  const setSystemDrawerOpen = useAudioGraphStore((s) => s.setSystemDrawerOpen);
   const graphEdgeFocus = useAudioGraphStore((s) => s.graphEdgeFocus);
   // ShellNav (SHELL-R1, ADR-0046): nav now lives in the store (not App-local
   // useState) because R2's `stopCapture` — a store action — must be able to
@@ -855,6 +794,14 @@ function App() {
       const presence = await invoke<CredentialPresence[]>(
         "load_credential_presence_cmd",
       );
+      // SHELL-R3 (plan §R3, ADR-0046): persisted (not just a local variable)
+      // so NowStrip's planned-route chip can call the SAME
+      // `hasConfiguredDurableNotesRoute` read this probe performs, rather
+      // than a route-chip-only re-derivation. `awsProfiles` below stays a
+      // local variable, NOT mirrored to the store (aws_bedrock + a profile
+      // credential source is the one narrow case the chip cannot fully
+      // verify yet — documented limitation, not a silent gap).
+      useAudioGraphStore.setState({ credentialPresence: presence });
       const settings = await invoke<AppSettings>("load_settings_cmd");
       // Hydrate the shared control/store view from the same passive settings
       // read so action gates never operate on a stale/null provider route.
@@ -1136,27 +1083,14 @@ function App() {
         </Suspense>
       )}
 
-      {/* Agent proposals pop-down overlay (toggled from the top bar). Suppressed
-          when During already shows the same live-assist surface inline. */}
-      {agentOverlayOpen &&
-        !(workspaceView === "during" && hasAgentActivity) && (
-          <PopoverOverlay
-            label={t("app.agentProposals")}
-            onClose={() => setAgentOverlayOpen(false)}
-          >
-            <AgentProposalsPanel />
-          </PopoverOverlay>
-        )}
-
-      {/* Gemini token usage pop-down overlay (toggled from the top bar) —
-          kept out of the chat column so chat gets the full height. */}
-      {tokenOverlayOpen && (
-        <PopoverOverlay
-          label={t("app.tokenUsage")}
-          onClose={() => setTokenOverlayOpen(false)}
-        >
-          <TokenUsagePanel />
-        </PopoverOverlay>
+      {/* System drawer (SHELL-R3, ADR-0046): projection runtime + token usage
+          + per-stage pipeline detail, opened from NowStrip's composite health
+          chip. Replaces the retired `PopoverOverlay`'s two consumers — see
+          `SystemDrawer.tsx`'s doc comment for the full retirement
+          disposition (agent proposals already had an inline home; token
+          usage moves here). */}
+      {systemDrawerOpen && (
+        <SystemDrawer onClose={() => setSystemDrawerOpen(false)} />
       )}
 
       {/* Unified notification host (ADR-0011): transient queue + legacy

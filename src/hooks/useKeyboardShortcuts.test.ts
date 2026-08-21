@@ -23,8 +23,11 @@ describe("useKeyboardShortcuts", () => {
   });
 
   it("Cmd+R toggles capture on when not capturing", () => {
-    const startCapture = vi.fn();
-    useAudioGraphStore.setState({ startCapture, isCapturing: false });
+    const startCaptureAndTranscribe = vi.fn();
+    useAudioGraphStore.setState({
+      startCaptureAndTranscribe,
+      isCapturing: false,
+    });
 
     renderHook(() => useKeyboardShortcuts());
 
@@ -32,7 +35,7 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(window, { key: "r", metaKey: true });
     });
 
-    expect(startCapture).toHaveBeenCalledTimes(1);
+    expect(startCaptureAndTranscribe).toHaveBeenCalledTimes(1);
   });
 
   it("Ctrl+R toggles capture off when currently capturing", () => {
@@ -49,8 +52,8 @@ describe("useKeyboardShortcuts", () => {
   });
 
   it("does NOT fire Cmd+R without any modifier", () => {
-    const startCapture = vi.fn();
-    useAudioGraphStore.setState({ startCapture });
+    const startCaptureAndTranscribe = vi.fn();
+    useAudioGraphStore.setState({ startCaptureAndTranscribe });
 
     renderHook(() => useKeyboardShortcuts());
 
@@ -58,7 +61,7 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(window, { key: "r" });
     });
 
-    expect(startCapture).not.toHaveBeenCalled();
+    expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
   });
 
   it("Cmd+, opens the settings modal", () => {
@@ -76,8 +79,11 @@ describe("useKeyboardShortcuts", () => {
 
   it("Cmd+Shift+S opens sessions browser (not plain Cmd+S)", () => {
     const openSessionsBrowser = vi.fn();
-    const startCapture = vi.fn();
-    useAudioGraphStore.setState({ openSessionsBrowser, startCapture });
+    const startCaptureAndTranscribe = vi.fn();
+    useAudioGraphStore.setState({
+      openSessionsBrowser,
+      startCaptureAndTranscribe,
+    });
 
     renderHook(() => useKeyboardShortcuts());
 
@@ -86,7 +92,7 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(window, { key: "s", metaKey: true });
     });
     expect(openSessionsBrowser).not.toHaveBeenCalled();
-    expect(startCapture).not.toHaveBeenCalled();
+    expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
 
     // Cmd+Shift+S opens sessions browser.
     act(() => {
@@ -100,8 +106,8 @@ describe("useKeyboardShortcuts", () => {
   });
 
   it("skips modifier shortcuts when focus is inside an <input>", () => {
-    const startCapture = vi.fn();
-    useAudioGraphStore.setState({ startCapture });
+    const startCaptureAndTranscribe = vi.fn();
+    useAudioGraphStore.setState({ startCaptureAndTranscribe });
 
     renderHook(() => useKeyboardShortcuts());
 
@@ -113,7 +119,7 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(input, { key: "r", metaKey: true });
     });
 
-    expect(startCapture).not.toHaveBeenCalled();
+    expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
     document.body.removeChild(input);
   });
 
@@ -179,8 +185,8 @@ describe("useKeyboardShortcuts", () => {
   });
 
   it("removes its keydown listener on unmount", () => {
-    const startCapture = vi.fn();
-    useAudioGraphStore.setState({ startCapture });
+    const startCaptureAndTranscribe = vi.fn();
+    useAudioGraphStore.setState({ startCaptureAndTranscribe });
 
     const { unmount } = renderHook(() => useKeyboardShortcuts());
     unmount();
@@ -189,6 +195,6 @@ describe("useKeyboardShortcuts", () => {
       fireEvent.keyDown(window, { key: "r", metaKey: true });
     });
 
-    expect(startCapture).not.toHaveBeenCalled();
+    expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
   });
 });

@@ -2841,6 +2841,15 @@ export interface AudioGraphStore {
   setIsCapturing: (capturing: boolean) => void;
   startCapture: () => Promise<void>;
   stopCapture: () => Promise<void>;
+  /**
+   * ONE START (SHELL-R3, ADR-0046): composes `startCapture` then
+   * `startTranscribe` — the latter ONLY when the same ADR-0033 enablement
+   * gate the (now-demoted) standalone Transcribe control always used
+   * already permits it. Claims no atomicity; ADR-0028's coordinated start
+   * (seed audio-graph-10ff) replaces this composition behind the same
+   * button when it lands. See `store/index.ts`'s implementation doc.
+   */
+  startCaptureAndTranscribe: () => Promise<void>;
 
   /// IDs of sources currently reporting backpressure. Updated by the
   /// `capture-backpressure` event listener. Non-empty means at least one
@@ -2871,12 +2880,33 @@ export interface AudioGraphStore {
   isChatLoading: boolean;
   rightPanelTab: "transcript" | "chat";
   setRightPanelTab: (tab: "transcript" | "chat") => void;
+  // SHELL-R3 (plan §R3, ADR-0046): `agentOverlayOpen`/`tokenOverlayOpen` and
+  // their setters stay wired but UNREAD by the shell — the pop-down overlay
+  // they drove (`PopoverOverlay`) is retired outright. Kept for the same
+  // reason `sessionsBrowserOpen` survived R2 (`store/shellNav.ts`'s module
+  // doc): `App.test.tsx`/`App.contract.test.tsx` both `setState` them
+  // directly and must stay byte-identical. R4 owns deleting the now-inert
+  // fields when it revisits those fixtures for the tab-id rename.
   agentOverlayOpen: boolean;
   setAgentOverlayOpen: (open: boolean) => void;
   toggleAgentOverlay: () => void;
   tokenOverlayOpen: boolean;
   setTokenOverlayOpen: (open: boolean) => void;
   toggleTokenOverlay: () => void;
+  /** System drawer (SHELL-R3, ADR-0046): opened from NowStrip's composite
+   * health chip. Hosts `ProjectionRuntimeStatusPanel` + `TokenUsagePanel` +
+   * per-stage pipeline detail — see `SystemDrawer.tsx`. */
+  systemDrawerOpen: boolean;
+  setSystemDrawerOpen: (open: boolean) => void;
+  toggleSystemDrawer: () => void;
+  /**
+   * Non-secret credential-presence snapshot from the same passive startup
+   * probe that gates `ExpressSetup` (`App.tsx`'s `runCredentialProbe`).
+   * Persisted here (SHELL-R3) so `NowStrip`'s planned-route chip can call
+   * the SAME `hasConfiguredDurableNotesRoute` read that probe performs,
+   * instead of a route-chip-only re-derivation (`utils/durableRoute.ts`).
+   */
+  credentialPresence: CredentialPresence[];
   nativeS2sEnabled: boolean;
   setNativeS2sEnabled: (enabled: boolean) => void;
   /**

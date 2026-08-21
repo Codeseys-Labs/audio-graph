@@ -2166,6 +2166,44 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: errorToMessage(e) });
     }
   },
+  // ONE START (SHELL-R3, plan §R3, ADR-0046): the NOW STRIP's Start button
+  // composes today's two separately-gated actions behind one control —
+  // `startCapture`, then `startTranscribe` ONLY where the SAME ADR-0033
+  // enablement gate the (now-demoted) standalone Transcribe control has
+  // always rendered its `aria-disabled` from already permits it
+  // (`deferredProviderForDurableStart`, mirrored from `ControlBar`'s old
+  // `canTranscribe`/`transcribeDisabled`: settings hydrated, no deferred
+  // provider, actually capturing, not already transcribing).
+  //
+  // CRITICAL (verified before this landed, not after): in CI no durable
+  // route is configured — the real Rust default `AsrProvider` is
+  // `local_whisper` (`src-tauri/src/settings/mod.rs`), whose registry
+  // descriptor is `ui_selectable: false` — so `deferredProviderForDurableStart`
+  // returns that descriptor and the transcribe leg below never fires. The
+  // mocked E2E flow (`e2e/specs/shell.e2e.ts`) therefore issues EXACTLY
+  // `start_capture`; `start_transcribe` is never invoked, so it can never
+  // fall through to the real (unmocked) Rust command and emit the
+  // ERROR-level line that would break that suite's zero-frontend-errors
+  // gate. `store/index.test.ts`'s "merged Start" describe block is the
+  // jsdom proof of this gating (asserts `startTranscribe`'s underlying
+  // `start_transcribe` invoke is NOT called when the predicate is true).
+  //
+  // NO ATOMICITY CLAIM: this is a frontend composition of two existing,
+  // independently-fallible actions — not a new backend contract. A failed
+  // `startCapture` leaves `isCapturing` false (re-read via `get()` below,
+  // not a snapshot taken before the `await`), so the transcribe leg is
+  // correctly skipped; a transcribe leg that itself fails sets `error` via
+  // `startTranscribe`'s own catch, exactly as if the two buttons had been
+  // clicked separately. ADR-0028's coordinated start (seed audio-graph-10ff)
+  // replaces this composition behind the same button when it lands.
+  startCaptureAndTranscribe: async () => {
+    await get().startCapture();
+    const { isCapturing, isTranscribing, settings } = get();
+    if (!isCapturing || isTranscribing) return;
+    if (!settings) return;
+    if (deferredProviderForDurableStart(settings)) return;
+    await get().startTranscribe();
+  },
   // SHELL-R2 (plan §R2, ADR-0046): "stop lands you on your own session". Read the
   // active session id BEFORE stopping — once `stop_capture` tears the
   // session down there is no other way to learn which session it was — then
@@ -2440,6 +2478,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   setTokenOverlayOpen: (open: boolean) => set({ tokenOverlayOpen: open }),
   toggleTokenOverlay: () =>
     set((state) => ({ tokenOverlayOpen: !state.tokenOverlayOpen })),
+  // System drawer (SHELL-R3, ADR-0046): opened from NowStrip's composite
+  // health chip. Replaces the two retired PopoverOverlay consumers' toggle
+  // shape above for the surface that actually moved here (token usage).
+  systemDrawerOpen: false,
+  setSystemDrawerOpen: (open: boolean) => set({ systemDrawerOpen: open }),
+  toggleSystemDrawer: () =>
+    set((state) => ({ systemDrawerOpen: !state.systemDrawerOpen })),
+  // Non-secret credential-presence snapshot (SHELL-R3) — see the field's
+  // doc comment in types/index.ts. Written by App.tsx's startup probe.
+  credentialPresence: [],
   // Conversation mode: when false (default) the app uses the cascading
   // STT -> LLM -> TTS pipeline; when true the native speech-to-speech path
   // (Gemini Live / OpenAI realtime) is enabled and its top-bar control shows.

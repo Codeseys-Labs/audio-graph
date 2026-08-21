@@ -53,8 +53,23 @@ vi.mock("./components/ProjectionRuntimeStatusPanel", () => ({
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
 }));
-vi.mock("./components/ControlBar", () => ({
+// SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip.
+vi.mock("./components/NowStrip", () => ({
   default: () => <div data-testid="controlbar-stub" />,
+}));
+// A minimal dialog-shaped stub (same convention as the ExpressSetup stub
+// above) so App-level tests can prove the ACTUAL `systemDrawerOpen` mount
+// wiring in App.tsx fires, without needing SystemDrawer's own nested
+// TokenUsagePanel/ProjectionRuntimeStatusPanel/PipelineStageDetail fixtures
+// (those are covered in SystemDrawer.test.tsx).
+vi.mock("./components/SystemDrawer", () => ({
+  default: ({ onClose }: { onClose: () => void }) => (
+    <div role="dialog" aria-label="System status">
+      <button type="button" onClick={onClose}>
+        Close
+      </button>
+    </div>
+  ),
 }));
 // A minimal ExpressSetup stub: a single "Skip" button that fires onDismiss,
 // letting us drive the dismissal → hand-off flow deterministically without
@@ -413,6 +428,33 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps setup visible when the saved keys are reported present:false (revoked/absent, not just missing)", async () => {
+    // `hasConfiguredDurableNotesRoute` filters `presence` down to
+    // `present: true` entries before checking a provider's
+    // `credential_keys` against them (`utils/durableRoute.ts`). No existing
+    // fixture anywhere in the repo seeds a `present: false` entry — this
+    // pins that the filter is load-bearing, not a no-op: an otherwise
+    // fully-configured Deepgram → OpenRouter route must NOT read as
+    // configured when the backend reports both keys as absent.
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd") {
+        return [
+          { key: "deepgram_api_key", present: false, source: "missing" },
+          { key: "openrouter_api_key", present: false, source: "missing" },
+        ] satisfies CredentialPresence[];
+      }
+      if (cmd === "load_settings_cmd") return startupSettings();
+      if (cmd === "get_model_status") return readyModels;
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
   });
 
   it("does not show Express Setup when a Deepgram and Cerebras credential pair exists", async () => {
@@ -1075,5 +1117,46 @@ describe("App — a11y batch (seed 4f2e)", () => {
     await waitFor(() =>
       expect(phaseRegion?.textContent).toMatch(/review view/i),
     );
+  });
+});
+
+// SHELL-R3 review fix: `NowStrip`'s composite health chip only calls
+// `setSystemDrawerOpen(true)` — it never asserts App actually mounts the
+// drawer in response. Pin the App.tsx `{systemDrawerOpen && <SystemDrawer
+// .../>}` wiring directly via `setState`, the same pattern the retired
+// overlays' fixtures used, so deleting that conditional mount fails a test.
+describe("App — System drawer mount wiring (SHELL-R3, ADR-0046)", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+    mockedInvoke.mockReset();
+    mockCredentialPresence("openai_api_key");
+    seedStore();
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+  });
+
+  it("mounts SystemDrawer only once systemDrawerOpen flips true, and its onClose clears the flag", async () => {
+    render(<App />);
+    expect(
+      screen.queryByRole("dialog", { name: /system status/i }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      useAudioGraphStore.setState({ systemDrawerOpen: true });
+    });
+    const dialog = await screen.findByRole("dialog", {
+      name: /system status/i,
+    });
+    expect(dialog).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+    expect(useAudioGraphStore.getState().systemDrawerOpen).toBe(false);
+    expect(
+      screen.queryByRole("dialog", { name: /system status/i }),
+    ).not.toBeInTheDocument();
   });
 });

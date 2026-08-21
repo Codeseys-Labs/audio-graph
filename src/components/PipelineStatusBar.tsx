@@ -1,14 +1,37 @@
 /**
- * Bottom status bar — one dot per pipeline stage showing Idle / Running /
- * Error, fed by the `PIPELINE_STATUS_EVENT` backend event.
+ * Bottom status bar — composite health during healthy capture, one dot per
+ * pipeline stage (Capture → Resample → ASR → Diarization → Extraction →
+ * Graph) when something needs attention.
  *
- * Stages (in processing order): Capture → Resample → ASR → Diarization →
- * Extraction → Graph. Each stage shows an icon, label, and a coloured dot
- * whose modifier class is derived from `StageStatus.type`. The tooltip
- * surfaces the processed-count (Running) or error message (Error).
+ * 50e3 FOLD (SHELL-R3, plan §R3, ADR-0046): "diagnostics compete with the
+ * core task" — while CAPTURING and `utils/pipelineHealth.ts`'s composite
+ * classification is `"healthy"` (no stage `Error`, no writer/consumer/source
+ * backpressure — a `Running` stage or a latency/turn sample alone is NOT a
+ * problem), this bar collapses to ONE composite row. The fold is gated on
+ * `isCapturing` too, not classification alone: an idle pipeline is
+ * trivially "healthy" by that classification's definition (nothing has run
+ * to fail), and collapsing THAT to an "All systems normal" row would assert
+ * an unobserved health claim the rest of this unit is otherwise careful to
+ * avoid (ADR-0030/0034) — so idle keeps the per-stage detail, exactly as
+ * before this fold (six dots, all `idle`/neutral). Per-stage dots (plus the
+ * turn/consumer/persistence detail below) return automatically the moment
+ * capture starts producing anything that actually degrades or errors, via
+ * `PipelineStageDetail` — the SAME subcomponent `SystemDrawer` renders
+ * unconditionally, so the full detail is always one click away even while
+ * the footer is collapsed.
+ *
+ * The outer `<nav role="status">` landmark is unchanged from before this
+ * fold (existing tests key off it) — "announce state TRANSITIONS only" is
+ * satisfied structurally, not via a second hidden live region: the
+ * collapsed row's text is static (it only reads differently when the
+ * composite classification itself changes), so nothing churns while
+ * healthy. The expanded per-stage view is exactly as chatty as it always
+ * was — that verbosity is now scoped to genuine degradation/error, which is
+ * the fold's whole point, not a regression to fix.
  *
  * Store bindings: `pipelineStatus` (the full `PipelineStatus` payload from
- * Rust).
+ * Rust), `pipelineLatencies`, `turnEvents`, `latestAudioConsumerHealth`,
+ * `persistenceQueueBackpressure`, `backpressuredSources`.
  *
  * Parent: `App.tsx` (bottom of layout). No props — purely reflective.
  */
@@ -21,6 +44,7 @@ import type {
   ProcessedAudioConsumerHealthPayload,
   StageStatus,
 } from "../types";
+import { computeCompositeHealth } from "../utils/pipelineHealth";
 import Icon, { type IconName } from "./Icon";
 import Tooltip from "./Tooltip";
 
@@ -178,7 +202,12 @@ function summarizePersistenceQueues(
   };
 }
 
-function PipelineStatusBar() {
+/**
+ * Full per-stage + turn/consumer/persistence detail. Store-self-contained
+ * (no props) so both `PipelineStatusBar` (expanded state) and `SystemDrawer`
+ * (always) can render it without prop plumbing between them.
+ */
+export function PipelineStageDetail() {
   const { t } = useTranslation();
   const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
   const pipelineLatencies = useAudioGraphStore((s) => s.pipelineLatencies);
@@ -204,11 +233,7 @@ function PipelineStatusBar() {
   );
 
   return (
-    <nav
-      className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-(--edge) gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-      aria-label={t("pipeline.label")}
-      role="status"
-    >
+    <>
       {PIPELINE_STAGES.map((stage, idx) => {
         const status = pipelineStatus[stage.key];
         const latency = formatLatency(pipelineLatencies[stage.key]);
@@ -387,6 +412,60 @@ function PipelineStatusBar() {
             </div>
           </Tooltip>
         </>
+      )}
+    </>
+  );
+}
+
+function PipelineStatusBar() {
+  const { t } = useTranslation();
+  const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
+  const consumerHealth = useAudioGraphStore((s) => s.latestAudioConsumerHealth);
+  const persistenceQueueBackpressure = useAudioGraphStore(
+    (s) => s.persistenceQueueBackpressure,
+  );
+  const backpressuredSources = useAudioGraphStore(
+    (s) => s.backpressuredSources,
+  );
+
+  const consumerDroppedChunks = consumerHealth
+    ? consumerHealth.consumers.reduce(
+        (sum, consumer) => sum + consumer.dropped_chunks,
+        0,
+      )
+    : 0;
+  const health = computeCompositeHealth({
+    pipelineStatus,
+    consumerDroppedChunks,
+    persistenceQueueBackpressure,
+    backpressuredSourceCount: backpressuredSources.length,
+  });
+  // The fold is scoped to CAPTURE — an idle pipeline is trivially "healthy"
+  // by `computeCompositeHealth`'s definition (no stage has errored or
+  // backpressured), but that is an unobserved default, not an observed
+  // "all systems normal" the fold's own copy would otherwise assert while
+  // nothing has run at all (ADR-0030/0034 discipline). Per-stage detail
+  // (idle, neutral dots) stays the idle default, matching pre-fold master.
+  const collapsed = isCapturing && health === "healthy";
+
+  return (
+    <nav
+      className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-(--edge) gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      aria-label={t("pipeline.label")}
+      role="status"
+    >
+      {collapsed ? (
+        <div className={STAGE_BASE}>
+          <span
+            className={`${DOT_BASE} ${DOT_MODIFIER.running}`}
+            role="img"
+            aria-label={t("pipeline.healthy")}
+          />
+          <span className={STAGE_NAME}>{t("pipeline.healthy")}</span>
+        </div>
+      ) : (
+        <PipelineStageDetail />
       )}
     </nav>
   );

@@ -24,6 +24,28 @@ function allIdle(): PipelineStatus {
   };
 }
 
+// SHELL-R3 (plan §R3, ADR-0046, folds audio-graph-50e3): the footer
+// collapses to a single composite row only while CAPTURING and
+// `computeCompositeHealth` classifies as "healthy" — which a bare `Running`
+// stage, a latency sample, or a turn event alone still is (none of those
+// are a problem). The fold does NOT fire on an idle (not-capturing)
+// pipeline even though that classifies as "healthy" too — an unobserved
+// default is not an observed "all systems normal" (ADR-0030/0034). Tests
+// below that want to see per-stage/latency/turn/consumer detail therefore
+// force expansion via an UNRELATED stage's Error status (`pipeline`/
+// "Resample" — chosen because no existing assertion in this file queries
+// that stage), so the fixture under test keeps its own meaning
+// uncontaminated.
+function forceExpanded(
+  overrides: Partial<PipelineStatus> = {},
+): PipelineStatus {
+  return {
+    ...allIdle(),
+    pipeline: { type: "Error", message: "forced-expansion-for-test" },
+    ...overrides,
+  };
+}
+
 function resetStore(
   overrides: {
     pipelineStatus?: PipelineStatus;
@@ -34,6 +56,8 @@ function resetStore(
       string,
       PersistenceQueueBackpressurePayload
     >;
+    backpressuredSources?: string[];
+    isCapturing?: boolean;
   } = {},
 ) {
   useAudioGraphStore.setState({
@@ -42,6 +66,8 @@ function resetStore(
     turnEvents: overrides.turnEvents ?? [],
     latestAudioConsumerHealth: overrides.latestAudioConsumerHealth ?? null,
     persistenceQueueBackpressure: overrides.persistenceQueueBackpressure ?? {},
+    backpressuredSources: overrides.backpressuredSources ?? [],
+    isCapturing: overrides.isCapturing ?? false,
   });
 }
 
@@ -56,7 +82,85 @@ describe("PipelineStatusBar", () => {
     expect(nav).toBeInTheDocument();
   });
 
+  // ── 50e3 fold: collapse while CAPTURING and healthy ──────────────────────
+  it("collapses to a single composite row when capturing, every stage is idle, and nothing is dropping", () => {
+    resetStore({ isCapturing: true });
+    render(<PipelineStatusBar />);
+    expect(screen.getByText(/all systems normal/i)).toBeInTheDocument();
+    expect(screen.queryByText("Capture")).not.toBeInTheDocument();
+    expect(screen.queryByText("Graph")).not.toBeInTheDocument();
+  });
+
+  it("stays collapsed while capturing and a stage is actively Running (not a problem)", () => {
+    resetStore({
+      isCapturing: true,
+      pipelineStatus: {
+        ...allIdle(),
+        asr: { type: "Running", processed_count: 12 },
+      },
+    });
+    render(<PipelineStatusBar />);
+    expect(screen.getByText(/all systems normal/i)).toBeInTheDocument();
+    expect(screen.queryByText("ASR")).not.toBeInTheDocument();
+  });
+
+  it("does NOT collapse while idle (not capturing), even though an all-idle pipeline classifies as healthy", () => {
+    // `computeCompositeHealth` on an all-`Idle` pipeline returns "healthy" —
+    // but that is an unobserved default, not an observed "all systems
+    // normal" (ADR-0030/0034). Master's idle footer showed six per-stage
+    // idle dots; this fold must not regress that while nothing has run.
+    resetStore({ isCapturing: false });
+    render(<PipelineStatusBar />);
+    expect(screen.queryByText(/all systems normal/i)).not.toBeInTheDocument();
+    for (const name of [
+      "Capture",
+      "Resample",
+      "ASR",
+      "Diarization",
+      "Extraction",
+      "Graph",
+    ]) {
+      expect(screen.getByText(name)).toBeInTheDocument();
+    }
+    // Every dot renders on the neutral `idle` modifier, not the saturated
+    // `running` one the collapsed row would use — idle stays visually
+    // neutral, matching pre-fold master.
+    const captureDot = screen.getByRole("img", { name: /Capture: Idle/i });
+    expect(captureDot).toHaveClass("bg-text-muted");
+    expect(captureDot).not.toHaveClass("bg-accent-green");
+  });
+
+  it("expands to per-stage detail the instant a stage reports Error", () => {
+    resetStore({
+      pipelineStatus: {
+        ...allIdle(),
+        graph: { type: "Error", message: "boom" },
+      },
+    });
+    render(<PipelineStatusBar />);
+    expect(screen.queryByText(/all systems normal/i)).not.toBeInTheDocument();
+    for (const name of [
+      "Capture",
+      "Resample",
+      "ASR",
+      "Diarization",
+      "Extraction",
+      "Graph",
+    ]) {
+      expect(screen.getByText(name)).toBeInTheDocument();
+    }
+  });
+
+  it("expands to per-stage detail when a capture source's ring buffer is dropping chunks", () => {
+    resetStore({ backpressuredSources: ["system-default"] });
+    render(<PipelineStatusBar />);
+    expect(screen.queryByText(/all systems normal/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Capture")).toBeInTheDocument();
+  });
+
+  // ── Expanded-state detail (unchanged rendering, now behind expansion) ────
   it("labels every pipeline stage in processing order", () => {
+    resetStore({ pipelineStatus: forceExpanded() });
     render(<PipelineStatusBar />);
     for (const name of [
       "Capture",
@@ -71,6 +175,7 @@ describe("PipelineStatusBar", () => {
   });
 
   it("renders one status dot per stage, defaulting to the Idle tooltip", () => {
+    resetStore({ pipelineStatus: forceExpanded() });
     render(<PipelineStatusBar />);
     // Each stage dot is a role=img with an aria-label embedding its tooltip.
     const captureDot = screen.getByRole("img", { name: /Capture: Idle/i });
@@ -81,10 +186,9 @@ describe("PipelineStatusBar", () => {
 
   it("surfaces the processed count in a Running stage's accessible label", () => {
     resetStore({
-      pipelineStatus: {
-        ...allIdle(),
+      pipelineStatus: forceExpanded({
         asr: { type: "Running", processed_count: 42 },
-      },
+      }),
     });
     render(<PipelineStatusBar />);
     expect(
@@ -94,10 +198,9 @@ describe("PipelineStatusBar", () => {
 
   it("surfaces the error message in an Error stage's accessible label", () => {
     resetStore({
-      pipelineStatus: {
-        ...allIdle(),
+      pipelineStatus: forceExpanded({
         graph: { type: "Error", message: "boom" },
-      },
+      }),
     });
     render(<PipelineStatusBar />);
     expect(
@@ -107,6 +210,7 @@ describe("PipelineStatusBar", () => {
 
   it("appends a formatted latency to the tooltip and renders a latency badge", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       pipelineLatencies: {
         asr: {
           stage: "asr",
@@ -129,6 +233,7 @@ describe("PipelineStatusBar", () => {
 
   it("formats sub-second-and-up latency in seconds with one decimal", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       pipelineLatencies: {
         capture: {
           stage: "capture",
@@ -143,6 +248,7 @@ describe("PipelineStatusBar", () => {
 
   it("ignores a non-finite latency sample (no badge rendered)", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       pipelineLatencies: {
         asr: {
           stage: "asr",
@@ -158,6 +264,7 @@ describe("PipelineStatusBar", () => {
   });
 
   it("renders the arrow separators between stages as decorative (aria-hidden)", () => {
+    resetStore({ pipelineStatus: forceExpanded() });
     const { container } = render(<PipelineStatusBar />);
     const hidden = container.querySelectorAll('[aria-hidden="true"]');
     // At minimum the 5 inter-stage arrows plus per-stage decorative icons.
@@ -166,6 +273,7 @@ describe("PipelineStatusBar", () => {
 
   it("shows a Turn chip with the latest turn event's provider + kind", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       turnEvents: [
         {
           provider: "gemini",
@@ -183,6 +291,7 @@ describe("PipelineStatusBar", () => {
 
   it("uses the most recent turn event when several have been recorded", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       turnEvents: [
         {
           provider: "deepgram",
@@ -206,13 +315,15 @@ describe("PipelineStatusBar", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("omits the Turn chip when no turn events have arrived", () => {
+  it("omits the Turn chip when no turn events have arrived, even while expanded", () => {
+    resetStore({ pipelineStatus: forceExpanded(), turnEvents: [] });
     render(<PipelineStatusBar />);
     expect(screen.queryByText(/^Turn$/)).not.toBeInTheDocument();
   });
 
   it("shows compact audio-consumer queue health", () => {
     resetStore({
+      pipelineStatus: forceExpanded(),
       latestAudioConsumerHealth: {
         consumers: [
           {
@@ -255,7 +366,7 @@ describe("PipelineStatusBar", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces dropped audio-consumer chunks in the status label", () => {
+  it("surfaces dropped audio-consumer chunks in the status label (and this alone triggers expansion)", () => {
     resetStore({
       latestAudioConsumerHealth: {
         consumers: [
@@ -285,7 +396,7 @@ describe("PipelineStatusBar", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces persistence queue pressure distinctly from storage-full", () => {
+  it("surfaces persistence queue pressure distinctly from storage-full (and this alone triggers expansion)", () => {
     resetStore({
       persistenceQueueBackpressure: {
         transcript_event: {

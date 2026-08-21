@@ -162,7 +162,7 @@ describe("accent-as-text on realistic surfaces (gate-fix review blocker fix)", (
     ["accent-green", "bg-secondary"], // AgentProposalsPanel diff text
     ["accent-green", "tint-success"], // SessionDataRoutePanel success banner
     ["accent-gemini", "bg-tertiary"], // TokenUsagePanel ddTotal
-    ["accent-gemini", "tint-gemini"], // ControlBar Gemini-active hover
+    ["accent-gemini", "tint-gemini"], // NowStrip Gemini-active hover (was ControlBar)
   ];
 
   for (const [accentName, surfaceName] of LIGHT_PAIRS) {

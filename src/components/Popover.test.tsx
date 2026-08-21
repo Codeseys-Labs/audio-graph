@@ -5,9 +5,11 @@ import Popover, { PopoverItem } from "./Popover";
 
 // SHELL-R2 (audio-graph-e0c4) coverage for the shared Popover primitive —
 // added per review finding (this component previously had none, unlike its
-// sibling PopoverOverlay). Exercises the behaviors the module doc asserts:
-// Escape/outside-click dismissal, and Popover.Close firing on enabled items
-// only (a disabled button never dispatches `click`).
+// former sibling `PopoverOverlay`, retired outright in SHELL-R3 — see
+// `SystemDrawer.test.tsx` for that pattern's surviving coverage). Exercises
+// the behaviors the module doc asserts: Escape/outside-click dismissal, and
+// Popover.Close firing on enabled items only (a disabled button never
+// dispatches `click`).
 
 describe("Popover", () => {
   it("renders the trigger as-is (asChild) with the content closed by default", () => {

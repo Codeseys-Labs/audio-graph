@@ -231,14 +231,16 @@
     border-left: 0;
   }
 
-  /* ControlBar (seed 88e2): the single-row header has no room for the center
-     capture group below ~1120px, so the green Start button + audio-source hint
-     get painted over by the Notes/Converse fieldset and the Agent/Tokens
-     cluster. Stack into two rows — brand + right-hand actions share the top
-     row, the capture group drops to a full-width wrapping row beneath — so the
-     primary Start action is never occluded. Mirrors the 1120/900 workspace
-     reflow above. (Unlayered: overrides the Tailwind utilities in @layer.) */
-  .control-bar {
+  /* NOW STRIP (seed 88e2, renamed from ControlBar in SHELL-R3 / plan §R3 /
+     ADR-0046 — same reflow, same reason): the single-row header has no room
+     for the center group below ~1120px, so the green Start button + idle
+     hint get painted over by the demoted mode/Gemini group and the
+     settings/sessions cluster. Stack into two rows — brand + right-hand
+     actions share the top row, the center group drops to a full-width
+     wrapping row beneath — so the primary Start action is never occluded.
+     Mirrors the 1120/900 workspace reflow above. (Unlayered: overrides the
+     Tailwind utilities in @layer.) */
+  .now-strip {
     height: auto;
     min-height: 52px;
     flex-wrap: wrap;
@@ -246,16 +248,16 @@
     padding-block: var(--space-3);
   }
 
-  .control-bar__brand {
+  .now-strip__brand {
     order: 1;
   }
 
-  .control-bar__actions {
+  .now-strip__actions {
     order: 2;
     justify-content: flex-end;
   }
 
-  .control-bar__center {
+  .now-strip__center {
     order: 3;
     flex-basis: 100%;
     flex-wrap: wrap;

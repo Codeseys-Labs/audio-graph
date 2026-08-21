@@ -13,9 +13,10 @@ import { useAudioGraphStore } from "../store";
  * Responsibilities:
  *   1. **Global shortcut** — the backend registers Cmd/Ctrl+Shift+R globally
  *      (fires even when unfocused) and emits `global-shortcut-toggle-capture`.
- *      We route it through the SAME store `startCapture`/`stopCapture` path the
- *      UI Start/Stop button uses — no parallel logic — so a no-source-selected
- *      start still surfaces the existing "No audio source selected" error.
+ *      We route it through the SAME store `startCaptureAndTranscribe`/
+ *      `stopCapture` path the UI Start/Stop button uses (SHELL-R3, ADR-0046's
+ *      "one Start") — no parallel logic — so a no-source-selected start still
+ *      surfaces the existing "No audio source selected" error.
  *   2. **Tray Stop menu item** — the backend emits `tray-stop-capture`; we call
  *      the store's `stopCapture` (same path as the UI Stop button).
  *   3. **Tray indicator sync** — capture state lives frontend-side (the store's
@@ -48,7 +49,7 @@ export function useNativeCapture(): void {
           if (capturing) {
             void useAudioGraphStore.getState().stopCapture();
           } else {
-            void useAudioGraphStore.getState().startCapture();
+            void useAudioGraphStore.getState().startCaptureAndTranscribe();
           }
         }).catch((err) => {
           // Route through the same diagnostics path as invoke failures
@@ -90,8 +91,8 @@ export function useNativeCapture(): void {
       cancelled = true;
       for (const fn of unlisten) if (fn) fn();
     };
-    // startCapture/stopCapture are stable store actions; getState() reads the
-    // live values, so this subscribes exactly once.
+    // startCaptureAndTranscribe/stopCapture are stable store actions;
+    // getState() reads the live values, so this subscribes exactly once.
   }, []);
 
   // ── Tray indicator sync (icon swap + content-free duration tooltip) ───────

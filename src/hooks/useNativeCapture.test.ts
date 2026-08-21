@@ -14,12 +14,12 @@ function evt(name: string): Event<unknown> {
 
 describe("useNativeCapture", () => {
   const handlers = new Map<string, Handler>();
-  const startCapture = vi.fn(async () => {});
+  const startCaptureAndTranscribe = vi.fn(async () => {});
   const stopCapture = vi.fn(async () => {});
 
   beforeEach(() => {
     handlers.clear();
-    startCapture.mockClear();
+    startCaptureAndTranscribe.mockClear();
     stopCapture.mockClear();
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockResolvedValue(undefined);
@@ -32,7 +32,7 @@ describe("useNativeCapture", () => {
     useAudioGraphStore.setState({
       isCapturing: false,
       captureStartTime: null,
-      startCapture,
+      startCaptureAndTranscribe,
       stopCapture,
     });
   });
@@ -61,7 +61,7 @@ describe("useNativeCapture", () => {
       );
     });
 
-    expect(startCapture).toHaveBeenCalledTimes(1);
+    expect(startCaptureAndTranscribe).toHaveBeenCalledTimes(1);
     expect(stopCapture).not.toHaveBeenCalled();
   });
 
@@ -82,7 +82,7 @@ describe("useNativeCapture", () => {
     });
 
     expect(stopCapture).toHaveBeenCalledTimes(1);
-    expect(startCapture).not.toHaveBeenCalled();
+    expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
   });
 
   it("tray Stop routes through the store stopCapture", async () => {

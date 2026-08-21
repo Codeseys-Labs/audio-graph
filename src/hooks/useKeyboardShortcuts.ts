@@ -73,7 +73,11 @@ export function useKeyboardShortcuts(): void {
         if (state.isCapturing) {
           void state.stopCapture();
         } else {
-          void state.startCapture();
+          // SHELL-R3 (plan §R3, ADR-0046): mirror the NOW STRIP's Start
+          // button exactly — `startCaptureAndTranscribe`, not the bare
+          // `startCapture`, so the hotkey and the click both compose the
+          // same ONE START behavior instead of silently diverging.
+          void state.startCaptureAndTranscribe();
         }
         return;
       }

@@ -3234,6 +3234,134 @@ describe("openSessionsBrowser — SHELL-R2 navigates instead of opening a modal"
 });
 
 // ---------------------------------------------------------------------------
+// ONE START (SHELL-R3, plan §R3, ADR-0046): the merged-start gating proof.
+// The critical, verify-before-coding claim this ticket makes is that in CI
+// (no durable notes route configured) the NOW STRIP's Start button issues
+// EXACTLY `start_capture` — `start_transcribe` must never fire, because an
+// unmocked `start_transcribe` falls through to the real Rust command in the
+// E2E binary (`e2e/specs/shell.e2e.ts:186`'s fetch-bridge fallthrough) and
+// an ERROR-level line from that would break the suite's zero-frontend-
+// errors gate (test 5). `local_whisper` — the REAL Rust default
+// `AsrProvider` (`src-tauri/src/settings/mod.rs`'s `impl Default`) — is the
+// registry's one `ui_selectable: false` ASR descriptor, so it is the
+// faithful "no route configured" fixture, not a synthetic stand-in.
+// ---------------------------------------------------------------------------
+describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () => {
+  beforeEach(() => {
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["system-default"],
+      isCapturing: false,
+      isTranscribing: false,
+      error: null,
+    });
+  });
+
+  it("issues EXACTLY start_capture — never start_transcribe — when no durable route is configured (the real CI default)", async () => {
+    const invoked: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      invoked.push(cmd);
+      if (cmd === "start_capture") return null;
+      return undefined;
+    });
+    useAudioGraphStore.setState({
+      settings: selectableSettings({
+        // The real Rust default: `ui_selectable: false` in the registry —
+        // the ADR-0033 gate the old standalone Transcribe button rendered
+        // its aria-disabled from, mirrored here via
+        // `deferredProviderForDurableStart`.
+        asr_provider: { type: "local_whisper" },
+      }),
+    });
+
+    await useAudioGraphStore.getState().startCaptureAndTranscribe();
+
+    expect(invoked).toContain("start_capture");
+    expect(invoked).not.toContain("start_transcribe");
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
+    // Independent teeth for the outer gate (not just startTranscribe's own
+    // internal re-check): if `startCaptureAndTranscribe` dropped its own
+    // `deferredProviderForDurableStart` check, execution would still reach
+    // `startTranscribe`, whose internal guard would bail WITHOUT invoking
+    // `start_transcribe` — but it would also stamp a provider-deferred
+    // error onto an otherwise-successful capture start. Asserting `error`
+    // stays null here fails under that mutation even though the invoke
+    // list alone would not.
+    expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
+  it("composes start_transcribe when the durable route IS configured and capture starts", async () => {
+    const invoked: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      invoked.push(cmd);
+      if (cmd === "start_capture") return null;
+      if (cmd === "start_transcribe") return null;
+      return undefined;
+    });
+    useAudioGraphStore.setState({ settings: selectableSettings() });
+
+    await useAudioGraphStore.getState().startCaptureAndTranscribe();
+
+    expect(invoked).toEqual(["start_capture", "start_transcribe"]);
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
+  });
+
+  it("skips the transcribe leg when settings have not hydrated yet (mirrors the old canTranscribe's settings !== null facet)", async () => {
+    const invoked: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      invoked.push(cmd);
+      if (cmd === "start_capture") return null;
+      return undefined;
+    });
+    // Reachable pre-hydration window: App's credential probe can resolve
+    // before `load_settings_cmd`, leaving `settings` null at Start-click
+    // time (see the sibling minor-finding fix on this gate).
+    useAudioGraphStore.setState({ settings: null });
+
+    await useAudioGraphStore.getState().startCaptureAndTranscribe();
+
+    expect(invoked).toContain("start_capture");
+    expect(invoked).not.toContain("start_transcribe");
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
+    // No spurious "provider settings are still loading" error should
+    // surface on top of an otherwise-successful capture start — the outer
+    // gate should skip quietly, exactly as the old aria-disabled Transcribe
+    // button did.
+    expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
+  it("skips the transcribe leg when startCapture itself fails (no atomicity claim — re-reads state, not a pre-await snapshot)", async () => {
+    const invoked: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      invoked.push(cmd);
+      if (cmd === "start_capture") throw new Error("mocked-capture-failure");
+      return undefined;
+    });
+    useAudioGraphStore.setState({ settings: selectableSettings() });
+
+    await useAudioGraphStore.getState().startCaptureAndTranscribe();
+
+    // `safeInvoke` relays its own `report_frontend_diagnostic` call on a
+    // failed invoke (audio-graph-3e71) — assert on presence/absence, not
+    // exact array equality, so that diagnostic doesn't false-fail this test.
+    expect(invoked).toContain("start_capture");
+    expect(invoked).not.toContain("start_transcribe");
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+    // Pin the ACTUAL failure message, not just non-null: if
+    // `startCaptureAndTranscribe` dropped its own `!isCapturing` re-read
+    // gate, it would still reach `startTranscribe`, whose internal
+    // `!isCapturing` guard bails without invoking `start_transcribe` — but
+    // it overwrites this error with "Cannot start transcription: capture
+    // is not running", masking the real capture failure from the user.
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /mocked-capture-failure/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // safeInvoke adoption (audio-graph-3e71): the store routes every Rust IPC
 // through `safeInvoke` (imported as `invoke`). A failed store action must both
 // (a) keep its existing catch → error-state behavior AND (b) relay EXACTLY ONE

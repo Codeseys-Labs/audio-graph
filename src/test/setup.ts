@@ -21,10 +21,19 @@ import { DEFAULT_SHELL_NAV } from "../store/shellNav";
 // through a named flag setter a per-file reset helper would already know
 // about), so a test that exercises Stop in one `it()` must not leak an
 // optimistic row into an unrelated one later in the same file.
+//
+// `systemDrawerOpen`/`credentialPresence` (SHELL-R3, ADR-0046) join the same
+// beforeEach for the same class of reason: they're new store-wide state this
+// unit introduces, read by `NowStrip`/`SystemDrawer` but not necessarily
+// known to every OTHER test file's own local reset helper, so a test that
+// opens the drawer or seeds a route-probe fixture in one `it()` must not
+// leak into an unrelated one later in the same file.
 beforeEach(() => {
   useAudioGraphStore.setState({
     nav: DEFAULT_SHELL_NAV,
     pendingFinalizingSession: null,
+    systemDrawerOpen: false,
+    credentialPresence: [],
   });
 });
 
