@@ -18,7 +18,9 @@ use crate::projection_llm::{
     projection_patch_prompt_messages, projection_patch_repair_prompt_messages,
     projection_patch_strict_json_schema, trusted_projection_patch_from_model_json,
 };
-use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
+use crate::projections::{
+    MaterializedNotes, ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger,
+};
 use crate::settings::LlmProvider;
 
 use super::route::{
@@ -714,7 +716,30 @@ fn run_projection_patch_dispatch(
 ) -> Result<ProjectionPatchOutcome, String> {
     let route = authorize_and_budget_route_dispatch(handles, provider)
         .map_err(|error| error.to_string())?;
-    let messages = projection_patch_prompt_messages(job, ledger).map_err(|e| e.to_string())?;
+    // No live-notes snapshot at this call site (seed audio-graph-253c): this
+    // IS the live production dispatch path (`generate_projection_patch`'s own
+    // doc says as much: "Runtime projection dispatch calls this from live ASR
+    // observation"; the full chain runs speech/mod.rs's
+    // `spawn_projection_job` -> `run_projection_job` ->
+    // `ExecutorProjectionPatchGenerator::generate_projection_patch` -> here),
+    // it is just not yet wired to carry the real `MaterializedNotes`. That
+    // notes state already exists one accessor away at the caller
+    // (`ProjectionRuntimeHandle::materialized_projection_snapshot`, `state.rs`,
+    // sitting right next to `transcript_ledger_snapshot` which supplies
+    // `ledger` above) — but threading it here needs a new field on
+    // `LlmJob::ProjectionPatch`, a widened `generate_projection_patch`
+    // signature, and updating `ExecutorProjectionPatchGenerator`'s call site,
+    // all of which live in `speech/mod.rs`, owned by a separate in-flight
+    // workflow (see this module's `projection_llm` sibling's top-of-file
+    // doc). Passing `None` here — rather than an empty `MaterializedNotes` —
+    // means the Notes-kind prompt OMITS the "Current notes state" block
+    // entirely instead of asserting a false "(no notes yet)": an empty
+    // snapshot is indistinguishable from a real empty session and would
+    // license the model to mint ids as if none existed, which is the same
+    // overwrite-storm failure mode this seed exists to fix.
+    let notes: Option<&MaterializedNotes> = None;
+    let messages =
+        projection_patch_prompt_messages(job, ledger, notes).map_err(|e| e.to_string())?;
     let cache_context = ProjectionCacheContext {
         session_id: job.session_id.clone(),
         cache_breakpoint_message_index:
@@ -727,6 +752,7 @@ fn run_projection_patch_dispatch(
         &messages,
         job,
         ledger,
+        notes,
         sequence,
         created_at_ms,
     )
@@ -787,6 +813,7 @@ fn run_projection_patch_on_route(
     messages: &[ChatMessage],
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     sequence: u64,
     created_at_ms: u64,
 ) -> Result<ProjectionPatchOutcome, String> {
@@ -810,6 +837,7 @@ fn run_projection_patch_on_route(
             let repair_messages = projection_patch_repair_prompt_messages(
                 job,
                 ledger,
+                notes,
                 &output.raw_json,
                 &first_error,
             )
@@ -1724,9 +1752,10 @@ mod tests {
                     }
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -1785,9 +1814,10 @@ mod tests {
                     Ok(projection_output(invalid.clone(), 3))
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -1845,9 +1875,10 @@ mod tests {
                     }
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             9,
             456,
         )
@@ -1904,9 +1935,10 @@ mod tests {
                     Ok(output)
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -1941,9 +1973,10 @@ mod tests {
                     Ok(output)
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -1977,6 +2010,7 @@ mod tests {
             &[],
             &projection_test_job(ProjectionKind::Notes).0,
             &projection_test_job(ProjectionKind::Notes).1,
+            None,
             4,
             123,
         )
@@ -2052,9 +2086,10 @@ mod tests {
                     Ok(output)
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -2105,9 +2140,10 @@ mod tests {
                     Err("OpenRouter HTTP error: status=502 (repair failed)".to_string())
                 }
             },
-            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
+            None,
             4,
             123,
         )
@@ -2762,7 +2798,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-        let messages = projection_patch_prompt_messages(&job, &ledger).expect("prompt");
+        let messages = projection_patch_prompt_messages(&job, &ledger, None).expect("prompt");
         let cache = ProjectionCacheContext {
             session_id: job.session_id.clone(),
             cache_breakpoint_message_index: 0,

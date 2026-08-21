@@ -1,9 +1,20 @@
 //! Structured LLM output contract for notes/graph projection patches.
 //!
-//! This module stops at prompt construction, model-output parsing, and trusted
-//! patch construction. Runtime scheduler dispatch is intentionally wired in a
-//! later slice so live ASR ingestion cannot start provider calls until the
-//! apply path and telemetry are integrated together.
+//! This module owns prompt construction, model-output parsing, and trusted
+//! patch construction. Runtime scheduler dispatch already calls into this
+//! module from live ASR ingestion today (`llm/executor.rs`'s
+//! `run_projection_patch_dispatch`, reached from `speech/mod.rs`'s
+//! `run_projection_job` on every basis-bound projection tick) — dispatch was
+//! NOT deferred to a later slice. What IS still pending, at the time of seed
+//! audio-graph-253c, is threading the live `MaterializedNotes` state into
+//! that one production call site: the (job, ledger) inputs this module's
+//! builders take carry no notes state, and the plumbing to add it (a new
+//! field on `LlmJob::ProjectionPatch`, a widened `generate_projection_patch`
+//! signature, and updating `ExecutorProjectionPatchGenerator`'s call site) all
+//! cross into `speech/mod.rs`, which is owned by a separate in-flight
+//! workflow. Until that plumbing lands, callers pass `None` for the notes
+//! parameter and get a prompt with no notes-state assertion at all, rather
+//! than a fabricated one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,9 +23,9 @@ use schemars::JsonSchema;
 
 use crate::llm::engine::ChatMessage;
 use crate::projections::{
-    GraphNodeDraft, ProjectionBasisStaleness, ProjectionJob, ProjectionKind, ProjectionOperation,
-    ProjectionPatch, ProjectionProvenance, ROLLING_SUMMARY_HOT_WINDOW_TURNS, TranscriptEvent,
-    TranscriptLedger, ordered_for_window,
+    GraphNodeDraft, MaterializedNote, MaterializedNotes, ProjectionBasisStaleness, ProjectionJob,
+    ProjectionKind, ProjectionOperation, ProjectionPatch, ProjectionProvenance,
+    ROLLING_SUMMARY_HOT_WINDOW_TURNS, TranscriptEvent, TranscriptLedger, ordered_for_window,
 };
 
 pub const PROJECTION_PATCH_PROMPT_ID: &str = "projection_patch_v1";
@@ -57,6 +68,29 @@ const EVIDENCE_GUIDANCE: &str = "Every upsert_note, upsert_graph_node, and upser
 /// Bounds each folded turn's contribution so the summary stays far smaller than
 /// the full transcript JSON it replaces.
 const SUMMARY_TURN_DIGEST_MAX_CHARS: usize = 160;
+
+/// Max number of existing notes rendered into the Notes-kind prompt's live
+/// notes-state snapshot (seed audio-graph-253c). Selection is by most-recently-
+/// updated (`updated_by_sequence` descending); a session that has accumulated
+/// more notes than this still gets a truncated block plus a count line, rather
+/// than an unbounded prompt.
+const NOTES_SNAPSHOT_MAX_ENTRIES: usize = 30;
+
+/// Max characters of a single note's body kept in the one-line summary the
+/// live notes-state snapshot renders per note. Mirrors
+/// `SUMMARY_TURN_DIGEST_MAX_CHARS`'s bounding posture (applied to note bodies
+/// instead of transcript turns) so one long note can never dominate the block.
+const NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS: usize = 160;
+
+/// Max characters of a single note's `id` or `title` kept in the live
+/// notes-state snapshot. Unlike the body, `id` and `title` are model-authored
+/// `String`s with no length validation anywhere on the apply path (`upsert_note`
+/// accepts them verbatim), so without this cap one oversized title/id would
+/// make the per-note line — and therefore the whole block — unbounded despite
+/// [`NOTES_SNAPSHOT_MAX_ENTRIES`] and [`NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS`]
+/// bounding the other two axes. Shorter than the body cap because an id/title
+/// is expected to be short prose, not a paragraph.
+const NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS: usize = 80;
 
 /// Incremental extractive rolling summary of the transcript turns that have
 /// left the verbatim hot window (ADR-0025 §2c / seed audio-graph-18ee).
@@ -642,11 +676,39 @@ pub struct ProjectionPromptShape {
     /// Character count of the pinned typed-fact block (graph/transcript-derived
     /// context). 0 when absent.
     pub pinned_fact_chars: u64,
+    /// Character count of the Notes-kind live notes-state snapshot block
+    /// (seed audio-graph-253c), content-free like the other fields here. 0
+    /// when the caller passed `notes: None` (no block rendered at all — see
+    /// [`projection_patch_prompt_messages`]) or for a Graph-kind job.
+    pub notes_snapshot_chars: u64,
+    /// Number of existing notes rendered into the snapshot block (capped at
+    /// [`NOTES_SNAPSHOT_MAX_ENTRIES`]; the true total may be larger — see the
+    /// snapshot's own trailing count line). 0 under the same conditions as
+    /// `notes_snapshot_chars`.
+    pub notes_snapshot_entries: u32,
 }
 
 pub fn projection_prompt_shape(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+) -> ProjectionPromptShape {
+    projection_prompt_shape_with_notes(job, ledger, None)
+}
+
+/// Widened form of [`projection_prompt_shape`] that also accounts for the
+/// Notes-kind live notes-state snapshot (seed audio-graph-253c). Kept as a
+/// separate function, additive to the existing `projection_prompt_shape`,
+/// because the one production caller of the data-movement shape
+/// (`speech/mod.rs`'s `projection_movement_facts`) is owned by a separate
+/// in-flight workflow (the same `speech/mod.rs` fence
+/// [`projection_patch_prompt_messages`]'s doc comment describes) — this
+/// function exists so that caller can adopt the `notes_snapshot_*` fields by
+/// switching call targets, without this module reaching across the fence to
+/// widen the existing call site's argument list itself.
+pub fn projection_prompt_shape_with_notes(
+    job: &ProjectionJob,
+    ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
 ) -> ProjectionPromptShape {
     let Ok(events) = basis_events(job, ledger) else {
         return ProjectionPromptShape::default();
@@ -654,15 +716,38 @@ pub fn projection_prompt_shape(
     let (older, _hot) = split_summary_window(&events);
     let pinned = pinned_typed_facts(&events);
     let pinned_chars: usize = pinned.iter().map(|line| line.chars().count()).sum();
+    let (notes_snapshot_chars, notes_snapshot_entries) = match notes {
+        Some(notes) if job.kind == ProjectionKind::Notes && !notes.notes.is_empty() => (
+            render_notes_snapshot(notes).chars().count() as u64,
+            notes.notes.len().min(NOTES_SNAPSHOT_MAX_ENTRIES) as u32,
+        ),
+        _ => (0, 0),
+    };
     ProjectionPromptShape {
         has_rolling_summary: !older.is_empty(),
         pinned_fact_chars: pinned_chars as u64,
+        notes_snapshot_chars,
+        notes_snapshot_entries,
     }
 }
 
+/// `notes` is the current Notes projection materialization (seed
+/// audio-graph-253c), when the caller actually has it. `Some(&materialized)`
+/// renders the live "Current notes state" block (via
+/// [`render_notes_snapshot`]) for `ProjectionKind::Notes` jobs — an empty
+/// `MaterializedNotes` there is a truthful "no notes yet" (the caller
+/// affirmatively knows the session has none). `None` means the caller cannot
+/// currently supply the real notes state (as of this seed, the one
+/// production call site in `llm/executor.rs` cannot reach
+/// `AppState::materialized_projection_state` — see this module's top-of-file
+/// doc) and OMITS the block entirely rather than rendering a fabricated
+/// "(no notes yet)" that would be indistinguishable from a real empty
+/// session and would license the model to mint ids as if none existed. Graph
+/// kind never renders this block regardless of `notes` (seed e700's lane).
 pub fn projection_patch_prompt_messages(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
 ) -> Result<Vec<ChatMessage>, ProjectionPatchDraftError> {
     ledger
         .validate_basis(&job.basis)
@@ -681,7 +766,12 @@ pub fn projection_patch_prompt_messages(
 
     let operation_guidance = match job.kind {
         ProjectionKind::Notes => {
-            "Use only upsert_note, delete_note, and reorder_note operations. Keep stable note ids when refining earlier notes."
+            "Use only upsert_note, delete_note, and reorder_note operations. This prompt \
+             includes a \"Current notes state\" block listing every existing note's id, \
+             title, and a one-line body summary. Check that block before minting an id: if a \
+             note there already covers this topic, upsert_note with THAT SAME id to refine it \
+             in place; only use an id absent from that block when the note is genuinely new. \
+             Keep stable note ids when refining earlier notes."
         }
         ProjectionKind::Graph => {
             "Use only graph operations: upsert_graph_node, remove_graph_node, invalidate_graph_node, upsert_graph_edge, remove_graph_edge, invalidate_graph_edge, strengthen_graph_edge, weaken_graph_edge, merge_graph_nodes, and split_graph_node. Upsert nodes before edges that reference them. Prefer retcon operations over duplicate nodes when later transcript context corrects earlier assumptions."
@@ -699,6 +789,12 @@ pub fn projection_patch_prompt_messages(
     //   [0] system: instructions + operation guidance + output schema (immutable)
     //   [1] stable context: pinned facts + rolling summary (append-only)
     //   [.] append-only hot-buffer transcript (grows at the tail)
+    //   [.] Notes-kind AND `notes.is_some()` ONLY: live notes-state snapshot
+    //       (audio-graph-253c) — NOT append-only (an existing note can be
+    //       rewritten in place), so it lives here in the variable region,
+    //       never in the [0]/[1] prefix. Omitted (not rendered as an empty
+    //       block) when the caller passed `None`, i.e. does not actually
+    //       have the live notes state — see this function's doc comment.
     //   [last] per-tick volatile metadata (basis hash / span count / job id)
     // Anything that changes every tick MUST stay at the tail or it busts the
     // cached prefix. See `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`.
@@ -713,7 +809,7 @@ pub fn projection_patch_prompt_messages(
         pinned_facts.join("\n")
     };
 
-    Ok(vec![
+    let mut messages = vec![
         ChatMessage {
             role: "system".to_string(),
             content: format!(
@@ -734,24 +830,46 @@ pub fn projection_patch_prompt_messages(
             role: "user".to_string(),
             content: format!("Recent transcript (verbatim, most recent turns):\n{transcript}"),
         },
-        ChatMessage {
+    ];
+
+    // `notes == None`: the caller does not have the live notes state (see
+    // the doc comment above) — the message is omitted rather than rendered
+    // with a fabricated "(no notes yet)" body, since that would be
+    // indistinguishable from a real empty session and would license the
+    // model to mint ids as if none existed.
+    if job.kind == ProjectionKind::Notes
+        && let Some(notes) = notes
+    {
+        messages.push(ChatMessage {
             role: "user".to_string(),
             content: format!(
-                "Projection job:\n\
-                 id: {job_id}\n\
-                 session_id: {session_id}\n\
-                 kind: {kind}\n\
-                 basis_hash: {basis_hash}\n\
-                 span_count: {span_count}\n\n\
-                 Return a compact patch draft as JSON: {{\"operations\": [...], \"confidence\": 0.0-1.0}}.",
-                job_id = job.id,
-                session_id = job.session_id,
-                kind = projection_kind_key(&job.kind),
-                basis_hash = job.basis.transcript_hash,
-                span_count = job.basis.span_revisions.len(),
+                "Current notes state (existing note ids — reuse one of these exactly when \
+                 refining or extending that SAME note; only mint a new id for a genuinely new \
+                 note):\n{notes_block}",
+                notes_block = render_notes_snapshot(notes),
             ),
-        },
-    ])
+        });
+    }
+
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "Projection job:\n\
+             id: {job_id}\n\
+             session_id: {session_id}\n\
+             kind: {kind}\n\
+             basis_hash: {basis_hash}\n\
+             span_count: {span_count}\n\n\
+             Return a compact patch draft as JSON: {{\"operations\": [...], \"confidence\": 0.0-1.0}}.",
+            job_id = job.id,
+            session_id = job.session_id,
+            kind = projection_kind_key(&job.kind),
+            basis_hash = job.basis.transcript_hash,
+            span_count = job.basis.span_revisions.len(),
+        ),
+    });
+
+    Ok(messages)
 }
 
 /// Pinned must-never-lose facts, rendered as a deterministic structured block.
@@ -761,9 +879,17 @@ pub fn projection_patch_prompt_messages(
 /// something, in what span) are pinned as structured lines rather than trusted
 /// to the summary. Derived deterministically from the basis events so the block
 /// is byte-stable across turns (append-only), keeping the cache prefix intact.
-/// This is transcript-derived (not a live graph snapshot) to keep the prompt
-/// builder's `(job, ledger)` seam intact; the graph-snapshot source is a later
-/// pillar (§2c graph feed).
+/// This is transcript-derived (not a live notes/graph snapshot) to keep this
+/// helper's `&[TranscriptEvent]`-only seam intact. The Notes-kind live notes
+/// snapshot (seed audio-graph-253c) is a SEPARATE block, rendered by
+/// [`render_notes_snapshot`] from the `notes: Option<&MaterializedNotes>`
+/// parameter [`projection_patch_prompt_messages`] now takes. That parameter
+/// closes the seam this doc comment used to describe as unclosed ONLY when a
+/// caller passes `Some` — the one production call site as of this seed still
+/// passes `None` (see this module's top-of-file doc), so the seam remains
+/// open in practice pending the `speech/mod.rs` plumbing that seed needs. A
+/// live graph snapshot for the Graph kind remains a later pillar (seed e700
+/// owns that lane's problems).
 fn pinned_typed_facts(events: &[TranscriptEvent]) -> Vec<String> {
     // First-appearance order (NOT sorted): a newly-seen speaker appends at the
     // tail, so the block stays append-only across turns and the stable-prefix
@@ -782,13 +908,99 @@ fn pinned_typed_facts(events: &[TranscriptEvent]) -> Vec<String> {
     facts
 }
 
+/// Render the live Notes-kind notes state into a bounded, deterministic block
+/// (seed audio-graph-253c): every upsert the model emits full-replaces a note
+/// by id (`MaterializedNotes::upsert_note`), but the prompt never showed which
+/// ids already existed, so a model that could not see id `note-1` re-minted it
+/// blind on every tick — measured field impact: 83 patches / 293 upserts over
+/// only 23 final ids in one 16m41s session, 94% of upserts landing on six id
+/// slots, note-1 rewritten 77 times. This block is what makes "keep stable
+/// note ids" (the existing prompt instruction) actually followable.
+///
+/// Lives in the prompt's per-job VARIABLE region (after the cache-stable
+/// prefix, `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`), because unlike
+/// `pinned_typed_facts` this is NOT append-only — an existing note's title/body
+/// can be rewritten in place, so folding it into the byte-stable prefix would
+/// bust the prompt cache on every note edit.
+///
+/// Selection is most-recently-updated first (`updated_by_sequence` descending,
+/// ties broken by id for determinism), capped at
+/// [`NOTES_SNAPSHOT_MAX_ENTRIES`]; a session with more notes than the cap
+/// still gets every note ID **shown or counted**, never silently dropped: the
+/// cut is one deterministic total-order truncation, and the trailing count
+/// line reports the true total so the model is never told a capped session is
+/// complete.
+///
+/// NOTE on ordering vs. `reorder_note`: this list is recency-ordered, which is
+/// NOT necessarily the notes' actual display order (`MaterializedNotes.notes`
+/// is itself an ordered `Vec` that `reorder_note` maintains by index). A
+/// `reorder_note { id, after_id }` operation the model emits from reading this
+/// block targets that real Vec order, not the recency order shown here.
+fn render_notes_snapshot(notes: &MaterializedNotes) -> String {
+    if notes.notes.is_empty() {
+        return "(no notes yet)".to_string();
+    }
+
+    let total = notes.notes.len();
+    let mut ordered: Vec<&MaterializedNote> = notes.notes.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.updated_by_sequence
+            .cmp(&a.updated_by_sequence)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let shown = ordered.len().min(NOTES_SNAPSHOT_MAX_ENTRIES);
+
+    let mut lines: Vec<String> = ordered[..shown]
+        .iter()
+        .map(|note| {
+            format!(
+                "- id: {} | title: {} | body: {}",
+                one_line_bounded(&note.id, NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS),
+                one_line_bounded(&note.title, NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS),
+                one_line_bounded(&note.body, NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS)
+            )
+        })
+        .collect();
+
+    if total > shown {
+        lines.push(format!(
+            "(+{} more existing note(s) not shown; {total} total)",
+            total - shown
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// One bounded, single-line rendering of a model-authored field (note id,
+/// title, or body) for [`render_notes_snapshot`]. Collapses embedded
+/// newlines/whitespace and truncates to `max_chars`.
+///
+/// `id` and `title` are `String`s with no length or newline validation
+/// anywhere on the apply path (`upsert_note` accepts them verbatim, and there
+/// is no `maxLength`/schema constraint on either field) — without running them
+/// through this same collapse-and-truncate step as the body, a single
+/// oversized or newline-containing id/title would make one snapshot line (and
+/// therefore the whole block) unbounded, and an embedded newline would break
+/// the one-line-per-note invariant the snapshot's line-count bound relies on.
+fn one_line_bounded(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    if collapsed.chars().count() > max_chars {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 pub fn projection_patch_repair_prompt_messages(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     invalid_model_output: &str,
     error: &ProjectionPatchDraftError,
 ) -> Result<Vec<ChatMessage>, ProjectionPatchDraftError> {
-    let mut messages = projection_patch_prompt_messages(job, ledger)?;
+    let mut messages = projection_patch_prompt_messages(job, ledger, notes)?;
     let schema = projection_patch_draft_json_schema()
         .map(|value| value.to_string())
         .unwrap_or_else(|_| {
@@ -1188,6 +1400,10 @@ mod tests {
             priority: ProjectionPriority::Realtime,
             queued_at_ms: 10,
         }
+    }
+
+    fn empty_notes() -> MaterializedNotes {
+        MaterializedNotes::new("session-1")
     }
 
     fn context() -> ProjectionPatchBuildContext {
@@ -1779,7 +1995,8 @@ mod tests {
             queued_at_ms: 10,
         };
 
-        let err = projection_patch_prompt_messages(&job, &ledger).expect_err("stale basis");
+        let err = projection_patch_prompt_messages(&job, &ledger, Some(&empty_notes()))
+            .expect_err("stale basis");
 
         assert!(matches!(err, ProjectionPatchDraftError::StaleBasis { .. }));
     }
@@ -1806,22 +2023,29 @@ mod tests {
             operation: "upsert_graph_node",
         };
 
-        let messages = projection_patch_repair_prompt_messages(&job, &ledger, &invalid, &error)
-            .expect("repair prompt");
+        let messages = projection_patch_repair_prompt_messages(
+            &job,
+            &ledger,
+            Some(&empty_notes()),
+            &invalid,
+            &error,
+        )
+        .expect("repair prompt");
 
-        // Static→dynamic base prompt is 4 messages (system, stable-context,
-        // hot-buffer transcript, per-tick metadata); the repair pass appends the
-        // invalid assistant turn + the correction user turn.
-        assert_eq!(messages.len(), 6);
-        assert_eq!(messages[4].role, "assistant");
-        assert!(messages[4].content.contains("upsert_graph_node"));
-        assert_eq!(messages[5].role, "user");
-        assert!(messages[5].content.contains("expected_kind: notes"));
-        assert!(messages[5].content.contains("validation_error:"));
+        // Static→dynamic base prompt is 5 messages for a Notes-kind job
+        // (system, stable-context, hot-buffer transcript, notes-state
+        // snapshot, per-tick metadata); the repair pass appends the invalid
+        // assistant turn + the correction user turn.
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[5].role, "assistant");
         assert!(messages[5].content.contains("upsert_graph_node"));
-        assert!(messages[5].content.contains("Output JSON schema"));
+        assert_eq!(messages[6].role, "user");
+        assert!(messages[6].content.contains("expected_kind: notes"));
+        assert!(messages[6].content.contains("validation_error:"));
+        assert!(messages[6].content.contains("upsert_graph_node"));
+        assert!(messages[6].content.contains("Output JSON schema"));
         assert!(
-            messages[5]
+            messages[6]
                 .content
                 .contains("Do not include trusted metadata")
         );
@@ -1840,7 +2064,8 @@ mod tests {
             .apply_event(event("span-1", 1, "Alice chose Soniox."))
             .unwrap();
         let job = job(ProjectionKind::Notes, &ledger);
-        let messages = projection_patch_prompt_messages(&job, &ledger).expect("prompt");
+        let messages =
+            projection_patch_prompt_messages(&job, &ledger, Some(&empty_notes())).expect("prompt");
 
         let system = &messages[0].content;
         for term in [
@@ -1877,7 +2102,8 @@ mod tests {
                 .unwrap();
         }
         let job = job(ProjectionKind::Notes, &ledger);
-        let messages = projection_patch_prompt_messages(&job, &ledger).expect("windowed prompt");
+        let messages = projection_patch_prompt_messages(&job, &ledger, Some(&empty_notes()))
+            .expect("windowed prompt");
 
         // The hot-buffer transcript block (message 2) carries only the last K
         // turns verbatim, not all of them.
@@ -1942,7 +2168,8 @@ mod tests {
                 .unwrap();
         }
         let first_job = job(ProjectionKind::Notes, &ledger);
-        let first = projection_patch_prompt_messages(&first_job, &ledger).expect("first prompt");
+        let first = projection_patch_prompt_messages(&first_job, &ledger, Some(&empty_notes()))
+            .expect("first prompt");
 
         // Append a brand-new turn. Because the new turn enters the hot buffer
         // and pushes the oldest one into the (append-only) summary, the stable
@@ -1951,7 +2178,8 @@ mod tests {
             .apply_event(event("span-new", 1, "A fresh turn arrives"))
             .unwrap();
         let second_job = job(ProjectionKind::Notes, &ledger);
-        let second = projection_patch_prompt_messages(&second_job, &ledger).expect("second prompt");
+        let second = projection_patch_prompt_messages(&second_job, &ledger, Some(&empty_notes()))
+            .expect("second prompt");
 
         assert_eq!(PROJECTION_STABLE_PREFIX_MESSAGE_COUNT, 2);
         // Message 0 (system block: instructions + guidance + schema) is the
@@ -1972,6 +2200,495 @@ mod tests {
             first.last().map(|m| &m.content),
             second.last().map(|m| &m.content)
         );
+    }
+
+    /// Seam-safety proof (audio-graph-253c): a note being REWRITTEN (not
+    /// appended) between two calls against the SAME ledger state must still
+    /// leave the cache-stable prefix (messages 0 and 1) byte-identical. This
+    /// is the load-bearing reason the notes snapshot was placed in the
+    /// per-job variable region (message 3) instead of the pinned-facts block
+    /// (message 1): a snapshot that changes shape when a note's body is
+    /// edited in place would bust the cache if it lived in the append-only
+    /// prefix.
+    #[test]
+    fn notes_snapshot_placement_never_busts_the_cache_stable_prefix() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+
+        let mut notes_v1 = empty_notes();
+        notes_v1
+            .apply_patch(
+                &notes_patch(1, "note:1", "Choice", "Alice chose Soniox."),
+                None,
+            )
+            .expect("apply first note version");
+        let before = projection_patch_prompt_messages(&job, &ledger, Some(&notes_v1))
+            .expect("prompt with first note version");
+
+        // Rewrite the SAME note id in place (the exact overwrite shape the
+        // field measurement showed happening 77 times to `note-1`) — the
+        // ledger/job/basis are untouched, only the notes materialization
+        // changed shape.
+        let mut notes_v2 = notes_v1.clone();
+        notes_v2
+            .apply_patch(
+                &notes_patch(
+                    2,
+                    "note:1",
+                    "Choice",
+                    "Alice chose Soniox for the realtime pilot, not production.",
+                ),
+                None,
+            )
+            .expect("apply rewritten note version");
+        let after = projection_patch_prompt_messages(&job, &ledger, Some(&notes_v2))
+            .expect("prompt with rewritten note version");
+
+        assert_eq!(
+            before[0].content, after[0].content,
+            "system block (message 0) must stay byte-identical when only notes content changes"
+        );
+        assert_eq!(
+            before[1].content, after[1].content,
+            "pinned-facts/summary block (message 1) must stay byte-identical when only notes content changes"
+        );
+        // The notes-snapshot message (message 3, Notes-kind only) DOES change —
+        // proving the rewrite is actually visible where it is supposed to be.
+        assert_ne!(
+            before[3].content, after[3].content,
+            "notes-snapshot message must reflect the rewritten note body"
+        );
+        assert!(after[3].content.contains("not production"));
+    }
+
+    /// Helper: a one-operation Notes patch, used to build a
+    /// `MaterializedNotes` fixture by direct `apply_patch` calls (no ledger,
+    /// no LLM route — pure, synchronous, no cross-thread state).
+    fn notes_patch(sequence: u64, id: &str, title: &str, body: &str) -> ProjectionPatch {
+        ProjectionPatch {
+            route: None,
+            sequence,
+            kind: ProjectionKind::Notes,
+            llm_request_id: format!("test-request-{sequence}"),
+            basis: ProjectionBasis {
+                span_revisions: vec![ProjectionBasisSpan {
+                    span_id: "span-1".to_string(),
+                    revision_number: 1,
+                }],
+                diarization_span_revisions: Vec::new(),
+                transcript_hash: format!("fnv1a64:{sequence:016x}"),
+                summarized_through_revision: None,
+            },
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: id.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+            confidence: 1.0,
+            provenance: ProjectionProvenance {
+                provider: "test".to_string(),
+                model: "test-model".to_string(),
+                prompt_id: PROJECTION_PATCH_PROMPT_ID.to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: sequence,
+        }
+    }
+
+    // ----- audio-graph-253c: live notes-state snapshot ----------------------
+
+    /// The snapshot block is present (with every note's id) for Notes-kind
+    /// jobs and ABSENT (not merely empty) for Graph-kind jobs — Graph-kind
+    /// prompt shape is seed e700's lane, unchanged here.
+    #[test]
+    fn notes_snapshot_present_for_notes_kind_and_absent_for_graph_kind() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                ),
+                None,
+            )
+            .expect("apply note");
+
+        let notes_job = job(ProjectionKind::Notes, &ledger);
+        let notes_messages = projection_patch_prompt_messages(&notes_job, &ledger, Some(&notes))
+            .expect("notes prompt");
+        assert_eq!(
+            notes_messages.len(),
+            5,
+            "Notes-kind prompt carries the extra notes-snapshot message"
+        );
+        assert!(
+            notes_messages
+                .iter()
+                .any(|m| m.content.contains("note:decision")),
+            "Notes-kind prompt must show the existing note's id somewhere"
+        );
+        assert!(notes_messages[3].content.contains("Current notes state"));
+        assert!(notes_messages[3].content.contains("note:decision"));
+        assert!(notes_messages[3].content.contains("Provider decision"));
+
+        let graph_job = job(ProjectionKind::Graph, &ledger);
+        let graph_messages = projection_patch_prompt_messages(&graph_job, &ledger, Some(&notes))
+            .expect("graph prompt");
+        assert_eq!(
+            graph_messages.len(),
+            4,
+            "Graph-kind prompt has no notes-snapshot message at all"
+        );
+        assert!(
+            graph_messages
+                .iter()
+                .all(|m| !m.content.contains("note:decision")),
+            "Graph-kind prompt must never leak notes content (seed e700 owns that lane)"
+        );
+        assert!(
+            graph_messages
+                .iter()
+                .all(|m| !m.content.contains("Current notes state")),
+            "the snapshot block itself must be absent, not merely empty, for Graph kind"
+        );
+    }
+
+    /// `notes: None` (the caller does not actually have the live notes
+    /// state — as of this seed, the one production call site in
+    /// `llm/executor.rs` cannot reach it) must OMIT the notes-state message
+    /// entirely for a Notes-kind job, never render a fabricated "(no notes
+    /// yet)" body. A fabricated empty block is indistinguishable from a real
+    /// empty session and would license the model to mint ids as if none
+    /// existed — the exact overwrite-storm mechanism this seed exists to fix,
+    /// just re-triggered via a false premise instead of silence.
+    #[test]
+    fn notes_snapshot_omitted_not_fabricated_when_caller_has_no_notes_state() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+
+        let notes_job = job(ProjectionKind::Notes, &ledger);
+        let messages =
+            projection_patch_prompt_messages(&notes_job, &ledger, None).expect("notes prompt");
+
+        assert_eq!(
+            messages.len(),
+            4,
+            "with notes=None the notes-snapshot message must be absent, same shape as Graph-kind"
+        );
+        // The byte-stable system message (message 0) legitimately references
+        // the block by name as part of the id-stability instruction text —
+        // that guidance text is unconditional (see the doc comment on
+        // `projection_patch_prompt_messages`). What must never happen is a
+        // per-tick message claiming notes state, true or false.
+        assert!(
+            messages[1..]
+                .iter()
+                .all(|m| !m.content.contains("Current notes state")),
+            "notes=None must render no per-tick notes-state message, got: {messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| !m.content.contains("no notes yet")),
+            "notes=None must never fabricate a \"(no notes yet)\" claim, got: {messages:?}"
+        );
+    }
+
+    /// ADR-0025 §2g / seed audio-graph-72d5: the data-movement ledger must be
+    /// able to see the notes-snapshot block's content-free shape once a
+    /// caller has real notes state, and must report zero when it does not —
+    /// so the ledger and the actual prompt never disagree about whether note
+    /// content left the device on a given tick.
+    #[test]
+    fn prompt_shape_with_notes_reports_notes_snapshot_shape_content_free() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                ),
+                None,
+            )
+            .expect("apply note");
+
+        let notes_job = job(ProjectionKind::Notes, &ledger);
+        let with_notes = projection_prompt_shape_with_notes(&notes_job, &ledger, Some(&notes));
+        assert_eq!(with_notes.notes_snapshot_entries, 1);
+        assert!(with_notes.notes_snapshot_chars > 0);
+
+        // `None` (unwired caller) and the plain, non-widened
+        // `projection_prompt_shape` must both report zero — no phantom
+        // off-device notes content recorded when none was actually sent.
+        let unwired = projection_prompt_shape_with_notes(&notes_job, &ledger, None);
+        assert_eq!(unwired.notes_snapshot_entries, 0);
+        assert_eq!(unwired.notes_snapshot_chars, 0);
+        let plain = projection_prompt_shape(&notes_job, &ledger);
+        assert_eq!(plain.notes_snapshot_entries, 0);
+        assert_eq!(plain.notes_snapshot_chars, 0);
+
+        // Graph-kind never reports notes-snapshot shape, even with notes
+        // handy (seed e700's lane; Graph prompts never render this block).
+        let graph_job = job(ProjectionKind::Graph, &ledger);
+        let graph_shape = projection_prompt_shape_with_notes(&graph_job, &ledger, Some(&notes));
+        assert_eq!(graph_shape.notes_snapshot_entries, 0);
+        assert_eq!(graph_shape.notes_snapshot_chars, 0);
+    }
+
+    /// A session with more notes than [`NOTES_SNAPSHOT_MAX_ENTRIES`] still
+    /// gets a bounded block: every note beyond the cap is folded into one
+    /// trailing count line rather than growing the prompt unbounded.
+    #[test]
+    fn notes_snapshot_is_bounded_at_the_cap_with_a_count_line() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Many topics discussed."))
+            .unwrap();
+        let mut notes = empty_notes();
+        let total = NOTES_SNAPSHOT_MAX_ENTRIES + 5;
+        for i in 0..total {
+            notes
+                .apply_patch(
+                    &notes_patch(
+                        (i + 1) as u64,
+                        &format!("note:{i}"),
+                        &format!("Topic {i}"),
+                        &format!("Body of note {i}."),
+                    ),
+                    None,
+                )
+                .expect("apply note");
+        }
+
+        let block = render_notes_snapshot(&notes);
+        let shown_lines = block.lines().count();
+        // NOTES_SNAPSHOT_MAX_ENTRIES note lines + one trailing count line.
+        assert_eq!(shown_lines, NOTES_SNAPSHOT_MAX_ENTRIES + 1);
+        assert!(
+            block.contains(&format!(
+                "+5 more existing note(s) not shown; {total} total"
+            )),
+            "got: {block}"
+        );
+        // The most-recently-applied notes (highest sequence) must be the ones
+        // actually shown, never silently dropped in favor of older ones.
+        assert!(block.contains(&format!("note:{}", total - 1)));
+        assert!(
+            !block.contains("note:0 |"),
+            "the oldest note past the cap must not be individually listed"
+        );
+    }
+
+    /// Prompt-size bound, demonstrated in bytes rather than asserted in the
+    /// abstract. Independent growth axes, each checked against a fixed byte
+    /// ceiling derived from the documented caps — this is what makes the
+    /// per-tick token cost bounded, not O(session length), the same growth
+    /// failure mode ADR-0025 already fixed for the transcript feed.
+    #[test]
+    fn notes_snapshot_prompt_size_is_bounded_independent_of_session_growth() {
+        fn snapshot_len(note_count: usize, body: &str) -> usize {
+            let mut notes = empty_notes();
+            for i in 0..note_count {
+                notes
+                    .apply_patch(
+                        &notes_patch(
+                            (i + 1) as u64,
+                            &format!("note:{i}"),
+                            &format!("Topic {i}"),
+                            body,
+                        ),
+                        None,
+                    )
+                    .expect("apply note");
+            }
+            render_notes_snapshot(&notes).len()
+        }
+
+        // Generous fixed ceiling derived from the documented caps: at most
+        // NOTES_SNAPSHOT_MAX_ENTRIES lines, each well under 400 bytes once
+        // the per-body cap is applied, plus a short trailing count line.
+        const CEILING_BYTES: usize = NOTES_SNAPSHOT_MAX_ENTRIES * 400 + 200;
+
+        // Axis 1 — note COUNT: a 200x increase (10 -> 2,000 notes, same short
+        // body each) must stay under the ceiling and must not grow anywhere
+        // close to proportionally, because the cap stops adding lines past
+        // NOTES_SNAPSHOT_MAX_ENTRIES.
+        let few_notes = snapshot_len(10, "A short note body.");
+        let many_notes = snapshot_len(2_000, "A short note body.");
+        assert!(
+            many_notes < CEILING_BYTES,
+            "2,000-note snapshot is {many_notes} bytes, over the {CEILING_BYTES}-byte ceiling — \
+             the cap is not actually bounding note-count growth"
+        );
+        assert!(
+            many_notes < few_notes * 4,
+            "snapshot size grew from {few_notes} to {many_notes} bytes across a 200x note-count \
+             increase (same body each) — this is not the roughly-flat growth the cap is supposed \
+             to give past NOTES_SNAPSHOT_MAX_ENTRIES"
+        );
+
+        // Axis 2 — per-note BODY LENGTH: a ~260x increase in one note's body
+        // (5,000 chars vs. 19) must stay under the ceiling and must not grow
+        // anywhere close to proportionally, because `one_line_bounded`
+        // truncates every body to `NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS`
+        // regardless of input length.
+        let short_bodies = snapshot_len(10, "A short note body.");
+        let long_bodies = snapshot_len(10, &"x".repeat(5_000));
+        assert!(
+            long_bodies < CEILING_BYTES,
+            "long-body snapshot is {long_bodies} bytes, over the {CEILING_BYTES}-byte ceiling — \
+             the per-body cap is not actually bounding body-length growth"
+        );
+        assert!(
+            long_bodies < short_bodies * 4,
+            "snapshot size grew from {short_bodies} to {long_bodies} bytes across a ~260x \
+             per-note body-length increase (same note count) — the per-body cap is not bounding"
+        );
+
+        // Axis 3 — per-note ID/TITLE LENGTH: unlike the body, `id` and `title`
+        // are model-authored `String`s with no length validation anywhere on
+        // the apply path (`upsert_note` accepts them verbatim). A single
+        // oversized id or title must not make the block unbounded either.
+        fn snapshot_len_with_id_and_title(id: &str, title: &str) -> usize {
+            let mut notes = empty_notes();
+            notes
+                .apply_patch(&notes_patch(1, id, title, "A short note body."), None)
+                .expect("apply note");
+            render_notes_snapshot(&notes).len()
+        }
+        let short_id_title = snapshot_len_with_id_and_title("n", "Topic");
+        let long_id_title = snapshot_len_with_id_and_title(&"i".repeat(5_000), &"t".repeat(5_000));
+        const ID_TITLE_CEILING_BYTES: usize = 2 * NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS * 4 + 200;
+        assert!(
+            long_id_title < ID_TITLE_CEILING_BYTES,
+            "single-note snapshot with a 5,000-char id AND title is {long_id_title} bytes, over \
+             the {ID_TITLE_CEILING_BYTES}-byte ceiling — id/title are not actually bounded"
+        );
+        assert!(
+            long_id_title < short_id_title * 20,
+            "snapshot size grew from {short_id_title} to {long_id_title} bytes across a 5,000x \
+             id/title-length increase (same note count) — id/title are not bounded independent \
+             of session growth"
+        );
+    }
+
+    /// A note title containing an embedded newline must not break the
+    /// one-line-per-note invariant [`notes_snapshot_is_bounded_at_the_cap_with_a_count_line`]
+    /// relies on (`block.lines().count()`), and must not let note content be
+    /// misparsed as a separate snapshot entry.
+    #[test]
+    fn notes_snapshot_collapses_newlines_in_title_and_id() {
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch(
+                    1,
+                    "note:1",
+                    "Multi-line\ntitle\nwith\nembedded\nnewlines",
+                    "A short note body.",
+                ),
+                None,
+            )
+            .expect("apply note");
+
+        let block = render_notes_snapshot(&notes);
+        assert_eq!(
+            block.lines().count(),
+            1,
+            "an embedded newline in the title must not add extra lines to the block, got: {block}"
+        );
+        assert!(block.contains("Multi-line title with embedded newlines"));
+    }
+
+    /// Determinism: the same `MaterializedNotes` renders byte-identically on
+    /// every call (no `HashMap` iteration, no wall-clock/random tie-break).
+    #[test]
+    fn notes_snapshot_has_stable_deterministic_ordering() {
+        let mut notes = empty_notes();
+        for (i, id) in ["note:c", "note:a", "note:b"].iter().enumerate() {
+            notes
+                .apply_patch(&notes_patch((i + 1) as u64, id, "Title", "Body."), None)
+                .expect("apply note");
+        }
+
+        let first = render_notes_snapshot(&notes);
+        let second = render_notes_snapshot(&notes);
+        assert_eq!(
+            first, second,
+            "rendering must be a pure, deterministic function of the notes state"
+        );
+
+        // Most-recently-updated first: note:b (sequence 3) precedes note:a
+        // (sequence 2) precedes note:c (sequence 1).
+        let b_index = first.find("note:b").expect("note:b present");
+        let a_index = first.find("note:a").expect("note:a present");
+        let c_index = first.find("note:c").expect("note:c present");
+        assert!(b_index < a_index && a_index < c_index, "got: {first}");
+    }
+
+    /// Regression proof for the measured overwrite storm (session ae528252):
+    /// job N's APPLIED patch introduces a note id; job N+1's prompt (built
+    /// from the resulting `MaterializedNotes`, exactly as a real scheduler
+    /// tick would once it can supply `Some(&materialized)`) must show that
+    /// same id, so the model has a followable "keep stable note ids"
+    /// instruction instead of re-minting blind.
+    #[test]
+    fn overwrite_storm_regression_next_job_prompt_contains_ids_from_previous_applied_patch() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox for the pilot."))
+            .unwrap();
+
+        // Job N's patch is APPLIED to the materialization, exactly as the
+        // scheduler's apply path would do after a successful generation.
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox for the pilot.",
+                ),
+                None,
+            )
+            .expect("apply job N's patch");
+
+        // Job N+1's prompt is built against the SAME resulting notes state —
+        // this is the exact seam the field measurement showed as blind.
+        let job_n_plus_1 = job(ProjectionKind::Notes, &ledger);
+        let messages = projection_patch_prompt_messages(&job_n_plus_1, &ledger, Some(&notes))
+            .expect("job N+1 prompt");
+
+        let snapshot_message = &messages[3].content;
+        assert!(
+            snapshot_message.contains("note:decision"),
+            "job N+1's prompt must show the note id job N's applied patch introduced, got: {snapshot_message}"
+        );
+        // The id-stability instruction must actually point at this block, not
+        // just assert stability in the abstract.
+        assert!(messages[0].content.contains("Current notes state"));
     }
 
     // ----- a324: provider-strict structured-output schema -------------------
