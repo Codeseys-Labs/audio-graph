@@ -73,7 +73,8 @@ pub struct OpenRouterConfig {
     ///
     /// Structured-output requests (extraction / projection JSON) do not use
     /// this value verbatim: [`STRUCTURED_OUTPUT_MIN_MAX_TOKENS`] floors it
-    /// (seed audio-graph-debf). The floor is applied once, up front — ADR-0038
+    /// (seed audio-graph-debf, raised by audio-graph-3e1c). The floor is
+    /// applied once, up front — ADR-0038
     /// sub-decision 4 forbids escalating it on a `Truncated` attempt, so
     /// there is no retry-driven change to this value. Free-form chat still
     /// uses this value exactly as configured.
@@ -1991,7 +1992,8 @@ impl OpenRouterClient {
 const CHAT_MAX_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------------------
-// Structured-output completion-budget floor (audio-graph-debf)
+// Structured-output completion-budget floor (audio-graph-debf, raised by
+// audio-graph-3e1c)
 // ---------------------------------------------------------------------------
 //
 // Field evidence (Windows preview build 3ba9812, live podcast test
@@ -2024,17 +2026,46 @@ const CHAT_MAX_ATTEMPTS: u32 = 3;
 // ADR-0038 sub-decision 4 is explicit that a `Truncated` terminal status must
 // not auto-spend a larger-budget attempt ("go to Finalization Blocked"), so
 // there is no retry-driven change to this value.
+//
+// audio-graph-3e1c raised the flat floor 2048 -> 4096. Field evidence
+// (session ae528252): of 82 Graph-projection jobs at the 2048 floor, 9
+// terminated `Truncated`/`UnusableCompletion`; the same session's 84/84
+// Notes jobs stayed under 2048. The raise stays flat rather than becoming
+// Graph-kind-aware for reason #2 above alone: no kind signal reaches this
+// layer, so a kind-aware floor would need new plumbing through every
+// structured-output entry point to buy a distinction this client cannot
+// make. That plumbing gap is decisive by itself and does not depend on the
+// raise being free.
+//
+// It is not free. `max_tokens` is a declared CAP, not spend — a provider
+// bills generated tokens, not the ceiling, so the raise costs no additional
+// BILLED tokens for a Notes job that already finishes under 2048. But
+// ADR-0038's own "Negative — the `Truncated` default costs a lane" consequence
+// (ADR-0038:219-225) records that Cerebras charges its PRE-GENERATION
+// rate-limit bucket from input plus the *declared* completion budget, before
+// generation — so doubling the declared cap to 4096 on every structured
+// request (including the 84/84 Notes jobs that never needed it) modestly
+// raises 429 likelihood on Cerebras-fronted routes (`route.cerebras_via_
+// openrouter`, dispatched through this same client). Accepted anyway because
+// the plumbing argument above already settles flat vs. kind-aware on its
+// own; this cost is real but not a reason to prefer a kind-aware floor this
+// layer cannot implement.
+//
+// ADR-0038 sub-decision 4 governs RUNTIME escalation after a `Truncated`
+// verdict on a single attempt; it does not speak to a static constant used
+// identically on every attempt before any completion happens, so this
+// config-time raise does not implicate it.
 
 /// Flat floor for a structured-output request's completion-token budget,
 /// regardless of the configured `OpenRouterConfig::max_tokens` (which may be
 /// tuned for chat, not extraction/projection) and regardless of which
 /// structured-output form or projection kind is in play — see the module
-/// note above for why this is flat rather than kind-aware. This is the
+/// note above for why this is flat rather than kind-aware. Originally the
 /// higher of the two figures
 /// docs/research/mvp-projection-correctness-2026-07-09.md measured (2048 for
-/// Graph); the lower 1536 figure that doc proposed for non-Graph structured
-/// forms is superseded by the 2026-08-20 extraction field evidence.
-const STRUCTURED_OUTPUT_MIN_MAX_TOKENS: u32 = 2048;
+/// Graph); raised to 4096 by audio-graph-3e1c after session ae528252 showed
+/// 9/82 Graph jobs still truncating at 2048.
+const STRUCTURED_OUTPUT_MIN_MAX_TOKENS: u32 = 4096;
 
 /// Class-only, content-free diagnostic for a terminal (non-retried) chat-
 /// completion body-decode failure. Never carries the response body or any
@@ -2875,10 +2906,20 @@ mod tests {
         let captured = send_one_request_and_capture_body(512, RequestOutputForm::JsonObject);
         let sent_max_tokens = request_body_field_u64(&captured, "max_tokens")
             .expect("attempt 1 must declare max_tokens");
+        // Asserted against the literal 4096, not just the
+        // `STRUCTURED_OUTPUT_MIN_MAX_TOKENS` symbol: a symbol-only comparison
+        // is a tautology that survives a regression reverting the constant's
+        // *value* (audio-graph-3e1c raised it from 2048 after session
+        // ae528252 measured 9/82 Graph jobs truncating at 2048). The literal
+        // gives this assertion teeth against that specific mutation.
+        assert_eq!(
+            sent_max_tokens, 4096,
+            "a structured request under the floor must be raised to the floor, got:\n{captured}"
+        );
         assert_eq!(
             sent_max_tokens,
             u64::from(STRUCTURED_OUTPUT_MIN_MAX_TOKENS),
-            "a structured request under the floor must be raised to the floor, got:\n{captured}"
+            "the wire value must match the named floor constant exactly, got:\n{captured}"
         );
     }
 
@@ -2890,6 +2931,29 @@ mod tests {
         assert_eq!(
             sent_max_tokens, 8192,
             "a configured value above the floor must pass through verbatim, never capped, got:\n{captured}"
+        );
+    }
+
+    /// audio-graph-3e1c: `StrictJsonSchema` is the form Graph and Notes
+    /// projection actually send on the wire (`chat_completion_with_schema_
+    /// cached`); the two tests above only exercise `JsonObject`. This pins
+    /// the floor on that real production path too, at the raised value,
+    /// so a schema-form-only regression in `is_structured_output` cannot
+    /// hide behind JsonObject-only coverage.
+    #[test]
+    fn structured_output_request_floors_a_small_configured_max_tokens_for_strict_json_schema() {
+        let form = RequestOutputForm::StrictJsonSchema {
+            name: "projection_patch".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let captured = send_one_request_and_capture_body(512, form);
+        let sent_max_tokens = request_body_field_u64(&captured, "max_tokens")
+            .expect("attempt 1 must declare max_tokens");
+        // Literal, not just the symbol — see the comment in the JsonObject
+        // variant of this assertion above for why.
+        assert_eq!(
+            sent_max_tokens, 4096,
+            "a strict-json-schema request under the floor must be raised to the floor, got:\n{captured}"
         );
     }
 
