@@ -1694,10 +1694,18 @@ trait ProjectionPatchGenerator: Send + Sync {
     /// Returns the dispatch outcome PLUS the identity of the route it actually
     /// reached, so a failure can still ledger under that identity instead of
     /// the session-start snapshot (seeds audio-graph-862c / audio-graph-7da4).
+    ///
+    /// `notes` is the live Notes-kind snapshot (seed audio-graph-253c part 2)
+    /// `run_projection_job` clones under `AppState`'s
+    /// `materialized_projection_state` lock and hands to every implementer —
+    /// this trait never reaches back into that lock itself. `Some` renders
+    /// the "Current notes state" prompt block; `None` omits it (Graph-kind,
+    /// or a Notes-kind snapshot whose session id did not match this job's).
     fn generate_projection_patch(
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
+        notes: Option<MaterializedNotes>,
         sequence: u64,
         created_at_ms: u64,
     ) -> ProjectionPatchAttempt;
@@ -1772,12 +1780,14 @@ impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
+        notes: Option<MaterializedNotes>,
         sequence: u64,
         created_at_ms: u64,
     ) -> ProjectionPatchAttempt {
         self.llm_executor.generate_projection_patch(
             job,
             ledger,
+            notes,
             self.llm_provider.clone(),
             sequence,
             created_at_ms,
@@ -2558,16 +2568,29 @@ fn actual_backend_identity(
 
 /// Build the content-free facts describing this projection submission for the
 /// data-movement ledger (ADR-0025 §2g / seed audio-graph-72d5).
+///
+/// `notes` is the SAME live Notes-kind snapshot (seed audio-graph-253c part 2)
+/// this job's actual prompt was (or will be) built with — passing it through
+/// `projection_prompt_shape_with_notes` instead of the notes-blind
+/// `projection_prompt_shape` is what lets `notes_snapshot_chars` /
+/// `notes_snapshot_entries` below ever report non-zero, so the notes content
+/// this call moves off-device is ledgered, not silently omitted from the
+/// privacy report. Content-free like every other field here: only a char
+/// count and an entry count ever leave this function.
+// 8 params since the notes-snapshot wiring (seed audio-graph-253c part 2)
+// pushed this one over clippy's default threshold of 7.
+#[allow(clippy::too_many_arguments)]
 fn projection_movement_facts(
     dispatch: &ProjectionDispatchContext,
     job: &ProjectionJob,
     sequence: u64,
     ledger: &crate::projections::TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     tokens_in: u64,
     tokens_out: u64,
     backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
-    let shape = crate::projection_llm::projection_prompt_shape(job, ledger);
+    let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, notes);
     let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
         ProjectionLedgerBackend::Actual(provenance, attempted_route) => {
             let (provider_id, cloud, prefix) =
@@ -2622,6 +2645,8 @@ fn projection_movement_facts(
         has_rolling_summary: shape.has_rolling_summary,
         has_cached_prefix,
         pinned_fact_chars: shape.pinned_fact_chars,
+        notes_snapshot_chars: shape.notes_snapshot_chars,
+        notes_snapshot_entries: shape.notes_snapshot_entries,
         tokens_in,
         tokens_out,
     }
@@ -2643,6 +2668,21 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
         .next_projection_sequence(&job.kind);
     let created_at_ms = current_unix_millis();
     let ledger = dispatch.projection_runtime.transcript_ledger_snapshot();
+    // Live Notes-kind notes snapshot (seed audio-graph-253c part 2), cloned
+    // under `AppState`'s `materialized_projection_state` lock and released
+    // immediately — same clone-and-release shape as `ledger` above, never
+    // held across the `generate_projection_patch` dispatch below. Graph-kind
+    // jobs never render the notes block, so they carry nothing (mirrors
+    // `projection_patch_prompt_messages`'s own `job.kind == Notes` gate).
+    // Session-pinned via `materialized_notes_snapshot_for_session`: `None`
+    // here can also mean a rotation raced this job's spawn (see that
+    // accessor's doc), not only "no notes yet".
+    let notes_snapshot = match job.kind {
+        ProjectionKind::Notes => dispatch
+            .projection_runtime
+            .materialized_notes_snapshot_for_session(&job.session_id),
+        ProjectionKind::Graph => None,
+    };
     let generation_started_ms = current_unix_millis();
 
     // Ledger the remote-LLM data flow before the call leaves the device
@@ -2656,6 +2696,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             &job,
             sequence,
             &ledger,
+            notes_snapshot.as_ref(),
             0,
             0,
             ProjectionLedgerBackend::Configured,
@@ -2669,6 +2710,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let attempt = dispatch.patch_generator.generate_projection_patch(
         job.clone(),
         ledger.clone(),
+        notes_snapshot.clone(),
         sequence,
         created_at_ms,
     );
@@ -2685,6 +2727,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &job,
                 sequence,
                 &ledger,
+                notes_snapshot.as_ref(),
                 u64::from(outcome.tokens_used),
                 0,
                 ProjectionLedgerBackend::Actual(&outcome.patch.provenance, attempted_route),
@@ -2824,6 +2867,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &job,
                 sequence,
                 &ledger,
+                notes_snapshot.as_ref(),
                 0,
                 0,
                 ProjectionLedgerBackend::FailedRoute(attempted_route),
@@ -7853,8 +7897,9 @@ mod tests_status {
     };
     use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulers};
     use crate::projections::{
-        DiarizationEventStability, ProjectionJob, ProjectionKind, ProjectionOperation,
-        ProjectionPatch, ProjectionProvenance, SpeakerTimeline, TranscriptLedger,
+        DiarizationEventStability, MaterializedNotes, ProjectionJob, ProjectionKind,
+        ProjectionOperation, ProjectionPatch, ProjectionProvenance, SpeakerTimeline,
+        TranscriptLedger,
     };
     use crate::settings::LlmProvider;
     use crate::state::{AppState, TranscriptSegment};
@@ -7996,6 +8041,7 @@ mod tests_status {
             dyn Fn(
                     ProjectionJob,
                     TranscriptLedger,
+                    Option<MaterializedNotes>,
                     u64,
                     u64,
                 ) -> Result<ProjectionPatchOutcome, String>
@@ -8009,6 +8055,7 @@ mod tests_status {
             generate: impl Fn(
                 ProjectionJob,
                 TranscriptLedger,
+                Option<MaterializedNotes>,
                 u64,
                 u64,
             ) -> Result<ProjectionPatchOutcome, String>
@@ -8045,12 +8092,13 @@ mod tests_status {
             &self,
             job: ProjectionJob,
             ledger: TranscriptLedger,
+            notes: Option<MaterializedNotes>,
             sequence: u64,
             created_at_ms: u64,
         ) -> ProjectionPatchAttempt {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ProjectionPatchAttempt {
-                outcome: (self.generate)(job, ledger, sequence, created_at_ms),
+                outcome: (self.generate)(job, ledger, notes, sequence, created_at_ms),
                 attempted_route: self.attempted_route,
             }
         }
@@ -9920,7 +9968,7 @@ mod tests_status {
         let app = AppState::new();
         let session_id = app.current_session_id();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 37,
@@ -10030,8 +10078,8 @@ mod tests_status {
         let old_job_id = old_job.id.clone();
         let schedulers_for_reset = app.projection_schedulers.clone();
         let ledger_for_reset = app.transcript_ledger.clone();
-        let (generator, _calls) =
-            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+        let (generator, _calls) = FnProjectionPatchGenerator::new(
+            move |job, _ledger, _notes, sequence, created_at_ms| {
                 let ledger = ledger_for_reset
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -10051,7 +10099,8 @@ mod tests_status {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 73,
                 })
-            });
+            },
+        );
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         run_projection_job(dispatch, old_job);
@@ -10132,7 +10181,7 @@ mod tests_status {
         };
 
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -10241,8 +10290,8 @@ mod tests_status {
         let stopping_flag = app.projection_lane_stopping.clone();
         let span_appended = Arc::new(AtomicBool::new(false));
         let span_appended_in_closure = span_appended.clone();
-        let (generator, calls) =
-            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+        let (generator, calls) = FnProjectionPatchGenerator::new(
+            move |job, _ledger, _notes, sequence, created_at_ms| {
                 if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
                     ledger_handle
                         .lock()
@@ -10262,7 +10311,8 @@ mod tests_status {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
                 })
-            });
+            },
+        );
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         spawn_projection_job(dispatch, job_a);
@@ -10368,8 +10418,8 @@ mod tests_status {
         let stopping_flag = app.projection_lane_stopping.clone();
         let span_appended = Arc::new(AtomicBool::new(false));
         let span_appended_in_closure = span_appended.clone();
-        let (generator, calls) =
-            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+        let (generator, calls) = FnProjectionPatchGenerator::new(
+            move |job, _ledger, _notes, sequence, created_at_ms| {
                 if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
                     ledger_handle
                         .lock()
@@ -10389,7 +10439,8 @@ mod tests_status {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
                 })
-            });
+            },
+        );
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         spawn_projection_job(dispatch.clone(), job_a);
@@ -10495,7 +10546,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -10613,7 +10664,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -10733,7 +10784,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -10846,7 +10897,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -10945,7 +10996,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -11161,7 +11212,7 @@ mod tests_status {
         let cloud_app = AppState::new();
         let notes_job = seed_ledger(&cloud_app);
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 let mut patch = test_projection_patch(&job, sequence, created_at_ms);
                 patch.provenance.provider = "openrouter".to_string();
                 Ok(ProjectionPatchOutcome {
@@ -11213,7 +11264,7 @@ mod tests_status {
         let local_app = AppState::new();
         let notes_job_local = seed_ledger(&local_app);
         let (generator2, _calls2) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 55,
@@ -11253,6 +11304,648 @@ mod tests_status {
         drop(recorded2);
         drain_app_writers(&local_app);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0025 §2g (seed audio-graph-253c part 2): switching
+    /// `projection_movement_facts` from `projection_prompt_shape` to
+    /// `projection_prompt_shape_with_notes` means the data-movement ledger
+    /// records the live notes-state snapshot's char/entry counts for a
+    /// Notes-kind tick that actually has a snapshot — and records NOTHING
+    /// notes-snapshot-derived for a Graph-kind tick, which never carries one
+    /// (`run_projection_job` passes `notes_snapshot: None` for Graph-kind).
+    /// The seeded transcript is a single short turn so `has_rolling_summary`
+    /// stays false, isolating the notes-snapshot signal specifically from the
+    /// unrelated rolling-summary one already covered by the sibling test
+    /// above.
+    #[test]
+    fn run_projection_job_ledgers_notes_snapshot_for_notes_kind_and_omits_it_for_graph_kind() {
+        use crate::persistence::DataClass;
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("movement-facts-notes-snapshot");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let observation = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "movement-facts-notes-span",
+                        1,
+                        "Short single turn.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            schedulers.observe_ledger(&ledger, 10)
+        };
+        let notes_job = match observation.notes {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected notes start job, got {other:?}"),
+        };
+        let graph_job = match observation.graph {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected graph start job, got {other:?}"),
+        };
+
+        // Seed an EXISTING note before either tick, so `run_projection_job`'s
+        // spawn-time clone (`materialized_notes_snapshot_for_session`) has a
+        // real, non-empty snapshot to report.
+        {
+            let mut materialized = app
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let seed_patch = test_projection_patch(&notes_job, 1, 5);
+            materialized
+                .notes
+                .apply_patch(&seed_patch, None)
+                .expect("seed note");
+        }
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 1,
+                })
+            });
+        let openrouter = LlmProvider::OpenRouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: String::new(),
+        };
+        let (dispatch, _event_sink, movements) =
+            projection_dispatch_for_app_with_movement(&app, generator, openrouter, true);
+
+        run_projection_job(dispatch.clone(), notes_job);
+        {
+            let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !recorded.is_empty(),
+                "the Notes-kind tick must record at least one movement event"
+            );
+            assert!(
+                recorded
+                    .iter()
+                    .any(|e| e.data_classes.contains(&DataClass::Notes)),
+                "a Notes-kind tick with an existing snapshot must tag DataClass::Notes \
+                 even with no rolling summary present, got: {recorded:?}"
+            );
+            assert!(
+                recorded.iter().any(|e| e
+                    .counts
+                    .as_ref()
+                    .and_then(|c| c.text_chars)
+                    .is_some_and(|chars| chars > 0)),
+                "the notes snapshot's char count must reach the ledger's text_chars field"
+            );
+        }
+        movements
+            .events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+
+        run_projection_job(dispatch, graph_job);
+        {
+            let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !recorded.is_empty(),
+                "the Graph-kind tick must still record its own movement events"
+            );
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|e| e.data_classes.contains(&DataClass::Notes)),
+                "a Graph-kind tick must never tag DataClass::Notes from a notes \
+                 snapshot it never carries, got: {recorded:?}"
+            );
+        }
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staleness semantics of the SPAWN-time notes-snapshot clone (seed
+    /// audio-graph-253c part 2): `run_projection_job` clones `MaterializedNotes`
+    /// ONCE, before dispatch, and never re-reads it for this tick. A patch that
+    /// applies to the SAME session's notes state between that clone and
+    /// generation — exactly what a second, concurrently-completing projection
+    /// job's apply would do — is acceptable staleness: the generator sees the
+    /// notes state as of spawn, not as of dispatch, and the missed update is
+    /// NOT lost (it stays in the durable materialized state; the NEXT tick's
+    /// spawn picks it up). This pins that behavior with a real race rather
+    /// than asserting it only in prose.
+    #[test]
+    fn run_projection_job_notes_snapshot_is_pinned_at_spawn_not_re_read_at_dispatch() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("notes-snapshot-staleness");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload("staleness-span", 1, "Short single turn.", true),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        let materialized_for_race = app.materialized_projection_state.clone();
+        let captured_snapshot: Arc<Mutex<Option<Option<MaterializedNotes>>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_closure = captured_snapshot.clone();
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, notes, sequence, created_at_ms| {
+                // Record exactly what THIS tick's dispatch received, BEFORE the
+                // concurrent mutation simulated just below.
+                *captured_for_closure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(notes.clone());
+
+                // Simulate a SECOND, concurrently-completing job applying its own
+                // patch to the SAME session between this job's spawn-time clone
+                // and this dispatch.
+                {
+                    let mut materialized = materialized_for_race
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let racing_patch = ProjectionPatch {
+                        sequence: materialized.notes.last_sequence + 1,
+                        kind: ProjectionKind::Notes,
+                        llm_request_id: "racing-patch".to_string(),
+                        basis: job.basis.clone(),
+                        operations: vec![ProjectionOperation::UpsertNote {
+                            id: "note:racing".to_string(),
+                            title: "Racing note".to_string(),
+                            body: "Applied concurrently, mid-dispatch.".to_string(),
+                            tags: vec![],
+                            evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                        }],
+                        confidence: 1.0,
+                        provenance: ProjectionProvenance {
+                            provider: "race".to_string(),
+                            model: "race".to_string(),
+                            prompt_id: "race".to_string(),
+                            route_id: None,
+                            model_source: crate::llm::route::ModelIdentitySource::Requested,
+                        },
+                        route: None,
+                        queued_at_ms: None,
+                        generation_latency_ms: None,
+                        apply_latency_ms: None,
+                        created_at_ms,
+                    };
+                    materialized
+                        .notes
+                        .apply_patch(&racing_patch, None)
+                        .expect("apply racing patch");
+                }
+
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 1,
+                })
+            });
+        let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
+
+        run_projection_job(dispatch, notes_job);
+
+        let received = captured_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("generator was called");
+        let received_notes = received.expect("Notes-kind job must receive Some(snapshot)");
+        assert!(
+            !received_notes.notes.iter().any(|n| n.id == "note:racing"),
+            "the snapshot handed to THIS tick's generator must be pinned at spawn — \
+             it must NOT observe a patch applied by a racing job mid-dispatch"
+        );
+
+        // Self-correcting: the racing note is NOT lost — it is present in the
+        // durable materialized state right now, ready for the NEXT tick's
+        // spawn to pick up.
+        let materialized = app
+            .materialized_projection_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            materialized
+                .notes
+                .notes
+                .iter()
+                .any(|n| n.id == "note:racing"),
+            "the racing job's own apply must not be lost — it is still in the \
+             durable state for the next tick to observe"
+        );
+        drop(materialized);
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Session-pinning of the SPAWN-time notes-snapshot clone (seed
+    /// audio-graph-253c part 2): unlike ordinary same-session staleness
+    /// (pinned above), a snapshot whose session id does not match this job's
+    /// own must NEVER reach the prompt. `run_projection_job` must pass `None`
+    /// — never the (unrelated) OTHER session's notes — for a job whose
+    /// `session_id` a rotation has already outrun by the time it runs (see
+    /// `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`'s
+    /// doc for why: `materialized_projection_state` is one `Arc<Mutex<_>>`
+    /// reused across rotations, not swapped).
+    #[test]
+    fn run_projection_job_omits_notes_snapshot_when_job_session_id_does_not_match_current_state() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("notes-snapshot-wrong-session");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let mut notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload("wrong-session-span", 1, "Short single turn.", true),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        // Seed a note under the REAL (current) session, then hand
+        // `run_projection_job` a job carrying a DIFFERENT session id —
+        // simulating a job spawned for an old session that a rotation has
+        // already replaced by the time it runs.
+        {
+            let mut materialized = app
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let seed_patch = test_projection_patch(&notes_job, 1, 5);
+            materialized
+                .notes
+                .apply_patch(&seed_patch, None)
+                .expect("seed note");
+        }
+        notes_job.session_id = "a-different-session".to_string();
+
+        let captured_notes: Arc<Mutex<Option<Option<MaterializedNotes>>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_closure = captured_notes.clone();
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, notes, sequence, created_at_ms| {
+                *captured_for_closure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(notes);
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 1,
+                })
+            });
+        let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
+
+        run_projection_job(dispatch, notes_job);
+
+        let received = captured_notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("generator was called");
+        assert!(
+            received.is_none(),
+            "a job whose session id does not match the current materialized \
+             state's session must receive None, never the OTHER session's notes"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- coverage-gap closure: the real ExecutorProjectionPatchGenerator ---
+
+    /// Loopback HTTP mock mirroring `llm::executor::tests::spawn_capturing_mock`
+    /// (duplicated here rather than shared — this codebase's convention for
+    /// per-module wire mocks; see `llm::openrouter`, `llm::streaming`, and
+    /// `llm::api_client`'s own separate copies). Serves `responses` (one per
+    /// connection, in order) and captures each request's raw JSON body so a
+    /// test can assert on what a REAL wire call actually carried.
+    async fn spawn_capturing_projection_mock(
+        responses: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_task = captured.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                let mut content_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if header_end.is_none()
+                        && let Some(hdr_end) = total.find("\r\n\r\n")
+                    {
+                        header_end = Some(hdr_end);
+                        content_len = total[..hdr_end]
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok());
+                    }
+                    match (content_len, header_end) {
+                        (Some(cl), Some(hdr_end)) if total.len() - (hdr_end + 4) >= cl => break,
+                        (None, Some(_)) => break,
+                        _ => {}
+                    }
+                }
+                if let Some(hdr_end) = header_end {
+                    let request_body = total[hdr_end + 4..].to_string();
+                    captured_for_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(request_body);
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), captured)
+    }
+
+    /// Closes a coverage gap the audio-graph-253c part-2 review flagged: every
+    /// other `run_projection_job` test in this module drives the
+    /// `FnProjectionPatchGenerator` test double, and the executor-level
+    /// live-wire test
+    /// (`llm::executor::tests::live_executor_dispatch_carries_job_ones_applied_note_id_into_job_twos_wire_request`)
+    /// calls `LlmExecutor::generate_projection_patch` directly — so the ONLY
+    /// production implementer of `ProjectionPatchGenerator`,
+    /// `ExecutorProjectionPatchGenerator`, had zero coverage of its own. This
+    /// test drives the REAL chain end to end: `AppState` ->
+    /// `ProjectionSchedulers::observe_ledger` -> `run_projection_job` ->
+    /// `ExecutorProjectionPatchGenerator::generate_projection_patch` ->
+    /// `LlmExecutor` -> the live worker thread -> `run_projection_patch_dispatch`
+    /// -> a REAL wire call against a loopback mock, with job 1's outcome
+    /// APPLIED by `run_projection_job` itself (exactly as production does)
+    /// before job 2 is scheduled and dispatched.
+    ///
+    /// Revert proof (performed manually during review, not re-executed at
+    /// runtime here): changing `ExecutorProjectionPatchGenerator::generate_projection_patch`
+    /// to forward `None` instead of `notes` makes this test fail the same way
+    /// `llm::executor::tests::live_executor_dispatch_carries_job_ones_applied_note_id_into_job_twos_wire_request`
+    /// fails on `run_projection_patch_dispatch`'s own revert: job 2's captured
+    /// wire body omits `note:decision`.
+    #[test]
+    fn app_state_dispatch_through_real_executor_generator_carries_job_ones_note_into_job_twos_wire_request()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("executor-generator-live-chain");
+        let _guard = DataDirGuard::set(&dir);
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let app = AppState::new();
+
+        let make_client = |base: &str| {
+            crate::llm::ApiClient::new(crate::llm::ApiConfig {
+                endpoint: base.to_string(),
+                api_key: Some("sk-executor-chain-probe".to_string()),
+                model: "probe-model".to_string(),
+                max_tokens: 64,
+                temperature: 0.1,
+            })
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+        };
+        let provider_for = |base: &str| LlmProvider::Api {
+            endpoint: base.to_string(),
+            api_key: "sk-executor-chain-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+
+        // ----- Job 1: first Notes-kind tick, no notes exist yet.
+        let job_one = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "executor-chain-span-1",
+                        1,
+                        "Alice chose Soniox for the pilot.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        let job_one_response = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Provider decision\",\"body\":\"Alice chose Soniox for the pilot.\",\
+        \"tags\":[],\"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"executor-chain-span-1\"}}],\
+        \"confidence\":0.9}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base_one, captured_one) =
+            rt.block_on(spawn_capturing_projection_mock(vec![job_one_response]));
+
+        let executor_one = crate::llm::executor::LlmExecutor::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(make_client(&base_one)))),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let dispatch_one = ProjectionDispatchContext {
+            transcript_ledger: app.transcript_ledger.clone(),
+            projection_schedulers: app.projection_schedulers.clone(),
+            projection_runtime: app.projection_runtime_handle(),
+            projection_job_workers: app.projection_job_workers.clone(),
+            projection_lane_stopping: app.projection_lane_stopping.clone(),
+            event_sink: Arc::new(RecordingProjectionRuntimeEventSink::default()),
+            patch_generator: Arc::new(super::ExecutorProjectionPatchGenerator {
+                llm_executor: executor_one,
+                llm_provider: provider_for(&base_one),
+            }),
+            llm_provider: provider_for(&base_one),
+            llm_allow_cloud_fallbacks: true,
+            data_movement_sink: Arc::new(RecordingProjectionDataMovementSink::default()),
+        };
+
+        run_projection_job(dispatch_one, job_one);
+
+        assert_eq!(
+            captured_one.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "job 1 must reach the wire exactly once through the real \
+             AppState -> ExecutorProjectionPatchGenerator -> LlmExecutor chain"
+        );
+        {
+            let materialized = app
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                materialized
+                    .notes
+                    .notes
+                    .iter()
+                    .any(|note| note.id == "note:decision"),
+                "run_projection_job must apply job 1's patch to the durable \
+                 materialized state, exactly as production does"
+            );
+        }
+
+        // ----- Job 2: a second Notes-kind tick over an extended basis, whose
+        // dispatch must observe job 1's applied note through the SAME live
+        // AppState -> generator -> executor chain.
+        let job_two = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "executor-chain-span-2",
+                        1,
+                        "Bob confirmed the timeline.",
+                        true,
+                    ),
+                ))
+                .expect("seed second transcript span");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 20).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected second notes start job, got {other:?}"),
+            }
+        };
+
+        let job_two_response = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Provider decision\",\"body\":\"Alice chose Soniox for the pilot, confirmed.\",\
+        \"tags\":[],\"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"executor-chain-span-2\"}}],\
+        \"confidence\":0.9}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base_two, captured_two) =
+            rt.block_on(spawn_capturing_projection_mock(vec![job_two_response]));
+
+        let executor_two = crate::llm::executor::LlmExecutor::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(make_client(&base_two)))),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let dispatch_two = ProjectionDispatchContext {
+            transcript_ledger: app.transcript_ledger.clone(),
+            projection_schedulers: app.projection_schedulers.clone(),
+            projection_runtime: app.projection_runtime_handle(),
+            projection_job_workers: app.projection_job_workers.clone(),
+            projection_lane_stopping: app.projection_lane_stopping.clone(),
+            event_sink: Arc::new(RecordingProjectionRuntimeEventSink::default()),
+            patch_generator: Arc::new(super::ExecutorProjectionPatchGenerator {
+                llm_executor: executor_two,
+                llm_provider: provider_for(&base_two),
+            }),
+            llm_provider: provider_for(&base_two),
+            llm_allow_cloud_fallbacks: true,
+            data_movement_sink: Arc::new(RecordingProjectionDataMovementSink::default()),
+        };
+
+        run_projection_job(dispatch_two, job_two);
+
+        let job_two_wire_bodies = captured_two.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            job_two_wire_bodies.len(),
+            1,
+            "job 2 must reach the wire exactly once"
+        );
+        assert!(
+            job_two_wire_bodies[0].contains("note:decision"),
+            "job 2's REAL wire request body must carry job 1's applied note id, \
+             proven through the AppState -> ExecutorProjectionPatchGenerator -> \
+             LlmExecutor -> worker_loop -> run_projection_patch_dispatch chain, \
+             got: {}",
+            job_two_wire_bodies[0]
+        );
+
+        drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11318,7 +12011,7 @@ mod tests_status {
         // including a SERVED model slug that differs from the requested one — the
         // shape `projection_openrouter` now stamps (ADR-0038 defect 3).
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 let mut patch = test_projection_patch(&job, sequence, created_at_ms);
                 patch.provenance.provider = "llm.openrouter".to_string();
                 patch.provenance.model = "anthropic/claude-sonnet-4.5".to_string();
@@ -11452,7 +12145,7 @@ mod tests_status {
         assert!(attempted.requires_cloud_transfer);
 
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, _sequence, _created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, _sequence, _created_at_ms| {
                 Err(format!(
                     "simulated Cerebras dispatch failure for {:?}",
                     job.kind
@@ -11549,7 +12242,7 @@ mod tests_status {
         assert!(attempted.requires_cloud_transfer);
 
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, _sequence, _created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, _sequence, _created_at_ms| {
                 Err(format!(
                     "simulated post-repoint dispatch failure for {:?}",
                     job.kind
@@ -11644,7 +12337,7 @@ mod tests_status {
         assert!(attempted.requires_cloud_transfer);
 
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 let mut patch = test_projection_patch(&job, sequence, created_at_ms);
                 // Generic served identity — NOT sharpened to a pinned
                 // accelerator — so this exercises the ambiguous arm of
@@ -11743,7 +12436,7 @@ mod tests_status {
         };
 
         let (generator, _calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
@@ -11789,7 +12482,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, _sequence, _created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, _sequence, _created_at_ms| {
                 Err(format!("fake generation failure for {:?}", job.kind))
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -11845,8 +12538,8 @@ mod tests_status {
         let mutated = Arc::new(AtomicBool::new(false));
         let ledger_for_mutation = app.transcript_ledger.clone();
         let mutated_for_generator = mutated.clone();
-        let (generator, calls) =
-            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+        let (generator, calls) = FnProjectionPatchGenerator::new(
+            move |job, _ledger, _notes, sequence, created_at_ms| {
                 if job.kind == ProjectionKind::Notes
                     && !mutated_for_generator.swap(true, Ordering::SeqCst)
                 {
@@ -11886,7 +12579,8 @@ mod tests_status {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 41,
                 })
-            });
+            },
+        );
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         {
@@ -11999,7 +12693,7 @@ mod tests_status {
 
         let app = AppState::new();
         let (generator, calls) =
-            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 37,

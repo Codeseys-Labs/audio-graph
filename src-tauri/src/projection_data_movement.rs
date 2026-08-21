@@ -65,6 +65,33 @@ pub struct ProjectionMovementFacts {
     /// Char count of the pinned typed-fact block (graph-derived context). 0
     /// when absent.
     pub pinned_fact_chars: u64,
+    /// Char count of the Notes-kind live notes-state snapshot block (seed
+    /// audio-graph-253c part 2) — content-free like every other field here:
+    /// a count only, never the note text itself. 0 for a Graph-kind call, when
+    /// no snapshot was available for this tick, OR when a snapshot was
+    /// available but held zero notes — a fresh session's first Notes tick
+    /// still renders a static "(no notes yet)" block into the prompt
+    /// (`projection_llm`'s prompt builder), but that block is boilerplate with
+    /// no note content, so this field (and `notes_snapshot_entries`) reports 0
+    /// rather than counting it (see
+    /// `projection_llm::ProjectionPromptShape::notes_snapshot_chars`, which
+    /// this is copied from).
+    pub notes_snapshot_chars: u64,
+    /// Number of existing notes rendered into the snapshot block. 0 under the
+    /// same conditions as `notes_snapshot_chars`.
+    ///
+    /// NOTE (audio-graph-253c part 2 review): unlike `notes_snapshot_chars`
+    /// (which folds into the durable ledger's `text_chars` via
+    /// [`movement_counts`]), this field has no sink in
+    /// [`crate::persistence::DataMovementEvent`] — `MovementCounts` (the
+    /// `audio-graph-ipc-contract` crate) has no entry-count field, and adding
+    /// one is an ipc-contract schema change this seed deliberately stayed out
+    /// of. It is populated and unit-tested at the `ProjectionMovementFacts`
+    /// level only (in-memory observability of the ADR-0025 §2g compliance
+    /// contract this module enforces), not persisted. If the durable ledger
+    /// ever needs an entry count alongside `text_chars`, that is a follow-up
+    /// ipc-contract change, not a bug in this field.
+    pub notes_snapshot_entries: u32,
     /// Total input token count as reported by the provider (0 when unknown).
     pub tokens_in: u64,
     /// Total output token count (0 when unknown).
@@ -116,8 +143,12 @@ fn resolved_destination(
 fn data_classes(facts: &ProjectionMovementFacts, remote: bool) -> Vec<DataClass> {
     let mut classes = vec![DataClass::Prompts, DataClass::TranscriptText];
     if remote {
-        if facts.has_rolling_summary {
-            // Rolling summary is transcript-derived note text.
+        if facts.has_rolling_summary || facts.notes_snapshot_chars > 0 {
+            // Rolling summary is transcript-derived note text; the live
+            // Notes-kind snapshot block (seed audio-graph-253c part 2) is
+            // literally the materialized notes state — both are `Notes`
+            // class content, so a call carrying either (or both) is tagged
+            // once, not doubled.
             classes.push(DataClass::Notes);
         }
         if facts.pinned_fact_chars > 0 {
@@ -129,13 +160,18 @@ fn data_classes(facts: &ProjectionMovementFacts, remote: bool) -> Vec<DataClass>
 }
 
 fn movement_counts(facts: &ProjectionMovementFacts) -> MovementCounts {
+    // `text_chars` sums every text-bearing block's char count into the one
+    // existing ledger field rather than adding a new one (seed
+    // audio-graph-253c part 2 deliberately makes no ipc-contract schema
+    // change — `notes_snapshot_chars`/`notes_snapshot_entries` stay internal
+    // to `ProjectionMovementFacts`, which callers/tests can still inspect
+    // directly).
+    let text_chars = facts
+        .pinned_fact_chars
+        .saturating_add(facts.notes_snapshot_chars);
     MovementCounts {
         audio_ms: None,
-        text_chars: if facts.pinned_fact_chars > 0 {
-            Some(facts.pinned_fact_chars)
-        } else {
-            None
-        },
+        text_chars: (text_chars > 0).then_some(text_chars),
         tokens_in: (facts.tokens_in > 0).then_some(facts.tokens_in),
         tokens_out: (facts.tokens_out > 0).then_some(facts.tokens_out),
         bytes: None,
@@ -253,6 +289,8 @@ mod tests {
             has_rolling_summary: true,
             has_cached_prefix: true,
             pinned_fact_chars: 120,
+            notes_snapshot_chars: 0,
+            notes_snapshot_entries: 0,
             tokens_in: 300,
             tokens_out: 80,
         }
@@ -339,5 +377,77 @@ mod tests {
         let event = build_started_event(&cloud_facts());
         assert_eq!(event.event_type, DataMovementEventType::ProviderCallStarted);
         assert_eq!(event.result.status, MovementStatus::Started);
+    }
+
+    // ----- audio-graph-253c part 2: live notes-state snapshot ledgering ----
+
+    /// A Notes-kind call carrying a live notes snapshot tags `DataClass::Notes`
+    /// and folds the snapshot's char count into the existing `text_chars`
+    /// ledger field, even when NO rolling summary is present — the two
+    /// conditions are independent triggers for the same class (seed
+    /// audio-graph-253c part 2: without this, the notes-snapshot block leaves
+    /// the device unledgered once `speech/mod.rs` is wired to it).
+    #[test]
+    fn notes_snapshot_alone_records_notes_class_and_folds_into_text_chars() {
+        let mut facts = cloud_facts();
+        facts.has_rolling_summary = false;
+        facts.pinned_fact_chars = 0;
+        facts.notes_snapshot_chars = 240;
+        facts.notes_snapshot_entries = 5;
+
+        let event = build_terminal_event(&facts, true, None);
+        assert!(
+            event.data_classes.contains(&DataClass::Notes),
+            "a live notes snapshot must tag DataClass::Notes even with no rolling summary"
+        );
+        let counts = event.counts.expect("counts present");
+        assert_eq!(
+            counts.text_chars,
+            Some(240),
+            "the snapshot's char count must reach the ledger's existing text_chars field"
+        );
+        // Content-free: only the count, never note titles/bodies, in the
+        // serialized event.
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(!json.contains("note:"));
+    }
+
+    /// A Graph-kind call (or a Notes-kind call with no snapshot available)
+    /// carries zero notes-snapshot facts and must not spuriously tag
+    /// `DataClass::Notes` or inflate `text_chars` on their account.
+    #[test]
+    fn zero_notes_snapshot_facts_do_not_tag_notes_class() {
+        let mut facts = cloud_facts();
+        facts.has_rolling_summary = false;
+        facts.pinned_fact_chars = 0;
+        facts.notes_snapshot_chars = 0;
+        facts.notes_snapshot_entries = 0;
+
+        let event = build_terminal_event(&facts, true, None);
+        assert!(!event.data_classes.contains(&DataClass::Notes));
+        assert!(event.counts.expect("counts present").text_chars.is_none());
+    }
+
+    /// Both a rolling summary AND a live notes snapshot present must still
+    /// tag `DataClass::Notes` exactly once (not doubled) and sum both char
+    /// counts into `text_chars` alongside the pinned facts.
+    #[test]
+    fn rolling_summary_and_notes_snapshot_together_sum_into_one_text_chars_count() {
+        let mut facts = cloud_facts(); // has_rolling_summary: true, pinned_fact_chars: 120
+        facts.notes_snapshot_chars = 60;
+        facts.notes_snapshot_entries = 2;
+
+        let event = build_terminal_event(&facts, true, None);
+        assert_eq!(
+            event
+                .data_classes
+                .iter()
+                .filter(|c| **c == DataClass::Notes)
+                .count(),
+            1,
+            "DataClass::Notes must appear exactly once regardless of how many \
+             notes-bearing conditions are true"
+        );
+        assert_eq!(event.counts.expect("counts present").text_chars, Some(180));
     }
 }

@@ -1,20 +1,21 @@
 //! Structured LLM output contract for notes/graph projection patches.
 //!
 //! This module owns prompt construction, model-output parsing, and trusted
-//! patch construction. Runtime scheduler dispatch already calls into this
-//! module from live ASR ingestion today (`llm/executor.rs`'s
-//! `run_projection_patch_dispatch`, reached from `speech/mod.rs`'s
-//! `run_projection_job` on every basis-bound projection tick) — dispatch was
-//! NOT deferred to a later slice. What IS still pending, at the time of seed
-//! audio-graph-253c, is threading the live `MaterializedNotes` state into
-//! that one production call site: the (job, ledger) inputs this module's
-//! builders take carry no notes state, and the plumbing to add it (a new
-//! field on `LlmJob::ProjectionPatch`, a widened `generate_projection_patch`
-//! signature, and updating `ExecutorProjectionPatchGenerator`'s call site) all
-//! cross into `speech/mod.rs`, which is owned by a separate in-flight
-//! workflow. Until that plumbing lands, callers pass `None` for the notes
-//! parameter and get a prompt with no notes-state assertion at all, rather
-//! than a fabricated one.
+//! patch construction. Runtime scheduler dispatch calls into this module from
+//! live ASR ingestion (`llm/executor.rs`'s `run_projection_patch_dispatch`,
+//! reached from `speech/mod.rs`'s `run_projection_job` on every basis-bound
+//! projection tick). As of seed audio-graph-253c part 2, that live dispatch
+//! path also threads the real `MaterializedNotes` state through: each Notes-
+//! kind tick clones the current materialization under `AppState`'s
+//! `materialized_projection_state` lock (`run_projection_job`), carries it
+//! through `LlmJob::ProjectionPatch` -> `generate_projection_patch` ->
+//! `run_projection_patch_dispatch`, and passes `Some(&snapshot)` into the
+//! builders below. `None` still reaches these builders in two cases: a
+//! Graph-kind job (which never renders the notes block regardless), or a
+//! Notes-kind snapshot whose session id did not match the job's own (see
+//! `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`) — both
+//! omit the "Current notes state" block rather than asserting a fabricated
+//! one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -697,14 +698,14 @@ pub fn projection_prompt_shape(
 
 /// Widened form of [`projection_prompt_shape`] that also accounts for the
 /// Notes-kind live notes-state snapshot (seed audio-graph-253c). Kept as a
-/// separate function, additive to the existing `projection_prompt_shape`,
-/// because the one production caller of the data-movement shape
-/// (`speech/mod.rs`'s `projection_movement_facts`) is owned by a separate
-/// in-flight workflow (the same `speech/mod.rs` fence
-/// [`projection_patch_prompt_messages`]'s doc comment describes) — this
-/// function exists so that caller can adopt the `notes_snapshot_*` fields by
-/// switching call targets, without this module reaching across the fence to
-/// widen the existing call site's argument list itself.
+/// separate function, additive to the existing `projection_prompt_shape`
+/// (which has exactly one caller left at HEAD — a test pinning the
+/// notes-blind shape below — and zero production callers), rather than
+/// changing that function's signature in place. As of seed audio-graph-253c
+/// part 2, `speech/mod.rs`'s `projection_movement_facts` — the data-movement
+/// ledger's one production caller of this shape — calls THIS function with
+/// the real live-dispatch snapshot, so
+/// `notes_snapshot_chars`/`notes_snapshot_entries` reach the ledger.
 pub fn projection_prompt_shape_with_notes(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
@@ -737,13 +738,15 @@ pub fn projection_prompt_shape_with_notes(
 /// [`render_notes_snapshot`]) for `ProjectionKind::Notes` jobs — an empty
 /// `MaterializedNotes` there is a truthful "no notes yet" (the caller
 /// affirmatively knows the session has none). `None` means the caller cannot
-/// currently supply the real notes state (as of this seed, the one
-/// production call site in `llm/executor.rs` cannot reach
-/// `AppState::materialized_projection_state` — see this module's top-of-file
-/// doc) and OMITS the block entirely rather than rendering a fabricated
-/// "(no notes yet)" that would be indistinguishable from a real empty
-/// session and would license the model to mint ids as if none existed. Graph
-/// kind never renders this block regardless of `notes` (seed e700's lane).
+/// currently supply the real notes state — the live production call site
+/// (`llm/executor.rs`'s `run_projection_patch_dispatch`) passes `None` only
+/// for a Graph-kind job or a Notes-kind snapshot that failed the session-
+/// identity check (see this module's top-of-file doc and
+/// `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`) — and
+/// OMITS the block entirely rather than rendering a fabricated "(no notes
+/// yet)" that would be indistinguishable from a real empty session and would
+/// license the model to mint ids as if none existed. Graph kind never renders
+/// this block regardless of `notes` (seed e700's lane).
 pub fn projection_patch_prompt_messages(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
@@ -765,13 +768,25 @@ pub fn projection_patch_prompt_messages(
     let pinned_facts = pinned_typed_facts(&events);
 
     let operation_guidance = match job.kind {
+        // NOTE: this text lives in the byte-stable prefix (`[0]` above), so it
+        // must stay the SAME string regardless of this tick's runtime
+        // `notes.is_some()` — branching on that here would leak a per-tick
+        // variable into the theoretically-stable system message and bust the
+        // cache prefix (ADR-0025 §2d). It is phrased to stay honest either
+        // way instead: a conditional "if a block appears" claim, not an
+        // unconditional "this prompt includes" claim, since the "Current
+        // notes state" block is only rendered below when `notes` is `Some`
+        // (see the doc comment above and this function's `notes == None`
+        // comment further down).
         ProjectionKind::Notes => {
-            "Use only upsert_note, delete_note, and reorder_note operations. This prompt \
-             includes a \"Current notes state\" block listing every existing note's id, \
-             title, and a one-line body summary. Check that block before minting an id: if a \
-             note there already covers this topic, upsert_note with THAT SAME id to refine it \
-             in place; only use an id absent from that block when the note is genuinely new. \
-             Keep stable note ids when refining earlier notes."
+            "Use only upsert_note, delete_note, and reorder_note operations. If a \"Current \
+             notes state\" block appears below, it lists every existing note's id, title, and \
+             a one-line body summary — check it before minting an id: if a note there already \
+             covers this topic, upsert_note with THAT SAME id to refine it in place; only use \
+             an id absent from that block when the note is genuinely new. If no such block \
+             appears, you have no visibility into already-existing note ids this tick, so only \
+             mint a new id when you are confident this is a genuinely new topic. Keep stable \
+             note ids when refining earlier notes."
         }
         ProjectionKind::Graph => {
             "Use only graph operations: upsert_graph_node, remove_graph_node, invalidate_graph_node, upsert_graph_edge, remove_graph_edge, invalidate_graph_edge, strengthen_graph_edge, weaken_graph_edge, merge_graph_nodes, and split_graph_node. Upsert nodes before edges that reference them. Prefer retcon operations over duplicate nodes when later transcript context corrects earlier assumptions."
@@ -883,13 +898,13 @@ pub fn projection_patch_prompt_messages(
 /// helper's `&[TranscriptEvent]`-only seam intact. The Notes-kind live notes
 /// snapshot (seed audio-graph-253c) is a SEPARATE block, rendered by
 /// [`render_notes_snapshot`] from the `notes: Option<&MaterializedNotes>`
-/// parameter [`projection_patch_prompt_messages`] now takes. That parameter
-/// closes the seam this doc comment used to describe as unclosed ONLY when a
-/// caller passes `Some` — the one production call site as of this seed still
-/// passes `None` (see this module's top-of-file doc), so the seam remains
-/// open in practice pending the `speech/mod.rs` plumbing that seed needs. A
-/// live graph snapshot for the Graph kind remains a later pillar (seed e700
-/// owns that lane's problems).
+/// parameter [`projection_patch_prompt_messages`] takes. As of seed
+/// audio-graph-253c part 2 the live production dispatch path passes
+/// `Some(&snapshot)` for every Notes-kind tick that can confirm its own
+/// session identity (see this module's top-of-file doc), closing the seam
+/// this doc comment used to describe as open in practice. A live graph
+/// snapshot for the Graph kind remains a later pillar (seed e700 owns that
+/// lane's problems).
 fn pinned_typed_facts(events: &[TranscriptEvent]) -> Vec<String> {
     // First-appearance order (NOT sorted): a newly-seen speaker appends at the
     // tail, so the block stays append-only across turns and the stable-prefix
@@ -2368,9 +2383,10 @@ mod tests {
         );
     }
 
-    /// `notes: None` (the caller does not actually have the live notes
-    /// state — as of this seed, the one production call site in
-    /// `llm/executor.rs` cannot reach it) must OMIT the notes-state message
+    /// `notes: None` (the caller does not actually have the live notes state
+    /// for this tick — e.g. a Graph-kind job, or a Notes-kind snapshot that
+    /// failed the session-identity check in `llm/executor.rs`'s live
+    /// dispatch path) must OMIT the notes-state message
     /// entirely for a Notes-kind job, never render a fabricated "(no notes
     /// yet)" body. A fabricated empty block is indistinguishable from a real
     /// empty session and would license the model to mint ids as if none

@@ -506,6 +506,42 @@ impl ProjectionRuntimeHandle {
         }
     }
 
+    /// Clone-and-release the CURRENT `MaterializedNotes` for one session, for
+    /// threading into a live Notes projection prompt (seed audio-graph-253c
+    /// part 2). Locks `materialized_projection_state` — the SAME lock
+    /// `next_projection_sequence`/`materialized_projection_snapshot` already
+    /// take — clones just the `notes` field (not the whole
+    /// `MaterializedProjectionState`, which would also clone the unrelated
+    /// `graph` half for a Notes-kind job that never reads it), and releases
+    /// the lock before returning. Callers must never hold this guard across
+    /// their own enqueue/dispatch call.
+    ///
+    /// Session-pinned: `expected_session_id` should be the CALLING job's own
+    /// `session_id`. `materialized_projection_state` is one `Arc<Mutex<_>>`
+    /// shared for the lifetime of the runtime handle; a session rotation
+    /// resets its CONTENTS in place (`AppState::rotate_session`) rather
+    /// than swapping the `Arc`, so a projection job thread for the OLD
+    /// session that is still mid-flight when a rotation lands would otherwise
+    /// read the NEW session's (unrelated) notes through this same accessor.
+    /// Returning `None` on a session mismatch is a content-safety choice, not
+    /// a staleness one: a same-session snapshot that is merely a few ticks
+    /// old is fine (self-correcting next tick — see the prompt builder's own
+    /// docs), but a WRONG-session snapshot must never be fed into this job's
+    /// prompt as if it were this session's own state.
+    pub fn materialized_notes_snapshot_for_session(
+        &self,
+        expected_session_id: &str,
+    ) -> Option<MaterializedNotes> {
+        let materialized = match self.materialized_projection_state.lock() {
+            Ok(materialized) => materialized,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if materialized.session_id != expected_session_id {
+            return None;
+        }
+        Some(materialized.notes.clone())
+    }
+
     pub fn apply_runtime_projection_patch(
         &self,
         expected_session_id: &str,

@@ -170,6 +170,11 @@ struct QueueState {
 /// exactly ONE authorized route (`llm/route.rs`). There is no per-job
 /// fallback-policy flag: ADR-0038 removed automatic cross-provider fallback, so
 /// there is nothing for a flag to select.
+// `ProjectionPatch` now carries an `Option<MaterializedNotes>` (seed
+// audio-graph-253c part 2), widening the size gap against `Extract`/`Chat`;
+// boxing it would ripple through every construction/match site for
+// negligible benefit (same tradeoff `LlmJobResult` already accepted below).
+#[allow(clippy::large_enum_variant)]
 enum LlmJob {
     Extract {
         text: String,
@@ -187,6 +192,14 @@ enum LlmJob {
     ProjectionPatch {
         job: ProjectionJob,
         ledger: TranscriptLedger,
+        /// Live Notes-kind notes snapshot (seed audio-graph-253c part 2),
+        /// cloned by the caller under `AppState`'s
+        /// `materialized_projection_state` lock at job-spawn time — never
+        /// re-read from that lock by this executor. `None` for a Graph-kind
+        /// job (which never renders the notes block) or when a Notes-kind
+        /// caller could not confirm the snapshot belonged to this job's own
+        /// session (see `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`).
+        notes: Option<MaterializedNotes>,
         sequence: u64,
         created_at_ms: u64,
         provider: LlmProvider,
@@ -341,10 +354,17 @@ impl LlmExecutor {
     /// Runtime projection dispatch calls this from live ASR observation after
     /// the scheduler starts a basis-bound job. Callers must still validate and
     /// apply the returned patch through `AppState::apply_runtime_projection_patch`.
+    ///
+    /// `notes` is the live Notes-kind snapshot (seed audio-graph-253c part 2),
+    /// cloned by the caller BEFORE this call — this executor never reaches
+    /// back into `AppState` for it. `Some(&materialized)` renders the "Current
+    /// notes state" prompt block via `projection_patch_prompt_messages`;
+    /// `None` omits it rather than asserting a fabricated "no notes yet".
     pub fn generate_projection_patch(
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
+        notes: Option<MaterializedNotes>,
         provider: LlmProvider,
         sequence: u64,
         created_at_ms: u64,
@@ -355,6 +375,7 @@ impl LlmExecutor {
             LlmJob::ProjectionPatch {
                 job,
                 ledger,
+                notes,
                 sequence,
                 created_at_ms,
                 provider,
@@ -470,6 +491,7 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
             LlmJob::ProjectionPatch {
                 job,
                 ledger,
+                notes,
                 sequence,
                 created_at_ms,
                 provider,
@@ -480,6 +502,7 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
                     &provider,
                     &job,
                     &ledger,
+                    notes.as_ref(),
                     sequence,
                     created_at_ms,
                 );
@@ -686,6 +709,7 @@ fn run_projection_patch(
     provider: &LlmProvider,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     sequence: u64,
     created_at_ms: u64,
 ) -> ProjectionPatchAttempt {
@@ -695,6 +719,7 @@ fn run_projection_patch(
         provider,
         job,
         ledger,
+        notes,
         sequence,
         created_at_ms,
         &mut attempted_route,
@@ -705,39 +730,35 @@ fn run_projection_patch(
     }
 }
 
+// 8 params since the notes-snapshot wiring (seed audio-graph-253c part 2)
+// pushed this one over clippy's default threshold of 7; bundling would
+// obscure the out-param contract documented above.
+#[allow(clippy::too_many_arguments)]
 fn run_projection_patch_dispatch(
     handles: &BackendHandles,
     provider: &LlmProvider,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     sequence: u64,
     created_at_ms: u64,
     attempted_route: &mut Option<AttemptedRouteIdentity>,
 ) -> Result<ProjectionPatchOutcome, String> {
     let route = authorize_and_budget_route_dispatch(handles, provider)
         .map_err(|error| error.to_string())?;
-    // No live-notes snapshot at this call site (seed audio-graph-253c): this
-    // IS the live production dispatch path (`generate_projection_patch`'s own
-    // doc says as much: "Runtime projection dispatch calls this from live ASR
-    // observation"; the full chain runs speech/mod.rs's
-    // `spawn_projection_job` -> `run_projection_job` ->
-    // `ExecutorProjectionPatchGenerator::generate_projection_patch` -> here),
-    // it is just not yet wired to carry the real `MaterializedNotes`. That
-    // notes state already exists one accessor away at the caller
-    // (`ProjectionRuntimeHandle::materialized_projection_snapshot`, `state.rs`,
-    // sitting right next to `transcript_ledger_snapshot` which supplies
-    // `ledger` above) — but threading it here needs a new field on
-    // `LlmJob::ProjectionPatch`, a widened `generate_projection_patch`
-    // signature, and updating `ExecutorProjectionPatchGenerator`'s call site,
-    // all of which live in `speech/mod.rs`, owned by a separate in-flight
-    // workflow (see this module's `projection_llm` sibling's top-of-file
-    // doc). Passing `None` here — rather than an empty `MaterializedNotes` —
-    // means the Notes-kind prompt OMITS the "Current notes state" block
+    // Live-notes snapshot wiring (seed audio-graph-253c part 2): `notes` is
+    // whatever the caller cloned under `AppState`'s
+    // `materialized_projection_state` lock at job-spawn time
+    // (`ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`),
+    // threaded all the way down through `LlmJob::ProjectionPatch` ->
+    // `generate_projection_patch` -> here. `None` means either a Graph-kind
+    // job (which never renders the notes block) or a Notes-kind caller that
+    // could not confirm the snapshot belonged to this job's own session — in
+    // both cases the Notes-kind prompt OMITS the "Current notes state" block
     // entirely instead of asserting a false "(no notes yet)": an empty
     // snapshot is indistinguishable from a real empty session and would
     // license the model to mint ids as if none existed, which is the same
     // overwrite-storm failure mode this seed exists to fix.
-    let notes: Option<&MaterializedNotes> = None;
     let messages =
         projection_patch_prompt_messages(job, ledger, notes).map_err(|e| e.to_string())?;
     let cache_context = ProjectionCacheContext {
@@ -2482,6 +2503,72 @@ mod tests {
         (format!("http://{}", addr), count)
     }
 
+    /// Like [`spawn_counting_mock`], but also captures each request's raw
+    /// JSON body (seed audio-graph-253c part 2's live-dispatch-path proof
+    /// needs to inspect what a REAL wire call actually carried, not just how
+    /// many calls were made). Bodies are captured in arrival order, so
+    /// `captured[0]` is the first request's body, `captured[1]` the second's,
+    /// etc.
+    async fn spawn_capturing_mock(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_task = captured.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                let mut content_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if header_end.is_none()
+                        && let Some(hdr_end) = total.find("\r\n\r\n")
+                    {
+                        header_end = Some(hdr_end);
+                        content_len = total[..hdr_end]
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok());
+                    }
+                    match (content_len, header_end) {
+                        (Some(cl), Some(hdr_end)) if total.len() - (hdr_end + 4) >= cl => break,
+                        (None, Some(_)) => break,
+                        _ => {}
+                    }
+                }
+                if let Some(hdr_end) = header_end {
+                    let request_body = total[hdr_end + 4..].to_string();
+                    captured_for_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(request_body);
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), captured)
+    }
+
     fn handles_with_only_api_client(endpoint: &str) -> BackendHandles {
         let client = ApiClient::new(crate::llm::ApiConfig {
             endpoint: endpoint.to_string(),
@@ -2537,7 +2624,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let attempt = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
         })
         .join()
         .expect("worker thread panic");
@@ -2596,7 +2683,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let err = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2656,7 +2743,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let outcome = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2705,7 +2792,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let outcome = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2747,7 +2834,7 @@ mod tests {
             model: "gpt-oss-120b".to_string(),
         };
 
-        let attempt = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, 1, 100);
+        let attempt = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, None, 1, 100);
         let err = attempt
             .outcome
             .expect_err("a re-pointed client must fail closed");
@@ -2833,6 +2920,164 @@ mod tests {
     }
 
     // ----- end-to-end through the live worker thread -----------------------
+
+    /// The field-bug kill shot at the REAL executor dispatch path (seed
+    /// audio-graph-253c part 2). Drives two Notes-kind projection jobs through
+    /// the ACTUAL `LlmExecutor` — `generate_projection_patch` -> `enqueue` ->
+    /// the live `worker_loop` thread -> `run_projection_patch` ->
+    /// `run_projection_patch_dispatch` -> `projection_patch_prompt_messages`
+    /// -> a REAL wire call against a loopback mock — with job 1's outcome
+    /// APPLIED to a `MaterializedNotes` in between, exactly what the
+    /// scheduler's apply path does in production. Asserts job 2's ACTUAL WIRE
+    /// REQUEST BODY (not just the pure prompt builder — part 1's
+    /// `overwrite_storm_regression_next_job_prompt_contains_ids_from_previous_applied_patch`
+    /// in `projection_llm.rs` already proved that layer) carries job 1's
+    /// applied note id.
+    ///
+    /// Revert proof: hardcoding `run_projection_patch_dispatch`'s `notes`
+    /// back to `let notes: Option<&MaterializedNotes> = None;` (the pre-part-2
+    /// production behavior) makes this test fail, because job 2's prompt then
+    /// omits the "Current notes state" block entirely and the wire request
+    /// never carries `note:decision`.
+    #[test]
+    fn live_executor_dispatch_carries_job_ones_applied_note_id_into_job_twos_wire_request() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+
+        let mut ledger = TranscriptLedger::new("session-livewire");
+        ledger
+            .apply_event(projection_test_event(
+                "span-1",
+                "Alice chose Soniox for the pilot.",
+            ))
+            .expect("seed ledger");
+
+        // ----- Job 1: no notes exist yet (a real, empty MaterializedNotes for
+        // this session — what `materialized_notes_snapshot_for_session`
+        // returns on the first tick, NOT `None`).
+        let job_one_response = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Provider decision\",\"body\":\"Alice chose Soniox for the pilot.\",\
+        \"tags\":[],\"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"span-1\"}}],\
+        \"confidence\":0.9}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base_one, captured_one) = rt.block_on(spawn_capturing_mock(vec![job_one_response]));
+
+        let make_client = |base: &str| {
+            ApiClient::new(crate::llm::ApiConfig {
+                endpoint: base.to_string(),
+                api_key: Some("sk-livewire-probe".to_string()),
+                model: "probe-model".to_string(),
+                max_tokens: 64,
+                temperature: 0.1,
+            })
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+        };
+        let provider_for = |base: &str| LlmProvider::Api {
+            endpoint: base.to_string(),
+            api_key: "sk-livewire-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+
+        let executor_one = LlmExecutor::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(make_client(&base_one)))),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let job_one = ProjectionJob {
+            id: "projection:session-livewire:notes:1".to_string(),
+            session_id: "session-livewire".to_string(),
+            kind: ProjectionKind::Notes,
+            basis: ledger.current_basis(),
+            priority: ProjectionPriority::Realtime,
+            queued_at_ms: 10,
+        };
+        let empty_notes = crate::projections::MaterializedNotes::new("session-livewire");
+
+        let attempt_one = executor_one.generate_projection_patch(
+            job_one,
+            ledger.clone(),
+            Some(empty_notes),
+            provider_for(&base_one),
+            1,
+            100,
+        );
+        let outcome_one = attempt_one.outcome.expect("job 1's draft succeeds");
+        assert_eq!(
+            captured_one.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "job 1 must reach the wire exactly once"
+        );
+
+        // Apply job 1's patch — the SAME effect the scheduler's apply path
+        // has on `AppState::materialized_projection_state` in production.
+        let mut notes_after_job_one =
+            crate::projections::MaterializedNotes::new("session-livewire");
+        notes_after_job_one
+            .apply_patch(&outcome_one.patch, None)
+            .expect("apply job 1's patch");
+        assert!(
+            notes_after_job_one
+                .notes
+                .iter()
+                .any(|note| note.id == "note:decision"),
+            "job 1's patch must have introduced note:decision"
+        );
+
+        // ----- Job 2: dispatched with job 1's resulting notes snapshot.
+        let job_two_response = serde_json::json!({
+            "choices": [{
+                "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+        \"id\":\"note:decision\",\"title\":\"Provider decision\",\"body\":\"Alice chose Soniox for the pilot, confirmed.\",\
+        \"tags\":[],\"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"span-1\"}}],\
+        \"confidence\":0.9}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let (base_two, captured_two) = rt.block_on(spawn_capturing_mock(vec![job_two_response]));
+
+        let executor_two = LlmExecutor::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(make_client(&base_two)))),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let job_two = ProjectionJob {
+            id: "projection:session-livewire:notes:2".to_string(),
+            session_id: "session-livewire".to_string(),
+            kind: ProjectionKind::Notes,
+            basis: ledger.current_basis(),
+            priority: ProjectionPriority::Realtime,
+            queued_at_ms: 20,
+        };
+
+        let attempt_two = executor_two.generate_projection_patch(
+            job_two,
+            ledger,
+            Some(notes_after_job_one),
+            provider_for(&base_two),
+            2,
+            200,
+        );
+        attempt_two.outcome.expect("job 2's draft succeeds");
+
+        let requests_two = captured_two.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            requests_two.len(),
+            1,
+            "job 2 must reach the wire exactly once"
+        );
+        assert!(
+            requests_two[0].contains("note:decision"),
+            "job 2's ACTUAL WIRE REQUEST must carry job 1's applied note id — got: {}",
+            requests_two[0]
+        );
+    }
 
     #[test]
     fn executor_chat_with_no_backends_returns_err_not_panic() {

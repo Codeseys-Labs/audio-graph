@@ -7,9 +7,9 @@
 
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulers};
 use crate::projections::{
-    DiarizationSpanRevision, MaterializedProjectionState, ProjectionApplyError, ProjectionJob,
-    ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptEvent, TranscriptLedger,
-    TranscriptLedgerError,
+    DiarizationSpanRevision, MaterializedNotes, MaterializedProjectionState, ProjectionApplyError,
+    ProjectionJob, ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptEvent,
+    TranscriptLedger, TranscriptLedgerError,
 };
 
 const TWO_SPAN_REPAIR_FIXTURE_JSON: &str =
@@ -187,7 +187,7 @@ pub fn run_offline_projection_fixture(
     run_offline_projection_replay(
         fixture.session_id,
         fixture.steps,
-        move |job, _ledger, sequence, created_at_ms| {
+        move |job, _ledger, _notes, sequence, created_at_ms| {
             let Some(plan) = generated_patches.next() else {
                 return Err(format!(
                     "fixture did not provide a generated {:?} patch for job {}",
@@ -253,6 +253,13 @@ pub fn summarize_offline_projection_fixture_costs(
     summary
 }
 
+/// `generator`'s third parameter is the live Notes-kind notes snapshot (seed
+/// audio-graph-253c part 2), mirroring the production
+/// `ProjectionPatchGenerator::generate_projection_patch` signature. This
+/// harness can supply a REAL one trivially — `complete_kind` below already
+/// holds the replay's own `MaterializedProjectionState` in scope at the exact
+/// point it calls `generator`, so it passes `Some(&materialized.notes)`
+/// rather than `None` with an unwired excuse.
 pub fn run_offline_projection_replay<G>(
     session_id: impl Into<String>,
     steps: impl IntoIterator<Item = OfflineProjectionReplayStep>,
@@ -262,6 +269,7 @@ where
     G: FnMut(
         &ProjectionJob,
         &TranscriptLedger,
+        Option<&MaterializedNotes>,
         u64,
         u64,
     ) -> Result<OfflineProjectionPatchOutcome, String>,
@@ -408,6 +416,7 @@ fn complete_kind<G>(
     G: FnMut(
         &ProjectionJob,
         &TranscriptLedger,
+        Option<&MaterializedNotes>,
         u64,
         u64,
     ) -> Result<OfflineProjectionPatchOutcome, String>,
@@ -421,7 +430,13 @@ fn complete_kind<G>(
     };
 
     *sequence = sequence.saturating_add(1);
-    let generated = generator(&job, ledger, *sequence, now_ms);
+    // Notes-kind only, mirroring production (`run_projection_job`): a
+    // Graph-kind job never renders the notes block, so it carries nothing.
+    let notes = match kind {
+        ProjectionKind::Notes => Some(&materialized.notes),
+        ProjectionKind::Graph => None,
+    };
+    let generated = generator(&job, ledger, notes, *sequence, now_ms);
     match generated {
         Ok(outcome) => {
             metrics.generated_patch_count += 1;
@@ -786,7 +801,7 @@ mod tests {
                 },
                 OfflineProjectionReplayStep::CompleteNotes { now_ms: 1_200 },
             ],
-            |job, ledger, sequence, created_at_ms| {
+            |job, ledger, notes, sequence, created_at_ms| {
                 let started = Instant::now();
                 // `attempted_route` is unused here: this is an offline replay
                 // smoke test, not the live ledger path, so there is no
@@ -796,6 +811,7 @@ mod tests {
                     .generate_projection_patch(
                         job.clone(),
                         ledger.clone(),
+                        notes.cloned(),
                         provider.clone(),
                         sequence,
                         created_at_ms,
@@ -942,7 +958,7 @@ mod tests {
                 OfflineProjectionReplayStep::CompleteAll { now_ms: 1_200 },
                 OfflineProjectionReplayStep::CompleteAll { now_ms: 1_400 },
             ],
-            |job, _ledger, sequence, created_at_ms| {
+            |job, _ledger, _notes, sequence, created_at_ms| {
                 calls.push((
                     job.kind.clone(),
                     job.priority.clone(),
@@ -1406,7 +1422,7 @@ mod tests {
                 },
                 OfflineProjectionReplayStep::CompleteNotes { now_ms: 1_400 },
             ],
-            |job, _ledger, sequence, created_at_ms| {
+            |job, _ledger, _notes, sequence, created_at_ms| {
                 Ok(OfflineProjectionPatchOutcome {
                     patch: patch_for_job(job, sequence, created_at_ms),
                     tokens_used: 5,
