@@ -50,6 +50,8 @@
       "source_sample_id": "6930-75918-0000",
       "audio_path": "audio/librispeech-6930-75918-0000-3s.wav",
       "duration_ms": 3000,
+      "sha256": "8e27de5020bcf2ac5ce3a24968a4350d4b25c713c6e93967f1155e53d85cb55d",
+      "byte_length": 96078,
       "text": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
     },
     {
@@ -58,6 +60,8 @@
       "source_sample_id": "1320-122617-0022",
       "audio_path": "audio/librispeech-1320-122617-0022-3s.wav",
       "duration_ms": 3000,
+      "sha256": "4f616dd2cec56575b61177eb0c3893b58dd88713aed92f6fc1e008449c786c5e",
+      "byte_length": 96078,
       "text": "THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER"
     }
   ],
@@ -67,6 +71,8 @@
       "kind": "overlap",
       "audio_path": "audio/two-speaker-overlap-librispeech.wav",
       "duration_ms": 3800,
+      "sha256": "97226d9efce86aa224373acd118c59ae7aa60590c9620cddd6b78cc5aa540738",
+      "byte_length": 121678,
       "expected_speaker_count": 2,
       "segments": [
         {
@@ -112,6 +118,8 @@
       "kind": "turn_taking",
       "audio_path": "audio/two-speaker-turn-taking-librispeech.wav",
       "duration_ms": 6800,
+      "sha256": "62decbb1b197c3e230e0dc802865e107ff6ff213b9ef1aff554c64766f844f3a",
+      "byte_length": 217644,
       "notes": [
         "audio-graph-1ee3/653a: extended from 6400ms to 6800ms by appending a 400ms trailing silence after speaker B's segment (which still ends at 6400ms below), mirroring the pre-existing 400ms A/B gap so B gets the same in-stream Deepgram endpointing cue A already gets."
       ],

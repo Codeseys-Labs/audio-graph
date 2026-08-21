@@ -22,3 +22,12 @@ marks mono-ASR and diarization baselines as pending until a real local or cloud
 baseline run is recorded. Generated speaker lanes remain experimental and must
 not become selectable until those baselines and source-separation measurements
 exist.
+
+Each of the four checked-in WAVs (the two LibriSpeech source components and
+the two derived overlap/turn-taking fixtures) also carries a `sha256` and
+`byte_length` in the manifest for tamper-evidence. Because these are real
+recordings, not code-generated, there is no synthesizer to regenerate them
+from — `source_separation_fixtures.rs`'s
+`source_separation_wavs_match_manifest_sha256` test is assert-only and fails
+loudly, naming the drifted file, if the on-disk bytes ever stop matching the
+recorded hash.

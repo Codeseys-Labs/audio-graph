@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 struct SourceSeparationFixtureManifest {
@@ -46,6 +47,8 @@ struct SourceComponent {
     speaker_id: String,
     audio_path: String,
     duration_ms: u64,
+    sha256: String,
+    byte_length: u64,
     text: String,
 }
 
@@ -55,6 +58,8 @@ struct Fixture {
     kind: FixtureKind,
     audio_path: String,
     duration_ms: u64,
+    sha256: String,
+    byte_length: u64,
     expected_speaker_count: u32,
     segments: Vec<Segment>,
     baseline: Baseline,
@@ -185,6 +190,22 @@ fn source_separation_manifest_has_required_fixture_shapes() {
         );
         assert!(!component.text.trim().is_empty());
         assert_eq!(component.duration_ms, 3000);
+        assert_eq!(
+            component.sha256.len(),
+            64,
+            "{} sha256 must be 64 hex chars",
+            component.id
+        );
+        assert!(
+            component.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "{} sha256 must be hex",
+            component.id
+        );
+        assert!(
+            component.byte_length > 0,
+            "{} byte_length must be set",
+            component.id
+        );
     }
 
     let overlap = manifest
@@ -210,6 +231,22 @@ fn source_separation_manifest_has_required_fixture_shapes() {
     for fixture in &manifest.fixtures {
         assert!(!fixture.id.trim().is_empty());
         assert_eq!(fixture.expected_speaker_count, 2);
+        assert_eq!(
+            fixture.sha256.len(),
+            64,
+            "{} sha256 must be 64 hex chars",
+            fixture.id
+        );
+        assert!(
+            fixture.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "{} sha256 must be hex",
+            fixture.id
+        );
+        assert!(
+            fixture.byte_length > 0,
+            "{} byte_length must be set",
+            fixture.id
+        );
         assert_eq!(fixture.baseline.mono_asr.status, "pending_real_run");
         assert_eq!(fixture.baseline.diarization.status, "pending_real_run");
         assert!(fixture.baseline.mono_asr.required_before_close);
@@ -298,6 +335,71 @@ fn source_separation_wavs_match_manifest_format() {
             path.display()
         );
     }
+}
+
+/// Tamper-evidence for the checked-in LibriSpeech-derived WAVs.
+///
+/// Unlike `audio_signal_fixtures.rs`'s synthesized fixtures, these four WAVs
+/// are real recordings derived from LibriSpeech and are NOT regenerable from
+/// code — there is no synthesizer to fall back on. So this test is
+/// assert-only: it fails loudly (naming the drifted file) the moment the
+/// on-disk bytes stop matching the manifest's recorded `sha256`/`byte_length`,
+/// with no self-heal path. If a fixture legitimately needs to change, the
+/// manifest hash must be updated deliberately in the same change.
+#[test]
+fn source_separation_wavs_match_manifest_sha256() {
+    let manifest = load_manifest();
+    let mut entries = manifest
+        .source_components
+        .iter()
+        .map(|component| {
+            (
+                component.id.as_str(),
+                component.audio_path.as_str(),
+                component.sha256.as_str(),
+                component.byte_length,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.extend(manifest.fixtures.iter().map(|fixture| {
+        (
+            fixture.id.as_str(),
+            fixture.audio_path.as_str(),
+            fixture.sha256.as_str(),
+            fixture.byte_length,
+        )
+    }));
+
+    assert_eq!(
+        entries.len(),
+        4,
+        "expected exactly 4 LibriSpeech-derived WAVs to carry tamper-evidence hashes"
+    );
+
+    for (id, relative_path, expected_sha256, expected_byte_length) in entries {
+        let path = fixture_root().join(relative_path);
+        let on_disk = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        assert_eq!(
+            on_disk.len() as u64,
+            expected_byte_length,
+            "{id} ({}) on-disk byte length no longer matches the manifest — this fixture is a checked-in recording, not regenerable; if the change is intentional, update the manifest's byte_length and sha256 together",
+            path.display()
+        );
+        assert_eq!(
+            sha256_hex(&on_disk),
+            expected_sha256,
+            "{id} ({}) on-disk SHA-256 no longer matches the manifest — this fixture is a checked-in recording, not regenerable; if the change is intentional, update the manifest's sha256 and byte_length together",
+            path.display()
+        );
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn load_manifest() -> SourceSeparationFixtureManifest {
