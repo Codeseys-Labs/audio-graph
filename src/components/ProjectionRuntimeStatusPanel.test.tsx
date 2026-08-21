@@ -294,6 +294,9 @@ describe("ProjectionRuntimeStatusPanel", () => {
     ).toBeGreaterThan(0);
     expect(within(region).getAllByText("3").length).toBeGreaterThan(0);
     expect(within(region).getByText(/capture latency/i)).toBeInTheDocument();
+    expect(within(region).getByText(/capture latency/i)).toHaveClass(
+      "ag-label",
+    );
     expect(within(region).getByText("18ms")).toBeInTheDocument();
     expect(within(region).getByText(/asr latency/i)).toBeInTheDocument();
     expect(within(region).getByText("240ms")).toBeInTheDocument();
@@ -349,7 +352,10 @@ describe("ProjectionRuntimeStatusPanel", () => {
     const notes = await screen.findByRole("article", {
       name: /notes queue/i,
     });
-    expect(within(notes).getByText(/needs attention/i)).toBeInTheDocument();
+    const attentionBadge = within(notes).getByText(/needs attention/i);
+    expect(attentionBadge).toBeInTheDocument();
+    expect(attentionBadge).toHaveClass("ag-chip");
+    expect(attentionBadge).toHaveAttribute("data-tone", "warning");
     expect(within(notes).getByText("Failed")).toBeInTheDocument();
     expect(within(notes).getAllByText("2").length).toBeGreaterThanOrEqual(2);
     expect(within(notes).getByText("Stale")).toBeInTheDocument();

@@ -174,7 +174,7 @@ describe("LiveTranscript", () => {
     });
     render(<LiveTranscript />);
     expect(screen.getByText("First line")).toBeInTheDocument();
-    expect(screen.getByText("SPK 1")).toBeInTheDocument();
+    expect(screen.getByText("SPK 1")).toHaveClass("ag-label");
     // Empty-state copy is gone once segments exist.
     expect(
       screen.queryByText(/transcription isn't running/i),
@@ -240,9 +240,11 @@ describe("LiveTranscript", () => {
   it("enables exports once there is at least one segment", () => {
     resetStore({ transcriptSegments: [segment()] });
     render(<LiveTranscript />);
-    expect(
-      screen.getByRole("button", { name: /export transcript as json/i }),
-    ).toBeEnabled();
+    const jsonButton = screen.getByRole("button", {
+      name: /export transcript as json/i,
+    });
+    expect(jsonButton).toBeEnabled();
+    expect(jsonButton).toHaveClass("ag-btn-micro");
   });
 
   it("exporting JSON invokes exportTranscript and resolves a session-scoped filename", async () => {

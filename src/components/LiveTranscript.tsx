@@ -273,7 +273,7 @@ function LiveTranscript() {
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="ag-btn-micro"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportJsonTitle")}
@@ -283,7 +283,7 @@ function LiveTranscript() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="ag-btn-micro"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportTxtTitle")}
@@ -348,7 +348,7 @@ function LiveTranscript() {
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (
                     <span
-                      className="text-xs font-semibold py-px px-(--space-4) rounded-[10px] border border-solid whitespace-nowrap tracking-wide"
+                      className="ag-label py-px px-(--space-4) rounded-[10px] border border-solid whitespace-nowrap"
                       style={{
                         backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
                         color: getSpeakerColor(seg.speaker_id),

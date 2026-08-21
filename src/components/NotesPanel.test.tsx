@@ -164,6 +164,9 @@ describe("NotesPanel", () => {
   it("always renders the Notes header", () => {
     render(<NotesPanel />);
     expect(screen.getByText(/^Notes$/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Notes$/).closest(".ag-panel-head"),
+    ).not.toBeNull();
   });
 
   it("does not synthesize before provider settings hydrate", async () => {
@@ -325,6 +328,8 @@ describe("NotesPanel", () => {
     ).toBeInTheDocument();
     const note = screen.getByText("Decision").closest("li") as HTMLElement;
     expect(note).toHaveAttribute("data-note-id", "note:decision");
+    expect(note).toHaveClass("ag-card");
+    expect(note).toHaveAttribute("data-elevation", "flat");
     expect(
       within(note).getByText("Ship projection notes."),
     ).toBeInTheDocument();

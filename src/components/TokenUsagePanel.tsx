@@ -468,14 +468,13 @@ function TokenUsagePanel() {
   // so they are applied directly to the elements here. The mono stack resolves
   // through the bridged `font-mono` utility (Phase 1, D7).
   const scopeLabel =
-    "flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0 text-[9px] font-bold uppercase tracking-wide text-text-muted";
+    "ag-label flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0";
   const grid = "grid grid-cols-3 gap-x-[10px] gap-y-(--space-2) m-0";
   const cell = "flex flex-col min-w-0";
-  const dt =
-    "text-[9px] font-semibold uppercase tracking-wide text-text-muted m-0 leading-[1.2]";
+  const dt = "ag-label m-0";
   const dd =
-    "font-mono text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap tabular-nums";
-  const ddTotal = `${dd} text-accent-gemini text-md`;
+    "font-mono text-md font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap tabular-nums";
+  const ddTotal = `${dd} text-accent-gemini`;
   const empty = "m-0 text-xs italic text-text-muted leading-[1.4]";
 
   return (
@@ -502,7 +501,8 @@ function TokenUsagePanel() {
           )}
           {session.llmTurns > 0 && (
             <span
-              className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl tracking-wide"
+              className="ag-chip"
+              data-tone="info"
               title={t("tokens.llmChatsTooltip")}
             >
               {t("tokens.llmChats", { count: session.llmTurns })}
@@ -619,7 +619,7 @@ function TokenUsagePanel() {
           {t("tokens.lifetime")}
           {hasLifetime && (
             <span
-              className="text-[9px] font-semibold text-text-muted tracking-wide normal-case"
+              className="ag-label normal-case"
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: lifetime.turns })}

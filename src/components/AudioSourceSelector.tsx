@@ -745,7 +745,7 @@ export default function AudioSourceSelector() {
                       : t("settings.audioSources.collapseGroup", { label })
                   }
                 >
-                  <span className="inline-block w-[10px] text-[9px] text-text-muted">
+                  <span className="inline-block w-[10px] text-xs text-text-muted">
                     <Icon
                       name={isCollapsed ? "chevronRight" : "chevronDown"}
                       size={14}
@@ -900,7 +900,7 @@ export default function AudioSourceSelector() {
                         })
                   }
                 >
-                  <span className="inline-block w-[10px] text-[9px] text-text-muted">
+                  <span className="inline-block w-[10px] text-xs text-text-muted">
                     <Icon
                       name={
                         collapsed.has("Running Processes")

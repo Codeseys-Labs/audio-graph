@@ -239,12 +239,9 @@ export default function NotesPanel({
     "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-(--edge)";
 
   return (
-    <div
-      ref={panelRef}
-      className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto"
-    >
-      <div className="flex items-center justify-between gap-(--space-4) mb-(--space-4)">
-        <span className="text-sm font-bold tracking-wide uppercase text-text-secondary">
+    <div ref={panelRef} className="flex h-full flex-col overflow-hidden">
+      <div className="ag-panel-head shrink-0">
+        <span className="ag-panel-head__title inline-flex items-center gap-(--space-2)">
           <Icon name="notes" size={16} /> {t("notes.title")}
         </span>
         {headerActions && (
@@ -272,143 +269,146 @@ export default function NotesPanel({
         )}
       </div>
 
-      {loadedSessionId && (
-        <p
-          id="notes-review-synthesis-help"
-          className="m-0 mb-(--space-4) rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs leading-[1.4] text-text-secondary"
-          role="status"
-        >
-          <Icon name="warning" size={14} /> {t("notes.reviewSynthesisBlocked")}
-        </p>
-      )}
-
-      {error !== null && (
-        <div
-          role="alert"
-          className="flex items-start gap-(--space-3) mb-(--space-4) py-(--space-3) px-(--space-4) rounded-lg bg-(--tint-danger) text-(--text-on-tint-danger) text-sm"
-        >
-          <Icon name="warning" size={16} />
-          <span className="flex-1 [overflow-wrap:anywhere]">
-            {t("notes.error", { message: error })}
-          </span>
-          <IconButton
-            icon="close"
-            label={t("notes.dismissError")}
-            variant="ghost"
-            className="bg-none border-none cursor-pointer shrink-0 opacity-70 hover:opacity-100"
-            onClick={dismissError}
-          />
-        </div>
-      )}
-
-      {result !== null && (
-        <section className="mb-(--space-5)">
-          <div className="flex items-center justify-between gap-(--space-3) mb-[5px]">
-            <h4 className={sectionTitle}>{t("notes.synthesized")}</h4>
-            <span className="text-xs text-text-muted italic shrink-0">
-              {t("notes.synthesizedAt", { time: synthesizedTime })}
-            </span>
-          </div>
-          <div className="text-sm leading-[1.5] text-text-primary whitespace-pre-wrap break-words py-(--space-4) px-(--space-5) rounded-lg bg-bg-tertiary border border-(--edge)">
-            {result.markdown}
-          </div>
-          {isStale && (
-            <p className="text-xs text-text-muted italic mt-(--space-2)">
-              {t("notes.stale")}
-            </p>
-          )}
-        </section>
-      )}
-
-      {isEmpty ? (
-        <div
-          className="flex flex-col items-center justify-center flex-1 gap-(--space-4) py-(--space-6) px-(--space-4) text-center select-none"
-          data-testid="notes-empty-hero"
-        >
-          <span className="text-text-muted opacity-40" aria-hidden="true">
-            <Icon name="notes" size={32} />
-          </span>
-          <div className="flex flex-col gap-(--space-2) max-w-[320px]">
-            <p className="m-0 text-text-secondary text-md font-medium">
-              {t("notes.emptyTitle")}
-            </p>
-            <p className="m-0 text-text-muted text-sm leading-normal">
-              {t("notes.empty")}
-            </p>
-          </div>
-          <button
-            type="button"
-            className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
-            onClick={() =>
-              loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language)
-            }
+      <div className="flex flex-1 flex-col overflow-y-auto py-(--space-4) px-(--space-5)">
+        {loadedSessionId && (
+          <p
+            id="notes-review-synthesis-help"
+            className="m-0 mb-(--space-4) rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs leading-[1.4] text-text-secondary"
+            role="status"
           >
-            <Icon name="start" size={16} />
-            {t("notes.emptyPreviewSample")}
-          </button>
-        </div>
-      ) : (
-        <div className="flex flex-col gap-(--space-5)">
-          {liveNotes.length > 0 && (
-            <section>
-              <div className="flex items-center justify-between gap-(--space-3) mb-[5px]">
-                <h4 className={sectionTitle}>{t("notes.materialized")}</h4>
-                <span className="text-xs text-text-muted italic shrink-0">
-                  {t("notes.materializedSequence", {
-                    sequence: materializedNotes?.last_sequence ?? 0,
-                  })}
-                </span>
-              </div>
-              <ul className="list-none p-0 m-0 flex flex-col gap-(--space-3)">
-                {liveNotes.map((note) => (
-                  <MaterializedNoteItem
-                    key={note.id}
-                    note={note}
-                    revisionCount={noteRevisionCounts.get(note.id) ?? 0}
-                  />
-                ))}
-              </ul>
-            </section>
-          )}
-          {notes.participants.length > 0 && (
-            <section>
-              <h4 className={sectionTitle}>{t("notes.participants")}</h4>
-              <div className="flex flex-wrap gap-(--space-3)">
-                {notes.participants.map((p) => (
-                  <span key={p} className={`${chipBase} text-text-primary`}>
-                    {p}
-                  </span>
-                ))}
-              </div>
-            </section>
-          )}
-          {notes.questions.length > 0 && (
-            <NotesList
-              title={t("notes.openQuestions")}
-              items={notes.questions}
+            <Icon name="warning" size={14} />{" "}
+            {t("notes.reviewSynthesisBlocked")}
+          </p>
+        )}
+
+        {error !== null && (
+          <div
+            role="alert"
+            className="flex items-start gap-(--space-3) mb-(--space-4) py-(--space-3) px-(--space-4) rounded-lg bg-(--tint-danger) text-(--text-on-tint-danger) text-sm"
+          >
+            <Icon name="warning" size={16} />
+            <span className="flex-1 [overflow-wrap:anywhere]">
+              {t("notes.error", { message: error })}
+            </span>
+            <IconButton
+              icon="close"
+              label={t("notes.dismissError")}
+              variant="ghost"
+              className="bg-none border-none cursor-pointer shrink-0 opacity-70 hover:opacity-100"
+              onClick={dismissError}
             />
-          )}
-          {notes.tasks.length > 0 && (
-            <NotesList title={t("notes.actionItems")} items={notes.tasks} />
-          )}
-          {notes.decisions.length > 0 && (
-            <NotesList title={t("notes.decisions")} items={notes.decisions} />
-          )}
-          {notes.topics.length > 0 && (
-            <section>
-              <h4 className={sectionTitle}>{t("notes.keyTopics")}</h4>
-              <div className="flex flex-wrap gap-(--space-3)">
-                {notes.topics.slice(0, 12).map((n) => (
-                  <span key={n.id} className={`${chipBase} text-accent-blue`}>
-                    {n.name}
-                    {n.mention_count > 1 ? ` ·${n.mention_count}` : ""}
+          </div>
+        )}
+
+        {result !== null && (
+          <section className="mb-(--space-5)">
+            <div className="flex items-center justify-between gap-(--space-3) mb-[5px]">
+              <h4 className={sectionTitle}>{t("notes.synthesized")}</h4>
+              <span className="text-xs text-text-muted italic shrink-0">
+                {t("notes.synthesizedAt", { time: synthesizedTime })}
+              </span>
+            </div>
+            <div className="text-base text-text-primary whitespace-pre-wrap break-words py-(--space-4) px-(--space-5) rounded-lg bg-bg-tertiary border border-(--edge)">
+              {result.markdown}
+            </div>
+            {isStale && (
+              <p className="text-xs text-text-muted italic mt-(--space-2)">
+                {t("notes.stale")}
+              </p>
+            )}
+          </section>
+        )}
+
+        {isEmpty ? (
+          <div
+            className="flex flex-col items-center justify-center flex-1 gap-(--space-4) py-(--space-6) px-(--space-4) text-center select-none"
+            data-testid="notes-empty-hero"
+          >
+            <span className="text-text-muted opacity-40" aria-hidden="true">
+              <Icon name="notes" size={32} />
+            </span>
+            <div className="flex flex-col gap-(--space-2) max-w-[320px]">
+              <p className="m-0 text-text-secondary text-md font-medium">
+                {t("notes.emptyTitle")}
+              </p>
+              <p className="m-0 text-text-muted text-sm leading-normal">
+                {t("notes.empty")}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
+              onClick={() =>
+                loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language)
+              }
+            >
+              <Icon name="start" size={16} />
+              {t("notes.emptyPreviewSample")}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-(--space-5)">
+            {liveNotes.length > 0 && (
+              <section>
+                <div className="flex items-center justify-between gap-(--space-3) mb-[5px]">
+                  <h4 className={sectionTitle}>{t("notes.materialized")}</h4>
+                  <span className="text-xs text-text-muted italic shrink-0">
+                    {t("notes.materializedSequence", {
+                      sequence: materializedNotes?.last_sequence ?? 0,
+                    })}
                   </span>
-                ))}
-              </div>
-            </section>
-          )}
-        </div>
-      )}
+                </div>
+                <ul className="list-none p-0 m-0 flex flex-col gap-(--space-3)">
+                  {liveNotes.map((note) => (
+                    <MaterializedNoteItem
+                      key={note.id}
+                      note={note}
+                      revisionCount={noteRevisionCounts.get(note.id) ?? 0}
+                    />
+                  ))}
+                </ul>
+              </section>
+            )}
+            {notes.participants.length > 0 && (
+              <section>
+                <h4 className={sectionTitle}>{t("notes.participants")}</h4>
+                <div className="flex flex-wrap gap-(--space-3)">
+                  {notes.participants.map((p) => (
+                    <span key={p} className={`${chipBase} text-text-primary`}>
+                      {p}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+            {notes.questions.length > 0 && (
+              <NotesList
+                title={t("notes.openQuestions")}
+                items={notes.questions}
+              />
+            )}
+            {notes.tasks.length > 0 && (
+              <NotesList title={t("notes.actionItems")} items={notes.tasks} />
+            )}
+            {notes.decisions.length > 0 && (
+              <NotesList title={t("notes.decisions")} items={notes.decisions} />
+            )}
+            {notes.topics.length > 0 && (
+              <section>
+                <h4 className={sectionTitle}>{t("notes.keyTopics")}</h4>
+                <div className="flex flex-wrap gap-(--space-3)">
+                  {notes.topics.slice(0, 12).map((n) => (
+                    <span key={n.id} className={`${chipBase} text-accent-blue`}>
+                      {n.name}
+                      {n.mention_count > 1 ? ` ·${n.mention_count}` : ""}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -443,10 +443,7 @@ function MaterializedNoteItem({
   const { t } = useTranslation();
   const showRevision = revisionCount > 1;
   return (
-    <li
-      data-note-id={note.id}
-      className="rounded-md border border-(--edge) bg-bg-tertiary py-(--space-3) px-(--space-4)"
-    >
+    <li data-note-id={note.id} className="ag-card" data-elevation="flat">
       <div className="flex items-start justify-between gap-(--space-3)">
         <h5 className="m-0 text-sm font-semibold text-text-primary [overflow-wrap:anywhere]">
           {note.title}
@@ -460,7 +457,7 @@ function MaterializedNoteItem({
           {t("notes.noteRevisions", { count: revisionCount })}
         </p>
       )}
-      <p className="m-0 mt-(--space-2) text-sm leading-[1.45] text-text-secondary whitespace-pre-wrap [overflow-wrap:anywhere]">
+      <p className="m-0 mt-(--space-2) text-base text-text-secondary whitespace-pre-wrap [overflow-wrap:anywhere]">
         {note.body}
       </p>
       {note.tags.length > 0 && (
@@ -490,7 +487,7 @@ function NotesList({ title, items }: { title: string; items: GraphNode[] }) {
         {items.slice(0, 8).map((n) => (
           <li
             key={n.id}
-            className="text-sm leading-[1.4] text-text-primary [overflow-wrap:anywhere]"
+            className="text-base text-text-primary [overflow-wrap:anywhere]"
           >
             {n.name}
           </li>

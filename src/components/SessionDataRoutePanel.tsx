@@ -73,10 +73,7 @@ function DataClassChips({ classes }: DataClassChipsProps) {
   return (
     <ul className="m-0 flex list-none flex-wrap gap-(--space-2) p-0">
       {classes.map((cls) => (
-        <li
-          key={cls}
-          className="rounded-xl bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide text-text-secondary"
-        >
+        <li key={cls} className="ag-chip" data-tone="neutral">
           {dataClassLabel(cls, t)}
         </li>
       ))}
@@ -99,7 +96,7 @@ function ProviderTransferRow({ transfer }: ProviderTransferRowProps) {
         <span className="min-w-0 text-xs font-semibold text-text-primary [overflow-wrap:anywhere]">
           {transfer.providerId ?? t(`dataRoute.boundary.${transfer.boundary}`)}
         </span>
-        <span className="shrink-0 rounded-xl bg-(--tint-accent-info-hover) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide text-accent-blue">
+        <span className="ag-chip shrink-0" data-tone="info">
           {t(`dataRoute.boundary.${transfer.boundary}`)}
         </span>
       </div>
@@ -133,14 +130,15 @@ function RedactedErrorRow({ error }: RedactedErrorRowProps) {
         <span className="flex shrink-0 items-center gap-(--space-2)">
           {error.count > 1 && (
             <span
-              className="rounded-xl bg-(--tint-warning) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide text-accent-yellow"
+              className="ag-chip"
+              data-tone="warning"
               data-testid="data-route-error-count"
             >
               {t("dataRoute.errorOccurrences", { count: error.count })}
             </span>
           )}
           {error.errorCode && (
-            <span className="font-mono text-[9px] font-semibold uppercase tracking-wide text-accent-yellow">
+            <span className="font-mono text-xs font-semibold uppercase tracking-wide text-accent-yellow">
               {error.errorCode}
             </span>
           )}
@@ -339,10 +337,10 @@ export default function SessionDataRoutePanel({
           {/* Privacy mode + capture source overview. */}
           <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0">
             <div className="min-w-0">
-              <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
+              <dt className="ag-label m-0">
                 {t("dataRoute.privacyModeLabel")}
               </dt>
-              <dd className="m-0 mt-[2px] text-xs font-semibold text-text-primary leading-tight [overflow-wrap:anywhere]">
+              <dd className="m-0 mt-[2px] text-md font-semibold text-text-primary leading-tight tabular-nums [overflow-wrap:anywhere]">
                 {report.privacyModes.length > 0
                   ? report.privacyModes
                       .map((mode) => privacyModeLabel(mode, t))
@@ -351,26 +349,24 @@ export default function SessionDataRoutePanel({
               </dd>
             </div>
             <div className="min-w-0">
-              <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
-                {t("dataRoute.eventCountLabel")}
-              </dt>
-              <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight tabular-nums">
+              <dt className="ag-label m-0">{t("dataRoute.eventCountLabel")}</dt>
+              <dd className="m-0 mt-[2px] font-mono text-md font-semibold text-text-primary leading-tight tabular-nums">
                 {report.eventCount}
               </dd>
             </div>
             <div className="min-w-0">
-              <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
+              <dt className="ag-label m-0">
                 {t("dataRoute.localEventsLabel")}
               </dt>
-              <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight tabular-nums">
+              <dd className="m-0 mt-[2px] font-mono text-md font-semibold text-text-primary leading-tight tabular-nums">
                 {report.localEvents.length}
               </dd>
             </div>
             <div className="min-w-0">
-              <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
+              <dt className="ag-label m-0">
                 {t("dataRoute.egressEventsLabel")}
               </dt>
-              <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight tabular-nums">
+              <dd className="m-0 mt-[2px] font-mono text-md font-semibold text-text-primary leading-tight tabular-nums">
                 {report.egressEvents.length}
               </dd>
             </div>
@@ -414,7 +410,7 @@ export default function SessionDataRoutePanel({
                   ))}
                 </ul>
                 <div>
-                  <p className="m-0 mb-(--space-1) text-[9px] font-semibold uppercase tracking-wide text-text-muted">
+                  <p className="ag-label m-0 mb-(--space-1)">
                     {t("dataRoute.egressDataClassesLabel")}
                   </p>
                   <DataClassChips classes={report.egressDataClasses} />
@@ -437,10 +433,10 @@ export default function SessionDataRoutePanel({
                 ] as const
               ).map(([key, value]) => (
                 <div key={key} className="min-w-0">
-                  <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
+                  <dt className="ag-label m-0">
                     {t(`dataRoute.artifact.${key}`)}
                   </dt>
-                  <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight tabular-nums">
+                  <dd className="m-0 mt-[2px] font-mono text-md font-semibold text-text-primary leading-tight tabular-nums">
                     {value}
                   </dd>
                 </div>
@@ -470,7 +466,7 @@ export default function SessionDataRoutePanel({
             </Section>
           )}
 
-          <p className="m-0 text-[9px] italic text-text-muted leading-[1.3]">
+          <p className="m-0 text-xs italic text-text-muted leading-[1.3]">
             {t("dataRoute.redactionNote")}
           </p>
         </div>

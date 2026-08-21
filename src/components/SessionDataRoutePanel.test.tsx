@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
@@ -173,6 +173,14 @@ describe("SessionDataRoutePanel", () => {
     expect(transfer).toHaveTextContent(/chat_completions/i);
     expect(transfer).toHaveTextContent(/Prompts/i);
     expect(transfer).toHaveTextContent(/Transcript text/i);
+    // Pins the boundary/data-class recipe adoption (.ag-chip[data-tone]).
+    expect(within(transfer).getByText("Provider")).toHaveAttribute(
+      "data-tone",
+      "info",
+    );
+    expect(within(transfer).getByText("Prompts")).toHaveClass("ag-chip");
+    // Pins the dt → .ag-label recipe adoption on the overview grid.
+    expect(screen.getByText("Ledger events")).toHaveClass("ag-label");
 
     // The local-only banner must NOT be shown for a cloud session.
     expect(
@@ -246,6 +254,8 @@ describe("SessionDataRoutePanel", () => {
     const counts = screen.getAllByTestId("data-route-error-count");
     expect(counts).toHaveLength(1);
     expect(counts[0]).toHaveTextContent("×12");
+    expect(counts[0]).toHaveClass("ag-chip");
+    expect(counts[0]).toHaveAttribute("data-tone", "warning");
     // Only the most recent occurrence's message is shown.
     expect(
       screen.getByText(/Rate limited \(attempt 11\)/i),

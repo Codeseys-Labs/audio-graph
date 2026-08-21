@@ -628,6 +628,9 @@ describe("AudioSourceSelector", () => {
     });
     expect(groupBtn).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Microphone")).toBeInTheDocument();
+    // Chevron wrapper floors at text-xs (audio-graph-1ebc fence-widen fix) —
+    // no sub-11px arbitrary size left in this component.
+    expect(groupBtn.querySelector("span")).toHaveClass("text-xs");
     fireEvent.click(groupBtn);
     expect(groupBtn).toHaveAttribute("aria-expanded", "false");
     // Collapsed → the row is no longer rendered.

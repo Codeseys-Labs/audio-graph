@@ -238,7 +238,7 @@ function SeekTimeline() {
           <Icon name="transcript" size={15} />
           {t("seekTimeline.title")}
         </h3>
-        <span className="text-xs text-text-muted">
+        <span className="ag-label tabular-nums">
           {t("seekTimeline.rangeLabel", {
             start: formatTime(minMs / 1000),
             end: formatTime((minMs + spanMs) / 1000),
@@ -323,7 +323,7 @@ function SeekTimeline() {
                       type="button"
                       data-testid="seek-timeline-block"
                       data-span-id={entry.span_id}
-                      className="absolute top-1/2 flex h-[18px] -translate-y-1/2 items-center overflow-hidden rounded-sm border border-solid px-(--space-2) text-left text-[9px] leading-none text-text-primary transition-transform cursor-pointer hover:z-10 hover:scale-y-125 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
+                      className="absolute top-1/2 flex h-[18px] -translate-y-1/2 items-center overflow-hidden rounded-sm border border-solid px-(--space-2) text-left text-xs leading-none text-text-primary transition-transform cursor-pointer hover:z-10 hover:scale-y-125 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
                       style={{
                         left: `${leftPct}%`,
                         width: `${widthPct}%`,
@@ -340,7 +340,7 @@ function SeekTimeline() {
                         type="button"
                         data-testid="seek-timeline-edge-badge"
                         data-span-id={entry.span_id}
-                        className="absolute top-1/2 z-20 shrink-0 -translate-x-full -translate-y-1/2 rounded-[6px] border-none bg-(--tint-accent-info) px-(--space-1) text-[8px] font-semibold text-(--text-on-tint-info) cursor-pointer hover:bg-(--tint-accent-info-hover) focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
+                        className="absolute top-1/2 z-20 shrink-0 -translate-x-full -translate-y-1/2 rounded-[6px] border-none bg-(--tint-accent-info) px-(--space-1) text-xs font-semibold text-(--text-on-tint-info) cursor-pointer hover:bg-(--tint-accent-info-hover) focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
                         style={{
                           left: `${Math.min(100, leftPct + widthPct)}%`,
                         }}

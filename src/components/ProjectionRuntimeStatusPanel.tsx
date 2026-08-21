@@ -92,10 +92,8 @@ interface MetricProps {
 function Metric({ label, value }: MetricProps) {
   return (
     <div className="min-w-0">
-      <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
-        {label}
-      </dt>
-      <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight overflow-hidden text-ellipsis whitespace-nowrap tabular-nums">
+      <dt className="ag-label m-0">{label}</dt>
+      <dd className="m-0 mt-[2px] font-mono text-md font-semibold text-text-primary leading-tight overflow-hidden text-ellipsis whitespace-nowrap tabular-nums">
         {value}
       </dd>
     </div>
@@ -221,10 +219,10 @@ function ReplayArtifactRow({ label, artifact }: ReplayArtifactRowProps) {
   const { t } = useTranslation();
   const tone =
     artifact.status === "current"
-      ? "text-accent-green bg-(--tint-success)"
+      ? "success"
       : artifact.status === "missing"
-        ? "text-text-muted bg-(--hover-overlay)"
-        : "text-accent-yellow bg-(--tint-warning)";
+        ? "neutral"
+        : "warning";
 
   return (
     <div className="rounded-md border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2)">
@@ -232,9 +230,7 @@ function ReplayArtifactRow({ label, artifact }: ReplayArtifactRowProps) {
         <span className="min-w-0 text-xs font-semibold text-text-primary">
           {label}
         </span>
-        <span
-          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide ${tone}`}
-        >
+        <span className="ag-chip shrink-0" data-tone={tone}>
           {t(`projectionDiagnostics.replayStatus.${artifact.status}`)}
         </span>
       </div>
@@ -485,7 +481,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
           <Icon name="graph" size={14} />
           {t("projectionDiagnostics.graphOperationsTitle")}
         </h4>
-        <span className="shrink-0 rounded-xl bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide text-text-secondary">
+        <span className="ag-chip shrink-0" data-tone="neutral">
           {t("projectionDiagnostics.graphOperationCount", {
             count: operations.length,
           })}
@@ -533,12 +529,12 @@ function SchedulerCard({
 }: SchedulerCardProps) {
   const { t } = useTranslation();
   const state = schedulerState(scheduler);
-  const badgeClass =
+  const badgeTone =
     state === "attention"
-      ? "text-accent-yellow bg-(--tint-warning)"
+      ? "warning"
       : state === "inFlight" || state === "pending"
-        ? "text-accent-blue bg-(--tint-accent-info-hover)"
-        : "text-text-secondary bg-(--hover-overlay)";
+        ? "info"
+        : "neutral";
 
   return (
     <article
@@ -553,9 +549,7 @@ function SchedulerCard({
           />
           {title}
         </h4>
-        <span
-          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide ${badgeClass}`}
-        >
+        <span className="ag-chip shrink-0" data-tone={badgeTone}>
           {t(`projectionDiagnostics.schedulerState.${state}`)}
         </span>
       </div>

@@ -109,10 +109,12 @@ describe("SeekTimeline", () => {
         }),
       ],
     });
-    render(<SeekTimeline />);
+    const { container } = render(<SeekTimeline />);
     // Two distinct speakers → two lanes, three blocks total.
     expect(screen.getAllByTestId("seek-timeline-lane")).toHaveLength(2);
     expect(screen.getAllByTestId("seek-timeline-block")).toHaveLength(3);
+    // Range label pins the .ag-label/tabular-nums recipe adoption.
+    expect(container.querySelector(".ag-label")).toHaveClass("tabular-nums");
   });
 
   it("positions blocks by media time (left/width % from start/end)", () => {

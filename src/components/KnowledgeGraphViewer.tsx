@@ -532,7 +532,7 @@ function KnowledgeGraphViewer() {
 
       {hasNodes && (
         <div
-          className="absolute bottom-(--space-4) left-(--space-4) flex items-center gap-(--space-3) bg-(--graph-overlay-bg) [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
+          className="ag-chip absolute bottom-(--space-4) left-(--space-4) gap-(--space-3) bg-(--graph-overlay-bg) [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
           role="status"
           aria-live="polite"
           aria-label={

@@ -197,8 +197,9 @@ describe("TokenUsagePanel", () => {
 
     const session = sessionScope();
     // Total row reflects sum across both turns (150 + 50 = 200).
-    const totalCell = within(session).getByText("Total")
-      .parentElement as HTMLElement;
+    const totalLabel = within(session).getByText("Total");
+    expect(totalLabel).toHaveClass("ag-label");
+    const totalCell = totalLabel.parentElement as HTMLElement;
     expect(totalCell).toHaveTextContent("200");
 
     // Prompt sums to 140.

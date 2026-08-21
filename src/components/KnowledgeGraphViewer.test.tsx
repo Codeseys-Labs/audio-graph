@@ -183,9 +183,10 @@ describe("KnowledgeGraphViewer", () => {
     expect(screen.getByText("Nodes: 2")).toBeInTheDocument();
     expect(screen.getByText("Edges: 1")).toBeInTheDocument();
     // The aria-label summarizes the graph for assistive tech.
-    expect(
-      screen.getByRole("status", { name: /2 nodes, 1 edges/i }),
-    ).toBeInTheDocument();
+    const overlay = screen.getByRole("status", { name: /2 nodes, 1 edges/i });
+    expect(overlay).toBeInTheDocument();
+    // Pins the legend-chip recipe adoption (.ag-chip).
+    expect(overlay).toHaveClass("ag-chip");
   });
 
   it("prefers the active materialized projection graph when present", () => {
