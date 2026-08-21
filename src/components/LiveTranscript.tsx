@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
+import { useSessionView } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -46,7 +47,7 @@ const FALLBACK_COLORS = [
 
 function LiveTranscript() {
   const { t } = useTranslation();
-  const rawSegments = useAudioGraphStore((s) => s.transcriptSegments);
+  const { transcriptSegments: rawSegments } = useSessionView();
   const diarizationSpanRevisions = useAudioGraphStore(
     (s) => s.diarizationSpanRevisions,
   );

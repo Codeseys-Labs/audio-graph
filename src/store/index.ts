@@ -108,6 +108,7 @@ import type {
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import { errorToMessage } from "../utils/errorToMessage";
 import { materializedGraphToSnapshot } from "../utils/materializedGraph";
+import { createShellNavSlice } from "./shellNav";
 
 const idleStage: StageStatus = { type: "Idle" };
 // Monotonic foreground-session generation. Any transition to Live or a newer
@@ -1381,6 +1382,9 @@ function sampleSessionPreviewState(language?: string) {
 }
 
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
+  // ── Shell navigation (SHELL-R1, ADR-0046) ───────────────────────────────
+  ...createShellNavSlice(set, get),
+
   // ── Audio sources ────────────────────────────────────────────────────
   audioSources: [],
   selectedSourceIds: [],

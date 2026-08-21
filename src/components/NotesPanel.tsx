@@ -20,6 +20,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { useSessionView } from "../session/SessionViewProvider";
 import { deferredProviderForLlmStart, useAudioGraphStore } from "../store";
 import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
@@ -45,10 +46,12 @@ interface SynthesisResult {
 
 export default function NotesPanel() {
   const { t, i18n } = useTranslation();
-  const segments = useAudioGraphStore((s) => s.transcriptSegments);
-  const graph = useAudioGraphStore((s) => s.graphSnapshot);
-  const materializedNotes = useAudioGraphStore((s) => s.materializedNotes);
-  const projectionEvents = useAudioGraphStore((s) => s.sessionProjectionEvents);
+  const {
+    transcriptSegments: segments,
+    graphSnapshot: graph,
+    materializedNotes,
+    sessionProjectionEvents: projectionEvents,
+  } = useSessionView();
   const settings = useAudioGraphStore((s) => s.settings);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const loadSampleSessionPreview = useAudioGraphStore(

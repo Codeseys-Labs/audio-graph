@@ -83,7 +83,12 @@ import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNativeCapture } from "./hooks/useNativeCapture";
 import { useTauriEvents } from "./hooks/useTauriEvents";
+import { SessionViewProvider } from "./session/SessionViewProvider";
 import { useAudioGraphStore } from "./store";
+// ShellNav (SHELL-R1, ADR-0046): `deriveWorkspaceView` is the pure function
+// that replaces the old App-local `workspaceView` `useState` — see
+// `store/shellNav.ts` for the full during/after/analysis rationale.
+import { deriveWorkspaceView } from "./store/shellNav";
 import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 import "./styles/index.css";
 
@@ -257,6 +262,389 @@ function focusWorkspaceTab(view: WorkspaceView) {
   }
 }
 
+// ── Composition seams (SHELL-R1, ADR-0046) ─────────────────────────────────
+// App.tsx's four named regions, extracted verbatim so later units (R2-R5)
+// have a seam to land new chrome on without re-touching sibling regions.
+// Zero behavior/DOM change this unit — every prop below is exactly the value
+// the inline JSX it replaces already closed over; State/handlers stay owned
+// by `App()`, which is why regions take explicit props rather than reading
+// the store directly (that keeps this a pure JSX-structure move, not a data-
+// flow change).
+
+interface ShellChromeProps {
+  workspaceView: WorkspaceView;
+  recordingAnnouncement: string;
+  phaseAnnouncement: string;
+  handoffVisible: boolean;
+  dismissHandoff: () => void;
+}
+
+/** Region 1: banners + chrome — skip link, live regions, top banners,
+ * ControlBar, and the post-onboarding hand-off nudge. */
+function ShellChrome({
+  workspaceView,
+  recordingAnnouncement,
+  phaseAnnouncement,
+  handoffVisible,
+  dismissHandoff,
+}: ShellChromeProps) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {/* Skip-to-main link (seed audio-graph-4f2e / WCAG 2.4.1). Visually
+          hidden until focused; jumps keyboard users past the banners + control
+          bar straight to the active workspace panel (its id tracks the current
+          phase). */}
+      <a href={`#workspace-panel-${workspaceView}`} className="skip-to-main">
+        {t("app.a11y.skipToMain")}
+      </a>
+      {/* Assertive recording-state announcement — distinct from the polite
+          workspace-switcher state region below (WCAG 4.1.3). */}
+      <div role="status" aria-live="assertive" className="sr-only">
+        {recordingAnnouncement}
+      </div>
+      {/* Polite phase-transition announcement (critique B7). */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {phaseAnnouncement}
+      </div>
+      <StorageBanner />
+      <DemoModeBanner />
+      <ControlBar />
+      {handoffVisible && (
+        <aside
+          className="flex items-center gap-(--space-5) px-(--space-6) py-(--space-3) bg-(--tint-accent-info) border-b border-(--tint-border-info) text-text-primary"
+          aria-label={t("onboarding.handoffTitle")}
+          // Announce the nudge when it appears: ExpressSetup just closed (its
+          // focused element is gone) so SR/keyboard users would otherwise miss
+          // the onboarding steps. A polite live region notifies without
+          // stealing focus (mirrors ADR-0011 Notifications' status semantics).
+          role="status"
+          aria-live="polite"
+        >
+          <span className="font-semibold text-sm shrink-0">
+            {t("onboarding.handoffTitle")}
+          </span>
+          <ol className="flex items-center gap-(--space-5) m-0 p-0 list-none text-sm text-text-secondary">
+            <li>
+              <span className="mr-(--space-2) font-semibold text-accent-blue">
+                1.
+              </span>
+              {t("onboarding.handoffStep1")}
+            </li>
+            <li>
+              <span className="mr-(--space-2) font-semibold text-accent-blue">
+                2.
+              </span>
+              {t("onboarding.handoffStep2")}
+            </li>
+          </ol>
+          <button
+            type="button"
+            className="ml-auto shrink-0 py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none hover:opacity-90"
+            onClick={dismissHandoff}
+            aria-label={t("onboarding.handoffDismissLabel")}
+          >
+            {t("onboarding.handoffDismiss")}
+          </button>
+        </aside>
+      )}
+    </>
+  );
+}
+
+interface ShellDestinationBarProps {
+  workspaceView: WorkspaceView;
+  isCapturing: boolean;
+  samplePreviewActive: boolean;
+  loadedSessionId: string | null;
+  onSelectView: (view: WorkspaceView) => void;
+  onTabKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) => void;
+}
+
+/** Region 2: destination bar — the workspace phase tablist + live state
+ * region. Named "destination bar" ahead of R4's Capture/Sessions rename;
+ * today it still renders the three legacy tabs, byte-identical. */
+function ShellDestinationBar({
+  workspaceView,
+  isCapturing,
+  samplePreviewActive,
+  loadedSessionId,
+  onSelectView,
+  onTabKeyDown,
+}: ShellDestinationBarProps) {
+  const { t } = useTranslation();
+  return (
+    <nav className="workspace-switcher" aria-label={t("workspace.navigation")}>
+      <div
+        className="workspace-switcher__tabs"
+        role="tablist"
+        aria-label={t("workspace.label")}
+      >
+        {WORKSPACE_VIEWS.map((view) => (
+          <button
+            key={view}
+            type="button"
+            role="tab"
+            id={`workspace-tab-${view}`}
+            aria-selected={workspaceView === view}
+            aria-controls={`workspace-panel-${view}`}
+            tabIndex={workspaceView === view ? 0 : -1}
+            className="workspace-switcher__tab"
+            onClick={() => onSelectView(view)}
+            onKeyDown={onTabKeyDown}
+          >
+            {view === "during" && isCapturing
+              ? t("workspace.liveNow")
+              : t(`workspace.${view}`)}
+          </button>
+        ))}
+      </div>
+      <div className="workspace-switcher__state" aria-live="polite">
+        {isCapturing ? (
+          <span>{t("workspace.stateLive")}</span>
+        ) : samplePreviewActive ? (
+          <span>{t("workspace.stateSample")}</span>
+        ) : loadedSessionId ? (
+          <span>{t("workspace.stateLoaded")}</span>
+        ) : (
+          <span>{t("workspace.stateIdle")}</span>
+        )}
+      </div>
+    </nav>
+  );
+}
+
+interface ShellRailContentAsideProps {
+  workspaceView: WorkspaceView;
+  leftWidth: number;
+  resizeLeft: (dx: number) => void;
+  showGetStartedFallback: boolean;
+  previewSampleSession: () => void;
+  retryCredentialProbe: () => Promise<void>;
+  openSettings: () => void;
+  probeRetrying: boolean;
+  probeUnreadable: boolean;
+  hasAgentActivity: boolean;
+  samplePreviewActive: boolean;
+  loadedSessionId: string | null;
+  rightWidth: number;
+  resizeRight: (dx: number) => void;
+  resizeNotes: (dy: number) => void;
+  notesHeight: number;
+  rightPanelTab: "transcript" | "chat";
+  setRightPanelTab: (tab: "transcript" | "chat") => void;
+  handleTabKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) => void;
+}
+
+/** Region 3: rail + content + aside — the left source rail, the active
+ * workspace panel's main content, and (Analysis only) the right transcript/
+ * chat aside. The session-scoped readers under here (`NotesPanel`,
+ * `LiveTranscript`, `KnowledgeGraphViewer`, `SeekTimeline`) are wrapped in
+ * `SessionViewProvider` by the caller. */
+function ShellRailContentAside({
+  workspaceView,
+  leftWidth,
+  resizeLeft,
+  showGetStartedFallback,
+  previewSampleSession,
+  retryCredentialProbe,
+  openSettings,
+  probeRetrying,
+  probeUnreadable,
+  hasAgentActivity,
+  samplePreviewActive,
+  loadedSessionId,
+  rightWidth,
+  resizeRight,
+  resizeNotes,
+  notesHeight,
+  rightPanelTab,
+  setRightPanelTab,
+  handleTabKeyDown,
+}: ShellRailContentAsideProps) {
+  const { t } = useTranslation();
+
+  const graphPanel = (
+    <Suspense fallback={null}>
+      <KnowledgeGraphViewer />
+    </Suspense>
+  );
+
+  const analysisContextPanel = (
+    <aside className="right-panel" style={{ width: rightWidth }}>
+      <div
+        className="flex border-b border-(--edge) bg-bg-secondary shrink-0"
+        role="tablist"
+        aria-label={t("app.rightPanelViews")}
+      >
+        <button
+          type="button"
+          role="tab"
+          id="right-tab-transcript"
+          aria-selected={rightPanelTab === "transcript"}
+          aria-controls="right-tabpanel"
+          tabIndex={rightPanelTab === "transcript" ? 0 : -1}
+          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
+          onClick={() => setRightPanelTab("transcript")}
+          onKeyDown={handleTabKeyDown}
+        >
+          <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="right-tab-chat"
+          aria-selected={rightPanelTab === "chat"}
+          aria-controls="right-tabpanel"
+          tabIndex={rightPanelTab === "chat" ? 0 : -1}
+          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
+          onClick={() => setRightPanelTab("chat")}
+          onKeyDown={handleTabKeyDown}
+        >
+          <Icon name="chat" size={16} /> {t("app.tabChat")}
+        </button>
+      </div>
+      <div
+        id="right-tabpanel"
+        role="tabpanel"
+        className="flex-1 min-h-0 flex flex-col overflow-hidden"
+        aria-labelledby={
+          rightPanelTab === "transcript"
+            ? "right-tab-transcript"
+            : "right-tab-chat"
+        }
+      >
+        {rightPanelTab === "transcript" ? <LiveTranscript /> : <ChatSidebar />}
+      </div>
+      {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
+      {!samplePreviewActive && loadedSessionId && (
+        <SessionDataRoutePanel sessionId={loadedSessionId} />
+      )}
+    </aside>
+  );
+
+  return (
+    <div className={`main-layout main-layout--${workspaceView}`}>
+      <aside className="left-panel" style={{ width: leftWidth }}>
+        <AudioSourceSelector />
+        <SpeakerPanel />
+      </aside>
+      <ResizeDivider
+        orientation="vertical"
+        onResize={resizeLeft}
+        ariaLabel={t("app.resizeSources")}
+      />
+      {workspaceView === "during" &&
+        (showGetStartedFallback ? (
+          <main
+            id="workspace-panel-during"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-during"
+            className="workspace-panel"
+          >
+            <GetStartedFallback
+              onPreviewSample={previewSampleSession}
+              onRetry={retryCredentialProbe}
+              onOpenSettings={openSettings}
+              retrying={probeRetrying}
+              unreadable={probeUnreadable}
+            />
+          </main>
+        ) : (
+          <main
+            id="workspace-panel-during"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-during"
+            className="workspace-panel workspace-panel--during"
+          >
+            <section
+              className="workspace-panel__primary"
+              aria-label={t("workspace.duringNotes")}
+            >
+              <NotesPanel />
+            </section>
+            <section
+              className="workspace-panel__transcript"
+              aria-label={t("workspace.duringTranscript")}
+            >
+              <LiveTranscript />
+            </section>
+            {hasAgentActivity && (
+              <section
+                className="workspace-panel__assist"
+                aria-label={t("workspace.liveAssist")}
+              >
+                <AgentProposalsPanel />
+              </section>
+            )}
+          </main>
+        ))}
+      {workspaceView === "after" && (
+        <main
+          id="workspace-panel-after"
+          role="tabpanel"
+          aria-labelledby="workspace-tab-after"
+          className="workspace-panel workspace-panel--after"
+        >
+          <section
+            className="workspace-panel__review-notes"
+            aria-label={t("workspace.afterNotes")}
+          >
+            <NotesPanel />
+          </section>
+          <section
+            className="workspace-panel__review-transcript"
+            aria-label={t("workspace.afterTranscript")}
+          >
+            <LiveTranscript />
+          </section>
+          {(samplePreviewActive || loadedSessionId) && (
+            <section
+              className="workspace-panel__seek"
+              aria-label={t("seekTimeline.label")}
+            >
+              <SeekTimeline />
+            </section>
+          )}
+        </main>
+      )}
+      {workspaceView === "analysis" && (
+        <main
+          id="workspace-panel-analysis"
+          role="tabpanel"
+          aria-labelledby="workspace-tab-analysis"
+          className="center-panel workspace-panel--analysis"
+        >
+          <div className="center-panel__graph">{graphPanel}</div>
+          <ResizeDivider
+            orientation="horizontal"
+            onResize={resizeNotes}
+            ariaLabel={t("app.resizeNotes")}
+          />
+          <div className="center-panel__notes" style={{ height: notesHeight }}>
+            <NotesPanel />
+          </div>
+        </main>
+      )}
+      {workspaceView === "analysis" && (
+        <>
+          <ResizeDivider
+            orientation="vertical"
+            onResize={resizeRight}
+            ariaLabel={t("app.resizeTranscriptChat")}
+          />
+          {analysisContextPanel}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Region 4: footer — the per-stage pipeline status strip. */
+function ShellFooter() {
+  return <PipelineStatusBar />;
+}
+
 function App() {
   // Subscribe to Tauri backend events
   useTauriEvents();
@@ -294,7 +682,14 @@ function App() {
   const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
   const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
   const graphEdgeFocus = useAudioGraphStore((s) => s.graphEdgeFocus);
-  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("during");
+  // ShellNav (SHELL-R1, ADR-0046): nav now lives in the store (not App-local
+  // useState) because R2's `stopCapture` — a store action — must be able to
+  // route to it directly. `workspaceView` stays a derived local const so
+  // every read site below is unchanged; see `store/shellNav.ts` for the
+  // during/after/analysis mapping this derivation preserves byte-identical.
+  const nav = useAudioGraphStore((s) => s.nav);
+  const setWorkspaceView = useAudioGraphStore((s) => s.setWorkspaceView);
+  const workspaceView = deriveWorkspaceView(nav);
 
   // Assertive recording-state announcement (seed audio-graph-4f2e / WCAG
   // 4.1.3). The polite `workspace-switcher__state` region already narrates the
@@ -357,7 +752,7 @@ function App() {
       prevEdgeFocusNonceRef.current = nonce;
       setWorkspaceView("analysis");
     }
-  }, [graphEdgeFocus?.nonce]);
+  }, [graphEdgeFocus?.nonce, setWorkspaceView]);
 
   // First-time setup: on mount, probe non-secret credential presence for a
   // complete durable notes/graph cloud path. Partial configs keep Express Setup
@@ -406,6 +801,7 @@ function App() {
     i18n.resolvedLanguage,
     loadSampleSessionPreview,
     setAgentOverlayOpen,
+    setWorkspaceView,
   ]);
   // Re-surface the hand-off whenever it's been re-armed (its show-once flag was
   // cleared), regardless of whether ExpressSetup ever popped. This is the fix
@@ -443,7 +839,13 @@ function App() {
     if (samplePreviewActive || loadedSessionId) {
       setWorkspaceView("after");
     }
-  }, [isCapturing, loadedSessionId, samplePreviewActive, setRightPanelTab]);
+  }, [
+    isCapturing,
+    loadedSessionId,
+    samplePreviewActive,
+    setRightPanelTab,
+    setWorkspaceView,
+  ]);
   const prevSamplePreviewActiveRef = useRef(samplePreviewActive);
   useEffect(() => {
     const becameActive =
@@ -664,12 +1066,6 @@ function App() {
     tabs?.[nextIndex]?.focus();
   };
 
-  const graphPanel = (
-    <Suspense fallback={null}>
-      <KnowledgeGraphViewer />
-    </Suspense>
-  );
-
   // Show the Get-started fallback only on a genuinely idle first-run During
   // surface: the probe threw AND there's no capture, sample preview, or loaded
   // session that would otherwise fill the panels with real content. This keeps
@@ -677,278 +1073,55 @@ function App() {
   const showGetStartedFallback =
     probeFailed && !isCapturing && !samplePreviewActive && !loadedSessionId;
 
-  const analysisContextPanel = (
-    <aside className="right-panel" style={{ width: rightWidth }}>
-      <div
-        className="flex border-b border-(--edge) bg-bg-secondary shrink-0"
-        role="tablist"
-        aria-label={t("app.rightPanelViews")}
-      >
-        <button
-          type="button"
-          role="tab"
-          id="right-tab-transcript"
-          aria-selected={rightPanelTab === "transcript"}
-          aria-controls="right-tabpanel"
-          tabIndex={rightPanelTab === "transcript" ? 0 : -1}
-          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-          onClick={() => setRightPanelTab("transcript")}
-          onKeyDown={handleTabKeyDown}
-        >
-          <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          id="right-tab-chat"
-          aria-selected={rightPanelTab === "chat"}
-          aria-controls="right-tabpanel"
-          tabIndex={rightPanelTab === "chat" ? 0 : -1}
-          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-[background-color,border-color,color] duration-(--motion-base) ease-(--ease-standard) border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-          onClick={() => setRightPanelTab("chat")}
-          onKeyDown={handleTabKeyDown}
-        >
-          <Icon name="chat" size={16} /> {t("app.tabChat")}
-        </button>
-      </div>
-      <div
-        id="right-tabpanel"
-        role="tabpanel"
-        className="flex-1 min-h-0 flex flex-col overflow-hidden"
-        aria-labelledby={
-          rightPanelTab === "transcript"
-            ? "right-tab-transcript"
-            : "right-tab-chat"
-        }
-      >
-        {rightPanelTab === "transcript" ? <LiveTranscript /> : <ChatSidebar />}
-      </div>
-      {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
-      {!samplePreviewActive && loadedSessionId && (
-        <SessionDataRoutePanel sessionId={loadedSessionId} />
-      )}
-    </aside>
-  );
-
   return (
     <div
       className="app-container"
       data-onboarding-probe={probeCompleted ? "settled" : "pending"}
     >
-      {/* Skip-to-main link (seed audio-graph-4f2e / WCAG 2.4.1). Visually
-          hidden until focused; jumps keyboard users past the banners + control
-          bar straight to the active workspace panel (its id tracks the current
-          phase). */}
-      <a href={`#workspace-panel-${workspaceView}`} className="skip-to-main">
-        {t("app.a11y.skipToMain")}
-      </a>
-      {/* Assertive recording-state announcement — distinct from the polite
-          workspace-switcher state region below (WCAG 4.1.3). */}
-      <div role="status" aria-live="assertive" className="sr-only">
-        {recordingAnnouncement}
-      </div>
-      {/* Polite phase-transition announcement (critique B7). */}
-      <div role="status" aria-live="polite" className="sr-only">
-        {phaseAnnouncement}
-      </div>
-      <StorageBanner />
-      <DemoModeBanner />
-      <ControlBar />
-      {handoffVisible && (
-        <aside
-          className="flex items-center gap-(--space-5) px-(--space-6) py-(--space-3) bg-(--tint-accent-info) border-b border-(--tint-border-info) text-text-primary"
-          aria-label={t("onboarding.handoffTitle")}
-          // Announce the nudge when it appears: ExpressSetup just closed (its
-          // focused element is gone) so SR/keyboard users would otherwise miss
-          // the onboarding steps. A polite live region notifies without
-          // stealing focus (mirrors ADR-0011 Notifications' status semantics).
-          role="status"
-          aria-live="polite"
-        >
-          <span className="font-semibold text-sm shrink-0">
-            {t("onboarding.handoffTitle")}
-          </span>
-          <ol className="flex items-center gap-(--space-5) m-0 p-0 list-none text-sm text-text-secondary">
-            <li>
-              <span className="mr-(--space-2) font-semibold text-accent-blue">
-                1.
-              </span>
-              {t("onboarding.handoffStep1")}
-            </li>
-            <li>
-              <span className="mr-(--space-2) font-semibold text-accent-blue">
-                2.
-              </span>
-              {t("onboarding.handoffStep2")}
-            </li>
-          </ol>
-          <button
-            type="button"
-            className="ml-auto shrink-0 py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none hover:opacity-90"
-            onClick={dismissHandoff}
-            aria-label={t("onboarding.handoffDismissLabel")}
-          >
-            {t("onboarding.handoffDismiss")}
-          </button>
-        </aside>
-      )}
-      <nav
-        className="workspace-switcher"
-        aria-label={t("workspace.navigation")}
-      >
-        <div
-          className="workspace-switcher__tabs"
-          role="tablist"
-          aria-label={t("workspace.label")}
-        >
-          {WORKSPACE_VIEWS.map((view) => (
-            <button
-              key={view}
-              type="button"
-              role="tab"
-              id={`workspace-tab-${view}`}
-              aria-selected={workspaceView === view}
-              aria-controls={`workspace-panel-${view}`}
-              tabIndex={workspaceView === view ? 0 : -1}
-              className="workspace-switcher__tab"
-              onClick={() => setWorkspaceView(view)}
-              onKeyDown={handleWorkspaceViewKeyDown}
-            >
-              {view === "during" && isCapturing
-                ? t("workspace.liveNow")
-                : t(`workspace.${view}`)}
-            </button>
-          ))}
-        </div>
-        <div className="workspace-switcher__state" aria-live="polite">
-          {isCapturing ? (
-            <span>{t("workspace.stateLive")}</span>
-          ) : samplePreviewActive ? (
-            <span>{t("workspace.stateSample")}</span>
-          ) : loadedSessionId ? (
-            <span>{t("workspace.stateLoaded")}</span>
-          ) : (
-            <span>{t("workspace.stateIdle")}</span>
-          )}
-        </div>
-      </nav>
-      <div className={`main-layout main-layout--${workspaceView}`}>
-        <aside className="left-panel" style={{ width: leftWidth }}>
-          <AudioSourceSelector />
-          <SpeakerPanel />
-        </aside>
-        <ResizeDivider
-          orientation="vertical"
-          onResize={resizeLeft}
-          ariaLabel={t("app.resizeSources")}
+      <ShellChrome
+        workspaceView={workspaceView}
+        recordingAnnouncement={recordingAnnouncement}
+        phaseAnnouncement={phaseAnnouncement}
+        handoffVisible={handoffVisible}
+        dismissHandoff={dismissHandoff}
+      />
+      <ShellDestinationBar
+        workspaceView={workspaceView}
+        isCapturing={isCapturing}
+        samplePreviewActive={samplePreviewActive}
+        loadedSessionId={loadedSessionId}
+        onSelectView={setWorkspaceView}
+        onTabKeyDown={handleWorkspaceViewKeyDown}
+      />
+      {/* SessionViewProvider (SHELL-R1): the seam future per-session store
+          isolation (store/index.ts:2100, out of scope this unit) lands
+          behind, without reopening NotesPanel/LiveTranscript/
+          KnowledgeGraphViewer/SeekTimeline. Today it forwards the identical
+          global-store values those panels already read. */}
+      <SessionViewProvider>
+        <ShellRailContentAside
+          workspaceView={workspaceView}
+          leftWidth={leftWidth}
+          resizeLeft={resizeLeft}
+          showGetStartedFallback={showGetStartedFallback}
+          previewSampleSession={previewSampleSession}
+          retryCredentialProbe={retryCredentialProbe}
+          openSettings={openSettings}
+          probeRetrying={probeRetrying}
+          probeUnreadable={probeUnreadable}
+          hasAgentActivity={hasAgentActivity}
+          samplePreviewActive={samplePreviewActive}
+          loadedSessionId={loadedSessionId}
+          rightWidth={rightWidth}
+          resizeRight={resizeRight}
+          resizeNotes={resizeNotes}
+          notesHeight={notesHeight}
+          rightPanelTab={rightPanelTab}
+          setRightPanelTab={setRightPanelTab}
+          handleTabKeyDown={handleTabKeyDown}
         />
-        {workspaceView === "during" &&
-          (showGetStartedFallback ? (
-            <main
-              id="workspace-panel-during"
-              role="tabpanel"
-              aria-labelledby="workspace-tab-during"
-              className="workspace-panel"
-            >
-              <GetStartedFallback
-                onPreviewSample={previewSampleSession}
-                onRetry={retryCredentialProbe}
-                onOpenSettings={openSettings}
-                retrying={probeRetrying}
-                unreadable={probeUnreadable}
-              />
-            </main>
-          ) : (
-            <main
-              id="workspace-panel-during"
-              role="tabpanel"
-              aria-labelledby="workspace-tab-during"
-              className="workspace-panel workspace-panel--during"
-            >
-              <section
-                className="workspace-panel__primary"
-                aria-label={t("workspace.duringNotes")}
-              >
-                <NotesPanel />
-              </section>
-              <section
-                className="workspace-panel__transcript"
-                aria-label={t("workspace.duringTranscript")}
-              >
-                <LiveTranscript />
-              </section>
-              {hasAgentActivity && (
-                <section
-                  className="workspace-panel__assist"
-                  aria-label={t("workspace.liveAssist")}
-                >
-                  <AgentProposalsPanel />
-                </section>
-              )}
-            </main>
-          ))}
-        {workspaceView === "after" && (
-          <main
-            id="workspace-panel-after"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-after"
-            className="workspace-panel workspace-panel--after"
-          >
-            <section
-              className="workspace-panel__review-notes"
-              aria-label={t("workspace.afterNotes")}
-            >
-              <NotesPanel />
-            </section>
-            <section
-              className="workspace-panel__review-transcript"
-              aria-label={t("workspace.afterTranscript")}
-            >
-              <LiveTranscript />
-            </section>
-            {(samplePreviewActive || loadedSessionId) && (
-              <section
-                className="workspace-panel__seek"
-                aria-label={t("seekTimeline.label")}
-              >
-                <SeekTimeline />
-              </section>
-            )}
-          </main>
-        )}
-        {workspaceView === "analysis" && (
-          <main
-            id="workspace-panel-analysis"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-analysis"
-            className="center-panel workspace-panel--analysis"
-          >
-            <div className="center-panel__graph">{graphPanel}</div>
-            <ResizeDivider
-              orientation="horizontal"
-              onResize={resizeNotes}
-              ariaLabel={t("app.resizeNotes")}
-            />
-            <div
-              className="center-panel__notes"
-              style={{ height: notesHeight }}
-            >
-              <NotesPanel />
-            </div>
-          </main>
-        )}
-        {workspaceView === "analysis" && (
-          <>
-            <ResizeDivider
-              orientation="vertical"
-              onResize={resizeRight}
-              ariaLabel={t("app.resizeTranscriptChat")}
-            />
-            {analysisContextPanel}
-          </>
-        )}
-      </div>
-      <PipelineStatusBar />
+      </SessionViewProvider>
+      <ShellFooter />
 
       {/* Settings modal */}
       {settingsOpen && (

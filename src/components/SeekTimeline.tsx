@@ -35,6 +35,7 @@
 import { Fragment, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
+import { useSessionView } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { TimelineEntry } from "../types";
 import { formatTime } from "../utils/format";
@@ -78,7 +79,7 @@ interface Lane {
 
 function SeekTimeline() {
   const { t } = useTranslation();
-  const timeline = useAudioGraphStore((s) => s.sessionTimeline);
+  const { sessionTimeline: timeline } = useSessionView();
   const loading = useAudioGraphStore((s) => s.sessionTimelineLoading);
   const sessionTranscriptEvents = useAudioGraphStore(
     (s) => s.sessionTranscriptEvents,

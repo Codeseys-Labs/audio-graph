@@ -21,6 +21,7 @@ import ForceGraph2D, {
   type NodeObject,
 } from "react-force-graph-2d";
 import { useTranslation } from "react-i18next";
+import { useSessionView } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { GraphLink, GraphNode } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
@@ -72,7 +73,7 @@ function escapeHtml(s: string): string {
 
 function KnowledgeGraphViewer() {
   const { t } = useTranslation();
-  const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
+  const { graphSnapshot } = useSessionView();
   const materializedProjectionGraph = useAudioGraphStore(
     (s) => s.materializedProjectionGraph,
   );

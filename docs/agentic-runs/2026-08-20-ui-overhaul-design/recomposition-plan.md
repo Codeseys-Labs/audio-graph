@@ -100,6 +100,34 @@ transitional states are named in R3.
   `App.contract.test.tsx` green **untouched**, `git diff --stat e2e/` empty, full vitest green,
   zero i18n churn, zero visual diff. E2E run in CI green with zero spec edits.
 - **SIZE:** M. **DEPS:** T1 (`audio-graph-8d89` — the contract net must exist first).
+- **LANDED STATUS (seed `audio-graph-59fb`, branch `shell/audio-graph-59fb`) — read before starting
+  R2/R3:** what actually shipped is narrower than the WHAT bullet above promises, by deliberate
+  design (reset call sites in `store/index.ts` bypass the named flag setters, so a synchronized
+  mirror would silently drift — worse than not shipping it). Recorded here so R2/R3 don't assume
+  state that doesn't exist yet:
+  - Only **1 of 7** flags actually moved: App-local `workspaceView` → `nav.dest`/`nav.lens`
+    (`deriveWorkspaceView`/`navForWorkspaceView` in `src/store/shellNav.ts`). The other six —
+    `loadedSessionId`, `rightPanelTab`, `sessionsBrowserOpen`, `agentOverlayOpen`,
+    `tokenOverlayOpen`, `settingsOpen` — are **untouched**: same state, same actions, same call
+    sites. `src/store/index.ts` gained only the 4-line slice spread (`createShellNavSlice`), not
+    the "flag delegation" this section's FILES line named.
+  - The `+ drawer` half of the shape is **not instantiated**. `ShellDrawerState` exists in
+    `src/store/shellNav.ts` as a documented type only (no store field, no reads, no writes) —
+    R3's System drawer lands *on* this name, not on live state.
+  - `nav.sessionId` has **zero writers and zero readers** this unit; R2's `stopCapture` is meant
+    to be its first caller (`nav = {dest:"sessions", sessionId, lens:"notes"}`).
+  - `setNavDest`/`setNavSessionId`/`setNavLens` ship with no call sites yet — R2 is the intended
+    first caller. Known sharp edge for R2: `setNavDest` alone does not renormalize `lens`, so
+    calling it while `lens` is still `"graph"` (reachable via the graph-edge-focus effect) derives
+    to `analysis` rather than `after`/Review — use `setWorkspaceView` (which does renormalize) or
+    normalize `lens` explicitly at the call site.
+  - Tests for the slice (named in this section's FILES line) landed in a follow-up fix pass, not
+    the original commit: `src/store/shellNav.test.ts` (pure-function + store-wiring coverage,
+    including the same-value-bailout and dest/lens footgun above) and
+    `src/session/SessionViewProvider.test.tsx`.
+  - E2E was not run locally for this unit; `git diff --stat origin/master...HEAD -- e2e/` was
+    confirmed empty (no spec edits), and the ACCEPTANCE line's "E2E run in CI green" is satisfied
+    by the PR's CI run, not by a local run — flagging explicitly rather than leaving it ambiguous.
 
 ### R2 — Sessions destination: list→detail with lenses; Stop lands on your session
 
@@ -542,6 +570,12 @@ for continuity with T1–T3). Texts follow the 8d89/b9dc/99aa house style.
 
 **R1 — "SHELL-R1: ShellNav store slice + SessionViewProvider shim + region extraction (contract-neutral)"**
 > Introduce src/store/shellNav.ts: one typed nav object ({dest:"capture"|"sessions", sessionId, lens} + drawer) replacing App-local workspaceView (App.tsx:297) and absorbing loadedSessionId/rightPanelTab/sessionsBrowserOpen/agentOverlayOpen/tokenOverlayOpen/settingsOpen routing; during this unit it still derives and drives the existing during/after/analysis shell — ids, classes, labels, DOM byte-identical. Add SessionViewProvider + useSessionView() (transcriptSegments, graphSnapshot, materializedNotes, sessionTimeline, sessionProjectionEvents; defaults to global store) with one-line reads in NotesPanel/LiveTranscript/KnowledgeGraphViewer/SeekTimeline — zero behavior change, so later per-session store isolation (store/index.ts:2100) never reopens panels. Extract App.tsx's four regions (banners+chrome / destination bar / rail-content-aside / footer) rendering today's content. HONEST CONSTRAINTS: nav must live in the store because stopCapture (a store action) must route in R2 — App-local state cannot deliver that. ACCEPTANCE: App.contract.test.tsx green UNTOUCHED; git diff --stat e2e/ empty; full vitest + parity green; zero visual diff; CI E2E green with zero spec edits (this unit exists to prove the refactor is contract-neutral). Size M. Depends on audio-graph-8d89 (T1). Parent audio-graph-19c7.
+>
+> **LANDED (audio-graph-59fb):** only workspaceView actually moved (→ nav.dest/nav.lens); the other
+> six flags and the `+ drawer` shape are explicitly deferred (see §R1's "LANDED STATUS" note above
+> for the full disposition and the setNavDest/lens sharp edge R2 should know about) — absorbing
+> them remains R2/R3's job, not done here. Tests for the slice landed in a follow-up fix pass:
+> src/store/shellNav.test.ts, src/session/SessionViewProvider.test.tsx.
 
 **R2 — "SHELL-R2: Sessions destination — list→detail with lenses; Stop lands on your own session"**
 > Inside #workspace-panel-after with all three tab ids intact: SessionsBrowser modal → rail(list)+detail. List: search + persisted SessionSortMode, SessionMetadata rows (title/relative time/duration/counts/state chip via .ag-chip[data-tone], extensible to finalizing/blocked per ADR-0035/0036); export/trash/restore/permanent-delete → row overflow on @radix-ui/react-popover (ratified D5); Trash filter. stopCapture (store/index.ts:2157-2177) reads get_session_id (already exists, :1979) before stopping, sets nav={dest:sessions, sessionId, lens:notes}, calls listSessions(); optimistic "finalizing" row if the index lags (1d92 gap). Detail lens tabs (same roving-tablist pattern as the right-panel pair): Notes(default)/Transcript/Timeline(SeekTimeline promoted to full lens)/Graph(lazy)/Route(SessionDataRoutePanel unchanged); ChatSidebar becomes an Ask aside lens on Notes/Graph. Live-locked detail reuses sessions.reviewLockedWhileLive verbatim — concurrent Live+Review NOT delivered. Manual synthesis moves to detail overflow as "Generate prose summary" (retarget the data-notes-synthesize shortcut, NotesPanel.tsx:118). Fold e7e5: one hours-aware formatter in utils/format.ts; delete SessionsBrowser.tsx:77 local copy; align ProjectionRuntimeStatusPanel formatAgeMs. Sample preview renders as ephemeral detail. SessionsBrowser stops being lazy — verify force-graph chunk still defers via bun run build:analyze. HONEST CONSTRAINTS: analysis tab keeps its graph/diagnostics until R4 (deliberate interim duplication of reach, not state); SessionDataRoutePanel copy byte-identical (ADR-0034 non-engagement in PR body); recipes from T2/T3 only, no parallel styles. ACCEPTANCE: stop leaves the user viewing the just-ended session's notes; git diff --stat e2e/ empty; App.contract.test.tsx green untouched; restore/trash/export/delete + session restore regression-free; SessionsBrowser.test.tsx rewritten not deleted (d19f case preserved); shared-formatter test; en+pt same commit, parity green; full vitest + CI E2E. Size L. Depends on SHELL-R1, audio-graph-b9dc, audio-graph-99aa. Parent audio-graph-19c7.

@@ -1,9 +1,23 @@
 import "@testing-library/jest-dom";
-import { vi } from "vitest";
+import { beforeEach, vi } from "vitest";
 // Initialize the i18next singleton for the whole test run so components that
 // call `t()` render real English copy instead of raw key strings, regardless
 // of each test file's import graph or execution order.
 import "../i18n";
+import { useAudioGraphStore } from "../store";
+import { DEFAULT_SHELL_NAV } from "../store/shellNav";
+
+// ShellNav (SHELL-R1): `nav` replaced App-local `workspaceView` `useState`,
+// so — unlike the old per-mount local state — it now lives in the
+// module-singleton Zustand store and survives across `render(<App />)` calls
+// within one test file. A production window mounts `<App />` exactly once,
+// so this is purely a test-isolation artifact; reset it here (once, for
+// every test file) rather than asking each test file's own store-reset
+// helper to know about a slice it didn't introduce (several, including
+// `App.contract.test.tsx`, must stay untouched — seed audio-graph-59fb).
+beforeEach(() => {
+  useAudioGraphStore.setState({ nav: DEFAULT_SHELL_NAV });
+});
 
 // jsdom does not implement ResizeObserver, which Radix UI primitives (e.g.
 // the Tooltip's positioning) construct on mount. Provide a no-op polyfill so

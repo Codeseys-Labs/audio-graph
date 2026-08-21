@@ -33,6 +33,18 @@ import type {
   AudioSourceInfo,
   SourceId,
 } from "../generated/audioSource";
+// ShellNav (SHELL-R1, seed audio-graph-59fb, ADR-0046): the typed nav object
+// that replaces App-local `workspaceView`. Defined in `store/` (not here)
+// because it ships with pure derivation helpers (`deriveWorkspaceView` /
+// `navForWorkspaceView`) the store's own slice creator and `App.tsx` both
+// need — re-exported below so store consumers can import the type from
+// `../types` like every other `AudioGraphStore` field type.
+import type {
+  LegacyWorkspaceView,
+  SessionLens,
+  ShellDest,
+  ShellNav,
+} from "../store/shellNav";
 
 export type {
   AudioChannelProvenanceKind,
@@ -53,7 +65,6 @@ export type {
   AudioSourceType,
   SourceId,
 } from "../generated/audioSource";
-
 // Session data-movement ledger audit schema (seed audio-graph-70a3), consumed
 // by the session data-route / privacy report UI (seed audio-graph-51e0). The
 // generated file is the single source of truth mirrored from the Rust
@@ -83,6 +94,7 @@ export type {
   PrivacyMode as LedgerPrivacyMode,
   RetentionClass,
 } from "../generated/sessionDataMovement";
+export type { LegacyWorkspaceView, SessionLens, ShellDest, ShellNav };
 
 export type SegmentId = string;
 
@@ -2661,6 +2673,16 @@ export interface NotifyOptions {
 
 /** Shape of the Zustand audio-graph store. */
 export interface AudioGraphStore {
+  // ── Shell navigation (SHELL-R1, ADR-0046) ───────────────────────────────
+  // One typed nav object, store-owned so R2's `stopCapture` (a store action)
+  // can route to it — see `store/shellNav.ts` for the full rationale and the
+  // during/after/analysis derivation this unit keeps byte-identical.
+  nav: ShellNav;
+  setWorkspaceView: (view: LegacyWorkspaceView) => void;
+  setNavDest: (dest: ShellDest) => void;
+  setNavSessionId: (sessionId: string | null) => void;
+  setNavLens: (lens: SessionLens) => void;
+
   // Audio sources
   audioSources: AudioSourceInfo[];
   selectedSourceIds: SourceId[];
