@@ -118,7 +118,7 @@ function ChatSidebar() {
             key={`${msg.role}-${idx}`}
             className={`flex flex-col max-w-[90%] ${msg.role === "user" ? "self-end" : "self-start"}`}
           >
-            <div className="text-[0.65rem] uppercase tracking-[0.05em] text-text-muted mb-(--space-1) px-(--space-2)">
+            <div className="text-[0.65rem] uppercase tracking-wide text-text-muted mb-(--space-1) px-(--space-2)">
               {msg.role === "user"
                 ? t("chat.roleUser")
                 : t("chat.roleAssistant")}
@@ -137,7 +137,7 @@ function ChatSidebar() {
 
         {isChatLoading && (
           <div className="flex flex-col max-w-[90%] self-start">
-            <div className="text-[0.65rem] uppercase tracking-[0.05em] text-text-muted mb-(--space-1) px-(--space-2)">
+            <div className="text-[0.65rem] uppercase tracking-wide text-text-muted mb-(--space-1) px-(--space-2)">
               {t("chat.roleAssistant")}
             </div>
             <div
@@ -190,7 +190,7 @@ function ChatSidebar() {
             disabled={isChatLoading || historicalReview}
           />
           <IconButton
-            className="py-(--space-4) px-[14px] border-none rounded-lg bg-accent-blue text-(--on-accent-blue) text-[1rem] cursor-pointer transition-all duration-200 shrink-0 hover:not-disabled:bg-(--accent-blue-hover) hover:not-disabled:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
+            className="py-(--space-4) px-[14px] border-none rounded-lg bg-accent-blue text-(--on-accent-blue) text-[1rem] cursor-pointer transition-[background-color,transform,opacity] duration-(--motion-base) ease-(--ease-standard) shrink-0 hover:not-disabled:bg-(--accent-blue-hover) hover:not-disabled:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
             icon="send"
             label={t("chat.send")}
             onClick={handleSend}

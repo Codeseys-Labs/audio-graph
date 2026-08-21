@@ -52,15 +52,22 @@
   }
 }
 
+/* Opacity-only as of UI-T3/audio-graph-99aa (was opacity + `transform:
+   scale()`). Consumed as a fixed-size 8-10px dot (ControlBar.tsx) with
+   nothing else in its box to reflow, so the earlier `transform: scale()`
+   step was not literally forcing layout — transform is a
+   compositor/paint-only property per the CSS spec — but it also bought
+   nothing an opacity-only pulse doesn't already deliver for a "recording"
+   indicator, and dropping it removes a layer-promotion candidate from an
+   `infinite`-duration animation for no visual loss. Zero component edits:
+   the 3 consumers reference this keyframe by name only. */
 @keyframes pulse-recording {
   0%,
   100% {
     opacity: 1;
-    transform: scale(1);
   }
   50% {
     opacity: 0.4;
-    transform: scale(0.85);
   }
 }
 

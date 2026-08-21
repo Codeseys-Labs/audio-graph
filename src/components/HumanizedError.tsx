@@ -56,7 +56,7 @@ export default function HumanizedError({ raw, onRetry }: HumanizedErrorProps) {
               <summary className="cursor-pointer select-none text-text-muted [&::-webkit-details-marker]:hidden">
                 {t("notifications.details")}
               </summary>
-              <pre className="m-0 mt-(--space-2) max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-sm border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2) font-mono text-2xs text-text-secondary leading-[1.4]">
+              <pre className="m-0 mt-(--space-2) max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-sm border border-(--edge) bg-bg-tertiary px-(--space-3) py-(--space-2) font-mono text-xs text-text-secondary leading-[1.4]">
                 {humanized.raw}
               </pre>
             </details>

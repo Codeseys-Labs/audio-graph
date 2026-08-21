@@ -76,7 +76,12 @@
   font-size: 18px;
   padding: 4px 8px;
   border-radius: 4px;
-  transition: all 0.15s;
+  /* Explicit property list, not `all` (UI-T3/audio-graph-99aa): only color
+     and background-color change on :hover below. Motion tokens instead of
+     the old bare 0.15s literal. */
+  transition:
+    color var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
   line-height: 1;
 }
 
@@ -126,7 +131,10 @@
   font-size: 14px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  /* 0.04em — matches the closed-set `tracking-wide` value (UI-T3/
+     audio-graph-99aa gate-fix review); this module isn't Tailwind-utility
+     styled, so the value is inlined rather than a `tracking-wide` class. */
+  letter-spacing: 0.04em;
   color: var(--text-secondary);
   margin: 0 0 16px;
 }
@@ -1205,7 +1213,12 @@
   cursor: pointer;
   font-size: 13px;
   font-weight: 500;
-  transition: all 0.2s;
+  /* Explicit property list, not `all` (UI-T3/audio-graph-99aa): the
+     variant rules below only ever change background-color on :hover and
+     opacity on :disabled. */
+  transition:
+    background-color var(--motion-base) var(--ease-standard),
+    opacity var(--motion-base) var(--ease-standard);
   line-height: 1.4;
 }
 
@@ -1474,7 +1487,8 @@
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.05em;
+  /* 0.04em — matches tracking-wide (UI-T3/audio-graph-99aa gate-fix review). */
+  letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 

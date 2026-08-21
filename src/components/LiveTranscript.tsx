@@ -264,13 +264,13 @@ function LiveTranscript() {
         <h3 className="panel-title">{t("transcript.title")}</h3>
         <div className="flex items-center gap-(--space-3)">
           {segments.length > 0 && (
-            <span className="text-2xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+            <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
               {segments.length}
             </span>
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportJsonTitle")}
@@ -280,7 +280,7 @@ function LiveTranscript() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportTxtTitle")}
@@ -310,7 +310,7 @@ function LiveTranscript() {
         {visibleSegments.length === 0 && !asrPartial ? (
           <div className="flex flex-col items-center justify-center flex-1 select-none">
             <span
-              className="text-3xl text-text-muted opacity-40 mb-(--space-4) tracking-[4px]"
+              className="text-3xl text-text-muted opacity-40 mb-(--space-4) tracking-normal"
               aria-hidden="true"
             >
               <Icon name="transcript" size={24} />
@@ -345,7 +345,7 @@ function LiveTranscript() {
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (
                     <span
-                      className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-solid whitespace-nowrap tracking-[0.2px]"
+                      className="text-xs font-semibold py-px px-(--space-4) rounded-[10px] border border-solid whitespace-nowrap tracking-wide"
                       style={{
                         backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
                         color: getSpeakerColor(seg.speaker_id),
@@ -355,7 +355,7 @@ function LiveTranscript() {
                       {seg.speaker_label}
                     </span>
                   )}
-                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">
+                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-xs text-text-muted shrink-0">
                     {formatTime(seg.start_time)}
                   </span>
                   {(transcriptRevisionNumbers.get(seg.id) ?? 0) > 1 && (
@@ -397,10 +397,10 @@ function LiveTranscript() {
                 aria-live="polite"
               >
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
-                  <span className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-(--tint-border-warning) bg-(--tint-warning) text-(--text-on-tint-warning) whitespace-nowrap uppercase">
+                  <span className="text-xs font-semibold py-px px-(--space-4) rounded-[10px] border border-(--tint-border-warning) bg-(--tint-warning) text-(--text-on-tint-warning) whitespace-nowrap uppercase">
                     {asrPartial.provider}
                   </span>
-                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">
+                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-xs text-text-muted shrink-0">
                     {formatTime(asrPartial.start_time)}
                   </span>
                 </div>

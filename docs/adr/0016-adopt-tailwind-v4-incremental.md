@@ -32,6 +32,16 @@ explicit owner decision to adopt a utility framework.
 > unaffected and remains in force. Read ADR-0047 for the third channel's
 > scope and boundary.
 
+> **Status note (2026-08-20, UI-T3/audio-graph-99aa):** the font-size scale
+> named in the "Conventions (for subsequent migrations)" and "Conventions
+> clause" sections below as `text-2xs..3xl` / `text-2xs..text-3xl` is
+> amended: `--font-size-2xs`/`text-2xs` is **retired** (10px, below the new
+> 11px floor) after a 55-site sweep left it with zero consumers. The scale
+> is now `text-xs..text-3xl` (11px floor). `text-2xs` no longer generates a
+> Tailwind utility at all — treat any remaining reference to it in this
+> document as historical, not current convention. See `src/styles.css`'s
+> `@theme inline` comment for the live convention text.
+
 ## Context
 
 ADR-0015 (proposed earlier today) recommended staying on vanilla, modularized CSS

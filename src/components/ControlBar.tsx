@@ -241,7 +241,7 @@ function ControlBar() {
       aria-label={t("controlBar.toolbarLabel")}
     >
       <div className="control-bar__brand flex items-center min-w-[140px]">
-        <h1 className="text-lg font-bold text-accent-blue m-0 tracking-[-0.3px]">
+        <h1 className="text-lg font-bold text-accent-blue m-0 tracking-normal">
           AudioGraph
         </h1>
       </div>
@@ -252,7 +252,7 @@ function ControlBar() {
         {/* ── Capture controls ────────────────────────────────── */}
         <button
           type="button"
-          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-(--on-accent-green) border-accent-green enabled:hover:bg-(--accent-green-hover) enabled:hover:border-(--accent-green-hover) disabled:opacity-40 disabled:cursor-not-allowed"}`}
+          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-[background-color,border-color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-(--on-accent-green) border-accent-green enabled:hover:bg-(--accent-green-hover) enabled:hover:border-(--accent-green-hover) disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
           disabled={(!canStart && !isCapturing) || capturePending}
           aria-label={
@@ -289,7 +289,7 @@ function ControlBar() {
               aria-hidden="true"
             />
             <span
-              className="font-mono text-[15px] font-semibold text-text-primary tracking-[0.5px] min-w-[50px]"
+              className="font-mono text-[15px] font-semibold text-text-primary tracking-wide tabular-nums min-w-[50px]"
               aria-live="polite"
               aria-atomic="true"
             >
@@ -311,7 +311,7 @@ function ControlBar() {
         <Tooltip content={transcribeReason}>
           <button
             type="button"
-            className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:border-text-muted aria-disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple hover:bg-(--accent-purple-hover) hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple hover:bg-(--tint-purple)"}`}
+            className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-[background-color,border-color,color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:border-text-muted aria-disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple hover:bg-(--accent-purple-hover) hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple hover:bg-(--tint-purple)"}`}
             onClick={() => {
               // ARIA-disabled controls must no-op in JS (semantics only).
               if (transcribeDisabled) return;
@@ -352,7 +352,7 @@ function ControlBar() {
             <Tooltip content={geminiReason}>
               <button
                 type="button"
-                className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:border-text-muted aria-disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-(--on-accent-gemini) border-(--accent-gemini) hover:bg-(--accent-gemini-hover) hover:border-(--accent-gemini-hover)" : "border-(--accent-gemini) text-(--accent-gemini) hover:bg-(--tint-gemini)"}`}
+                className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-[background-color,border-color,color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:border-text-muted aria-disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-(--on-accent-gemini) border-(--accent-gemini) hover:bg-(--accent-gemini-hover) hover:border-(--accent-gemini-hover)" : "border-(--accent-gemini) text-(--accent-gemini) hover:bg-(--tint-gemini)"}`}
                 onClick={() => {
                   if (geminiDisabled) return;
                   void handleToggleGemini();
@@ -452,7 +452,7 @@ function ControlBar() {
         >
           <Icon name="agent" size={16} /> {t("controlBar.agent")}
           {agentProposals.length > 0 && (
-            <span className="inline-flex items-center justify-center min-w-[16px] h-[16px] px-(--space-2) ml-[5px] rounded-lg bg-accent-red text-white text-2xs font-bold">
+            <span className="inline-flex items-center justify-center min-w-[16px] h-[16px] px-(--space-2) ml-[5px] rounded-lg bg-accent-red text-white text-xs font-bold">
               {agentProposals.length}
             </span>
           )}

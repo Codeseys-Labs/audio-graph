@@ -13,6 +13,62 @@ function tokenValues(name: string): string[] {
   );
 }
 
+/* --------------------------------------------------------------------------
+   Alias-resolving token reader (UI-T3/audio-graph-99aa)
+   --------------------------------------------------------------------------
+   --accent-blue/--accent-blue-hover/--on-accent-blue are no longer literal
+   hex declarations — they alias --accent/--accent-hover/--on-accent
+   (ratified decision D3: the two hues sat ~11-12deg apart, so 163 call
+   sites split across two names now render one color under both). A plain
+   hex-literal regex (tokenValues above) would see zero declarations for
+   these three names. rawTokenValues captures the raw declaration text
+   (hex OR `var(--other)`) per occurrence; resolvedTokenValues follows a
+   single level of var() aliasing back to the referenced token's value at
+   the SAME positional index (declaration order === theme order: [0] dark
+   :root, [1] the light media query, [2] the explicit data-theme override —
+   same convention the --edge suite below already relies on), so the
+   contrast math below is computed from styles.css's literal values either
+   way, never hardcoded. */
+function rawTokenValues(name: string): string[] {
+  return Array.from(
+    css.matchAll(new RegExp(`--${name}:\\s*([^;]+);`, "g")),
+    (match) => match[1].trim(),
+  );
+}
+
+function resolvedTokenValues(
+  name: string,
+  seen: Set<string> = new Set(),
+): string[] {
+  if (seen.has(name)) {
+    throw new Error(`circular --${name} alias chain in styles.css`);
+  }
+  seen.add(name);
+  return rawTokenValues(name).map((raw, index) => {
+    if (/^#[0-9a-fA-F]{6}$/.test(raw)) {
+      return raw;
+    }
+    const aliasMatch = raw.match(/^var\(--([\w-]+)\)$/);
+    if (aliasMatch) {
+      // A fresh copy per recursive call, not the same mutable Set: each
+      // declaration-index resolution is independent (different theme
+      // occurrence), so resolving --accent at index 1 must not "remember"
+      // that index 0 already visited --accent — that isn't a cycle, it's
+      // the same alias resolved once per theme.
+      const resolved = resolvedTokenValues(aliasMatch[1], new Set(seen))[index];
+      if (!resolved) {
+        throw new Error(
+          `--${name} declaration #${index} aliases --${aliasMatch[1]}, which has no declaration at the same theme position`,
+        );
+      }
+      return resolved;
+    }
+    throw new Error(
+      `--${name} declaration #${index} ("${raw}") is neither a hex color nor a single-level var() alias`,
+    );
+  });
+}
+
 function luminance(hex: string): number {
   const channels = [1, 3, 5].map(
     (offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255,
@@ -31,16 +87,158 @@ function contrast(a: string, b: string): number {
 }
 
 describe("semantic accent foregrounds", () => {
-  it("keeps every --accent-blue/--on-accent-blue declaration pair at AA contrast", () => {
-    const backgrounds = tokenValues("accent-blue");
-    const foregrounds = tokenValues("on-accent-blue");
+  // Extended from the single --accent-blue pair (UI-T2) to all 7
+  // accent/on-accent pairs, both themes (UI-T3/audio-graph-99aa) — the
+  // 4.5:1 floor is the exact one the original --accent-blue-only test
+  // enforced; every pair must clear it, never a weaker one. --accent-blue
+  // is now an alias of --accent (see the styles.css comment), so its pair
+  // here is expected to mirror --accent's numbers exactly — that IS the
+  // point of the alias, not a test bug.
+  const ACCENT_NAMES = [
+    "accent",
+    "accent-red",
+    "accent-green",
+    "accent-gemini",
+    "accent-blue",
+    "accent-yellow",
+    "accent-purple",
+  ];
 
-    expect(backgrounds.length).toBeGreaterThanOrEqual(2);
-    expect(foregrounds).toHaveLength(backgrounds.length);
-    for (const [index, background] of backgrounds.entries()) {
-      expect(contrast(background, foregrounds[index])).toBeGreaterThanOrEqual(
-        4.5,
-      );
+  for (const name of ACCENT_NAMES) {
+    it(`keeps every --${name}/--on-${name} declaration pair at AA contrast (>=4.5:1)`, () => {
+      const backgrounds = resolvedTokenValues(name);
+      const foregrounds = resolvedTokenValues(`on-${name}`);
+
+      expect(backgrounds.length, name).toBeGreaterThanOrEqual(2);
+      expect(foregrounds, name).toHaveLength(backgrounds.length);
+      for (const [index, background] of backgrounds.entries()) {
+        const ratio = contrast(background, foregrounds[index]);
+        expect(
+          ratio,
+          `--${name} decl #${index} (${background}) vs --on-${name} (${foregrounds[index]}) = ${ratio.toFixed(3)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    });
+  }
+});
+
+/* --------------------------------------------------------------------------
+   Accent-as-text on realistic surfaces (gate-fix review blocker fix,
+   UI-T3/audio-graph-99aa)
+   --------------------------------------------------------------------------
+   The suite above only checks the fill/on-fill pairing. Accent tokens are
+   ALSO rendered directly as TEXT color on ordinary surfaces and tints
+   (ConversationModeControl's badges, TokenUsagePanel's gemini total,
+   ProjectionRuntimeStatusPanel/SessionDataRoutePanel/AgentProposalsPanel's
+   green status text) — a usage this file did not check before the OKLCH
+   re-derivation shipped 6+ live sub-4.5:1 pairs in the light theme with the
+   fill/on-fill test staying green throughout. This locks the specific real
+   call-site pairings (theme, accent name, surface/tint name) so a future
+   token edit that only re-verifies fills can't silently regress text
+   usage again. Light theme only: dark-theme fills sit at 7.0-7.5:1 with
+   enough headroom that no dark surface/tint combination in this palette
+   can push a dark accent below 4.5:1 as text. */
+describe("accent-as-text on realistic surfaces (gate-fix review blocker fix)", () => {
+  // Reads the CURRENT light-theme hex directly (tokenValues' hex-only
+  // regex), not resolvedTokenValues: --tint-* tokens declare an rgba() in
+  // the dark :root block, which resolvedTokenValues would try to parse as
+  // an alias and throw on. Every name used here (accent/accent-green/
+  // accent-gemini/bg-tertiary/bg-secondary/tint-accent/tint-success/
+  // tint-gemini) is a plain hex literal in BOTH light entry points, and
+  // the identity test below independently pins those two entries equal —
+  // so the last hex match is always "the current light value" regardless
+  // of whether the dark declaration above it was hex (2 light matches at
+  // indices [1],[2]) or non-hex (2 light matches at indices [0],[1]).
+  function lightHex(name: string): string {
+    const values = tokenValues(name);
+    expect(values.length, name).toBeGreaterThanOrEqual(2);
+    return values[values.length - 1];
+  }
+
+  const LIGHT_PAIRS: Array<[accent: string, surface: string]> = [
+    ["accent", "tint-accent"], // ConversationModeControl ENGINE_ACTIVE
+    ["accent", "bg-tertiary"], // ConversationModeControl BADGE_ACTION
+    ["accent-green", "bg-tertiary"], // ProjectionRuntimeStatusPanel success text
+    ["accent-green", "bg-secondary"], // AgentProposalsPanel diff text
+    ["accent-green", "tint-success"], // SessionDataRoutePanel success banner
+    ["accent-gemini", "bg-tertiary"], // TokenUsagePanel ddTotal
+    ["accent-gemini", "tint-gemini"], // ControlBar Gemini-active hover
+  ];
+
+  for (const [accentName, surfaceName] of LIGHT_PAIRS) {
+    it(`keeps light --${accentName} at AA contrast (>=4.5:1) as text on --${surfaceName}`, () => {
+      const accentHex = lightHex(accentName);
+      const surfaceHex = lightHex(surfaceName);
+      const ratio = contrast(accentHex, surfaceHex);
+      expect(
+        ratio,
+        `--${accentName} (${accentHex}) vs --${surfaceName} (${surfaceHex}) = ${ratio.toFixed(3)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    });
+  }
+});
+
+/* --------------------------------------------------------------------------
+   Accent alias identity (gate-fix review, UI-T3/audio-graph-99aa)
+   --------------------------------------------------------------------------
+   Two gaps a review probe found: (1) nothing locked --accent-blue's alias
+   FORM, so a future edit could reintroduce an independent (but
+   numerically-AA-passing) literal hex and the contrast test above would
+   stay green — defeating the D3 "one color under two names" invariant
+   silently; (2) the accent/on-accent/hover block is hand-duplicated between
+   the `@media (prefers-color-scheme: light)` default and the explicit
+   `[data-theme="light"]` override (same structural risk the --edge suite
+   below already guards for bg/edge/border tokens), but the existing
+   "identical between the two light entry points" test only covers
+   ALL_TOKEN_NAMES, which excludes every accent name. A probe that replaced
+   `--accent-blue: var(--accent);` with an AA-passing literal in ONLY the
+   `[data-theme="light"]` block left the full suite green before this fix. */
+describe("accent alias identity (gate-fix review, UI-T3/audio-graph-99aa)", () => {
+  it.each([
+    ["accent-blue", "accent"],
+    ["accent-blue-hover", "accent-hover"],
+    ["on-accent-blue", "on-accent"],
+  ])("keeps --%s a var(--%s) alias — raw declaration text, not just the resolved value — in every theme block", (aliasName, targetName) => {
+    const raws = rawTokenValues(aliasName);
+    expect(raws.length, aliasName).toBeGreaterThanOrEqual(3);
+    for (const [index, raw] of raws.entries()) {
+      expect(raw, `--${aliasName} decl #${index}`).toBe(`var(--${targetName})`);
+    }
+  });
+
+  // Extends the --edge suite's "identical between the two light entry
+  // points" guard to every accent/on-accent/hover name, not just
+  // ALL_TOKEN_NAMES (bg/edge/border). Works whether a declaration is a hex
+  // literal or a var() alias, since it compares raw declaration text.
+  const ACCENT_AND_FRIENDS = [
+    "accent",
+    "accent-hover",
+    "on-accent",
+    "accent-red",
+    "accent-red-hover",
+    "on-accent-red",
+    "accent-green",
+    "accent-green-hover",
+    "on-accent-green",
+    "accent-gemini",
+    "accent-gemini-hover",
+    "on-accent-gemini",
+    "accent-blue",
+    "accent-blue-hover",
+    "on-accent-blue",
+    "accent-yellow",
+    "on-accent-yellow",
+    "accent-purple",
+    "accent-purple-hover",
+    "on-accent-purple",
+  ];
+
+  it("keeps every accent/on-accent/hover declaration identical between the prefers-color-scheme default and the explicit data-theme override", () => {
+    for (const name of ACCENT_AND_FRIENDS) {
+      const raws = rawTokenValues(name);
+      expect(raws.length, name).toBeGreaterThanOrEqual(3);
+      const [, mediaQueryValue, dataThemeValue] = raws;
+      expect(dataThemeValue, name).toBe(mediaQueryValue);
     }
   });
 });

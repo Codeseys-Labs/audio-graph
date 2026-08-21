@@ -468,13 +468,13 @@ function TokenUsagePanel() {
   // so they are applied directly to the elements here. The mono stack resolves
   // through the bridged `font-mono` utility (Phase 1, D7).
   const scopeLabel =
-    "flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0 text-[9px] font-bold uppercase tracking-[0.6px] text-text-muted";
+    "flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0 text-[9px] font-bold uppercase tracking-wide text-text-muted";
   const grid = "grid grid-cols-3 gap-x-[10px] gap-y-(--space-2) m-0";
   const cell = "flex flex-col min-w-0";
   const dt =
-    "text-[9px] font-semibold uppercase tracking-[0.4px] text-text-muted m-0 leading-[1.2]";
+    "text-[9px] font-semibold uppercase tracking-wide text-text-muted m-0 leading-[1.2]";
   const dd =
-    "font-mono text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap";
+    "font-mono text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap tabular-nums";
   const ddTotal = `${dd} text-accent-gemini text-md`;
   const empty = "m-0 text-xs italic text-text-muted leading-[1.4]";
 
@@ -488,7 +488,13 @@ function TokenUsagePanel() {
         <div className="flex items-center gap-(--space-3)">
           {session.turns > 0 && (
             <span
-              className="text-2xs font-semibold bg-[rgb(52_211_153/0.15)] text-accent-gemini py-px px-(--space-4) rounded-xl tracking-[0.2px]"
+              // Was a hardcoded rgb(52 211 153/…) literal — the RETIRED
+              // pre-99aa green --accent-gemini value, rendering teal text on
+              // a green badge fill (gate-fix review). --tint-gemini now
+              // tracks the current teal accent-gemini, so this resolves
+              // through the token instead of a second, independently-stale
+              // magic literal.
+              className="text-xs font-semibold bg-(--tint-gemini) text-accent-gemini py-px px-(--space-4) rounded-xl tracking-wide"
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: session.turns })}
@@ -496,7 +502,7 @@ function TokenUsagePanel() {
           )}
           {session.llmTurns > 0 && (
             <span
-              className="text-2xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl tracking-[0.2px]"
+              className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl tracking-wide"
               title={t("tokens.llmChatsTooltip")}
             >
               {t("tokens.llmChats", { count: session.llmTurns })}
@@ -504,7 +510,7 @@ function TokenUsagePanel() {
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleNewSession}
             disabled={newSessionLocked}
             aria-label={t("tokens.newSession")}
@@ -522,7 +528,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleReset}
             disabled={!hasSession}
             aria-label={t("tokens.reset")}
@@ -532,7 +538,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-(--hover-overlay) border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleClearAll}
             disabled={!hasAny}
             aria-label={t("tokens.clearAll")}
@@ -613,7 +619,7 @@ function TokenUsagePanel() {
           {t("tokens.lifetime")}
           {hasLifetime && (
             <span
-              className="text-[9px] font-semibold text-text-muted tracking-[0.2px] normal-case"
+              className="text-[9px] font-semibold text-text-muted tracking-wide normal-case"
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: lifetime.turns })}
@@ -681,7 +687,7 @@ function TokenUsagePanel() {
 
       {lastUsage && (
         <p
-          className="mt-(--space-3) mb-0 text-2xs text-text-muted leading-[1.3]"
+          className="mt-(--space-3) mb-0 text-xs text-text-muted leading-[1.3]"
           title={t("tokens.lastTurnTooltip")}
         >
           {t("tokens.lastTurn", {

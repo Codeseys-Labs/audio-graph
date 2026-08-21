@@ -232,7 +232,7 @@ function SeekTimeline() {
           <Icon name="transcript" size={15} />
           {t("seekTimeline.title")}
         </h3>
-        <span className="text-2xs text-text-muted">
+        <span className="text-xs text-text-muted">
           {t("seekTimeline.rangeLabel", {
             start: formatTime(minMs / 1000),
             end: formatTime((minMs + spanMs) / 1000),
@@ -240,7 +240,7 @@ function SeekTimeline() {
         </span>
       </header>
 
-      <p className="mb-(--space-3) shrink-0 text-2xs text-text-muted">
+      <p className="mb-(--space-3) shrink-0 text-xs text-text-muted">
         {t("seekTimeline.hint")}
       </p>
 
@@ -261,7 +261,7 @@ function SeekTimeline() {
             data-testid="seek-timeline-lane"
           >
             <span
-              className="w-[84px] shrink-0 truncate text-2xs font-semibold"
+              className="w-[84px] shrink-0 truncate text-xs font-semibold"
               style={{ color: lane.color }}
               title={lane.label ?? t("seekTimeline.unknownSpeaker")}
             >
@@ -357,7 +357,7 @@ function SeekTimeline() {
       </div>
 
       {total > shown && (
-        <p className="mt-(--space-2) shrink-0 text-2xs italic text-text-muted">
+        <p className="mt-(--space-2) shrink-0 text-xs italic text-text-muted">
           {t("seekTimeline.truncated", { shown, total })}
         </p>
       )}

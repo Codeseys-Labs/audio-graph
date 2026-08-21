@@ -164,7 +164,7 @@ export default function NotesPanel() {
   // Tailwind utility groups (ADR-0016). Colors/radii/fonts resolve through the
   // design tokens via the @theme bridge; spacing uses the token shorthand.
   const sectionTitle =
-    "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
+    "text-xs font-bold uppercase tracking-wide text-text-muted mb-[5px]";
   const chipBase =
     "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-(--edge)";
 
@@ -174,7 +174,7 @@ export default function NotesPanel() {
       className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto"
     >
       <div className="flex items-center justify-between gap-(--space-4) mb-(--space-4)">
-        <span className="text-sm font-bold tracking-[0.4px] uppercase text-text-secondary">
+        <span className="text-sm font-bold tracking-wide uppercase text-text-secondary">
           <Icon name="notes" size={16} /> {t("notes.title")}
         </span>
         <Button
@@ -408,7 +408,7 @@ function MaterializedNoteItem({
 }
 
 const SECTION_TITLE =
-  "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
+  "text-xs font-bold uppercase tracking-wide text-text-muted mb-[5px]";
 
 function NotesList({ title, items }: { title: string; items: GraphNode[] }) {
   return (

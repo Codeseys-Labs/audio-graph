@@ -31,9 +31,9 @@ const ENGINE =
   "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border border-(--edge) bg-transparent text-text-secondary text-xs rounded-full cursor-pointer hover:text-text-primary hover:border-divider-color";
 const ENGINE_ACTIVE = "text-accent border-accent bg-(--tint-accent)";
 const BADGE =
-  "ml-(--space-2) py-0 px-(--space-2) text-2xs rounded-sm bg-bg-tertiary text-text-muted border-none";
+  "ml-(--space-2) py-0 px-(--space-2) text-xs rounded-sm bg-bg-tertiary text-text-muted border-none";
 const BADGE_ACTION =
-  "ml-(--space-2) py-0 px-(--space-2) text-2xs rounded-sm bg-bg-tertiary border-none text-accent cursor-pointer hover:underline";
+  "ml-(--space-2) py-0 px-(--space-2) text-xs rounded-sm bg-bg-tertiary border-none text-accent cursor-pointer hover:underline";
 
 export default function ConversationModeControl() {
   const { t } = useTranslation();

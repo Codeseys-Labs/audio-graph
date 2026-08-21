@@ -396,7 +396,7 @@ function SessionsBrowser() {
                     </span>
                   </div>
 
-                  <div className="text-[0.8em] opacity-75 flex gap-(--space-5) flex-wrap">
+                  <div className="text-[0.8em] opacity-75 flex gap-(--space-5) flex-wrap tabular-nums">
                     <span>
                       {t("sessions.stats.duration")}:{" "}
                       {formatDuration(s.duration_seconds)}

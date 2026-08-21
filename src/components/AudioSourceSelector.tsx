@@ -564,7 +564,7 @@ export default function AudioSourceSelector() {
   // Tailwind utility groups (ADR-0016). Colors/radii/fonts resolve through the
   // design tokens via the @theme bridge; spacing uses the token shorthand.
   const groupLabel =
-    "text-2xs font-semibold uppercase tracking-[0.6px] text-text-muted mx-0 mb-(--space-1) px-(--space-2)";
+    "text-xs font-semibold uppercase tracking-wide text-text-muted mx-0 mb-(--space-1) px-(--space-2)";
   const groupToggle =
     "flex items-center gap-(--space-2) w-full bg-none border-none cursor-pointer text-left mt-(--space-3) hover:text-text-primary";
   const sourceItem =
@@ -748,7 +748,7 @@ export default function AudioSourceSelector() {
                     />
                   </span>
                   <Icon name={icon} size={14} /> {label}
-                  <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
+                  <span className="ml-(--space-3) text-xs text-text-muted font-normal">
                     {sources.length}
                   </span>
                 </button>
@@ -831,34 +831,34 @@ export default function AudioSourceSelector() {
                             {source.name}
                           </span>
                           {metadataLabel && (
-                            <span className="text-2xs font-mono bg-(--hover-overlay) text-text-muted py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-xs font-mono bg-(--hover-overlay) text-text-muted py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                               {metadataLabel}
                             </span>
                           )}
                           {(source.is_default === true ||
                             source.source_type.type === "SystemDefault") && (
-                            <span className="text-2xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                               Default
                             </span>
                           )}
                           {source.source_type.type !== "SystemDefault" &&
                             modeLabel && (
-                              <span className="text-2xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              <span className="text-xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                                 {modeLabel}
                               </span>
                             )}
                           {formatLabel && (
-                            <span className="text-2xs font-semibold bg-(--hover-overlay) text-text-secondary py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-xs font-semibold bg-(--hover-overlay) text-text-secondary py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                               {formatLabel}
                             </span>
                           )}
                           {unsupported && (
-                            <span className="text-2xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                               Unsupported
                             </span>
                           )}
                           {recoveryIssue?.kind === "permission" && (
-                            <span className="text-2xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-wide shrink-0">
                               Permission
                             </span>
                           )}
@@ -907,7 +907,7 @@ export default function AudioSourceSelector() {
                     />
                   </span>
                   <Icon name="processes" size={14} /> Running Processes
-                  <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
+                  <span className="ml-(--space-3) text-xs text-text-muted font-normal">
                     {filteredProcesses.length}
                   </span>
                 </button>
@@ -997,12 +997,12 @@ export default function AudioSourceSelector() {
                           <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                             {proc.name}
                           </span>
-                          <span className="text-2xs text-text-muted font-mono whitespace-nowrap">
+                          <span className="text-xs text-text-muted font-mono whitespace-nowrap">
                             PID {proc.pid}
                           </span>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={processDisabled}
                             title={processTitle}
                             aria-pressed={selected}
@@ -1019,7 +1019,7 @@ export default function AudioSourceSelector() {
                           </span>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-(--edge) bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={treeDisabled}
                             title={treeTitle}
                             aria-pressed={treeSelected}

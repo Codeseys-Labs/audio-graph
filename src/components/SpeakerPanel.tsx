@@ -54,7 +54,7 @@ function SpeakerPanel() {
                   })}
                 </span>
               </div>
-              <span className="text-2xs font-semibold bg-bg-tertiary text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">
+              <span className="text-xs font-semibold bg-bg-tertiary text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0 tabular-nums">
                 {speaker.segment_count}
               </span>
             </li>

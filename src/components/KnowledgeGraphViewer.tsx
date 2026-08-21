@@ -597,7 +597,7 @@ function KnowledgeGraphViewer() {
           </header>
           <dl className="grid grid-cols-2 gap-(--space-4) mb-(--space-5)">
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+              <dt className="text-xs uppercase tracking-wide text-text-muted">
                 {t("graph.inspect.type")}
               </dt>
               <dd className="text-md text-text-primary">
@@ -605,7 +605,7 @@ function KnowledgeGraphViewer() {
               </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+              <dt className="text-xs uppercase tracking-wide text-text-muted">
                 {t("graph.inspect.mentions")}
               </dt>
               <dd className="text-md text-text-primary">
@@ -613,7 +613,7 @@ function KnowledgeGraphViewer() {
               </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+              <dt className="text-xs uppercase tracking-wide text-text-muted">
                 {t("graph.inspect.firstSeen")}
               </dt>
               <dd className="text-md text-text-primary">
@@ -621,7 +621,7 @@ function KnowledgeGraphViewer() {
               </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+              <dt className="text-xs uppercase tracking-wide text-text-muted">
                 {t("graph.inspect.lastSeen")}
               </dt>
               <dd className="text-md text-text-primary">
@@ -635,7 +635,7 @@ function KnowledgeGraphViewer() {
             </p>
           )}
           <div className="graph-inspect__neighbors">
-            <h4 className="text-xs uppercase tracking-[0.04em] text-text-muted mb-(--space-3)">
+            <h4 className="text-xs uppercase tracking-wide text-text-muted mb-(--space-3)">
               {t("graph.inspect.connections", {
                 count: selectedNeighbors.length,
               })}
@@ -667,7 +667,7 @@ function KnowledgeGraphViewer() {
                       <span className="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
                         {n.name}
                       </span>
-                      <span className="text-2xs text-text-muted shrink-0">
+                      <span className="text-xs text-text-muted shrink-0">
                         {n.entity_type}
                       </span>
                     </button>
@@ -682,7 +682,7 @@ function KnowledgeGraphViewer() {
       <div className="absolute top-(--space-4) right-(--space-4) flex items-center gap-(--space-3) z-[2]">
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-bg-secondary border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={fitView}
           disabled={!hasNodes}
           title={t("graph.fit")}
@@ -692,7 +692,7 @@ function KnowledgeGraphViewer() {
         </button>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-xs font-semibold tracking-wide uppercase text-text-secondary bg-bg-secondary border border-(--edge) rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleExportJson}
           disabled={isExporting || !hasNodes}
           title={t("graph.exportJson")}

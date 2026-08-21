@@ -43,11 +43,20 @@
   --space-10: 40px;
   --space-12: 48px;
 
-  /* ---- Primitive: radius scale ---------------------------------------- */
-  --radius-xs: 2px;
+  /* ---- Primitive: radius scale (collapsed to 3 steps, UI-T3/audio-graph-99aa)
+     -----------------------------------------------------------------------
+     Was 5 steps (xs/sm/md/lg/xl) + pill/circle. Collapsed to 3
+     (sm/md/xl) + pill/circle: --radius-xs and --radius-lg are retired as
+     independent values and now ALIAS their nearest surviving step so every
+     `rounded-xs`/`rounded-lg` (and any raw `var(--radius-xs|-lg)`) call site
+     keeps resolving with zero component edits — the rendered radius at
+     those call sites changes (2px->4px for -xs, 8px->6px for -lg) and is
+     enumerated in the ticket report, not silent. -xs -> -sm (nearest: |2-4|=2
+     vs |2-6|=4). -lg -> -md (nearest: |8-6|=2 vs |8-12|=4). */
+  --radius-xs: var(--radius-sm);
   --radius-sm: 4px;
   --radius-md: 6px;
-  --radius-lg: 8px;
+  --radius-lg: var(--radius-md);
   --radius-xl: 12px;
   --radius-pill: 999px;
   --radius-circle: 50%;
@@ -57,7 +66,13 @@
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-family-mono:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --font-size-2xs: 10px;
+  /* --font-size-2xs (10px) retired below the UI-T3/audio-graph-99aa 11px
+     floor. DELETED rather than left defined-but-unconsumed: after the
+     55-site `text-2xs`->`text-xs` sweep (11 component files) it had zero
+     remaining consumers, so keeping a dead primitive around is pure
+     clutter with no reversibility benefit a comment doesn't already give
+     via this note + the PR history. --font-size-xs (11px) is now the
+     floor. */
   --font-size-xs: 11px;
   --font-size-sm: 12px;
   --font-size-md: 13px;
@@ -72,6 +87,21 @@
   --font-weight-bold: 700;
   --line-height-tight: 1.25;
   --line-height-base: 1.5;
+  /* Exactly two tracking values (UI-T3/audio-graph-99aa): a 50-site sweep
+     across 9 component files collapsed every ad hoc `tracking-[0.2px..
+     0.6px]`/`tracking-[0.04..0.05em]` arbitrary value onto one of these two
+     — 0.04em matches the value `.ag-label` (below) already uses for
+     uppercase micro-labels, so this formalizes an existing design choice
+     instead of inventing a new number. The one negative outlier
+     (`tracking-[-0.3px]`, ControlBar's wordmark) and one inert outlier
+     (`tracking-[4px]` on a single-icon span, LiveTranscript's empty state —
+     no adjacent glyph to space, so any tracking value is a visual no-op
+     there) both collapsed to 0 (--tracking-normal) since neither fits the
+     "give it a little air" semantic --tracking-wide encodes. See the
+     `@theme inline` block below, which overrides Tailwind's stock
+     `--tracking-wide` (0.025em) to 0.04em and removes the unused
+     tighter/tight/wider/widest keys so the two-value set is a structural
+     guarantee, not just a convention. */
 
   /* ---- Primitive: elevation / shadow scale ---------------------------- */
   --shadow-1: 0 2px 8px rgba(0, 0, 0, 0.35);
@@ -89,12 +119,25 @@
   --z-banner: 1100;
   --z-notification: 1200;
 
-  /* ---- Primitive: motion scale ---------------------------------------- */
+  /* ---- Primitive: motion scale (exactly 4 tokens, UI-T3/audio-graph-99aa)
+     -----------------------------------------------------------------------
+     3 durations (120/180/260ms) + 1 easing curve. --motion-slow moves
+     250ms->260ms (rounds onto the new scale's step; no consumer asserted
+     the old 250ms literal). --ease-standard and --ease-out previously
+     diverged (`ease` vs `cubic-bezier(0.16,1,0.3,1)`) — both names are kept
+     (their consumers reference the names, not raw values) but now ALIAS
+     the same single curve, so every existing `var(--ease-standard)` /
+     `var(--ease-out)` call site picks up the new curve with zero component
+     edits. Corrected (gate-fix review): the only `var(--ease-out)` consumer
+     in the repo is `primitives.css`'s `.notification` entrance animation
+     (settings.css has none — grep-verified); that one site's rendered
+     easing moves cubic-bezier(0.16,1,0.3,1)->cubic-bezier(0.2,0,0.2,1) and,
+     via --motion-slow below, its duration moves 0.25s->0.26s. */
   --motion-fast: 0.12s;
   --motion-base: 0.18s;
-  --motion-slow: 0.25s;
-  --ease-standard: ease;
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-slow: 0.26s;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+  --ease-out: var(--ease-standard);
 
   /* ---- Semantic: surfaces & borders ----------------------------------- */
   /* Deep, neutral slate with a cohesive indigo accent. Contrast-audited
@@ -129,26 +172,77 @@
      --bg-tertiary. Previous #6f7a8c failed on bg-tertiary (3.59:1). */
   --text-muted: #868fa0;
 
-  /* ---- Semantic: accents (with paired on-accent foregrounds) ---------- */
-  --accent: #6c8cff;
-  --accent-hover: #8aa2ff;
+  /* ---- Semantic: accents (with paired on-accent foregrounds) ----------
+     OKLCH re-derivation (UI-T3/audio-graph-99aa, ratified decision D3).
+     Every hue below is preserved from its pre-99aa value EXCEPT --accent
+     (pushed from ~270deg to a decisive ~265deg) and --accent-gemini
+     (widened from ~163deg to ~178deg, true teal — was reading as
+     near-identical to --accent-green's ~154deg). --accent-blue is no
+     longer an independent hue: it sat only ~11-12deg from --accent, so it
+     is now a hard ALIAS (`var(--accent)`) rather than a second value that
+     happened to look similar — 163 call sites split across the two names
+     now render one color under two token names, by construction (zero of
+     those call sites needed editing).
+     Lightness/chroma target per theme: dark L*72/C.16, light L*54/C.17 (guidance
+     range ±2 L*, ±.01-.02 C), holding hue fixed and reducing chroma only
+     where sRGB gamut forces it (--accent-gemini and light --accent-green
+     land under the C guidance for this reason — physically, no in-gamut
+     sRGB color exists at the guidance chroma for a teal this light or a
+     green this saturated at L*54; hue is unaffected, contrast is
+     unaffected). The one BINDING-constraint deviation is light
+     --accent-yellow, which needed L*65 instead: at L*54 (guidance) the
+     max in-gamut chroma for its hue only reaches ~0.115-0.12, and against
+     the existing --on-accent-yellow (#221700, unchanged) that computes
+     3.4:1 — under the 4.5:1 floor `styles.a11y.test.ts` already enforced
+     for --accent-blue before this change and now enforces for all 7 pairs
+     (never weaken). Contrast wins per the ticket's own tie-break — hence
+     L*65, clearing 5.32:1. Full old->new hex/contrast/hue-delta table in
+     the PR body.
+
+     Gate-fix review correction (2026-08-20): the derivation above only
+     verified the FILL/--on-*-fill pairing. --accent, --accent-green, and
+     --accent-gemini are ALSO rendered as direct TEXT color in the light
+     theme (ConversationModeControl's --tint-accent badge, TokenUsagePanel's
+     gemini total on --bg-tertiary, ProjectionRuntimeStatusPanel/
+     SessionDataRoutePanel/AgentProposalsPanel's green status text, etc.) —
+     a usage `styles.a11y.test.ts` did not check. At the original L*54 those
+     three dropped as low as 4.03:1 against --bg-tertiary, under the 4.5:1
+     floor. Contrast wins per the same tie-break already used for light
+     --accent-yellow above: all three are darkened further in the light
+     theme only (dark theme was never at risk — its fills sit at 7.0-7.5:1
+     with headroom) until every real text-on-surface call site clears
+     4.5:1 with margin. Hue is unaffected; --accent-green and
+     --accent-gemini clip chroma slightly harder as a side effect (moving
+     further from the sRGB gamut's widest point for those hues). See
+     docs/reviews/wcag-contrast-audit.md's gate-fix follow-up for the full
+     before/after numbers.
+
+     Same review also found --tint-accent/--tint-purple/--tint-gemini
+     (below) and light --divider-hover were literal alpha/hex copies of the
+     PRE-99aa accent RGBs that never moved with this re-derivation — fixed
+     alongside the text-contrast darkening above so no token still points
+     at a retired hue (the light --accent-gemini move specifically was
+     "stop reading as green"; a stale green tint behind teal text/borders
+     defeated that). */
+  --accent: #78a1ff;
+  --accent-hover: #95b6ff;
   --on-accent: #0a1026;
-  --accent-red: #ff6b85;
-  --accent-red-hover: #ff7f98;
+  --accent-red: #f77589;
+  --accent-red-hover: #ff92a1;
   --on-accent-red: #26080d;
-  --accent-green: #45d483;
-  --accent-green-hover: #5cec92;
+  --accent-green: #39c175;
+  --accent-green-hover: #51d587;
   --on-accent-green: #0a2010;
-  --accent-gemini: #34d399;
-  --accent-gemini-hover: #4aeaaa;
+  --accent-gemini: #00bfa5;
+  --accent-gemini-hover: #00d5b7;
   --on-accent-gemini: #0a2015;
-  --accent-blue: #5b9dff;
-  --accent-blue-hover: #79b0ff;
-  --on-accent-blue: #061629;
-  --accent-yellow: #ffcc4a;
+  --accent-blue: var(--accent);
+  --accent-blue-hover: var(--accent-hover);
+  --on-accent-blue: var(--on-accent);
+  --accent-yellow: #cc9d00;
   --on-accent-yellow: #1b1200;
-  --accent-purple: #b98cff;
-  --accent-purple-hover: #c4a3ff;
+  --accent-purple: #b58af9;
+  --accent-purple-hover: #c5a3ff;
   --on-accent-purple: #1a1028;
 
   /* ---- Semantic: status (for ADR-0011 feedback severities) ------------ */
@@ -193,15 +287,30 @@
      Translucent accent washes used as active/hover/selected backgrounds for
      accent-colored controls (active pills, info chips, hovered ghost
      buttons). Light theme overrides to opaque pale fills so they stay
-     visible on a light surface. */
-  --tint-accent: rgba(108, 140, 255, 0.14);
+     visible on a light surface.
+
+     --tint-accent/--tint-purple/--tint-gemini/--tint-danger-icon's RGB
+     channels below are literal copies of --accent/--accent-purple/
+     --accent-gemini/--accent-red's PRE-99aa hex (gate-fix review finding:
+     they never moved with the OKLCH re-derivation above, so
+     hover:bg-(--tint-gemini) under text-(--accent-gemini) in ControlBar.tsx
+     was rendering the retired green behind the new teal). Updated here to
+     the current dark-theme accent RGB at the SAME alpha each token already
+     used; the light-theme opaque equivalents below are recomputed the same
+     way the pre-existing --tint-danger/--tint-success pairs were (an
+     opaque composite of this rgba over white, then hand-tuned for
+     visibility — reverse-engineered from each token's own prior light
+     value and reapplied to the new RGB, see PR notes). --tint-accent-info*
+     and --tint-danger were never accent copies (they're independent
+     Tailwind-palette constants) and are unaffected. */
+  --tint-accent: rgba(120, 161, 255, 0.14);
   --tint-accent-info: rgba(96, 165, 250, 0.15);
   --tint-accent-info-hover: rgba(96, 165, 250, 0.1);
   --tint-accent-info-strong: rgba(96, 165, 250, 0.12);
   --tint-border-accent-info: rgba(96, 165, 250, 0.4);
-  --tint-danger-icon: rgba(255, 107, 133, 0.14);
-  --tint-purple: rgba(185, 140, 255, 0.16);
-  --tint-gemini: rgba(52, 211, 153, 0.12);
+  --tint-danger-icon: rgba(247, 117, 137, 0.14);
+  --tint-purple: rgba(181, 138, 249, 0.16);
+  --tint-gemini: rgba(0, 191, 165, 0.12);
 
   /* ---- Semantic: knowledge-graph canvas ------------------------------- */
   /* The react-force-graph canvas is painted in JS; these tokens are read via
@@ -265,7 +374,7 @@
     --bg-elevated: #fafbfd;
     --border-color: #d4dae3;
     --divider-color: #c4ccd8;
-    --divider-hover: #3a5bd9;
+    --divider-hover: #3a62cc;
 
     /* Non-text contrast (WCAG 1.4.11, ADR-0047) — see the :root comment. */
     --edge: #7285a1;
@@ -277,26 +386,33 @@
     --text-muted: #5c6677;
 
     /* Accents — desaturated/darkened so fills + accent text clear AA on
-       light surfaces. on-accent foregrounds re-paired for the lighter fills. */
-    --accent: #3a5bd9;
-    --accent-hover: #2c49bf;
+       light surfaces. on-accent foregrounds re-paired for the lighter fills.
+       OKLCH re-derivation, UI-T3/audio-graph-99aa — see the :root comment
+       above for the full rationale (hue moves, --accent-blue alias, the
+       light --accent-yellow contrast-over-guidance deviation, and the
+       gate-fix review correction that darkened --accent/--accent-green/
+       --accent-gemini further for their direct-text-on-surface call
+       sites). --divider-hover mirrors --accent (gate-fix review: it was a
+       stale literal copy of the pre-99aa value). */
+    --accent: #3a62cc;
+    --accent-hover: #2d54bc;
     --on-accent: #ffffff;
-    --accent-red: #c8324b;
-    --accent-red-hover: #ad283e;
+    --accent-red: #bd364a;
+    --accent-red-hover: #a8203a;
     --on-accent-red: #ffffff;
-    --accent-green: #0f7a3d;
-    --accent-green-hover: #0c6633;
+    --accent-green: #00793b;
+    --accent-green-hover: #007136;
     --on-accent-green: #ffffff;
-    --accent-gemini: #0f7a55;
-    --accent-gemini-hover: #0c6647;
+    --accent-gemini: #007363;
+    --accent-gemini-hover: #006e5e;
     --on-accent-gemini: #ffffff;
-    --accent-blue: #1f6fe0;
-    --accent-blue-hover: #1559bd;
-    --on-accent-blue: #ffffff;
-    --accent-yellow: #d98e00;
+    --accent-blue: var(--accent);
+    --accent-blue-hover: var(--accent-hover);
+    --on-accent-blue: var(--on-accent);
+    --accent-yellow: #c27f00;
     --on-accent-yellow: #221700;
-    --accent-purple: #7c3aed;
-    --accent-purple-hover: #6929cc;
+    --accent-purple: #7555c7;
+    --accent-purple-hover: #6542b3;
     --on-accent-purple: #ffffff;
 
     /* Interaction overlays flip to a dark tint so hover "darkens". */
@@ -328,15 +444,20 @@
     --tint-border-warning: #f0d28a;
     --tint-success-strong: #cfeeda;
 
-    /* Accent tints → opaque pale fills so they stay visible on light. */
-    --tint-accent: #e2e7fb;
+    /* Accent tints → opaque pale fills so they stay visible on light.
+       --tint-accent/--tint-purple/--tint-gemini recomputed from the new
+       dark-theme accent RGB (gate-fix review; see the :root comment on the
+       rgba versions above) — --tint-danger-icon's opaque light value is
+       intentionally shared with --tint-danger (not accent-red-derived), so
+       it is untouched. */
+    --tint-accent: #e4ecff;
     --tint-accent-info: #e1ecfd;
     --tint-accent-info-hover: #e8f0fd;
     --tint-accent-info-strong: #dde9fc;
     --tint-border-accent-info: #b6d0f7;
     --tint-danger-icon: #fbe0e4;
-    --tint-purple: #ece2fc;
-    --tint-gemini: #d6f3e7;
+    --tint-purple: #ece0fd;
+    --tint-gemini: #c3f0ea;
 
     /* Knowledge-graph canvas inverts to a light surface with dark labels. */
     --graph-bg: #f4f6fa;
@@ -354,7 +475,7 @@
   --bg-elevated: #fafbfd;
   --border-color: #d4dae3;
   --divider-color: #c4ccd8;
-  --divider-hover: #3a5bd9;
+  --divider-hover: #3a62cc;
 
   /* Non-text contrast (WCAG 1.4.11, ADR-0047) — see the :root comment. */
   --edge: #7285a1;
@@ -364,25 +485,28 @@
   --text-secondary: #475063;
   --text-muted: #5c6677;
 
-  --accent: #3a5bd9;
-  --accent-hover: #2c49bf;
+  /* OKLCH re-derivation, UI-T3/audio-graph-99aa — identical to the
+     prefers-color-scheme block above (styles.a11y.test.ts asserts this for
+     every accent/on-accent/hover name, not just this comment's word). */
+  --accent: #3a62cc;
+  --accent-hover: #2d54bc;
   --on-accent: #ffffff;
-  --accent-red: #c8324b;
-  --accent-red-hover: #ad283e;
+  --accent-red: #bd364a;
+  --accent-red-hover: #a8203a;
   --on-accent-red: #ffffff;
-  --accent-green: #0f7a3d;
-  --accent-green-hover: #0c6633;
+  --accent-green: #00793b;
+  --accent-green-hover: #007136;
   --on-accent-green: #ffffff;
-  --accent-gemini: #0f7a55;
-  --accent-gemini-hover: #0c6647;
+  --accent-gemini: #007363;
+  --accent-gemini-hover: #006e5e;
   --on-accent-gemini: #ffffff;
-  --accent-blue: #1f6fe0;
-  --accent-blue-hover: #1559bd;
-  --on-accent-blue: #ffffff;
-  --accent-yellow: #d98e00;
+  --accent-blue: var(--accent);
+  --accent-blue-hover: var(--accent-hover);
+  --on-accent-blue: var(--on-accent);
+  --accent-yellow: #c27f00;
   --on-accent-yellow: #221700;
-  --accent-purple: #7c3aed;
-  --accent-purple-hover: #6929cc;
+  --accent-purple: #7555c7;
+  --accent-purple-hover: #6542b3;
   --on-accent-purple: #ffffff;
 
   --hover-overlay: rgba(0, 0, 0, 0.05);
@@ -410,14 +534,14 @@
   --tint-border-warning: #f0d28a;
   --tint-success-strong: #cfeeda;
 
-  --tint-accent: #e2e7fb;
+  --tint-accent: #e4ecff;
   --tint-accent-info: #e1ecfd;
   --tint-accent-info-hover: #e8f0fd;
   --tint-accent-info-strong: #dde9fc;
   --tint-border-accent-info: #b6d0f7;
   --tint-danger-icon: #fbe0e4;
-  --tint-purple: #ece2fc;
-  --tint-gemini: #d6f3e7;
+  --tint-purple: #ece0fd;
+  --tint-gemini: #c3f0ea;
 
   --graph-bg: #f4f6fa;
   --graph-node-label: #1a1f29;
@@ -571,8 +695,18 @@ body {
 
    Conventions for migrated components (see ADR-0016):
    - Color:  bg-* / text-* / border-* (e.g. bg-bg-secondary, text-text-muted).
-   - Radius: rounded-xs..rounded-xl. Shadow: shadow-1..shadow-3.
-   - Font size: text-2xs..text-3xl (size only; set line-height explicitly).
+   - Radius: rounded-xs..rounded-xl (3 real steps as of UI-T3/audio-graph-99aa
+     — -xs and -lg alias their nearest survivor; see the primitive comment).
+     Shadow: shadow-1..shadow-3.
+   - Font size: text-xs..text-3xl. Floor is 11px (text-2xs/--font-size-2xs
+     retired, UI-T3/audio-graph-99aa). Every size now carries a paired
+     line-height automatically via Tailwind's `--text-*--line-height`
+     companion-variable convention below — components MAY still add an
+     explicit `leading-*`/`leading-[...]` utility to override it, but no
+     longer MUST.
+   - Tracking: exactly two values, `tracking-normal` (0) and `tracking-wide`
+     (0.04em, overridden from Tailwind's stock 0.025em) — no other
+     `tracking-*` utility is registered (UI-T3/audio-graph-99aa).
    - Spacing: use the token arbitrary-value shorthand p-(--space-5),
      gap-(--space-3); our px scale is non-linear and does not match Tailwind
      numeric spacing. One-off raw px use brackets, e.g. rounded-[10px].
@@ -633,16 +767,47 @@ body {
   --shadow-2: var(--shadow-2);
   --shadow-3: var(--shadow-3);
 
-  /* Font size → text-2xs..text-3xl (size only; line-height set per component) */
-  --text-2xs: var(--font-size-2xs);
+  /* Font size → text-xs..text-3xl, each with a MANDATORY paired line-height
+     (UI-T3/audio-graph-99aa). Tailwind v4 reads the `--text-<name>--
+     line-height` companion variable and applies it alongside `font-size`
+     whenever the plain `text-<name>` utility is used — so every size in
+     the scale now has a sane default leading with zero component edits,
+     rather than requiring a separate `leading-*`/`leading-[...]` utility
+     at every call site (components with a manually-set leading utility are
+     unaffected either way; the explicit one still wins). Below-base sizes
+     (xs/sm/md) and heading-ish sizes (xl/2xl/3xl) pair with
+     --line-height-tight (dense micro-text and headings both read tighter);
+     base/lg (body-text sizes) pair with --line-height-base. */
   --text-xs: var(--font-size-xs);
+  --text-xs--line-height: var(--line-height-tight);
   --text-sm: var(--font-size-sm);
+  --text-sm--line-height: var(--line-height-tight);
   --text-md: var(--font-size-md);
+  --text-md--line-height: var(--line-height-tight);
   --text-base: var(--font-size-base);
+  --text-base--line-height: var(--line-height-base);
   --text-lg: var(--font-size-lg);
+  --text-lg--line-height: var(--line-height-base);
   --text-xl: var(--font-size-xl);
+  --text-xl--line-height: var(--line-height-tight);
   --text-2xl: var(--font-size-2xl);
+  --text-2xl--line-height: var(--line-height-tight);
   --text-3xl: var(--font-size-3xl);
+  --text-3xl--line-height: var(--line-height-tight);
+
+  /* Tracking — exactly two values (UI-T3/audio-graph-99aa). Override
+     Tailwind's stock --tracking-wide (0.025em) to the value the codebase
+     had already converged on for uppercase micro-labels (`.ag-label`
+     below), then remove the other four stock tracking keys entirely
+     (`initial` unsets a theme key in Tailwind v4) so the two-value set is
+     enforced structurally — `tracking-tighter/-tight/-wider/-widest`
+     simply do not generate a utility, rather than silently offering a
+     third value nothing in this design system asks for. */
+  --tracking-wide: 0.04em;
+  --tracking-tighter: initial;
+  --tracking-tight: initial;
+  --tracking-wider: initial;
+  --tracking-widest: initial;
 }
 
 /* --------------------------------------------------------------------------

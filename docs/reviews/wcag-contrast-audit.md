@@ -137,6 +137,172 @@ banners" comment in `styles.css`) and are not touched by this pass. The 42
 not-yet-migrated `.css`-module sites named above are also out of scope until
 those modules migrate onto the token bridge (T7 territory).
 
+## Follow-up — 2026-08-20 (OKLCH accent re-derivation, UI-T3/audio-graph-99aa)
+
+Ticket UI-T3 (ratified decision D3) re-derived all 7 accent/on-accent pairs in
+OKLCH, both themes, at a fixed target lightness/chroma per theme (dark
+L\*72/C.16, light L\*54/C.17, guidance range ±2 L\*/±.01-.02 C) while holding
+each hue fixed — except `--accent` (pushed to a decisive ~265deg) and
+`--accent-gemini` (widened from ~163deg to ~178deg, true teal), which move on
+purpose. `--accent-blue` (previously ~11-12deg from `--accent`, with roughly
+a hundred call sites split across the two names — see the "call-site count"
+note below, the exact figure is not independently verified) is no longer an
+independent value: it is
+now a hard alias of `--accent` (`--accent-blue: var(--accent)`), so its row
+below mirrors `--accent`'s numbers exactly — that is the point of the alias.
+The six literal `--on-accent-*` declarations are byte-identical to their
+pre-99aa values; only the fills move (see the "`--on-accent-*` foregrounds"
+note further down for the one nuance that follows from the alias, not from
+an edited literal).
+
+The 4.5:1 AA floor is the one `src/styles.a11y.test.ts` already enforced for
+`--accent-blue` alone before this change; it now enforces all 7 pairs, both
+themes, and never regresses below it (extension, not a weakening) — see the
+"semantic accent foregrounds" describe block.
+
+**Dark theme:**
+
+| Token | Old hex | New hex | Old ratio | New ratio | Hue Δ |
+|---|---|---|---:|---:|---:|
+| `--accent` | `#6c8cff` | `#78a1ff` | 6.13:1 | 7.48:1 | -4.4deg (270→265) |
+| `--accent-red` | `#ff6b85` | `#f77589` | 6.85:1 | 7.00:1 | +0.3deg (preserved) |
+| `--accent-green` | `#45d483` | `#39c175` | 8.96:1 | 7.38:1 | -0.1deg (preserved) |
+| `--accent-gemini` | `#34d399` | `#00bfa5` | 8.88:1 | 7.31:1 | +15.1deg (163→178) |
+| `--accent-blue` | `#5b9dff` (own hue, ~258deg) | `var(--accent)` = `#78a1ff` | 6.68:1 | 7.48:1 | now == `--accent`'s hue |
+| `--accent-yellow` | `#ffcc4a` | `#cc9d00` | 12.35:1 | 7.41:1 | +0.3deg (preserved) |
+| `--accent-purple` | `#b98cff` | `#b58af9` | 7.19:1 | 6.94:1 | -0.1deg (preserved) |
+
+**Light theme (as originally shipped — see the gate-fix follow-up below for
+the corrected `--accent`/`--accent-green`/`--accent-gemini` values that
+actually landed; this table is kept for the fill/on-fill history):**
+
+| Token | Old hex | New hex (as first shipped) | Old ratio | New ratio | Hue Δ |
+|---|---|---|---:|---:|---:|
+| `--accent` | `#3a5bd9` | `#3d66d0` | 5.71:1 | 5.24:1 | -2.6deg (268→265) |
+| `--accent-red` | `#c8324b` | `#bd364a` | 5.23:1 | 5.54:1 | +0.1deg (preserved) |
+| `--accent-green` | `#0f7a3d` | `#008541` | 5.42:1 | 4.74:1 | +0.2deg (preserved) |
+| `--accent-gemini` | `#0f7a55` | `#00816f` | 5.34:1 | 4.81:1 | +15.5deg (163→178) |
+| `--accent-blue` | `#1f6fe0` (own hue, ~258deg) | `var(--accent)` = `#3d66d0` | 4.76:1 | 5.24:1 | now == `--accent`'s hue |
+| `--accent-yellow` | `#d98e00` | `#c27f00` | 6.57:1 | 5.32:1 | +0.4deg (preserved) |
+| `--accent-purple` | `#7c3aed` | `#7555c7` | 5.70:1 | 5.41:1 | -0.3deg (preserved) |
+
+**Deviations from the L\*/C guidance, both documented and both resolved in
+favor of the binding contrast constraint per the ticket's own tie-break:**
+
+- **Gamut, not guidance, forces chroma down for dark `--accent`, dark
+  `--accent-gemini`/light `--accent-gemini`, and light `--accent-green`.**
+  No in-gamut sRGB color exists at the guidance chroma for a blue-violet
+  this light, a teal this light, or a green this saturated at the target
+  lightness — hue and contrast are both unaffected; only chroma clips below
+  the ±.01-.02 band (e.g. light `--accent-gemini` originally landed at
+  C≈0.099 against a C.17 target). **Correction (gate-fix review):** light
+  `--accent` does **not** clip — at L\*54/H265.2 the max in-gamut sRGB
+  chroma is ≈0.2546, and the shipped `#3d66d0` sits at C≈0.170, exactly the
+  guidance target, so the original bullet's "`--accent`/`--accent-gemini`
+  (both themes)" phrasing overclaimed for the light side. Conversely, dark
+  `--accent-yellow` (`#cc9d00`, C≈0.147) *is* marginally below the
+  .16±.01 band (max in-gamut chroma at that L/H is ≈0.1473) and was missing
+  from this bullet.
+- **Light `--accent-yellow` is the one true guidance-vs-contrast conflict
+  in the original fill/on-fill derivation.** At the guidance L\*54, the
+  maximum in-gamut chroma for yellow's hue only reaches ~0.115-0.12, and
+  against the unchanged `--on-accent-yellow` (`#221700`) that computes
+  3.4:1 — under the 4.5:1 floor. Contrast wins: light `--accent-yellow` is
+  derived at L\*65 instead (still hue-preserved), clearing 5.32:1.
+
+**Call-site count:** the "163 call sites split with `--accent`'s own"
+figure originally recorded here could not be independently reproduced
+(varying grep methodologies converge on roughly 90-176, same order of
+magnitude, not an exact match) and should be read as an estimate, not a
+verified count — the alias fix itself does not depend on the exact number.
+
+**`--on-accent-*` foregrounds:** the six surviving literal declarations are
+byte-identical to their pre-99aa values, but `--on-accent-blue` no longer
+*resolves* to its old dark literal (`#061629`) — as `var(--on-accent)` it
+now resolves to `#0a1026`. Every consumer pairs it with an accent-blue fill,
+so this lands at 7.48:1 dark / 5.24:1 light (both above the floor, and the
+dark case above the old pairing's 6.68:1) — a correct outcome of the alias,
+just not literally "unchanged."
+
+**Zero component edits by construction:** every existing `bg-accent-blue`,
+`text-accent-blue`, `border-(--accent-blue)`, etc. call site keeps
+resolving through the same token name; only the value it resolves to
+changed. No `.tsx`/`.css` file outside `src/styles.css` was touched for
+this fill/on-fill section (the gate-fix follow-up below does touch two
+`.tsx` files, for unrelated reasons named there).
+
+## Follow-up — 2026-08-20 (gate-fix review, UI-T3/audio-graph-99aa)
+
+A review of the OKLCH re-derivation above found it only verified the
+fill/on-fill pairing. Two defects followed from that gap:
+
+### Blocker: light-theme accent-as-text dropped below 4.5:1
+
+`--accent`, `--accent-green`, and `--accent-gemini` are also rendered
+directly as **text** color in the light theme, on ordinary surfaces and
+tints, not just as fills paired with `--on-*`. At the original L\*54 several
+real call sites dropped under the 4.5:1 floor:
+
+| Site | Pairing | Old ratio | Shipped (broken) ratio |
+|---|---|---:|---:|
+| `ConversationModeControl.tsx` `ENGINE_ACTIVE` | `--accent` text on `--tint-accent` | 4.64:1 | 4.25:1 |
+| `ConversationModeControl.tsx` `BADGE_ACTION` | `--accent` text on `--bg-tertiary` | 4.86:1 | 4.46:1 |
+| `ProjectionRuntimeStatusPanel.tsx:229` | `--accent-green` text on `--tint-success` | 4.81:1 | 4.21:1 |
+| `AgentProposalsPanel.tsx:210` | `--accent-green` text on `--bg-secondary` | 5.01:1 | 4.38:1 |
+| `TokenUsagePanel.tsx:478` (`ddTotal`) | `--accent-gemini` text on `--bg-tertiary` | 4.54:1 | 4.09:1 |
+
+Fix: darkened light `--accent` (`#3d66d0`→`#3a62cc`), `--accent-green`
+(`#008541`→`#00793b`), and `--accent-gemini` (`#00816f`→`#007363`) further,
+holding hue fixed, until every real text-on-surface call site above clears
+4.5:1 with margin (verified against the darkest surface/tint each token is
+actually rendered on, not just the fill test):
+
+| Token | New hex | vs `--bg-tertiary` | vs its tightest real tint | vs white (`--on-*`) |
+|---|---|---:|---:|---:|
+| `--accent` | `#3a62cc` | 4.71:1 | 4.67:1 (`--tint-accent`) | 5.53:1 |
+| `--accent-green` | `#00793b` | 4.71:1 | 4.91:1 (`--tint-success`) | 5.53:1 |
+| `--accent-gemini` | `#007363` | 4.92:1 | 4.67:1 (`--tint-gemini`) | 5.78:1 |
+
+Dark theme was never at risk (fills sit at 7.0-7.5:1 with headroom); only
+the light-theme hexes above changed. Hue held fixed (<0.25deg drift, same
+class as the rounding noise elsewhere in this document). Side effect:
+`--accent-green` and `--accent-gemini` clip chroma slightly harder at the
+new, darker lightness (max in-gamut chroma shrinks as L drops for these
+hues) — contrast wins per the same tie-break already used for light
+`--accent-yellow`. `src/styles.a11y.test.ts` gained a
+"accent-as-text on realistic surfaces" describe block asserting these
+specific pairings so this defect class can't silently regress again.
+
+### Major: stale tint tokens still pointed at retired accent hues
+
+`--tint-accent`, `--tint-purple`, `--tint-gemini` (RGB channels), and
+`--tint-danger-icon`'s dark rgba, plus light `--divider-hover`, were
+literal copies of the **pre-99aa** accent hex/rgb and never moved with the
+re-derivation. Most visibly: `--accent-gemini` moved 163deg→178deg
+specifically so it stops reading as green, yet `ControlBar.tsx`'s
+Gemini-active hover state rendered new teal text on the old green
+`--tint-gemini` wash, and `TokenUsagePanel.tsx:491` hardcoded the retired
+green as an inline `rgb(52 211 153/…)` literal behind teal
+`text-accent-gemini`. Fixed: the dark rgba tokens now carry the current
+accent RGB at their original alpha; the light opaque equivalents are
+recomputed the same way the pre-existing `--tint-danger`/`--tint-success`
+pairs already were (composited over white at each token's own effective
+alpha, then reapplied to the new RGB); `--divider-hover` now mirrors
+`--accent`; the `TokenUsagePanel.tsx` inline literal now reads
+`bg-(--tint-gemini)`. `--tint-danger-icon`'s light value is intentionally
+shared with `--tint-danger` (not accent-red-derived) and was left alone.
+
+### Minor: motion rendered delta not enumerated
+
+The original motion-scale change enumerated only the 8 `transition-all`
+rewrites (explicit component edits), not the one site of *alias fallout*:
+`src/styles/primitives.css:166`'s `.notification` entrance animation is the
+only `var(--ease-out)` consumer in the repo (`settings.css` has none, unlike
+the styles.css comment's prior claim) and the only `var(--motion-slow)`
+consumer — its rendered easing moves
+`cubic-bezier(0.16,1,0.3,1)`→`cubic-bezier(0.2,0,0.2,1)` and duration
+`0.25s`→`0.26s`.
+
 ## Residual Risk
 
 This was a static color audit, not a full screen-reader or keyboard navigation

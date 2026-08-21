@@ -97,10 +97,10 @@ interface MetricProps {
 function Metric({ label, value }: MetricProps) {
   return (
     <div className="min-w-0">
-      <dt className="m-0 text-[9px] font-semibold uppercase tracking-[0.4px] text-text-muted leading-[1.2]">
+      <dt className="m-0 text-[9px] font-semibold uppercase tracking-wide text-text-muted leading-[1.2]">
         {label}
       </dt>
-      <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight overflow-hidden text-ellipsis whitespace-nowrap">
+      <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight overflow-hidden text-ellipsis whitespace-nowrap tabular-nums">
         {value}
       </dd>
     </div>
@@ -238,12 +238,12 @@ function ReplayArtifactRow({ label, artifact }: ReplayArtifactRowProps) {
           {label}
         </span>
         <span
-          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${tone}`}
+          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide ${tone}`}
         >
           {t(`projectionDiagnostics.replayStatus.${artifact.status}`)}
         </span>
       </div>
-      <p className="m-0 text-2xs text-text-secondary leading-[1.35]">
+      <p className="m-0 text-xs text-text-secondary leading-[1.35]">
         {t("projectionDiagnostics.replayArtifactDetail", {
           storedSeq: formatCount(artifact.stored_last_sequence),
           replayedSeq: formatCount(artifact.replayed_last_sequence),
@@ -282,7 +282,7 @@ function ReplayReportCard({
         </h4>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-3) py-[2px] text-2xs font-semibold uppercase tracking-[0.3px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
+          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-3) py-[2px] text-xs font-semibold uppercase tracking-wide text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
           disabled={loadState === "loading"}
           onClick={onRun}
           aria-label={t("projectionDiagnostics.replayCheckLabel")}
@@ -490,7 +490,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
           <Icon name="graph" size={14} />
           {t("projectionDiagnostics.graphOperationsTitle")}
         </h4>
-        <span className="shrink-0 rounded-xl bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] text-text-secondary">
+        <span className="shrink-0 rounded-xl bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide text-text-secondary">
           {t("projectionDiagnostics.graphOperationCount", {
             count: operations.length,
           })}
@@ -511,7 +511,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
               <span className="block text-xs font-semibold text-text-primary leading-[1.25]">
                 {operation.title}
               </span>
-              <span className="block text-2xs text-text-secondary leading-[1.35] [overflow-wrap:anywhere]">
+              <span className="block text-xs text-text-secondary leading-[1.35] [overflow-wrap:anywhere]">
                 {operation.detail}
               </span>
             </span>
@@ -559,13 +559,13 @@ function SchedulerCard({
           {title}
         </h4>
         <span
-          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${badgeClass}`}
+          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-wide ${badgeClass}`}
         >
           {t(`projectionDiagnostics.schedulerState.${state}`)}
         </span>
       </div>
       {scheduler.in_flight_job_id && (
-        <p className="m-0 mb-(--space-3) text-2xs text-text-secondary leading-[1.3] [overflow-wrap:anywhere]">
+        <p className="m-0 mb-(--space-3) text-xs text-text-secondary leading-[1.3] [overflow-wrap:anywhere]">
           {t("projectionDiagnostics.inFlightJob", {
             id: scheduler.in_flight_job_id,
             count: scheduler.in_flight_span_count,
@@ -734,7 +734,7 @@ export default function ProjectionRuntimeStatusPanel() {
         </h3>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-4) py-[3px] text-2xs font-semibold uppercase tracking-[0.4px] text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
+          className="inline-flex items-center gap-(--space-2) rounded-md border border-(--edge) bg-(--hover-overlay) px-(--space-4) py-[3px] text-xs font-semibold uppercase tracking-wide text-text-secondary leading-[1.3] cursor-pointer transition-colors hover:not-disabled:border-(--tint-border-accent-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:text-(--text-on-tint-info) disabled:cursor-not-allowed disabled:opacity-45"
           disabled={loadState === "loading"}
           onClick={() => void load()}
           aria-label={t("projectionDiagnostics.refreshLabel")}
