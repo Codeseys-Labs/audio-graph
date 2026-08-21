@@ -2324,6 +2324,40 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
         }
     }
 
+    // ADR-0045 decision 6 (audio-graph-5fd1): reseed each projection lane's
+    // coverage head from this session's accepted `projection_patches` log
+    // before the speech thread that drives the schedulers spawns below.
+    // `ProjectionSchedulers::restore_from_snapshot` no longer exists
+    // (audio-graph-464c) — `reseed_coverage_heads` is now the ONLY channel
+    // through which scheduler coverage state may come from disk. Cold start
+    // mints a fresh session id with no persisted patches (`AppState::new`),
+    // and `load_session_impl` never installs a historical ledger into
+    // `AppState`, so in every capture started today this loads an empty
+    // patch log and reseeds nothing — it exists so a future resume/reopen
+    // surface (audio-graph-9751-adjacent) cannot route around it the way the
+    // deleted snapshot restore could be.
+    //
+    // A corrupt/truncated `projection_patches` log must refuse
+    // transcribe-start loudly, not reseed nothing and silently replay
+    // duplicate work later — `StrictCanonicalRead` exists precisely so
+    // canonical-log corruption fails closed (review finding, 5fd1). `?`
+    // propagates via `From<String> for AppError` (`error.rs`), which wraps
+    // the message as `AppError::Unknown` unchanged; the message itself is
+    // already class-only and content-redacted by construction
+    // (`CanonicalReaderError`'s `Display` never includes a path, session id,
+    // event id, or payload value — see `persistence/canonical_reader.rs`).
+    {
+        let session_id = state.current_session_id();
+        let accepted_patches =
+            FileMemoryRepository::user_data().load_projection_patches(&session_id)?;
+        let heads = crate::projection_scheduler::derive_coverage_heads(&accepted_patches);
+        let mut schedulers = state
+            .projection_schedulers
+            .lock()
+            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
+        schedulers.reseed_coverage_heads(heads);
+    }
+
     // 1. Start speech processor thread (ASR + Diarization orchestrator).
     //    The speech processor reads directly from the processed audio channel,
     //    accumulates chunks into ~2s segments, and runs ASR inline.
@@ -11900,6 +11934,48 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("deserialize") || message.contains("canonical"));
         assert!(!message.contains("legacy text must not mask corruption"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0045 decision 6 review finding (audio-graph-5fd1): the
+    /// `start_transcribe` coverage-head reseed used to call
+    /// `load_projection_patches(&session_id).unwrap_or_default()`, so a
+    /// corrupt/truncated `projection_patches` canonical log silently reseeded
+    /// nothing instead of refusing to start — masking corruption exactly like
+    /// the legacy-transcript-fallback bug this mirrors. This test pins the
+    /// loader itself failing closed; `start_transcribe` now propagates that
+    /// `Err` via `?` (`commands.rs`) instead of swallowing it.
+    #[test]
+    fn strict_reader_corrupt_projection_patches_log_fails_closed_instead_of_reseeding_nothing() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-corrupt-projection-patches");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "corrupt-canonical-projection-patches";
+
+        std::fs::write(
+            crate::user_data::projection_events_path(session_id)
+                .expect("resolve canonical projection patches path"),
+            b"not a canonical projection patch record\n",
+        )
+        .expect("write corrupt canonical projection patches stream");
+
+        let error = FileMemoryRepository::user_data()
+            .load_projection_patches(session_id)
+            .expect_err(
+                "canonical projection-patches corruption must fail closed, not reseed nothing \
+                 (audio-graph-5fd1 review finding)",
+            );
+        assert!(
+            error.contains("deserialize") || error.contains("canonical"),
+            "error must describe the failure class, not swallow it: {error}"
+        );
+        assert!(
+            !error.contains("not a canonical projection patch record"),
+            "corrupt log content must never leak into the propagated error message: {error}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

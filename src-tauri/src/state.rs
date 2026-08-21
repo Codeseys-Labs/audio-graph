@@ -1003,7 +1003,13 @@ impl AppState {
                 Err(poisoned) => poisoned.into_inner(),
             };
             // Persist the outgoing session's queue state before the reset
-            // wipes it so `load_session` can rehydrate it later.
+            // wipes it. Diagnostics only (ADR-0045 decision 6,
+            // audio-graph-464c/5fd1): nothing reads this back as authority —
+            // `ProjectionSchedulers::restore_from_snapshot`, which used to
+            // rehydrate it on load, is deleted. The one disk-to-scheduler
+            // channel left is `reseed_coverage_heads`, fed by
+            // `derive_coverage_heads` over the accepted `projection_patches`
+            // log, not this snapshot.
             crate::persistence::save_scheduler_queue_state(&prev, &schedulers.snapshot_queue());
             schedulers.reset(new_session_id);
         }
