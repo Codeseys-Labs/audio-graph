@@ -66,6 +66,12 @@
     "close": "Close",
     "pipelineHeading": "Pipeline stages"
   },
+  "shellLayout": {
+    "sources": "Sources",
+    "sourcesClose": "Close sources panel",
+    "speakers": "Speakers",
+    "speakersClose": "Close speakers panel"
+  },
   "workspace": {
     "navigation": "Workspace navigation",
     "label": "Workspace",

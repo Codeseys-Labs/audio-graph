@@ -196,50 +196,94 @@
   }
 }
 
-@media (max-width: 900px) {
-  .app-container {
-    overflow: hidden;
-  }
+/* SHELL-R7 (plan §R7, ADR-0046): the old max-width:900px "stack" tier is
+   retired outright, not layered under. `useShellLayout()`'s tier hook is
+   now the single source of truth for how the rail/aside regions present
+   below 1024px, and its `compact` tier is a deliberate FLOOR: there is no
+   further collapse point between 767px and 0 (Design 3's own weakness
+   analysis cut the mobile "stack" shape; see the hook's doc comment).
+   Subtracted, not stacked with overrides. Full inventory of what this
+   removed (all six rule groups the old block held, for an honest deletion
+   record — not just the four the rail/aside tier system directly
+   supersedes):
+     - `.main-layout` 1-col grid, `.left-panel` capped to a 280px-tall
+       strip, `.resize-divider { display: none }`, and the
+       `.workspace-switcher` column-stacking rules — directly superseded by
+       `App.tsx`'s per-tier rendering below.
+     - `.workspace-switcher__state { width: 100% }` — dead by the time this
+       block was deleted: SHELL-R4 already relocated that element out of
+       `.workspace-switcher` (a column at this breakpoint) into `NowStrip`'s
+       horizontal `now-strip__center` flex row, where a 100%-width override
+       doesn't apply. The BASE `.workspace-switcher__state` rule above
+       (ellipsis/no-wrap) still applies there and is unaffected.
+     - `.app-container { overflow: hidden }` and
+       `.workspace-panel { min-height: 560px }` — orthogonal to the
+       rail/aside tier system (they don't govern rail/aside presentation),
+       dropped as part of the same block rather than surgically kept.
+       Verified harmless: `.main-layout` already carries its own
+       `overflow: hidden` above, and `.workspace-panel`'s content sizes
+       correctly without a hard min-height at every tier down to 700px
+       (see the R7 screenshot set). */
 
-  .workspace-switcher {
-    align-items: stretch;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
+.shell-drawer-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  flex-shrink: 0;
+  background-color: var(--bg-secondary);
+}
 
-  .workspace-switcher__tabs {
-    width: 100%;
-  }
+.shell-drawer-trigger--rail {
+  border-right: 1px solid var(--border-color);
+}
 
-  .workspace-switcher__tab {
-    flex: 1;
-    padding-inline: var(--space-3);
-  }
+.shell-drawer-trigger--aside {
+  border-left: 1px solid var(--border-color);
+}
 
-  .workspace-switcher__state {
-    width: 100%;
-  }
+/* Drawer chrome shared by the rail (`side="start"`) and aside
+   (`side="end"`) drawers `ShellDrawer` renders (SHELL-R7). Mirrors
+   `SystemDrawer`'s established fixed/full-height overlay shape, but as
+   plain CSS here rather than duplicated inline Tailwind utilities, since
+   this tier system's styles live in this file. */
+.shell-drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  z-index: var(--z-modal);
+  background-color: var(--bg-secondary);
+  box-shadow: var(--shadow-overlay);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: shell-drawer-slide-in-start 0.18s ease-out;
+}
 
-  .main-layout {
-    display: grid;
-    grid-template-columns: 1fr;
-    grid-auto-rows: auto;
-    overflow: auto;
-  }
+.shell-drawer--start {
+  left: 0;
+  border-right: 1px solid var(--edge);
+}
 
-  .left-panel {
-    width: auto !important;
-    min-width: 0;
-    max-height: 280px;
-    border-inline: 0;
-  }
+.shell-drawer--end {
+  right: 0;
+  border-left: 1px solid var(--edge);
+  animation-name: shell-drawer-slide-in-end;
+}
 
-  .workspace-panel {
-    min-height: 560px;
-  }
+.shell-drawer__body {
+  flex: 1;
+  overflow: auto;
+}
 
-  .resize-divider {
-    display: none;
+/* Reduced-motion: the drawers still open/close instantly, just without the
+   slide (mirrors the `.settings-overlay`/`.settings-landed` convention in
+   settings.css). */
+@media (prefers-reduced-motion: reduce) {
+  .shell-drawer {
+    animation: none;
   }
 }
 

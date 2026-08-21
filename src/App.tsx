@@ -10,8 +10,15 @@
  *     `.workspace-switcher__state` live region — SHELL-R3/R4, ADR-0046;
  *     replaces the old `ControlBar`).
  *   - Destination bar: Capture / Sessions.
- *   - Middle flex:
- *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
+ *   - Middle flex (SHELL-R7, plan §R7, ADR-0046 — `useShellLayout()` tiers):
+ *       - Left rail: `AudioSourceSelector`, plus `SpeakerPanel` too at the
+ *         `wide` tier (>=1280px). Below `wide`, `SpeakerPanel` becomes a
+ *         right-hand focus-trapped drawer (`standard`, 1024-1279px); below
+ *         `standard` (`compact`, <1024px — the floor; there is deliberately
+ *         no further "stack" tier), `AudioSourceSelector` becomes a matching
+ *         left-hand drawer too. Both drawers reuse `ShellDrawer`'s shared
+ *         `useFocusTrap` + Escape chrome (same pattern `SystemDrawer`
+ *         established, D5: no Radix dialog).
  *       - Main: destination-specific content. Capture is a 3-way choice —
  *         `GetStartedFallback` (the credential-presence probe threw),
  *         `PreflightCard` (genuinely idle — SHELL-R5, ADR-0046: a pass/fail
@@ -61,6 +68,7 @@ import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "./analytics/safeInvoke";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
+import IconButton from "./components/IconButton";
 import LiveTranscript from "./components/LiveTranscript";
 import NotesPanel from "./components/NotesPanel";
 // SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip (restyle + one Start
@@ -93,12 +101,16 @@ import Notifications from "./components/Notifications";
 // SHELL-R5 (plan §R5, ADR-0046): the Capture destination's idle-state
 // surface — see this file's doc comment on `ShellRailContentAside`.
 import PreflightCard from "./components/PreflightCard";
+// SHELL-R7 (plan §R7, ADR-0046): shared drawer chrome for the rail/aside
+// drawers `useShellLayout()`'s tier drives — see that hook's doc comment.
+import ShellDrawer from "./components/ShellDrawer";
 import StorageBanner from "./components/StorageBanner";
 import SystemDrawer from "./components/SystemDrawer";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNativeCapture } from "./hooks/useNativeCapture";
+import { useShellLayout } from "./hooks/useShellLayout";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { SessionViewProvider } from "./session/SessionViewProvider";
 import { useAudioGraphStore } from "./store";
@@ -358,6 +370,14 @@ interface ShellRailContentAsideProps {
   probeRetrying: boolean;
   probeUnreadable: boolean;
   hasAgentActivity: boolean;
+  // SHELL-R7 (plan §R7, ADR-0046): `useShellLayout()`'s tier drives whether
+  // the rail (`AudioSourceSelector`) and aside (`SpeakerPanel`) regions are
+  // pinned inline here or collapsed behind a drawer `App()` renders itself
+  // — see that component's doc comment on the wide/standard/compact split.
+  railPinned: boolean;
+  asidePinned: boolean;
+  onOpenSourcesDrawer: () => void;
+  onOpenSpeakersDrawer: () => void;
 }
 
 /** Region 3: rail + content + aside — the left source rail and the active
@@ -373,7 +393,18 @@ interface ShellRailContentAsideProps {
  * `GetStartedFallback`'s exact role), `showPreflightCard` (genuinely idle —
  * `PreflightCard` replaces the pre-R5 "empty live cockpit" of rendering
  * NotesPanel/LiveTranscript with nothing in them yet), or live/reviewing
- * (the original NotesPanel + LiveTranscript + AgentProposalsPanel trio). */
+ * (the original NotesPanel + LiveTranscript + AgentProposalsPanel trio).
+ *
+ * SHELL-R7 (plan §R7, ADR-0046): at the `wide` tier this renders BYTE-
+ * IDENTICAL to the pre-R7 shape — `AudioSourceSelector` + `SpeakerPanel`
+ * together in `.left-panel`, no drawers, no triggers — since `railPinned`
+ * and `asidePinned` are both true there. Below `wide`, `SpeakerPanel` (the
+ * aside) is the first to leave the pinned flow — a `shell-drawer-trigger`
+ * strip takes its place at the trailing edge — and below `standard`,
+ * `AudioSourceSelector` (the rail) follows it, replaced by a matching
+ * leading-edge trigger. Neither trigger renders `ResizeDivider` alongside
+ * it — dragging a divider next to a collapsed trigger strip has nothing to
+ * resize. */
 function ShellRailContentAside({
   workspaceView,
   leftWidth,
@@ -386,20 +417,43 @@ function ShellRailContentAside({
   probeRetrying,
   probeUnreadable,
   hasAgentActivity,
+  railPinned,
+  asidePinned,
+  onOpenSourcesDrawer,
+  onOpenSpeakersDrawer,
 }: ShellRailContentAsideProps) {
   const { t } = useTranslation();
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
-      <aside className="left-panel" style={{ width: leftWidth }}>
-        <AudioSourceSelector />
-        <SpeakerPanel />
-      </aside>
-      <ResizeDivider
-        orientation="vertical"
-        onResize={resizeLeft}
-        ariaLabel={t("app.resizeSources")}
-      />
+      {railPinned ? (
+        // `tabIndex={-1}`: not in the tab order, but a resize-driven drawer
+        // close (below) needs a programmatic focus target that survives the
+        // trigger's unmount — see that effect's comment.
+        <aside
+          className="left-panel"
+          style={{ width: leftWidth }}
+          tabIndex={-1}
+        >
+          <AudioSourceSelector />
+          {asidePinned && <SpeakerPanel />}
+        </aside>
+      ) : (
+        <div className="shell-drawer-trigger shell-drawer-trigger--rail">
+          <IconButton
+            icon="mic"
+            label={t("shellLayout.sources")}
+            onClick={onOpenSourcesDrawer}
+          />
+        </div>
+      )}
+      {railPinned && (
+        <ResizeDivider
+          orientation="vertical"
+          onResize={resizeLeft}
+          ariaLabel={t("app.resizeSources")}
+        />
+      )}
       {workspaceView === "capture" &&
         (showGetStartedFallback ? (
           <main
@@ -467,6 +521,15 @@ function ShellRailContentAside({
         >
           <SessionsBrowser />
         </main>
+      )}
+      {!asidePinned && (
+        <div className="shell-drawer-trigger shell-drawer-trigger--aside">
+          <IconButton
+            icon="speaker"
+            label={t("shellLayout.speakers")}
+            onClick={onOpenSpeakersDrawer}
+          />
+        </div>
       )}
     </div>
   );
@@ -855,6 +918,54 @@ function App() {
       return n;
     });
 
+  // SHELL-R7 (plan §R7, ADR-0046): the shell layout tier drives whether the
+  // rail (`AudioSourceSelector`) and aside (`SpeakerPanel`) regions are
+  // pinned inline in `ShellRailContentAside` or collapsed behind one of the
+  // two drawers rendered below — see `useShellLayout.ts`'s doc comment for
+  // the exact wide/standard/compact boundaries.
+  const shellTier = useShellLayout();
+  const railPinned = shellTier !== "compact";
+  const asidePinned = shellTier === "wide";
+  const [sourcesDrawerOpen, setSourcesDrawerOpen] = useState(false);
+  const [speakersDrawerOpen, setSpeakersDrawerOpen] = useState(false);
+  // At most one drawer open at a time — both are full-height, full-scrim
+  // overlays anchored to opposite edges, and stacking two of them has no
+  // sensible visual or focus-trap semantics.
+  const openSourcesDrawer = useCallback(() => {
+    setSpeakersDrawerOpen(false);
+    setSourcesDrawerOpen(true);
+  }, []);
+  const openSpeakersDrawer = useCallback(() => {
+    setSourcesDrawerOpen(false);
+    setSpeakersDrawerOpen(true);
+  }, []);
+  const closeSourcesDrawer = useCallback(() => setSourcesDrawerOpen(false), []);
+  const closeSpeakersDrawer = useCallback(
+    () => setSpeakersDrawerOpen(false),
+    [],
+  );
+  // A resize back up to a tier where a region is pinned again must not leave
+  // its drawer dangling open behind newly-visible inline content. When the
+  // drawer WAS open, its trigger unmounts in this same commit (the trigger
+  // strip is `!railPinned`/`!asidePinned`-gated), so `useFocusTrap`'s own
+  // "restore focus to whatever opened me" cleanup finds nothing left to
+  // restore to and silently drops focus to `<body>`. Move focus to the
+  // now-visible `.left-panel` ourselves first so a keyboard user doesn't
+  // lose their place — this is a resize-triggered close, not the
+  // Escape/click close path (which the trigger IS still mounted for).
+  useEffect(() => {
+    if (railPinned && sourcesDrawerOpen) {
+      document.querySelector<HTMLElement>(".left-panel")?.focus();
+    }
+    if (railPinned) setSourcesDrawerOpen(false);
+  }, [railPinned, sourcesDrawerOpen]);
+  useEffect(() => {
+    if (asidePinned && speakersDrawerOpen) {
+      document.querySelector<HTMLElement>(".left-panel")?.focus();
+    }
+    if (asidePinned) setSpeakersDrawerOpen(false);
+  }, [asidePinned, speakersDrawerOpen]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Cmd/Ctrl+/ (or Shift+/ → "?") opens the help modal. Skip when typing
@@ -971,6 +1082,10 @@ function App() {
           probeRetrying={probeRetrying}
           probeUnreadable={probeUnreadable}
           hasAgentActivity={hasAgentActivity}
+          railPinned={railPinned}
+          asidePinned={asidePinned}
+          onOpenSourcesDrawer={openSourcesDrawer}
+          onOpenSpeakersDrawer={openSpeakersDrawer}
         />
       </SessionViewProvider>
       <ShellFooter />
@@ -1005,6 +1120,34 @@ function App() {
           usage moves here). */}
       {systemDrawerOpen && (
         <SystemDrawer onClose={() => setSystemDrawerOpen(false)} />
+      )}
+
+      {/* Rail/aside drawers (SHELL-R7, plan §R7, ADR-0046): the same
+          `AudioSourceSelector`/`SpeakerPanel` components `ShellRailContentAside`
+          renders pinned at wider tiers, hosted in `ShellDrawer`'s shared
+          focus-trap/Escape/scrim chrome once `useShellLayout()`'s tier moves
+          either region out of the pinned flow. Mutually exclusive with each
+          other (see `openSourcesDrawer`/`openSpeakersDrawer` above), and with
+          `SystemDrawer` only by convention (nothing here forces it). */}
+      {sourcesDrawerOpen && (
+        <ShellDrawer
+          side="start"
+          label={t("shellLayout.sources")}
+          closeLabel={t("shellLayout.sourcesClose")}
+          onClose={closeSourcesDrawer}
+        >
+          <AudioSourceSelector />
+        </ShellDrawer>
+      )}
+      {speakersDrawerOpen && (
+        <ShellDrawer
+          side="end"
+          label={t("shellLayout.speakers")}
+          closeLabel={t("shellLayout.speakersClose")}
+          onClose={closeSpeakersDrawer}
+        >
+          <SpeakerPanel />
+        </ShellDrawer>
       )}
 
       {/* Unified notification host (ADR-0011): transient queue + legacy

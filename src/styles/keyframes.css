@@ -112,3 +112,30 @@
     background-color: transparent;
   }
 }
+
+/* Consumed by `.shell-drawer` (layout.css) — SHELL-R7's rail/aside drawers.
+   Two directions (mirrored translateX) so the panel slides in from whichever
+   edge it's anchored to; gated on prefers-reduced-motion at the consumer
+   rule. Note for scope auditors: this file isn't in SHELL-R7's literally
+   enumerated file list (useShellLayout.ts + tests, App.tsx, layout.css,
+   drawer chrome, App tests), but it's purely additive (two new
+   `@keyframes`, zero existing rules touched) and this repo's keyframes all
+   live here already — putting them in layout.css instead would have been
+   the worse choice. */
+@keyframes shell-drawer-slide-in-start {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes shell-drawer-slide-in-end {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}

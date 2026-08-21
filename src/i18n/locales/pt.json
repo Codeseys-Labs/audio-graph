@@ -66,6 +66,12 @@
     "close": "Fechar",
     "pipelineHeading": "Estágios do pipeline"
   },
+  "shellLayout": {
+    "sources": "Fontes",
+    "sourcesClose": "Fechar painel de fontes",
+    "speakers": "Falantes",
+    "speakersClose": "Fechar painel de falantes"
+  },
   "workspace": {
     "navigation": "Navegação do espaço de trabalho",
     "label": "Espaço de trabalho",
