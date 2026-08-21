@@ -11930,7 +11930,10 @@ mod tests_status {
 
         run_projection_job(dispatch_two, job_two);
 
-        let job_two_wire_bodies = captured_two.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let job_two_wire_bodies = captured_two
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         assert_eq!(
             job_two_wire_bodies.len(),
             1,
