@@ -61,15 +61,21 @@ export function modeReadinessTone(status: string): BadgeTone {
 }
 
 /**
- * Map a capability-card selectability status to a tone. Mirrors the prior
- * `.settings-provider-capability-card__badge--*` grouping
- * (selected/selectable/ready=success; planned/setup/unchecked/
- * missing_credentials=warning; error=danger) and defaults to neutral.
+ * Map a capability-card selectability status to a tone. `selectable` is a
+ * PLANNED-axis fact (`ui_selectable && status === "implemented" &&
+ * providerRoute != null` — pure registry/config state, ProviderCapabilityCard.tsx)
+ * — never an OBSERVED claim, so it maps to `accent` (audio-graph-2554,
+ * settings T2 tone law: "Axes 1 and 2 may never render success tone",
+ * design-b §2), matching the existing "Selected" chip convention used
+ * elsewhere for the same axis. `selected`/`ready` are legacy arms retained
+ * for the closed-variant fallback contract (D3) but are not passed by the
+ * current caller.
  */
 export function selectabilityTone(status: string): BadgeTone {
   switch (status) {
-    case "selected":
     case "selectable":
+      return "accent";
+    case "selected":
     case "ready":
       return "success";
     case "error":

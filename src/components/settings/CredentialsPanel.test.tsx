@@ -167,6 +167,128 @@ describe("CredentialsPanel readiness model actions", () => {
   });
 });
 
+// ── The tone law (audio-graph-2554, settings T2) ────────────────────────────
+describe("CredentialsPanel — the tone law", () => {
+  it("demotes a stale ready in the by-provider rollup to the existing 'Unchecked' copy, not an unchanged Ready chip", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        visibleProviderReadiness: [
+          readiness({
+            provider_id: "asr.deepgram",
+            status: "ready",
+            stale: true,
+          }),
+        ],
+        activeReadinessProviderIdSet: new Set(["asr.deepgram"]),
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const row = screen
+      .getByText("Deepgram streaming")
+      .closest(".settings-readiness__item") as HTMLElement;
+    const chip = within(row).getByText(
+      t("settings.providerReadiness.status.unchecked"),
+    );
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+    expect(within(row).queryByText("Ready")).not.toBeInTheDocument();
+  });
+
+  it("renders no axis-3 chip in the rollup for a non-active provider's real ready — the setup affordance (missing key/error) is unaffected", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        visibleProviderReadiness: [
+          readiness({ provider_id: "asr.deepgram", status: "ready" }),
+          readiness({
+            provider_id: "asr.soniox",
+            status: "missing_credentials",
+            // Realistic backend shape, not just a plausible one: the
+            // backend sets `automatic_probe_available: false`
+            // unconditionally whenever required credentials are missing
+            // (`automatic_probe_available_from_decision`, commands.rs), so
+            // EVERY `missing_credentials` entry carries this in production.
+            // Proves the tone law's automatic_probe_available rule does not
+            // (mis)fire on a real structural blocker — only a reported
+            // "ready" this app can't re-verify gets demoted by it.
+            automatic_probe_available: false,
+          }),
+        ],
+        // Neither provider is active here — only asr.soniox keeps its chip
+        // (a real, structural "missing key" fact); asr.deepgram's stale-out
+        // "ready" gets no chip at all.
+        activeReadinessProviderIdSet: new Set<string>(),
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const deepgramRow = screen
+      .getByText("Deepgram streaming")
+      .closest(".settings-readiness__item") as HTMLElement;
+    expect(
+      deepgramRow.querySelector(".settings-readiness__item-main .ag-chip"),
+    ).toBeNull();
+
+    const sonioxRow = screen
+      .getByText("Soniox realtime")
+      .closest(".settings-readiness__item") as HTMLElement;
+    expect(
+      within(sonioxRow).getByText(
+        t("settings.providerReadiness.status.missing_credentials"),
+      ),
+    ).toHaveAttribute("data-tone", "warning");
+  });
+
+  it("routes the credential-health chip through the helper: a non-active related provider demotes the aggregate off Ready", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [deepgramCredential],
+        relatedReadinessForCredential: () => [
+          // A different provider that also unlocks this key: genuinely
+          // "ready" per the backend, but not the one actually in use.
+          readiness({ provider_id: "asr.deepgram", status: "ready" }),
+        ],
+        activeReadinessProviderIdSet: new Set<string>(), // not active
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const row = screen
+      .getByText("deepgram_api_key")
+      .closest(".settings-credential-health__item") as HTMLElement;
+    expect(
+      within(row).getByText(
+        t("settings.credentialHealth.statusChip.needsValidation"),
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(row).queryByText(t("settings.credentialHealth.statusChip.ready")),
+    ).not.toBeInTheDocument();
+  });
+
+  it("a saved-key-but-error fixture never renders the ready chip in credential health", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [deepgramCredential],
+        relatedReadinessForCredential: () => [
+          readiness({ provider_id: "asr.deepgram", status: "error" }),
+        ],
+        activeReadinessProviderIdSet: new Set(["asr.deepgram"]),
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const row = screen
+      .getByText("deepgram_api_key")
+      .closest(".settings-credential-health__item") as HTMLElement;
+    expect(
+      within(row).getByText(t("settings.credentialHealth.statusChip.failing")),
+    ).toBeInTheDocument();
+    expect(
+      within(row).queryByText(t("settings.credentialHealth.statusChip.ready")),
+    ).not.toBeInTheDocument();
+  });
+});
+
 // ── In-place credential entry on the credential-health rows ─────────────────
 // The rows used to be status-only: "Replace" navigated to the STT/LLM tab and
 // the global footer Save silently sent "" when the field wasn't edited. Each

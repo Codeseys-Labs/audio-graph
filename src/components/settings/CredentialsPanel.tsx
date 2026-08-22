@@ -29,8 +29,9 @@ import {
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import SecretCredentialControl from "../SecretCredentialControl";
-import { type BadgeTone, readinessTone } from "./badgeTone";
+import { type BadgeTone, readinessTone as statusTone } from "./badgeTone";
 import ReadinessModelActions from "./ReadinessModelActions";
+import { readinessAxisTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   formatCredentialCheckedAt,
@@ -52,10 +53,30 @@ const CREDENTIAL_CHIP_TONE: Record<CredentialChip, BadgeTone> = {
   unavailable: "neutral",
 };
 
-function credentialStatusChip(related: ProviderReadiness[]): CredentialChip {
+function credentialStatusChip(
+  related: ProviderReadiness[],
+  activeProviderIds: ReadonlySet<string>,
+): CredentialChip {
   if (related.length === 0) return "unused";
   if (related.some((entry) => entry.status === "error")) return "failing";
-  if (related.every((entry) => entry.status === "ready")) return "ready";
+  // The tone LAW (audio-graph-2554, settings T2): "Ready" for a saved key
+  // requires EVERY provider it unlocks to be a fresh, active-probe "ready" —
+  // a related provider that is stale, unprobeable, or simply not the one
+  // actually in use demotes the whole chip instead of being masked by the
+  // `.every` check silently passing on raw backend status.
+  if (
+    related.every((entry) => {
+      const axis = readinessAxisTone({
+        status: entry.status,
+        stale: entry.stale,
+        automaticProbeAvailable: entry.automatic_probe_available,
+        active: activeProviderIds.has(entry.provider_id),
+      });
+      return !axis.forceNeutral && axis.effectiveStatus === "ready";
+    })
+  ) {
+    return "ready";
+  }
   return "needsValidation";
 }
 
@@ -162,9 +183,9 @@ export default function CredentialsPanel() {
             <div className="settings-readiness__list">
               {visibleProviderReadiness.map((entry) => {
                 const catalogSummary = providerCatalogSummary(entry);
-                const selectedModel = activeReadinessProviderIdSet.has(
-                  entry.provider_id,
-                )
+                const isActiveReadinessProvider =
+                  activeReadinessProviderIdSet.has(entry.provider_id);
+                const selectedModel = isActiveReadinessProvider
                   ? selectedModelForProvider(entry.provider_id)
                   : null;
                 const recoveryAction = providerRecoveryAction(
@@ -173,6 +194,23 @@ export default function CredentialsPanel() {
                   PROVIDER_DESCRIPTORS.get(entry.provider_id),
                 );
                 const credentialRoute = credentialRouteForReadiness(entry);
+                // The tone LAW (audio-graph-2554, settings T2): this rollup
+                // deliberately keeps showing REAL blockers (missing
+                // credentials, errors) for a provider nobody is using yet —
+                // that is the "here's a provider you haven't set up"
+                // affordance documented above. Only the "ready"/success claim
+                // is gated on Axis 3 (active + fresh); a non-active
+                // provider's stale "ready" renders no axis-3 chip at all
+                // rather than a misleading one.
+                const readinessAxis = readinessAxisTone({
+                  status: entry.status,
+                  stale: entry.stale,
+                  automaticProbeAvailable: entry.automatic_probe_available,
+                  active: isActiveReadinessProvider,
+                });
+                const readinessChipTone = readinessAxis.forceNeutral
+                  ? "neutral"
+                  : statusTone(readinessAxis.effectiveStatus);
 
                 return (
                   <div
@@ -184,12 +222,13 @@ export default function CredentialsPanel() {
                         {PROVIDER_READINESS_LABELS.get(entry.provider_id) ??
                           entry.provider_id}
                       </span>
-                      <span
-                        className="ag-chip"
-                        data-tone={readinessTone(entry.status)}
-                      >
-                        {t(`settings.providerReadiness.status.${entry.status}`)}
-                      </span>
+                      {readinessAxis.render && (
+                        <span className="ag-chip" data-tone={readinessChipTone}>
+                          {t(
+                            `settings.providerReadiness.status.${readinessAxis.effectiveStatus}`,
+                          )}
+                        </span>
+                      )}
                     </div>
                     {selectedModel && (
                       <p className="settings-readiness__meta">
@@ -287,7 +326,10 @@ export default function CredentialsPanel() {
               // instead. Behavior is identical when there is no error.
               const chip: CredentialChip = providerReadinessError
                 ? "unavailable"
-                : credentialStatusChip(relatedReadiness);
+                : credentialStatusChip(
+                    relatedReadiness,
+                    activeReadinessProviderIdSet,
+                  );
               // In-place editing is offered for the routable (known) credential
               // keys — the same set that surfaced the navigate-away "Replace"
               // button. The draft binds to the shared controller map so the

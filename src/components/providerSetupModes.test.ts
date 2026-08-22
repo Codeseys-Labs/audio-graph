@@ -31,6 +31,7 @@ function readyProvider(
   providerId: string,
   credentials: readonly string[] = [],
   runtime?: ProviderRuntimeReadiness,
+  overrides: Partial<ProviderReadiness> = {},
 ): ProviderReadiness {
   return {
     provider_id: providerId,
@@ -41,6 +42,7 @@ function readyProvider(
     credentials: credentials.map((key) => ({ key, present: true })),
     model_catalog: [],
     runtime: runtime ?? null,
+    ...overrides,
   };
 }
 
@@ -392,6 +394,38 @@ describe("deriveProviderSetupModeCards", () => {
           covered: false,
         }),
       ]),
+    );
+  });
+
+  it("demotes a stale-ready provider off 'ready' for the aggregate — the tone LAW's C1 corollary (audio-graph-2554, settings T2)", () => {
+    // A cached "ready" past its TTL is not the same fact as a fresh one.
+    // Without this, the SELECTED mode card (ProductModeSummaryCards) would
+    // render a green "Ready" chip from a stale probe at the exact instant
+    // CredentialsPanel's by-provider rollup (which reads `stale` directly)
+    // correctly demotes the same provider to neutral "Unchecked" —
+    // contradictory chips from the same underlying data.
+    const cards = deriveProviderSetupModeCards({
+      settings: settings({
+        asrType: "deepgram",
+        deepgramModel: "nova-3",
+        llmType: "openrouter",
+        openrouterModel: "openai/gpt-4o-mini",
+      }),
+      credentialPresence: presence("deepgram_api_key", "openrouter_api_key"),
+      providerReadiness: [
+        readyProvider("asr.deepgram", ["deepgram_api_key"], undefined, {
+          stale: true,
+        }),
+        readyProvider("llm.openrouter", ["openrouter_api_key"]),
+      ],
+    });
+
+    const cloud = byId(cards, "cloud_fast");
+
+    expect(cloud.readinessStatus).not.toBe("ready");
+    expect(cloud.readinessStatus).toBe("unchecked");
+    expect(providerById(cloud, "asr.deepgram").readinessStatus).toBe(
+      "unchecked",
     );
   });
 

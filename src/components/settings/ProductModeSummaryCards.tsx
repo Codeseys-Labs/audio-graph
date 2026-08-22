@@ -11,6 +11,7 @@
 
 import { useTranslation } from "react-i18next";
 import { modeReadinessTone } from "./badgeTone";
+import { readinessAxisTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerSetupBlockerKindLabel,
@@ -52,6 +53,21 @@ export default function ProductModeSummaryCards() {
           const credentialRoute = providerSetupCredentialRoute(card);
           const modelRoute = providerSetupModelRoute(card);
           const hasSourceBlocker = providerSetupCardHasSourceBlocker(card);
+          // The tone LAW (audio-graph-2554, settings T2): a mode card's
+          // aggregate status may claim "Ready" only for the mode that is
+          // ACTUALLY the one running (`card.selected` stands in for Axis 3 at
+          // this granularity — a candidate mode nobody has switched to is
+          // not "actively probed" no matter what its providers' cached
+          // readiness says). `modeReadinessTone`/`providerSetupStatusLabel`
+          // still own the concrete tone/copy for every other status
+          // (including "blocked", which the shared law doesn't know about).
+          const readinessAxis = readinessAxisTone({
+            status: card.readinessStatus,
+            active: card.selected,
+          });
+          const readinessChipTone = readinessAxis.forceNeutral
+            ? "neutral"
+            : modeReadinessTone(readinessAxis.effectiveStatus);
 
           return (
             <article
@@ -92,12 +108,9 @@ export default function ProductModeSummaryCards() {
                       {t("settings.modes.notInMvp")}
                     </span>
                   )}
-                  {card.uiSelectable && (
-                    <span
-                      className="ag-chip"
-                      data-tone={modeReadinessTone(card.readinessStatus)}
-                    >
-                      {providerSetupStatusLabel(card.readinessStatus)}
+                  {card.uiSelectable && readinessAxis.render && (
+                    <span className="ag-chip" data-tone={readinessChipTone}>
+                      {providerSetupStatusLabel(readinessAxis.effectiveStatus)}
                     </span>
                   )}
                 </div>

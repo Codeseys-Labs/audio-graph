@@ -7,7 +7,6 @@ import type {
   ProviderDataBoundary,
   ProviderDescriptor,
   ProviderReadiness,
-  ProviderReadinessStatus,
   ProviderStage,
   SourceRecoveryIssue,
 } from "../types";
@@ -1120,7 +1119,7 @@ function providerReadinessStatus(
     return "error";
   }
   if (blockers.length > 0) return "blocked";
-  if (readiness) return readinessStatusFromBackend(readiness.status);
+  if (readiness) return readinessStatusFromBackend(readiness);
   if (descriptor.status === "planned") return "blocked";
   // A deferred-but-implemented provider is not offered for new selection; a
   // saved session still pointing at one reads as blocked until switched.
@@ -1132,11 +1131,18 @@ function providerReadinessStatus(
 }
 
 function readinessStatusFromBackend(
-  status: ProviderReadinessStatus,
+  readiness: ProviderReadiness,
 ): ProviderSetupReadinessStatus {
-  switch (status) {
+  switch (readiness.status) {
     case "ready":
-      return "ready";
+      // The tone LAW (audio-graph-2554, settings T2 — corollary C1: "stale
+      // demotes tone, never merely an appended sentence"): a cached "ready"
+      // past its TTL is not the same fact as a fresh one. Demoting it here,
+      // at the aggregate-derivation layer, is what stops the SELECTED mode
+      // card from showing a green "Ready" chip at the same instant
+      // CredentialsPanel's by-provider rollup (which reads `stale` directly)
+      // correctly demotes the very same provider to neutral "Unchecked".
+      return readiness.stale ? "unchecked" : "ready";
     case "missing_credentials":
       return "missing_credentials";
     case "error":

@@ -23,7 +23,8 @@ import {
   providerRoadmapAuthLabel,
   providerStatusLabel,
 } from "../providerRegistryHelpers";
-import { readinessTone, selectabilityTone } from "./badgeTone";
+import { selectabilityTone, readinessTone as statusTone } from "./badgeTone";
+import { readinessAxisTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerAudioFormatLabel,
@@ -90,9 +91,28 @@ export default function ProviderCapabilityCard({
         ? "Deferred"
         : "Readiness only";
   const selected = activeReadinessProviderIdSet.has(descriptor.id);
-  const readinessStatus = readiness?.status ?? "unchecked";
   const readinessLabel = readiness
     ? t(`settings.providerReadiness.status.${readiness.status}`)
+    : "Not checked";
+  // The tone LAW (audio-graph-2554, settings T2): the readiness BADGE (as
+  // opposed to the raw technical dl row and message above, which stay a
+  // literal echo of whatever the backend last reported for inspection) may
+  // only claim success/"Ready" for the provider actually in active/selected
+  // use, freshly and automatically probed. A non-active provider's last
+  // known status (e.g. a "planned" provider like Soniox that happens to have
+  // a real, ready backend probe from before it was gated out of selection)
+  // renders NO axis-3 chip at all rather than a misleading claim.
+  const readinessAxis = readinessAxisTone({
+    status: readiness?.status,
+    stale: readiness?.stale,
+    automaticProbeAvailable: readiness?.automatic_probe_available,
+    active: selected,
+  });
+  const readinessBadgeTone = readinessAxis.forceNeutral
+    ? "neutral"
+    : statusTone(readinessAxis.effectiveStatus);
+  const readinessBadgeLabel = readiness
+    ? t(`settings.providerReadiness.status.${readinessAxis.effectiveStatus}`)
     : "Not checked";
   const backendCatalogSummary = readiness
     ? providerCatalogSummary(readiness)
@@ -129,19 +149,31 @@ export default function ProviderCapabilityCard({
         </div>
         <div className="settings-provider-capability-card__badges">
           {selected && (
-            <span className="ag-chip" data-tone="success">
+            // "Selected" is a PLANNED-axis fact (this is the configured
+            // provider), not an OBSERVED-readiness claim — `accent`, not
+            // `success`, so it never borrows the tone the law reserves for a
+            // real, fresh, active probe (matches the mode card's own
+            // "Selected" chip in ProductModeSummaryCards.tsx).
+            <span className="ag-chip" data-tone="accent">
               Selected
             </span>
           )}
+          {/* "Selectable" is likewise a PLANNED-axis registry fact (Axis 1:
+              ui_selectable + implemented + a routable provider), never an
+              OBSERVED claim — `selectabilityTone` (badgeTone.ts) maps it to
+              `accent`, not `success`, for the same reason as "Selected"
+              above (audio-graph-2554, settings T2 tone law). */}
           <span
             className="ag-chip"
             data-tone={selectabilityTone(selectabilityStatus)}
           >
             {selectabilityLabel}
           </span>
-          <span className="ag-chip" data-tone={readinessTone(readinessStatus)}>
-            {readinessLabel}
-          </span>
+          {readinessAxis.render && (
+            <span className="ag-chip" data-tone={readinessBadgeTone}>
+              {readinessBadgeLabel}
+            </span>
+          )}
         </div>
       </div>
 

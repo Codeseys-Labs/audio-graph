@@ -687,11 +687,17 @@ describe("SettingsPage", () => {
     expect(deepgramCard).toHaveTextContent(/asr\.deepgram/i);
     expect(deepgramCard).toHaveTextContent(/Stage\s*ASR/i);
     expect(deepgramCard).toHaveTextContent(/Selectable/i);
-    // Badge absorption (audio-graph-4d67): pin the selectability chip's
-    // render contract the same way as the mode card's "Selected" chip above.
+    // Badge absorption (audio-graph-4d67); tone retargeted by the tone LAW
+    // (audio-graph-2554, settings T2): "Selectable" is a PLANNED-axis
+    // registry fact (ui_selectable + implemented + a routable provider) —
+    // never an OBSERVED claim. It previously borrowed `success`, the exact
+    // tone the law reserves for a fresh, active, real backend probe (Axis
+    // 3); a saved-key-but-`status:"error"` Deepgram fixture would otherwise
+    // render this chip green right next to a red "Error" chip. `accent`
+    // matches the existing "Selected" chip convention for the same axis.
     const selectableChip = within(deepgramCard).getByText("Selectable");
     expect(selectableChip).toHaveClass("ag-chip");
-    expect(selectableChip).toHaveAttribute("data-tone", "success");
+    expect(selectableChip).toHaveAttribute("data-tone", "accent");
     expect(deepgramCard).toHaveTextContent(/Streaming\s*Yes/i);
     expect(deepgramCard).toHaveTextContent(/Partial revisions\s*Yes/i);
     expect(deepgramCard).toHaveTextContent(/Diarization\s*Yes/i);
