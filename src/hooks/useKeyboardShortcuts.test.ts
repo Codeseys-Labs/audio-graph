@@ -75,6 +75,11 @@ describe("useKeyboardShortcuts", () => {
     });
 
     expect(openSettings).toHaveBeenCalledTimes(1);
+    // Settings T1 (seed audio-graph-2b9a): openSettings now takes an
+    // optional route; the shortcut has no better destination to compute, so
+    // it must keep navigating bare — unchanged behavior under the widened
+    // signature.
+    expect(openSettings).toHaveBeenCalledWith();
   });
 
   it("Cmd+Shift+S opens sessions browser (not plain Cmd+S)", () => {

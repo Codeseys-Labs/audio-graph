@@ -19,7 +19,20 @@
  * codes) are passed through verbatim rather than clobbered into a generic
  * "Something went wrong". Only a recognizably *technical* unknown gets the
  * generic treatment.
+ *
+ * Settings T1 (seed audio-graph-2b9a) adds an optional `route` to the
+ * per-class meta table: a STATIC "if this error class fires, here's the one
+ * Settings destination worth sending the user to" default (currently just
+ * `auth` → the Credentials tab's readiness section — a rejected key is by far
+ * the most common cause of an `auth`-classified failure, and the Credentials
+ * tab is where every provider's key status is visible in one place). This is
+ * deliberately NOT a per-instance/dynamic route computed from which provider
+ * actually failed — `humanizeError` only ever sees a message string, with no
+ * signal about which provider produced it. `SettingsPage`'s save-error alert
+ * reads `.route` off the humanized result and renders a "Go to" action via
+ * the existing `openSettingsControlRoute` when it's non-null.
  */
+import type { SettingsRoute } from "../types";
 
 export type ErrorClass =
   | "ipc_unavailable"
@@ -49,6 +62,9 @@ export interface HumanizedError {
   retryable: boolean;
   /** The original developer-facing string, preserved for a Details reveal. */
   raw: string;
+  /** Settings destination for this error class's "Go to" action, or `null`
+   * when no single destination is a sound default (see module doc comment). */
+  route: SettingsRoute | null;
 }
 
 // The flagship offender: the Tauri IPC bridge is undefined (browser preview or
@@ -80,6 +96,7 @@ interface ClassMeta {
   severity: "error" | "warning";
   transient: boolean;
   retryable: boolean;
+  route?: SettingsRoute;
 }
 
 const CLASS_META: Record<Exclude<ErrorClass, "unknown">, ClassMeta> = {
@@ -110,6 +127,10 @@ const CLASS_META: Record<Exclude<ErrorClass, "unknown">, ClassMeta> = {
     severity: "error",
     transient: false,
     retryable: false,
+    // A rejected/missing key is the overwhelming cause of an `auth`-classified
+    // save failure; the Credentials tab's readiness section is where every
+    // provider's key status is visible in one place (see module doc comment).
+    route: { tab: "credentials", fieldId: "settings-readiness-title" },
   },
   rate_limit: {
     titleKey: "errors.rateLimit.title",
@@ -152,6 +173,7 @@ export function humanizeError(raw: string): HumanizedError {
       transient: meta.transient,
       retryable: meta.retryable,
       raw: message,
+      route: meta.route ?? null,
     };
   }
 
@@ -169,6 +191,7 @@ export function humanizeError(raw: string): HumanizedError {
       transient: false,
       retryable: false,
       raw: message,
+      route: null,
     };
   }
 
@@ -181,5 +204,6 @@ export function humanizeError(raw: string): HumanizedError {
     transient: false,
     retryable: false,
     raw: message,
+    route: null,
   };
 }

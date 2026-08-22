@@ -142,5 +142,10 @@ describe("DemoModeBanner", () => {
     });
 
     await waitFor(() => expect(openSettings).toHaveBeenCalledTimes(1));
+    // Settings T1 (seed audio-graph-2b9a): openSettings now takes an
+    // optional route; this call site keeps its own manual scroll-to-Models
+    // hack rather than computing one, so it must keep navigating bare —
+    // unchanged behavior under the widened signature.
+    expect(openSettings).toHaveBeenCalledWith();
   });
 });

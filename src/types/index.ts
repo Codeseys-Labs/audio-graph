@@ -27,6 +27,14 @@
  * `ALLOWED_CREDENTIAL_KEYS` must stay in lockstep with
  * `src-tauri/src/credentials/mod.rs::ALLOWED_CREDENTIAL_KEYS`.
  */
+
+// SettingsTab (settings T1, seed audio-graph-2b9a): the Settings rail's tab
+// union. Defined in `components/settings/settingsRailConfig.ts` (not here)
+// because that file is the single source of truth the rail component and the
+// settings controller both read from, and it has zero imports of its own —
+// re-imported here (a leaf, so no cycle) so `SettingsRoute` below can widen
+// `openSettings` without every external caller reaching into `components/`.
+import type { SettingsTab } from "../components/settings/settingsRailConfig";
 import type {
   AudioPermissionRecoveryHint,
   AudioPermissionStatus,
@@ -2682,6 +2690,19 @@ export interface NotifyOptions {
   id?: string;
 }
 
+/**
+ * External address for a spot inside the Settings modal — settings T1 (seed
+ * audio-graph-2b9a). `fieldId` is a DOM id inside `tab`'s panel;
+ * `activate` mirrors `focusSettingsField`'s own flag (click a button target
+ * before focusing it, e.g. "Add key" discloses a credential input). No
+ * mutation member on purpose — see `openSettings`'s doc comment below.
+ */
+export interface SettingsRoute {
+  tab: SettingsTab;
+  fieldId?: string;
+  activate?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Store type
 // ---------------------------------------------------------------------------
@@ -3000,8 +3021,34 @@ export interface AudioGraphStore {
   settingsOpen: boolean;
   settingsLoading: boolean;
   isDeletingModel: string | null;
-  openSettings: () => void;
+  /**
+   * `openSettings(route)` navigates the Settings modal to a specific tab and
+   * (optionally) a field within it — settings T1, seed audio-graph-2b9a. The
+   * route parks as `pendingSettingsRoute` below until the modal's first
+   * hydration, at which point `useSettingsController` reads it as `activeTab`'s
+   * initial state and focuses `fieldId` (see that hook's doc comment).
+   *
+   * Deliberately has NO `apply`/mutation member: every caller outside the
+   * settings controller (PreflightCard, ExpressSetup, NowStrip, the keyboard
+   * shortcut, ADR-0013's conversation-mode control) may only NAVIGATE, never
+   * silently change a provider selection. The controller's own internal
+   * route table (`components/settings/settingsRoutes.ts`) has a richer,
+   * apply-carrying route type for its own credential/provider-setup flows,
+   * but that type is never the argument to this action.
+   */
+  openSettings: (route?: SettingsRoute) => void;
   closeSettings: () => void;
+  /**
+   * The route (if any) the most recent `openSettings(route)` call parked,
+   * awaiting the modal's first hydration. `useSettingsController` reads this
+   * as `activeTab`'s initial state, then consumes it via
+   * `consumePendingSettingsRoute` below once `settingsLoading` clears.
+   */
+  pendingSettingsRoute: SettingsRoute | null;
+  /** Reads + clears `pendingSettingsRoute` in one step, returning the route
+   * that was pending (or `null`). Idempotent: calling it again before a new
+   * `openSettings(route)` returns `null`. */
+  consumePendingSettingsRoute: () => SettingsRoute | null;
   fetchSettings: () => Promise<void>;
   saveSettings: (settings: AppSettings) => Promise<void>;
   fetchModelStatus: () => Promise<void>;

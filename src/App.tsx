@@ -1106,7 +1106,10 @@ function App() {
         <Suspense fallback={null}>
           <ExpressSetup
             onDismiss={dismissExpressSetup}
-            onOpenAdvanced={() => openSettings()}
+            // Settings T1 (seed audio-graph-2b9a): `ExpressSetup` computes the
+            // in-progress leg's route itself; `openSettings`'s signature now
+            // matches `onOpenAdvanced`'s directly, so no wrapper is needed.
+            onOpenAdvanced={openSettings}
             onPreviewSampleSession={previewSampleSession}
           />
         </Suspense>

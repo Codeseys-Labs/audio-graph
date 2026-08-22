@@ -47,6 +47,7 @@ function SettingsPage() {
           handleDiscardAndClose,
           handleSave,
           modalRef,
+          openSettingsControlRoute,
           requestClose,
           saveError,
           setConfirmingClose,
@@ -143,6 +144,20 @@ function SettingsPage() {
                             <HumanizedError
                               raw={saveError}
                               onRetry={handleSave}
+                              // Settings T1 (seed audio-graph-2b9a): route-
+                              // carrying errors — `humanizeError`'s meta table
+                              // supplies the destination (currently just
+                              // `auth`); this always yields a route with a
+                              // `fieldId` (see that module's doc comment), so
+                              // `openSettingsControlRoute`'s existing
+                              // required-`fieldId` shape is satisfied as-is.
+                              onGoToRoute={(route) =>
+                                openSettingsControlRoute({
+                                  tab: route.tab,
+                                  fieldId: route.fieldId ?? "",
+                                  activate: route.activate,
+                                })
+                              }
                             />
                           </span>
                           <IconButton

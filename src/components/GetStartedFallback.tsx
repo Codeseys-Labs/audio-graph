@@ -109,7 +109,13 @@ function GetStartedFallback({
         <button
           type="button"
           className="inline-flex items-center gap-(--space-2) py-(--space-3) px-(--space-4) rounded-md text-sm cursor-pointer bg-transparent border-none text-text-secondary underline transition-colors hover:text-text-primary"
-          onClick={onOpenSettings}
+          // Settings T1 (seed audio-graph-2b9a): `onOpenSettings` threads
+          // back to the store's `openSettings(route?)`, whose signature
+          // widened to accept an optional route. A bare `onClick=
+          // {onOpenSettings}` would forward the click's React MouseEvent as
+          // that route argument (same hazard fixed at NowStrip.tsx) — wrap
+          // so it always navigates bare.
+          onClick={() => onOpenSettings()}
         >
           <Icon name="settings" size={16} />
           {t("onboarding.fallbackOpenSettings")}

@@ -235,6 +235,35 @@ describe("PreflightCard", () => {
     expect(actions.openSettings).toHaveBeenCalledTimes(1);
   });
 
+  // Settings T1 (seed audio-graph-2b9a): the fix action now carries a
+  // per-leg route computed from data the card already holds, instead of
+  // always opening Settings bare. With the ASR leg (deepgram) already
+  // configured but the LLM leg (default fixture: openrouter) missing its
+  // key, the fix action must land on the LLM tab's credential field.
+  it("routes the Route row's fix action to the blocking LLM leg once ASR is already configured", () => {
+    resetStore({
+      credentialPresence: [
+        {
+          key: "deepgram_api_key",
+          present: true,
+          source: "credentials_yaml",
+        },
+      ],
+    });
+    render(<PreflightCard />);
+    fireEvent.click(
+      within(screen.getByTestId("preflight-row-route")).getByRole("button", {
+        name: /configure/i,
+      }),
+    );
+    expect(actions.openSettings).toHaveBeenCalledTimes(1);
+    expect(actions.openSettings).toHaveBeenCalledWith({
+      tab: "llm",
+      fieldId: "llm-openrouter-api-key",
+      activate: true,
+    });
+  });
+
   // ── Storage row (reuses StorageBanner's data source) ───────────────────
   it("passes the Storage row when no storage-full event has published, with its fix action disabled (nothing to fix)", () => {
     render(<PreflightCard />);

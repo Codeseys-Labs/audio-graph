@@ -2949,15 +2949,26 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   settingsOpen: false,
   settingsLoading: false,
   isDeletingModel: null,
+  pendingSettingsRoute: null,
 
-  openSettings: () => {
-    set({ settingsOpen: true });
+  // `route` is settings T1's addressing scheme (seed audio-graph-2b9a):
+  // parked as `pendingSettingsRoute` for `useSettingsController` to read as
+  // `activeTab`'s initial state and consume (via `consumePendingSettingsRoute`
+  // below) once the modal has hydrated. Deliberately no `apply` — see the
+  // `openSettings` doc comment on `AudioGraphStore` (types/index.ts).
+  openSettings: (route) => {
+    set({ settingsOpen: true, pendingSettingsRoute: route ?? null });
     const { fetchSettings, fetchModels, fetchModelStatus } = get();
     fetchSettings();
     fetchModels();
     fetchModelStatus();
   },
   closeSettings: () => set({ settingsOpen: false }),
+  consumePendingSettingsRoute: () => {
+    const route = get().pendingSettingsRoute;
+    set({ pendingSettingsRoute: null });
+    return route;
+  },
 
   fetchSettings: async () => {
     set({ settingsLoading: true });

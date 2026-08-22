@@ -412,6 +412,11 @@ describe("NowStrip", () => {
     fireEvent.click(screen.getByRole("button", { name: /settings/i }));
     expect(actions.openSessionsBrowser).toHaveBeenCalledTimes(1);
     expect(actions.openSettings).toHaveBeenCalledTimes(1);
+    // Settings T1 (seed audio-graph-2b9a): openSettings now takes an
+    // optional route; this call site has no better destination to compute,
+    // so it must keep navigating bare (no route argument) — unchanged
+    // behavior under the widened signature.
+    expect(actions.openSettings).toHaveBeenCalledWith();
   });
 
   it("does not render the retired Agent/Tokens toggle buttons or the Transcribe control", () => {

@@ -90,6 +90,24 @@ import {
   RAIL_SECTIONS,
   type SettingsTab,
 } from "./settingsRailConfig";
+// The route TABLE (which tab/fieldId a provider id or credential key maps
+// to) is a pure lookup extracted to `settingsRoutes.ts` (settings T1, seed
+// audio-graph-2b9a) — see that file's doc comment. Every function imported
+// here is aliased with a `pure` prefix because this hook re-exposes a
+// same-named wrapper that resolves the pure result's `applyAction` into a
+// real `dispatch`/`setTtsType` closure (this module is the only place that
+// may do that — the pure module never touches `dispatch`).
+import {
+  type ApplyAction,
+  credentialRouteForKey as pureCredentialRouteForKey,
+  credentialRouteForProviderCredential as pureCredentialRouteForProviderCredential,
+  credentialRouteForProviderSetupSelection as pureCredentialRouteForProviderSetupSelection,
+  credentialRouteForReadiness as pureCredentialRouteForReadiness,
+  modelRouteForProviderId as pureModelRouteForProviderId,
+  providerRouteForProviderId as pureProviderRouteForProviderId,
+  relatedReadinessForCredential as pureRelatedReadinessForCredential,
+  type RouteEntry,
+} from "./settingsRoutes";
 
 // Theme choices surfaced in the General tab segmented control. Order mirrors
 // the escalation from "let the OS decide" → explicit light → explicit dark.
@@ -900,10 +918,6 @@ export function providerDefaultModelLabel(
   return descriptor.default_model?.trim() || "Not set";
 }
 
-function firstCredentialKey(entry: ProviderReadiness): string | null {
-  return entry.credentials[0]?.key ?? null;
-}
-
 function coerceDiarizationMode(
   value: DiarizationMode | undefined,
 ): DiarizationMode {
@@ -976,6 +990,8 @@ export function useSettingsController() {
     downloadModel,
     deleteModel,
     listAwsProfiles,
+    pendingSettingsRoute,
+    consumePendingSettingsRoute,
   } = useAudioGraphStore();
   const conversationMode = useAudioGraphStore((s) => s.conversationMode);
   const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
@@ -1606,7 +1622,15 @@ export function useSettingsController() {
   // the presentational rail both read from there. Aliased to SETTINGS_TABS for
   // the keyboard handler + context-value key that consumers already reference.
   const SETTINGS_TABS = RAIL_SECTIONS;
-  const [activeTab, setActiveTab] = useState<SettingsTab>("overview");
+  // T1 addressing (seed audio-graph-2b9a): `openSettings(route)` parks `route`
+  // as the store's `pendingSettingsRoute` before this hook ever mounts (the
+  // modal only renders once `settingsOpen` flips true, in the same store
+  // update). The lazy initializer below reads it exactly once, at first
+  // render, so an external deep link lands the modal directly on the right
+  // tab instead of always opening on "overview" and requiring a second nav.
+  const [activeTab, setActiveTab] = useState<SettingsTab>(
+    () => pendingSettingsRoute?.tab ?? "overview",
+  );
   // Below the narrow breakpoint the rail flips to a horizontal tablist, so the
   // announced orientation flips too (blueprint §1.4). The doubled arrow
   // handlers (Up/Down AND Left/Right) keep working regardless.
@@ -1630,303 +1654,152 @@ export function useSettingsController() {
     tabRefs.current[tab]?.focus();
   };
 
-  const focusSettingsField = (fieldId: string, activate = false) => {
-    window.setTimeout(() => {
-      const element = document.getElementById(fieldId);
-      if (!(element instanceof HTMLElement)) return;
-      if (activate && element instanceof HTMLButtonElement) {
-        element.click();
-        focusSettingsField(fieldId);
-        return;
-      }
-      // Reduced-motion users get an instant scroll and no pulse (blueprint §3).
-      const prefersReducedMotion =
-        typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      element.scrollIntoView?.({
-        block: "nearest",
-        behavior: prefersReducedMotion ? "auto" : "smooth",
-      });
-      if (!element.matches("input, select, textarea, button, [tabindex]")) {
-        element.setAttribute("tabindex", "-1");
-      }
-      element.focus();
-      // Landed-field highlight pulse — paired with focus so SR + sighted users
-      // get the same "you are here" signal after a deep-link (blueprint §3).
-      // The CSS animation is itself gated on prefers-reduced-motion, so the
-      // class is harmless to add either way; we still skip the timer churn when
-      // motion is reduced.
-      if (!prefersReducedMotion) {
-        element.classList.add("settings-landed");
-        window.setTimeout(() => {
-          element.classList.remove("settings-landed");
-        }, 1500);
-      }
-    }, 0);
+  // `useCallback` (not a plain const) so the pending-route effect below can
+  // list it as a dependency without refiring every render.
+  const focusSettingsField = useCallback(
+    (fieldId: string, activate = false) => {
+      window.setTimeout(() => {
+        const element = document.getElementById(fieldId);
+        if (!(element instanceof HTMLElement)) return;
+        if (activate && element instanceof HTMLButtonElement) {
+          element.click();
+          focusSettingsField(fieldId);
+          return;
+        }
+        // Reduced-motion users get an instant scroll and no pulse (blueprint §3).
+        const prefersReducedMotion =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        element.scrollIntoView?.({
+          block: "nearest",
+          behavior: prefersReducedMotion ? "auto" : "smooth",
+        });
+        if (!element.matches("input, select, textarea, button, [tabindex]")) {
+          element.setAttribute("tabindex", "-1");
+        }
+        element.focus();
+        // Landed-field highlight pulse — paired with focus so SR + sighted users
+        // get the same "you are here" signal after a deep-link (blueprint §3).
+        // The CSS animation is itself gated on prefers-reduced-motion, so the
+        // class is harmless to add either way; we still skip the timer churn when
+        // motion is reduced.
+        if (!prefersReducedMotion) {
+          element.classList.add("settings-landed");
+          window.setTimeout(() => {
+            element.classList.remove("settings-landed");
+          }, 1500);
+        }
+      }, 0);
+    },
+    [],
+  );
+
+  // Consume the pending route + focus its field once the modal has actually
+  // hydrated (the tab panels don't render at all while `settingsLoading` is
+  // true — see `SettingsPage.tsx` — so focusing any earlier would find no
+  // DOM node). `pendingRouteConsumedRef` makes this run exactly once per
+  // mount: `consumePendingSettingsRoute()` itself is idempotent (a second
+  // call returns `null`), but without the ref guard this effect would refire
+  // — and refocus the field, restealing user focus — every time
+  // `settingsLoading` toggles again later (e.g. a subsequent Save).
+  const pendingRouteConsumedRef = useRef(false);
+  useEffect(() => {
+    if (pendingRouteConsumedRef.current || settingsLoading) return;
+    pendingRouteConsumedRef.current = true;
+    const route = consumePendingSettingsRoute();
+    if (route?.fieldId) {
+      focusSettingsField(route.fieldId, route.activate);
+    }
+  }, [settingsLoading, consumePendingSettingsRoute, focusSettingsField]);
+
+  // ── Route table (pure lookup in ./settingsRoutes.ts) ────────────────────
+  // Every function below is a thin wrapper: it calls the pure module for the
+  // routing DECISION (tab/fieldId/activate + a serializable `applyAction`),
+  // then — only here, where `dispatch`/`setTtsType` are in scope — resolves
+  // `applyAction` into the real closure and attaches it as `apply`. Callers
+  // (inside this hook and outside, via the hook's return value) see the
+  // exact same shapes and behavior as before the extraction.
+  const applyActionToFn = (action: ApplyAction): (() => void) => {
+    switch (action.kind) {
+      case "asr_variant":
+        return () => dispatch(setField("asrType", action.variant));
+      case "llm_variant":
+        return () => dispatch(setField("llmType", action.variant));
+      case "asr_aws_transcribe_credential":
+        return () => {
+          dispatch(setField("asrType", "aws_transcribe"));
+          dispatch(setField("awsAsrCredentialMode", "access_keys"));
+        };
+      case "llm_aws_bedrock_credential":
+        return () => {
+          dispatch(setField("llmType", "aws_bedrock"));
+          dispatch(setField("awsBedrockCredentialMode", "access_keys"));
+        };
+      case "gemini_api_key":
+        return () => dispatch(setField("geminiAuthMode", "api_key"));
+      case "gemini_vertex_ai":
+        return () => dispatch(setField("geminiAuthMode", "vertex_ai"));
+      case "tts_variant":
+        return () => setTtsType(action.variant);
+    }
   };
+
+  const withApply = (entry: RouteEntry | null): CredentialRoute | null =>
+    entry && {
+      tab: entry.tab,
+      fieldId: entry.fieldId,
+      activate: entry.activate,
+      apply: entry.applyAction ? applyActionToFn(entry.applyAction) : undefined,
+    };
 
   const credentialRouteForProviderCredential = (
     providerId: string,
     credentialKey: string | null,
-  ): CredentialRoute | null => {
-    switch (providerId) {
-      case "asr.api":
-        return {
-          tab: "stt",
-          fieldId: "asr-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "api")),
-        };
-      case "asr.openai_realtime":
-        return {
-          tab: "stt",
-          fieldId: "openai-realtime-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "openai_realtime")),
-        };
-      case "realtime_agent.openai_realtime":
-        // Native voice-agent OpenAI credential. This is the
-        // realtime_agent.openai_realtime provider (native voice agent), NOT
-        // asr.openai_realtime (pipeline STT). Route to the Realtime-agent tab's
-        // capability card (where the native agent + its OpenAI credential live),
-        // NOT the STT tab's `openai-realtime-api-key` field — that field only
-        // renders when `asrType === "openai_realtime"`, so pointing here used to
-        // FORCE `dispatch(setField("asrType","openai_realtime"))`, silently
-        // rewriting the user's saved STT provider (asr_provider) on the next
-        // Save (the pipeline-STT vs native-agent split-brain). No `apply`:
-        // mirrors the sibling `realtime_agent.gemini_live` route in
-        // `providerRouteForProviderId`, which navigates without mutating state.
-        if (credentialKey !== "openai_api_key") return null;
-        return {
-          tab: "gemini",
-          fieldId:
-            "settings-provider-capability-realtime_agent.openai_realtime",
-          activate: true,
-        };
-      case "asr.deepgram":
-        return {
-          tab: "stt",
-          fieldId: "deepgram-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "deepgram")),
-        };
-      case "asr.assemblyai":
-        return {
-          tab: "stt",
-          fieldId: "assemblyai-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "assemblyai")),
-        };
-      case "asr.aws_transcribe":
-        return {
-          tab: "stt",
-          fieldId: "aws-asr-access-key",
-          activate: true,
-          apply: () => {
-            dispatch(setField("asrType", "aws_transcribe"));
-            dispatch(setField("awsAsrCredentialMode", "access_keys"));
-          },
-        };
-      case "llm.api":
-        return {
-          tab: "llm",
-          fieldId: "llm-custom-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "api")),
-        };
-      case "llm.cerebras":
-        return {
-          tab: "llm",
-          fieldId: "llm-cerebras-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "cerebras")),
-        };
-      case "llm.sambanova":
-        return {
-          tab: "llm",
-          fieldId: "llm-sambanova-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "sambanova")),
-        };
-      case "llm.openrouter":
-        return {
-          tab: "llm",
-          fieldId: "llm-openrouter-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "openrouter")),
-        };
-      case "llm.aws_bedrock":
-        return {
-          tab: "llm",
-          fieldId: "llm-bedrock-access-key",
-          activate: true,
-          apply: () => {
-            dispatch(setField("llmType", "aws_bedrock"));
-            dispatch(setField("awsBedrockCredentialMode", "access_keys"));
-          },
-        };
-      case "realtime_agent.gemini_live":
-        if (credentialKey !== "gemini_api_key") return null;
-        return {
-          tab: "gemini",
-          fieldId: "gemini-api-key",
-          activate: true,
-          apply: () => dispatch(setField("geminiAuthMode", "api_key")),
-        };
-      default:
-        return null;
-    }
-  };
+  ): CredentialRoute | null =>
+    withApply(
+      pureCredentialRouteForProviderCredential(providerId, credentialKey),
+    );
 
   const credentialRouteForReadiness = (
     entry: ProviderReadiness,
-    credentialKey = firstCredentialKey(entry),
-  ): CredentialRoute | null => {
-    return credentialRouteForProviderCredential(
-      entry.provider_id,
-      credentialKey,
-    );
-  };
-
-  const activeOpenAiCredentialRoute = (): CredentialRoute | null => {
-    if (
-      llmType === "api" &&
-      endpointCredentialKey(llmEndpoint) === "openai_api_key"
-    ) {
-      return credentialRouteForProviderCredential("llm.api", "openai_api_key");
-    }
-    if (
-      asrType === "api" &&
-      endpointCredentialKey(asrEndpoint) === "openai_api_key"
-    ) {
-      return credentialRouteForProviderCredential("asr.api", "openai_api_key");
-    }
-    if (asrType === "openai_realtime") {
-      return credentialRouteForProviderCredential(
-        "asr.openai_realtime",
-        "openai_api_key",
-      );
-    }
-
-    return null;
-  };
-
-  const readinessOpenAiCredentialRoute = (
-    readinessEntries: ProviderReadiness[],
-  ): CredentialRoute | null => {
-    const readinessPriority = ["llm.api", "asr.api", "asr.openai_realtime"];
-    for (const providerId of readinessPriority) {
-      const entry = readinessEntries.find(
-        (candidate) => candidate.provider_id === providerId,
-      );
-      if (!entry) continue;
-      const route = credentialRouteForReadiness(entry, "openai_api_key");
-      if (route) return route;
-    }
-
-    return (
-      readinessEntries
-        .map((entry) => credentialRouteForReadiness(entry, "openai_api_key"))
-        .find((route): route is CredentialRoute => route != null) ?? null
-    );
-  };
-
-  const activeProviderCredentialRouteForKey = (
-    key: string,
-  ): CredentialRoute | null => {
-    if (key === "openai_api_key") return activeOpenAiCredentialRoute();
-
-    for (const providerId of activeReadinessProviderIds) {
-      if (
-        providerId === "asr.api" &&
-        endpointCredentialKey(asrEndpoint) !== key
-      )
-        continue;
-      if (
-        providerId === "llm.api" &&
-        endpointCredentialKey(llmEndpoint) !== key
-      )
-        continue;
-      const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
-      if (!descriptor?.credential_keys.includes(key)) continue;
-      const route = credentialRouteForProviderCredential(providerId, key);
-      if (route) return route;
-    }
-
-    return null;
-  };
-
-  const fallbackCredentialRouteForKey = (
-    key: string,
-  ): CredentialRoute | null => {
-    const activeRoute = activeProviderCredentialRouteForKey(key);
-    if (activeRoute) return activeRoute;
-
-    switch (key) {
-      case "openai_api_key":
-        return null;
-      case "openrouter_api_key":
-        return {
-          tab: "llm",
-          fieldId: "llm-openrouter-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "openrouter")),
-        };
-      case "cerebras_api_key":
-        return {
-          tab: "llm",
-          fieldId: "llm-cerebras-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "cerebras")),
-        };
-      case "sambanova_api_key":
-        return {
-          tab: "llm",
-          fieldId: "llm-sambanova-api-key",
-          activate: true,
-          apply: () => dispatch(setField("llmType", "sambanova")),
-        };
-      case "deepgram_api_key":
-        return {
-          tab: "stt",
-          fieldId: "deepgram-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "deepgram")),
-        };
-      case "assemblyai_api_key":
-        return {
-          tab: "stt",
-          fieldId: "assemblyai-api-key",
-          activate: true,
-          apply: () => dispatch(setField("asrType", "assemblyai")),
-        };
-      case "gemini_api_key":
-        return {
-          tab: "gemini",
-          fieldId: "gemini-api-key",
-          activate: true,
-          apply: () => dispatch(setField("geminiAuthMode", "api_key")),
-        };
-      case "aws_access_key":
-      case "aws_secret_key":
-      case "aws_session_token":
-        return {
-          tab: "stt",
-          fieldId: "aws-asr-access-key",
-          activate: true,
-          apply: () => {
-            dispatch(setField("asrType", "aws_transcribe"));
-            dispatch(setField("awsAsrCredentialMode", "access_keys"));
-          },
-        };
-      default:
-        return null;
-    }
-  };
+    credentialKey?: string | null,
+  ): CredentialRoute | null =>
+    withApply(pureCredentialRouteForReadiness(entry, credentialKey));
 
   const relatedReadinessForCredential = (key: string): ProviderReadiness[] =>
-    providerReadinessEntries.filter((entry) =>
-      entry.credentials.some((credential) => credential.key === key),
+    pureRelatedReadinessForCredential(key, providerReadinessEntries);
+
+  const credentialRouteForKey = (key: string): CredentialRoute | null =>
+    withApply(
+      pureCredentialRouteForKey(key, {
+        activeReadinessProviderIds,
+        providerReadinessEntries,
+        asrType,
+        llmType,
+        asrEndpointCredentialKey: endpointCredentialKey(asrEndpoint),
+        llmEndpointCredentialKey: endpointCredentialKey(llmEndpoint),
+      }),
+    );
+
+  const providerRouteForProviderId = (
+    providerId: string,
+  ): SettingsControlRoute | null =>
+    withApply(pureProviderRouteForProviderId(providerId));
+
+  const modelRouteForProviderId = (
+    providerId: string,
+  ): SettingsControlRoute | null =>
+    withApply(pureModelRouteForProviderId(providerId));
+
+  const credentialRouteForProviderSetupSelection = (
+    selection: ProviderSetupProviderSelection,
+    credentialKey: string | null = selection.credentials[0]?.key ?? null,
+  ): SettingsControlRoute | null =>
+    withApply(
+      pureCredentialRouteForProviderSetupSelection(
+        selection.providerId,
+        credentialKey,
+      ),
     );
 
   const providerLabelsForCredential = (
@@ -1962,32 +1835,6 @@ export function useSettingsController() {
       }
     }
     return latest;
-  };
-
-  const credentialRouteForKey = (key: string): CredentialRoute | null => {
-    const relatedReadiness = relatedReadinessForCredential(key);
-    if (key === "openai_api_key") {
-      return (
-        activeOpenAiCredentialRoute() ??
-        readinessOpenAiCredentialRoute(relatedReadiness)
-      );
-    }
-
-    const activeReadinessRoute = activeReadinessProviderIds
-      .flatMap((providerId) =>
-        relatedReadiness.filter((entry) => entry.provider_id === providerId),
-      )
-      .map((entry) => credentialRouteForReadiness(entry, key))
-      .find((route): route is CredentialRoute => route != null);
-    if (activeReadinessRoute) return activeReadinessRoute;
-
-    const activeConfiguredRoute = activeProviderCredentialRouteForKey(key);
-    if (activeConfiguredRoute) return activeConfiguredRoute;
-
-    const readinessRoute = relatedReadiness
-      .map((entry) => credentialRouteForReadiness(entry, key))
-      .find((route): route is CredentialRoute => route != null);
-    return readinessRoute ?? fallbackCredentialRouteForKey(key);
   };
 
   const openSettingsControlRoute = (route: SettingsControlRoute) => {
@@ -2062,221 +1909,6 @@ export function useSettingsController() {
     const route = credentialRouteForKey(key);
     if (!route) return;
     openCredentialRoute(route);
-  };
-
-  const providerRouteForProviderId = (
-    providerId: string,
-  ): SettingsControlRoute | null => {
-    switch (providerId) {
-      case "asr.local_whisper":
-        return {
-          tab: "stt",
-          fieldId: "asr-whisper-model",
-          apply: () => dispatch(setField("asrType", "local_whisper")),
-        };
-      case "asr.api":
-        return {
-          tab: "stt",
-          fieldId: "asr-endpoint",
-          apply: () => dispatch(setField("asrType", "api")),
-        };
-      case "asr.openai_realtime":
-        return {
-          tab: "stt",
-          fieldId: "openai-realtime-model",
-          apply: () => dispatch(setField("asrType", "openai_realtime")),
-        };
-      case "asr.aws_transcribe":
-        return {
-          tab: "stt",
-          fieldId: "aws-asr-region",
-          apply: () => dispatch(setField("asrType", "aws_transcribe")),
-        };
-      case "asr.deepgram":
-        return {
-          tab: "stt",
-          fieldId: "deepgram-model",
-          apply: () => dispatch(setField("asrType", "deepgram")),
-        };
-      case "asr.assemblyai":
-        return {
-          tab: "stt",
-          fieldId: "assemblyai-api-key",
-          apply: () => dispatch(setField("asrType", "assemblyai")),
-        };
-      case "asr.sherpa_onnx":
-        return {
-          tab: "stt",
-          fieldId: "sherpa-model-dir",
-          apply: () => dispatch(setField("asrType", "sherpa_onnx")),
-        };
-      case "llm.local_llama":
-        return {
-          tab: "llm",
-          fieldId: "streaming-prefill-toggle",
-          apply: () => dispatch(setField("llmType", "local_llama")),
-        };
-      case "llm.api":
-        return {
-          tab: "llm",
-          fieldId: "llm-custom-endpoint",
-          apply: () => dispatch(setField("llmType", "api")),
-        };
-      case "llm.cerebras":
-        return {
-          tab: "llm",
-          fieldId: "llm-cerebras-model",
-          apply: () => dispatch(setField("llmType", "cerebras")),
-        };
-      case "llm.sambanova":
-        return {
-          tab: "llm",
-          fieldId: "llm-sambanova-model",
-          apply: () => dispatch(setField("llmType", "sambanova")),
-        };
-      case "llm.openrouter":
-        return {
-          tab: "llm",
-          fieldId: "llm-openrouter-model",
-          apply: () => dispatch(setField("llmType", "openrouter")),
-        };
-      case "llm.aws_bedrock":
-        return {
-          tab: "llm",
-          fieldId: "llm-bedrock-region",
-          apply: () => dispatch(setField("llmType", "aws_bedrock")),
-        };
-      case "llm.mistralrs":
-        return {
-          tab: "llm",
-          fieldId: "llm-mistralrs-model-id",
-          apply: () => dispatch(setField("llmType", "mistralrs")),
-        };
-      case "realtime_agent.gemini_live":
-        return { tab: "gemini", fieldId: "gemini-model" };
-      case "tts.none":
-        return {
-          tab: "tts",
-          fieldId: "tts-provider-select",
-          apply: () => setTtsType("none"),
-        };
-      case "tts.deepgram_aura":
-        return {
-          tab: "tts",
-          fieldId: "tts-provider-select",
-          apply: () => setTtsType("deepgram_aura"),
-        };
-      default:
-        return null;
-    }
-  };
-
-  const modelRouteForProviderId = (
-    providerId: string,
-  ): SettingsControlRoute | null => {
-    switch (providerId) {
-      case "asr.local_whisper":
-        return providerRouteForProviderId(providerId);
-      case "asr.api":
-        return {
-          tab: "stt",
-          fieldId: "asr-model",
-          apply: () => dispatch(setField("asrType", "api")),
-        };
-      case "asr.openai_realtime":
-        return {
-          tab: "stt",
-          fieldId: "openai-realtime-model",
-          apply: () => dispatch(setField("asrType", "openai_realtime")),
-        };
-      case "asr.deepgram":
-        return {
-          tab: "stt",
-          fieldId: "deepgram-model",
-          apply: () => dispatch(setField("asrType", "deepgram")),
-        };
-      case "asr.sherpa_onnx":
-        return {
-          tab: "stt",
-          fieldId: "sherpa-model-dir",
-          apply: () => dispatch(setField("asrType", "sherpa_onnx")),
-        };
-      case "llm.local_llama":
-        return { tab: "general", fieldId: "settings-models-section" };
-      case "llm.api":
-        return {
-          tab: "llm",
-          fieldId: "llm-custom-model",
-          apply: () => dispatch(setField("llmType", "api")),
-        };
-      case "llm.cerebras":
-        return {
-          tab: "llm",
-          fieldId: "llm-cerebras-model",
-          apply: () => dispatch(setField("llmType", "cerebras")),
-        };
-      case "llm.sambanova":
-        return {
-          tab: "llm",
-          fieldId: "llm-sambanova-model",
-          apply: () => dispatch(setField("llmType", "sambanova")),
-        };
-      case "llm.openrouter":
-        return {
-          tab: "llm",
-          fieldId: "llm-openrouter-model",
-          apply: () => dispatch(setField("llmType", "openrouter")),
-        };
-      case "llm.aws_bedrock":
-        return {
-          tab: "llm",
-          fieldId: "llm-bedrock-model-id",
-          apply: () => dispatch(setField("llmType", "aws_bedrock")),
-        };
-      case "llm.mistralrs":
-        return {
-          tab: "llm",
-          fieldId: "llm-mistralrs-model-id",
-          apply: () => dispatch(setField("llmType", "mistralrs")),
-        };
-      case "realtime_agent.gemini_live":
-        return { tab: "gemini", fieldId: "gemini-model" };
-      case "tts.deepgram_aura":
-        return {
-          tab: "tts",
-          fieldId: "aura-voice-select",
-          apply: () => setTtsType("deepgram_aura"),
-        };
-      default:
-        return null;
-    }
-  };
-
-  const credentialRouteForProviderSetupSelection = (
-    selection: ProviderSetupProviderSelection,
-    credentialKey: string | null = selection.credentials[0]?.key ?? null,
-  ): SettingsControlRoute | null => {
-    if (selection.providerId === "tts.deepgram_aura") {
-      return {
-        tab: "tts",
-        fieldId: "tts-deepgram-api-key",
-        apply: () => setTtsType("deepgram_aura"),
-      };
-    }
-    if (
-      selection.providerId === "realtime_agent.gemini_live" &&
-      credentialKey === "google_service_account_path"
-    ) {
-      return {
-        tab: "gemini",
-        fieldId: "gemini-service-account-path",
-        apply: () => dispatch(setField("geminiAuthMode", "vertex_ai")),
-      };
-    }
-    return credentialRouteForProviderCredential(
-      selection.providerId,
-      credentialKey,
-    );
   };
 
   const providerSetupSelectionForBlocker = (
@@ -3677,6 +3309,15 @@ export function useSettingsController() {
     }
   };
 
+  // Settings T1 (seed audio-graph-2b9a) landing note: the extraction dropped
+  // four route-resolution members that used to be part of this returned
+  // object — `activeOpenAiCredentialRoute`, `activeProviderCredentialRouteForKey`,
+  // `fallbackCredentialRouteForKey` (the controller-bound wrapper; the pure,
+  // same-named export from `./settingsRoutes` is unrelated), and
+  // `readinessOpenAiCredentialRoute`. `git grep` at the pre-extraction commit
+  // shows zero consumers of any of the four outside this hook, so this is
+  // dead-surface cleanup, not an API break — but it is a narrowing of this
+  // hook's public surface that the "pure extraction" framing didn't call out.
   return {
     OPENROUTER_MODELS_CACHE_TTL_MS,
     RAIL_GROUP_LABEL_KEYS,
@@ -3689,8 +3330,6 @@ export function useSettingsController() {
     activeLlmProviderDescriptor,
     activeLlmProviderId,
     activeLlmProviderReadiness,
-    activeOpenAiCredentialRoute,
-    activeProviderCredentialRouteForKey,
     activeReadinessProviderIdSet,
     activeReadinessProviderIds,
     activeTab,
@@ -3796,7 +3435,6 @@ export function useSettingsController() {
     dispatch,
     downloadModel,
     downloadProgress,
-    fallbackCredentialRouteForKey,
     fingerprint,
     firstProviderSetupRoute,
     focusSettingsField,
@@ -3911,7 +3549,6 @@ export function useSettingsController() {
     providerSetupProviderRoute,
     providerSetupSelectionForBlocker,
     railHorizontal,
-    readinessOpenAiCredentialRoute,
     refreshAwsProfiles,
     refreshCredentialPresence,
     refreshProviderReadiness,

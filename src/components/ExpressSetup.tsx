@@ -10,7 +10,10 @@
  *   - `onDismiss`: close the modal (`Skip` or successful save).
  *   - `onOpenAdvanced`: hand off to the full `SettingsPage` — the parent
  *     `App.tsx` sets `expressSetupVisible = false` then opens Settings
- *     so the two modals don't stack.
+ *     so the two modals don't stack. Settings T1 (seed audio-graph-2b9a)
+ *     widened this to take an optional route: if either leg was left
+ *     mid-entry (a cloud choice picked but no key typed yet), Advanced lands
+ *     Settings directly on that provider's own field instead of "overview".
  *   - `onPreviewSampleSession`: optional parent-owned handoff into a
  *     frontend-only sample session preview.
  *
@@ -33,6 +36,7 @@ import type {
   GeminiSettings,
   LlmApiConfig,
   LlmProvider,
+  SettingsRoute,
 } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
 import IconButton from "./IconButton";
@@ -46,11 +50,12 @@ import {
   type ProviderSetupStageRole,
   providerSetupSourceRecoveryIssues,
 } from "./providerSetupModes";
+import { providerRouteForStage } from "./settings/settingsRoutes";
 import { initialSettingsState, type SettingsState } from "./settingsTypes";
 
 interface ExpressSetupProps {
   onDismiss: () => void;
-  onOpenAdvanced: () => void;
+  onOpenAdvanced: (route?: SettingsRoute) => void;
   onPreviewSampleSession?: () => void;
 }
 
@@ -674,8 +679,36 @@ function ExpressSetup({
     }
   };
 
+  // Settings T1 (seed audio-graph-2b9a): carry whichever leg was left
+  // mid-entry — a cloud choice picked but no key typed yet — into the
+  // Advanced handoff, so Settings lands directly on that provider's field
+  // instead of always opening on "overview". Priority mirrors the form's own
+  // top-to-bottom order (ASR step above LLM step); at most one of
+  // `asrNeedsKey`/`llmNeedsKey` is normally true when Advanced is reachable
+  // (`canSave` already requires both to be false), but if the user clicked
+  // through with the input focused rather than filled, favor the earlier step.
+  //
+  // Recorded divergence: this is per-CAUSE (triggered specifically by a
+  // missing key) and routes via `providerRouteForStage`, landing on the
+  // model/endpoint field — NOT the credential field. `durableRoute.ts`'s
+  // `preflightRouteForBlockingLeg` (PreflightCard's equivalent fix action)
+  // is per-LEG and prefers the credential field first. Both are
+  // spec-conformant (synthesis §T1); this is a deliberate choice, not
+  // drift — see that function's doc comment for the cross-reference.
   const handleAdvanced = () => {
-    onOpenAdvanced();
+    const route = asrNeedsKey
+      ? providerRouteForStage("asr", buildAsrProvider().type)
+      : llmNeedsKey
+        ? providerRouteForStage("llm", buildLlmProvider().type)
+        : null;
+    // Project down to the navigate-only external shape — this hook's route
+    // table also carries an `applyAction` for the settings controller's own
+    // internal use; outside callers (this one included) never forward it.
+    onOpenAdvanced(
+      route
+        ? { tab: route.tab, fieldId: route.fieldId, activate: route.activate }
+        : undefined,
+    );
     onDismiss();
   };
 

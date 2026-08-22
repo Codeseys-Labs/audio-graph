@@ -358,7 +358,11 @@ function NowStrip() {
           icon="settings"
           label={t("controlBar.settings")}
           variant="ghost"
-          onClick={openSettings}
+          // Settings T1 (seed audio-graph-2b9a) widened `openSettings` to
+          // take an optional route; `onClick` would otherwise forward the
+          // click's `MouseEvent` as that argument. Bare navigation only
+          // here — unchanged behavior, new signature.
+          onClick={() => openSettings()}
         />
       </div>
     </header>

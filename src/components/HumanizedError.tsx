@@ -10,8 +10,16 @@
  *
  * Uses the token-bridged Tailwind utilities (ADR-0016) so it renders correctly
  * inside both the `.notification` BEM host and the panel's Tailwind markup.
+ *
+ * `onGoToRoute` (settings T1, seed audio-graph-2b9a) is an optional escape
+ * hatch for the one caller that has a Settings modal to navigate — the
+ * footer save-error alert. Kept as a callback rather than importing any
+ * settings machinery here so this component stays usable from the
+ * non-settings surfaces (`Notifications`, the Analysis diagnostics panel)
+ * that don't pass it and never render the button.
  */
 import { useTranslation } from "react-i18next";
+import type { SettingsRoute } from "../types";
 import { humanizeError } from "../utils/humanizeError";
 
 export interface HumanizedErrorProps {
@@ -19,9 +27,16 @@ export interface HumanizedErrorProps {
   raw: string;
   /** Optional retry handler; a Retry button renders only when provided. */
   onRetry?: () => void;
+  /** Optional Settings-navigation handler; a "Go to" action renders only
+   * when provided AND the classified error carries a `route`. */
+  onGoToRoute?: (route: SettingsRoute) => void;
 }
 
-export default function HumanizedError({ raw, onRetry }: HumanizedErrorProps) {
+export default function HumanizedError({
+  raw,
+  onRetry,
+  onGoToRoute,
+}: HumanizedErrorProps) {
   const { t } = useTranslation();
   const humanized = humanizeError(raw);
   const title = humanized.titleKey ? t(humanized.titleKey) : humanized.title;
@@ -29,6 +44,7 @@ export default function HumanizedError({ raw, onRetry }: HumanizedErrorProps) {
   // Don't duplicate the raw string in Details when it is already the title
   // (verbatim passthrough of an already-friendly message).
   const showDetails = humanized.raw.length > 0 && humanized.raw !== title;
+  const goToRoute = humanized.route;
 
   return (
     <div className="flex min-w-0 flex-col gap-(--space-2)">
@@ -40,7 +56,7 @@ export default function HumanizedError({ raw, onRetry }: HumanizedErrorProps) {
           {cause}
         </p>
       )}
-      {(onRetry || showDetails) && (
+      {(onRetry || showDetails || (goToRoute && onGoToRoute)) && (
         <div className="flex flex-wrap items-center gap-(--space-3)">
           {onRetry && (
             <button
@@ -49,6 +65,17 @@ export default function HumanizedError({ raw, onRetry }: HumanizedErrorProps) {
               onClick={onRetry}
             >
               {t("notifications.retry")}
+            </button>
+          )}
+          {goToRoute && onGoToRoute && (
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={() => onGoToRoute(goToRoute)}
+            >
+              {/* Reuses the existing "Configure" fix-action label
+                  (`controlBar.configure`) rather than a new i18n key. */}
+              {t("controlBar.configure")}
             </button>
           )}
           {showDetails && (

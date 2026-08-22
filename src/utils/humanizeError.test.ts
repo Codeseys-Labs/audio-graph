@@ -90,4 +90,27 @@ describe("humanizeError", () => {
     expect(humanizeError("401 Unauthorized").transient).toBe(false);
     expect(humanizeError("401 Unauthorized").retryable).toBe(false);
   });
+
+  // Settings T1 (seed audio-graph-2b9a): route-carrying errors.
+  it("carries a Settings route for an auth-classified error, and null for every other class", () => {
+    expect(humanizeError("401 Unauthorized").route).toEqual({
+      tab: "credentials",
+      fieldId: "settings-readiness-title",
+    });
+    expect(humanizeError("Invalid API key").route).toEqual({
+      tab: "credentials",
+      fieldId: "settings-readiness-title",
+    });
+    // No other class has a sound single destination — a mutation that made
+    // some OTHER class emit a route (or auth emit none) fails here.
+    expect(humanizeError("Failed to fetch").route).toBeNull();
+    expect(humanizeError("HTTP 429 Too Many Requests").route).toBeNull();
+    expect(humanizeError("Command foo_cmd not found").route).toBeNull();
+    expect(
+      humanizeError("Cannot read properties of undefined (reading 'invoke')")
+        .route,
+    ).toBeNull();
+    expect(humanizeError("TypeError: x.y is not a function").route).toBeNull();
+    expect(humanizeError("some brand-new failure").route).toBeNull();
+  });
 });

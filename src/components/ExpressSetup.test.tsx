@@ -799,4 +799,76 @@ describe("ExpressSetup", () => {
       await i18n.changeLanguage("en");
     }
   });
+
+  // ── Advanced handoff route (settings T1, seed audio-graph-2b9a) ─────────
+  describe("Advanced handoff", () => {
+    it("carries the in-progress ASR leg's route when neither leg has a key yet (ASR checked first)", async () => {
+      // Default choices (deepgram/openai) with no saved or typed keys: both
+      // legs are mid-entry, so the earlier form step (ASR) wins.
+      mockProviderState({ presence: [] });
+      const onOpenAdvanced = vi.fn();
+      render(
+        <ExpressSetup onDismiss={() => {}} onOpenAdvanced={onOpenAdvanced} />,
+      );
+      await waitFor(() =>
+        expect(screen.getByLabelText(/ASR API key/i)).toBeInTheDocument(),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+      expect(onOpenAdvanced).toHaveBeenCalledTimes(1);
+      expect(onOpenAdvanced).toHaveBeenCalledWith({
+        tab: "stt",
+        fieldId: "deepgram-model",
+      });
+    });
+
+    it("carries the in-progress LLM leg's route once the ASR leg's key is already saved", async () => {
+      mockProviderState({
+        presence: credentialPresence("deepgram_api_key"),
+        readiness: [readyProvider("asr.deepgram", ["deepgram_api_key"])],
+      });
+      const onOpenAdvanced = vi.fn();
+      render(
+        <ExpressSetup onDismiss={() => {}} onOpenAdvanced={onOpenAdvanced} />,
+      );
+      // The ASR key field disappears once its saved presence resolves —
+      // confirms `asrNeedsKey` has flipped false before Advanced is clicked.
+      await waitFor(() =>
+        expect(screen.queryByLabelText(/ASR API key/i)).not.toBeInTheDocument(),
+      );
+      expect(screen.getByLabelText(/LLM API key/i)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+      expect(onOpenAdvanced).toHaveBeenCalledTimes(1);
+      expect(onOpenAdvanced).toHaveBeenCalledWith({
+        tab: "llm",
+        fieldId: "llm-custom-endpoint",
+      });
+    });
+
+    it("hands off with no route once both legs already have a saved key", async () => {
+      mockProviderState({
+        presence: credentialPresence("deepgram_api_key", "openai_api_key"),
+        readiness: [
+          readyProvider("asr.deepgram", ["deepgram_api_key"]),
+          readyProvider("llm.api", ["openai_api_key"]),
+        ],
+      });
+      const onOpenAdvanced = vi.fn();
+      render(
+        <ExpressSetup onDismiss={() => {}} onOpenAdvanced={onOpenAdvanced} />,
+      );
+      await waitFor(() =>
+        expect(screen.queryByLabelText(/LLM API key/i)).not.toBeInTheDocument(),
+      );
+      expect(screen.queryByLabelText(/ASR API key/i)).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+      expect(onOpenAdvanced).toHaveBeenCalledTimes(1);
+      expect(onOpenAdvanced).toHaveBeenCalledWith(undefined);
+    });
+  });
 });

@@ -24,8 +24,11 @@
  *     `describePlannedRoute`, `utils/durableRoute.ts` — passive, no
  *     provider egress, ADR-0028). Always labeled "planned", never "observed"
  *     (ADR-0030/0034) — credential presence alone never renders as "Ready".
- *     Fix action opens Settings (the same `openSettings()` the gear icon
- *     already uses — not a new invoke).
+ *     Fix action opens Settings (the same `openSettings()` action the gear
+ *     icon already uses — not a new invoke) routed to whichever leg is
+ *     actually blocking (settings T1, seed audio-graph-2b9a:
+ *     `preflightRouteForBlockingLeg`, `utils/durableRoute.ts`), landing on
+ *     that provider's own field instead of always opening on "overview".
  *   - Storage — reuses `StorageBanner`'s own module-level state
  *     (`useCaptureStorageFullState`, `./StorageBanner.tsx`), a passive read
  *     with no invoke of its own. Fix action focuses the banner's own Resume
@@ -82,6 +85,7 @@ import { describeSelectedSourceLabels } from "../utils/captureTarget";
 import {
   describePlannedRoute,
   hasConfiguredDurableNotesRoute,
+  preflightRouteForBlockingLeg,
 } from "../utils/durableRoute";
 import ConversationModeControl from "./ConversationModeControl";
 import Icon from "./Icon";
@@ -245,6 +249,16 @@ function PreflightCard() {
     routeConfigured && plannedRoute
       ? t("nowStrip.routePlanned", { route: plannedRoute })
       : t("nowStrip.routeUnconfigured");
+  // Settings T1 (seed audio-graph-2b9a): land the fix action on whichever leg
+  // (ASR/LLM) is actually blocking, computed from data this card already
+  // holds — no new invoke — instead of always opening Settings bare on
+  // "overview". `undefined` when the route is fully configured (button is
+  // disabled below via `pass`, so `openSettings()` bare is unreachable, but
+  // the fallback keeps this a total function of its inputs).
+  const routeFixAction = () =>
+    openSettings(
+      preflightRouteForBlockingLeg(settings, credentialPresence, modelStatus),
+    );
 
   // ── Storage row ─────────────────────────────────────────────────────────
   const storagePass = storagePayload === null;
@@ -313,7 +327,7 @@ function PreflightCard() {
           detail={routeDetail}
           pass={routeConfigured}
           actionLabel={t("controlBar.configure")}
-          onAction={openSettings}
+          onAction={routeFixAction}
         />
         <PreflightRow
           testId="preflight-row-storage"

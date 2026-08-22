@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type { AppSettings, AudioSourceInfo, ProviderReadiness } from "../types";
 import SettingsPage from "./SettingsPage";
+import { ROUTE_INDEX } from "./settings/settingsRoutes";
 import {
   buildAwsCredentialSource,
   endpointCredentialKey,
@@ -6817,6 +6818,214 @@ describe("SettingsPage", () => {
         { endpoint: "https://api.openai.com/v1", apiKey: "sk-asr" },
       );
       expect(saveCredentialCalls()).toHaveLength(0);
+    });
+  });
+
+  // ── Settings T1 addressing (seed audio-graph-2b9a) ──────────────────────
+  describe("pendingSettingsRoute addressing", () => {
+    it("lands on the routed tab + focuses the field on first hydration, and consumes the route (a second mount lands on overview)", async () => {
+      resetStore({
+        settings: {
+          ...baseSettings,
+          llm_provider: {
+            type: "openrouter",
+            model: "openai/gpt-4.1-mini",
+            base_url: "https://openrouter.ai/api/v1",
+            include_usage_in_stream: true,
+          },
+        },
+        pendingSettingsRoute: {
+          tab: "llm",
+          fieldId: "llm-openrouter-api-key",
+        },
+      });
+
+      const { unmount } = render(<SettingsPage />);
+
+      // Mutating the `activeTab` initial-state read back to a bare
+      // `useState("overview")` fails this: the LLM panel (not Overview)
+      // must already be showing, landed and focused, without any click.
+      await waitFor(() => {
+        const field = document.getElementById("llm-openrouter-api-key");
+        expect(field).toHaveFocus();
+        expect(field).toHaveClass("settings-landed");
+      });
+      expect(document.getElementById("settings-tab-llm")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+
+      unmount();
+      // The route must be CONSUMED — dropping that step would leave
+      // `pendingSettingsRoute` set and re-land the second mount on "llm" too.
+      expect(useAudioGraphStore.getState().pendingSettingsRoute).toBeNull();
+
+      render(<SettingsPage />);
+      expect(document.getElementById("settings-tab-overview")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    });
+
+    it("survives a route arriving while settingsLoading is still true, and consumes it once loading flips false", async () => {
+      // Mutation probe: dropping `|| settingsLoading` from the consume
+      // effect's guard passes this test only by accident of timing — the
+      // real hazard it exists to catch is the route arriving BEFORE the
+      // tab panels (and their fields) have mounted, which is exactly what
+      // `openSettings(route)` does in production (fetchSettings sets
+      // `settingsLoading: true` before the first render). The round-trip
+      // test above seeds `settingsLoading: false` from the start, so it
+      // never exercises this path.
+      resetStore({
+        settingsLoading: true,
+        settings: {
+          ...baseSettings,
+          llm_provider: {
+            type: "openrouter",
+            model: "openai/gpt-4.1-mini",
+            base_url: "https://openrouter.ai/api/v1",
+            include_usage_in_stream: true,
+          },
+        },
+        pendingSettingsRoute: {
+          tab: "llm",
+          fieldId: "llm-openrouter-api-key",
+        },
+      });
+
+      render(<SettingsPage />);
+
+      // Still behind the loading placeholder: no tab panels, no field, and
+      // the route must not have been consumed yet.
+      expect(screen.getByText(/loading settings/i)).toBeInTheDocument();
+      expect(
+        document.getElementById("llm-openrouter-api-key"),
+      ).not.toBeInTheDocument();
+      expect(useAudioGraphStore.getState().pendingSettingsRoute).not.toBeNull();
+
+      act(() => {
+        useAudioGraphStore.setState({ settingsLoading: false });
+      });
+
+      await waitFor(() => {
+        const field = document.getElementById("llm-openrouter-api-key");
+        expect(field).toHaveFocus();
+        expect(field).toHaveClass("settings-landed");
+      });
+      expect(document.getElementById("settings-tab-llm")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(useAudioGraphStore.getState().pendingSettingsRoute).toBeNull();
+    });
+  });
+
+  // ── Route-carrying save errors (settings T1, seed audio-graph-2b9a) ─────
+  describe("save-error 'Go to' action", () => {
+    it("renders a Go-to action only for a route-carrying (401) save error, and it navigates + focuses the field", async () => {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "save_settings_cmd") {
+          throw new Error("401 Unauthorized: invalid api key");
+        }
+        if (cmd === "load_settings_cmd") return baseSettings;
+        return undefined;
+      });
+      resetStore({ saveSettings: realStoreSaveSettings });
+
+      render(<SettingsPage />);
+      await clickSaveSettings();
+
+      const region = await screen.findByTestId("settings-save-error");
+      const goToButton = within(region).getByRole("button", {
+        name: /configure/i,
+      });
+
+      fireEvent.click(goToButton);
+
+      await waitFor(() => {
+        const field = document.getElementById("settings-readiness-title");
+        expect(field).toHaveFocus();
+      });
+      expect(
+        document.getElementById("settings-tab-credentials"),
+      ).toHaveAttribute("aria-selected", "true");
+    });
+
+    it("renders no Go-to action for a non-route-carrying (technical/unknown) save error", async () => {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "save_settings_cmd") {
+          throw new Error("backend panicked at settings::persist");
+        }
+        if (cmd === "load_settings_cmd") return baseSettings;
+        return undefined;
+      });
+      resetStore({ saveSettings: realStoreSaveSettings });
+
+      render(<SettingsPage />);
+      await clickSaveSettings();
+
+      const region = await screen.findByTestId("settings-save-error");
+      expect(
+        within(region).queryByRole("button", { name: /configure/i }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  // ── Route-table drift tripwire (settings T1, seed audio-graph-2b9a) ─────
+  // Iterates the FULL `ROUTE_INDEX`. Entries whose provider/variant is
+  // selected under `baseSettings` (local_whisper / api / none / gemini_live
+  // api_key) MUST resolve to a real DOM node — a route entry whose fieldId
+  // stops matching a rendered field fails here instead of silently
+  // misrouting a future caller. Entries gated on a non-default variant
+  // (e.g. deepgram, sambanova) are not selected by this fixture, so their
+  // fields are legitimately absent — synthesis §T1 ACCEPTANCE states this
+  // residual drift risk explicitly rather than mounting every variant here.
+  describe("ROUTE_INDEX drift tripwire", () => {
+    const DEFAULT_REACHABLE_FIELD_IDS = new Set([
+      "asr-whisper-model",
+      "llm-custom-endpoint",
+      "llm-custom-model",
+      "llm-custom-api-key",
+      "tts-provider-select",
+      "gemini-model",
+      "gemini-api-key",
+      "settings-provider-capability-realtime_agent.openai_realtime",
+    ]);
+
+    it("resolves every ROUTE_INDEX entry selected by the default fixture to a real DOM node", () => {
+      resetStore();
+      render(<SettingsPage />);
+
+      const seenDefaultReachable = new Set<string>();
+      const missingDefaultReachable: string[] = [];
+      for (const { tab, fieldId } of ROUTE_INDEX) {
+        if (!DEFAULT_REACHABLE_FIELD_IDS.has(fieldId)) continue;
+        const tabButton = document.getElementById(`settings-tab-${tab}`);
+        expect(tabButton).toBeInstanceOf(HTMLElement);
+        fireEvent.click(tabButton as HTMLElement);
+        seenDefaultReachable.add(fieldId);
+        if (!document.getElementById(fieldId)) {
+          missingDefaultReachable.push(`${tab}:${fieldId}`);
+        }
+      }
+
+      expect(missingDefaultReachable).toEqual([]);
+      // Every allow-listed id must actually appear somewhere in ROUTE_INDEX —
+      // otherwise this test would vacuously pass on an empty intersection.
+      expect([...seenDefaultReachable].sort()).toEqual(
+        [...DEFAULT_REACHABLE_FIELD_IDS].sort(),
+      );
+      expect(ROUTE_INDEX.length).toBeGreaterThan(
+        DEFAULT_REACHABLE_FIELD_IDS.size,
+      );
     });
   });
 });
