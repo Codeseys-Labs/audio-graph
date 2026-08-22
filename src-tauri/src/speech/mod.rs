@@ -195,15 +195,76 @@ impl DiarizationEventSink for TauriDiarizationEventSink<'_> {
     }
 }
 
+/// LOCK-ORDERING AUDIT (audio-graph-9b11): `emit_and_dispatch_diarization_span_revision`
+/// (the sole consumer of `transcript_ledger` on this context) acquires
+/// `transcript_ledger` alone, in its own scoped block, to derive a
+/// session-relative timestamp — then drops it BEFORE acquiring
+/// `speaker_timeline` and `knowledge_graph` (in that order, unchanged from the
+/// pre-existing dispatch). The three locks are therefore never held
+/// concurrently by this path: `transcript_ledger` -> (dropped) ->
+/// `speaker_timeline` -> `knowledge_graph`. This mirrors the discipline
+/// `commands.rs`'s `merge_graph_entities_impl` / `approve_agent_proposal_impl`
+/// established for the manual-write call sites (audio-graph-4b52): compute the
+/// ledger-derived timestamp in a scoped block, then take the graph lock
+/// separately.
+///
+/// IMPORTANT — `lock_current_session_generation` is NOT an example of that
+/// standalone/scoped-and-dropped discipline; do not extend this audit's
+/// "every other ledger site drops it first" claim to it. It deliberately
+/// *returns* the live `transcript_ledger` `MutexGuard` (see its own doc
+/// comment), and `apply_extraction_result_if_current` binds that guard as
+/// `_generation_guard` and holds it across a subsequent `knowledge_graph.lock()`
+/// — a real, permanent `transcript_ledger` -> `knowledge_graph` nesting on the
+/// extraction-commit path. That nesting happens to be the SAME direction as
+/// this dispatch path (ledger acquired-and-released before graph), so it does
+/// not create a cycle with this function. But it does mean the reverse order
+/// — `knowledge_graph` or `speaker_timeline` acquired first, `transcript_ledger`
+/// second — is permanently forbidden anywhere in this codebase, not merely
+/// avoided on this dispatch path: taking it would deadlock against
+/// `apply_extraction_result_if_current`'s held ledger guard. Verified by
+/// grepping every `transcript_ledger` / `speaker_timeline` / `knowledge_graph`
+/// lock site in `commands.rs`, `speech/mod.rs`, `state.rs`,
+/// `persistence/mod.rs`, and `speech/tests_integration.rs`: no site anywhere
+/// acquires `knowledge_graph`/`speaker_timeline` first and `transcript_ledger`
+/// second, so this new order cannot invert an existing one.
 struct DiarizationDispatchContext<'a, E: DiarizationEventSink + ?Sized> {
     event_sink: &'a E,
     speaker_timeline: &'a Arc<Mutex<SpeakerTimeline>>,
     knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: &'a Arc<RwLock<GraphSnapshot>>,
+    /// Anchor source for converting the live diarization retcon's wall-clock
+    /// receipt time into the graph's session-relative-seconds clock, via
+    /// `TranscriptLedger::session_relative_timestamp` (audio-graph-9b11, same
+    /// bug class/fix as audio-graph-4b52's manual-write call sites). Locked
+    /// standalone and dropped before `speaker_timeline`/`knowledge_graph` — see
+    /// the lock-ordering audit above.
+    transcript_ledger: &'a Arc<Mutex<TranscriptLedger>>,
     /// Session the accepted revision is durably appended under, so a live
     /// speaker relabel survives reload and can be replayed into a
     /// `SpeakerTimeline` (ADR-0025 §2b / ADR-0026 §3 cross-reload retcon).
     session_id: &'a str,
+}
+
+/// Best available anchor id for `TranscriptLedger::session_relative_timestamp`
+/// from a diarization span revision's own basis references (audio-graph-9b11).
+///
+/// Prefers the first `basis_asr_span_ids` entry: it maps 1:1 onto the ledger's
+/// `TranscriptEvent::span_id` (the field every recorded ASR span revision sets
+/// unconditionally), so it is the more reliable exact-match candidate.
+/// `basis_transcript_segment_ids` is the fallback — it maps onto
+/// `TranscriptEvent::transcript_segment_id`, an `Option` that a partial-revision
+/// producer can leave unset. When a revision carries neither (e.g. the
+/// clustering backend's provisional spans, which have no ASR basis at all),
+/// this returns `""`, which resolves through `session_relative_timestamp`'s own
+/// any-span / `0.0` fallback tiers rather than forcing that fallback
+/// unconditionally the way an always-empty anchor would.
+fn diarization_revision_anchor_id(revision: &DiarizationSpanRevision) -> &str {
+    revision
+        .basis_asr_span_ids
+        .first()
+        .or_else(|| revision.basis_transcript_segment_ids.first())
+        .map(String::as_str)
+        .unwrap_or("")
 }
 
 fn millis_from_secs(value: f64) -> i64 {
@@ -443,6 +504,38 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
 
     let revision = DiarizationSpanRevision::from(payload);
 
+    // Convert the wall-clock receipt time into the graph's session-relative-
+    // seconds clock (audio-graph-9b11, same bug class as audio-graph-4b52):
+    // left as raw epoch seconds, a live retcon's re-pointed edge would always
+    // be the graph's maximum `valid_from` and could never be evicted. Locked
+    // standalone and dropped BEFORE `speaker_timeline`/`knowledge_graph` below
+    // — see the lock-ordering audit on `DiarizationDispatchContext`.
+    //
+    // Deliberate trade-off: this locks `transcript_ledger` and runs
+    // `session_relative_timestamp`'s scan over `latest_spans` on EVERY
+    // revision, even the common case where no remap fires and `timestamp` is
+    // never read (dispatch below only consumes it inside the `Some(remap)`
+    // branch). Deferring the lookup until a remap is known would require
+    // taking `transcript_ledger` *after* `speaker_timeline`/`knowledge_graph`
+    // are already held — the exact reverse-order acquisition the audit above
+    // documents as permanently forbidden (it would deadlock against
+    // `apply_extraction_result_if_current`'s held ledger guard). So the ledger
+    // lock stays up-front and unconditional; it is intentionally paid on
+    // every revision to keep the lock order fixed, not an oversight.
+    let timestamp = {
+        let ledger = match dispatch_ctx.transcript_ledger.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("Transcript ledger mutex poisoned; recovering");
+                poisoned.into_inner()
+            }
+        };
+        ledger.session_relative_timestamp(
+            diarization_revision_anchor_id(&revision),
+            current_unix_millis(),
+        )
+    };
+
     let (outcome, delta, snapshot) = {
         let mut timeline = match dispatch_ctx.speaker_timeline.lock() {
             Ok(guard) => guard,
@@ -462,7 +555,7 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
             &mut timeline,
             &mut graph,
             revision.clone(),
-            current_unix_millis() as f64 / 1000.0,
+            timestamp,
         );
         if outcome.retcon_fired {
             let delta = graph.has_delta().then(|| graph.take_delta());
@@ -1210,6 +1303,7 @@ pub(crate) fn maybe_spawn_clustering_diarization(
     speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     session_id: String,
 ) -> Option<ClusteringDiarizationHandle> {
     use crate::diarization::DiarizationBackend;
@@ -1267,6 +1361,7 @@ pub(crate) fn maybe_spawn_clustering_diarization(
                     speaker_timeline,
                     knowledge_graph,
                     graph_snapshot,
+                    transcript_ledger,
                     spans,
                     session_id,
                 );
@@ -1323,6 +1418,7 @@ fn run_clustering_emit_loop(
     speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
     session_id: String,
 ) {
@@ -1335,6 +1431,7 @@ fn run_clustering_emit_loop(
         speaker_timeline: &speaker_timeline,
         knowledge_graph: &knowledge_graph,
         graph_snapshot: &graph_snapshot,
+        transcript_ledger: &transcript_ledger,
         session_id: &session_id,
     };
     log::info!("Clustering diarization emit loop: entering");
@@ -3131,6 +3228,7 @@ fn emit_transcript_and_extract_with_meta(
         speaker_timeline: &ctx.speaker_timeline,
         knowledge_graph: &ctx.knowledge_graph,
         graph_snapshot: &ctx.graph_snapshot,
+        transcript_ledger: &ctx.transcript_ledger,
         session_id: &diarization_session_id,
     };
     emit_diarization_span_revision_for_transcript(
@@ -3471,6 +3569,7 @@ fn emit_assemblyai_speaker_revision(
         speaker_timeline: &ctx.speaker_timeline,
         knowledge_graph: &ctx.knowledge_graph,
         graph_snapshot: &ctx.graph_snapshot,
+        transcript_ledger: &ctx.transcript_ledger,
         session_id: &diarization_session_id,
     };
     emit_assemblyai_speaker_revision_with_dispatch(
@@ -4700,6 +4799,7 @@ fn run_asr_worker(
         shared.speaker_timeline.clone(),
         shared.knowledge_graph.clone(),
         shared.graph_snapshot.clone(),
+        shared.transcript_ledger.clone(),
         shared.projection_runtime.current_session_id(),
     );
 
@@ -4982,6 +5082,7 @@ pub(crate) fn run_speech_processor_diarization_only(
         shared.speaker_timeline.clone(),
         shared.knowledge_graph.clone(),
         shared.graph_snapshot.clone(),
+        shared.transcript_ledger.clone(),
         shared.projection_runtime.current_session_id(),
     );
 
@@ -5192,6 +5293,7 @@ pub(crate) fn run_speech_processor_diarization_only(
             speaker_timeline: &shared.speaker_timeline,
             knowledge_graph: &shared.knowledge_graph,
             graph_snapshot: &shared.graph_snapshot,
+            transcript_ledger: &shared.transcript_ledger,
             session_id: &diarization_session_id,
         };
         emit_diarization_span_revision_for_transcript(
@@ -9320,6 +9422,7 @@ mod tests_status {
             speaker_timeline: &app.speaker_timeline,
             knowledge_graph: &app.knowledge_graph,
             graph_snapshot: &app.graph_snapshot,
+            transcript_ledger: &app.transcript_ledger,
             session_id,
         };
 
@@ -9457,6 +9560,7 @@ mod tests_status {
             speaker_timeline: &app.speaker_timeline,
             knowledge_graph: &app.knowledge_graph,
             graph_snapshot: &app.graph_snapshot,
+            transcript_ledger: &app.transcript_ledger,
             session_id,
         };
 
@@ -9564,6 +9668,433 @@ mod tests_status {
         assert_eq!(
             replayed_via_trait.latest_spans[0].speaker_label.as_deref(),
             Some("Alice")
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a ledger-seeding ASR span with a given `span_id`/`start_time`/
+    /// `received_at_ms`, otherwise filled with arbitrary-but-valid fields.
+    /// Mirrors the fixtures `graph/temporal.rs` and `commands.rs` used to pin
+    /// audio-graph-4b52.
+    fn diarization_test_asr_span(
+        span_id: &str,
+        start_time: f64,
+        received_at_ms: u64,
+    ) -> events::AsrSpanRevisionPayload {
+        events::AsrSpanRevisionPayload {
+            span_id: span_id.to_string(),
+            provider: "system".to_string(),
+            source_id: "mic".to_string(),
+            provider_item_id: None,
+            transcript_segment_id: Some(format!("{span_id}-segment")),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text: "hello".to_string(),
+            start_time,
+            end_time: start_time + 1.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: events::AsrSpanStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms,
+        }
+    }
+
+    /// A provisional-then-relabel pair of diarization span revisions citing
+    /// `basis_asr_span_ids: [anchor_span_id]`, mirroring the shape
+    /// `emit_diarization_span_revision_for_transcript` /
+    /// `emit_assemblyai_speaker_revision_with_dispatch` build in production
+    /// (audio-graph-9b11).
+    fn diarization_relabel_pair(
+        span_id: &str,
+        anchor_span_id: &str,
+        start_time: f64,
+        provisional_label: &str,
+        canonical_label: &str,
+    ) -> (
+        events::DiarizationSpanRevisionPayload,
+        events::DiarizationSpanRevisionPayload,
+    ) {
+        let provisional = events::DiarizationSpanRevisionPayload {
+            span_id: span_id.to_string(),
+            provider: "local_clustering".to_string(),
+            timeline_id: "session".to_string(),
+            source_id: None,
+            speaker_id: Some(provisional_label.to_lowercase()),
+            speaker_label: Some(provisional_label.to_string()),
+            channel: None,
+            start_time,
+            end_time: start_time + 1.0,
+            confidence: Some(0.7),
+            is_final: false,
+            stability: DiarizationSpanStability::Provisional,
+            revision_number: 1,
+            supersedes: None,
+            basis_asr_span_ids: vec![anchor_span_id.to_string()],
+            basis_transcript_segment_ids: Vec::new(),
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: current_unix_millis(),
+        };
+        let relabel = events::DiarizationSpanRevisionPayload {
+            speaker_id: Some(canonical_label.to_lowercase()),
+            speaker_label: Some(canonical_label.to_string()),
+            confidence: Some(0.95),
+            is_final: true,
+            stability: DiarizationSpanStability::Stable,
+            revision_number: 2,
+            supersedes: Some(revision_ref(span_id, 1)),
+            received_at_ms: current_unix_millis(),
+            ..provisional.clone()
+        };
+        (provisional, relabel)
+    }
+
+    /// Seed `graph` with a provisional speaker node ("Speaker 2") related to
+    /// "Acme", plus an already-known canonical identity ("Alice") — the same
+    /// shape `assemblyai_speaker_revision_emission_retcons_graph_on_label_remap`
+    /// and `graph/temporal.rs`'s audio-graph-4b52 tests use, so a diarization
+    /// relabel of "Speaker 2" -> "Alice" retcons exactly one edge.
+    fn seed_provisional_speaker_graph(graph: &mut crate::graph::temporal::TemporalKnowledgeGraph) {
+        use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+        graph.process_extraction(
+            &ExtractionResult {
+                entities: vec![
+                    ExtractedEntity {
+                        name: "Speaker 2".to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                    ExtractedEntity {
+                        name: "Acme".to_string(),
+                        entity_type: "Organization".to_string(),
+                        description: None,
+                    },
+                    ExtractedEntity {
+                        name: "Alice".to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                ],
+                relations: vec![ExtractedRelation {
+                    source: "Speaker 2".to_string(),
+                    target: "Acme".to_string(),
+                    relation_type: "works_at".to_string(),
+                    detail: None,
+                }],
+            },
+            1.0,
+            "Speaker 2",
+            "seg-1",
+        );
+        let _ = graph.take_delta();
+    }
+
+    /// audio-graph-9b11 acceptance (fix for the bug the 4b52 fix escalated):
+    /// a live diarization relabel dispatched through
+    /// `emit_and_dispatch_diarization_span_revision` must call
+    /// `supersede_entity` with a SESSION-RELATIVE timestamp derived from the
+    /// revision's own `basis_asr_span_ids` anchor via
+    /// `TranscriptLedger::session_relative_timestamp` — not raw
+    /// `current_unix_millis() as f64 / 1000.0` (epoch scale). Master's bug:
+    /// left as epoch seconds, the re-pointed edge's `valid_from` is always the
+    /// graph's maximum, so `evict_excess_edges`'s `min_by` (graph/temporal.rs)
+    /// can never select it for eviction — immortal.
+    ///
+    /// The ledger is seeded with TWO spans: a DECOY sorted first (very
+    /// negative `start_time`, so `.first()`-style fallback would land far from
+    /// the truth) and the EXACT anchor the revision cites via
+    /// `basis_asr_span_ids`. This is deliberate: if the wiring ever regresses
+    /// to passing `""` (or otherwise drops the revision's own anchor id)
+    /// instead of `diarization_revision_anchor_id(&revision)`, the result
+    /// silently lands on the decoy instead of failing to compile — this test
+    /// is what catches that class of regression.
+    #[test]
+    fn live_diarization_retcon_writes_session_relative_valid_from() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("live-diarization-retcon-session-relative");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let event_sink = RecordingDiarizationEventSink::default();
+        let session_id = "live-diarization-retcon-session-relative";
+        let diarization_dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &app.speaker_timeline,
+            knowledge_graph: &app.knowledge_graph,
+            graph_snapshot: &app.graph_snapshot,
+            transcript_ledger: &app.transcript_ledger,
+            session_id,
+        };
+
+        let anchor_span_id = "asr-span-anchor";
+        {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Decoy: sorts first (very negative start_time) and is NOT what the
+            // revision cites.
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    diarization_test_asr_span("decoy-span", -500.0, 1_800_000_000_000),
+                ))
+                .expect("seed decoy span");
+            // The exact anchor the revision's `basis_asr_span_ids` cites: 5s
+            // into the session, recorded "now" so the wall-clock offset to
+            // `current_unix_millis()` at dispatch time stays tiny.
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    diarization_test_asr_span(anchor_span_id, 5.0, current_unix_millis()),
+                ))
+                .expect("seed exact-anchor span");
+        }
+
+        {
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            seed_provisional_speaker_graph(&mut graph);
+        }
+
+        let (provisional, relabel) = diarization_relabel_pair(
+            "diarization-span-1",
+            anchor_span_id,
+            5.0,
+            "Speaker 2",
+            "Alice",
+        );
+        let first = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, provisional);
+        assert!(first.accepted);
+        assert!(
+            !first.retcon_fired,
+            "first-seen provisional should not retcon"
+        );
+
+        let second = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, relabel);
+        assert!(second.accepted);
+        assert!(second.retcon_fired);
+        assert_eq!(second.edges_retconned, 1);
+
+        let live_from = app
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_edge_valid_from_for_test("Alice", "Acme", "works_at")
+            .expect("the re-pointed live edge should exist");
+        assert!(
+            (live_from - 5.0).abs() < 5.0,
+            "expected session-relative seconds near the exact anchor's \
+             start_time (5.0), got {live_from} (looks like raw epoch seconds \
+             leaked through, or the decoy span was used instead of the \
+             revision's own basis_asr_span_ids anchor)"
+        );
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-9b11: the SAME bug class/fix as
+    /// `graph/temporal.rs`'s `supersede_entity_repointed_edge_evicts_on_same_terms_as_live_path_edge`
+    /// (audio-graph-4b52), but proven through the LIVE diarization-dispatch
+    /// entry point instead of a direct `supersede_entity` call — this is what
+    /// actually exercises the `DiarizationDispatchContext` wiring under test,
+    /// not just the ledger helper it calls into.
+    #[test]
+    fn live_diarization_retcon_edge_evicts_on_same_terms_as_live_path_edge() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("live-diarization-retcon-edge-eviction");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let event_sink = RecordingDiarizationEventSink::default();
+        let session_id = "live-diarization-retcon-edge-eviction";
+        let diarization_dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &app.speaker_timeline,
+            knowledge_graph: &app.knowledge_graph,
+            graph_snapshot: &app.graph_snapshot,
+            transcript_ledger: &app.transcript_ledger,
+            session_id,
+        };
+
+        let anchor_span_id = "asr-span-anchor";
+        {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    diarization_test_asr_span(anchor_span_id, 5.0, current_unix_millis()),
+                ))
+                .expect("seed exact-anchor span");
+        }
+
+        {
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            seed_provisional_speaker_graph(&mut graph);
+        }
+
+        let (provisional, relabel) = diarization_relabel_pair(
+            "diarization-span-1",
+            anchor_span_id,
+            5.0,
+            "Speaker 2",
+            "Alice",
+        );
+        let first = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, provisional);
+        assert!(first.accepted);
+        let second = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, relabel);
+        assert!(second.accepted);
+        assert_eq!(second.edges_retconned, 1);
+
+        // Fill the graph with MAX_EDGES more live-path edges between the SAME
+        // two surviving nodes (distinct relation types, so each is a new edge
+        // rather than a weight-fold), each newer (larger `valid_from`) than
+        // the retcon timestamp (~5.0), to push the graph past the eviction
+        // threshold — mirrors `graph/temporal.rs`'s
+        // `supersede_entity_repointed_edge_evicts_on_same_terms_as_live_path_edge`.
+        {
+            use crate::graph::entities::{ExtractedRelation, ExtractionResult};
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..crate::graph::temporal::MAX_EDGES {
+                graph.process_extraction(
+                    &ExtractionResult {
+                        entities: vec![],
+                        relations: vec![ExtractedRelation {
+                            source: "Alice".to_string(),
+                            target: "Acme".to_string(),
+                            relation_type: format!("filler-{i}"),
+                            detail: None,
+                        }],
+                    },
+                    100.0 + i as f64,
+                    "spk",
+                    &format!("seg-live-{i}"),
+                );
+            }
+        }
+
+        let graph = app
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            graph
+                .live_edge_valid_from_for_test("Alice", "Acme", "works_at")
+                .is_none(),
+            "the live-retconned edge must be evictable on the same terms as a \
+             live-path edge, not immortal under epoch-scale timestamps"
+        );
+        assert_eq!(graph.edge_count(), crate::graph::temporal::MAX_EDGES);
+        drop(graph);
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-9b11 design care: when a live diarization revision cites a
+    /// span/segment id that is NOT in the ledger (ledger rotation race, or a
+    /// revision producer whose basis ids never made it into the ledger), the
+    /// wiring must fall through to `session_relative_timestamp`'s any-span
+    /// fallback tier — landing near whatever span IS in the ledger — rather
+    /// than silently degrading to epoch seconds or panicking. This pins that
+    /// fallback behavior for the live dispatch path specifically (the ledger
+    /// helper's own fallback tiers are already unit-tested in
+    /// `projections.rs`).
+    #[test]
+    fn live_diarization_retcon_falls_back_to_any_span_anchor_when_cited_span_is_absent() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("live-diarization-retcon-fallback-anchor");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let event_sink = RecordingDiarizationEventSink::default();
+        let session_id = "live-diarization-retcon-fallback-anchor";
+        let diarization_dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &app.speaker_timeline,
+            knowledge_graph: &app.knowledge_graph,
+            graph_snapshot: &app.graph_snapshot,
+            transcript_ledger: &app.transcript_ledger,
+            session_id,
+        };
+
+        // The ledger has exactly one span, 9s into the session — but the
+        // revision below cites a DIFFERENT span id that never made it into
+        // the ledger.
+        {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    diarization_test_asr_span(
+                        "the-only-span-in-the-ledger",
+                        9.0,
+                        current_unix_millis(),
+                    ),
+                ))
+                .expect("seed the only span");
+        }
+
+        {
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            seed_provisional_speaker_graph(&mut graph);
+        }
+
+        let (provisional, relabel) = diarization_relabel_pair(
+            "diarization-span-1",
+            "span-id-never-recorded-in-the-ledger",
+            9.0,
+            "Speaker 2",
+            "Alice",
+        );
+        let first = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, provisional);
+        assert!(first.accepted);
+        let second = emit_and_dispatch_diarization_span_revision(&diarization_dispatch, relabel);
+        assert!(second.accepted);
+        assert_eq!(second.edges_retconned, 1);
+
+        let live_from = app
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_edge_valid_from_for_test("Alice", "Acme", "works_at")
+            .expect("the re-pointed live edge should exist");
+        assert!(
+            (live_from - 9.0).abs() < 5.0,
+            "expected the any-span fallback anchor's start_time (9.0), got \
+             {live_from} (should fall back to the one span in the ledger, \
+             not 0.0 / a panic / epoch seconds)"
         );
 
         drain_app_writers(&app);

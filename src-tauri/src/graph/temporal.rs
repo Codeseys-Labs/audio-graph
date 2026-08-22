@@ -45,7 +45,12 @@ pub struct TemporalEdge {
 const MAX_NODES: usize = 1000;
 
 /// Maximum number of edges before eviction of oldest (lowest `valid_from`).
-const MAX_EDGES: usize = 5000;
+///
+/// `pub(crate)` (widened from private for audio-graph-9b11) so the live
+/// diarization-dispatch eviction regression test in `speech/mod.rs` can drive
+/// the real threshold instead of duplicating it as a second magic number that
+/// could silently drift out of sync with this one.
+pub(crate) const MAX_EDGES: usize = 5000;
 
 /// A temporal knowledge graph backed by petgraph's StableGraph.
 pub struct TemporalKnowledgeGraph {
