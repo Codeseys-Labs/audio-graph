@@ -1863,6 +1863,22 @@ pub struct MaterializedGraph {
     pub last_sequence: u64,
     pub nodes: Vec<MaterializedGraphNode>,
     pub edges: Vec<MaterializedGraphEdge>,
+    /// Raw model-supplied node id -> the id `upsert_node` ACTUALLY landed it
+    /// on, for every redirection ever observed across THIS graph's whole
+    /// history (audio-graph-e700 replay-compatibility fix). Unlike the
+    /// per-`apply_patch` `id_overrides` local used while an operation list is
+    /// being processed, this map is a field on the graph itself: it is
+    /// carried forward by `apply_patch` (`next = self.clone()` copies it,
+    /// `*self = next` commits it) so a LATER, SEPARATE patch — including one
+    /// replayed from an empty graph on session reload — can still resolve a
+    /// raw id that an EARLIER patch's upsert redirected elsewhere (e.g. a
+    /// fuzzy cross-id name merge). See `resolve_graph_node_id`'s doc comment
+    /// for the full resolution order and why a literal existing row always
+    /// takes priority over an entry here. Never pruned; only ever grows,
+    /// which is safe because every key is a short model-invented id string,
+    /// not transcript content.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub id_aliases: BTreeMap<String, String>,
 }
 
 impl fmt::Debug for MaterializedGraph {
@@ -1876,6 +1892,7 @@ impl fmt::Debug for MaterializedGraph {
             .field("last_sequence", &self.last_sequence)
             .field("nodes", &nodes)
             .field("edges", &edges)
+            .field("id_aliases", &self.id_aliases)
             .finish()
     }
 }
@@ -1890,6 +1907,7 @@ impl MaterializedGraph {
             last_sequence: 0,
             nodes: Vec::new(),
             edges: Vec::new(),
+            id_aliases: BTreeMap::new(),
         }
     }
 
@@ -1914,6 +1932,24 @@ impl MaterializedGraph {
         }
 
         let mut next = self.clone();
+        // Raw model id -> the id it was ACTUALLY persisted under, for THIS
+        // patch only (seed audio-graph-e700 sub-fixes 2/3). `upsert_node`
+        // may land a fresh `UpsertGraphNode` on a DIFFERENT id than the one
+        // the model supplied — either because it merged into an existing
+        // near-duplicate entity found by name, or because the model's raw id
+        // collided with an unrelated existing node and had to be
+        // disambiguated (see `upsert_node`'s doc comment). Every OTHER
+        // node-id-bearing operation in this SAME patch resolves through this
+        // map FIRST — it always wins over `next.id_aliases` below, because it
+        // reflects what THIS patch itself just did, which must take priority
+        // over any older redirection history (audio-graph-e700 blocker-class
+        // fix: without this, a same-patch reference right after a displaced
+        // upsert would incorrectly fall through to a stale cross-patch
+        // alias, or to a pre-existing unrelated node that happens to still
+        // literally own the raw id). Local to one `apply_patch` call, never
+        // stored on `self`.
+        let mut id_overrides: BTreeMap<String, String> = BTreeMap::new();
+
         for operation in &patch.operations {
             match operation {
                 ProjectionOperation::UpsertGraphNode {
@@ -1922,22 +1958,39 @@ impl MaterializedGraph {
                     entity_type,
                     description,
                     evidence,
-                } => next.upsert_node(
-                    id,
-                    name,
-                    entity_type,
-                    description.clone(),
-                    evidence,
-                    evidence_basis,
-                    patch,
-                ),
+                } => {
+                    let final_id = next.upsert_node(
+                        id,
+                        name,
+                        entity_type,
+                        description.clone(),
+                        evidence,
+                        evidence_basis,
+                        patch,
+                    );
+                    if final_id != *id {
+                        id_overrides.insert(id.clone(), final_id.clone());
+                        // Persisted across patches too (audio-graph-e700
+                        // replay-compatibility fix), so a LATER, SEPARATE
+                        // patch that references this same raw id — including
+                        // one replayed from an empty graph on session reload
+                        // — can still resolve it instead of hard-erroring.
+                        // See `resolve_graph_node_id`'s doc comment for why a
+                        // literal existing row always takes priority over
+                        // this entry, so it never overrides a legitimate
+                        // stable-id reuse.
+                        next.id_aliases.insert(id.clone(), final_id);
+                    }
+                }
                 ProjectionOperation::RemoveGraphNode { id } => {
-                    next.nodes.retain(|node| node.id != *id);
+                    let id = resolve_graph_node_id(&next, &id_overrides, id);
+                    next.nodes.retain(|node| node.id != id);
                     next.edges
-                        .retain(|edge| edge.source != *id && edge.target != *id);
+                        .retain(|edge| edge.source != id && edge.target != id);
                 }
                 ProjectionOperation::InvalidateGraphNode { id } => {
-                    next.invalidate_node(id, patch)?;
+                    let id = resolve_graph_node_id(&next, &id_overrides, id);
+                    next.invalidate_node(&id, patch)?;
                 }
                 ProjectionOperation::UpsertGraphEdge {
                     id,
@@ -1948,22 +2001,24 @@ impl MaterializedGraph {
                     weight,
                     evidence,
                 } => {
-                    if !next.has_active_node(source) {
+                    let source = resolve_graph_node_id(&next, &id_overrides, source);
+                    let target = resolve_graph_node_id(&next, &id_overrides, target);
+                    if !next.has_active_node(&source) {
                         return Err(ProjectionApplyError::MissingGraphNode {
                             edge_id: id.clone(),
-                            node_id: source.clone(),
+                            node_id: source,
                         });
                     }
-                    if !next.has_active_node(target) {
+                    if !next.has_active_node(&target) {
                         return Err(ProjectionApplyError::MissingGraphNode {
                             edge_id: id.clone(),
-                            node_id: target.clone(),
+                            node_id: target,
                         });
                     }
                     next.upsert_edge(
                         id,
-                        source,
-                        target,
+                        &source,
+                        &target,
                         relation_type,
                         label.clone(),
                         *weight,
@@ -1988,13 +2043,32 @@ impl MaterializedGraph {
                     source_id,
                     target_id,
                 } => {
-                    next.merge_nodes(source_id, target_id, patch)?;
+                    let source_id = resolve_graph_node_id(&next, &id_overrides, source_id);
+                    let target_id = resolve_graph_node_id(&next, &id_overrides, target_id);
+                    // A merge whose two ends resolve to the SAME node is a
+                    // no-op, not an error (audio-graph-e700
+                    // replay-compatibility fix): a model naturally emits
+                    // `upsert n1; upsert n7 (fuzzy-absorbed into n1);
+                    // merge_graph_nodes(source: n7, target: n1)` in one
+                    // patch to explicitly reconcile the near-duplicate it
+                    // just created — `upsert_node` already unified them, so
+                    // there is nothing left to merge. Erroring here would
+                    // reject the WHOLE patch (this operation runs inside the
+                    // same all-or-nothing `next`) for a redundant-but-benign
+                    // operation, exactly the automatic-blocker class this
+                    // ticket forbids. Mirrors the TS
+                    // `applyProjectionGraphPatch`'s existing
+                    // `sourceId === targetId` no-op guard.
+                    if source_id != target_id {
+                        next.merge_nodes(&source_id, &target_id, patch)?;
+                    }
                 }
                 ProjectionOperation::SplitGraphNode {
                     id,
                     replacement_nodes,
                 } => {
-                    next.split_node(id, replacement_nodes, patch)?;
+                    let id = resolve_graph_node_id(&next, &id_overrides, id);
+                    next.split_node(&id, replacement_nodes, patch)?;
                 }
                 ProjectionOperation::UpsertNote { .. }
                 | ProjectionOperation::DeleteNote { .. }
@@ -2018,6 +2092,67 @@ impl MaterializedGraph {
             .any(|node| node.id == id && node.valid_until_ms.is_none())
     }
 
+    /// Upsert a graph node, returning the id it was ACTUALLY persisted under
+    /// (seed audio-graph-e700 sub-fixes 2 and 3).
+    ///
+    /// Before this change, this matched purely on the model-supplied `id`
+    /// (`self.nodes.iter_mut().find(|node| node.id == id)`), which is what
+    /// let two unrelated projection ticks that both happened to invent id
+    /// `"node1"` silently overwrite each other's node under one shared id —
+    /// the field evidence behind this ticket measured 54 of 155 persisted
+    /// node ids carrying more than one distinct name across one session.
+    /// Identity now resolves by NAME (via [`fuzzy_entity_name_match`]), in
+    /// three tiers:
+    ///
+    /// 1. A node — ACTIVE or already invalidated — already has this exact
+    ///    `id`, and its name still matches `name`. Update it in place, keep
+    ///    the id, and RESURRECT it (clear `valid_until_ms`) if it was
+    ///    invalidated. Covers both the common "stable id, refined over
+    ///    later ticks" case (see `projection_llm`'s
+    ///    `later_graph_context_can_update_stable_node_id` test) and the
+    ///    "invalidate, then re-upsert the same entity under the same id"
+    ///    case a pre-e700 accepted log may depend on for replay (the old
+    ///    code matched purely on id regardless of active status, so it
+    ///    always resurrected in place; requiring ACTIVE here — as an
+    ///    earlier version of this fix did — mints a needless disambiguated
+    ///    id instead and can make a later patch's raw-id reference to this
+    ///    same entity hard-error on replay; audio-graph-e700
+    ///    replay-compatibility fix). The name check still means an
+    ///    UNRELATED entity minted under this same (invalidated) id is never
+    ///    mistaken for the original — falls through to tier 2/3 instead.
+    /// 2. No id match (or the id match's name diverged too far to be the
+    ///    same entity — the collision case) — search ALL active nodes of
+    ///    the SAME `entity_type` for a name match anywhere. A hit means
+    ///    either a near-duplicate under a DIFFERENT raw id (sub-fix 3, e.g.
+    ///    "Postgres" / "PostgreSQL" minted under two different ids across
+    ///    ticks) or the collision case landing on its true owner. Update
+    ///    that node, keep ITS id. `apply_patch` records this redirection —
+    ///    raw `id` -> the final id returned here — in `self.id_aliases` so
+    ///    a LATER, separate patch that references the raw id by itself
+    ///    (an edge endpoint, an invalidate, a merge...) can still resolve it
+    ///    instead of hard-erroring (see `resolve_graph_node_id`).
+    /// 3. No match anywhere — a genuinely new entity. Use `id` verbatim
+    ///    UNLESS some other node (active or already invalidated) already
+    ///    owns that exact literal id with a name that never matched it —
+    ///    then mint a disambiguated id ([`Self::disambiguated_new_node_id`])
+    ///    so two distinct entities never share one persisted row.
+    ///
+    /// `entity_type` is compared case-insensitively but otherwise exactly as
+    /// given — never the ontology-canonicalized form — because this method
+    /// also runs unmodified against pre-audio-graph-e700 replay data, which
+    /// may carry inconsistent free-string types the fresh-ingest normalizer
+    /// (`projection_llm::normalize_projection_patch_draft_ontology`) never
+    /// touched.
+    ///
+    /// DISCLOSED TRADE-OFF: a same-id rename whose new name falls OUTSIDE
+    /// [`fuzzy_entity_name_match`]'s window (e.g. `"Roadmap"` ->
+    /// `"Q3 Roadmap"`, or `"Alice"` -> `"Alice Smith"`) fails tier 1 on the
+    /// name check and, finding no other match, forks a visible duplicate
+    /// under a disambiguated id at tier 3 instead of updating in place —
+    /// this method does NOT preserve every pre-e700 same-id update pattern,
+    /// only ones whose name still fuzzy-matches. Accepted against the
+    /// collision bug this whole function exists to fix; pinned by
+    /// `same_id_rename_beyond_the_fuzzy_window_forks_a_disambiguated_duplicate`.
     #[allow(clippy::too_many_arguments)]
     fn upsert_node(
         &mut self,
@@ -2028,9 +2163,26 @@ impl MaterializedGraph {
         evidence: &crate::claim_evidence::EvidenceAnchor,
         evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
         patch: &ProjectionPatch,
-    ) {
+    ) -> String {
+        let same_id_match = self
+            .nodes
+            .iter()
+            .position(|node| node.id == id && fuzzy_entity_name_match(&node.name, name));
+        let target_index = same_id_match.or_else(|| {
+            self.nodes.iter().position(|node| {
+                node.valid_until_ms.is_none()
+                    && node.entity_type.eq_ignore_ascii_case(entity_type)
+                    && fuzzy_entity_name_match(&node.name, name)
+            })
+        });
+
+        let final_id = match target_index {
+            Some(index) => self.nodes[index].id.clone(),
+            None => self.disambiguated_new_node_id(id),
+        };
+
         let next = MaterializedGraphNode {
-            id: id.to_string(),
+            id: final_id.clone(),
             name: name.to_string(),
             entity_type: entity_type.to_string(),
             description,
@@ -2044,10 +2196,34 @@ impl MaterializedGraph {
             evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
 
-        if let Some(existing) = self.nodes.iter_mut().find(|node| node.id == id) {
-            *existing = next;
-        } else {
-            self.nodes.push(next);
+        match target_index {
+            Some(index) => self.nodes[index] = next,
+            None => self.nodes.push(next),
+        }
+
+        final_id
+    }
+
+    /// Mint a collision-free id for a genuinely new node when the model's
+    /// raw `id` is already owned by a DIFFERENT entity — any node, active or
+    /// already invalidated, ever recorded under that literal string (the
+    /// audio-graph-e700 field bug: two ticks independently invented the same
+    /// generic id, e.g. `"node1"`, for two unrelated entities). Deterministic
+    /// within one call: the first free `"{id}~2"`, `"{id}~3"`, ... suffix, so
+    /// replaying the same patch log always produces the same disambiguated
+    /// id — it depends on nothing but the graph's own existing id set, never
+    /// on wall-clock time or randomness.
+    fn disambiguated_new_node_id(&self, id: &str) -> String {
+        if !self.nodes.iter().any(|node| node.id == id) {
+            return id.to_string();
+        }
+        let mut suffix: u64 = 2;
+        loop {
+            let candidate = format!("{id}~{suffix}");
+            if !self.nodes.iter().any(|node| node.id == candidate) {
+                return candidate;
+            }
+            suffix += 1;
         }
     }
 
@@ -2828,6 +3004,162 @@ pub(crate) fn resolve_claim_evidence_basis_events(
                 })
         })
         .collect()
+}
+
+/// Resolve a node id referenced by a graph operation (edge endpoint,
+/// invalidate/merge/split target, ...) to the id it should ACTUALLY be
+/// looked up under, in three tiers (audio-graph-e700 replay-compatibility
+/// fix):
+///
+/// 1. THIS patch's same-patch remap table (`id_overrides`, see
+///    `MaterializedGraph::apply_patch`'s doc comment) — always wins when
+///    present, since it reflects what THIS patch's own upsert JUST did,
+///    which must take priority over anything older.
+/// 2. A literal row under `id` in `graph.nodes` — active OR already
+///    invalidated. Once an id has its own row it never again means anything
+///    else, even if it is ALSO, separately, the source of a stale entry in
+///    `graph.id_aliases` recorded before that row existed. This is what
+///    keeps a legitimate stable-id reuse across ticks (tier 1 of
+///    `upsert_node`) and the disclosed "first owner wins" semantics after a
+///    same-id-different-name collision working exactly as before.
+/// 3. `graph.id_aliases`, followed to its end (bounded by the map's own
+///    size, so a cycle can never loop forever): the persistent, cross-patch
+///    record of every raw id `upsert_node` ever redirected to a DIFFERENT
+///    final id. This is the tier that makes a pre-e700 accepted log (or a
+///    fresh session) replay/apply without error when an EARLIER patch's
+///    fuzzy name merge absorbed a raw id that has no row of its own, and a
+///    LATER, separate patch references that exact raw id.
+///
+/// Falls back to `id` verbatim when none of the above apply — the common
+/// case, and correct: an id that was never upserted at all should fail
+/// `has_active_node`/`active_node_index` exactly as it always has.
+fn resolve_graph_node_id(
+    graph: &MaterializedGraph,
+    id_overrides: &BTreeMap<String, String>,
+    id: &str,
+) -> String {
+    if let Some(overridden) = id_overrides.get(id) {
+        return overridden.clone();
+    }
+    if graph.nodes.iter().any(|node| node.id == id) {
+        return id.to_string();
+    }
+    let mut current = id.to_string();
+    for _ in 0..=graph.id_aliases.len() {
+        let Some(aliased) = graph.id_aliases.get(&current) else {
+            break;
+        };
+        if aliased == &current {
+            break;
+        }
+        current = aliased.clone();
+        if graph.nodes.iter().any(|node| node.id == current) {
+            break;
+        }
+    }
+    current
+}
+
+/// Minimum shared-prefix length ratio (shorter/longer, over the
+/// alphanumeric-only "fuzzy core" — [`fuzzy_entity_name_core`]) for two
+/// entity names to be treated as the same real-world entity purely from
+/// their spelling (seed audio-graph-e700 sub-fix 3).
+///
+/// Deliberately NOT the generic Jaro-Winkler threshold
+/// `graph::temporal::TemporalKnowledgeGraph::resolve_entity` uses — that
+/// algorithm is reused elsewhere in this codebase ONLY for
+/// human-supervised merges: every unsupervised production caller of
+/// `supersede_entity` (diarization retcon, projection-adjacent speaker
+/// merges) passes `threshold = 1.0` (exact-only); the one caller that
+/// accepts a lower threshold takes it from an explicit user action
+/// (`merge_graph_entities`), never runs it automatically. Plain Jaro-Winkler
+/// on full names scores dangerously high for exactly the pattern this
+/// ticket's field evidence describes — generic model-invented labels that
+/// share a long common stem and differ only in a trailing enumerator:
+/// measured `jaro_winkler("task 1", "task 2") = 0.933`,
+/// `jaro_winkler("decision 1", "decision 2") = 0.960`,
+/// `jaro_winkler("provider a", "provider b") = 0.960` — ALL at or above the
+/// `jaro_winkler("postgres", "postgresql") = 0.960` pair this sub-fix exists
+/// to catch. One global similarity threshold cannot separate those two
+/// classes.
+///
+/// The prefix+ratio rule below can, because same-length differing-suffix
+/// names (the dangerous class above) can never satisfy a literal prefix
+/// relationship on their alphanumeric core, while a genuine
+/// abbreviation/extension can: `"postgres"` (core len 8) is a true prefix of
+/// `"postgresql"` (core len 10), ratio 0.8; `"gpt-4"` (core `"gpt4"`, len 4)
+/// is a true prefix of `"gpt-4o"` (core `"gpt4o"`, len 5), ratio 0.8. 0.6 is
+/// calibrated so `"react"` / `"react native"` (core lens 5 / 11, ratio
+/// 0.45 — arguably different products) does NOT merge, while both measured
+/// examples above (ratio 0.8) do. `"acme corp"` / `"acme corporation"`
+/// (ratio 0.53) also stays unmerged at this threshold — an accepted false
+/// negative (two names stay separate that a human might consider the same
+/// org), which is the safe direction to be wrong in for an AUTOMATIC,
+/// unsupervised merge.
+const FUZZY_ENTITY_NAME_MIN_PREFIX_RATIO: f64 = 0.6;
+
+/// Case/whitespace-normalized name for EXACT-match comparisons: trim,
+/// collapse internal whitespace runs to a single space, lowercase.
+/// Punctuation is preserved at this tier — see [`fuzzy_entity_name_core`]
+/// for the looser tier that also strips it.
+fn normalized_entity_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Alphanumeric-only "core" of a name, used ONLY by the prefix/ratio fuzzy
+/// tier in [`fuzzy_entity_name_match`]. Stripping whitespace/punctuation
+/// entirely (not just collapsing it) is what makes `"OpenAI"` and `"Open
+/// AI"` resolve to the identical core `"openai"` — a legitimate
+/// near-duplicate this ticket's sub-fix 3 targets — without needing the
+/// prefix/ratio check at all.
+fn fuzzy_entity_name_core(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// True when `a` and `b` name the SAME real-world entity closely enough to
+/// merge automatically at projection-graph ingest (seed audio-graph-e700 sub-
+/// fixes 2 and 3: both the "same id, name drifted" tier and the "different
+/// id, near-duplicate name" tier in `MaterializedGraph::upsert_node` resolve
+/// through this one function, so they can never disagree about what counts
+/// as a match). See [`FUZZY_ENTITY_NAME_MIN_PREFIX_RATIO`]'s doc comment for
+/// why this is a deliberately narrower rule than generic Jaro-Winkler
+/// similarity.
+fn fuzzy_entity_name_match(a: &str, b: &str) -> bool {
+    if normalized_entity_name(a) == normalized_entity_name(b) {
+        return true;
+    }
+    let (core_a, core_b) = (fuzzy_entity_name_core(a), fuzzy_entity_name_core(b));
+    if core_a.is_empty() || core_b.is_empty() {
+        return false;
+    }
+    if core_a == core_b {
+        return true;
+    }
+    // Length in CHARS (Unicode scalar values), not bytes: the TS mirror
+    // (`fuzzyEntityNameCore`/`fuzzyEntityNameMatch` in
+    // `src/utils/materializedGraph.ts`) counts Unicode code points via
+    // `Array.from`, which has no byte-length equivalent in JS. Using byte
+    // length here would silently disagree with the frontend for any
+    // non-ASCII name — e.g. multi-byte-per-character scripts (CJK, Cyrillic,
+    // accented Latin) would get a DIFFERENT ratio in Rust than in TS for the
+    // identical pair of names, so the live incremental view and a replayed
+    // session could resolve node identity differently (audio-graph-e700).
+    let (len_a, len_b) = (core_a.chars().count(), core_b.chars().count());
+    let (shorter, longer, len_shorter, len_longer) = if len_a <= len_b {
+        (&core_a, &core_b, len_a, len_b)
+    } else {
+        (&core_b, &core_a, len_b, len_a)
+    };
+    if !longer.starts_with(shorter.as_str()) {
+        return false;
+    }
+    (len_shorter as f64 / len_longer as f64) >= FUZZY_ENTITY_NAME_MIN_PREFIX_RATIO
 }
 
 /// Re-judge one operation's untrusted [`EvidenceAnchor`](crate::claim_evidence::EvidenceAnchor)
@@ -4414,6 +4746,214 @@ mod tests {
             graph.edges.is_empty(),
             "removing a node should remove incident edges"
         );
+    }
+
+    /// seed audio-graph-e700 sub-fix 2 (UPSERT KEYING): two SEPARATE
+    /// projection ticks (jobs) that both independently invent the model id
+    /// `"node1"` for two UNRELATED entities must no longer silently collapse
+    /// into one node under that shared id — the field evidence behind this
+    /// ticket measured 54 of 155 persisted node ids carrying more than one
+    /// distinct name. Before this fix, `upsert_node` matched purely on `id`,
+    /// so the second tick's "Bob" would have overwritten the first tick's
+    /// "Alice" in place, losing "Alice" entirely.
+    #[test]
+    fn upsert_collision_same_model_id_different_names_does_not_merge() {
+        let mut graph = MaterializedGraph::new("session-1");
+        let first_tick = graph_patch(
+            1,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Alice".to_string(),
+                entity_type: "Person".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&first_tick, None)
+            .expect("first tick seed");
+
+        let second_tick = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Bob".to_string(),
+                entity_type: "Person".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&second_tick, None)
+            .expect("second tick, colliding raw id");
+
+        assert_eq!(
+            graph.nodes.len(),
+            2,
+            "colliding raw ids for two different names must produce two nodes, got: {:?}",
+            graph
+                .nodes
+                .iter()
+                .map(|n| (&n.id, &n.name))
+                .collect::<Vec<_>>()
+        );
+        let alice = graph
+            .nodes
+            .iter()
+            .find(|node| node.name == "Alice")
+            .expect("Alice survives the collision");
+        let bob = graph
+            .nodes
+            .iter()
+            .find(|node| node.name == "Bob")
+            .expect("Bob is inserted under a disambiguated id");
+        assert_ne!(
+            alice.id, bob.id,
+            "the two distinct entities must never share one persisted id"
+        );
+        assert_eq!(
+            alice.id, "node1",
+            "the first occupant keeps the raw model id"
+        );
+        assert_eq!(
+            bob.id, "node1~2",
+            "the colliding second entity gets a deterministic disambiguated id"
+        );
+        assert!(alice.valid_until_ms.is_none());
+        assert!(bob.valid_until_ms.is_none());
+    }
+
+    /// seed audio-graph-e700 sub-fix 3 (FUZZY RESOLUTION): "Postgres" and
+    /// "PostgreSQL" minted under two DIFFERENT model ids across two
+    /// projection ticks must merge into ONE node instead of forking, bounded
+    /// deterministically by [`fuzzy_entity_name_match`] (no LLM calls
+    /// involved).
+    #[test]
+    fn fuzzy_resolution_merges_near_duplicate_entity_names_across_ids() {
+        let mut graph = MaterializedGraph::new("session-1");
+        let first_tick = graph_patch(
+            1,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "product-1".to_string(),
+                name: "Postgres".to_string(),
+                entity_type: "Product".to_string(),
+                description: Some("A relational database.".to_string()),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&first_tick, None)
+            .expect("first tick seed");
+
+        let second_tick = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "product-7".to_string(),
+                name: "PostgreSQL".to_string(),
+                entity_type: "Product".to_string(),
+                description: Some("Open-source object-relational database.".to_string()),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&second_tick, None)
+            .expect("second tick, near-duplicate name under a different id");
+
+        let active_nodes: Vec<&MaterializedGraphNode> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.valid_until_ms.is_none())
+            .collect();
+        assert_eq!(
+            active_nodes.len(),
+            1,
+            "near-duplicate names must merge into one active node, got: {:?}",
+            active_nodes
+                .iter()
+                .map(|n| (&n.id, &n.name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            active_nodes[0].id, "product-1",
+            "the merge keeps the FIRST id"
+        );
+        assert_eq!(
+            active_nodes[0].name, "PostgreSQL",
+            "the merge takes the LATEST name"
+        );
+        assert_eq!(
+            active_nodes[0].description.as_deref(),
+            Some("Open-source object-relational database."),
+            "the merge takes the LATEST description, matching ordinary update-in-place upserts"
+        );
+    }
+
+    /// Direct assertions on the standalone [`fuzzy_entity_name_match`]
+    /// matcher — NOT a `MaterializedGraph`/`upsert_node` wiring test (no
+    /// graph is constructed, no id is ever shared between two calls here,
+    /// despite this test's name). It pins the matcher's negative cases
+    /// (dissimilar names must never match, even sharing a common prefix
+    /// style) that back BOTH tiers 1 and 2 of `upsert_node`, since both
+    /// route through this one function. The actual "same id, tier 1" wiring
+    /// path is covered incidentally by
+    /// `upsert_collision_same_model_id_different_names_does_not_merge`
+    /// (across two ticks) and `same_id_rename_beyond_the_fuzzy_window_forks_a_disambiguated_duplicate`
+    /// (single id, name drifts beyond the fuzzy window).
+    #[test]
+    fn fuzzy_resolution_does_not_cross_merge_dissimilar_names_sharing_an_id() {
+        assert!(!fuzzy_entity_name_match("Alice", "Bob"));
+        assert!(!fuzzy_entity_name_match("task 1", "task 2"));
+        assert!(!fuzzy_entity_name_match("decision 1", "decision 2"));
+        assert!(!fuzzy_entity_name_match("provider a", "provider b"));
+        assert!(fuzzy_entity_name_match("Postgres", "PostgreSQL"));
+        assert!(fuzzy_entity_name_match("OpenAI", "Open AI"));
+    }
+
+    /// Pins `FUZZY_ENTITY_NAME_MIN_PREFIX_RATIO`'s 0.6 floor itself, not just
+    /// the prefix requirement: "React" is a genuine prefix of "React
+    /// Native" (core `"react"` / `"reactnative"`, ratio 5/11 ≈ 0.4545), so
+    /// this pair is caught ONLY by the ratio check, never by
+    /// `longer.starts_with(shorter)` alone. Mutating the constant to `0.0`
+    /// passes every OTHER test in this module (they all also satisfy the
+    /// prefix requirement or are rejected by it outright) but flips this
+    /// assertion — mirrors the TS
+    /// `fuzzyEntityNameMatch`'s "does not merge names below the prefix
+    /// ratio floor" test (`React`/`React Native`) exactly, closing the gap
+    /// where only the frontend suite pinned this floor.
+    #[test]
+    fn fuzzy_resolution_does_not_merge_names_below_the_prefix_ratio_floor() {
+        assert!(!fuzzy_entity_name_match("React", "React Native"));
+    }
+
+    /// The TS mirror counts core length in Unicode CODE POINTS
+    /// (`Array.from(core).length`) because JS has no cheap equivalent of
+    /// Rust's UTF-8 byte length; matching that basis in Rust (`.chars()`
+    /// count instead of `.len()` bytes — audio-graph-e700 fix) is what
+    /// makes the two languages agree on every non-ASCII case, not just the
+    /// CJK example in `fuzzy_resolution_matches_non_ascii_names...` (whose
+    /// three characters happen to all be 3-byte, so byte- and char-based
+    /// ratios there are coincidentally identical). This pair straddles the
+    /// 0.6 floor DIFFERENTLY depending on the length basis: `"café"` is 4
+    /// chars / 5 bytes (the accented `é` is 2 bytes in UTF-8), and
+    /// `"cafétea"` is 7 chars / 8 bytes — char ratio 4/7 ≈ 0.571 (below the
+    /// floor) vs byte ratio 5/8 = 0.625 (above it). Reverting the length
+    /// basis back to `.len()` flips this to a false MATCH.
+    #[test]
+    fn fuzzy_resolution_uses_char_count_not_byte_length_for_the_ratio() {
+        assert!(!fuzzy_entity_name_match("café", "cafétea"));
+    }
+
+    /// Cross-language parity pin for the CJK counterexample the frontend
+    /// fuzzy-core parity gap was measured against — see the mirrored TS
+    /// test "resolves non-ASCII names identically to the Rust backend" in
+    /// `src/utils/materializedGraph.test.ts`. Both languages must agree, or
+    /// the live incremental view diverges from a replayed session.
+    #[test]
+    fn fuzzy_resolution_matches_non_ascii_names_identically_to_the_ts_mirror() {
+        assert!(!fuzzy_entity_name_match("José", "Jose"));
+        // CJK: "東京" (2 chars) is a genuine prefix of "東京都" (3 chars),
+        // ratio 2/3 ≈ 0.667 >= the 0.6 floor.
+        assert!(fuzzy_entity_name_match("東京", "東京都"));
     }
 
     #[test]
@@ -6025,6 +6565,604 @@ mod tests {
         assert!(replayed.state.graph.nodes.iter().any(|node| {
             node.id == "topic:provider-implementation" && node.valid_until_ms.is_none()
         }));
+    }
+
+    /// seed audio-graph-e700 REPLAY COMPATIBILITY (blocker-class per the
+    /// ticket): a fixture shaped like a PRE-e700 session — free-string
+    /// `entity_type`/`relation_type` values that are neither
+    /// case-normalized nor members of the closed ontology, AND two separate
+    /// patches that collide on a generic model-invented id (`"node1"`) for
+    /// two unrelated names, exactly the field bug this ticket fixes.
+    /// Replaying it through TODAY's `apply_patch` must not error and must
+    /// not drop any entity (ADR-0045: "no accepted patch may be silently
+    /// discarded" — materialization is a pure re-derivation from the
+    /// accepted patch log; a validation that rejects old events is an
+    /// automatic blocker). Built directly from this test
+    /// module's existing fixture style, NOT from field-session content (this
+    /// ticket's STOP CONDITION forbids reading the session that produced the
+    /// measured 31-invented-type / 54-colliding-id evidence).
+    #[test]
+    fn replay_tolerates_pre_e700_free_string_types_and_colliding_ids() {
+        let old_style_patch_one = graph_patch(
+            1,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node1".to_string(),
+                    name: "Alice".to_string(),
+                    // Pre-e700 free string: not a canonical ontology name at
+                    // all, and never normalized by replay (only fresh
+                    // ingest normalizes).
+                    entity_type: "SPEAKER".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node2".to_string(),
+                    name: "Q3 Roadmap".to_string(),
+                    entity_type: "meeting_topic".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphEdge {
+                    id: "edge1".to_string(),
+                    source: "node1".to_string(),
+                    target: "node2".to_string(),
+                    relation_type: "DISCUSSED".to_string(),
+                    label: None,
+                    weight: 0.6,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+        );
+        // A later, SEPARATE tick that independently re-invented the SAME
+        // generic id ("node1") for an unrelated entity — the measured field
+        // bug (54 of 155 colliding node ids in one session).
+        let old_style_patch_two = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Carol".to_string(),
+                entity_type: "SPEAKER".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches(
+            "session-old",
+            [old_style_patch_one, old_style_patch_two],
+        )
+        .expect("pre-e700 free-string types and colliding ids must not error on replay");
+
+        assert_eq!(
+            replayed.graph.nodes.len(),
+            3,
+            "no node may be silently dropped on replay, got: {:?}",
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .map(|n| (&n.id, &n.name))
+                .collect::<Vec<_>>()
+        );
+        assert!(replayed.graph.nodes.iter().any(|n| n.name == "Alice"));
+        assert!(replayed.graph.nodes.iter().any(|n| n.name == "Q3 Roadmap"));
+        assert!(replayed.graph.nodes.iter().any(|n| n.name == "Carol"));
+        // The collision-disambiguated Carol must land under a DIFFERENT
+        // persisted id than Alice — three distinct names sharing a
+        // duplicated id would satisfy the bare node-count check above while
+        // corrupting the graph (two rows the frontend's `id`-keyed
+        // `findIndex` lookups could never distinguish).
+        let ids: std::collections::BTreeSet<&str> =
+            replayed.graph.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "every persisted node must have a UNIQUE id, got ids: {:?}",
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .map(|n| &n.id)
+                .collect::<Vec<_>>()
+        );
+        // The pre-e700 free-string entity_type/relation_type values are
+        // NEVER rewritten by replay — normalization is ingest-only
+        // (`projection_llm::normalize_projection_patch_draft_ontology`),
+        // never applied to historical persisted operations.
+        assert!(
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .any(|n| n.entity_type == "SPEAKER")
+        );
+        assert!(
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .any(|n| n.entity_type == "meeting_topic")
+        );
+        assert_eq!(replayed.graph.edges[0].relation_type, "DISCUSSED");
+    }
+
+    /// seed audio-graph-e700 REPLAY COMPATIBILITY (blocker per reviewer
+    /// finding 1): a pre-e700 accepted log commonly contains
+    /// upsert-then-invalidate-then-re-upsert-under-the-same-id sequences
+    /// (the old code always resurrected in place, since it matched purely
+    /// on id regardless of active status). Requiring the tier-1 same-id
+    /// match to be ACTIVE broke this: the re-upsert would miss all three
+    /// tiers and mint a disambiguated id instead, so a LATER patch's raw-id
+    /// reference (an edge, here) would hard-error with `MissingGraphNode`
+    /// even though the exact same log replayed cleanly under the old gate.
+    #[test]
+    fn resurrection_after_invalidate_keeps_the_same_id_for_later_cross_patch_reference() {
+        let seed = graph_patch(
+            1,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node1".to_string(),
+                    name: "Alice".to_string(),
+                    entity_type: "Person".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node2".to_string(),
+                    name: "Roadmap".to_string(),
+                    entity_type: "Topic".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+        );
+        let invalidate = graph_patch(
+            2,
+            vec![ProjectionOperation::InvalidateGraphNode {
+                id: "node1".to_string(),
+            }],
+        );
+        let resurrect = graph_patch(
+            3,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Alice".to_string(),
+                entity_type: "Person".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        // A LATER, SEPARATE patch referencing the resurrected raw id — the
+        // per-patch `id_overrides` map is empty here, so this can only
+        // succeed if `node1` is actually active again.
+        let later_edge = graph_patch(
+            4,
+            vec![ProjectionOperation::UpsertGraphEdge {
+                id: "edge1".to_string(),
+                source: "node1".to_string(),
+                target: "node2".to_string(),
+                relation_type: "discussed".to_string(),
+                label: None,
+                weight: 0.5,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches(
+            "session-resurrect",
+            [seed, invalidate, resurrect, later_edge],
+        )
+        .expect("resurrection followed by a later cross-patch edge reference must not error");
+
+        assert!(
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .any(|n| n.id == "node1" && n.valid_until_ms.is_none()),
+            "node1 must be resurrected active under its ORIGINAL id, not forked: {:?}",
+            replayed
+                .graph
+                .nodes
+                .iter()
+                .map(|n| (&n.id, &n.name, n.valid_until_ms))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            replayed.graph.nodes.len(),
+            2,
+            "resurrection must update the original row, never fork a duplicate"
+        );
+        let edge = replayed
+            .graph
+            .edges
+            .iter()
+            .find(|e| e.id == "edge1")
+            .expect("edge from the later patch must have been applied");
+        assert_eq!(edge.source, "node1");
+    }
+
+    /// seed audio-graph-e700 REPLAY COMPATIBILITY (blocker per reviewer
+    /// finding 2): a raw id fuzzy-absorbed by `upsert_node` (tier 2, cross-id
+    /// near-duplicate merge) never gets a row of its own — the model's raw
+    /// id `"n7"` never appears as a literal id anywhere in `graph.nodes`.
+    /// Before this fix, `resolve_graph_node_id` had no memory of that
+    /// redirection once its ORIGINATING patch finished (`id_overrides` was
+    /// local to one `apply_patch` call), so a LATER, separate patch
+    /// referencing `"n7"` directly (an edge endpoint here) would fail
+    /// `has_active_node` and return `Err(MissingGraphNode)` — on a log every
+    /// patch of which was individually accepted by the old gate.
+    #[test]
+    fn cross_patch_reference_to_a_fuzzy_absorbed_raw_id_resolves_via_persistent_alias() {
+        let mut graph = MaterializedGraph::new("session-alias");
+        let first_tick = graph_patch(
+            1,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "n1".to_string(),
+                    name: "Postgres".to_string(),
+                    entity_type: "Product".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "n20".to_string(),
+                    name: "Deployment".to_string(),
+                    entity_type: "Topic".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+        );
+        graph.apply_patch(&first_tick, None).expect("seed tick");
+
+        // "n7" never had its own row: `upsert_node` finds it fuzzy-matches
+        // the ALREADY-active "n1" (Postgres) by name and absorbs into it.
+        let second_tick = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "n7".to_string(),
+                name: "PostgreSQL".to_string(),
+                entity_type: "Product".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&second_tick, None)
+            .expect("absorption tick");
+        assert!(
+            !graph.nodes.iter().any(|n| n.id == "n7"),
+            "the raw id must never get a row of its own once absorbed"
+        );
+        assert_eq!(
+            graph.id_aliases.get("n7").map(String::as_str),
+            Some("n1"),
+            "the redirection must be recorded persistently, not just per-patch"
+        );
+
+        // A THIRD, separate patch referencing the raw id "n7" directly.
+        let third_tick = graph_patch(
+            3,
+            vec![ProjectionOperation::UpsertGraphEdge {
+                id: "edge1".to_string(),
+                source: "n7".to_string(),
+                target: "n20".to_string(),
+                relation_type: "used_for".to_string(),
+                label: None,
+                weight: 0.5,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&third_tick, None)
+            .expect("a later, separate patch referencing the absorbed raw id must not hard-error");
+
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.id == "edge1")
+            .expect("edge must have been applied");
+        assert_eq!(
+            edge.source, "n1",
+            "the edge must land on the id the content actually lives under"
+        );
+
+        // The SAME cross-patch trap also applies to `invalidate_graph_node`
+        // referencing the absorbed raw id directly.
+        let fourth_tick = graph_patch(
+            4,
+            vec![ProjectionOperation::InvalidateGraphNode {
+                id: "n7".to_string(),
+            }],
+        );
+        graph.apply_patch(&fourth_tick, None).expect(
+            "invalidate_graph_node on the absorbed raw id must resolve to the real node, not error",
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.id == "n1" && n.valid_until_ms.is_some()),
+            "invalidating via the absorbed raw id must invalidate the node it actually landed on"
+        );
+    }
+
+    /// seed audio-graph-e700 REPLAY COMPATIBILITY: a model naturally emits
+    /// `upsert n1; upsert n7 (fuzzy-absorbed into n1); merge_graph_nodes
+    /// (source: n7, target: n1)` in ONE patch to explicitly reconcile the
+    /// near-duplicate it just created in the SAME breath. Before this fix
+    /// this resolved both ids to `"n1"` via `id_overrides` and then
+    /// `merge_nodes` rejected the now-identical pair with
+    /// `Err(InvalidGraphMerge)`, failing the WHOLE patch — on an operation
+    /// that is semantically a no-op, not an error.
+    #[test]
+    fn same_patch_merge_into_its_own_fuzzy_absorption_target_is_a_no_op() {
+        let mut graph = MaterializedGraph::new("session-merge-noop");
+        let patch = graph_patch(
+            1,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "n1".to_string(),
+                    name: "Postgres".to_string(),
+                    entity_type: "Product".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "n7".to_string(),
+                    name: "PostgreSQL".to_string(),
+                    entity_type: "Product".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::MergeGraphNodes {
+                    source_id: "n7".to_string(),
+                    target_id: "n1".to_string(),
+                },
+            ],
+        );
+
+        graph
+            .apply_patch(&patch, None)
+            .expect("a merge that resolves to a no-op must not reject the whole patch");
+
+        let active: Vec<&MaterializedGraphNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.valid_until_ms.is_none())
+            .collect();
+        assert_eq!(
+            active.len(),
+            1,
+            "the absorption already unified them; the redundant merge must not invalidate n1"
+        );
+        assert_eq!(active[0].id, "n1");
+    }
+
+    /// seed audio-graph-e700 (reviewer finding 3): the SAME-patch remap
+    /// table must keep working for a displaced upsert even when the
+    /// displacement is a tier-3 DISAMBIGUATION (collision with an unrelated
+    /// PRE-EXISTING node), not just a tier-2 fuzzy absorption — this is the
+    /// one cross-reference axis no test in either language exercised before
+    /// (mutating `resolve_graph_node_id` to the identity function passed the
+    /// whole suite).
+    #[test]
+    fn same_patch_displaced_upsert_cross_reference_lands_on_the_disambiguated_id() {
+        let mut graph = MaterializedGraph::new("session-displaced-xref");
+        let seed = graph_patch(
+            1,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node1".to_string(),
+                    name: "Alice".to_string(),
+                    entity_type: "Person".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "topic:standup".to_string(),
+                    name: "Standup".to_string(),
+                    entity_type: "Topic".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+        );
+        graph.apply_patch(&seed, None).expect("seed collision node");
+
+        // In ONE later patch: an unrelated "Bob" upsert collides on the
+        // literal id "node1" (gets displaced to "node1~2"), and an edge in
+        // the SAME patch references the raw id "node1" — per the
+        // Graph-kind prompt's own model-facing convention, this means "the
+        // node I just upserted", i.e. Bob/"node1~2", not the pre-existing
+        // Alice.
+        let displaced = graph_patch(
+            2,
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node1".to_string(),
+                    name: "Bob".to_string(),
+                    entity_type: "Person".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphEdge {
+                    id: "edge1".to_string(),
+                    source: "node1".to_string(),
+                    target: "topic:standup".to_string(),
+                    relation_type: "discussed".to_string(),
+                    label: None,
+                    weight: 0.5,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+        );
+        graph
+            .apply_patch(&displaced, None)
+            .expect("displaced upsert plus same-patch cross-reference");
+
+        let bob = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "Bob")
+            .expect("Bob must be inserted under a disambiguated id");
+        assert_eq!(bob.id, "node1~2");
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.id == "edge1")
+            .expect("edge must have been applied");
+        assert_eq!(
+            edge.source, "node1~2",
+            "a same-patch reference to the raw id must follow THIS patch's own displacement, \
+             not the pre-existing node that still literally owns that id"
+        );
+        assert_eq!(edge.target, "topic:standup");
+    }
+
+    /// Reviewer finding (minor, disclosed trade-off): a legitimate same-id
+    /// rename whose new name falls OUTSIDE `fuzzy_entity_name_match`'s
+    /// window (no shared prefix core, or below the 0.6 ratio floor) no
+    /// longer updates in place — it forks a visible duplicate under a
+    /// disambiguated id instead, because tier 1 requires the name to still
+    /// fuzzy-match. This is an accepted trade-off against the collision bug
+    /// (see `upsert_collision_same_model_id_different_names_does_not_merge`),
+    /// not a defect; this test PINS the current, intentional behavior so a
+    /// future change to it is deliberate rather than an accidental
+    /// regression.
+    #[test]
+    fn same_id_rename_beyond_the_fuzzy_window_forks_a_disambiguated_duplicate() {
+        let mut graph = MaterializedGraph::new("session-rename-fork");
+        let first = graph_patch(
+            1,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "topic:roadmap".to_string(),
+                name: "Roadmap".to_string(),
+                entity_type: "Topic".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph.apply_patch(&first, None).expect("seed topic node");
+
+        let renamed = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "topic:roadmap".to_string(),
+                name: "Q3 Roadmap".to_string(),
+                entity_type: "Topic".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&renamed, None)
+            .expect("rename beyond the fuzzy window");
+
+        let active: Vec<&MaterializedGraphNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.valid_until_ms.is_none())
+            .collect();
+        assert_eq!(
+            active.len(),
+            2,
+            "documented current behavior: a rename beyond the fuzzy window forks, \
+             it does not update in place, got: {:?}",
+            active.iter().map(|n| (&n.id, &n.name)).collect::<Vec<_>>()
+        );
+        assert!(
+            active
+                .iter()
+                .any(|n| n.name == "Roadmap" && n.id == "topic:roadmap")
+        );
+        assert!(
+            active
+                .iter()
+                .any(|n| n.name == "Q3 Roadmap" && n.id == "topic:roadmap~2")
+        );
+    }
+
+    /// Reviewer finding (major, disclosed trade-off): after a same-id
+    /// collision displaces a later upsert to a disambiguated id (tier 3), a
+    /// LATER, SEPARATE patch's raw-id reference resolves to the FIRST
+    /// occupant of that literal id (the one that still literally owns it),
+    /// not the most-recently-written entity the model probably meant by
+    /// reusing that raw id. Pre-e700, the model's LATEST content under a
+    /// shared id always won (destructive overwrite in place); this fix
+    /// deliberately does not persist tier-3 displacements into
+    /// `id_aliases` in a way that would override a literal row (see
+    /// `resolve_graph_node_id`'s doc comment, tier 2) — it is less
+    /// destructive than the old overwrite, but not equivalent to "latest
+    /// wins" either. This test pins the CHOSEN semantics so a future change
+    /// to it (e.g. binding cross-patch raw-id references to the
+    /// most-recently-written owner instead) is deliberate.
+    #[test]
+    fn cross_patch_reference_after_a_collision_binds_to_the_first_occupant_not_the_latest() {
+        let mut graph = MaterializedGraph::new("session-first-owner-wins");
+        let seed = graph_patch(
+            1,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Alice".to_string(),
+                entity_type: "Person".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph
+            .apply_patch(&seed, None)
+            .expect("seed Alice under node1");
+
+        // A SEPARATE, later patch mints "Bob" under the same raw id — no
+        // fuzzy match, so tier 3 displaces Bob to "node1~2"; Alice's row
+        // (literal id "node1") is untouched.
+        let collision = graph_patch(
+            2,
+            vec![ProjectionOperation::UpsertGraphNode {
+                id: "node1".to_string(),
+                name: "Bob".to_string(),
+                entity_type: "Person".to_string(),
+                description: None,
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+            }],
+        );
+        graph.apply_patch(&collision, None).expect("Bob displaced");
+
+        // A THIRD, separate patch references the raw id "node1" directly —
+        // `id_overrides` is empty (fresh patch), so this resolves via the
+        // literal-row check, landing on Alice, not Bob.
+        let reference = graph_patch(
+            3,
+            vec![ProjectionOperation::InvalidateGraphNode {
+                id: "node1".to_string(),
+            }],
+        );
+        graph
+            .apply_patch(&reference, None)
+            .expect("cross-patch reference to the collided raw id must not error");
+
+        let alice = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "Alice")
+            .expect("Alice still exists under node1");
+        assert!(
+            alice.valid_until_ms.is_some(),
+            "the cross-patch invalidate_graph_node(\"node1\") must have bound to Alice \
+             (the first occupant of the literal id), not Bob"
+        );
+        let bob = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "Bob")
+            .expect("Bob still exists under node1~2");
+        assert!(
+            bob.valid_until_ms.is_none(),
+            "Bob (node1~2) must be UNAFFECTED by a cross-patch reference to the raw id \"node1\""
+        );
     }
 
     #[test]

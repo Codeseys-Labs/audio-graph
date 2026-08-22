@@ -1943,6 +1943,15 @@ export interface MaterializedGraph {
   last_sequence: number;
   nodes: MaterializedGraphNode[];
   edges: MaterializedGraphEdge[];
+  /**
+   * Raw model-supplied node id -> the id it was ACTUALLY persisted under,
+   * for every redirection ever observed across this graph's whole history
+   * (audio-graph-e700 replay-compatibility fix; mirrors
+   * `MaterializedGraph::id_aliases` in the Rust backend). Optional/omitted
+   * when empty (the Rust side skips serializing an empty map), so treat a
+   * missing key the same as `{}`.
+   */
+  id_aliases?: Record<string, string>;
 }
 
 export type PromotionSourceObjectType =

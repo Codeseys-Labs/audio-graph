@@ -84,8 +84,15 @@ pub const ENTITY_TYPES: &[EntityType] = &[
     },
 ];
 
-/// Closed set of relation types. `relation_type` SHOULD be one of these, but
-/// the model may emit another lowercase verb phrase when none fit.
+/// Suggested/preferred relation types — NOT a closed set (the header used
+/// to say "Closed set", which contradicted the very next sentence and this
+/// const's own behavior: `relation_type` SHOULD be one of these, but the
+/// model may emit another lowercase verb phrase when none fit, and nothing
+/// downstream rejects that). Corrected during audio-graph-e700, whose
+/// ticket explicitly asked to investigate this exact question ("does the
+/// ontology define a CLOSED relation set?") before deciding whether to bind
+/// `relation_type` to an enum on the wire the way `entity_type` now is; the
+/// answer, confirmed against every actual caller, is no.
 pub const RELATION_TYPES: &[RelationType] = &[
     RelationType {
         name: "mentions",
@@ -195,6 +202,134 @@ pub fn relation_type_color(relation_type: &str) -> &'static str {
         .unwrap_or("#757575")
 }
 
+/// Deterministic ingest-side fallback for a model-supplied `entity_type`
+/// string that did not survive schema-level enum binding (seed
+/// audio-graph-e700 sub-fix 1): a non-strict route, a repair-prompt retry,
+/// or a strict-mode provider that ignored the enum anyway. Always returns
+/// one of [`ENTITY_TYPES`]'s ten canonical names — never a new invented
+/// category — via three tiers:
+///
+/// 1. Case-insensitive exact match (`"PERSON"`, `"person"` -> `"Person"`).
+/// 2. A small curated synonym table for common near-synonyms
+///    ([`entity_type_synonym`]) — deliberately NOT fuzzy matching, because
+///    fuzzy string similarity on a short closed vocabulary of category
+///    *names* is unreliable for genuine synonyms: measured
+///    `jaro_winkler("company", "location") = 0.607` and
+///    `jaro_winkler("concept", "product") = 0.619` are indistinguishable
+///    from noise, while a curated table gets both right deterministically.
+/// 3. A near-misspelling of a canonical name only, caught by a
+///    deliberately HIGH Jaro-Winkler threshold: measured
+///    `jaro_winkler("persn", "person") = 0.967` and
+///    `jaro_winkler("orgnization", "organization") = 0.938` clear it, while
+///    the semantic-synonym false positives in tier 2's doc comment (0.607,
+///    0.619) stay well below it.
+///
+/// Anything that clears none of the three tiers falls back to `"Topic"` —
+/// [`ENTITY_TYPES`]'s existing broadest bucket ("a subject, concept, or
+/// theme being discussed"), not a fabricated `"Other"` category (which would
+/// be an ontology expansion, out of scope for this fallback).
+///
+/// Ingest-time only: called from
+/// `projection_llm::normalize_projection_patch_draft_ontology` on a FRESH
+/// model draft, before it becomes a trusted, persisted `ProjectionPatch`.
+/// Never called from `MaterializedGraph::apply_patch` (replay) — a session
+/// persisted before this fallback existed keeps its original free-string
+/// `entity_type` forever; replay tolerates it exactly as it always has
+/// (ADR-0029 / ADR-0045: materialization is a pure re-derivation from the
+/// accepted patch log, which this fallback never rewrites).
+pub fn normalize_entity_type(raw: &str) -> &'static str {
+    let trimmed = raw.trim();
+    if let Some(exact) = ENTITY_TYPES
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(trimmed))
+    {
+        return exact.name;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if let Some(synonym) = entity_type_synonym(&lower) {
+        return synonym;
+    }
+
+    const TYPO_THRESHOLD: f64 = 0.93;
+    let mut best: Option<(&'static str, f64)> = None;
+    for t in ENTITY_TYPES {
+        let score = strsim::jaro_winkler(&lower, &t.name.to_lowercase());
+        if score >= TYPO_THRESHOLD && best.is_none_or(|(_, current)| score > current) {
+            best = Some((t.name, score));
+        }
+    }
+    if let Some((name, _)) = best {
+        return name;
+    }
+
+    "Topic"
+}
+
+/// Curated near-synonym table backing tier 2 of [`normalize_entity_type`].
+/// `lower` must already be trimmed and lowercased. Kept intentionally small
+/// and explicit (no fuzzy scoring) — see [`normalize_entity_type`]'s doc
+/// comment for why fuzzy matching a short category vocabulary for semantic
+/// synonyms is unreliable. Not exhaustive: the STOP CONDITION in seed
+/// audio-graph-e700 forbids reading the field session that produced the 31
+/// invented types this ticket cites, so this table is built from generally
+/// plausible near-synonyms, not that measured list.
+fn entity_type_synonym(lower: &str) -> Option<&'static str> {
+    Some(match lower {
+        "company" | "team" | "group" | "institution" | "org" | "employer" => "Organization",
+        "place" | "venue" | "site" | "region" | "city" | "country" => "Location",
+        "meeting" | "appointment" | "deadline" | "milestone" => "Event",
+        "concept" | "subject" | "theme" | "idea" | "issue" => "Topic",
+        "tool" | "app" | "application" | "artifact" | "document" | "technology" | "provider"
+        | "library" | "service" | "software" => "Product",
+        "todo" | "action" | "action_item" => "Task",
+        "conclusion" | "choice" | "resolution" | "verdict" => "Decision",
+        "time" | "datetime" | "timestamp" => "Date",
+        "speaker" | "individual" | "human" | "attendee" | "participant" => "Person",
+        "inquiry" | "query" => "Question",
+        _ => return None,
+    })
+}
+
+/// Deterministic soft-normalization for a model-supplied `relation_type`
+/// string (seed audio-graph-e700 sub-fix "RELATION TYPES"). Unlike
+/// `entity_type`, [`RELATION_TYPES`] is NOT a hard-closed set — its own doc
+/// comment used to open with "Closed set", which contradicted the very
+/// next sentence AND [`extraction_system_prompt`]'s guidance to the model
+/// that it "may emit another lowercase verb phrase when none fit"; that
+/// header has been corrected (see [`RELATION_TYPES`]'s doc comment) rather
+/// than silently resolved in whichever direction happened to be cheaper. So
+/// this never rejects or remaps onto a fixed vocabulary — it only collapses
+/// trivial surface-form variance (case, whitespace, punctuation) so
+/// `"Works At"`, `"works-at"`,
+/// and `"works_at"` land on the SAME persisted string instead of forking
+/// into distinct relation types that only differ by formatting. Idempotent:
+/// normalizing an already-normalized string is a no-op. An empty or
+/// all-punctuation input falls back to `"related_to"` — an existing
+/// [`RELATION_TYPES`] entry ("generic association between X and Y"), not an
+/// invented catch-all.
+pub fn normalize_relation_type(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_separator = true; // suppress a leading underscore
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            out.push('_');
+            last_was_separator = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "related_to".to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +359,61 @@ mod tests {
         assert_eq!(entity_type_color("unknown"), "#607D8B");
         assert_eq!(relation_type_color("MENTIONS"), "#2196F3");
         assert_eq!(relation_type_color("nope"), "#757575");
+    }
+
+    #[test]
+    fn normalize_entity_type_matches_case_insensitively() {
+        assert_eq!(normalize_entity_type("person"), "Person");
+        assert_eq!(normalize_entity_type("PERSON"), "Person");
+        assert_eq!(normalize_entity_type("  Question  "), "Question");
+    }
+
+    #[test]
+    fn normalize_entity_type_applies_curated_synonyms() {
+        assert_eq!(normalize_entity_type("company"), "Organization");
+        assert_eq!(normalize_entity_type("provider"), "Product");
+        assert_eq!(normalize_entity_type("place"), "Location");
+        assert_eq!(normalize_entity_type("meeting"), "Event");
+        assert_eq!(normalize_entity_type("todo"), "Task");
+        assert_eq!(normalize_entity_type("conclusion"), "Decision");
+        assert_eq!(normalize_entity_type("datetime"), "Date");
+    }
+
+    #[test]
+    fn normalize_entity_type_catches_near_misspellings() {
+        assert_eq!(normalize_entity_type("persn"), "Person");
+        assert_eq!(normalize_entity_type("orgnization"), "Organization");
+    }
+
+    #[test]
+    fn normalize_entity_type_falls_back_to_topic_for_unrecognized_input() {
+        // These score well below the typo threshold against every canonical
+        // name (measured: best fuzzy hit for "SECRET TYPE" is "event" at
+        // 0.624) and have no curated synonym, so they hit the final
+        // catch-all rather than fabricating a new category.
+        assert_eq!(normalize_entity_type("SECRET TYPE"), "Topic");
+        assert_eq!(normalize_entity_type("Widget Category 47"), "Topic");
+        assert_eq!(normalize_entity_type(""), "Topic");
+    }
+
+    #[test]
+    fn normalize_relation_type_collapses_surface_form_variance() {
+        assert_eq!(normalize_relation_type("Works At"), "works_at");
+        assert_eq!(normalize_relation_type("works-at"), "works_at");
+        assert_eq!(normalize_relation_type("works_at"), "works_at");
+        assert_eq!(normalize_relation_type("  WORKS   AT  "), "works_at");
+    }
+
+    #[test]
+    fn normalize_relation_type_is_idempotent() {
+        let once = normalize_relation_type("Reports To!!");
+        let twice = normalize_relation_type(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn normalize_relation_type_falls_back_to_related_to_for_empty_input() {
+        assert_eq!(normalize_relation_type(""), "related_to");
+        assert_eq!(normalize_relation_type("   ---   "), "related_to");
     }
 }

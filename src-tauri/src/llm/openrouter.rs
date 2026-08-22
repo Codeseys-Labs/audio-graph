@@ -3375,6 +3375,127 @@ mod tests {
         );
     }
 
+    /// seed audio-graph-e700 sub-fix 1 (SCHEMA BINDING): the REAL Graph-kind
+    /// strict schema — the one actually sent to OpenRouter for graph
+    /// projection jobs, not a hand-rolled stand-in — must pin `entity_type`
+    /// to the closed ten-name ontology enum in the wire body, so a
+    /// schema-capable model cannot emit an invented category. Asserts on the
+    /// serialized request the way `json_schema_request_carries_strict_schema_and_preserves_cache_routing`
+    /// does (deterministic, no TCP-chunking flakiness), not on the schema
+    /// value in isolation, because it is the WIRE shape this ticket's field
+    /// evidence (31 invented entity types in one session) diagnosed as
+    /// missing the constraint.
+    #[test]
+    fn graph_projection_schema_binds_entity_type_to_closed_ontology_enum_on_the_wire() {
+        let config = test_config(None);
+        let schema = crate::projection_llm::projection_patch_strict_json_schema(
+            &crate::projections::ProjectionKind::Graph,
+        );
+        let request = build_chat_completion_request(
+            &config,
+            vec![ApiMessage::text(
+                "user".to_string(),
+                "graph job".to_string(),
+            )],
+            Some(ResponseFormat::json_schema("projection_patch", schema)),
+            None,
+        );
+        let sent = serde_json::to_value(&request).expect("request serializes");
+
+        let variants = sent["response_format"]["json_schema"]["schema"]["properties"]["operations"]
+            ["items"]["anyOf"]
+            .as_array()
+            .expect("graph kind offers operation variants");
+        let upsert_graph_node = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["type"]["enum"]
+                    .as_array()
+                    .is_some_and(|type_enum| {
+                        type_enum.contains(&serde_json::json!("upsert_graph_node"))
+                    })
+            })
+            .expect("upsert_graph_node variant present on the wire");
+        let entity_type_enum = upsert_graph_node["properties"]["entity_type"]["enum"]
+            .as_array()
+            .expect("entity_type must carry an enum constraint on the wire");
+        let entity_type_names: Vec<&str> = entity_type_enum
+            .iter()
+            .map(|value| value.as_str().expect("enum entries are strings"))
+            .collect();
+        assert_eq!(
+            entity_type_names,
+            crate::ontology::ENTITY_TYPES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>(),
+            "wire schema's entity_type enum must be exactly the closed ontology, got:\n{sent}"
+        );
+        assert!(
+            !entity_type_names.contains(&"Provider"),
+            "an invented type absent from the closed ontology must not be a valid enum member"
+        );
+
+        // `relation_type` must stay unconstrained on the wire — RELATION_TYPES
+        // is a suggested/preferred set, not a closed one (ontology.rs's doc
+        // comment on RELATION_TYPES used to say "Closed set", which
+        // contradicted both the sentence right after it and this exact wire
+        // behavior; the doc comment has been corrected, not this behavior).
+        // This is the negative half of the same wire assertion.
+        let upsert_graph_edge = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["type"]["enum"]
+                    .as_array()
+                    .is_some_and(|type_enum| {
+                        type_enum.contains(&serde_json::json!("upsert_graph_edge"))
+                    })
+            })
+            .expect("upsert_graph_edge variant present on the wire");
+        assert!(
+            upsert_graph_edge["properties"]["relation_type"]
+                .get("enum")
+                .is_none(),
+            "relation_type must NOT be enum-bound on the wire — RELATION_TYPES is not closed"
+        );
+
+        // The OTHER call site the same commit bound to the closed ontology
+        // (`graph_node_draft`, feeding `split_graph_node.replacement_nodes`)
+        // was previously unpinned — half the schema binding could regress
+        // (reopening invented entity types through split replacements on
+        // the strict route) without any test catching it.
+        let split_graph_node = variants
+            .iter()
+            .find(|variant| {
+                variant["properties"]["type"]["enum"]
+                    .as_array()
+                    .is_some_and(|type_enum| {
+                        type_enum.contains(&serde_json::json!("split_graph_node"))
+                    })
+            })
+            .expect("split_graph_node variant present on the wire");
+        let replacement_entity_type_enum = split_graph_node["properties"]["replacement_nodes"]
+            ["items"]["properties"]["entity_type"]["enum"]
+            .as_array()
+            .expect(
+                "split_graph_node.replacement_nodes items' entity_type must carry an enum \
+                 constraint on the wire",
+            );
+        let replacement_entity_type_names: Vec<&str> = replacement_entity_type_enum
+            .iter()
+            .map(|value| value.as_str().expect("enum entries are strings"))
+            .collect();
+        assert_eq!(
+            replacement_entity_type_names,
+            crate::ontology::ENTITY_TYPES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>(),
+            "split_graph_node's replacement_nodes entity_type enum must be exactly the closed \
+             ontology, got:\n{sent}"
+        );
+    }
+
     /// The json-object (non-schema) request must NOT carry a `json_schema`
     /// payload — its `response_format` stays `{ "type": "json_object" }` exactly,
     /// so the legacy request shape is unchanged (audio-graph-a324).

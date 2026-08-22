@@ -107,7 +107,10 @@ import type {
 } from "../types";
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import { errorToMessage } from "../utils/errorToMessage";
-import { materializedGraphToSnapshot } from "../utils/materializedGraph";
+import {
+  fuzzyEntityNameMatch,
+  materializedGraphToSnapshot,
+} from "../utils/materializedGraph";
 import { createShellNavSlice } from "./shellNav";
 
 const idleStage: StageStatus = { type: "Idle" };
@@ -519,6 +522,118 @@ function activeMaterializedNode(graph: MaterializedGraph, id: string): boolean {
   );
 }
 
+/**
+ * Mint a collision-free id for a genuinely new node when the model's raw
+ * `id` is already owned by a DIFFERENT entity (seed audio-graph-e700 sub-fix
+ * 2). Mirrors `MaterializedGraph::disambiguated_new_node_id` in the Rust
+ * backend exactly, so the live view and a replayed session never disagree
+ * about which id a colliding upsert landed on.
+ */
+function disambiguatedNewNodeId(graph: MaterializedGraph, id: string): string {
+  if (!graph.nodes.some((node) => node.id === id)) return id;
+  let suffix = 2;
+  while (graph.nodes.some((node) => node.id === `${id}~${suffix}`)) {
+    suffix += 1;
+  }
+  return `${id}~${suffix}`;
+}
+
+/**
+ * Upsert a graph node by NAME (seed audio-graph-e700 sub-fixes 2 and 3),
+ * mirroring `MaterializedGraph::upsert_node` in the Rust backend exactly —
+ * see that function's doc comment for the full three-tier rationale. Returns
+ * the id the node was ACTUALLY persisted under, so callers can remap
+ * same-patch node-id references (an edge created right after the node it
+ * connects to) the same way `apply_patch`'s `id_overrides` does.
+ */
+function upsertMaterializedGraphNodeByName(
+  graph: MaterializedGraph,
+  patch: ProjectionPatch,
+  id: string,
+  name: string,
+  entityType: string,
+  description: string | null | undefined,
+): string {
+  // Matches a node under this exact id regardless of active status — NOT
+  // just active rows (audio-graph-e700 replay-compatibility fix). A
+  // pre-e700 accepted log commonly contains an
+  // upsert-then-invalidate-then-re-upsert-under-the-same-id sequence (the
+  // old code always resurrected in place, matching purely on id). Requiring
+  // ACTIVE here misses that resurrection, minting a needless disambiguated
+  // id instead and breaking a later reference to the same raw id. The name
+  // check still guards against treating an UNRELATED entity minted under
+  // this same (invalidated) id as the original — mirrors
+  // `MaterializedGraph::upsert_node`'s tier 1 in the Rust backend exactly.
+  const sameIdIndex = graph.nodes.findIndex(
+    (node) => node.id === id && fuzzyEntityNameMatch(node.name, name),
+  );
+  const targetIndex =
+    sameIdIndex >= 0
+      ? sameIdIndex
+      : graph.nodes.findIndex(
+          (node) =>
+            node.valid_until_ms == null &&
+            node.entity_type.toLowerCase() === entityType.toLowerCase() &&
+            fuzzyEntityNameMatch(node.name, name),
+        );
+
+  const finalId =
+    targetIndex >= 0
+      ? graph.nodes[targetIndex].id
+      : disambiguatedNewNodeId(graph, id);
+
+  const next = projectionGraphPatchNode(
+    patch,
+    finalId,
+    name,
+    entityType,
+    description,
+  );
+  if (targetIndex >= 0) graph.nodes[targetIndex] = next;
+  else graph.nodes.push(next);
+
+  return finalId;
+}
+
+/**
+ * Resolve a node id referenced by a graph operation (edge endpoint,
+ * invalidate/merge/split target, ...) to the id it should ACTUALLY be
+ * looked up under. Mirrors `resolve_graph_node_id` in the Rust backend
+ * exactly — see that function's doc comment for the full three-tier
+ * resolution order and rationale (audio-graph-e700 replay-compatibility
+ * fix):
+ *
+ * 1. THIS patch's same-patch remap table (`idOverrides`) — always wins.
+ * 2. A literal row under `id` in `graph.nodes` — active OR already
+ *    invalidated. Preserves legitimate stable-id reuse across ticks and the
+ *    "first owner wins" semantics after a same-id-different-name collision.
+ * 3. `graph.id_aliases`, followed to its end (bounded, cycle-safe): the
+ *    persistent record of every raw id `upsertMaterializedGraphNodeByName`
+ *    ever redirected to a different final id. Lets a LATER, separate patch
+ *    resolve a raw id an EARLIER patch's fuzzy name merge absorbed, instead
+ *    of failing `activeMaterializedNode` for a node that never had a row of
+ *    its own.
+ */
+function resolveGraphNodeId(
+  graph: MaterializedGraph,
+  idOverrides: Map<string, string>,
+  id: string,
+): string {
+  const overridden = idOverrides.get(id);
+  if (overridden != null) return overridden;
+  if (graph.nodes.some((node) => node.id === id)) return id;
+  const aliases = graph.id_aliases ?? {};
+  let current = id;
+  const maxHops = Object.keys(aliases).length + 1;
+  for (let hop = 0; hop < maxHops; hop += 1) {
+    const aliased = aliases[current];
+    if (aliased == null || aliased === current) break;
+    current = aliased;
+    if (graph.nodes.some((node) => node.id === current)) break;
+  }
+  return current;
+}
+
 function activeMaterializedNodeIndex(
   graph: MaterializedGraph,
   id: string,
@@ -613,6 +728,7 @@ function applyProjectionGraphPatch(
         ...current,
         nodes: current.nodes.map((node) => ({ ...node })),
         edges: current.edges.map((edge) => ({ ...edge })),
+        id_aliases: { ...(current.id_aliases ?? {}) },
       }
     : {
         schema_version: 1,
@@ -620,32 +736,48 @@ function applyProjectionGraphPatch(
         last_sequence: 0,
         nodes: [],
         edges: [],
+        id_aliases: {},
       };
+
+  // Raw model id -> the id it was ACTUALLY persisted under, for THIS patch
+  // only (seed audio-graph-e700 sub-fixes 2/3). Mirrors `apply_patch`'s
+  // `id_overrides` in the Rust backend exactly — always wins over
+  // `graph.id_aliases` (see `resolveGraphNodeId`'s doc comment), because it
+  // reflects what THIS patch itself just did.
+  const idOverrides = new Map<string, string>();
 
   for (const operation of patch.operations) {
     switch (operation.type) {
       case "upsert_graph_node": {
-        const next = projectionGraphPatchNode(
+        const finalId = upsertMaterializedGraphNodeByName(
+          graph,
           patch,
           operation.id,
           operation.name,
           operation.entity_type,
           operation.description,
         );
-        const index = graph.nodes.findIndex((node) => node.id === operation.id);
-        if (index >= 0) graph.nodes[index] = next;
-        else graph.nodes.push(next);
+        if (finalId !== operation.id) {
+          idOverrides.set(operation.id, finalId);
+          // Persisted across patches too (audio-graph-e700
+          // replay-compatibility fix), so a LATER, SEPARATE patch that
+          // references this same raw id can still resolve it instead of
+          // failing `activeMaterializedNode`/`activeMaterializedNodeIndex`.
+          graph.id_aliases = { ...graph.id_aliases, [operation.id]: finalId };
+        }
         break;
       }
-      case "remove_graph_node":
-        graph.nodes = graph.nodes.filter((node) => node.id !== operation.id);
+      case "remove_graph_node": {
+        const id = resolveGraphNodeId(graph, idOverrides, operation.id);
+        graph.nodes = graph.nodes.filter((node) => node.id !== id);
         graph.edges = graph.edges.filter(
-          (edge) =>
-            edge.source !== operation.id && edge.target !== operation.id,
+          (edge) => edge.source !== id && edge.target !== id,
         );
         break;
+      }
       case "invalidate_graph_node": {
-        const index = activeMaterializedNodeIndex(graph, operation.id);
+        const id = resolveGraphNodeId(graph, idOverrides, operation.id);
+        const index = activeMaterializedNodeIndex(graph, id);
         if (index < 0) break;
         invalidateMaterializedNodeAt(graph, index, patch);
         for (
@@ -656,7 +788,7 @@ function applyProjectionGraphPatch(
           const edge = graph.edges[edgeIndex];
           if (
             edge.valid_until_ms == null &&
-            (edge.source === operation.id || edge.target === operation.id)
+            (edge.source === id || edge.target === id)
           ) {
             invalidateMaterializedEdgeAt(graph, edgeIndex, patch);
           }
@@ -664,17 +796,19 @@ function applyProjectionGraphPatch(
         break;
       }
       case "upsert_graph_edge": {
+        const source = resolveGraphNodeId(graph, idOverrides, operation.source);
+        const target = resolveGraphNodeId(graph, idOverrides, operation.target);
         if (
-          !activeMaterializedNode(graph, operation.source) ||
-          !activeMaterializedNode(graph, operation.target)
+          !activeMaterializedNode(graph, source) ||
+          !activeMaterializedNode(graph, target)
         ) {
           break;
         }
         const next = projectionGraphPatchEdge(
           patch,
           operation.id,
-          operation.source,
-          operation.target,
+          source,
+          target,
           operation.relation_type,
           operation.label,
           operation.weight,
@@ -713,35 +847,36 @@ function applyProjectionGraphPatch(
         break;
       }
       case "merge_graph_nodes": {
-        if (
-          operation.source_id === operation.target_id ||
-          !activeMaterializedNode(graph, operation.target_id)
-        ) {
-          break;
-        }
-        const sourceIndex = activeMaterializedNodeIndex(
+        const sourceId = resolveGraphNodeId(
           graph,
+          idOverrides,
           operation.source_id,
         );
+        const targetId = resolveGraphNodeId(
+          graph,
+          idOverrides,
+          operation.target_id,
+        );
+        if (sourceId === targetId || !activeMaterializedNode(graph, targetId)) {
+          break;
+        }
+        const sourceIndex = activeMaterializedNodeIndex(graph, sourceId);
         if (sourceIndex < 0) break;
         invalidateMaterializedNodeAt(graph, sourceIndex, patch);
         for (let index = 0; index < graph.edges.length; index += 1) {
           const edge = graph.edges[index];
           if (edge.valid_until_ms != null) continue;
           let next = edge;
-          if (next.source === operation.source_id) {
-            next = { ...next, source: operation.target_id };
+          if (next.source === sourceId) {
+            next = { ...next, source: targetId };
           }
-          if (next.target === operation.source_id) {
-            next = { ...next, target: operation.target_id };
+          if (next.target === sourceId) {
+            next = { ...next, target: targetId };
           }
           if (next.source === next.target) {
             graph.edges[index] = next;
             invalidateMaterializedEdgeAt(graph, index, patch);
-          } else if (
-            next.source === operation.target_id ||
-            next.target === operation.target_id
-          ) {
+          } else if (next.source === targetId || next.target === targetId) {
             graph.edges[index] = {
               ...next,
               updated_by_sequence: patch.sequence,
@@ -756,7 +891,8 @@ function applyProjectionGraphPatch(
       }
       case "split_graph_node": {
         if (operation.replacement_nodes.length < 2) break;
-        const index = activeMaterializedNodeIndex(graph, operation.id);
+        const id = resolveGraphNodeId(graph, idOverrides, operation.id);
+        const index = activeMaterializedNodeIndex(graph, id);
         if (index < 0) break;
         invalidateMaterializedNodeAt(graph, index, patch);
         for (
@@ -767,24 +903,24 @@ function applyProjectionGraphPatch(
           const edge = graph.edges[edgeIndex];
           if (
             edge.valid_until_ms == null &&
-            (edge.source === operation.id || edge.target === operation.id)
+            (edge.source === id || edge.target === id)
           ) {
             invalidateMaterializedEdgeAt(graph, edgeIndex, patch);
           }
         }
+        // Reuses the same name-based upsert as `upsert_graph_node` (seed
+        // audio-graph-e700), mirroring `MaterializedGraph::split_node`'s
+        // Rust implementation, which delegates its replacement inserts to
+        // `upsert_node` rather than a raw id-keyed insert.
         for (const replacement of operation.replacement_nodes) {
-          const next = projectionGraphPatchNode(
+          upsertMaterializedGraphNodeByName(
+            graph,
             patch,
             replacement.id,
             replacement.name,
             replacement.entity_type,
             replacement.description,
           );
-          const replacementIndex = graph.nodes.findIndex(
-            (node) => node.id === replacement.id,
-          );
-          if (replacementIndex >= 0) graph.nodes[replacementIndex] = next;
-          else graph.nodes.push(next);
         }
         break;
       }

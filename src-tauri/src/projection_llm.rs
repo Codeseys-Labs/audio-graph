@@ -451,6 +451,37 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
     fn nullable_string() -> serde_json::Value {
         json!({ "type": ["string", "null"] })
     }
+    // seed audio-graph-e700 sub-fix 1 (SCHEMA BINDING): `entity_type` is
+    // bound to `ontology::ENTITY_TYPES`'s closed ten-name enum at the
+    // schema level, so a schema-capable/strict-mode provider cannot emit an
+    // invented category at all — the field evidence behind this ticket
+    // measured 31 invented entity types in one session's projection graph.
+    // `relation_type` deliberately stays `string()` (see the plain
+    // `string()` calls on the `upsert_graph_edge` variant below): this
+    // ticket's own instruction was to investigate whether the ontology
+    // defines a CLOSED relation set before binding it the same way, and
+    // `RELATION_TYPES`'s own doc comment used to answer that with a
+    // self-contradiction (it opened "Closed set of relation types" and then
+    // immediately said the model "may emit another lowercase verb phrase
+    // when none fit"). Resolved in favor of NOT closed, confirmed against
+    // every actual caller (`extraction_system_prompt`'s prompt guidance and
+    // the absence of any downstream rejection of a novel relation string),
+    // and the doc comment on `RELATION_TYPES` has been corrected to match.
+    // Binding `relation_type` to an enum here would fabricate a closed
+    // relation ontology this ticket was explicitly told not to invent.
+    // Anything that still slips through this enum on a non-strict
+    // route (or a strict-mode provider that ignores it) is caught by the
+    // deterministic ingest-side fallback,
+    // `normalize_projection_patch_draft_ontology` below.
+    fn entity_type_enum() -> serde_json::Value {
+        json!({
+            "type": "string",
+            "enum": crate::ontology::ENTITY_TYPES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>(),
+        })
+    }
     fn string_array() -> serde_json::Value {
         json!({ "type": "array", "items": { "type": "string" } })
     }
@@ -509,7 +540,7 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
         "properties": {
             "id": string(),
             "name": string(),
-            "entity_type": string(),
+            "entity_type": entity_type_enum(),
             "description": nullable_string(),
         },
         "required": ["id", "name", "entity_type", "description"],
@@ -545,7 +576,7 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
                 &[
                     ("id", string()),
                     ("name", string()),
-                    ("entity_type", string()),
+                    ("entity_type", entity_type_enum()),
                     ("description", nullable_string()),
                     ("evidence", evidence()),
                 ],
@@ -615,12 +646,60 @@ pub fn parse_projection_patch_draft(
     expected_kind: &ProjectionKind,
     basis: &BTreeMap<&str, &TranscriptEvent>,
 ) -> Result<ProjectionPatchDraft, ProjectionPatchDraftError> {
-    let draft: ProjectionPatchDraft =
+    let mut draft: ProjectionPatchDraft =
         serde_json::from_str(raw).map_err(|error| ProjectionPatchDraftError::InvalidJson {
             error: error.to_string(),
         })?;
     validate_projection_patch_draft(&draft, expected_kind, basis)?;
+    // seed audio-graph-e700: normalize AFTER structural validation (so
+    // `require_non_empty`'s emptiness check still sees the model's raw
+    // string, not a fallback that would mask a genuinely empty field) and
+    // BEFORE the draft's operations are trusted into a persisted
+    // `ProjectionPatch` — every FRESH-ingest event this backend writes from
+    // here on carries a canonical `entity_type` and a soft-normalized
+    // `relation_type`, regardless of which route produced it (strict-schema
+    // enum binding above only covers the OpenRouter strict-mode schema; this
+    // catches everything else, including anything that slips past that
+    // enum). Never applied to replay — see `ontology::normalize_entity_type`
+    // and `normalize_projection_patch_draft_ontology`'s doc comments.
+    normalize_projection_patch_draft_ontology(&mut draft);
     Ok(draft)
+}
+
+/// Ingest-time ontology normalization for a freshly-parsed, structurally
+/// valid model draft (seed audio-graph-e700). See
+/// [`parse_projection_patch_draft`]'s call site for exactly when this runs.
+/// Deliberately NOT applied inside `MaterializedGraph::apply_patch` /
+/// replay: a session's pre-e700 events keep whatever free-string
+/// `entity_type`/`relation_type` values they were persisted with forever;
+/// replay never re-validates or rewrites historical operations (ADR-0045:
+/// "no accepted patch may be silently discarded"; "materialized state
+/// rebuilt from the accepted patch log" — materialization is a pure
+/// re-derivation from the accepted patch log, not a place that mutates that
+/// log's content. ADR-0029 is about a DIFFERENT thing — gating optional,
+/// separately-rebuildable query indexes on measured demand — and is not
+/// cited here).
+fn normalize_projection_patch_draft_ontology(draft: &mut ProjectionPatchDraft) {
+    for operation in &mut draft.operations {
+        match operation {
+            ProjectionOperation::UpsertGraphNode { entity_type, .. } => {
+                *entity_type = crate::ontology::normalize_entity_type(entity_type).to_string();
+            }
+            ProjectionOperation::UpsertGraphEdge { relation_type, .. } => {
+                *relation_type = crate::ontology::normalize_relation_type(relation_type);
+            }
+            ProjectionOperation::SplitGraphNode {
+                replacement_nodes, ..
+            } => {
+                for replacement in replacement_nodes {
+                    replacement.entity_type =
+                        crate::ontology::normalize_entity_type(&replacement.entity_type)
+                            .to_string();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn trusted_projection_patch_from_model_json(
@@ -1647,6 +1726,129 @@ mod tests {
         assert_eq!(patch.kind, ProjectionKind::Graph);
         assert_eq!(patch.operations.len(), 3);
         assert_eq!(patch.confidence, 0.76);
+    }
+
+    /// seed audio-graph-e700 sub-fix 1 (INGEST FALLBACK): a non-strict route
+    /// (or a strict-mode provider that ignored the wire enum) can still hand
+    /// `trusted_projection_patch_from_model_json` an invented `entity_type`.
+    /// The deterministic fallback (`ontology::normalize_entity_type`) must
+    /// rewrite it to a canonical ontology name in the TRUSTED patch that
+    /// actually gets persisted — never reject the whole patch over it, and
+    /// never leave the invented string riding through.
+    #[test]
+    fn ingest_normalizes_invented_entity_type_to_closed_ontology() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "The team evaluated Postgres."))
+            .unwrap();
+        let job = job(ProjectionKind::Graph, &ledger);
+        let raw = serde_json::json!({
+            "operations": [{
+                "type": "upsert_graph_node",
+                "id": "node1",
+                "name": "Postgres",
+                "entity_type": "Provider",
+                "description": null,
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+            }]
+        })
+        .to_string();
+
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect("invented entity_type must not be rejected outright");
+
+        assert!(matches!(
+            patch.operations.first(),
+            Some(ProjectionOperation::UpsertGraphNode { entity_type, .. })
+                if entity_type == "Product"
+        ));
+    }
+
+    /// Companion negative case: an entity_type that already matches the
+    /// closed ontology (any case) must pass through unchanged in shape (only
+    /// case-canonicalized), proving the fallback does not perturb already-
+    /// valid model output.
+    #[test]
+    fn ingest_preserves_already_canonical_entity_type() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice is a person."))
+            .unwrap();
+        let job = job(ProjectionKind::Graph, &ledger);
+        let raw = serde_json::json!({
+            "operations": [{
+                "type": "upsert_graph_node",
+                "id": "person:alice",
+                "name": "Alice",
+                "entity_type": "person",
+                "description": null,
+                "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+            }]
+        })
+        .to_string();
+
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect("valid patch");
+
+        assert!(matches!(
+            patch.operations.first(),
+            Some(ProjectionOperation::UpsertGraphNode { entity_type, .. })
+                if entity_type == "Person"
+        ));
+    }
+
+    /// seed audio-graph-e700 (RELATION TYPES): `relation_type` is NOT bound
+    /// to a closed enum (ontology.rs's `RELATION_TYPES` is explicitly open),
+    /// but surface-form variance (case/punctuation/whitespace) must still
+    /// collapse at ingest so `"Works At"` and `"works_at"` land on the SAME
+    /// persisted string.
+    #[test]
+    fn ingest_soft_normalizes_relation_type_surface_form() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice works with Bob."))
+            .unwrap();
+        let job = job(ProjectionKind::Graph, &ledger);
+        let raw = serde_json::json!({
+            "operations": [
+                {
+                    "type": "upsert_graph_node",
+                    "id": "person:alice",
+                    "name": "Alice",
+                    "entity_type": "person",
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                },
+                {
+                    "type": "upsert_graph_node",
+                    "id": "person:bob",
+                    "name": "Bob",
+                    "entity_type": "person",
+                    "description": null,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                },
+                {
+                    "type": "upsert_graph_edge",
+                    "id": "edge:alice:bob",
+                    "source": "person:alice",
+                    "target": "person:bob",
+                    "relation_type": "Works With!!",
+                    "label": null,
+                    "weight": 0.5,
+                    "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+                }
+            ]
+        })
+        .to_string();
+
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+            .expect("valid patch");
+
+        assert!(matches!(
+            patch.operations.last(),
+            Some(ProjectionOperation::UpsertGraphEdge { relation_type, .. })
+                if relation_type == "works_with"
+        ));
     }
 
     #[test]

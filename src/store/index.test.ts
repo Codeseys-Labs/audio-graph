@@ -2110,6 +2110,322 @@ describe("AudioGraphStore", () => {
     ).toEqual(["other", "target-a", "target-b"]);
   });
 
+  // seed audio-graph-e700 sub-fix 2 (UPSERT KEYING): mirrors the Rust
+  // `upsert_collision_same_model_id_different_names_does_not_merge` test —
+  // the live incremental view must resolve the SAME collision the same way
+  // a replayed session's `MaterializedGraph::apply_patch` does.
+  it("does not merge two different names that collide on the same raw model id across ticks", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Alice",
+          entity_type: "Person",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Bob",
+          entity_type: "Person",
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    const activeNodes = graph?.nodes.filter(
+      (node) => node.valid_until_ms == null,
+    );
+    expect(activeNodes?.map((node) => node.name).sort()).toEqual([
+      "Alice",
+      "Bob",
+    ]);
+    const alice = activeNodes?.find((node) => node.name === "Alice");
+    const bob = activeNodes?.find((node) => node.name === "Bob");
+    expect(alice?.id).toBe("node1");
+    expect(bob?.id).toBe("node1~2");
+  });
+
+  // seed audio-graph-e700 sub-fix 3 (FUZZY RESOLUTION): mirrors the Rust
+  // `fuzzy_resolution_merges_near_duplicate_entity_names_across_ids` test.
+  it("merges a near-duplicate entity name minted under a different id across ticks", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "product-1",
+          name: "Postgres",
+          entity_type: "Product",
+          description: "A relational database.",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "product-7",
+          name: "PostgreSQL",
+          entity_type: "Product",
+          description: "Open-source object-relational database.",
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    const activeNodes = graph?.nodes.filter(
+      (node) => node.valid_until_ms == null,
+    );
+    expect(activeNodes).toHaveLength(1);
+    expect(activeNodes?.[0]).toMatchObject({
+      id: "product-1",
+      name: "PostgreSQL",
+      description: "Open-source object-relational database.",
+    });
+  });
+
+  // seed audio-graph-e700 REPLAY COMPATIBILITY: mirrors the Rust
+  // `resurrection_after_invalidate_keeps_the_same_id_for_later_cross_patch_reference`
+  // test — a raw id that was invalidated and then re-upserted under the SAME
+  // id must resurrect in place, not fork, so a LATER, separate patch's raw-id
+  // reference (an edge here) still resolves.
+  it("resurrects an invalidated node under its original id for a later cross-patch edge reference", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Alice",
+          entity_type: "Person",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "node2",
+          name: "Roadmap",
+          entity_type: "Topic",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [{ type: "invalidate_graph_node", id: "node1" }]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(3, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Alice",
+          entity_type: "Person",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(4, [
+        {
+          type: "upsert_graph_edge",
+          id: "edge1",
+          source: "node1",
+          target: "node2",
+          relation_type: "discussed",
+          label: null,
+          weight: 0.5,
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(
+      graph?.nodes.filter((n) => n.valid_until_ms == null).map((n) => n.id),
+    ).toEqual(expect.arrayContaining(["node1", "node2"]));
+    expect(graph?.nodes).toHaveLength(2);
+    expect(graph?.edges.find((e) => e.id === "edge1")?.source).toBe("node1");
+  });
+
+  // seed audio-graph-e700 REPLAY COMPATIBILITY: mirrors the Rust
+  // `cross_patch_reference_to_a_fuzzy_absorbed_raw_id_resolves_via_persistent_alias`
+  // test — a raw id fuzzy-absorbed into a DIFFERENT node's id never gets a
+  // row of its own, so a LATER, separate patch referencing that raw id must
+  // resolve through the persisted `id_aliases`, not fail.
+  it("resolves a later cross-patch reference to a fuzzy-absorbed raw id via the persisted alias", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "n1",
+          name: "Postgres",
+          entity_type: "Product",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "n20",
+          name: "Deployment",
+          entity_type: "Topic",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "n7",
+          name: "PostgreSQL",
+          entity_type: "Product",
+        },
+      ]),
+    );
+
+    let graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(graph?.nodes.some((n) => n.id === "n7")).toBe(false);
+    expect(graph?.id_aliases?.n7).toBe("n1");
+
+    store.addProjectionPatch(
+      graphProjectionPatch(3, [
+        {
+          type: "upsert_graph_edge",
+          id: "edge1",
+          source: "n7",
+          target: "n20",
+          relation_type: "used_for",
+          label: null,
+          weight: 0.5,
+        },
+      ]),
+    );
+
+    graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(graph?.edges.find((e) => e.id === "edge1")?.source).toBe("n1");
+  });
+
+  // seed audio-graph-e700 REPLAY COMPATIBILITY: mirrors the Rust
+  // `same_patch_merge_into_its_own_fuzzy_absorption_target_is_a_no_op` test
+  // (and pins the TS `sourceId === targetId` guard the Rust side lacked).
+  it("treats a same-patch merge into its own fuzzy absorption target as a no-op", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "n1",
+          name: "Postgres",
+          entity_type: "Product",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "n7",
+          name: "PostgreSQL",
+          entity_type: "Product",
+        },
+        {
+          type: "merge_graph_nodes",
+          source_id: "n7",
+          target_id: "n1",
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    const active = graph?.nodes.filter((n) => n.valid_until_ms == null);
+    expect(active).toHaveLength(1);
+    expect(active?.[0].id).toBe("n1");
+  });
+
+  // seed audio-graph-e700 (reviewer finding 3): mirrors the Rust
+  // `same_patch_displaced_upsert_cross_reference_lands_on_the_disambiguated_id`
+  // test — a same-patch reference to a raw id displaced by a tier-3
+  // disambiguation (collision with an unrelated PRE-EXISTING node) must
+  // follow THIS patch's own displacement, not the pre-existing node that
+  // still literally owns the id.
+  it("resolves a same-patch reference to a displaced upsert onto the disambiguated id", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Alice",
+          entity_type: "Person",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "topic:standup",
+          name: "Standup",
+          entity_type: "Topic",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Bob",
+          entity_type: "Person",
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge1",
+          source: "node1",
+          target: "topic:standup",
+          relation_type: "discussed",
+          label: null,
+          weight: 0.5,
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    const bob = graph?.nodes.find((n) => n.name === "Bob");
+    expect(bob?.id).toBe("node1~2");
+    expect(graph?.edges.find((e) => e.id === "edge1")?.source).toBe("node1~2");
+  });
+
+  // Reviewer finding (major, disclosed trade-off): mirrors the Rust
+  // `cross_patch_reference_after_a_collision_binds_to_the_first_occupant_not_the_latest`
+  // test — a LATER, separate patch's raw-id reference after a collision
+  // binds to the FIRST occupant of that literal id, not the
+  // most-recently-written entity. Pinned so a future change to this
+  // semantic is deliberate.
+  it("binds a later cross-patch reference after a collision to the first occupant, not the latest", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Alice",
+          entity_type: "Person",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "node1",
+          name: "Bob",
+          entity_type: "Person",
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(3, [{ type: "invalidate_graph_node", id: "node1" }]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    const alice = graph?.nodes.find((n) => n.name === "Alice");
+    const bob = graph?.nodes.find((n) => n.name === "Bob");
+    expect(alice?.valid_until_ms).not.toBeNull();
+    expect(bob?.valid_until_ms).toBeNull();
+  });
+
   it("invalidate_graph_edge retcon stamps valid_until_ms so the render view hides the edge (9d93)", () => {
     const store = useAudioGraphStore.getState();
     store.addProjectionPatch(
