@@ -160,6 +160,16 @@ pub struct DeepgramConfig {
     pub eager_eot_threshold: Option<f32>,
     /// Flux maximum silence before forcing `EndOfTurn`.
     pub eot_timeout_ms: Option<u32>,
+    /// Domain vocabulary to bias transcription toward (Deepgram "Keyterm
+    /// Prompting"), e.g. project jargon or proper nouns the ASR otherwise
+    /// mishears. Connection-time only — Deepgram keyterms are a `v1/listen`
+    /// URL query param, so they must be known before the socket opens; there
+    /// is no mechanism to add a keyterm mid-session without reconnecting
+    /// (audio-graph-6470 seam analysis). Empty by default (no bias applied).
+    /// Sent ONLY on the v1/Nova branch of [`deepgram_listen_url`] — nothing in
+    /// this codebase establishes that the v2/Flux endpoint accepts keyterms
+    /// (see the comment on that branch), so it is never forwarded there.
+    pub keyterms: Vec<String>,
     /// Runtime privacy guard for session audio egress.
     pub content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
@@ -179,6 +189,9 @@ impl std::fmt::Debug for DeepgramConfig {
             .field("eot_threshold", &self.eot_threshold)
             .field("eager_eot_threshold", &self.eager_eot_threshold)
             .field("eot_timeout_ms", &self.eot_timeout_ms)
+            // Keyterm VALUES are derived from user session/domain content and
+            // must never be logged — only the count (audio-graph-6470).
+            .field("keyterms_count", &self.keyterms.len())
             .field("content_egress_policy", &self.content_egress_policy)
             .finish()
     }
@@ -746,6 +759,15 @@ const DEEPGRAM_AUTH_FAILED_MESSAGE: &str = "Deepgram authentication failed (401)
 /// config) — `model` is a required enum on `v1/listen`, so a value outside it
 /// is a 400, not a 401. Extracted as a constant so the unit test asserts the
 /// exact user-visible string.
+///
+/// KNOWN GAP (audio-graph-6470): the `keyterm` query params added by the
+/// keyterm-prompting seam are also a plausible (if defensively capped —
+/// see [`DEEPGRAM_MAX_KEYTERMS`]) contributor to a 400 on this same upgrade
+/// (e.g. a term Deepgram rejects). This message still names only `model`;
+/// widening the user-visible copy to cover keyterms was left out of this
+/// change to avoid unnecessary user-facing string churn for what should now
+/// be a rare case post-cap, but a future edit touching this message should
+/// account for that second cause.
 const DEEPGRAM_BAD_REQUEST_MESSAGE: &str = "Deepgram rejected the request (400): invalid or unsupported model. Reselect a model in Settings";
 
 /// Classify a tungstenite connect error into a typed, actionable message.
@@ -947,6 +969,47 @@ pub(crate) fn sanitize_deepgram_model(model: &str) -> String {
     DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string()
 }
 
+/// Defensive cap on the number of `keyterm` params sent in a single
+/// `v1/listen` URL (audio-graph-6470). This is NOT Deepgram's documented
+/// keyterm limit — nothing in this repo establishes what that is, or
+/// whether one exists — it exists purely as a URL-length safety margin. A
+/// review probe with 500 hostile keyterms produced a 43k-character `wss`
+/// URL; HTTP front ends commonly reject request targets above roughly
+/// 8-16KB (`414`/`431`), which [`classify_connect_error`] has no arm for and
+/// which would otherwise surface as an opaque "WebSocket connect failed".
+/// 100 terms is a generous ceiling for a hand-curated domain glossary while
+/// keeping the worst case comfortably under that range.
+const DEEPGRAM_MAX_KEYTERMS: usize = 100;
+
+/// Encode set for [`encode_deepgram_keyterm`]: percent-encode everything
+/// except RFC 3986 §2.3 "unreserved" characters (`ALPHA / DIGIT / "-" / "."
+/// / "_" / "~"`). Starting from `NON_ALPHANUMERIC` and punching the four
+/// unreserved punctuation characters back out keeps ordinary hyphenated /
+/// dotted terms (`"KV-cache"`, product names) readable in the URL, while
+/// everything query-structurally dangerous (`&`, `=`, `#`, `/`, `?`, `+`,
+/// whitespace, quotes, non-ASCII) still gets encoded.
+const DEEPGRAM_KEYTERM_ENCODE_SET: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+
+/// Percent-encode a single Deepgram `keyterm` value for the listen-URL query
+/// string (audio-graph-6470).
+///
+/// Uses RFC 3986 percent-encoding (`%20` for space) rather than
+/// `url::Url::query_pairs_mut`'s `application/x-www-form-urlencoded`
+/// serialization (`+` for space): this is a hand-built query string appended
+/// to a raw WebSocket URI, not an HTML form submission, and the
+/// websocket/HTTP libraries parsing it on both ends follow RFC 3986, not the
+/// legacy forms convention. [`DEEPGRAM_KEYTERM_ENCODE_SET`] guarantees
+/// delimiter characters a hostile keyterm might contain (`&`, `=`, `#`,
+/// whitespace, non-ASCII) can never be misparsed as query-string structure.
+fn encode_deepgram_keyterm(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, DEEPGRAM_KEYTERM_ENCODE_SET).to_string()
+}
+
 fn deepgram_listen_url(config: &DeepgramConfig) -> String {
     // Sanitize at the last possible moment so the URL can NEVER carry an
     // invalid `model` (e.g. a stale `general`) regardless of how the config was
@@ -959,13 +1022,50 @@ fn deepgram_listen_url(config: &DeepgramConfig) -> String {
             "wss://api.deepgram.com/v2/listen?encoding=linear16&sample_rate=16000&channels=1&model={model}"
         )
     } else {
+        // `smart_format` (paragraphs/punctuation/entity formatting) and
+        // `numerals` (digit formatting) are added here per audio-graph-6470:
+        // production connections were sending neither, and a field-measured
+        // session showed 18% of segments confidently garbled as a result.
+        // Unlike the Flux-branch comment below, this is NOT backed by an
+        // in-repo audit doc — `git grep -i 'smart_format|numerals'` across
+        // docs/ and research/ returns nothing. The claim that `smart_format`
+        // layers on top of (rather than conflicts with) `punctuate=true`,
+        // still yielding sentence punctuation, is recalled Deepgram-API
+        // knowledge, not something this repo has fetched and recorded — same
+        // disclosure standard as the keyterm repeat-param convention below.
+        // What IS repo-verified: the existing Deepgram fixture-replay tests
+        // and the audio-graph-4aed multi-speaker-split tests pass unmodified
+        // with these params added, so canned transcript payloads parse the
+        // same either way (parser tolerance, not a live-API guarantee).
         format!(
-            "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model={}&interim_results=true&diarize={}&punctuate=true",
+            "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model={}&interim_results=true&diarize={}&punctuate=true&smart_format=true&numerals=true",
             model, config.enable_diarization
         )
     };
 
     if is_flux {
+        // Flux (v2/listen) does NOT get `smart_format`/`numerals`/`keyterm`.
+        // This is an evidenced omission, not an oversight: the prior fetched-
+        // docs audit (`docs/plans/2026-07-02-provider-api-audit.md` §3.3) found
+        // that Deepgram's `listen-flux` reference documents ONLY
+        // `encoding`+`sample_rate` for raw audio plus the turn-detection family
+        // (`eot_threshold`/`eager_eot_threshold`/`eot_timeout_ms`) — the same
+        // audit flagged this branch's undocumented `channels=1` as a separate
+        // benign nit (backlog P2-4). Nothing in this repo's comments, tests, or
+        // that audit establishes Flux support for formatting or keyterm
+        // params, so none are added here rather than guessed at.
+        //
+        // A configured-but-silently-dropped glossary is otherwise invisible
+        // to the user (no UI surfaces `keyterms` yet — audio-graph-6470), so
+        // log a COUNT-only warning; keyterm VALUES are user/domain content
+        // and must never be logged.
+        if !config.keyterms.is_empty() {
+            log::warn!(
+                "Deepgram: {} configured keyterm(s) are NOT sent on the Flux (v2/listen) \
+                 connection — keyterm prompting is only established as supported on v1/listen",
+                config.keyterms.len()
+            );
+        }
         if let Some(threshold) = config.eot_threshold {
             url.push_str(&format!("&eot_threshold={threshold}"));
         }
@@ -984,6 +1084,45 @@ fn deepgram_listen_url(config: &DeepgramConfig) -> String {
         }
         if config.vad_events {
             url.push_str("&vad_events=true");
+        }
+        // Deepgram "Keyterm Prompting" (audio-graph-6470 keyterm seam): the
+        // documented convention is to repeat the `keyterm` query param once
+        // per term — NOT a single comma-joined value — so each is appended as
+        // its own `&keyterm=<value>` pair, individually percent-encoded
+        // (hostile values: spaces, punctuation, unicode). Blank entries
+        // (empty or whitespace-only, e.g. from a stray config line) are
+        // skipped defensively rather than sent as a meaningless empty term.
+        // Connection-time only, per [`DeepgramConfig::keyterms`]'s doc comment
+        // — no reconnect-on-new-keyterm mechanism exists or is being added.
+        //
+        // KNOWN GAP (not guessed at): this loop runs for every valid v1
+        // family (`nova-3`, `nova-2`, `nova`, `enhanced`, `base` — see
+        // [`DEEPGRAM_STREAMING_MODEL_FAMILIES`]), not just `nova-3`. Nothing
+        // in this repo's docs/tests establishes whether Deepgram's Keyterm
+        // Prompting is `nova-3`-only or applies to the whole v1 family, so
+        // — same standard as the Flux omission above — no per-family gating
+        // is added without repo evidence either way. Flagged as a follow-up
+        // to verify against Deepgram's docs, not fixed here.
+        //
+        // [`DEEPGRAM_MAX_KEYTERMS`] caps how many entries are actually sent —
+        // a URL-length safety margin, not Deepgram's documented limit (see
+        // that constant's doc comment). Truncation is logged as a COUNT
+        // only; keyterm VALUES are user/domain content and must never be
+        // logged.
+        if config.keyterms.len() > DEEPGRAM_MAX_KEYTERMS {
+            log::warn!(
+                "Deepgram: keyterm list has {} entries, only sending the first {} \
+                 (URL-length safety cap, audio-graph-6470)",
+                config.keyterms.len(),
+                DEEPGRAM_MAX_KEYTERMS
+            );
+        }
+        for term in config.keyterms.iter().take(DEEPGRAM_MAX_KEYTERMS) {
+            if term.trim().is_empty() {
+                continue;
+            }
+            url.push_str("&keyterm=");
+            url.push_str(&encode_deepgram_keyterm(term));
         }
     }
 
@@ -2077,6 +2216,7 @@ mod tests {
             eot_threshold: Some(0.5),
             eager_eot_threshold: None,
             eot_timeout_ms: None,
+            keyterms: Vec::new(),
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         }
     }
@@ -2098,6 +2238,26 @@ mod tests {
         assert!(debug.contains("<present>"));
         assert!(debug.contains("nova-3"));
         assert!(debug.contains("endpointing_ms"));
+    }
+
+    #[test]
+    fn deepgram_config_debug_never_leaks_keyterm_values() {
+        // Keyterm VALUES are user/domain content and must never be logged —
+        // only the count (audio-graph-6470, project-wide logging rule).
+        let mut config = test_config("nova-3");
+        config.keyterms = vec![
+            "dg-debug-keyterm-secret".to_string(),
+            "another sensitive term".to_string(),
+        ];
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("dg-debug-keyterm-secret"));
+        assert!(!debug.contains("another sensitive term"));
+        assert!(
+            debug.contains("keyterms_count: 2"),
+            "debug output should retain the keyterm COUNT: {debug}"
+        );
     }
 
     #[test]
@@ -2419,6 +2579,199 @@ mod tests {
         let flux = deepgram_listen_url(&test_config("flux-general-en"));
         assert!(flux.contains("model=flux-general-en"));
         assert!(flux.starts_with("wss://api.deepgram.com/v2/listen?"));
+    }
+
+    #[test]
+    fn listen_url_v1_includes_smart_format_and_numerals() {
+        // audio-graph-6470 fix: the v1/Nova branch must carry both new
+        // formatting params. MUTATION CHECK: reverting either
+        // `&smart_format=true` or `&numerals=true` in `deepgram_listen_url`
+        // makes this test fail — each assertion below checks a substring
+        // that only that literal can produce, so dropping either param from
+        // the format string is directly observable here, no external record
+        // needed.
+        let url = deepgram_listen_url(&test_config("nova-3"));
+        assert!(
+            url.contains("smart_format=true"),
+            "v1 URL must request smart_format: {url}"
+        );
+        assert!(
+            url.contains("numerals=true"),
+            "v1 URL must request numerals: {url}"
+        );
+        // Must still carry the pre-existing punctuate=true (smart_format is
+        // additive, not a replacement — see the builder's comment).
+        assert!(url.contains("punctuate=true"), "must keep punctuate: {url}");
+        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"));
+    }
+
+    #[test]
+    fn listen_url_flux_omits_formatting_and_keyterm_params() {
+        // Flux (v2/listen) gets NEITHER the new formatting params NOR
+        // keyterms — nothing in this codebase establishes Flux support for
+        // either (see the builder's Flux-branch comment citing the
+        // 2026-07-02 provider-api audit). Even with keyterms configured, none
+        // must leak onto the v2 URL.
+        let mut config = test_config("flux-general-en");
+        config.keyterms = vec!["KV cache".to_string()];
+        let url = deepgram_listen_url(&config);
+        assert!(url.starts_with("wss://api.deepgram.com/v2/listen?"));
+        assert!(
+            !url.contains("smart_format"),
+            "flux must omit smart_format: {url}"
+        );
+        assert!(!url.contains("numerals"), "flux must omit numerals: {url}");
+        assert!(!url.contains("keyterm"), "flux must omit keyterm: {url}");
+    }
+
+    #[test]
+    fn listen_url_v1_appends_one_keyterm_param_per_term() {
+        // Deepgram's Keyterm Prompting convention repeats the query param
+        // once per term — it is NOT comma-joined into a single value. A
+        // comma-joined value would be sent to Deepgram as one literal
+        // (mis-parsed) keyterm string instead of N separate terms.
+        let mut config = test_config("nova-3");
+        config.keyterms = vec!["KV cache".to_string(), "transformer".to_string()];
+        let url = deepgram_listen_url(&config);
+        assert_eq!(
+            url.matches("&keyterm=").count(),
+            2,
+            "expected one &keyterm= per term, not comma-joined: {url}"
+        );
+        assert!(
+            url.contains("keyterm=KV%20cache"),
+            "first term missing/wrong: {url}"
+        );
+        assert!(
+            url.contains("keyterm=transformer"),
+            "second term missing: {url}"
+        );
+    }
+
+    #[test]
+    fn listen_url_v1_omits_keyterm_param_when_none_configured() {
+        // Default config (empty keyterms) must not add a dangling `&keyterm=`
+        // with no value — the param is entirely absent, not present-but-empty.
+        let url = deepgram_listen_url(&test_config("nova-3"));
+        assert!(
+            !url.contains("keyterm"),
+            "no keyterm param expected when the list is empty: {url}"
+        );
+    }
+
+    #[test]
+    fn listen_url_v1_skips_blank_keyterm_entries() {
+        // A blank/whitespace-only entry (e.g. a stray empty config line) is
+        // dropped rather than sent as a meaningless empty term.
+        let mut config = test_config("nova-3");
+        config.keyterms = vec!["".to_string(), "   ".to_string(), "real-term".to_string()];
+        let url = deepgram_listen_url(&config);
+        assert_eq!(
+            url.matches("&keyterm=").count(),
+            1,
+            "blank entries must be skipped: {url}"
+        );
+        assert!(url.contains("keyterm=real-term"));
+    }
+
+    #[test]
+    fn listen_url_v1_clamps_keyterm_count_and_stays_well_formed() {
+        // Pin the URL-length safety cap (audio-graph-6470 review finding):
+        // an oversized glossary must be truncated to DEEPGRAM_MAX_KEYTERMS
+        // entries rather than producing an unbounded (and potentially
+        // server-rejected) URL. Also re-verify well-formedness at this size
+        // — the same "every query pair has exactly one '='" property a
+        // reviewer probed manually at 500 entries.
+        let mut config = test_config("nova-3");
+        config.keyterms = (0..(DEEPGRAM_MAX_KEYTERMS + 50))
+            .map(|i| format!("term-{i}"))
+            .collect();
+        let url = deepgram_listen_url(&config);
+        assert_eq!(
+            url.matches("&keyterm=").count(),
+            DEEPGRAM_MAX_KEYTERMS,
+            "oversized keyterm list must be clamped to the safety cap: {url}"
+        );
+        // The clamp keeps the FIRST N terms, not an arbitrary subset.
+        assert!(url.contains("keyterm=term-0"));
+        assert!(url.contains(&format!("keyterm=term-{}", DEEPGRAM_MAX_KEYTERMS - 1)));
+        assert!(
+            !url.contains(&format!("keyterm=term-{DEEPGRAM_MAX_KEYTERMS}")),
+            "the (N+1)th term must be dropped by the clamp: {url}"
+        );
+        let query = url.split_once('?').expect("URL must have a query string").1;
+        for pair in query.split('&') {
+            assert_eq!(
+                pair.matches('=').count(),
+                1,
+                "every query pair must have exactly one '=': {pair:?} in {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_deepgram_keyterm_percent_encodes_hostile_values() {
+        // Direct unit coverage of the encoder against hostile inputs: spaces,
+        // query/URI-structural delimiters, quotes, and non-ASCII text. Every
+        // case must round-trip losslessly through percent-decoding.
+        let hostile = [
+            "KV cache",
+            "R&D",
+            "a=b",
+            "100%",
+            "C#",
+            "\"quoted\"",
+            "café",
+            "日本語",
+            "a+b",
+            "tab\there",
+        ];
+        for value in hostile {
+            let encoded = encode_deepgram_keyterm(value);
+            // The delimiter characters that would corrupt a query string must
+            // never appear literally in the encoded output.
+            for structural in ['&', '=', '#', ' '] {
+                assert!(
+                    !encoded.contains(structural),
+                    "encoded keyterm must not contain raw {structural:?}: {value:?} -> {encoded:?}"
+                );
+            }
+            let decoded = percent_encoding::percent_decode_str(&encoded)
+                .decode_utf8()
+                .unwrap_or_else(|e| panic!("decode failed for {value:?} -> {encoded:?}: {e}"));
+            assert_eq!(
+                decoded, value,
+                "percent-decoding the encoded keyterm must losslessly recover the original"
+            );
+        }
+    }
+
+    #[test]
+    fn listen_url_percent_encodes_hostile_keyterm_end_to_end() {
+        // End-to-end through the URL builder: a hostile keyterm value must
+        // come back out of the URL, percent-decoded, unchanged — and must
+        // never split the query string into extra bogus params.
+        let mut config = test_config("nova-3");
+        config.keyterms = vec!["R&D team's \"KV cache\" (café)".to_string()];
+        let url = deepgram_listen_url(&config);
+
+        let query = url.split_once('?').expect("URL must have a query string").1;
+        let pairs: Vec<&str> = query.split('&').collect();
+        let keyterm_pairs: Vec<&str> = pairs
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with("keyterm="))
+            .collect();
+        assert_eq!(
+            keyterm_pairs.len(),
+            1,
+            "a hostile value must not fragment into multiple query pairs: {query}"
+        );
+        let encoded_value = keyterm_pairs[0].strip_prefix("keyterm=").unwrap();
+        let decoded = percent_encoding::percent_decode_str(encoded_value)
+            .decode_utf8()
+            .expect("decode");
+        assert_eq!(decoded, "R&D team's \"KV cache\" (café)");
     }
 
     #[test]
@@ -4564,6 +4917,7 @@ mod tests {
             eot_threshold: None,
             eager_eot_threshold: None,
             eot_timeout_ms: None,
+            keyterms: Vec::new(),
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         };
 

@@ -522,6 +522,14 @@ function ExpressSetup({
           api_key: "",
           model: "nova-3",
           enable_diarization: true,
+          // Preserve any keyterm glossary already in config.yaml
+          // (audio-graph-6470: config-file-only field, no UI here). This is
+          // a whole-struct write — omitting it would wipe a hand-edited
+          // glossary the next time Quick Setup is re-run.
+          keyterms:
+            settings?.asr_provider.type === "deepgram"
+              ? (settings.asr_provider.keyterms ?? [])
+              : [],
         };
       case "assemblyai":
         return {

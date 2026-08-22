@@ -132,6 +132,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             AsrProvider::AssemblyAI {
                 api_key: String::new(),
@@ -274,6 +275,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 0,
+            keyterms: vec![],
         };
         let llm = LlmProvider::OpenRouter {
             model: "openai/gpt-4.1-mini".to_string(),

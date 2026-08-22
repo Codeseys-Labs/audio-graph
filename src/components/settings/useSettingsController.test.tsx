@@ -904,6 +904,12 @@ function deepgramSettings(): AppSettings {
       eager_eot_threshold: 0.4,
       eot_timeout_ms: 7000,
       max_speakers: 4,
+      // Non-empty on purpose (audio-graph-6470 regression coverage): this
+      // field has no Settings UI control, so the ONLY way it can survive a
+      // Save is a direct passthrough from the previously-loaded value. An
+      // empty default here would let a dropped-field bug hide behind a
+      // vacuously-true `[] === []` comparison.
+      keyterms: ["KV cache", "Deepgram"],
     },
     diarization: {
       mode: "provider",
@@ -965,6 +971,12 @@ describe("useSettingsController — provider selection/config round-trip", () =>
       eager_eot_threshold: 0.4,
       eot_timeout_ms: 7000,
       max_speakers: 4,
+      // Regression coverage for audio-graph-6470: the config-file-only
+      // keyterm glossary has no UI control, so it must be preserved
+      // verbatim by a direct passthrough — NOT silently dropped to `[]`
+      // the way this Save path used to drop `demo_mode`/`analytics_enabled`
+      // before those got the same passthrough treatment.
+      keyterms: ["KV cache", "Deepgram"],
     });
   });
 

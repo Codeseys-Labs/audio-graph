@@ -272,6 +272,11 @@ tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 base64 = "0.22"
 futures-util = "0.3"
 url = "2"
+# RFC 3986 percent-encoding for manually-built query-string values (Deepgram
+# `keyterm` params — audio-graph-6470). Already resolved transitively via
+# `url`; declared directly since we call it ourselves rather than only
+# through `url::Url`'s own (form-encoded, `+`-for-space) query builder.
+percent-encoding = "2"
 
 # Transitive `time` floor pin (ac5d — build reproducibility).
 # `cookie 0.18.1` (pulled in transitively via reqwest/tower-cookies/tauri) calls

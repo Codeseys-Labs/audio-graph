@@ -223,6 +223,17 @@ pub enum AsrProvider {
         /// most-recently-seen in-range speaker. `0` = no cap (raw Deepgram).
         #[serde(default = "default_max_speakers")]
         max_speakers: u32,
+        /// Domain vocabulary to bias transcription toward (Deepgram "Keyterm
+        /// Prompting" — audio-graph-6470). Connection-time only: Deepgram
+        /// keyterms are a `v1/listen` URL query param, so they must be known
+        /// before the socket opens. There is deliberately no mechanism here
+        /// to grow this list from session/graph content mid-session (that
+        /// would need a reconnect-to-update-keyterms design, tracked as a
+        /// follow-up, not built here) — this is a static, user- or
+        /// config-supplied glossary only. Empty by default (no bias applied).
+        /// No UI control yet; config-file-only until a Settings hook exists.
+        #[serde(default)]
+        keyterms: Vec<String>,
     },
     #[serde(rename = "assemblyai")]
     AssemblyAI {
@@ -322,6 +333,7 @@ impl std::fmt::Debug for AsrProvider {
                 eager_eot_threshold,
                 eot_timeout_ms,
                 max_speakers,
+                keyterms,
             } => f
                 .debug_struct("DeepgramStreaming")
                 .field(
@@ -337,6 +349,9 @@ impl std::fmt::Debug for AsrProvider {
                 .field("eager_eot_threshold", eager_eot_threshold)
                 .field("eot_timeout_ms", eot_timeout_ms)
                 .field("max_speakers", max_speakers)
+                // Keyterm VALUES are user/domain content — never logged, only
+                // the count (audio-graph-6470).
+                .field("keyterms_count", &keyterms.len())
                 .finish(),
             Self::AssemblyAI {
                 api_key,
@@ -2507,6 +2522,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 0,
+                keyterms: vec![],
             }
             .requires_cloud_content_transfer()
         );
@@ -2633,6 +2649,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 0,
+            keyterms: vec![],
         };
         let report = deepgram.apply_diarization_settings(&DiarizationSettings {
             mode: DiarizationMode::Hybrid,
@@ -2671,6 +2688,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 5,
+            keyterms: vec![],
         };
         // Provider mode keeps enable_diarization true; Auto speaker count returns
         // the provider's own cap verbatim — the user's cap of 5 is honored.
@@ -2745,6 +2763,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 6,
+            keyterms: vec![],
         };
         // Off mode disables provider diarization; Fixed(2) also re-caps.
         let report = deepgram.apply_diarization_settings(&DiarizationSettings {
@@ -2860,9 +2879,17 @@ mod tests {
                 eager_eot_threshold: 0.5,
                 eot_timeout_ms: 1200,
                 max_speakers: 0,
+                // Keyterm VALUES are user/domain content and must never
+                // appear in Debug output — only their count (audio-graph-6470).
+                keyterms: vec!["dg-debug-keyterm-secret".to_string()],
             },
-            &["dg-asr-secret"],
-            &["DeepgramStreaming", "nova-3", "max_speakers"],
+            &["dg-asr-secret", "dg-debug-keyterm-secret"],
+            &[
+                "DeepgramStreaming",
+                "nova-3",
+                "max_speakers",
+                "keyterms_count",
+            ],
         );
         assert_debug_redacts(
             &AsrProvider::AssemblyAI {
@@ -3220,6 +3247,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 2,
+                keyterms: vec![],
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.openai.com/v1".into(),
@@ -4154,6 +4182,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             ..AppSettings::default()
         };
@@ -4473,6 +4502,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 2,
+                keyterms: vec![],
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.groq.com/openai/v1".into(),
@@ -4730,6 +4760,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 5000,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             ..AppSettings::default()
         };
@@ -4768,6 +4799,7 @@ mod tests {
                     eager_eot_threshold: 0.0,
                     eot_timeout_ms: 5000,
                     max_speakers: 0,
+                    keyterms: vec![],
                 },
                 ..AppSettings::default()
             }
@@ -4839,6 +4871,7 @@ mod tests {
                 eager_eot_threshold: 0.4,
                 eot_timeout_ms: 7000,
                 max_speakers: 4,
+                keyterms: vec!["KV cache".to_string(), "Deepgram".to_string()],
             },
             ..AppSettings::default()
         };
@@ -4860,6 +4893,7 @@ mod tests {
                 eager_eot_threshold,
                 eot_timeout_ms,
                 max_speakers,
+                keyterms,
             } => {
                 assert!(api_key.is_empty(), "api_key must never round-trip");
                 assert_eq!(model, "flux-general-multi");
@@ -4871,6 +4905,10 @@ mod tests {
                 assert!((eager_eot_threshold - 0.4).abs() < f32::EPSILON);
                 assert_eq!(eot_timeout_ms, 7000);
                 assert_eq!(max_speakers, 4);
+                assert_eq!(
+                    keyterms,
+                    vec!["KV cache".to_string(), "Deepgram".to_string()]
+                );
             }
             other => panic!("unexpected ASR provider after round-trip: {other:?}"),
         }
@@ -4921,7 +4959,9 @@ mod tests {
     /// FULL documented default set. This is the config-to-default contract the
     /// frontend hydration mirrors (`?? 300`, `?? 1000`, `?? true`, `?? 0.5`,
     /// `?? 0`, `?? 0`, `?? 0`) — if a serde default changes here without the
-    /// frontend following, save/load starts mutating configs.
+    /// frontend following, save/load starts mutating configs. `keyterms` has
+    /// no frontend hydration mirror yet (audio-graph-6470: config-file-only,
+    /// no UI control) — its default must still be the empty list.
     #[test]
     fn minimal_deepgram_yaml_hydrates_documented_defaults() {
         let parsed = parse_settings_yaml("asr_provider:\n  type: deepgram\n").expect("parses");
@@ -4937,6 +4977,7 @@ mod tests {
                 eager_eot_threshold,
                 eot_timeout_ms,
                 max_speakers,
+                keyterms,
             } => {
                 assert!(api_key.is_empty());
                 assert_eq!(
@@ -4951,6 +4992,10 @@ mod tests {
                 assert_eq!(eager_eot_threshold, 0.0);
                 assert_eq!(eot_timeout_ms, 0);
                 assert_eq!(max_speakers, 0, "BUG-4: default is NO speaker cap");
+                assert!(
+                    keyterms.is_empty(),
+                    "default keyterms must be empty (no bias applied)"
+                );
             }
             other => panic!("unexpected ASR provider: {other:?}"),
         }

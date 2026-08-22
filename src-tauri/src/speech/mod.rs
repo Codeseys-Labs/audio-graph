@@ -3919,6 +3919,10 @@ fn flush_source_accumulators(
 ///   (Model validity/aliasing is enforced downstream by
 ///   `sanitize_deepgram_model` at URL-build time and upstream by
 ///   `settings::migrate_asr_provider_model` at load time.)
+/// - `keyterms`: verbatim (audio-graph-6470). Static, connection-time-only
+///   glossary; `deepgram_listen_url` decides per-branch whether/how to send
+///   them (v1 only — see that function's Flux-branch comment) and owns their
+///   percent-encoding.
 ///
 /// Returns `None` for non-Deepgram variants.
 fn deepgram_config_from_settings(
@@ -3936,6 +3940,7 @@ fn deepgram_config_from_settings(
         eager_eot_threshold,
         eot_timeout_ms,
         max_speakers: _,
+        keyterms,
     } = asr_provider
     else {
         return None;
@@ -3958,6 +3963,7 @@ fn deepgram_config_from_settings(
         eot_threshold: (eot_threshold > 0.0).then_some(eot_threshold),
         eager_eot_threshold: effective_eager_eot,
         eot_timeout_ms: (eot_timeout_ms > 0).then_some(eot_timeout_ms),
+        keyterms: keyterms.clone(),
         content_egress_policy,
     })
 }
@@ -7741,6 +7747,7 @@ mod tests_provider_dispatch {
             eager_eot_threshold,
             eot_timeout_ms,
             max_speakers: 0,
+            keyterms: vec![],
         }
     }
 
@@ -7760,6 +7767,7 @@ mod tests_provider_dispatch {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 5000,
             max_speakers: 3,
+            keyterms: vec!["KV cache".to_string(), "transformer".to_string()],
         };
         let config = deepgram_config_from_settings(&provider, ProviderContentEgressPolicy::allow())
             .expect("deepgram variant maps");
@@ -7767,6 +7775,11 @@ mod tests_provider_dispatch {
         assert_eq!(config.model, "flux-general-en");
         assert!(!config.enable_diarization);
         assert!(!config.vad_events);
+        assert_eq!(
+            config.keyterms,
+            vec!["KV cache".to_string(), "transformer".to_string()],
+            "keyterms must reach the worker config verbatim"
+        );
         assert_eq!(
             config.content_egress_policy,
             ProviderContentEgressPolicy::allow()

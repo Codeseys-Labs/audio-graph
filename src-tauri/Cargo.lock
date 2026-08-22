@@ -600,6 +600,7 @@ dependencies = [
  "mistralrs",
  "nix 0.31.3",
  "parakeet-rs",
+ "percent-encoding",
  "petgraph",
  "rayon",
  "regex",

@@ -697,6 +697,12 @@ export type AsrProvider =
       eager_eot_threshold?: number;
       eot_timeout_ms?: number;
       max_speakers?: number;
+      /** Domain vocabulary for Deepgram Keyterm Prompting (audio-graph-6470).
+       * Config-file-only today — no Settings UI control exists yet — so any
+       * whole-struct write MUST pass through the previously-loaded value
+       * rather than omit it, or a Settings Save silently wipes a hand-edited
+       * glossary back to empty. */
+      keyterms?: string[];
     }
   | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
   | {

@@ -679,6 +679,42 @@ describe("ExpressSetup", () => {
     expect(useAudioGraphStore.getState().converseEngine).toBe("pipelined");
   });
 
+  it("preserves an existing Deepgram keyterm glossary across a re-run Save (audio-graph-6470)", async () => {
+    // keyterms has no Settings UI control — the only way it gets set is a
+    // hand-edited config.yaml. Re-running Quick Setup (e.g. to change the
+    // LLM choice) must not silently wipe it back to `[]`.
+    useAudioGraphStore.setState({
+      settings: {
+        ...makeExistingSettings(),
+        asr_provider: {
+          type: "deepgram",
+          api_key: "",
+          model: "nova-3",
+          enable_diarization: true,
+          keyterms: ["KV cache", "Deepgram"],
+        },
+      },
+    });
+    render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
+
+    fireEvent.change(screen.getByLabelText(/ASR API key/i), {
+      target: { value: "dg-key" },
+    });
+    fireEvent.change(screen.getByLabelText(/LLM API key/i), {
+      target: { value: "sk-openai" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
+    });
+
+    const saved = savedSettingsArg();
+    expect(saved.asr_provider.type).toBe("deepgram");
+    if (saved.asr_provider.type === "deepgram") {
+      expect(saved.asr_provider.keyterms).toEqual(["KV cache", "Deepgram"]);
+    }
+  });
+
   it("never writes deferred Gemini Live or Anthropic credentials", async () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 

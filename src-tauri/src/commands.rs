@@ -14046,6 +14046,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 0,
+            keyterms: vec![],
         };
         settings.llm_provider = crate::settings::LlmProvider::OpenRouter {
             model: "openai/gpt-4.1-mini".to_string(),
@@ -14701,6 +14702,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             ..Default::default()
         };
@@ -14745,6 +14747,7 @@ mod tests {
             eager_eot_threshold: 0.3,
             eot_timeout_ms: 1500,
             max_speakers: 2,
+            keyterms: vec![],
         };
         let flux = effective_stt_fidelity(descriptor, &settings).expect("Flux fidelity");
         assert_eq!(
@@ -14789,6 +14792,7 @@ mod tests {
             eager_eot_threshold: 0.0,
             eot_timeout_ms: 0,
             max_speakers: 0,
+            keyterms: vec![],
         };
         let nova_fingerprint = provider_readiness_config_fingerprint(
             descriptor,
@@ -14825,6 +14829,7 @@ mod tests {
                     eager_eot_threshold: 0.0,
                     eot_timeout_ms: 0,
                     max_speakers: 0,
+                    keyterms: vec![],
                 },
                 diarization: crate::settings::DiarizationSettings {
                     mode: global_mode,
@@ -14866,6 +14871,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             diarization: crate::settings::DiarizationSettings {
                 mode: DiarizationMode::Provider,
@@ -17299,6 +17305,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 2,
+                keyterms: vec![],
             },
             &active_sources,
             Some("system-default"),
@@ -17340,6 +17347,7 @@ mod tests {
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
                 max_speakers: 2,
+                keyterms: vec![],
             },
             &active_sources,
             Some("app:42"),
@@ -18137,6 +18145,7 @@ mod tests {
                 eager_eot_threshold: 0.3,
                 eot_timeout_ms: 5000,
                 max_speakers: 0,
+                keyterms: vec![],
             },
             ..Default::default()
         }

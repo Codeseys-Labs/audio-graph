@@ -3017,6 +3017,17 @@ export function useSettingsController() {
           ),
           eot_timeout_ms: Math.max(0, Math.round(deepgramEotTimeoutMs)),
           max_speakers: Math.max(0, Math.round(deepgramMaxSpeakers)),
+          // Preserve the config-file-only keyterm glossary across a Settings
+          // save (audio-graph-6470). There is no UI control for this field
+          // yet — the only way to set it is a hand-edited config.yaml — so
+          // without this passthrough ANY Settings save (even one unrelated to
+          // ASR) would silently wipe it back to `[]`, exactly the class of
+          // bug this repo already fixed for `demo_mode`/`analytics_enabled`
+          // below.
+          keyterms:
+            settings?.asr_provider.type === "deepgram"
+              ? (settings.asr_provider.keyterms ?? [])
+              : [],
         };
         break;
       }
