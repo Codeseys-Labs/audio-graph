@@ -5677,6 +5677,368 @@ fn remap_deepgram_speaker(
     *last_speaker
 }
 
+/// A retained "highest-revision-seen" interim for a span that has not yet
+/// received a final (audio-graph-e70e). `run_deepgram_event_receiver`'s
+/// interim path never persists anything receiver-side — this struct is the
+/// state that lets a span whose final never arrives get promoted into a
+/// durable `TranscriptSegment` instead of silently vanishing (field
+/// evidence: one session lost 14 spans / 96 words this way, accounting for
+/// all 5 largest intra-transcript gaps).
+///
+/// Overwritten (not merged) on every subsequent interim for the same
+/// `span_id`: Deepgram's streaming interims are cumulative/refined, so the
+/// latest one for a span is always a superset of any earlier one. This also
+/// resets `retained_at`, so a span that keeps receiving fresh interims never
+/// goes stale for the age-based heartbeat trigger below -- only a span whose
+/// updates (interim OR final) have genuinely stopped arriving does.
+#[derive(Debug, Clone)]
+struct PendingInterimSpan {
+    source_id: String,
+    text: String,
+    start: f64,
+    end_time: f64,
+    confidence: f32,
+    /// Per-word data from the highest-revision interim, kept so promotion
+    /// can reuse `group_words_by_speaker` exactly like the real final path
+    /// (audio-graph-4aed) instead of collapsing a multi-speaker span onto a
+    /// single run.
+    words: Vec<crate::asr::deepgram::DeepgramWord>,
+    /// When this entry was inserted/overwritten (audio-graph-e70e review
+    /// follow-up). Feeds the age-based heartbeat promotion trigger --
+    /// `age_expired_pending_span_ids` -- which bounds how long a stalled
+    /// span can sit unpromoted, independent of whether another final ever
+    /// arrives to fire the past-range trigger.
+    retained_at: std::time::Instant,
+}
+
+/// Margin added to a pending interim's `end_time` before a later final's
+/// `start` (for a DIFFERENT span) is treated as proof the pending span will
+/// never get its own final (audio-graph-e70e "past-the-range" promotion
+/// trigger). Deepgram emits `Transcript` events in temporal order, so a
+/// final's `start` strictly past another pending span's end is decisive on
+/// its own; the margin only absorbs provider timestamp jitter between
+/// events. It is not load-bearing for correctness — a late genuine final for
+/// an already-promoted span still supersedes it via revision numbers (see
+/// `promote_pending_interim`), it just wouldn't be as prompt without this
+/// margin's cushion against jitter.
+const PAST_RANGE_PROMOTION_MARGIN_SECS: f64 = 0.05;
+
+/// Upper bound on how long a pending interim can sit with no update (no
+/// fresher interim, no final) before the heartbeat tick promotes it anyway
+/// (audio-graph-e70e review follow-up). Covers two gaps the past-range
+/// trigger cannot, because that trigger only fires inside the `is_final`
+/// branch: (1) a run of consecutive interim-only spans where no later final
+/// ever arrives to prove any of them are "in the past", and (2) the tail
+/// after the session's last final. It also bounds `pending_interims_by_span`
+/// itself -- without this, a sustained finals outage grows the map (and the
+/// eventual session-end promotion burst) for the rest of the session with no
+/// cap, exactly the regime the ticket's field evidence describes.
+///
+/// Chosen relative to `COALESCE_MAX_AGE_MS` (3.5s, the extraction-batch age
+/// bound below) with headroom so this trigger does not race normal
+/// coalescing. An early promotion is safe even when a genuine final was
+/// still coming: `promote_pending_interim`'s revision bookkeeping is
+/// specifically designed so that late final correctly SUPERSEDES the
+/// promoted entry (see its doc comment and
+/// `deepgram_late_final_after_promotion_supersedes_not_duplicates`), so the
+/// only cost of promoting slightly early is a redundant flat
+/// `transcript_buffer` row -- already accepted by design, not a new
+/// correctness gap.
+const PENDING_INTERIM_MAX_AGE_SECS: f64 = 5.0;
+
+/// Pending span_ids whose retained interim is now provably in the past
+/// relative to `current_final_start` (the `start` of a final for some OTHER
+/// span), sorted by `start` ascending for deterministic promotion order when
+/// one final's arrival proves multiple pending spans stale at once (review
+/// finding: `HashMap` iteration order is randomized per process; the
+/// session-end flush already sorts for this same reason). Excludes
+/// `current_span_id` itself — that one is cleared directly by the final path
+/// via `pending_interims_by_span.remove` regardless of this heuristic.
+fn past_range_pending_span_ids(
+    pending_interims_by_span: &HashMap<String, PendingInterimSpan>,
+    current_span_id: &str,
+    current_final_start: f64,
+) -> Vec<String> {
+    let mut matches: Vec<(String, f64)> = pending_interims_by_span
+        .iter()
+        .filter(|(span_id, pending)| {
+            span_id.as_str() != current_span_id
+                && pending.end_time + PAST_RANGE_PROMOTION_MARGIN_SECS <= current_final_start
+        })
+        .map(|(span_id, pending)| (span_id.clone(), pending.start))
+        .collect();
+    matches.sort_by(|(_, a), (_, b)| a.total_cmp(b));
+    matches.into_iter().map(|(span_id, _)| span_id).collect()
+}
+
+/// Pending span_ids that have gone `PENDING_INTERIM_MAX_AGE_SECS` without an
+/// update (no fresher interim, no final), sorted by `start` ascending for
+/// the same deterministic-ordering reason as `past_range_pending_span_ids`.
+fn age_expired_pending_span_ids(
+    pending_interims_by_span: &HashMap<String, PendingInterimSpan>,
+    now: std::time::Instant,
+) -> Vec<String> {
+    let mut matches: Vec<(String, f64)> = pending_interims_by_span
+        .iter()
+        .filter(|(_, pending)| {
+            now.saturating_duration_since(pending.retained_at)
+                .as_secs_f64()
+                >= PENDING_INTERIM_MAX_AGE_SECS
+        })
+        .map(|(span_id, pending)| (span_id.clone(), pending.start))
+        .collect();
+    matches.sort_by(|(_, a), (_, b)| a.total_cmp(b));
+    matches.into_iter().map(|(span_id, _)| span_id).collect()
+}
+
+/// Promote a retained pending interim into one or more durable
+/// `TranscriptSegment`s (audio-graph-e70e). Mirrors the real final path as
+/// closely as possible so a promoted span behaves identically to a genuine
+/// final for every downstream consumer (store dedup, projections, session
+/// timeline):
+///
+/// - Splits on per-word speaker changes via `group_words_by_speaker`, exactly
+///   like the multi-speaker final path (audio-graph-4aed) — a retained
+///   interim that crosses a turn boundary is not collapsed onto its first
+///   word's speaker.
+/// - Remaps the raw `deepgram-{n}` speaker id through `remap_deepgram_speaker`
+///   (consuming a `speaker_map` cap slot). Interims deliberately skip this
+///   because they are provisional/revisable (audio-graph-4aed review), but a
+///   promoted span IS the permanent record now, so it participates in the
+///   same speaker cap as every other final. ADR-0017's `max_speakers` collapse
+///   is already a first-seen-order heuristic even for on-time finals, so a
+///   promoted span's slot possibly landing "out of order" relative to true
+///   speech time (e.g. promoted at session end, well after later finals
+///   already claimed slots) is the same class of approximation the cap
+///   already accepts, not a new correctness hole. The converse direction
+///   also holds and is more load-bearing: because both mid-session triggers
+///   promote pending spans BEFORE the current final's own
+///   `group_words_by_speaker`/`remap_deepgram_speaker` call runs, a
+///   promotion can claim a cap slot that a not-yet-processed genuine final
+///   would otherwise have claimed for itself, changing that final's speaker
+///   label relative to a replay of the same event stream without this
+///   feature. This is intentional, not a regression: every pending span
+///   promoted this way is provably earlier in time than the triggering final
+///   (`past_range_pending_span_ids`'s `end_time` check, or
+///   `age_expired_pending_span_ids`'s staleness check), so remapping it
+///   first keeps the cap's first-seen-order heuristic aligned with true
+///   chronological speech order instead of mere final-arrival order. Pinned
+///   by `deepgram_past_range_promotion_claims_speaker_slot_before_triggering_final`.
+/// - Emits through `emit_transcript_and_extract_with_meta`, the same call the
+///   final path uses, so persistence/events/extraction/projection dispatch
+///   are byte-for-byte identical to a genuine final.
+///
+/// Revision bookkeeping for the FIRST (or only) run — the one keyed on
+/// `span_id`, the same span_id any live interims used — deliberately uses
+/// `next_span_revision` (increment, KEEP the map entry) instead of
+/// `final_span_revision` (increment, REMOVE). If a late genuine final for
+/// this span_id arrives after promotion, it calls `final_span_revision`
+/// itself and computes a STRICTLY HIGHER revision number than the promoted
+/// one (removing the entry at that point, same as any normal final) — so the
+/// transcript ledger's `apply_event` (higher revision replaces the current
+/// one) and the frontend's `winningAsrRevisionsBySpan`/`isStaleAsrRevision`
+/// dedup (audio-graph-a35a) both let the true final correctly SUPERSEDE the
+/// promoted row instead of duplicating it or being rejected as stale. Runs
+/// after the first (multi-speaker split only) always use
+/// `final_span_revision` — those span_ids are brand new and never had a live
+/// interim to keep alive for, matching the real final path exactly.
+#[allow(clippy::too_many_arguments)]
+fn promote_pending_interim(
+    span_id: String,
+    pending: PendingInterimSpan,
+    ctx: &TranscriptProcessingContext,
+    revision_numbers_by_span: &mut HashMap<String, u64>,
+    speaker_map: &mut HashMap<u32, u32>,
+    last_speaker: &mut u32,
+    max_speakers: u32,
+    diarization_worker: &mut DiarizationWorker,
+    asr_count: &mut u64,
+    diarization_count: &mut u64,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    let PendingInterimSpan {
+        source_id,
+        text,
+        start,
+        end_time,
+        confidence,
+        words,
+        retained_at: _,
+    } = pending;
+
+    log::info!(
+        "Deepgram: promoting interim-only span (no final ever arrived) span_id={} text_len={} word_count={}",
+        span_id,
+        text.chars().count(),
+        words.len(),
+    );
+
+    let runs = crate::asr::deepgram::group_words_by_speaker(&words);
+
+    if runs.len() <= 1 {
+        let (revision_number, supersedes) = next_span_revision(revision_numbers_by_span, &span_id);
+        let speaker_from_deepgram = words.first().and_then(|w| w.speaker).map(|raw| {
+            let id = remap_deepgram_speaker(raw, max_speakers, speaker_map, last_speaker);
+            format!("Speaker {}", id)
+        });
+
+        *asr_count += 1;
+        let segment = TranscriptSegment {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_id: source_id.clone(),
+            speaker_id: speaker_from_deepgram.clone(),
+            speaker_label: speaker_from_deepgram,
+            text,
+            start_time: start,
+            end_time,
+            confidence,
+        };
+
+        let final_segment = if segment.speaker_label.is_some() {
+            *diarization_count += 1;
+            segment.clone()
+        } else {
+            let input = DiarizationInput {
+                transcript: segment.clone(),
+                speech_audio: vec![],
+                speech_start_time: Duration::from_secs_f64(start),
+                speech_end_time: Duration::from_secs_f64(end_time),
+            };
+            let diarized = diarization_worker.process_input(input);
+            *diarization_count += 1;
+            let _ = ctx
+                .app_handle
+                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+            diarized.segment
+        };
+
+        emit_transcript_and_extract_with_meta(
+            final_segment,
+            None,
+            ctx,
+            *asr_count,
+            *diarization_count,
+            extraction_count,
+            graph_update_count,
+            AsrRevisionMeta {
+                span_id: Some(span_id),
+                revision_number: Some(revision_number),
+                supersedes,
+                raw_event_ref: Some("deepgram.results.interim-promoted".to_string()),
+                ..AsrRevisionMeta::default()
+            },
+        );
+        return;
+    }
+
+    // Multi-speaker retained interim: split into per-run segments exactly
+    // like a multi-speaker final (audio-graph-4aed). Run 0 keeps the
+    // pending's own `span_id` (matching the final path's convention so it
+    // still closes out any live-interim revision history); the
+    // `used_span_ids` collision guard mirrors the final path's, for the same
+    // millisecond-quantization reason (see the final path's comment).
+    let run_count = runs.len();
+    let mut used_span_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(run_count);
+    used_span_ids.insert(span_id.clone());
+    for (run_index, (speaker, run_words)) in runs.into_iter().enumerate() {
+        let is_first_run = run_index == 0;
+        let is_last_run = run_index + 1 == run_count;
+        let run_start = if is_first_run {
+            start
+        } else {
+            run_words.first().map(|w| w.start).unwrap_or(start)
+        };
+        let run_end = if is_last_run {
+            end_time
+        } else {
+            run_words.last().map(|w| w.end).unwrap_or(end_time)
+        };
+        let run_text = run_words
+            .iter()
+            .map(|w| w.display_word())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let run_span_id = if is_first_run {
+            span_id.clone()
+        } else {
+            let mut candidate = provider_start_span_id("deepgram", &source_id, run_start);
+            let mut ms_bump: i64 = 0;
+            while used_span_ids.contains(&candidate) {
+                ms_bump += 1;
+                candidate = provider_start_span_id(
+                    "deepgram",
+                    &source_id,
+                    run_start + (ms_bump as f64) / 1000.0,
+                );
+            }
+            candidate
+        };
+        used_span_ids.insert(run_span_id.clone());
+
+        // Run 0 keeps the promoted span alive (see doc comment above); later
+        // runs are brand-new span_ids, closed exactly like the final path.
+        let (run_revision_number, run_supersedes) = if is_first_run {
+            next_span_revision(revision_numbers_by_span, &run_span_id)
+        } else {
+            final_span_revision(revision_numbers_by_span, &run_span_id)
+        };
+
+        let speaker_from_deepgram = speaker.map(|raw| {
+            let id = remap_deepgram_speaker(raw, max_speakers, speaker_map, last_speaker);
+            format!("Speaker {}", id)
+        });
+
+        *asr_count += 1;
+        let run_segment = TranscriptSegment {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_id: source_id.clone(),
+            speaker_id: speaker_from_deepgram.clone(),
+            speaker_label: speaker_from_deepgram,
+            text: run_text,
+            start_time: run_start,
+            end_time: run_end,
+            confidence,
+        };
+
+        let final_run_segment = if run_segment.speaker_label.is_some() {
+            *diarization_count += 1;
+            run_segment.clone()
+        } else {
+            let input = DiarizationInput {
+                transcript: run_segment.clone(),
+                speech_audio: vec![],
+                speech_start_time: Duration::from_secs_f64(run_start),
+                speech_end_time: Duration::from_secs_f64(run_end),
+            };
+            let diarized = diarization_worker.process_input(input);
+            *diarization_count += 1;
+            let _ = ctx
+                .app_handle
+                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+            diarized.segment
+        };
+
+        emit_transcript_and_extract_with_meta(
+            final_run_segment,
+            None,
+            ctx,
+            *asr_count,
+            *diarization_count,
+            extraction_count,
+            graph_update_count,
+            AsrRevisionMeta {
+                span_id: Some(run_span_id),
+                revision_number: Some(run_revision_number),
+                supersedes: run_supersedes,
+                raw_event_ref: Some(format!("deepgram.results.interim-promoted:run{run_index}")),
+                ..AsrRevisionMeta::default()
+            },
+        );
+    }
+}
+
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
@@ -5708,6 +6070,10 @@ fn run_deepgram_event_receiver(
     let mut speaker_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut last_speaker: u32 = 0;
     let mut revision_numbers_by_span: HashMap<String, u64> = HashMap::new();
+    // audio-graph-e70e: highest-revision interim retained per span with no
+    // final yet, so a span whose final never arrives can still be promoted
+    // into a durable TranscriptSegment (see `promote_pending_interim`).
+    let mut pending_interims_by_span: HashMap<String, PendingInterimSpan> = HashMap::new();
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
@@ -5738,6 +6104,37 @@ fn run_deepgram_event_receiver(
         let event = match event_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => ev,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // audio-graph-e70e review follow-up: promote any pending
+                // interim that has gone `PENDING_INTERIM_MAX_AGE_SECS`
+                // without an update, BEFORE the extraction-coalescing flush
+                // below (mirrors the session-end ordering: a promotion's own
+                // `emit_transcript_and_extract_with_meta` call enqueues a
+                // coalesce_submit that this same tick's flush should be free
+                // to consider). Covers mid-session gaps the past-range
+                // trigger cannot (a run of consecutive interim-only spans,
+                // or the tail after the session's last final) and bounds
+                // `pending_interims_by_span`'s growth -- see
+                // `PENDING_INTERIM_MAX_AGE_SECS`'s doc comment.
+                for stale_span_id in
+                    age_expired_pending_span_ids(&pending_interims_by_span, Instant::now())
+                {
+                    if let Some(stale_pending) = pending_interims_by_span.remove(&stale_span_id) {
+                        promote_pending_interim(
+                            stale_span_id,
+                            stale_pending,
+                            &ctx,
+                            &mut revision_numbers_by_span,
+                            &mut speaker_map,
+                            &mut last_speaker,
+                            max_speakers,
+                            &mut diarization_worker,
+                            &mut asr_count,
+                            &mut diarization_count,
+                            &extraction_count,
+                            &graph_update_count,
+                        );
+                    }
+                }
                 // Heartbeat: flush a coalesced extraction batch once speech has
                 // paused (idle/age), without waiting for the next segment.
                 flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
@@ -5787,6 +6184,25 @@ fn run_deepgram_event_receiver(
                         confidence,
                         interim_speaker_id.is_some()
                     );
+                    // audio-graph-e70e: retain this interim (overwriting any
+                    // earlier one for the same span_id) so the span can be
+                    // promoted into a durable TranscriptSegment if its final
+                    // never arrives — see `promote_pending_interim` and the
+                    // Disconnected exit arm below. Cloned rather than moved:
+                    // `text`/`source_id`/`words` are still needed below to
+                    // emit the live partial exactly as before.
+                    pending_interims_by_span.insert(
+                        span_id.clone(),
+                        PendingInterimSpan {
+                            source_id: source_id.clone(),
+                            text: text.clone(),
+                            start,
+                            end_time,
+                            confidence,
+                            words: words.clone(),
+                            retained_at: std::time::Instant::now(),
+                        },
+                    );
                     emit_asr_partial_with_meta(
                         &ctx,
                         "deepgram",
@@ -5805,6 +6221,40 @@ fn run_deepgram_event_receiver(
                         },
                     );
                     continue;
+                }
+
+                // audio-graph-e70e: a final for this span has now arrived —
+                // drop any retained interim so it is never promoted later;
+                // the final below is authoritative and is about to persist
+                // its own TranscriptSegment(s) for this exact span_id.
+                pending_interims_by_span.remove(&span_id);
+
+                // audio-graph-e70e "past-the-range" promotion trigger: this
+                // final's `start` is proof that any OTHER still-pending span
+                // whose retained interim ended well before it will never get
+                // its own final (Deepgram emits `Transcript` events in
+                // temporal order) — promote those now instead of waiting for
+                // session end. See `past_range_pending_span_ids` /
+                // `promote_pending_interim`.
+                for stale_span_id in
+                    past_range_pending_span_ids(&pending_interims_by_span, &span_id, start)
+                {
+                    if let Some(stale_pending) = pending_interims_by_span.remove(&stale_span_id) {
+                        promote_pending_interim(
+                            stale_span_id,
+                            stale_pending,
+                            &ctx,
+                            &mut revision_numbers_by_span,
+                            &mut speaker_map,
+                            &mut last_speaker,
+                            max_speakers,
+                            &mut diarization_worker,
+                            &mut asr_count,
+                            &mut diarization_count,
+                            &extraction_count,
+                            &graph_update_count,
+                        );
+                    }
                 }
 
                 // Group the final's words into contiguous same-speaker runs
@@ -6155,6 +6605,41 @@ fn run_deepgram_event_receiver(
                 );
             }
         }
+    }
+
+    // audio-graph-e70e: the event channel has disconnected (session end) —
+    // promote every span still waiting on a final that will now never
+    // arrive, sorted by start time for deterministic ordering, so words that
+    // only ever received interims are not silently dropped from the
+    // session's transcript record. Must run BEFORE `flush_pending_now`
+    // below: each promotion enqueues a coalesced extraction submission
+    // (`emit_transcript_and_extract_with_meta` -> `coalesce_submit`), and
+    // that flush call is what drains the coalescing buffer one last time
+    // before this thread exits.
+    let mut remaining_pending: Vec<(String, PendingInterimSpan)> =
+        pending_interims_by_span.drain().collect();
+    remaining_pending.sort_by(|(_, a), (_, b)| a.start.total_cmp(&b.start));
+    if !remaining_pending.is_empty() {
+        log::info!(
+            "Deepgram event receiver: promoting {} interim-only span(s) with no final at session end",
+            remaining_pending.len(),
+        );
+    }
+    for (stale_span_id, stale_pending) in remaining_pending {
+        promote_pending_interim(
+            stale_span_id,
+            stale_pending,
+            &ctx,
+            &mut revision_numbers_by_span,
+            &mut speaker_map,
+            &mut last_speaker,
+            max_speakers,
+            &mut diarization_worker,
+            &mut asr_count,
+            &mut diarization_count,
+            &extraction_count,
+            &graph_update_count,
+        );
     }
 
     // Flush any coalesced batch so the final utterance before stop reaches the graph.

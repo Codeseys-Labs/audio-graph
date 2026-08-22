@@ -1344,3 +1344,894 @@ fn two_speakers_produce_distinct_person_nodes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// audio-graph-e70e: interim-only span promotion
+// ---------------------------------------------------------------------------
+//
+// Field evidence: a session lost 14 spans / 96 words that received interims
+// but never a final — nothing receiver-side retained them, so they never
+// persisted. These tests drive the real `run_deepgram_event_receiver` thread
+// (never a hand-rolled substitute) and check both:
+// - `transcript_buffer`: the backend's flat ring-buffer, one row per
+//   `emit_transcript_and_extract_with_meta` call. It is NOT deduped across
+//   revisions (that's a frontend job — `winningAsrRevisionsBySpan` /
+//   `isStaleAsrRevision` in `store/index.ts`, audio-graph-a35a) — a late
+//   final after a promotion legitimately adds a SECOND raw row here, and
+//   that is correct, not a regression.
+// - `transcript_ledger.latest_spans`: the deduped, one-row-per-`span_id`
+//   source of truth (`TranscriptLedger::apply_event` replaces in place). A
+//   promotion must not duplicate a ledger entry, and a late final for an
+//   already-promoted span must SUPERSEDE it there, not add a second entry.
+
+/// Shared harness for the tests in this section: builds the same
+/// `SpeechShared`/`SpeechConfig` pair `deepgram_multi_speaker_final_splits_into_per_run_segments`
+/// builds inline, and spawns the real `run_deepgram_event_receiver` thread
+/// against it. Extracted into a struct (rather than copied per test, as the
+/// rest of this file does) because this section needs 6 variations on the
+/// same setup to cover the distinct promotion-trigger/dedup behaviors.
+struct DeepgramReceiverHarness {
+    event_tx: Option<crossbeam_channel::Sender<crate::asr::deepgram::DeepgramEvent>>,
+    receiver_thread: Option<std::thread::JoinHandle<()>>,
+    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+    projection_job_workers: crate::state::ProjectionJobRegistry,
+    projection_lane_stopping: Arc<AtomicBool>,
+    source_id: String,
+    models_dir: PathBuf,
+    _data_dir_guard: DataDirGuard,
+}
+
+impl DeepgramReceiverHarness {
+    fn new(label: &str, max_speakers: u32) -> Self {
+        let data_dir = unique_tempdir(label);
+        let data_dir_guard = DataDirGuard::set(&data_dir);
+        let app_handle = super::shared_test_app_handle();
+        let session_id = format!("{label}-session");
+        let models_dir =
+            std::env::temp_dir().join(format!("audio-graph-{label}-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&models_dir).expect("create temp models dir");
+
+        let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
+            Arc::new(RwLock::new(VecDeque::new()));
+        let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+        let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
+        let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+        let graph_extractor = Arc::new(RuleBasedExtractor::new());
+        let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
+        let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
+        let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+        let openrouter_client: Arc<Mutex<Option<OpenRouterClient>>> = Arc::new(Mutex::new(None));
+        let llm_executor = LlmExecutor::new(
+            llm_engine.clone(),
+            api_client.clone(),
+            openrouter_client,
+            mistralrs_engine.clone(),
+        );
+        let transcript_event_writer =
+            Arc::new(Mutex::new(TranscriptEventWriter::spawn(&session_id)));
+        assert!(
+            transcript_event_writer.lock().unwrap().is_some(),
+            "integration fixture requires an accepting canonical writer"
+        );
+
+        let projection_job_workers: crate::state::ProjectionJobRegistry =
+            Arc::new(Mutex::new(Vec::new()));
+        let projection_lane_stopping = Arc::new(AtomicBool::new(false));
+        let transcript_ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone())));
+        let shared = SpeechShared {
+            transcript_buffer: transcript_buffer.clone(),
+            transcript_writer: Arc::new(Mutex::new(None)),
+            transcript_event_writer,
+            transcript_ledger: transcript_ledger.clone(),
+            speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+                session_id.clone(),
+            ))),
+            projection_schedulers: Arc::new(Mutex::new(
+                crate::projection_scheduler::ProjectionSchedulers::new(session_id.clone()),
+            )),
+            projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(
+                &session_id,
+            ),
+            active_session_id: Arc::new(RwLock::new(session_id.clone())),
+            pipeline_status: pipeline_status.clone(),
+            app_handle,
+            knowledge_graph,
+            graph_snapshot,
+            graph_extractor,
+            llm_engine,
+            api_client,
+            mistralrs_engine,
+            llm_executor,
+            pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+            projection_job_workers: projection_job_workers.clone(),
+            projection_lane_stopping: projection_lane_stopping.clone(),
+        };
+        let config = SpeechConfig {
+            models_dir: models_dir.clone(),
+            llm_provider: LlmProvider::default(),
+            llm_allow_cloud_fallbacks: true,
+            provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+        };
+        let source_id = "integration-source".to_string();
+        let source_id_hint = Arc::new(RwLock::new(Some(source_id.clone())));
+
+        let (event_tx, event_rx) =
+            crossbeam_channel::bounded::<crate::asr::deepgram::DeepgramEvent>(16);
+        let receiver_thread = std::thread::spawn(move || {
+            super::run_deepgram_event_receiver(
+                event_rx,
+                shared,
+                config,
+                source_id_hint,
+                max_speakers,
+            );
+        });
+
+        Self {
+            event_tx: Some(event_tx),
+            receiver_thread: Some(receiver_thread),
+            transcript_buffer,
+            transcript_ledger,
+            projection_job_workers,
+            projection_lane_stopping,
+            source_id,
+            models_dir,
+            _data_dir_guard: data_dir_guard,
+        }
+    }
+
+    fn send(&self, event: crate::asr::deepgram::DeepgramEvent) {
+        self.event_tx
+            .as_ref()
+            .expect("harness already disconnected")
+            .send(event)
+            .expect("send deepgram event");
+    }
+
+    fn wait_for_buffer_len(&self, label: &str, len: usize) {
+        wait_until(label, || {
+            self.transcript_buffer
+                .read()
+                .map(|buf| buf.len() == len)
+                .unwrap_or(false)
+        });
+    }
+
+    /// Drop the event sender and wait for the receiver thread to exit —
+    /// drives the audio-graph-e70e session-end pending-interim flush and
+    /// guarantees (like the pre-existing idle-tick test's join pattern) that
+    /// every already-sent event has been fully processed before returning.
+    fn disconnect_and_join(&mut self) {
+        self.event_tx.take();
+        let Some(receiver_thread) = self.receiver_thread.take() else {
+            return;
+        };
+        let (join_done_tx, join_done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = join_done_tx.send(receiver_thread.join());
+        });
+        join_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("event receiver thread must exit within 3s of the channel disconnecting")
+            .expect("event receiver thread must exit cleanly once the channel disconnects");
+    }
+}
+
+impl Drop for DeepgramReceiverHarness {
+    fn drop(&mut self) {
+        self.disconnect_and_join();
+        stop_and_drain_projection_lane(
+            &self.projection_lane_stopping,
+            &self.projection_job_workers,
+        );
+        let _ = fs::remove_dir_all(&self.models_dir);
+    }
+}
+
+fn interim_event(
+    text: &str,
+    start: f64,
+    duration: f64,
+    confidence: f32,
+) -> crate::asr::deepgram::DeepgramEvent {
+    crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: text.to_string(),
+        confidence,
+        is_final: false,
+        speech_final: false,
+        start,
+        duration,
+        words: Vec::new(),
+    }
+}
+
+fn final_event(
+    text: &str,
+    start: f64,
+    duration: f64,
+    confidence: f32,
+) -> crate::asr::deepgram::DeepgramEvent {
+    crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: text.to_string(),
+        confidence,
+        is_final: true,
+        speech_final: true,
+        start,
+        duration,
+        words: Vec::new(),
+    }
+}
+
+/// Pinned behavior: a span that only ever receives interims (no final) must
+/// be promoted into exactly one durable `TranscriptSegment` once the session
+/// ends, using the LATEST (highest-revision) retained interim's text — not
+/// the first — and carrying a distinct provenance marker so a promoted
+/// segment is auditable as such.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_interim_only_span_promoted_at_disconnect() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-disconnect-promote", 0);
+
+    // Two interims for the SAME span (start=0.0): the second is a refined
+    // superset of the first. No final for this span is ever sent.
+    harness.send(interim_event("the quick", 0.0, 0.6, 0.6));
+    harness.send(interim_event("the quick fox", 0.0, 1.0, 0.9));
+
+    harness.disconnect_and_join();
+
+    let expected_span_id = super::provider_start_span_id("deepgram", &harness.source_id, 0.0);
+
+    {
+        let buffer = harness.transcript_buffer.read().unwrap();
+        assert_eq!(
+            buffer.len(),
+            1,
+            "the interim-only span must be promoted into exactly one TranscriptSegment \
+             at session end, got {} segments",
+            buffer.len()
+        );
+        assert_eq!(
+            buffer[0].text, "the quick fox",
+            "promotion must use the highest-revision (latest) retained interim, not the first"
+        );
+        assert_eq!(buffer[0].start_time, 0.0);
+        assert_eq!(buffer[0].end_time, 1.0);
+    }
+
+    let ledger = harness.transcript_ledger.lock().unwrap();
+    assert_eq!(ledger.latest_spans.len(), 1);
+    let span = ledger
+        .latest_spans
+        .iter()
+        .find(|s| s.span_id == expected_span_id)
+        .expect("promoted span must keep the same span_id its interims used");
+    assert!(span.is_final, "promoted span must be marked final");
+    // Two interims were sent for this span, so the interim path's own
+    // `next_span_revision` calls already advanced the ledger to revision 2
+    // (one per interim) before promotion runs its own `next_span_revision`
+    // call, landing on revision 3.
+    assert_eq!(
+        span.revision_number, 3,
+        "promotion must supersede the interims' own revisions (1, 2), not collide with them"
+    );
+    assert_eq!(
+        span.supersedes.as_deref(),
+        Some(format!("{expected_span_id}@rev2").as_str())
+    );
+    assert_eq!(
+        span.raw_event_ref.as_deref(),
+        Some("deepgram.results.interim-promoted"),
+        "promoted segment must carry a distinct provenance marker from a genuine final"
+    );
+}
+
+/// Pinned behavior: a span whose final DOES arrive must never also be
+/// promoted — the retained interim must be cleared, not left to be
+/// (re)promoted at session end, which would duplicate the row.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_span_with_final_is_not_promoted_no_duplicate() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-final-clears-pending", 0);
+
+    harness.send(interim_event("the quick", 0.0, 0.6, 0.6));
+    harness.send(final_event("the quick fox", 0.0, 1.0, 0.9));
+
+    harness.disconnect_and_join();
+
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer.len(),
+        1,
+        "the span's own final must be the only segment; the interim must not \
+         ALSO be promoted at disconnect (got {} segments)",
+        buffer.len()
+    );
+    assert_eq!(buffer[0].text, "the quick fox");
+    drop(buffer);
+
+    let ledger = harness.transcript_ledger.lock().unwrap();
+    assert_eq!(ledger.latest_spans.len(), 1);
+    assert_eq!(
+        ledger.latest_spans[0].raw_event_ref.as_deref(),
+        Some("deepgram.results.final"),
+        "the surviving span must be the genuine final, not a promoted interim"
+    );
+}
+
+/// Pinned behavior: a final for a LATER span is proof that an earlier
+/// pending span (whose retained interim ended well before it) will never
+/// get its own final — Deepgram emits `Transcript` events in temporal order.
+/// That earlier span must be promoted immediately (mid-session), not only
+/// at session end.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_past_range_final_promotes_earlier_pending_span_mid_session() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-past-range-promote", 0);
+
+    // Span A: interim only, end_time = 1.0. Never gets a final.
+    harness.send(interim_event("alpha span", 0.0, 1.0, 0.8));
+    // Span B: a final whose start (5.0) is well past A's end + margin —
+    // this must promote A BEFORE B's own segment is appended.
+    harness.send(final_event("bravo span", 5.0, 1.0, 0.8));
+
+    harness.wait_for_buffer_len("past-range promotion of A plus B's own final", 2);
+
+    let span_a_id = super::provider_start_span_id("deepgram", &harness.source_id, 0.0);
+    let span_b_id = super::provider_start_span_id("deepgram", &harness.source_id, 5.0);
+
+    {
+        let buffer = harness.transcript_buffer.read().unwrap();
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(
+            buffer[0].text, "alpha span",
+            "the past-range-promoted span must land BEFORE the triggering final's own segment"
+        );
+        assert_eq!(buffer[1].text, "bravo span");
+    }
+
+    {
+        let ledger = harness.transcript_ledger.lock().unwrap();
+        assert_eq!(ledger.latest_spans.len(), 2);
+        let span_a = ledger
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == span_a_id)
+            .expect("span A must be in the ledger");
+        assert_eq!(
+            span_a.raw_event_ref.as_deref(),
+            Some("deepgram.results.interim-promoted")
+        );
+        let span_b = ledger
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == span_b_id)
+            .expect("span B must be in the ledger");
+        assert_eq!(
+            span_b.raw_event_ref.as_deref(),
+            Some("deepgram.results.final")
+        );
+    }
+
+    // Disconnecting now must NOT promote span A a second time — it was
+    // already removed from the pending map when the past-range trigger
+    // fired.
+    harness.disconnect_and_join();
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer.len(),
+        2,
+        "session-end flush must not re-promote a span the past-range trigger already handled"
+    );
+}
+
+/// Pinned behavior (the double-emission hazard): a late final that arrives
+/// for a span AFTER it has already been promoted must SUPERSEDE the
+/// promoted ledger entry in place, not add a second one — the promotion's
+/// revision bookkeeping (`next_span_revision`, keep-alive) exists precisely
+/// so `final_span_revision` computes a strictly higher revision for the late
+/// final, matching the transcript ledger's replace-on-higher-revision rule.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_late_final_after_promotion_supersedes_not_duplicates() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-late-final-supersede", 0);
+
+    // Span A promoted via the past-range trigger (see the test above).
+    harness.send(interim_event("alpha span", 0.0, 1.0, 0.8));
+    harness.send(final_event("bravo span", 5.0, 1.0, 0.8));
+    harness.wait_for_buffer_len("A promoted, B final lands", 2);
+
+    let span_a_id = super::provider_start_span_id("deepgram", &harness.source_id, 0.0);
+    {
+        let ledger = harness.transcript_ledger.lock().unwrap();
+        assert_eq!(ledger.latest_spans.len(), 2, "sanity: A promoted + B final");
+        let span_a = ledger
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == span_a_id)
+            .expect("span A must be promoted before the late final arrives");
+        assert_eq!(span_a.revision_number, 2, "sanity: promotion's revision");
+    }
+
+    // A late, corrected final for span A itself arrives after promotion.
+    harness.send(final_event("alpha span corrected", 0.0, 1.2, 0.95));
+    harness.wait_for_buffer_len(
+        "late final for A appends its own raw row (backend buffer is not deduped)",
+        3,
+    );
+
+    let ledger = harness.transcript_ledger.lock().unwrap();
+    assert_eq!(
+        ledger.latest_spans.len(),
+        2,
+        "the late final must SUPERSEDE span A's promoted ledger entry, not add a third \
+         span — this is the load-bearing dedup surface, not the raw transcript_buffer"
+    );
+    let span_a = ledger
+        .latest_spans
+        .iter()
+        .find(|s| s.span_id == span_a_id)
+        .expect("span A must still be present, now superseded");
+    assert!(span_a.is_final);
+    assert_eq!(span_a.text, "alpha span corrected");
+    assert_eq!(
+        span_a.raw_event_ref.as_deref(),
+        Some("deepgram.results.final"),
+        "the genuine final must win over the promoted interim's provenance marker"
+    );
+    assert_eq!(
+        span_a.revision_number, 3,
+        "the late final must compute a strictly higher revision than the promotion (2)"
+    );
+    assert_eq!(
+        span_a.supersedes.as_deref(),
+        Some(format!("{span_a_id}@rev2").as_str())
+    );
+    drop(ledger);
+
+    // Session end must not disturb this outcome further.
+    harness.disconnect_and_join();
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(buffer.len(), 3);
+    let ledger = harness.transcript_ledger.lock().unwrap();
+    assert_eq!(ledger.latest_spans.len(), 2);
+}
+
+/// Pinned behavior: a retained interim that carries per-word speaker data
+/// spanning a turn boundary must be split into per-run segments on
+/// promotion, exactly like a genuine multi-speaker final (audio-graph-4aed)
+/// — not collapsed onto the first word's speaker.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_multi_speaker_interim_promotion_splits_into_per_run_segments() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-multi-speaker-promote", 0);
+
+    let word =
+        |word: &str, start: f64, end: f64, speaker: u32| crate::asr::deepgram::DeepgramWord {
+            word: word.to_string(),
+            punctuated_word: None,
+            start,
+            end,
+            confidence: 0.8,
+            speaker: Some(speaker),
+        };
+
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "hello world".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 1.0,
+        duration: 1.5,
+        words: vec![word("hello", 1.0, 1.5, 0), word("world", 1.5, 2.5, 1)],
+    });
+
+    harness.disconnect_and_join();
+
+    let run0_span_id = super::provider_start_span_id("deepgram", &harness.source_id, 1.0);
+    let run1_span_id = super::provider_start_span_id("deepgram", &harness.source_id, 1.5);
+
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer.len(),
+        2,
+        "a mid-interim speaker change must split into two promoted segments"
+    );
+    assert_eq!(buffer[0].text, "hello");
+    assert_eq!(buffer[0].speaker_label.as_deref(), Some("Speaker 0"));
+    assert_eq!(buffer[1].text, "world");
+    assert_eq!(
+        buffer[1].speaker_label.as_deref(),
+        Some("Speaker 1"),
+        "run 1's words must not be silently attributed to run 0's speaker"
+    );
+    drop(buffer);
+
+    let ledger = harness.transcript_ledger.lock().unwrap();
+    assert_eq!(ledger.latest_spans.len(), 2);
+    let run0 = ledger
+        .latest_spans
+        .iter()
+        .find(|s| s.span_id == run0_span_id)
+        .expect("run 0 must keep the pending span's own span_id");
+    // Mirrors the real final path's multi-run convention exactly: EVERY run
+    // (including run 0) gets a `:run{index}` suffix in the multi-speaker
+    // branch — only the single-run branch omits it.
+    assert_eq!(
+        run0.raw_event_ref.as_deref(),
+        Some("deepgram.results.interim-promoted:run0")
+    );
+    let run1 = ledger
+        .latest_spans
+        .iter()
+        .find(|s| s.span_id == run1_span_id)
+        .expect("run 1 must land on its own new span_id");
+    assert_eq!(
+        run1.raw_event_ref.as_deref(),
+        Some("deepgram.results.interim-promoted:run1")
+    );
+}
+
+/// Pinned behavior: promotion consumes a `speaker_map` remap slot exactly
+/// like a genuine final (audio-graph-4aed review — interims deliberately do
+/// not). Proven here by capping `max_speakers=1` across TWO separately
+/// promoted spans: the second span's raw speaker id is over the cap and must
+/// collapse onto the first span's remapped speaker, showing the SAME shared
+/// `speaker_map`/`last_speaker` state used by a genuine final path is
+/// threaded through every promotion in the session-end flush loop.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_promoted_interim_speaker_consumes_shared_speaker_cap() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-speaker-cap-promote", 1);
+
+    let word = |word: &str, speaker: u32| crate::asr::deepgram::DeepgramWord {
+        word: word.to_string(),
+        punctuated_word: None,
+        start: 0.0,
+        end: 0.5,
+        confidence: 0.8,
+        speaker: Some(speaker),
+    };
+
+    // Two disjoint interim-only spans, raw speakers 0 and 1, neither ever
+    // finalized. Promoted at disconnect in start-time order (0.0 then 2.0).
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "first speaker".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 0.0,
+        duration: 0.5,
+        words: vec![word("hi", 0)],
+    });
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "second speaker".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 2.0,
+        duration: 0.5,
+        words: vec![word("yo", 1)],
+    });
+
+    harness.disconnect_and_join();
+
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(buffer.len(), 2);
+    assert_eq!(
+        buffer[0].speaker_label.as_deref(),
+        Some("Speaker 0"),
+        "raw speaker 0 promotes into the first (and only, max_speakers=1) cap slot"
+    );
+    assert_eq!(
+        buffer[1].speaker_label.as_deref(),
+        Some("Speaker 0"),
+        "raw speaker 1 is over the cap and must collapse onto the last-seen speaker, \
+         proving promotion consumes the SAME shared speaker_map/last_speaker state \
+         a genuine final would (not a fresh/reset one per promotion)"
+    );
+}
+
+/// Pinned behavior (review finding, minor): when ONE final proves multiple
+/// pending spans stale at once, they must be promoted in ascending `start`
+/// order -- `HashMap` iteration order is randomized per process, so without
+/// an explicit sort the promotion order (and therefore speaker-cap slot
+/// assignment, transcript_buffer row order, and extraction context windows)
+/// would be nondeterministic across identical replays of the same event
+/// stream. Tested directly against the pure helper (not through the
+/// receiver thread) so this is deterministic regardless of `HashMap`'s own
+/// iteration order for any given run -- five distinct, non-monotonically
+/// inserted spans make a coincidental pass under a "no sort" mutation
+/// vanishingly unlikely (1/120).
+#[test]
+fn past_range_pending_span_ids_orders_by_start_ascending() {
+    let mut pending: HashMap<String, super::PendingInterimSpan> = HashMap::new();
+    let starts = [4.0, 0.5, 2.5, 1.5, 3.5];
+    for start in starts {
+        let span_id = super::provider_start_span_id("deepgram", "src", start);
+        pending.insert(
+            span_id,
+            super::PendingInterimSpan {
+                source_id: "src".to_string(),
+                text: format!("span at {start}"),
+                start,
+                end_time: start + 0.1,
+                confidence: 0.9,
+                words: Vec::new(),
+                retained_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    let ordered = super::past_range_pending_span_ids(&pending, "current-final-span", 100.0);
+
+    let mut sorted_starts = starts;
+    sorted_starts.sort_by(|a, b| a.total_cmp(b));
+    let expected: Vec<String> = sorted_starts
+        .iter()
+        .map(|start| super::provider_start_span_id("deepgram", "src", *start))
+        .collect();
+    assert_eq!(
+        ordered, expected,
+        "past-range promotions must be sorted by start time, mirroring the \
+         disconnect flush's explicit sort, so multi-span promotion order is \
+         deterministic across replays"
+    );
+}
+
+/// Pinned behavior (major review finding): a span that receives interims
+/// but never gets a final -- where no LATER final ever arrives either, so
+/// the past-range trigger never fires -- must still be promoted before
+/// session end once it has gone `PENDING_INTERIM_MAX_AGE_SECS` without an
+/// update. Without this heartbeat trigger, a run of consecutive
+/// interim-only spans (finals stop arriving entirely) or the tail after the
+/// session's last final defer entirely to the session-end burst; this test
+/// exercises exactly the case the past-range trigger structurally cannot
+/// cover (it only runs inside the `is_final` branch).
+///
+/// Deliberately does NOT call `disconnect_and_join` before asserting: if the
+/// age-based trigger were missing or broken, this test would time out
+/// waiting for a mid-session promotion that never happens, rather than
+/// silently passing via the (unrelated, already-tested) disconnect flush.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_stale_pending_promoted_by_heartbeat_without_next_final() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-heartbeat-promote", 0);
+
+    harness.send(interim_event("stalled utterance", 1.0, 0.5, 0.85));
+
+    // No final, and no later span, ever arrives -- only the age-based
+    // heartbeat (500ms idle tick, PENDING_INTERIM_MAX_AGE_SECS threshold)
+    // can promote this. Poll with a bespoke deadline longer than
+    // `wait_until`'s fixed 3s, since PENDING_INTERIM_MAX_AGE_SECS is 5s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    loop {
+        if harness
+            .transcript_buffer
+            .read()
+            .map(|buf| buf.len() == 1)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the age-based heartbeat trigger to promote a \
+             stalled interim-only span with no final and no later span ever arriving"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    {
+        let buffer = harness.transcript_buffer.read().unwrap();
+        assert_eq!(buffer[0].text, "stalled utterance");
+    }
+
+    let span_id = super::provider_start_span_id("deepgram", &harness.source_id, 1.0);
+    {
+        let ledger = harness.transcript_ledger.lock().unwrap();
+        let span = ledger
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == span_id)
+            .expect("heartbeat-promoted span must be in the ledger");
+        assert_eq!(
+            span.raw_event_ref.as_deref(),
+            Some("deepgram.results.interim-promoted"),
+            "heartbeat promotion must go through the same promotion path as \
+             the past-range/disconnect triggers, not a bespoke one"
+        );
+    }
+
+    // Disconnecting now must not re-promote it a second time.
+    harness.disconnect_and_join();
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer.len(),
+        1,
+        "session-end flush must not re-promote a span the heartbeat trigger already handled"
+    );
+}
+
+/// Pinned behavior (major review finding, scope-honesty lens): past-range
+/// promotion runs BEFORE the triggering final's own
+/// `group_words_by_speaker`/`remap_deepgram_speaker` call, so a promoted
+/// span can claim a speaker-cap slot the triggering final would otherwise
+/// have claimed for itself -- changing that final's own speaker label
+/// relative to a replay of the same event stream without this feature. This
+/// is intentional, not a regression (see `promote_pending_interim`'s doc
+/// comment): the promoted span is provably earlier in time than the
+/// triggering final, so claiming its cap slot first keeps the cap's
+/// "first-seen" heuristic aligned with true chronological speech order
+/// rather than mere final-arrival order. Previously untested in this exact
+/// direction --
+/// `deepgram_promoted_interim_speaker_consumes_shared_speaker_cap` only
+/// proves shared state across two *promotions*, never promotion-then-final.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_past_range_promotion_claims_speaker_slot_before_triggering_final() {
+    let harness = DeepgramReceiverHarness::new("e70e-promotion-steals-slot", 2);
+
+    let word = |word: &str, speaker: u32| crate::asr::deepgram::DeepgramWord {
+        word: word.to_string(),
+        punctuated_word: None,
+        start: 0.0,
+        end: 1.0,
+        confidence: 0.8,
+        speaker: Some(speaker),
+    };
+
+    // Pending span with Deepgram's over-segmented raw speaker 7 -- never
+    // finalized.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "pending speaker".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 0.0,
+        duration: 1.0,
+        words: vec![word("pending", 7)],
+    });
+    // A final for a LATER span, whose own raw speaker id (0) has never
+    // appeared before in this session. Past-range promotion of the pending
+    // span above fires first, before this final's own remap.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "triggering final".to_string(),
+        confidence: 0.8,
+        is_final: true,
+        speech_final: true,
+        start: 5.0,
+        duration: 1.0,
+        words: vec![word("triggering", 0)],
+    });
+
+    harness.wait_for_buffer_len("promotion of the pending span plus the triggering final", 2);
+
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer[0].text, "pending speaker",
+        "the promoted pending span must be appended BEFORE the triggering final's own \
+         segment (it is processed first, ahead of the final's own remap)"
+    );
+    assert_eq!(
+        buffer[0].speaker_label.as_deref(),
+        Some("Speaker 0"),
+        "the earlier (chronologically) promoted span claims the first cap slot"
+    );
+    assert_eq!(buffer[1].text, "triggering final");
+    assert_eq!(
+        buffer[1].speaker_label.as_deref(),
+        Some("Speaker 1"),
+        "the triggering final's own raw speaker 0 is forced into the SECOND cap slot \
+         because the earlier pending span's promotion already claimed the first one -- \
+         this final would have gotten \"Speaker 0\" if promotion had not run first"
+    );
+}
+
+/// Pinned behavior (review findings, minor #2/#8): the implementer's report
+/// characterizes `pending_interims_by_span.remove(&span_id)` on a final as
+/// "defense in depth" whose disabling "is rejected before any buffer/counter
+/// side effect". True for the buffer, not for `speaker_map`:
+/// `remap_deepgram_speaker` (and the `asr_count`/diarization counters) run
+/// BEFORE the ledger's stale-revision rejection inside a promotion attempt,
+/// so if clear-on-final were missing, a phantom re-promotion of the SAME
+/// span's stale pre-final interim would still consume/corrupt shared
+/// speaker-cap state even though its own segment write is correctly
+/// rejected. This test makes that consequence observable -- and therefore
+/// kill-able by a mutation removing the clear-on-final line -- via a LATER,
+/// unrelated span's speaker label.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_final_clears_pending_before_it_can_corrupt_speaker_cap() {
+    let mut harness = DeepgramReceiverHarness::new("e70e-clear-on-final-cap-safety", 3);
+
+    let word = |word: &str, speaker: u32| crate::asr::deepgram::DeepgramWord {
+        word: word.to_string(),
+        punctuated_word: None,
+        start: 0.0,
+        end: 1.0,
+        confidence: 0.8,
+        speaker: Some(speaker),
+    };
+
+    // Span A: an interim with raw speaker 7, immediately followed by A's OWN
+    // final (same start => same span_id) with raw speaker 0. Correct code
+    // clears A's pending entry right here, so raw speaker 7 is never
+    // remapped.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "a interim".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 0.0,
+        duration: 1.0,
+        words: vec![word("a", 7)],
+    });
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "a final".to_string(),
+        confidence: 0.9,
+        is_final: true,
+        speech_final: true,
+        start: 0.0,
+        duration: 1.0,
+        words: vec![word("a", 0)],
+    });
+    harness.wait_for_buffer_len("A's own final lands", 1);
+
+    // Span C: interim-only, raw speaker 9, never finalized -- promoted at
+    // disconnect.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "c interim".to_string(),
+        confidence: 0.8,
+        is_final: false,
+        speech_final: false,
+        start: 3.0,
+        duration: 1.0,
+        words: vec![word("c", 9)],
+    });
+
+    harness.disconnect_and_join();
+
+    let buffer = harness.transcript_buffer.read().unwrap();
+    assert_eq!(
+        buffer.len(),
+        2,
+        "A's final plus C's promotion; A's stale interim must not ALSO be promoted"
+    );
+    assert_eq!(buffer[0].speaker_label.as_deref(), Some("Speaker 0"));
+    assert_eq!(
+        buffer[1].speaker_label.as_deref(),
+        Some("Speaker 1"),
+        "raw speaker 7 from A's cleared interim must NOT have consumed a cap slot -- \
+         if `pending_interims_by_span.remove` on A's final were missing, A's stale \
+         interim (raw 7) would be promoted-then-rejected at session end but would \
+         still remap raw 7 into slot 1 first, pushing C's raw 9 to slot 2 (\"Speaker 2\")"
+    );
+}
