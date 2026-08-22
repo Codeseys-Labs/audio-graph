@@ -48,6 +48,12 @@ import {
 import SecretCredentialControl, {
   AwsCredentialControl,
 } from "./SecretCredentialControl";
+import { readinessTone as statusTone } from "./settings/badgeTone";
+import DeferredProviderRoster from "./settings/DeferredProviderRoster";
+import ProviderChooserRow, {
+  providerChooserAnnotationId,
+} from "./settings/ProviderChooserRow";
+import { readinessChipTone } from "./settings/readinessTone";
 import {
   type AwsCredentialMode,
   endpointCredentialKey,
@@ -139,6 +145,7 @@ interface AsrProviderSettingsProps {
   assemblyaiCredentialAvailable: boolean;
   assemblyaiSavedKeyPresent: boolean;
   providerOptions: ProviderSettingsOption<SettingsState["asrType"]>[];
+  deferredProviderOptions: ProviderSettingsOption<SettingsState["asrType"]>[];
   asrApiModelCatalog: ProviderModelCatalogItem[];
   deepgramModelCatalog: ProviderModelCatalogItem[];
   openaiRealtimeModelCatalog: ProviderModelCatalogItem[];
@@ -181,6 +188,7 @@ export default function AsrProviderSettings({
   assemblyaiCredentialAvailable,
   assemblyaiSavedKeyPresent,
   providerOptions,
+  deferredProviderOptions,
   asrApiModelCatalog,
   deepgramModelCatalog,
   openaiRealtimeModelCatalog,
@@ -251,9 +259,40 @@ export default function AsrProviderSettings({
     }
   };
 
+  // T2-derived chip for the panel head (settings T3, audio-graph-9d2b): the
+  // SAME law-gated axis the active row's chip and the ProviderReadinessPanel
+  // below already compute, so the head can never claim a "Ready" the panel
+  // itself would not.
+  const panelHeadReadinessChip = readinessChipTone(
+    {
+      status: activeProviderReadiness?.status,
+      stale: activeProviderReadiness?.stale,
+      automaticProbeAvailable:
+        activeProviderReadiness?.automatic_probe_available,
+      active: true,
+    },
+    statusTone,
+  );
+
   return (
     <div className="settings-section">
-      <h3 className="settings-section__title">{t("settings.sections.asr")}</h3>
+      <div className="ag-panel-head">
+        <h3 className="settings-section__title">
+          {t("settings.sections.asr")}
+        </h3>
+        {activeProviderDescriptor && (
+          <span className="settings-panel-head__variant">
+            {activeProviderDescriptor.display_name}
+            {panelHeadReadinessChip.render && (
+              <span className="ag-chip" data-tone={panelHeadReadinessChip.tone}>
+                {t(
+                  `settings.providerReadiness.status.${panelHeadReadinessChip.effectiveStatus}`,
+                )}
+              </span>
+            )}
+          </span>
+        )}
+      </div>
       <ProviderReadinessPanel
         entry={activeProviderReadiness}
         descriptor={activeProviderDescriptor}
@@ -266,27 +305,43 @@ export default function AsrProviderSettings({
         role="radiogroup"
         aria-label={t("settings.a11y.chooseAsrProvider")}
       >
-        {providerOptions.map((option) => (
-          <label className="settings-radio" key={option.descriptor.id}>
-            <input
-              type="radio"
-              name="asr-provider"
-              checked={asrType === option.value}
-              onChange={() => dispatch(setField("asrType", option.value))}
-            />
-            <span>{option.label}</span>
-            {option.value === "local_whisper" &&
-              asrType === "local_whisper" &&
-              modelStatus && (
-                <span
-                  className={`status-badge ${readinessBadge(modelStatus.whisper).cls}`}
-                >
-                  {t(readinessBadge(modelStatus.whisper).labelKey)}
-                </span>
-              )}
-          </label>
-        ))}
+        {providerOptions.map((option) => {
+          const isActive = asrType === option.value;
+          return (
+            <ProviderChooserRow
+              key={option.descriptor.id}
+              descriptor={option.descriptor}
+              active={isActive}
+              activeReadiness={isActive ? activeProviderReadiness : null}
+              credentialPresence={credentialPresence}
+              t={t}
+            >
+              <label className="settings-radio">
+                <input
+                  type="radio"
+                  name="asr-provider"
+                  checked={isActive}
+                  aria-describedby={providerChooserAnnotationId(
+                    option.descriptor.id,
+                  )}
+                  onChange={() => dispatch(setField("asrType", option.value))}
+                />
+                <span>{option.label}</span>
+                {option.value === "local_whisper" &&
+                  asrType === "local_whisper" &&
+                  modelStatus && (
+                    <span
+                      className={`status-badge ${readinessBadge(modelStatus.whisper).cls}`}
+                    >
+                      {t(readinessBadge(modelStatus.whisper).labelKey)}
+                    </span>
+                  )}
+              </label>
+            </ProviderChooserRow>
+          );
+        })}
       </div>
+      <DeferredProviderRoster options={deferredProviderOptions} t={t} />
 
       {activeProviderDescriptor &&
         providerIsDeferred(activeProviderDescriptor) && (

@@ -11,7 +11,7 @@
 
 import { useTranslation } from "react-i18next";
 import { modeReadinessTone } from "./badgeTone";
-import { readinessAxisTone } from "./readinessTone";
+import { readinessChipTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerSetupBlockerKindLabel,
@@ -61,13 +61,13 @@ export default function ProductModeSummaryCards() {
           // readiness says). `modeReadinessTone`/`providerSetupStatusLabel`
           // still own the concrete tone/copy for every other status
           // (including "blocked", which the shared law doesn't know about).
-          const readinessAxis = readinessAxisTone({
-            status: card.readinessStatus,
-            active: card.selected,
-          });
-          const readinessChipTone = readinessAxis.forceNeutral
-            ? "neutral"
-            : modeReadinessTone(readinessAxis.effectiveStatus);
+          // `readinessChipTone` (settings T3, audio-graph-9d2b) is the one
+          // seam that folds `forceNeutral` into the tone instead of every
+          // caller hand-applying the same branch.
+          const readinessChip = readinessChipTone(
+            { status: card.readinessStatus, active: card.selected },
+            modeReadinessTone,
+          );
 
           return (
             <article
@@ -108,9 +108,9 @@ export default function ProductModeSummaryCards() {
                       {t("settings.modes.notInMvp")}
                     </span>
                   )}
-                  {card.uiSelectable && readinessAxis.render && (
-                    <span className="ag-chip" data-tone={readinessChipTone}>
-                      {providerSetupStatusLabel(readinessAxis.effectiveStatus)}
+                  {card.uiSelectable && readinessChip.render && (
+                    <span className="ag-chip" data-tone={readinessChip.tone}>
+                      {providerSetupStatusLabel(readinessChip.effectiveStatus)}
                     </span>
                   )}
                 </div>

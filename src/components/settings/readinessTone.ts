@@ -28,6 +28,8 @@
  * chips) get the same law by construction instead of re-deriving it.
  */
 
+import type { BadgeTone } from "./badgeTone";
+
 /** The "nothing has been (successfully, freshly, actively) observed" status
  * every demotion collapses to for copy purposes — reuses each caller's
  * existing "unchecked" key/label (e.g.
@@ -122,4 +124,37 @@ export function readinessAxisTone<S extends string>({
   const forceNeutral = effectiveStatus === "unchecked";
 
   return { render: true, effectiveStatus, forceNeutral };
+}
+
+export interface ReadinessChipResult<S extends string> {
+  /** Same meaning as {@link ReadinessAxisResult.render}. */
+  render: boolean;
+  /** Same meaning as {@link ReadinessAxisResult.effectiveStatus}. */
+  effectiveStatus: S | Unchecked;
+  /** The tone to render — `forceNeutral` already folded in, so callers never
+   * hand-apply the `forceNeutral ? "neutral" : statusToneMap(effectiveStatus)`
+   * branch themselves. */
+  tone: BadgeTone;
+}
+
+/**
+ * The thin wrapper the law's own doc comment (above) promises: every call
+ * site that used to compute `readinessAxisTone(...)` and then hand-apply
+ * `axis.forceNeutral ? "neutral" : someStatusToneMap(axis.effectiveStatus)`
+ * now makes ONE call instead (settings T3, audio-graph-9d2b — folds in seed
+ * 73bf). The render/forceNeutral contract is enforced at this one seam;
+ * `statusToneMap` still owns each caller's own concrete status→tone palette
+ * (`readinessTone`/`modeReadinessTone` from `badgeTone.ts`) for every
+ * effective status the law does NOT force-neutral.
+ */
+export function readinessChipTone<S extends string>(
+  input: ReadinessAxisInput<S>,
+  statusToneMap: (status: S | Unchecked) => BadgeTone,
+): ReadinessChipResult<S> {
+  const axis = readinessAxisTone(input);
+  return {
+    render: axis.render,
+    effectiveStatus: axis.effectiveStatus,
+    tone: axis.forceNeutral ? "neutral" : statusToneMap(axis.effectiveStatus),
+  };
 }

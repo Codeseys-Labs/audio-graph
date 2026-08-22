@@ -41,6 +41,7 @@ import Icon from "../Icon";
 import type { CredentialPresenceLookup } from "../ProviderReadinessPanel";
 import {
   defaultModelForProvider,
+  deferredProviderOptionsForStage,
   modelCatalogForProvider,
   PROVIDER_DESCRIPTORS,
   providerIdForSettingsVariant,
@@ -75,6 +76,7 @@ import {
   settingsReducer,
   type TestKey,
 } from "../settingsTypes";
+import { readinessAxisTone } from "./readinessTone";
 import {
   buildOpenRouterRoutingPolicy,
   DEFAULT_OPENROUTER_BASE_URL,
@@ -133,6 +135,14 @@ const LLM_PROVIDER_SETTINGS_VARIANTS = [
 ] as const;
 const TTS_PROVIDER_SETTINGS_VARIANTS = ["none", "deepgram_aura"] as const;
 export type TtsType = (typeof TTS_PROVIDER_SETTINGS_VARIANTS)[number];
+// Cause-specific diarization requirement reasons (settings T3,
+// audio-graph-9d2b) — see `diarizationUnavailableReason` below. `null` means
+// the currently-selected diarization mode is available.
+export type DiarizationUnavailableReason =
+  | "providerUnsupported"
+  | "localModelMissing"
+  | "hybridUnmet"
+  | null;
 export const ASR_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "asr",
   ASR_PROVIDER_SETTINGS_VARIANTS,
@@ -144,6 +154,15 @@ export const LLM_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
 export const TTS_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "tts",
   TTS_PROVIDER_SETTINGS_VARIANTS,
+);
+// The deferred-roster companion of ASR_PROVIDER_OPTIONS (settings T3,
+// audio-graph-9d2b): every ASR settings-variant sub-form that is
+// `status: "implemented"` but withheld from the picker (`ui_selectable:
+// false`). Computed once at module scope from the same registry snapshot the
+// selectable list uses, so the roster's count is never hand-maintained.
+export const DEFERRED_ASR_PROVIDER_OPTIONS = deferredProviderOptionsForStage(
+  "asr",
+  ASR_PROVIDER_SETTINGS_VARIANTS,
 );
 
 function providerIdForPersistedLlm(settings: AppSettings): string {
@@ -1341,10 +1360,25 @@ export function useSettingsController() {
       (acc, entry) => acc + (entry.stale ? 1 : 0),
       0,
     );
+    // Tone-law demotion (audio-graph-2554/settings T2, folded in for this
+    // sr-only summary as part of the audio-graph-9d2b fix pass): this
+    // live-region text describes the SAME `visibleProviderReadiness` rollup
+    // CredentialsPanel renders chips for, so it must apply the same
+    // `readinessAxisTone` demotion those chips use — otherwise a stale or
+    // non-active "ready" entry gets counted as "Ready" here while the
+    // sighted chip for that exact entry reads "Unchecked" (or renders no
+    // chip at all), a sighted/non-sighted divergence. Only "ready" entries
+    // are ever demoted (to "unchecked"); every other status passes through.
     const counts = providerReadinessStatusEntries.reduce<
       Record<string, number>
     >((acc, entry) => {
-      const status = entry.status as ProviderReadinessStatusWithBlocked;
+      const axis = readinessAxisTone({
+        status: entry.status,
+        stale: entry.stale,
+        automaticProbeAvailable: entry.automatic_probe_available,
+        active: activeReadinessProviderIdSet.has(entry.provider_id),
+      });
+      const status = axis.effectiveStatus as ProviderReadinessStatusWithBlocked;
       acc[status] = (acc[status] ?? 0) + 1;
       return acc;
     }, {});
@@ -1367,6 +1401,7 @@ export function useSettingsController() {
       staleCount > 0 ? ` ${t("settings.providerReadiness.stale")}` : "";
     return `${title}: ${providerReadinessStatusEntries.length}. ${statusSummary}.${staleSummary}`;
   }, [
+    activeReadinessProviderIdSet,
     providerReadinessError,
     providerReadinessLoading,
     providerReadinessStatusEntries,
@@ -1543,10 +1578,27 @@ export function useSettingsController() {
   const localDiarizationReady = modelStatus?.sortformer === "Ready";
   const providerDiarizationRequested =
     diarizationMode === "provider" || diarizationMode === "hybrid";
-  const selectedDiarizationModeUnavailable =
-    (providerDiarizationRequested && !providerDiarizationSupported) ||
-    ((diarizationMode === "local" || diarizationMode === "hybrid") &&
-      !localDiarizationReady);
+  // Cause-specific diarization requirement (settings T3, audio-graph-9d2b):
+  // replaces the old single `selectedDiarizationModeUnavailable` boolean,
+  // which drove one generic "not available" hint that named no blocking
+  // setting. Each of the three currently-selectable modes fails for a
+  // distinct, nameable reason — resolve to exactly one of them so SttPanel
+  // can render the specific fix instead of a one-size-fits-all sentence.
+  // `null` means the current pick is available.
+  const diarizationUnavailableReason: DiarizationUnavailableReason = (() => {
+    if (diarizationMode === "provider") {
+      return providerDiarizationSupported ? null : "providerUnsupported";
+    }
+    if (diarizationMode === "local") {
+      return localDiarizationReady ? null : "localModelMissing";
+    }
+    if (diarizationMode === "hybrid") {
+      return providerDiarizationSupported && localDiarizationReady
+        ? null
+        : "hybridUnmet";
+    }
+    return null;
+  })();
   const providerSetupModeCards = useMemo(
     () =>
       deriveProviderSetupModeCards({
@@ -3442,6 +3494,7 @@ export function useSettingsController() {
     diarizationMaxSpeakers,
     diarizationMode,
     diarizationSpeakerCount,
+    diarizationUnavailableReason,
     dirty,
     dispatch,
     downloadModel,
@@ -3573,7 +3626,6 @@ export function useSettingsController() {
     saveSettings,
     savedCredentialEntries,
     selectSettingsTab,
-    selectedDiarizationModeUnavailable,
     selectedModelForProvider,
     selectedSourceIds,
     setActiveTab,

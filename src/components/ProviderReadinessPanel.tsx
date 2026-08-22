@@ -11,6 +11,8 @@ import type {
   SttFidelityDegradation,
 } from "../types";
 import { providerRoadmapAuthLabel } from "./providerRegistryHelpers";
+import { readinessTone as statusTone } from "./settings/badgeTone";
+import { readinessChipTone } from "./settings/readinessTone";
 
 export type CredentialPresenceLookup = Partial<
   Record<string, CredentialPresence>
@@ -568,11 +570,34 @@ export default function ProviderReadinessPanel({
   const recoveryAction = entry
     ? providerRecoveryAction(entry, t, descriptor)
     : null;
+  // The tone LAW (audio-graph-2554, settings T2; folded in for T3 /
+  // audio-graph-9d2b — seed 73bf): this panel always describes the provider
+  // actually selected right now (every call site passes the ACTIVE
+  // provider's readiness — AsrProviderSettings/LlmProviderSettings/TtsPanel/
+  // GeminiSettings), so Axis 3's `active` gate is unconditionally true here.
+  // What still needs gating is `stale`/`automatic_probe_available`: a cached
+  // or unverifiable "ready" must not render the label OR the
+  // `--tint-success` class as a bare "Ready" with a merely APPENDED stale
+  // sentence — the whole claim demotes together.
+  const readinessChip = entry
+    ? readinessChipTone(
+        {
+          status: entry.status,
+          stale: entry.stale,
+          automaticProbeAvailable: entry.automatic_probe_available,
+          active: true,
+        },
+        statusTone,
+      )
+    : null;
+  const effectiveEntryStatus = readinessChip?.effectiveStatus ?? null;
 
   return (
     <div
       className={`settings-provider-readiness ${
-        entry ? `settings-provider-readiness--${entry.status}` : ""
+        effectiveEntryStatus
+          ? `settings-provider-readiness--${effectiveEntryStatus}`
+          : ""
       }`}
     >
       <div
@@ -584,8 +609,8 @@ export default function ProviderReadinessPanel({
       >
         <div className="settings-provider-readiness__main">
           <span className="settings-provider-readiness__label">
-            {entry
-              ? t(`settings.providerReadiness.status.${entry.status}`)
+            {effectiveEntryStatus
+              ? t(`settings.providerReadiness.status.${effectiveEntryStatus}`)
               : loading
                 ? t("settings.providerReadiness.checking")
                 : t("settings.providerReadiness.status.unchecked")}

@@ -394,7 +394,19 @@
     },
     "providerDeferred": {
       "notice": "{{provider}} está implementado, mas foi adiado para o MVP atual e não pode mais ser selecionado. Suas configurações salvas permanecem inalteradas.",
-      "switchTo": "Alternar para {{provider}}"
+      "switchTo": "Alternar para {{provider}}",
+      "roster": {
+        "toggle": "Outros motores",
+        "summary": "Mais {{count}} motores já existem, mas não são selecionáveis nesta versão.",
+        "note": "Construídos, mas deliberadamente não oferecidos — configurações salvas continuam funcionando."
+      }
+    },
+    "providerChooser": {
+      "credentialSaved": "Chave salva",
+      "credentialNeeded": "Precisa de chave",
+      "credentialNone": "Sem chave",
+      "requirementLocalModel": "Requer selecionar um arquivo de modelo local.",
+      "requirementDefaultModel": "Modelo padrão: {{model}}"
     },
     "providerReadiness": {
       "title": "Prontidão dos provedores",
@@ -591,10 +603,10 @@
       },
       "dataBoundary": {
         "local_only": "Somente local",
-        "user_configured_endpoint": "Endpoint configurado",
+        "user_configured_endpoint": "Endpoint definido",
         "user_configured_region": "Região configurada",
         "provider_account_boundary": "Conta do provedor",
-        "vendor_cloud": "Nuvem do fornecedor"
+        "vendor_cloud": "Nuvem do provedor"
       },
       "session": {
         "noop": "Sem sessão",
@@ -681,8 +693,8 @@
     },
     "modes": {
       "title": "Modos",
-      "useThisMode": "Usar este modo"
-      ,"notInMvp": "Fora do MVP",
+      "useThisMode": "Usar este modo",
+      "notInMvp": "Fora do MVP",
       "notInMvpDetail": "Este modo aparece como contexto do roteiro, mas não pode ser selecionado no MVP atual."
     },
     "railGroups": {
@@ -712,7 +724,10 @@
       },
       "maxSpeakers": "Máximo de falantes",
       "maxSpeakersHint": "Usado apenas quando a contagem de falantes é Máximo fixo, onde este valor substitui qualquer limite específico do provedor nos controles avançados do provedor. Em Automática, o próprio limite do provedor é aplicado; em Sem limite, nenhum limite é aplicado, substituindo as configurações do provedor de qualquer forma.",
-      "unavailable": "O modo selecionado não está disponível para o provedor atual ou o estado do modelo local. Troque o provedor ou baixe o modelo de falantes antes de iniciar a captura."
+      "unavailable": "O modo selecionado não está disponível para o provedor atual ou o estado do modelo local. Troque o provedor ou baixe o modelo de falantes antes de iniciar a captura.",
+      "unavailableProviderUnsupported": "Rótulos do provedor exige um provedor ASR com suporte a diarização (atualmente Deepgram).",
+      "unavailableLocalModelMissing": "Linha do tempo local exige o modelo local de diarização baixado (seção Modelos).",
+      "unavailableHybridUnmet": "Híbrido exige um provedor ASR com diarização e o modelo local de diarização baixado."
     },
     "llmExtras": {
       "vllmPreset": "Predefinição vLLM local",
@@ -729,7 +744,8 @@
       "voice": "Voz",
       "speed": "Velocidade (0,7 – 1,5)",
       "speakAloud": "Ler respostas do chatbot em voz alta",
-      "needKeyHint": "Informe uma chave API do Deepgram aqui ou salve uma pelo provedor Deepgram em Voz para Texto."
+      "needKeyHint": "Informe uma chave API do Deepgram aqui ou salve uma pelo provedor Deepgram em Voz para Texto.",
+      "discardWarning": "Trocar do Deepgram Aura vai descartar sua voz salva ({{voice}}) e velocidade ({{speed}}) ao salvar. A leitura em voz alta é mantida."
     },
     "logging": {
       "title": "Registros",

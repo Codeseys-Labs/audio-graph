@@ -47,6 +47,25 @@ export default function TtsPanel() {
     testingTts,
     ttsTestResult,
   } = useSettings();
+  // Silent-discard warning (settings T3, audio-graph-9d2b): `tts_provider`
+  // only persists voice/speed when `ttsType === "deepgram_aura"`
+  // (useSettingsController's save payload collapses to `{type: "none"}`
+  // otherwise) — the aura draft state itself survives in memory regardless
+  // of `ttsType`, so a switch-away-then-save silently drops it with no
+  // preview today. Only warn once there is something non-default to lose —
+  // a fresh install with untouched aura defaults and `ttsType: "none"`
+  // should not see a warning about discarding nothing.
+  //
+  // `speak_aloud` is deliberately EXCLUDED from both this condition and the
+  // warning copy below: unlike voice/speed, `speak_aloud` is written to the
+  // save payload unconditionally (useSettingsController's save payload sets
+  // `speak_aloud: speakAloud` outside the `tts_provider` ternary), so it is
+  // never actually discarded on save — claiming otherwise would be a false
+  // statement inside the discard-warning trust mechanism (reviewer finding,
+  // audio-graph-9d2b fix pass).
+  const auraSettingsWouldBeDiscarded =
+    ttsType !== "deepgram_aura" &&
+    (auraVoice !== DEFAULT_AURA_VOICE || auraSpeed !== 1.0);
   return (
     <>
       {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
@@ -77,6 +96,17 @@ export default function TtsPanel() {
               </option>
             ))}
           </select>
+          {auraSettingsWouldBeDiscarded && (
+            <p
+              className="settings-hint settings-tts-discard-warning"
+              role="status"
+            >
+              {t("settings.tts.discardWarning", {
+                voice: auraVoice,
+                speed: auraSpeed,
+              })}
+            </p>
+          )}
         </div>
 
         {ttsType === "deepgram_aura" && (
@@ -120,7 +150,7 @@ export default function TtsPanel() {
               />
             </div>
 
-            <div className="settings-field settings-field--inline">
+            <div className="settings-field">
               <label htmlFor="speak-aloud-toggle">
                 <input
                   id="speak-aloud-toggle"

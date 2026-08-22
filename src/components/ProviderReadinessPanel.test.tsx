@@ -664,7 +664,14 @@ describe("ProviderReadinessPanel", () => {
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveAttribute("aria-busy", "true");
-    expect(status).toHaveTextContent(/Ready/i);
+    // Tone-law completion (settings T3, audio-graph-9d2b — folds in seed
+    // 73bf): this panel always describes the ACTIVE provider (every caller
+    // passes the currently-selected provider's readiness), so `stale: true`
+    // demotes the whole label to "Unchecked" instead of rendering "Ready"
+    // with a merely appended stale sentence — the previous version of this
+    // test asserted exactly that anti-pattern.
+    expect(status).not.toHaveTextContent(/Ready/i);
+    expect(status).toHaveTextContent(/Unchecked/i);
     expect(status).toHaveTextContent(/Checking/i);
     expect(status).toHaveTextContent(/Deepgram Aura key is valid/i);
     expect(status).toHaveTextContent(/Cached result may be stale/i);

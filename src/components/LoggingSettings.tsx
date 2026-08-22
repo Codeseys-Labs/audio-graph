@@ -187,7 +187,7 @@ export default function LoggingSettings() {
         </h3>
         <p className="settings-section-help">{t("settings.logging.help")}</p>
 
-        <div className="settings-field settings-field--inline">
+        <div className="settings-field">
           <label>
             <input
               type="checkbox"
@@ -245,7 +245,7 @@ export default function LoggingSettings() {
           </label>
         </div>
 
-        <div className="settings-field settings-field--inline">
+        <div className="settings-field">
           <button
             type="button"
             className="settings-btn"
@@ -305,7 +305,7 @@ export default function LoggingSettings() {
         </h3>
         <p className="settings-section-help">{t("settings.analytics.help")}</p>
 
-        <div className="settings-field settings-field--inline">
+        <div className="settings-field">
           <label>
             <input
               type="checkbox"

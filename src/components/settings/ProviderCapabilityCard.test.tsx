@@ -76,13 +76,17 @@ describe("ProviderCapabilityCard — the tone law (audio-graph-2554, settings T2
     // Only the selectability badge ("Planned") remains — no axis-3 chip at
     // all, not even a demoted/neutral one.
     expect(badges.querySelectorAll(".ag-chip")).toHaveLength(1);
-    // The raw technical dl dump (out of the badge's audited scope) is
-    // untouched — it still echoes the backend's literal report for
-    // inspection, so this is a deliberate scope boundary, not an oversight.
+    // Tone-law completion (settings T3, audio-graph-9d2b — folds in seed
+    // 73bf): the "raw technical dl dump stays a literal echo for inspection"
+    // scope boundary this test used to lock in is exactly the gap seed 73bf
+    // found — ADR-0030 doesn't carve out an exception for "it's inside Show
+    // advanced". The dl row now reads through the SAME law as the badge
+    // above it, so the two can never disagree.
     const readinessRow = within(card)
       .getByText("Readiness")
       .closest("div") as HTMLElement;
-    expect(readinessRow).toHaveTextContent("Ready");
+    expect(readinessRow).not.toHaveTextContent("Ready");
+    expect(readinessRow).toHaveTextContent("Unchecked");
   });
 
   it("routes the readiness badge through the helper: an active provider's error never renders success", () => {

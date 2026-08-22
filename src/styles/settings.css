@@ -1189,6 +1189,29 @@
   gap: var(--space-5);
 }
 
+/* `display: flex; align-items: center;` was deleted here for one landing
+   (settings T3, audio-graph-9d2b) on the theory that the annotated chooser
+   row (`.settings-radio-row`) needed `<label className="settings-radio">`
+   and its sibling `.settings-radio-annotation` to stack, not sit on one flex
+   line — RESTORED in the immediate fix pass (reviewer finding): that
+   reasoning was wrong. `.settings-radio-row` is a SEPARATE wrapping element
+   (`display: flex; flex-direction: column`) around the label + annotation;
+   its column stacking operates on ITS OWN children regardless of whatever
+   `display` the label itself uses — a flex container nested as a flex ITEM
+   of another flex container is normal CSS with no conflict. Deleting the
+   label's own flex instead regressed the other 12 `.settings-radio` render
+   sites (radio AND checkbox rows across GeminiSettings/LoggingSettings/
+   OpenRouterAcceleratorDiscovery/ExpressSetup/AsrProviderSettings/
+   LlmProviderSettings) that were never wrapped in `.settings-radio-row`: the
+   now-dead `gap` (no effect without flex) collapsed spacing between the
+   input and its label text, and checkbox rows additionally lost vertical
+   centering (the compensating `vertical-align: middle` below only targets
+   `input[type="radio"]`). It also collapsed the gap between "Local Llama"
+   and its `.status-badge` in the two intentionally-converted rows
+   (LlmProviderSettings.tsx / AsrProviderSettings.tsx), since `.status-badge`
+   has no margin of its own and relied on this `gap`. `.settings-radio`
+   appears in 0 test selectors, so none of this was caught by CI — verify
+   computed layout in the running app when touching this rule again. */
 .settings-radio {
   display: flex;
   align-items: center;
@@ -1200,6 +1223,84 @@
 
 .settings-radio input[type="radio"] {
   accent-color: var(--accent-blue);
+  vertical-align: middle;
+}
+
+/* The annotated chooser row (settings T3, audio-graph-9d2b): wraps the
+   EXISTING `.settings-radio` label (radio + text, unchanged, so the 7
+   anchored `getByRole("radio", {name: /^…$/i})` accessible-name assertions
+   stay untouched) and a SIBLING annotation node — never inside the label. */
+.settings-radio-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.settings-radio-annotation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.settings-radio-annotation__line {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+/* Deferred-provider roster (settings T3, audio-graph-9d2b): a collapsed,
+   plain-text, non-actionable disclosure — no interactive rows. */
+.settings-provider-deferred-roster {
+  margin-top: var(--space-4);
+}
+
+.settings-provider-deferred-roster__summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.settings-provider-deferred-roster__list {
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-5);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.settings-provider-deferred-roster__note {
+  color: var(--text-muted);
+}
+
+/* TTS silent-discard warning (settings T3, audio-graph-9d2b). */
+.settings-tts-discard-warning {
+  color: var(--color-danger);
+}
+
+/* Panel head (settings T3, audio-graph-9d2b): the live provider name +
+   T2-derived chip sitting beside the goal heading inside `.ag-panel-head`. */
+.settings-panel-head__variant {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+/* `.ag-panel-head > h3` (styles.css, `@layer components`) sets `margin: 0`,
+   but this barrel is UNLAYERED (seed 0922) and beats the layered recipe
+   regardless of specificity, so `.settings-section__title`'s own
+   `margin: 0 0 var(--space-6)` (16px bottom) silently wins whenever that
+   class is used for the h3 inside `.ag-panel-head` (AsrProviderSettings.tsx /
+   LlmProviderSettings.tsx — kept for visual parity with every other
+   uppercase-tracked `.settings-section__title` in Settings, so the class
+   itself stays; only the conflicting margin needs to go). Without this
+   override the h3's larger margin BOX gets centered by the head's
+   `align-items: center`, pushing its text ~8px above the
+   `.settings-panel-head__variant` chip on the same row. */
+.ag-panel-head > .settings-section__title {
+  margin: 0;
 }
 
 /* Form field */

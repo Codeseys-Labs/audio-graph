@@ -40,6 +40,11 @@ import {
 import SecretCredentialControl, {
   AwsCredentialControl,
 } from "./SecretCredentialControl";
+import { readinessTone as statusTone } from "./settings/badgeTone";
+import ProviderChooserRow, {
+  providerChooserAnnotationId,
+} from "./settings/ProviderChooserRow";
+import { readinessChipTone } from "./settings/readinessTone";
 import {
   type AwsCredentialMode,
   CEREBRAS_BASE_URL,
@@ -374,9 +379,38 @@ export default function LlmProviderSettings({
     dispatch(setField("llmType", value));
   };
 
+  // T2-derived chip for the panel head (settings T3, audio-graph-9d2b) — see
+  // AsrProviderSettings' identical head for the rationale.
+  const panelHeadReadinessChip = readinessChipTone(
+    {
+      status: activeProviderReadiness?.status,
+      stale: activeProviderReadiness?.stale,
+      automaticProbeAvailable:
+        activeProviderReadiness?.automatic_probe_available,
+      active: true,
+    },
+    statusTone,
+  );
+
   return (
     <div className="settings-section">
-      <h3 className="settings-section__title">{t("settings.sections.llm")}</h3>
+      <div className="ag-panel-head">
+        <h3 className="settings-section__title">
+          {t("settings.sections.llm")}
+        </h3>
+        {activeProviderDescriptor && (
+          <span className="settings-panel-head__variant">
+            {activeProviderDescriptor.display_name}
+            {panelHeadReadinessChip.render && (
+              <span className="ag-chip" data-tone={panelHeadReadinessChip.tone}>
+                {t(
+                  `settings.providerReadiness.status.${panelHeadReadinessChip.effectiveStatus}`,
+                )}
+              </span>
+            )}
+          </span>
+        )}
+      </div>
       <ProviderReadinessPanel
         entry={activeProviderReadiness}
         descriptor={activeProviderDescriptor}
@@ -389,31 +423,46 @@ export default function LlmProviderSettings({
         role="radiogroup"
         aria-label={t("settings.a11y.chooseLlmProvider")}
       >
-        {providerOptions.map((option) => (
-          <label className="settings-radio" key={option.descriptor.id}>
-            <input
-              type="radio"
-              name="llm-provider"
-              checked={llmType === option.value}
-              onChange={() => handleLlmProviderChange(option.value)}
-            />
-            <span>{option.label}</span>
-            {option.value === "local_llama" &&
-              llmType === "local_llama" &&
-              modelStatus && (
-                <span
-                  className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
-                >
-                  {t(readinessBadge(modelStatus.llm).labelKey)}
-                </span>
-              )}
-          </label>
-        ))}
+        {providerOptions.map((option) => {
+          const isActive = llmType === option.value;
+          return (
+            <ProviderChooserRow
+              key={option.descriptor.id}
+              descriptor={option.descriptor}
+              active={isActive}
+              activeReadiness={isActive ? activeProviderReadiness : null}
+              credentialPresence={credentialPresence}
+              t={t}
+            >
+              <label className="settings-radio">
+                <input
+                  type="radio"
+                  name="llm-provider"
+                  checked={isActive}
+                  aria-describedby={providerChooserAnnotationId(
+                    option.descriptor.id,
+                  )}
+                  onChange={() => handleLlmProviderChange(option.value)}
+                />
+                <span>{option.label}</span>
+                {option.value === "local_llama" &&
+                  llmType === "local_llama" &&
+                  modelStatus && (
+                    <span
+                      className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
+                    >
+                      {t(readinessBadge(modelStatus.llm).labelKey)}
+                    </span>
+                  )}
+              </label>
+            </ProviderChooserRow>
+          );
+        })}
       </div>
 
       {llmType === "local_llama" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field settings-field--inline">
+          <div className="settings-field">
             <label htmlFor="streaming-prefill-toggle">
               <input
                 id="streaming-prefill-toggle"

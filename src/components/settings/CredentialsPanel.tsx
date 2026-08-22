@@ -31,7 +31,7 @@ import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import SecretCredentialControl from "../SecretCredentialControl";
 import { type BadgeTone, readinessTone as statusTone } from "./badgeTone";
 import ReadinessModelActions from "./ReadinessModelActions";
-import { readinessAxisTone } from "./readinessTone";
+import { readinessAxisTone, readinessChipTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   formatCredentialCheckedAt,
@@ -201,16 +201,17 @@ export default function CredentialsPanel() {
                 // affordance documented above. Only the "ready"/success claim
                 // is gated on Axis 3 (active + fresh); a non-active
                 // provider's stale "ready" renders no axis-3 chip at all
-                // rather than a misleading one.
-                const readinessAxis = readinessAxisTone({
-                  status: entry.status,
-                  stale: entry.stale,
-                  automaticProbeAvailable: entry.automatic_probe_available,
-                  active: isActiveReadinessProvider,
-                });
-                const readinessChipTone = readinessAxis.forceNeutral
-                  ? "neutral"
-                  : statusTone(readinessAxis.effectiveStatus);
+                // rather than a misleading one. `readinessChipTone` (settings
+                // T3, audio-graph-9d2b) folds the forceNeutral branch in.
+                const readinessChip = readinessChipTone(
+                  {
+                    status: entry.status,
+                    stale: entry.stale,
+                    automaticProbeAvailable: entry.automatic_probe_available,
+                    active: isActiveReadinessProvider,
+                  },
+                  statusTone,
+                );
 
                 return (
                   <div
@@ -222,10 +223,13 @@ export default function CredentialsPanel() {
                         {PROVIDER_READINESS_LABELS.get(entry.provider_id) ??
                           entry.provider_id}
                       </span>
-                      {readinessAxis.render && (
-                        <span className="ag-chip" data-tone={readinessChipTone}>
+                      {readinessChip.render && (
+                        <span
+                          className="ag-chip"
+                          data-tone={readinessChip.tone}
+                        >
                           {t(
-                            `settings.providerReadiness.status.${readinessAxis.effectiveStatus}`,
+                            `settings.providerReadiness.status.${readinessChip.effectiveStatus}`,
                           )}
                         </span>
                       )}
@@ -388,8 +392,28 @@ export default function CredentialsPanel() {
                               PROVIDER_READINESS_LABELS.get(
                                 entry.provider_id,
                               ) ?? entry.provider_id;
+                            // The tone LAW (audio-graph-2554, settings T2,
+                            // folded in for T3/audio-graph-9d2b — seed 73bf):
+                            // this line is plain text with no chip/color, but
+                            // it is still a "Ready" CLAIM readers see, so it
+                            // is gated the same as every styled chip — a
+                            // stale or non-active provider's cached "ready"
+                            // reads as "Unchecked" here too, never a bare
+                            // echo of the raw backend status.
+                            const readinessChip = readinessChipTone(
+                              {
+                                status: entry.status,
+                                stale: entry.stale,
+                                automaticProbeAvailable:
+                                  entry.automatic_probe_available,
+                                active: activeReadinessProviderIdSet.has(
+                                  entry.provider_id,
+                                ),
+                              },
+                              statusTone,
+                            );
                             return `${label}: ${t(
-                              `settings.providerReadiness.status.${entry.status}`,
+                              `settings.providerReadiness.status.${readinessChip.effectiveStatus}`,
                             )}`;
                           })
                           .join(" • ")}

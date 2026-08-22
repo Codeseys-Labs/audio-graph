@@ -394,7 +394,19 @@
     },
     "providerDeferred": {
       "notice": "{{provider}} is implemented but deferred for the current MVP, so it is no longer selectable. Your saved settings are unchanged.",
-      "switchTo": "Switch to {{provider}}"
+      "switchTo": "Switch to {{provider}}",
+      "roster": {
+        "toggle": "Other engines",
+        "summary": "{{count}} more engines are built but not selectable in this version.",
+        "note": "Built, deliberately not offered — saved configurations keep working."
+      }
+    },
+    "providerChooser": {
+      "credentialSaved": "Key saved",
+      "credentialNeeded": "Needs key",
+      "credentialNone": "No key needed",
+      "requirementLocalModel": "Needs a local model file selected.",
+      "requirementDefaultModel": "Default model: {{model}}"
     },
     "providerReadiness": {
       "title": "Provider readiness",
@@ -681,8 +693,8 @@
     },
     "modes": {
       "title": "Modes",
-      "useThisMode": "Use this mode"
-      ,"notInMvp": "Not in MVP",
+      "useThisMode": "Use this mode",
+      "notInMvp": "Not in MVP",
       "notInMvpDetail": "This mode is visible for roadmap context but cannot be selected in the current MVP."
     },
     "railGroups": {
@@ -712,7 +724,10 @@
       },
       "maxSpeakers": "Maximum speakers",
       "maxSpeakersHint": "Only used when speaker count is Fixed, where this value overrides any provider-specific cap in advanced provider controls. Under Auto the provider's own cap applies instead; under Unbounded no cap is applied, overriding provider settings either way.",
-      "unavailable": "The selected mode is not available for the current provider or local model state. Switch provider or download the speaker model before starting capture."
+      "unavailable": "The selected mode is not available for the current provider or local model state. Switch provider or download the speaker model before starting capture.",
+      "unavailableProviderUnsupported": "Provider labels needs an ASR provider that supports diarization (currently Deepgram).",
+      "unavailableLocalModelMissing": "Local timeline needs the local diarization model downloaded (Models section).",
+      "unavailableHybridUnmet": "Hybrid needs both a diarization-capable ASR provider and the local diarization model downloaded."
     },
     "llmExtras": {
       "vllmPreset": "vLLM local preset",
@@ -729,7 +744,8 @@
       "voice": "Voice",
       "speed": "Speed (0.7 – 1.5)",
       "speakAloud": "Speak chatbot replies aloud",
-      "needKeyHint": "Enter a Deepgram API key here or save one from the Speech-to-Text Deepgram provider."
+      "needKeyHint": "Enter a Deepgram API key here or save one from the Speech-to-Text Deepgram provider.",
+      "discardWarning": "Switching away from Deepgram Aura will discard your saved voice ({{voice}}) and speed ({{speed}}) settings when you save. Your speak-aloud setting is kept."
     },
     "logging": {
       "title": "Logging",

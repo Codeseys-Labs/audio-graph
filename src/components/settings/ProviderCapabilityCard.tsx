@@ -24,7 +24,7 @@ import {
   providerStatusLabel,
 } from "../providerRegistryHelpers";
 import { selectabilityTone, readinessTone as statusTone } from "./badgeTone";
-import { readinessAxisTone } from "./readinessTone";
+import { readinessChipTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
 import {
   providerAudioFormatLabel,
@@ -91,29 +91,29 @@ export default function ProviderCapabilityCard({
         ? "Deferred"
         : "Readiness only";
   const selected = activeReadinessProviderIdSet.has(descriptor.id);
+  // The tone LAW (audio-graph-2554, settings T2; folded in for T3 /
+  // audio-graph-9d2b — seed 73bf) applies to BOTH the readiness badge above
+  // the `<dl>` AND this technical dl row: a "ready" backend probe for a
+  // provider nobody is actually using (e.g. a "planned" provider like Soniox
+  // that happens to have a real, ready probe from before it was gated out of
+  // selection) is not an honest "Ready" claim in either place — ADR-0030
+  // doesn't carve out an exception for "it's inside Show advanced". Both
+  // reads now go through the SAME `readinessChipTone` call so they can never
+  // disagree.
+  const readinessChip = readinessChipTone(
+    {
+      status: readiness?.status,
+      stale: readiness?.stale,
+      automaticProbeAvailable: readiness?.automatic_probe_available,
+      active: selected,
+    },
+    statusTone,
+  );
   const readinessLabel = readiness
-    ? t(`settings.providerReadiness.status.${readiness.status}`)
+    ? t(`settings.providerReadiness.status.${readinessChip.effectiveStatus}`)
     : "Not checked";
-  // The tone LAW (audio-graph-2554, settings T2): the readiness BADGE (as
-  // opposed to the raw technical dl row and message above, which stay a
-  // literal echo of whatever the backend last reported for inspection) may
-  // only claim success/"Ready" for the provider actually in active/selected
-  // use, freshly and automatically probed. A non-active provider's last
-  // known status (e.g. a "planned" provider like Soniox that happens to have
-  // a real, ready backend probe from before it was gated out of selection)
-  // renders NO axis-3 chip at all rather than a misleading claim.
-  const readinessAxis = readinessAxisTone({
-    status: readiness?.status,
-    stale: readiness?.stale,
-    automaticProbeAvailable: readiness?.automatic_probe_available,
-    active: selected,
-  });
-  const readinessBadgeTone = readinessAxis.forceNeutral
-    ? "neutral"
-    : statusTone(readinessAxis.effectiveStatus);
-  const readinessBadgeLabel = readiness
-    ? t(`settings.providerReadiness.status.${readinessAxis.effectiveStatus}`)
-    : "Not checked";
+  const readinessBadgeTone = readinessChip.tone;
+  const readinessBadgeLabel = readinessLabel;
   const backendCatalogSummary = readiness
     ? providerCatalogSummary(readiness)
     : null;
@@ -169,7 +169,7 @@ export default function ProviderCapabilityCard({
           >
             {selectabilityLabel}
           </span>
-          {readinessAxis.render && (
+          {readinessChip.render && (
             <span className="ag-chip" data-tone={readinessBadgeTone}>
               {readinessBadgeLabel}
             </span>

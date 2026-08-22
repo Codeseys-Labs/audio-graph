@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readinessTone as statusTone } from "./badgeTone";
-import { readinessAxisTone } from "./readinessTone";
+import { readinessAxisTone, readinessChipTone } from "./readinessTone";
 
 /**
  * The tone LAW, one rule per test (audio-graph-2554 — settings T2). Each test
@@ -154,5 +154,56 @@ describe("readinessAxisTone — the tone law", () => {
     expect(result.effectiveStatus).toBe("blocked");
     expect(result.forceNeutral).toBe(false);
     expect(result.render).toBe(true);
+  });
+});
+
+describe("readinessChipTone — the ONE seam (settings T3, audio-graph-9d2b)", () => {
+  // Each of these mirrors a `readinessAxisTone` test above, proving the
+  // wrapper folds `forceNeutral` in exactly the way every migrated call site
+  // used to hand-apply. Mutating the wrapper to skip the `forceNeutral`
+  // branch (i.e. always calling `statusToneMap(effectiveStatus)`) fails the
+  // stale/unverifiable-ready cases below with `success` instead of `neutral`.
+  it("folds forceNeutral into the tone for a stale active 'ready' — never success", () => {
+    const result = readinessChipTone(
+      { status: "ready", stale: true, active: true },
+      statusTone,
+    );
+
+    expect(result.tone).toBe("neutral");
+    expect(result.tone).not.toBe("success");
+    expect(result.effectiveStatus).toBe("unchecked");
+    expect(result.render).toBe(true);
+  });
+
+  it("passes a fresh active 'ready' straight through to the caller's own tone map", () => {
+    const result = readinessChipTone(
+      { status: "ready", stale: false, active: true },
+      statusTone,
+    );
+
+    expect(result.tone).toBe("success");
+    expect(result.effectiveStatus).toBe("ready");
+    expect(result.render).toBe(true);
+  });
+
+  it("renders nothing for a non-active provider's cached 'ready'", () => {
+    const result = readinessChipTone(
+      { status: "ready", active: false },
+      statusTone,
+    );
+
+    expect(result.render).toBe(false);
+  });
+
+  it("is generic over the caller's own status→tone map (mode-card aggregate)", () => {
+    const modeToneMap = (status: string) =>
+      status === "blocked" ? ("warning" as const) : statusTone(status);
+    const result = readinessChipTone(
+      { status: "blocked" as const, active: true },
+      modeToneMap,
+    );
+
+    expect(result.tone).toBe("warning");
+    expect(result.effectiveStatus).toBe("blocked");
   });
 });

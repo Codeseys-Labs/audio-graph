@@ -39,7 +39,7 @@ export default function GeminiPanel() {
         <p className="settings-section-help">
           {t("settings.conversation.help")}
         </p>
-        <div className="settings-field settings-field--inline">
+        <div className="settings-field">
           <label>
             <input
               type="checkbox"

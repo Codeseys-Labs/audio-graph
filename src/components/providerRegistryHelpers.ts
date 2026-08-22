@@ -81,6 +81,37 @@ export function selectableProviderOptionsForStage<T extends string>(
   });
 }
 
+/**
+ * The companion of {@link selectableProviderOptionsForStage}: every
+ * settings-variant sub-form that IS implemented but deliberately withheld
+ * from the picker (audio-graph-ad56/e153 MVP scoping — {@link
+ * providerIsDeferred}). Powers the settings T3 deferred-provider roster
+ * (audio-graph-9d2b) — "built, deliberately not offered; saved configs keep
+ * working" (R1). Deliberately excludes `status !== "implemented"`
+ * descriptors (e.g. "planned"): those have no real sub-form to fall back to
+ * and are not "built" in any sense the roster copy can honestly claim.
+ */
+export function deferredProviderOptionsForStage<T extends string>(
+  stage: ProviderStage,
+  settingsVariants: readonly T[],
+): ProviderSettingsOption<T>[] {
+  return settingsVariants.flatMap((settingsVariant) => {
+    const descriptor = providerDescriptorForSettingsVariant(
+      stage,
+      settingsVariant,
+    );
+    if (!descriptor || !providerIsDeferred(descriptor)) return [];
+
+    return [
+      {
+        value: settingsVariant,
+        label: descriptor.display_name,
+        descriptor,
+      },
+    ];
+  });
+}
+
 function formatProviderCredentialKeys(keys: readonly string[]): string {
   if (keys.length <= 2) return keys.join(", ");
   return `${keys.slice(0, 2).join(", ")} +${keys.length - 2} more`;

@@ -10,7 +10,10 @@ import AsrProviderSettings from "../AsrProviderSettings";
 import { setField } from "../settingsTypes";
 import ProviderCapabilityStageSection from "./ProviderCapabilityStageSection";
 import { useSettings } from "./SettingsContext";
-import { ASR_PROVIDER_OPTIONS } from "./useSettingsController";
+import {
+  ASR_PROVIDER_OPTIONS,
+  DEFERRED_ASR_PROVIDER_OPTIONS,
+} from "./useSettingsController";
 
 export default function SttPanel() {
   const {
@@ -23,7 +26,7 @@ export default function SttPanel() {
     diarizationMaxSpeakers,
     providerDiarizationSupported,
     localDiarizationReady,
-    selectedDiarizationModeUnavailable,
+    diarizationUnavailableReason,
     asrApiKey,
     asrApiModelCatalog,
     asrApiCredentialAvailable,
@@ -99,9 +102,28 @@ export default function SttPanel() {
               {t("settings.diarization.modes.hybrid")}
             </option>
           </select>
-          {selectedDiarizationModeUnavailable && (
+          {/* Cause-specific requirement lines (settings T3, audio-graph-9d2b):
+              the disabled options above already show WHICH modes are
+              unavailable (disable-with-reason, matching the maxSpeakers
+              pattern below); this line names WHY the currently-selected one
+              is, instead of one generic "not available" sentence that named
+              no blocking setting. Exactly one reason applies at a time —
+              `diarizationUnavailableReason` is derived from the same
+              `providerDiarizationSupported`/`localDiarizationReady` gates the
+              disabled options use, so the two can never disagree. */}
+          {diarizationUnavailableReason === "providerUnsupported" && (
             <p className="settings-hint">
-              {t("settings.diarization.unavailable")}
+              {t("settings.diarization.unavailableProviderUnsupported")}
+            </p>
+          )}
+          {diarizationUnavailableReason === "localModelMissing" && (
+            <p className="settings-hint">
+              {t("settings.diarization.unavailableLocalModelMissing")}
+            </p>
+          )}
+          {diarizationUnavailableReason === "hybridUnmet" && (
+            <p className="settings-hint">
+              {t("settings.diarization.unavailableHybridUnmet")}
             </p>
           )}
         </div>
@@ -205,6 +227,7 @@ export default function SttPanel() {
           assemblyaiSavedKeyPresent && !assemblyaiApiKey.trim()
         }
         providerOptions={ASR_PROVIDER_OPTIONS}
+        deferredProviderOptions={DEFERRED_ASR_PROVIDER_OPTIONS}
         asrApiModelCatalog={asrApiModelCatalog}
         deepgramModelCatalog={deepgramModelCatalog}
         openaiRealtimeModelCatalog={openaiRealtimeModelCatalog}

@@ -734,7 +734,13 @@ describe("SettingsPage", () => {
     expect(deepgramCard).toHaveTextContent(
       /Platform blockers\s*None declared/i,
     );
-    expect(deepgramCard).toHaveTextContent(/Readiness\s*Ready/i);
+    // Tone-law completion (settings T3, audio-graph-9d2b — folds in seed
+    // 73bf): the default fixture's active ASR provider is local_whisper (see
+    // `baseSettings`), so Deepgram's `status: "ready"` readiness entry here
+    // is itself an inactive-provider "ready" — Axis 3 demotes this dl row to
+    // "Unchecked" too, same as the badge above it and the Soniox card below.
+    expect(deepgramCard).not.toHaveTextContent(/Readiness\s*Ready/i);
+    expect(deepgramCard).toHaveTextContent(/Readiness\s*Unchecked/i);
     expect(deepgramCard).toHaveTextContent(/Deepgram key is valid/i);
     expect(
       within(deepgramCard).queryByRole("region", {
@@ -746,7 +752,14 @@ describe("SettingsPage", () => {
     expect(sonioxCard).toHaveTextContent(/Planned/i);
     expect(sonioxCard).toHaveTextContent(/Streaming\s*Yes/i);
     expect(sonioxCard).toHaveTextContent(/Diarization\s*Yes/i);
-    expect(sonioxCard).toHaveTextContent(/Readiness\s*Ready/i);
+    // Tone-law completion (settings T3, audio-graph-9d2b — folds in seed
+    // 73bf): the fixture reports `status: "ready"` for Soniox, but Soniox is
+    // not the active ASR provider (that's local_whisper/deepgram in this
+    // suite) — Axis 3 of the tone law demotes an inactive provider's "ready"
+    // to "Unchecked" for the readiness row too, not just the badge above it.
+    // A real, active probe (Deepgram, asserted above) still reads "Ready".
+    expect(sonioxCard).toHaveTextContent(/Readiness\s*Unchecked/i);
+    expect(sonioxCard).not.toHaveTextContent(/Readiness\s*Ready/i);
     expect(sonioxCard).toHaveTextContent(
       /planned providers are not selectable/i,
     );
@@ -2213,6 +2226,44 @@ describe("SettingsPage", () => {
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
     ).toBe(false);
+  });
+
+  it("demotes a stale active-provider 'ready' to Unchecked in the hidden status summary, matching its visible chip (fix pass: the sr-only rollup used to count raw status and could contradict the chip in the same panel)", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") {
+        return [
+          {
+            provider_id: "asr.local_whisper",
+            status: "ready",
+            message: "Local Whisper model file is present",
+            checked_at: Date.now(),
+            stale: true,
+            credential_epoch: 0,
+            credentials: [],
+          },
+        ] as unknown as ProviderReadiness[];
+      }
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+
+    render(<SettingsPage />);
+
+    const row = await readinessRowForProvider(/^Local Whisper$/i);
+    // The visible chip for this exact row demotes the stale "ready" to
+    // "Unchecked" (the T2 tone law).
+    expect(within(row).getByText(/^Unchecked$/i)).toBeInTheDocument();
+    expect(within(row).queryByText(/^Ready$/i)).not.toBeInTheDocument();
+
+    // The sr-only rollup describing the SAME list must agree — before the
+    // fix this read "Ready 1" here while the chip above said "Unchecked".
+    const liveStatus = screen.getByRole("status", {
+      name: /provider readiness/i,
+    });
+    expect(liveStatus).toHaveTextContent(/unchecked 1/i);
+    expect(liveStatus).not.toHaveTextContent(/ready 1/i);
   });
 
   it("keeps provider readiness list details and actions outside the live status region", async () => {
@@ -3731,6 +3782,98 @@ describe("SettingsPage", () => {
     ).toHaveValue("aura-asteria-en");
   });
 
+  it("warns with the verbatim aura values about to be discarded when switching away from Deepgram Aura, never claims speak-aloud is discarded (it is persisted unconditionally), and removes the warning when switching back", () => {
+    // Silent-discard warning (settings T3, audio-graph-9d2b): today
+    // `tts_provider` collapses to `{type: "none"}` on save whenever
+    // `ttsType !== "deepgram_aura"`, dropping the saved voice/speed with no
+    // preview. Seed the aura draft from a saved deepgram_aura config so the
+    // in-memory voice/speed values survive the switch (they are independent
+    // useState, not reset by `ttsType`). `speak_aloud` is saved
+    // unconditionally by useSettingsController's save payload (outside the
+    // `tts_provider` ternary) regardless of `ttsType`, so the warning must
+    // NOT claim it will be discarded — fixed after a reviewer flagged the
+    // prior copy naming speak-aloud as a false claim inside the discard
+    // trust mechanism.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        tts_provider: {
+          type: "deepgram_aura",
+          voice: "aura-zeus-en",
+          sample_rate: 24_000,
+          speed: 1.3,
+        },
+        speak_aloud: true,
+      },
+    });
+
+    render(<SettingsPage />);
+    goToTab(/text-to-speech/i);
+
+    expect(
+      screen.queryByText(/discard your saved voice/i),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/^provider$/i), {
+      target: { value: "none" },
+    });
+
+    const warning = screen.getByText(/discard your saved voice/i);
+    expect(warning).toHaveTextContent("aura-zeus-en");
+    expect(warning).toHaveTextContent("1.3");
+    // Speak-aloud is not discarded on save (persisted unconditionally by
+    // useSettingsController) — the warning must say it is KEPT, not list it
+    // among the values being discarded. Assert the exact message rather
+    // than a substring so a regression that re-adds speak-aloud to the
+    // discard clause (even phrased differently) fails this test.
+    expect(warning).toHaveTextContent(
+      "Switching away from Deepgram Aura will discard your saved voice (aura-zeus-en) and speed (1.3) settings when you save. Your speak-aloud setting is kept.",
+    );
+
+    fireEvent.change(screen.getByLabelText(/^provider$/i), {
+      target: { value: "deepgram_aura" },
+    });
+    expect(
+      screen.queryByText(/discard your saved voice/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not warn about discarding speak-aloud when only speak-aloud differs from default (it is never discarded on save)", () => {
+    // Mutation-style pin for the fix: before the fix, `speakAloud` alone
+    // (with untouched voice/speed defaults) tripped
+    // `auraSettingsWouldBeDiscarded`, firing a warning that named a setting
+    // which is in fact persisted unconditionally. Toggling speak-aloud alone
+    // must not surface the discard warning.
+    resetStore();
+    render(<SettingsPage />);
+    goToTab(/text-to-speech/i);
+
+    fireEvent.change(screen.getByLabelText(/^provider$/i), {
+      target: { value: "deepgram_aura" },
+    });
+    fireEvent.click(screen.getByLabelText(/speak chatbot replies aloud/i));
+    fireEvent.change(screen.getByLabelText(/^provider$/i), {
+      target: { value: "none" },
+    });
+
+    expect(
+      screen.queryByText(/discard your saved voice/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not warn about discarding untouched aura defaults on a fresh (none) TTS config", () => {
+    // No noise for a user who never configured TTS — the defaults
+    // (DEFAULT_AURA_VOICE / speed 1.0 / speak-aloud off) are not "about to be
+    // discarded", there is nothing non-default to lose.
+    resetStore();
+    render(<SettingsPage />);
+    goToTab(/text-to-speech/i);
+
+    expect(
+      screen.queryByText(/discard your saved voice/i),
+    ).not.toBeInTheDocument();
+  });
+
   it("refreshes provider readiness after clearing a saved credential", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     resetStore({
@@ -3918,6 +4061,36 @@ describe("SettingsPage", () => {
     });
     expect(
       within(geminiGroup).getByRole("radio", { name: /vertex ai/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("wires aria-describedby from the shipped ASR and LLM radios to their ProviderChooserRow annotation (mutation-covered: ProviderChooserRow.test.tsx only exercises a test-built radio, not these pages)", () => {
+    render(<SettingsPage />);
+
+    // ASR chooser — Deepgram streaming's annotation must carry its
+    // data-boundary chip ("Vendor cloud").
+    goToTab(/speech-to-text/i);
+    const asrRadio = screen.getByRole("radio", {
+      name: /^deepgram streaming$/i,
+    });
+    const asrDescribedBy = asrRadio.getAttribute("aria-describedby");
+    expect(asrDescribedBy).toBeTruthy();
+    const asrAnnotation = document.getElementById(asrDescribedBy as string);
+    expect(asrAnnotation).not.toBeNull();
+    expect(
+      within(asrAnnotation as HTMLElement).getByText(/vendor cloud/i),
+    ).toBeInTheDocument();
+
+    // LLM chooser — OpenRouter's annotation must carry its data-boundary
+    // chip ("Configured endpoint").
+    goToTab(/language model/i);
+    const llmRadio = screen.getByRole("radio", { name: /^openrouter$/i });
+    const llmDescribedBy = llmRadio.getAttribute("aria-describedby");
+    expect(llmDescribedBy).toBeTruthy();
+    const llmAnnotation = document.getElementById(llmDescribedBy as string);
+    expect(llmAnnotation).not.toBeNull();
+    expect(
+      within(llmAnnotation as HTMLElement).getByText(/configured endpoint/i),
     ).toBeInTheDocument();
   });
 
@@ -4610,14 +4783,22 @@ describe("SettingsPage", () => {
     }
   });
 
-  it("renders global diarization controls and disables unavailable modes", () => {
+  it("renders global diarization controls, disables unavailable modes, and names the cause-specific blocker for each", () => {
+    // Cause-specific requirement lines (settings T3, audio-graph-9d2b) replace
+    // the single generic "not available for the current provider" hint with
+    // three distinct strings, each naming the actual blocking setting for the
+    // currently-selected mode. The default fixture's ASR provider
+    // (local_whisper) supports neither provider diarization nor (with no
+    // model status seeded) the local model, so all three modes stay disabled
+    // for the whole test while `diarizationMode` is switched between them.
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
 
     expect(
       screen.getByRole("heading", { name: /^diarization$/i }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText(/diarization mode/i)).toBeInTheDocument();
+    const modeSelect = screen.getByLabelText(/diarization mode/i);
+    expect(modeSelect).toBeInTheDocument();
     expect(screen.getByLabelText(/speaker count/i)).toBeInTheDocument();
 
     expect(
@@ -4629,9 +4810,103 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("option", { name: /hybrid provider \+ local/i }),
     ).toBeDisabled();
+
+    // Cause 1 — "Provider labels" selected, but the active ASR provider
+    // (local_whisper) does not support provider diarization: name the
+    // required providers, not a generic "unavailable".
     expect(
-      screen.getByText(/not available for the current provider/i),
+      screen.getByText(
+        /provider labels needs an asr provider that supports diarization/i,
+      ),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/not available for the current provider/i),
+    ).not.toBeInTheDocument();
+
+    // Cause 2 — "Local timeline" selected, but the local diarization model
+    // is not ready: name the missing model, not the provider.
+    fireEvent.change(modeSelect, { target: { value: "local" } });
+    expect(
+      screen.getByText(/local timeline needs the local diarization model/i),
+    ).toBeInTheDocument();
+
+    // Cause 3 — "Hybrid" selected, needing both legs at once: name both.
+    fireEvent.change(modeSelect, { target: { value: "hybrid" } });
+    expect(
+      screen.getByText(
+        /hybrid needs both a diarization-capable asr provider and the local diarization model/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("anti-regression pin: local_whisper never joins the provider-diarization gate (audio-graph-9d2b)", () => {
+    // The diarization gate deliberately stays the hardcoded
+    // `providerDiarizationSupported` allow-list (aws_transcribe / deepgram /
+    // assemblyai) — the registry's `supports_diarization` flag is copy only
+    // (synthesis §T3) and must NEVER become the gate. Pin local_whisper OUT
+    // of it directly through the UI: the default fixture's active ASR
+    // provider is local_whisper (deferred — audio-graph-ad56 — so it no
+    // longer has its own radio, but its sub-form and diarization gating are
+    // still live for a saved config), and "Provider labels"/"Hybrid" stay
+    // disabled while it is active. Switching to the one allow-listed,
+    // selectable provider (Deepgram) enables them. Widening the allow-list
+    // to include local_whisper — or swapping the gate to
+    // `supports_diarization`, which reports local_whisper's diarization
+    // support differently — fails this test loudly instead of silently
+    // unlocking provider diarization for a provider that cannot produce it.
+    render(<SettingsPage />);
+    goToTab(/speech-to-text/i);
+
+    expect(
+      screen.queryByRole("radio", { name: /^local whisper$/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: /provider labels/i }),
+    ).toBeDisabled();
+
+    fireEvent.click(
+      screen.getByRole("radio", { name: /^deepgram streaming$/i }),
+    );
+
+    // "Provider labels" alone isolates the `providerDiarizationSupported`
+    // gate ("Hybrid" also needs `localDiarizationReady`, which this test
+    // does not seed, so it is not a clean signal for this specific pin).
+    expect(
+      screen.getByRole("option", { name: /provider labels/i }),
+    ).not.toBeDisabled();
+  });
+
+  it("lists the deferred ASR roster as a collapsed, non-actionable disclosure alongside the 1-item radiogroup", () => {
+    // Settings T3 (audio-graph-9d2b): the ASR chooser stays a 1-item
+    // radiogroup (audio-graph-ad56 MVP scoping) and gains a collapsed roster
+    // of every implemented-but-deferred engine. Ratified framing (R1,
+    // maintainer, 2026-08-21): "built, deliberately not offered; saved
+    // configs keep working" — never "coming soon".
+    render(<SettingsPage />);
+    goToTab(/speech-to-text/i);
+
+    const asrGroup = screen
+      .getByRole("heading", { name: /ASR Provider/i, level: 3 })
+      .closest(".settings-section") as HTMLElement;
+    expect(within(asrGroup).getAllByRole("radio")).toHaveLength(1);
+
+    const roster = within(asrGroup)
+      .getByText(/other engines/i)
+      .closest("details") as HTMLElement;
+    expect(roster).toBeInTheDocument();
+    expect(within(roster).queryAllByRole("button")).toHaveLength(0);
+    expect(within(roster).queryAllByRole("link")).toHaveLength(0);
+    expect(
+      within(roster).getByText(/openai realtime transcription/i),
+    ).toBeInTheDocument();
+    // The 1 selectable provider must never also appear in the roster.
+    expect(
+      within(roster).queryByText(/^deepgram streaming$/i),
+    ).not.toBeInTheDocument();
+    expect(
+      within(roster).getByText(/deliberately not offered/i),
+    ).toBeInTheDocument();
+    expect(within(roster).queryByText(/coming soon/i)).not.toBeInTheDocument();
   });
 
   it("persists global diarization policy and suppresses provider labels when off", async () => {
