@@ -142,10 +142,17 @@ describe("DemoModeBanner", () => {
     });
 
     await waitFor(() => expect(openSettings).toHaveBeenCalledTimes(1));
-    // Settings T1 (seed audio-graph-2b9a): openSettings now takes an
-    // optional route; this call site keeps its own manual scroll-to-Models
-    // hack rather than computing one, so it must keep navigating bare —
-    // unchanged behavior under the widened signature.
-    expect(openSettings).toHaveBeenCalledWith();
+    // T4b review fix: the banner used to call bare `openSettings()` plus its
+    // own manual `getElementById("settings-models-section")` scroll hack,
+    // which was already a silent no-op (only the ACTIVE settings panel
+    // mounts, and neither General nor Credentials is the default tab). It
+    // now routes through T1's own addressing mechanism
+    // (`modelRouteForProviderId("llm.local_llama")`), which actually lands
+    // on the Models section via `useSettingsController`'s
+    // `focusSettingsField`.
+    expect(openSettings).toHaveBeenCalledWith({
+      tab: "credentials",
+      fieldId: "settings-models-section",
+    });
   });
 });

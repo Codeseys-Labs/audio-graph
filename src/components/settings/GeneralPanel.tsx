@@ -1,31 +1,23 @@
 /**
- * General rail section (blueprint §5). Theme + language prefs, the
- * `<AudioSettings>` capture form, and the `<CredentialsManager>` models/log
- * controls. Consumes the settings controller via `useSettings()` so the shell
- * no longer prop-drills these into the inline branch (Phase 2).
+ * General rail section (blueprint §5). Theme + language prefs, and the
+ * `<AudioSettings>` capture form. Consumes the settings controller via
+ * `useSettings()` so the shell no longer prop-drills these into the inline
+ * branch (Phase 2).
+ *
+ * `<CredentialsManager>` (the Models section) moved to `CredentialsPanel.tsx`
+ * under the Credentials tab (T4a, audio-graph-4850, synthesis §T4a: "Models
+ * section moves route General -> Credentials"). `settingsRoutes.ts`'s
+ * `modelRouteForProviderId("llm.local_llama")` is the single source of truth
+ * for that destination — this panel no longer renders `#settings-models-section`
+ * at all.
  */
 
 import AudioSettings from "../AudioSettings";
-import CredentialsManager from "../CredentialsManager";
 import { useSettings } from "./SettingsContext";
 import { LANGUAGE_OPTIONS, THEME_OPTIONS } from "./useSettingsController";
 
 export default function GeneralPanel() {
-  const {
-    t,
-    i18n,
-    theme,
-    setTheme,
-    state,
-    dispatch,
-    models,
-    modelStatus,
-    isDownloading,
-    isDeletingModel,
-    downloadProgress,
-    downloadModel,
-    handleDeleteClick,
-  } = useSettings();
+  const { t, i18n, theme, setTheme, state, dispatch } = useSettings();
   return (
     <>
       <section className="settings-section">
@@ -94,17 +86,6 @@ export default function GeneralPanel() {
         </div>
       </section>
       <AudioSettings state={state} dispatch={dispatch} t={t} />
-      <CredentialsManager
-        state={state}
-        t={t}
-        models={models}
-        modelStatus={modelStatus}
-        isDownloading={isDownloading}
-        isDeletingModel={isDeletingModel}
-        downloadProgress={downloadProgress}
-        downloadModel={downloadModel}
-        handleDeleteClick={handleDeleteClick}
-      />
     </>
   );
 }

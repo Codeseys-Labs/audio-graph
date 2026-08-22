@@ -18,6 +18,38 @@ import SettingsRail from "./settingsRail";
 
 const t = ((key: string) => key) as TFunction;
 
+/** Realistic-shape fixture for the T4a rail engine line so the a11y tests
+ * below exercise the actual two-line markup (provider name + chip) rather
+ * than silently rendering an empty second span. */
+function makeRailEngineInfo() {
+  return {
+    stt: {
+      providerLabel: "Local Whisper",
+      chipRender: false,
+      chipTone: "neutral",
+      chipEffectiveStatus: "unchecked",
+    },
+    llm: {
+      providerLabel: "OpenAI-compatible LLM",
+      chipRender: true,
+      chipTone: "success",
+      chipEffectiveStatus: "ready",
+    },
+    tts: {
+      providerLabel: "TTS disabled",
+      chipRender: false,
+      chipTone: "neutral",
+      chipEffectiveStatus: "unchecked",
+    },
+    gemini: {
+      providerLabel: "Gemini Live",
+      chipRender: false,
+      chipTone: "neutral",
+      chipEffectiveStatus: "unchecked",
+    },
+  };
+}
+
 function makeValue(
   overrides: Partial<SettingsControllerValue> = {},
 ): SettingsControllerValue {
@@ -27,6 +59,7 @@ function makeValue(
     setActiveTab: vi.fn(),
     handleSettingsTabKeyDown: vi.fn(),
     railHorizontal: false,
+    railEngineInfo: makeRailEngineInfo(),
     tabRefs: { current: {} },
     tabButtonId: (tab: string) => `settings-tab-${tab}`,
     tabPanelId: (tab: string) => `settings-panel-${tab}`,
@@ -138,5 +171,33 @@ describe("SettingsRail a11y", () => {
 
     expect(llmTab).toHaveAttribute("aria-selected", "true");
     expect(llmTab).toHaveAttribute("tabindex", "0");
+  });
+
+  it("renders NO chip node at all for a row whose engine info says chipRender:false (T2 axis-3 'no chip' arm, not merely an empty-looking one)", () => {
+    mockUseSettings.mockReturnValue(makeValue());
+    render(<SettingsRail />);
+
+    const tabs = screen.getAllByRole("tab");
+    // Fixture: stt/tts/gemini all have chipRender:false, llm has
+    // chipRender:true — pins the presentational JSX gate
+    // (`engine?.chipRender && ...`) at this component seam. A mutation that
+    // widens the gate to `engine && ...` (dropping the chipRender check
+    // while `engine` itself stays truthy) would make this row grow a
+    // spurious "Unchecked" `.ag-chip` node and fail this assertion.
+    for (const tabId of [
+      "settings-tab-stt",
+      "settings-tab-tts",
+      "settings-tab-gemini",
+    ]) {
+      const tab = tabs.find((t) => t.id === tabId);
+      if (!tab) throw new Error(`expected rail tab ${tabId}`);
+      expect(tab.querySelector(".ag-chip")).toBeNull();
+    }
+
+    // Sanity: the chipRender:true row (llm) DOES render one, so the assertion
+    // above isn't vacuously true because `.ag-chip` never renders anywhere.
+    const llmTab = tabs.find((tab) => tab.id === "settings-tab-llm");
+    if (!llmTab) throw new Error("expected an LLM rail tab");
+    expect(llmTab.querySelector(".ag-chip")).not.toBeNull();
   });
 });

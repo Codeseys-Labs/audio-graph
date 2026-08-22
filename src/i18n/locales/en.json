@@ -689,7 +689,17 @@
       "gemini": "Realtime agent (native S2S)",
       "tts": "Text-to-Speech",
       "credentials": "Credentials & readiness",
-      "logging": "Logging"
+      "logging": "Logging",
+      "goal": {
+        "overview": "Pick your setup",
+        "general": "App preferences",
+        "stt": "Understand speech",
+        "llm": "Think & respond",
+        "gemini": "Talk in real time",
+        "tts": "Speak the reply",
+        "credentials": "Check setup health",
+        "logging": "Diagnostics & privacy"
+      }
     },
     "modes": {
       "title": "Modes",
@@ -697,8 +707,15 @@
       "notInMvp": "Not in MVP",
       "notInMvpDetail": "This mode is visible for roadmap context but cannot be selected in the current MVP."
     },
+    "palette": {
+      "title": "Find a setting",
+      "placeholder": "Search settings…",
+      "hint": "Type to search, ↑↓ to move, Enter to jump, Esc to close",
+      "empty": "No matching settings",
+      "resultsLabel": "Search results"
+    },
     "railGroups": {
-      "providers": "Providers & Models",
+      "providers": "Conversation pipeline",
       "app": "App"
     },
     "conversation": {
@@ -963,7 +980,8 @@
       "openSettings": "Open settings",
       "openSessions": "Open sessions browser",
       "openHelp": "Show this keyboard shortcuts help",
-      "closeModal": "Close any open modal"
+      "closeModal": "Close any open modal",
+      "findSetting": "Find a setting (or press /)"
     },
     "showGettingStarted": "Show getting-started guide again",
     "gettingStartedReArmed": "The getting-started guide will appear again next time you set up."

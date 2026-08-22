@@ -41,6 +41,12 @@ const SHORTCUTS: readonly ShortcutEntry[] = [
   { id: "openSettings", keys: ["Cmd/Ctrl", ","] },
   { id: "openSessions", keys: ["Cmd/Ctrl", "Shift", "S"] },
   { id: "openHelp", keys: ["Cmd/Ctrl", "/"] },
+  // T4b find-a-setting palette (audio-graph-4850): registered by
+  // `SettingsFindPalette.tsx`, not `useKeyboardShortcuts.ts` — a third
+  // global-shortcut source this list must still track manually. The
+  // description covers the bare "/" alternate binding too, rather than
+  // adding a second row for the same action.
+  { id: "findSetting", keys: ["Cmd/Ctrl", "F"] },
   { id: "closeModal", keys: ["Esc"] },
 ];
 

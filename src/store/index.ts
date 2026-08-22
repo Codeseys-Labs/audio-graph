@@ -2956,8 +2956,23 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // `activeTab`'s initial state and consume (via `consumePendingSettingsRoute`
   // below) once the modal has hydrated. Deliberately no `apply` — see the
   // `openSettings` doc comment on `AudioGraphStore` (types/index.ts).
+  //
+  // T4b review fix (audio-graph-4850): the refetch below is skipped when
+  // Settings is ALREADY open. `fetchSettings()`'s freshly-loaded `settings`
+  // object gets a new identity every call, and `useSettingsController`'s
+  // hydration effect re-runs on every `settings` identity change,
+  // dispatching `HYDRATE_FROM_SETTINGS` (`{...state, ...patch}`) and bumping
+  // the dirty-tracking `baselineEpoch` — silently overwriting any in-progress
+  // unsaved edit with NO confirm prompt, because the fresh baseline makes the
+  // form look clean again. That refetch was only ever needed to prime the
+  // FIRST load; a second `openSettings(route)` call while the modal is
+  // already mounted and hydrated (e.g. the T4b find palette jumping to a new
+  // field without closing Settings first) must only update the navigation
+  // target, never re-hydrate.
   openSettings: (route) => {
+    const alreadyOpen = get().settingsOpen;
     set({ settingsOpen: true, pendingSettingsRoute: route ?? null });
+    if (alreadyOpen) return;
     const { fetchSettings, fetchModels, fetchModelStatus } = get();
     fetchSettings();
     fetchModels();

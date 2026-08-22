@@ -82,6 +82,11 @@ function makeValue(
     credentialSaveNotice: {} as Record<string, string>,
     setCredentialDraft: vi.fn(),
     handleSaveCredentialValue: vi.fn(),
+    // T4a (audio-graph-4850): `<CredentialsManager>` (the Models section)
+    // moved here from GeneralPanel — `state`/`modelStatus` are the two
+    // additional context fields it reads that this panel didn't need before.
+    state: { confirmDelete: null },
+    modelStatus: null,
     models: [] as ModelInfo[],
     downloadModel: vi.fn(),
     handleDeleteClick: vi.fn(),
@@ -155,14 +160,21 @@ describe("CredentialsPanel readiness model actions", () => {
     );
     render(<CredentialsPanel />);
 
+    // Scoped to the by-provider readiness rollup, NOT the whole document:
+    // since T4a (audio-graph-4850) co-located `<CredentialsManager>` (the
+    // Models catalog section) on this same panel, that section legitimately
+    // renders its OWN Delete button for this same downloaded whisper file —
+    // this test's claim is only about the readiness ROLLUP's per-provider
+    // card, which must ignore a local file for a cloud provider regardless.
+    const rollup = screen.getByRole("region", { name: /provider readiness/i });
     expect(
-      screen.queryByTestId(`readiness-model-${WHISPER_SMALL}`),
+      within(rollup).queryByTestId(`readiness-model-${WHISPER_SMALL}`),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /download/i }),
+      within(rollup).queryByRole("button", { name: /download/i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /delete/i }),
+      within(rollup).queryByRole("button", { name: /delete/i }),
     ).not.toBeInTheDocument();
   });
 });

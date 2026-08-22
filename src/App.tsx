@@ -106,6 +106,11 @@ import PreflightCard from "./components/PreflightCard";
 import ShellDrawer from "./components/ShellDrawer";
 import StorageBanner from "./components/StorageBanner";
 import SystemDrawer from "./components/SystemDrawer";
+// T4b (audio-graph-4850, synthesis §T4b): mounted unconditionally (like
+// `Notifications` below), NOT gated on `settingsOpen` — ⌘F/Ctrl+F/`/` must
+// open the palette (and, via it, Settings itself) even while Settings is
+// currently closed. Renders nothing until its own shortcut opens it.
+import SettingsFindPalette from "./components/settings/SettingsFindPalette";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -1156,6 +1161,10 @@ function App() {
       {/* Unified notification host (ADR-0011): transient queue + legacy
           error string, stacked above modals with severity aria-live. */}
       <Notifications />
+
+      {/* "Find a setting" jump palette (T4b, audio-graph-4850) — always
+          mounted, renders nothing until ⌘F/Ctrl+F/`/` opens it. */}
+      <SettingsFindPalette />
     </div>
   );
 }

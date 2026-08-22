@@ -1488,6 +1488,35 @@
   color: var(--text-primary);
   background: var(--hover-overlay);
 }
+
+/* T4a dual-label rows (audio-graph-4850, synthesis §T4a): a new goal-vocabulary
+   line stacked above the pre-existing engine-vocabulary line. Both are
+   `display:block` (new nodes, not an override of any prior BEM rule — no
+   unlayered-barrel conflict, seed audio-graph-0922). */
+.settings-tab__goal {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-normal);
+}
+
+.settings-tab__engine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The live provider name (unlocalized everywhere else in this app too —
+   `PROVIDER_READINESS_LABELS`/`CredentialsPanel.tsx` — kept consistent). The
+   leading "·" is decorative chrome, not translatable copy. */
+.settings-tab__provider {
+  color: var(--text-muted);
+  font-weight: var(--font-weight-normal);
+}
+.settings-tab__provider::before {
+  content: "\00B7";
+  margin-right: var(--space-2);
+}
 /* Active state must be unambiguous at all widths (blueprint §1.4): filled
    background + left accent bar, paired with aria-selected. */
 .settings-tab--active {
@@ -1574,6 +1603,25 @@
     border-bottom-color: var(--accent);
     border-radius: var(--radius-md) var(--radius-md) 0 0;
   }
+
+  /* T4a known compromise (audio-graph-4850, synthesis §T4a, ratified R2): the
+     horizontal strip must stay single-line, so the NEW goal-vocabulary line
+     hides below 720px — below this width users keep today's (pre-T4a)
+     engine-first vocabulary (the unchanged `.settings-tab__engine` line
+     alone), not the new goal phrasing. This is a stated, accepted trade-off,
+     not an oversight.
+
+     UNPINNABLE by design in this repo's test harness, disclosed rather than
+     silently skipped: `vitest.config.ts` sets `css: false`, so jsdom never
+     applies ANY stylesheet (this one or any other) — no Vitest test can ever
+     observe this `display: none` taking effect, for this rule or any other
+     media query in the app. `e2e/specs/shell.e2e.ts` (the only real-browser
+     suite) never opens the Settings modal and has no tab/viewport coverage
+     to extend. Both gaps were verified, not assumed, during the T4b review
+     fix pass (audio-graph-4850). */
+  .settings-tab__goal {
+    display: none;
+  }
 }
 
 /* Respect prefers-reduced-motion across the settings surface (blueprint §3). */
@@ -1585,6 +1633,78 @@
   .settings-landed {
     animation: none;
   }
+}
+
+/* "Find a setting" jump palette (T4b, audio-graph-4850, synthesis §T4b).
+   New nodes only — no BEM site is touched, so the unlayered-barrel trap
+   (seed audio-graph-0922) does not apply here. Sits above `--z-modal` (reuses
+   the existing `--z-notification` token, styles.css) so it stays reachable
+   even while the Settings modal is already open. */
+.settings-palette-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim-color);
+  z-index: var(--z-notification);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+
+.settings-palette {
+  width: min(560px, calc(100vw - var(--space-8)));
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+}
+
+.settings-palette__input {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--border-color);
+  background: none;
+  color: var(--text-primary);
+  font-size: var(--font-size-lg);
+  padding: var(--space-4) var(--space-5);
+}
+.settings-palette__input:focus-visible {
+  outline: none;
+}
+
+.settings-palette__hint {
+  margin: 0;
+  padding: var(--space-2) var(--space-5);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.settings-palette__empty {
+  margin: 0;
+  padding: var(--space-5);
+  color: var(--text-muted);
+}
+
+.settings-palette__list {
+  margin: 0;
+  padding: var(--space-2);
+  overflow-y: auto;
+  list-style: none;
+}
+
+.settings-palette__option {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.settings-palette__option--active {
+  background: var(--hover-overlay-strong);
+  color: var(--text-primary);
 }
 
 /* Logging settings: log-file list. */

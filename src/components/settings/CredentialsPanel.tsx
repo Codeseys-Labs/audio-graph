@@ -17,9 +17,17 @@
  * Reads everything from `useSettings()`. The `.settings-credential-health__item`
  * markup + `<code>{key}</code>` shape is preserved so deep-link routing and the
  * credential tests keep resolving.
+ *
+ * Also hosts `<CredentialsManager>` (the local-models readiness section,
+ * `#settings-models-section`) — moved here from `GeneralPanel.tsx` by T4a
+ * (audio-graph-4850, synthesis §T4a: "Models section moves route General ->
+ * Credentials ('Setup health')"). `settingsRoutes.ts`'s
+ * `modelRouteForProviderId("llm.local_llama")` is the single source of truth
+ * for the `{tab, fieldId}` destination that points here.
  */
 
 import type { ProviderReadiness } from "../../types";
+import CredentialsManager from "../CredentialsManager";
 import {
   credentialSourceLabel,
   ProviderReadinessDetails,
@@ -83,6 +91,7 @@ function credentialStatusChip(
 export default function CredentialsPanel() {
   const {
     t,
+    state,
     savedCredentialEntries,
     relatedReadinessForCredential,
     providerLabelsForCredential,
@@ -104,6 +113,13 @@ export default function CredentialsPanel() {
     credentialSaveNotice,
     setCredentialDraft,
     handleSaveCredentialValue,
+    models,
+    modelStatus,
+    isDownloading,
+    isDeletingModel,
+    downloadProgress,
+    downloadModel,
+    handleDeleteClick,
   } = useSettings();
   // NOTE: The model-action state (models/downloadModel/handleDeleteClick/
   // confirmDelete/downloadProgress/isDownloading/isDeletingModel) is read inside
@@ -523,6 +539,17 @@ export default function CredentialsPanel() {
           </div>
         )}
       </section>
+      <CredentialsManager
+        state={state}
+        t={t}
+        models={models}
+        modelStatus={modelStatus}
+        isDownloading={isDownloading}
+        isDeletingModel={isDeletingModel}
+        downloadProgress={downloadProgress}
+        downloadModel={downloadModel}
+        handleDeleteClick={handleDeleteClick}
+      />
     </>
   );
 }

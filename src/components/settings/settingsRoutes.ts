@@ -555,7 +555,10 @@ export function modelRouteForProviderId(providerId: string): RouteEntry | null {
         applyAction: { kind: "asr_variant", variant: "sherpa_onnx" },
       };
     case "llm.local_llama":
-      return { tab: "general", fieldId: "settings-models-section" };
+      // T4a (audio-graph-4850, synthesis §T4a): the Models section moved
+      // General -> Credentials ("Setup health") — `CredentialsManager` now
+      // renders `#settings-models-section` inside `CredentialsPanel.tsx`.
+      return { tab: "credentials", fieldId: "settings-models-section" };
     case "llm.api":
       return {
         tab: "llm",

@@ -191,9 +191,9 @@ describe("modelRouteForProviderId", () => {
     );
   });
 
-  it("routes llm.local_llama's model route to the General tab's Models section, with no apply", () => {
+  it("routes llm.local_llama's model route to the Credentials tab's Models section, with no apply (T4a moved this from General)", () => {
     expect(modelRouteForProviderId("llm.local_llama")).toEqual({
-      tab: "general",
+      tab: "credentials",
       fieldId: "settings-models-section",
     });
   });

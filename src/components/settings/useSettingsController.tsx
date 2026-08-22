@@ -76,6 +76,7 @@ import {
   settingsReducer,
   type TestKey,
 } from "../settingsTypes";
+import { railEngineInfoForProvider } from "./railEngineInfo";
 import { readinessAxisTone } from "./readinessTone";
 import {
   buildOpenRouterRoutingPolicy,
@@ -1421,6 +1422,15 @@ export function useSettingsController() {
   const activeTtsProviderReadiness =
     providerReadiness[activeTtsProviderId] ?? null;
   const geminiProviderReadiness = providerReadiness[geminiProviderId] ?? null;
+  // The rail's realtime-agent row must reflect whichever agent is ACTUALLY
+  // selected (`selectedRealtimeAgentProviderId`, computed above), not always
+  // Gemini Live — a native+OpenAI setup otherwise showed "Gemini Live" on
+  // the engine line while OpenAI Realtime was the live agent (T4b review
+  // finding). `geminiProviderDescriptor`/`geminiProviderReadiness` above stay
+  // Gemini-Live-specific for `GeminiPanel`'s own settings sub-form, which
+  // always configures Gemini Live regardless of which agent is selected.
+  const selectedRealtimeAgentProviderReadiness =
+    providerReadiness[selectedRealtimeAgentProviderId] ?? null;
   const activeAsrProviderDescriptor =
     PROVIDER_DESCRIPTORS.get(activeAsrProviderId) ?? null;
   const activeLlmProviderDescriptor =
@@ -1429,6 +1439,59 @@ export function useSettingsController() {
     PROVIDER_DESCRIPTORS.get(activeTtsProviderId) ?? null;
   const geminiProviderDescriptor =
     PROVIDER_DESCRIPTORS.get(geminiProviderId) ?? null;
+  const selectedRealtimeAgentProviderDescriptor =
+    PROVIDER_DESCRIPTORS.get(selectedRealtimeAgentProviderId) ?? null;
+  // T4a rail engine line (audio-graph-4850, synthesis §T4a): the rail's
+  // second line per provider-bearing tab. `active` reuses the SAME
+  // `activeReadinessProviderIdSet` membership every other T2/T3 consumer
+  // checks — stt/llm/tts always have exactly one active variant by
+  // construction, so those three are unconditionally active; the realtime-
+  // agent ("gemini") tab's row names whichever agent is ACTUALLY selected
+  // (`selectedRealtimeAgentProviderId` — Gemini Live or OpenAI Realtime) and
+  // only earns the chip when native realtime is actually on AND that agent
+  // is the selected one, which is exactly what
+  // `activeReadinessProviderIdSet.has(selectedRealtimeAgentProviderId)`
+  // already encodes (T4b review fix: this previously hardcoded Gemini Live
+  // regardless of `converseRealtimeAgentProvider`).
+  const railEngineInfo = useMemo(
+    () => ({
+      stt: railEngineInfoForProvider(
+        activeAsrProviderDescriptor,
+        activeAsrProviderReadiness,
+        activeReadinessProviderIdSet.has(activeAsrProviderId),
+      ),
+      llm: railEngineInfoForProvider(
+        activeLlmProviderDescriptor,
+        activeLlmProviderReadiness,
+        activeReadinessProviderIdSet.has(activeLlmProviderId),
+      ),
+      tts: railEngineInfoForProvider(
+        activeTtsProviderDescriptor,
+        activeTtsProviderReadiness,
+        activeReadinessProviderIdSet.has(activeTtsProviderId),
+      ),
+      gemini: railEngineInfoForProvider(
+        selectedRealtimeAgentProviderDescriptor,
+        selectedRealtimeAgentProviderReadiness,
+        activeReadinessProviderIdSet.has(selectedRealtimeAgentProviderId),
+      ),
+    }),
+    [
+      activeAsrProviderDescriptor,
+      activeAsrProviderId,
+      activeAsrProviderReadiness,
+      activeLlmProviderDescriptor,
+      activeLlmProviderId,
+      activeLlmProviderReadiness,
+      activeReadinessProviderIdSet,
+      activeTtsProviderDescriptor,
+      activeTtsProviderId,
+      activeTtsProviderReadiness,
+      selectedRealtimeAgentProviderDescriptor,
+      selectedRealtimeAgentProviderId,
+      selectedRealtimeAgentProviderReadiness,
+    ],
+  );
   const openaiRealtimeModelCatalog = useMemo(
     () => modelCatalogForProvider(providerReadiness, "asr.openai_realtime"),
     [providerReadiness],
@@ -1749,20 +1812,37 @@ export function useSettingsController() {
   // Consume the pending route + focus its field once the modal has actually
   // hydrated (the tab panels don't render at all while `settingsLoading` is
   // true — see `SettingsPage.tsx` — so focusing any earlier would find no
-  // DOM node). `pendingRouteConsumedRef` makes this run exactly once per
-  // mount: `consumePendingSettingsRoute()` itself is idempotent (a second
-  // call returns `null`), but without the ref guard this effect would refire
-  // — and refocus the field, restealing user focus — every time
-  // `settingsLoading` toggles again later (e.g. a subsequent Save).
-  const pendingRouteConsumedRef = useRef(false);
+  // DOM node). Reactive to `pendingSettingsRoute` itself, not just "once at
+  // mount": a SECOND `openSettings(route)` call while this hook stays
+  // mounted — e.g. the T4b find-a-setting palette jumping to a new field
+  // without the user closing Settings first — must still navigate, not be
+  // silently dropped (T4b review fix, audio-graph-4850: the previous
+  // once-per-mount guard made Enter in the palette a no-op whenever
+  // Settings was already open, because the lazy `activeTab` initializer is
+  // the ONLY other place a route ever got applied). `consumedRouteRef`
+  // dedupes by the route's OBJECT IDENTITY — the store parks a fresh object
+  // per `openSettings` call, so this fires exactly once per distinct call
+  // (never re-focusing/restealing focus on an unrelated re-render, e.g. a
+  // later Save toggling `settingsLoading` again), yet still fires again for
+  // every NEW route the store parks afterward.
+  const consumedRouteRef = useRef<typeof pendingSettingsRoute>(null);
   useEffect(() => {
-    if (pendingRouteConsumedRef.current || settingsLoading) return;
-    pendingRouteConsumedRef.current = true;
-    const route = consumePendingSettingsRoute();
-    if (route?.fieldId) {
+    if (settingsLoading) return;
+    if (!pendingSettingsRoute) return;
+    if (pendingSettingsRoute === consumedRouteRef.current) return;
+    consumedRouteRef.current = pendingSettingsRoute;
+    const route = pendingSettingsRoute;
+    consumePendingSettingsRoute();
+    setActiveTab(route.tab);
+    if (route.fieldId) {
       focusSettingsField(route.fieldId, route.activate);
     }
-  }, [settingsLoading, consumePendingSettingsRoute, focusSettingsField]);
+  }, [
+    pendingSettingsRoute,
+    settingsLoading,
+    consumePendingSettingsRoute,
+    focusSettingsField,
+  ]);
 
   // ── Route table (pure lookup in ./settingsRoutes.ts) ────────────────────
   // Every function below is a thin wrapper: it calls the pure module for the
@@ -3612,6 +3692,7 @@ export function useSettingsController() {
     providerSetupModelRoute,
     providerSetupProviderRoute,
     providerSetupSelectionForBlocker,
+    railEngineInfo,
     railHorizontal,
     refreshAwsProfiles,
     refreshCredentialPresence,

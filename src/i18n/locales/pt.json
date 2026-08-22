@@ -689,7 +689,17 @@
       "gemini": "Agente em tempo real (S2S nativo)",
       "tts": "Texto para Voz",
       "credentials": "Credenciais e prontidão",
-      "logging": "Registros"
+      "logging": "Registros",
+      "goal": {
+        "overview": "Escolha sua configuração",
+        "general": "Preferências do app",
+        "stt": "Entender a fala",
+        "llm": "Pensar e responder",
+        "gemini": "Conversar em tempo real",
+        "tts": "Falar a resposta",
+        "credentials": "Verificar prontidão",
+        "logging": "Diagnóstico e privacidade"
+      }
     },
     "modes": {
       "title": "Modos",
@@ -697,8 +707,15 @@
       "notInMvp": "Fora do MVP",
       "notInMvpDetail": "Este modo aparece como contexto do roteiro, mas não pode ser selecionado no MVP atual."
     },
+    "palette": {
+      "title": "Encontrar uma configuração",
+      "placeholder": "Buscar configurações…",
+      "hint": "Digite para buscar, ↑↓ para mover, Enter para ir, Esc para fechar",
+      "empty": "Nenhuma configuração encontrada",
+      "resultsLabel": "Resultados da busca"
+    },
     "railGroups": {
-      "providers": "Provedores e Modelos",
+      "providers": "Pipeline de conversa",
       "app": "Aplicativo"
     },
     "conversation": {
@@ -963,7 +980,8 @@
       "openSettings": "Abrir configurações",
       "openSessions": "Abrir navegador de sessões",
       "openHelp": "Mostrar esta ajuda de atalhos de teclado",
-      "closeModal": "Fechar qualquer modal aberto"
+      "closeModal": "Fechar qualquer modal aberto",
+      "findSetting": "Encontrar uma configuração (ou pressione /)"
     },
     "showGettingStarted": "Mostrar o guia de introdução novamente",
     "gettingStartedReArmed": "O guia de introdução aparecerá novamente na próxima vez que você fizer a configuração."

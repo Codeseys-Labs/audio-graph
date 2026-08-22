@@ -8,9 +8,11 @@ import {
   within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "../store";
 import type { AppSettings, AudioSourceInfo, ProviderReadiness } from "../types";
 import SettingsPage from "./SettingsPage";
+import SettingsFindPalette from "./settings/SettingsFindPalette";
 import { ROUTE_INDEX } from "./settings/settingsRoutes";
 import {
   buildAwsCredentialSource,
@@ -32,6 +34,11 @@ const mockedInvoke = vi.mocked(invoke);
 // failure injected at the invoke layer — so the store-swallows-the-error
 // regression (silent success toast on failed persist) can't recur.
 const realStoreSaveSettings = useAudioGraphStore.getState().saveSettings;
+// The REAL `closeSettings` action, captured the same way — `resetStore`'s
+// default `closeSettings: vi.fn()` is a no-op stub that never actually
+// flips `settingsOpen`, which would make an Escape-double-close regression
+// invisible to any test asserting on `settingsOpen` afterward.
+const realStoreCloseSettings = useAudioGraphStore.getState().closeSettings;
 
 function failPlaintextCredentialLoadback(args?: unknown): never {
   void args;
@@ -4015,6 +4022,9 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("heading", { name: /^audio$/i }),
     ).toBeInTheDocument();
+    // T4a (audio-graph-4850): the Models section moved General -> Credentials
+    // ("Setup health") — the heading now renders under the Credentials tab.
+    goToTab(/credentials/i);
     expect(
       screen.getByRole("heading", { name: /^models$/i }),
     ).toBeInTheDocument();
@@ -5164,8 +5174,9 @@ describe("SettingsPage", () => {
 
   it("CredentialsManager renders the Models section header + empty state", () => {
     render(<SettingsPage />);
-    // The Models section lives under the General rail section.
-    goToTab(/general/i);
+    // T4a (audio-graph-4850): the Models section moved General -> Credentials
+    // ("Setup health").
+    goToTab(/credentials/i);
     expect(
       screen.getByRole("heading", { name: /^models$/i }),
     ).toBeInTheDocument();
@@ -7201,6 +7212,149 @@ describe("SettingsPage", () => {
     });
   });
 
+  // ── T4b review fix: openSettings(route) called AGAIN while the modal is
+  // already open (settings T1 mechanism + T4b's find-a-setting palette,
+  // audio-graph-4850) ────────────────────────────────────────────────────
+  // Reproduces, with the REAL store (no mocked `openSettings`) and the REAL
+  // `<SettingsPage>` mounted alongside the call, the exact integration gap
+  // the T4b review's adversarial probe found: the find palette calls
+  // `useAudioGraphStore.getState().openSettings(route)` directly, and it is
+  // the CANONICAL use case for that call to land while Settings is already
+  // open (you open Settings, can't find a field, invoke the palette). All
+  // 12 `SettingsFindPalette.test.tsx` tests mock `openSettings` and never
+  // render the palette alongside `<SettingsPage>`, so this integration path
+  // has no other coverage.
+  describe("openSettings(route) called again while already open (T4b review fix)", () => {
+    it("re-navigates (previously a silent no-op), does not refetch, and preserves an in-progress unsaved edit", async () => {
+      const fetchSettings = vi.fn(async () => {});
+      resetStore({
+        settingsOpen: true,
+        fetchSettings,
+        pendingSettingsRoute: null,
+      });
+
+      render(<SettingsPage />);
+      expect(document.getElementById("settings-tab-overview")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+
+      // An in-progress unsaved edit — e.g. typing a new LLM endpoint — BEFORE
+      // the second `openSettings(route)` call. This is the field the
+      // review's probe found silently reverted with zero confirmation.
+      goToTab(/language model/i);
+      const endpointField = screen.getByLabelText(
+        /endpoint/i,
+      ) as HTMLInputElement;
+      fireEvent.change(endpointField, {
+        target: { value: "https://my-unsaved-edit.example" },
+      });
+      expect(endpointField.value).toBe("https://my-unsaved-edit.example");
+
+      // The SAME call shape `SettingsFindPalette.tsx`'s `jump()` makes,
+      // fired directly at the store while the modal stays mounted.
+      act(() => {
+        useAudioGraphStore.getState().openSettings({ tab: "logging" });
+      });
+
+      // (1) It must navigate — the pending-route consume effect used to run
+      // exactly once per MOUNT (a lazy `useState` initializer + a
+      // once-guarded effect), so a route parked after that point was parked
+      // and then never read.
+      await waitFor(() => {
+        expect(document.getElementById("settings-tab-logging")).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      });
+      expect(useAudioGraphStore.getState().pendingSettingsRoute).toBeNull();
+
+      // (2) It must NOT refetch — `fetchSettings()`'s freshly loaded
+      // `settings` object gets a new identity every call, which re-runs the
+      // hydration effect and silently overwrites in-progress edits (the
+      // dirty baseline resets too, so no confirm prompt ever fires either).
+      expect(fetchSettings).not.toHaveBeenCalled();
+
+      // (3) The unsaved edit must have survived the round trip.
+      goToTab(/language model/i);
+      expect(
+        (screen.getByLabelText(/endpoint/i) as HTMLInputElement).value,
+      ).toBe("https://my-unsaved-edit.example");
+    });
+  });
+
+  // ── T4b review fix: Escape inside the palette must not leak past it
+  // (audio-graph-4850) ────────────────────────────────────────────────────
+  // Mirrors the exact App.tsx wiring the review's adversarial probe used:
+  // `useKeyboardShortcuts()` (registers the bubble-phase window Escape ->
+  // `closeSettings()` handler) + `<SettingsPage>` + `<SettingsFindPalette>`
+  // as SIBLINGS, all backed by the REAL store (no mocked `closeSettings`/
+  // `openSettings`). Two collisions the probe found, both only reachable
+  // with all three pieces mounted together — `SettingsFindPalette.test.tsx`
+  // renders the palette alone, so neither is covered there.
+  describe("palette Escape does not leak into the Settings modal underneath (T4b review fix)", () => {
+    function AppLikeHarness() {
+      useKeyboardShortcuts();
+      return (
+        <>
+          <SettingsPage />
+          <SettingsFindPalette />
+        </>
+      );
+    }
+
+    it("clean draft: closes only the palette, not the whole Settings modal too", () => {
+      resetStore({ settingsOpen: true, closeSettings: realStoreCloseSettings });
+      render(<AppLikeHarness />);
+
+      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+      const palette = screen.getByRole("combobox", { name: /find a setting/i });
+
+      fireEvent.keyDown(palette, { key: "Escape" });
+
+      // The palette is gone...
+      expect(
+        screen.queryByRole("combobox", { name: /find a setting/i }),
+      ).not.toBeInTheDocument();
+      // ...but Settings itself must still be open. Previously the palette's
+      // own Escape handler never called `stopPropagation()`, so the SAME
+      // keydown kept bubbling to `useKeyboardShortcuts.ts`'s window
+      // listener, which saw `settingsOpen` and closed the whole modal too.
+      expect(useAudioGraphStore.getState().settingsOpen).toBe(true);
+      expect(
+        screen.getByRole("dialog", { name: /settings/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("dirty draft: closes the palette without triggering the modal's discard-unsaved-changes confirm bar", () => {
+      resetStore({ settingsOpen: true, closeSettings: realStoreCloseSettings });
+      render(<AppLikeHarness />);
+
+      // Make an unsaved edit first so the controller's own dirty-tracking
+      // (and its capture-phase Escape interceptor) is armed.
+      goToTab(/language model/i);
+      fireEvent.change(screen.getByLabelText(/endpoint/i), {
+        target: { value: "https://dirty-draft.example" },
+      });
+
+      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+      const palette = screen.getByRole("combobox", { name: /find a setting/i });
+
+      fireEvent.keyDown(palette, { key: "Escape" });
+
+      // The palette must actually close...
+      expect(
+        screen.queryByRole("combobox", { name: /find a setting/i }),
+      ).not.toBeInTheDocument();
+      // ...not get silently swallowed by the modal's own dirty-draft
+      // interceptor (which used to fire FIRST, at capture phase, and call
+      // `stopImmediatePropagation()` before the palette's bubble-phase
+      // handler ever ran) while the confirm bar pops open behind it.
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(useAudioGraphStore.getState().settingsOpen).toBe(true);
+    });
+  });
+
   // ── Route-carrying save errors (settings T1, seed audio-graph-2b9a) ─────
   describe("save-error 'Go to' action", () => {
     it("renders a Go-to action only for a route-carrying (401) save error, and it navigates + focuses the field", async () => {
@@ -7307,6 +7461,132 @@ describe("SettingsPage", () => {
       expect(ROUTE_INDEX.length).toBeGreaterThan(
         DEFAULT_REACHABLE_FIELD_IDS.size,
       );
+    });
+  });
+
+  // ── T4a rail reserved-token guard, dynamic half (audio-graph-4850) ──────
+  // `settingsRailConfig.test.ts` statically checks every registry
+  // `display_name` and every goal-line/tab-label string in isolation. This
+  // is the dynamic half: mount the REAL rendered rail under several
+  // different active-provider fixtures (so the engine line's live provider
+  // name actually varies) and assert each of the 8 reserved tokens still
+  // resolves to EXACTLY ONE tab. A dual-label regression that leaks a
+  // second tab's token onto another tab's row turns `getByRole`'s "found
+  // multiple elements" failure into this test failing, instead of a
+  // downstream `goToTab` call silently clicking the wrong tab.
+  describe("T4a rail dual-label reserved-token guard", () => {
+    const RESERVED_TAB_TOKENS = [
+      /modes/i,
+      /general/i,
+      /logging/i,
+      /language model/i,
+      /speech-to-text/i,
+      /text-to-speech/i,
+      /realtime agent/i,
+      /credentials/i,
+    ];
+
+    it("every reserved token resolves to exactly one tab under the default fixture", () => {
+      resetStore();
+      render(<SettingsPage />);
+      for (const token of RESERVED_TAB_TOKENS) {
+        expect(screen.getAllByRole("tab", { name: token })).toHaveLength(1);
+      }
+    });
+
+    it("every reserved token still resolves to exactly one tab with a full alternate provider set active (deepgram ASR, Cerebras LLM, Deepgram Aura TTS, native realtime Vertex Gemini)", () => {
+      resetStore({
+        conversationMode: "converse",
+        converseEngine: "native",
+        settings: {
+          ...baseSettings,
+          asr_provider: {
+            type: "deepgram",
+            api_key: "",
+            model: "nova-3",
+            enable_diarization: false,
+          },
+          llm_provider: {
+            type: "api",
+            endpoint: "https://api.cerebras.ai/v1",
+            api_key: "",
+            model: "llama-3.3-70b",
+          },
+          tts_provider: {
+            type: "deepgram_aura",
+            voice: "aura-luna-en",
+            sample_rate: 24000,
+            speed: 1,
+          },
+          speak_aloud: true,
+          gemini: {
+            auth: {
+              type: "vertex_ai",
+              project_id: "audio-prod",
+              location: "us-central1",
+              service_account_path: "/secure/audio-prod-sa.json",
+            },
+            model: "gemini-2.0-flash-live-001",
+          },
+        },
+      });
+      render(<SettingsPage />);
+      for (const token of RESERVED_TAB_TOKENS) {
+        expect(screen.getAllByRole("tab", { name: token })).toHaveLength(1);
+      }
+    });
+
+    it("renders 'Ready' on the rail's engine line for a fresh, active, ready probe", async () => {
+      resetStore();
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+        if (cmd === "load_credential_presence_cmd") {
+          return [{ key: "openai_api_key", present: true, source: "manual" }];
+        }
+        if (cmd === "get_provider_readiness_cmd") {
+          return [
+            {
+              provider_id: "llm.api",
+              status: "ready",
+              message: "OpenAI-compatible endpoint is reachable",
+              checked_at: Date.now(),
+              stale: false,
+              credential_epoch: 0,
+              credentials: [{ key: "openai_api_key", present: true }],
+            } satisfies ProviderReadiness,
+          ];
+        }
+        if (cmd === "list_aws_profiles") return [];
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      const llmTab = await screen.findByRole("tab", {
+        name: /language model/i,
+      });
+      expect(within(llmTab).getByText("Ready")).toBeInTheDocument();
+    });
+
+    it("never renders 'Ready' on the rail's engine line for a presence-only/never-probed active provider (ADR-0030 — presence alone never means Ready)", () => {
+      resetStore();
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+        // Credential is saved (present) but the readiness fetch returns
+        // nothing for it — the real "never actually checked" shape. Mutating
+        // `railEngineInfoForProvider` to key the chip off credential
+        // presence instead of routing through T2's law would render
+        // "Ready" here anyway.
+        if (cmd === "load_credential_presence_cmd") {
+          return [{ key: "openai_api_key", present: true, source: "manual" }];
+        }
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      const llmTab = screen.getByRole("tab", { name: /language model/i });
+      expect(within(llmTab).queryByText("Ready")).not.toBeInTheDocument();
     });
   });
 });

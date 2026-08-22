@@ -1,8 +1,8 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import { scrollBehavior } from "../utils/motion";
 import Icon from "./Icon";
+import { modelRouteForProviderId } from "./settings/settingsRoutes";
 
 /**
  * Banner shown at the top of the app when the first-launch demo-mode
@@ -52,18 +52,18 @@ function DemoModeBanner() {
   if (bothReady) return null;
 
   const handleOpen = () => {
-    openSettings();
-    // Scroll to the Models section after the SettingsPage modal has
-    // mounted. requestAnimationFrame ensures the element exists before
-    // we query for it; falling back to the document top if the anchor
-    // ever gets renamed is deliberate — a missing scroll is better
-    // than an exception mid-click.
-    requestAnimationFrame(() => {
-      const el = document.getElementById("settings-models-section");
-      if (el) {
-        el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
-      }
-    });
+    // T4a moved the Models section General -> Credentials
+    // (`#settings-models-section` now renders inside `CredentialsPanel.tsx`,
+    // settingsRoutes.ts's `modelRouteForProviderId("llm.local_llama")`).
+    // Previously this called bare `openSettings()` + a manual
+    // `getElementById("settings-models-section")` scroll — since only the
+    // ACTIVE panel mounts (`SettingsPage.tsx`), that scroll was already a
+    // silent no-op pre-T4a (General doesn't default-render on open) and
+    // stayed one after T4a's move (Credentials isn't the default tab
+    // either). Routing through `openSettings(route)` (T1's own addressing
+    // mechanism) both lands on the right tab AND focuses/scrolls the field
+    // for real, via `useSettingsController`'s `focusSettingsField`.
+    openSettings(modelRouteForProviderId("llm.local_llama") ?? undefined);
   };
 
   return (

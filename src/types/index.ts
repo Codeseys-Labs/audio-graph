@@ -3030,17 +3030,31 @@ export interface AudioGraphStore {
   /**
    * `openSettings(route)` navigates the Settings modal to a specific tab and
    * (optionally) a field within it — settings T1, seed audio-graph-2b9a. The
-   * route parks as `pendingSettingsRoute` below until the modal's first
-   * hydration, at which point `useSettingsController` reads it as `activeTab`'s
-   * initial state and focuses `fieldId` (see that hook's doc comment).
+   * route parks as `pendingSettingsRoute` below; `useSettingsController`
+   * reads it as `activeTab`'s initial state on first mount AND stays
+   * reactive to it afterward — a later `openSettings(route)` call while the
+   * modal is still open (e.g. the T4b find-a-setting palette) re-navigates
+   * in place rather than being silently dropped (see that hook's doc
+   * comment on the pending-route effect).
+   *
+   * Only refetches `settings`/`models`/`modelStatus` the FIRST time (when
+   * `settingsOpen` was false) — a subsequent call while already open must
+   * never re-hydrate, which would silently clobber an in-progress unsaved
+   * edit and reset dirty tracking (T4b review fix, audio-graph-4850).
    *
    * Deliberately has NO `apply`/mutation member: every caller outside the
    * settings controller (PreflightCard, ExpressSetup, NowStrip, the keyboard
-   * shortcut, ADR-0013's conversation-mode control) may only NAVIGATE, never
-   * silently change a provider selection. The controller's own internal
-   * route table (`components/settings/settingsRoutes.ts`) has a richer,
-   * apply-carrying route type for its own credential/provider-setup flows,
-   * but that type is never the argument to this action.
+   * shortcut, ADR-0013's conversation-mode control, T4b's find palette) may
+   * only NAVIGATE, never silently change a provider selection. The
+   * controller's own internal route table
+   * (`components/settings/settingsRoutes.ts`) has a richer, apply-carrying
+   * route type for its own credential/provider-setup flows, but that type is
+   * never the argument to this action — which also means a route that needs
+   * an `applyAction` to make its target field actually RENDER (e.g. a
+   * provider-specific credential field gated on a variant toggle) may land
+   * on the right tab without the field being visible if the app isn't
+   * already in that variant. This is a known, disclosed T4b limitation, not
+   * a guarantee the palette's destinations are always visible on arrival.
    */
   openSettings: (route?: SettingsRoute) => void;
   closeSettings: () => void;
