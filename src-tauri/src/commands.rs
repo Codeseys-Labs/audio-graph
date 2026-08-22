@@ -11041,6 +11041,10 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
     fn add_question_to_graph_impl_normalizes_manual_write_timestamp_to_session_relative_seconds() {
         let state = AppState::new();
         let app_handle = crate::speech::shared_test_app_handle();
@@ -11095,6 +11099,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
     fn approve_agent_proposal_impl_normalizes_manual_write_timestamp_to_session_relative_seconds() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -11171,6 +11179,10 @@ mod tests {
     /// for a manual merge, so this always resolves through the ledger's
     /// fallback-to-any-span anchor.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
     fn merge_graph_entities_impl_normalizes_retcon_timestamp_to_session_relative_seconds() {
         let state = AppState::new();
         let app_handle = crate::speech::shared_test_app_handle();
