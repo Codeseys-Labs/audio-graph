@@ -1233,6 +1233,66 @@ fn diarize_extract_graph_chain_accumulates_entities() {
     );
 }
 
+/// Regression pin for audio-graph-4b52, scoped to what it actually drives:
+/// `process_one` (this file) reimplements the parts of
+/// `emit_transcript_and_extract_with_meta` / `process_extraction_and_emit`
+/// that don't touch `AppHandle` — it is a test harness, not the production
+/// call chain (`spawn_extraction_task` → `process_extraction_and_emit` →
+/// `apply_extraction_result_if_current` → `process_extraction`,
+/// `speech/mod.rs`). This test pins THAT HARNESS's own contract: it must
+/// keep calling `process_extraction` with the segment's raw `start_time`
+/// (session-relative seconds) completely unconverted, so if `process_one`
+/// ever drifts out of sync with the real chain by adding a conversion, this
+/// catches it.
+///
+/// The claim that the REAL production path is unmodified by the
+/// audio-graph-4b52 manual-proposal fix is established independently, by
+/// `git diff` showing zero lines touched in `speech/mod.rs` (the manual-write
+/// fix lives entirely in `commands.rs` / `projections.rs`) — not by this
+/// test. A future edit that "symmetrically" adds a ledger conversion inside
+/// `speech/mod.rs`'s real chain (e.g. at `process_extraction`'s call site
+/// around line 1521) would double-convert the live path into garbage
+/// without this test going red, since it never calls that chain.
+#[test]
+fn live_speech_path_timestamp_passes_through_unconverted() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
+    let buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> = Arc::new(RwLock::new(VecDeque::new()));
+    let extractor = RuleBasedExtractor::new();
+    let graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+
+    // A small, unambiguously session-relative start time (a few seconds into
+    // the session) — nowhere near epoch scale (~1.7e9).
+    let start_s = 42.5;
+    let input = make_input(
+        "Dana Scully briefed the team at Quantico.",
+        start_s,
+        start_s + 2.0,
+        0.4,
+    );
+    process_one(&mut worker, &buffer, &extractor, &graph, input);
+
+    let snapshot = graph.lock().unwrap().snapshot();
+    assert!(
+        !snapshot.nodes.is_empty(),
+        "expected at least one entity extracted from the segment"
+    );
+    for node in &snapshot.nodes {
+        assert_eq!(
+            node.first_seen, start_s,
+            "live path node '{}' first_seen must equal the segment's raw \
+             start_time ({start_s}) unconverted, got {}",
+            node.name, node.first_seen
+        );
+        assert_eq!(
+            node.last_seen, start_s,
+            "live path node '{}' last_seen must equal the segment's raw \
+             start_time ({start_s}) unconverted, got {}",
+            node.name, node.last_seen
+        );
+    }
+}
+
 #[test]
 fn transcript_buffer_ring_buffer_evicts_oldest_past_500() {
     // This exercises the overflow tail of `emit_transcript_and_extract_with_meta`

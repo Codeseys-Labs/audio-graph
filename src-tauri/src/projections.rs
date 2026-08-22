@@ -768,6 +768,79 @@ impl TranscriptLedger {
         ProjectionBasis::from_transcript_events(&self.latest_spans)
     }
 
+    /// Convert a wall-clock creation timestamp (Unix epoch ms) into the
+    /// session-relative-seconds domain that
+    /// `TemporalKnowledgeGraph::process_extraction` expects — the same
+    /// "relative to stream start" clock as `AccumulatedSegment::start_time`
+    /// (`speech/mod.rs`) and every `TranscriptEvent::start_time` in this
+    /// ledger.
+    ///
+    /// There is no dedicated "session start" anchor stored anywhere in
+    /// `AppState`: the live speech path derives its clock from a local
+    /// `Instant` that is never persisted. A durable per-session wall clock
+    /// DOES exist (`SessionMetadata::created_at`, `sessions/mod.rs`) — it was
+    /// considered and rejected: it is manifest-creation time, not
+    /// audio-stream-start time, and reading it here would add a disk read
+    /// (plus a session-id lookup this function doesn't otherwise need) for an
+    /// anchor no more accurate than the one already in hand. This ledger's
+    /// own `(start_time, received_at_ms)` pairs are that cheaper,
+    /// already-in-hand mapping between the two clocks, and using them is
+    /// inherently rotation-safe — `rotate_session` replaces this ledger
+    /// wholesale (see `AppState::rotate_session`), so a stale anchor from a
+    /// prior session can never leak into a new one the way a cached
+    /// wall-clock offset could.
+    ///
+    /// Anchor preference:
+    /// 1. The exact span that produced `source_segment_id`, matched against
+    ///    either `span_id` or `transcript_segment_id` — mirroring
+    ///    `live_assist_evidence_anchor`'s OR-match in `commands.rs`, since a
+    ///    partial-revision producer can leave `transcript_segment_id` unset
+    ///    (e.g. `speech/mod.rs`'s diarization-only revision path), so a
+    ///    caller's id may only resolve against the immutable `span_id`.
+    /// 2. Any other span currently in the ledger, when no exact match exists.
+    /// 3. `0.0` (session start) when the ledger has no spans at all.
+    ///
+    /// All three branches carry the SAME class of error: whatever
+    /// capture/ASR latency separates the anchor span's own `start_time` from
+    /// its own `received_at_ms` (the formula below reconstructs an implied
+    /// session-start wall clock from the anchor alone —
+    /// `received_at_ms - start_time * 1000` — then re-applies it to
+    /// `created_at_ms`). Preferring the exact match is NOT about
+    /// `created_at_ms` landing closer to that span's `received_at_ms`; every
+    /// span's implied anchor is equally "fresh" regardless of which one is
+    /// picked. It matters because it anchors on the span the caller is
+    /// actually citing, so a reader can attribute the result's drift to that
+    /// specific span's own capture latency instead of an arbitrary other
+    /// span's.
+    ///
+    /// Branch 3 (`0.0`) is reachable in production, not just a defensive
+    /// stub: `record_asr_span_revision_event` (`speech/mod.rs`) returns
+    /// `false` without advancing this ledger whenever the transcript-event
+    /// writer is unavailable or rejects the append, while the segment still
+    /// enters `transcript_buffer` and can still source a manual proposal or
+    /// auto-added question. When that happens, this returns `0.0` (session
+    /// start) rather than panicking or guessing — the SAFE failure direction,
+    /// since it makes the node the graph's EARLIEST eviction candidate, the
+    /// opposite of the epoch-timestamp immortality bug this function exists
+    /// to fix.
+    pub fn session_relative_timestamp(&self, source_segment_id: &str, created_at_ms: u64) -> f64 {
+        let anchor = self
+            .latest_spans
+            .iter()
+            .find(|event| {
+                event.span_id == source_segment_id
+                    || event.transcript_segment_id.as_deref() == Some(source_segment_id)
+            })
+            .or_else(|| self.latest_spans.first());
+
+        match anchor {
+            Some(event) => {
+                event.start_time + (created_at_ms as f64 - event.received_at_ms as f64) / 1000.0
+            }
+            None => 0.0,
+        }
+    }
+
     /// Basis visible to automatic notes/graph projection work. Provisional ASR
     /// revisions stay durable in the transcript ledger but cannot enter an LLM
     /// prompt or create follow-up churn until a final/end-of-turn revision
@@ -3091,6 +3164,118 @@ mod tests {
             transcript_events_hash_v1(std::slice::from_ref(&event)),
             "fnv1a64:4eb27818db1f8b3d",
             "the accepted v1 field bytes are a frozen replay golden"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `session_relative_timestamp` (audio-graph-4b52): converts a manual
+    // write's wall-clock `created_at_ms` into the session-relative-seconds
+    // domain `TemporalKnowledgeGraph::process_extraction` expects, using this
+    // ledger's own (start_time, received_at_ms) pairs as the anchor.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_relative_timestamp_uses_exact_segment_match_as_anchor() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        // asr_payload's fixed fields: transcript_segment_id "segment-1",
+        // start_time 1.0, received_at_ms 1_700_000_000_000 + revision_number.
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload("span-1", 2, "hello")))
+            .expect("seed matching span");
+        // A decoy span with a DIFFERENT segment id and a wildly different
+        // anchor, sorted to be `latest_spans[0]` (smaller start_time — the
+        // ledger sorts ascending by start_time; see `sort_latest_spans`), so
+        // the test only passes if the exact match is preferred over
+        // "whichever span happens to be first."
+        let mut decoy = asr_payload("span-2", 1, "decoy");
+        decoy.transcript_segment_id = Some("other-segment".to_string());
+        decoy.start_time = -500.0;
+        decoy.received_at_ms = 1_800_000_000_000;
+        ledger
+            .apply_event(TranscriptEvent::from(decoy))
+            .expect("seed decoy span");
+        assert_eq!(
+            ledger
+                .latest_spans
+                .first()
+                .and_then(|e| e.transcript_segment_id.as_deref()),
+            Some("other-segment"),
+            "sanity: the decoy must sort first so this test actually exercises \
+             the exact-match preference, not agree with `.first()` by luck"
+        );
+
+        // created_at_ms 500ms after the matching span's received_at_ms
+        // (1_700_000_000_002) should land at start_time (1.0) + 0.5s.
+        let timestamp = ledger.session_relative_timestamp("segment-1", 1_700_000_000_002 + 500);
+        assert!(
+            (timestamp - 1.5).abs() < 1e-9,
+            "expected 1.5s (matching span's start_time + 0.5s offset), got {timestamp}"
+        );
+    }
+
+    #[test]
+    fn session_relative_timestamp_falls_back_to_any_span_when_no_exact_match() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload("span-1", 2, "hello")))
+            .expect("seed span");
+
+        // "missing-segment" never appears in the ledger; fall back to the
+        // one span present (start_time 1.0, received_at_ms 1_700_000_000_002).
+        let timestamp =
+            ledger.session_relative_timestamp("missing-segment", 1_700_000_000_002 + 250);
+        assert!(
+            (timestamp - 1.25).abs() < 1e-9,
+            "expected fallback-anchored 1.25s, got {timestamp}"
+        );
+    }
+
+    #[test]
+    fn session_relative_timestamp_is_zero_when_ledger_has_no_spans() {
+        let ledger = TranscriptLedger::new("session-1");
+        assert_eq!(
+            ledger.session_relative_timestamp("any-segment", 1_700_000_000_000),
+            0.0,
+            "an empty ledger has no anchor to convert against; must stay total, not panic"
+        );
+    }
+
+    /// A partial-revision producer can leave `transcript_segment_id` unset
+    /// (`AsrSpanRevisionPayload::transcript_segment_id: None`), so a caller's
+    /// `source_segment_id` may only resolve against the span's immutable
+    /// `span_id` — mirroring `live_assist_evidence_anchor`'s existing
+    /// OR-match in `commands.rs`. Before this OR-match, this case fell all
+    /// the way through to the `.first()` fallback even when the exact span
+    /// WAS present in the ledger.
+    #[test]
+    fn session_relative_timestamp_matches_on_span_id_when_transcript_segment_id_is_none() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        let mut span_id_only = asr_payload("span-1", 2, "hello");
+        span_id_only.transcript_segment_id = None;
+        ledger
+            .apply_event(TranscriptEvent::from(span_id_only))
+            .expect("seed span-id-only span");
+
+        // A decoy sorted ahead of the real span, so this only passes if the
+        // exact `span_id` match is preferred over `.first()`.
+        let mut decoy = asr_payload("span-2", 1, "decoy");
+        decoy.transcript_segment_id = None;
+        decoy.start_time = -500.0;
+        decoy.received_at_ms = 1_800_000_000_000;
+        ledger
+            .apply_event(TranscriptEvent::from(decoy))
+            .expect("seed decoy span");
+        assert_eq!(
+            ledger.latest_spans.first().map(|e| e.span_id.as_str()),
+            Some("span-2"),
+            "sanity: the decoy must sort first so this test actually exercises \
+             the span_id match, not agree with `.first()` by luck"
+        );
+
+        let timestamp = ledger.session_relative_timestamp("span-1", 1_700_000_000_002 + 500);
+        assert!(
+            (timestamp - 1.5).abs() < 1e-9,
+            "expected span_id-matched anchor (start_time 1.0 + 0.5s offset), got {timestamp}"
         );
     }
 

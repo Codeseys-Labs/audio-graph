@@ -3754,6 +3754,18 @@ pub fn approve_agent_proposal(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<events::LiveAssistCardRecord> {
+    approve_agent_proposal_impl(proposal_id, app, state.inner())
+}
+
+/// Implementation of [`approve_agent_proposal`] that operates on a borrowed
+/// `&AppState` so it can be exercised from tests without constructing a
+/// per-test Tauri/tao app (mirrors `start_capture_impl`'s split;
+/// audio-graph-4b52 coverage-gap fix).
+fn approve_agent_proposal_impl(
+    proposal_id: String,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<events::LiveAssistCardRecord> {
     let proposal = {
         let mut pending = state
             .pending_agent_proposals
@@ -3783,7 +3795,7 @@ pub fn approve_agent_proposal(
     let mut graph_updated = false;
     let session_id = state.current_session_id();
     let existing_card = existing_live_assist_card(&session_id, &proposal.id);
-    let projection_patch_sequence = match approved_agent_projection_patch(&state, &proposal) {
+    let projection_patch_sequence = match approved_agent_projection_patch(state, &proposal) {
         Ok(sequence) => sequence,
         Err(error) => {
             events::emit_or_log(
@@ -3848,11 +3860,23 @@ pub fn approve_agent_proposal(
     };
 
     if let Some(extraction) = extraction {
+        // `proposal.created_at_ms` is Unix epoch ms (wall clock); the graph's
+        // `timestamp` param is session-relative seconds (the same "media
+        // clock" the live speech path uses for eviction ordering — see
+        // `TranscriptLedger::session_relative_timestamp`). Converting via the
+        // ledger anchor instead of a raw `/1000.0` keeps a manually-approved
+        // node evictable on the same terms as a live one (audio-graph-4b52).
+        let timestamp = {
+            let ledger = state
+                .transcript_ledger
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            ledger.session_relative_timestamp(&proposal.source_segment_id, proposal.created_at_ms)
+        };
         let mut graph = state
             .knowledge_graph
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
-        let timestamp = proposal.created_at_ms as f64 / 1000.0;
         graph.process_extraction(&extraction, timestamp, speaker, &proposal.source_segment_id);
 
         if graph.has_delta() {
@@ -3928,6 +3952,20 @@ pub fn add_question_to_graph(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
+    add_question_to_graph_impl(text, speaker, source_segment_id, app, state.inner())
+}
+
+/// Implementation of [`add_question_to_graph`] that operates on a borrowed
+/// `&AppState` so it can be exercised from tests without constructing a
+/// per-test Tauri/tao app (mirrors `start_capture_impl`'s split;
+/// audio-graph-4b52 coverage-gap fix).
+fn add_question_to_graph_impl(
+    text: String,
+    speaker: Option<String>,
+    source_segment_id: Option<String>,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<bool> {
     use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
     let q = question_text_from_body(text.trim());
     if q.is_empty() {
@@ -3959,16 +3997,21 @@ pub fn add_question_to_graph(
         }],
     };
 
+    // Same epoch-vs-session-relative conversion as `approve_agent_proposal`
+    // (audio-graph-4b52): `unix_millis()` is wall clock, but the graph's
+    // `timestamp` param is session-relative seconds.
+    let timestamp = {
+        let ledger = state
+            .transcript_ledger
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        ledger.session_relative_timestamp(&segment_id, unix_millis())
+    };
     let mut graph = state
         .knowledge_graph
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
-    graph.process_extraction(
-        &extraction,
-        unix_millis() as f64 / 1000.0,
-        &speaker,
-        &segment_id,
-    );
+    graph.process_extraction(&extraction, timestamp, &speaker, &segment_id);
     if graph.has_delta() {
         let delta = graph.take_delta();
         events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
@@ -4006,7 +4049,45 @@ pub fn merge_graph_entities(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<usize> {
-    let timestamp = unix_millis() as f64 / 1000.0;
+    merge_graph_entities_impl(
+        superseded_name,
+        canonical_name,
+        threshold,
+        app,
+        state.inner(),
+    )
+}
+
+/// Implementation of [`merge_graph_entities`] that operates on a borrowed
+/// `&AppState` so it can be exercised from tests without constructing a
+/// per-test Tauri/tao app (mirrors `start_capture_impl`'s split;
+/// audio-graph-4b52 coverage-gap fix).
+fn merge_graph_entities_impl(
+    superseded_name: String,
+    canonical_name: String,
+    threshold: Option<f64>,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<usize> {
+    // Same epoch-vs-session-relative conversion as `approve_agent_proposal` /
+    // `add_question_to_graph` (audio-graph-4b52): `unix_millis()` is wall
+    // clock, but `supersede_entity`'s `timestamp` lands in `invalidate_edge`'s
+    // `valid_until` and the re-pointed edge's `valid_from` — the same
+    // session-relative-seconds domain `evict_excess_edges` compares against
+    // (`graph/temporal.rs`), and the audio-time axis ADR-0026 §Consequences
+    // says "lives only on the live TemporalEdge". Left as raw epoch seconds,
+    // a retconned edge's `valid_from` is always the graph's maximum and can
+    // never be evicted, the exact immortality bug fixed for nodes, but for
+    // edges. There is no source segment id for a manual merge, so this
+    // always resolves through the ledger's fallback-to-any-span anchor (see
+    // `TranscriptLedger::session_relative_timestamp`).
+    let timestamp = {
+        let ledger = state
+            .transcript_ledger
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        ledger.session_relative_timestamp("", unix_millis())
+    };
     let threshold = threshold.unwrap_or(1.0);
 
     let mut graph = state
@@ -10942,6 +11023,232 @@ mod tests {
             anchor
                 .note
                 .is_some_and(|note| note.contains("segment-gone"))
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // audio-graph-4b52 fix-pass: handler-level coverage for the two
+    // command-handler call sites that wire `TranscriptLedger::
+    // session_relative_timestamp` into `process_extraction`. The helper
+    // itself was already unit-tested (see `projections.rs`), but the 3-line
+    // lock-and-derive glue at each `#[tauri::command]` site had no test —
+    // a mutation probe reverting either wiring back to
+    // `created_at_ms as f64 / 1000.0` / `unix_millis() as f64 / 1000.0`
+    // passed the entire suite. These drive the real `*_impl` functions
+    // (mirroring `start_capture_impl`'s existing borrowed-state split) with
+    // `AppState::new()` + `crate::speech::shared_test_app_handle()`, so a
+    // future edit that reorders or reverts the wiring fails here directly.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn add_question_to_graph_impl_normalizes_manual_write_timestamp_to_session_relative_seconds() {
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+
+        // The live span this question cites: 1s into the session. Unlike
+        // `approve_agent_proposal` (which converts a stored
+        // `proposal.created_at_ms`), `add_question_to_graph` calls
+        // `unix_millis()` itself with no injectable clock, so the anchor's
+        // `received_at_ms` must be pinned to "now" (not a fixed historical
+        // constant) or the fallback math measures real wall-clock drift
+        // between this test's fixture and its call, not the bug under test.
+        let mut fixture = transcript_event_fixture("span-1", "segment-1");
+        fixture.received_at_ms = unix_millis();
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger.apply_event(fixture).expect("seed ledger span");
+        }
+
+        let result = add_question_to_graph_impl(
+            "What is the migration deadline?".to_string(),
+            Some("Ana".to_string()),
+            Some("segment-1".to_string()),
+            app_handle,
+            &state,
+        )
+        .expect("add_question_to_graph_impl should succeed");
+        assert!(result);
+
+        let snapshot = state
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        let question_node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.entity_type == "Question")
+            .expect("a Question node should have been written");
+        // Session-relative seconds close to the anchor's `start_time` (1.0),
+        // give or take the handful of milliseconds this test takes to run —
+        // nowhere near epoch scale (~1.7e9), which is what master's
+        // `unix_millis() as f64 / 1000.0` would have produced here.
+        assert!(
+            (question_node.first_seen - 1.0).abs() < 5.0,
+            "expected session-relative seconds near 1.0, got {} \
+             (looks like raw epoch seconds leaked through — master's bug)",
+            question_node.first_seen
+        );
+    }
+
+    #[test]
+    fn approve_agent_proposal_impl_normalizes_manual_write_timestamp_to_session_relative_seconds() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("approve-agent-proposal-timestamp");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+
+        // The live span the proposal cites: 1s into the session, recorded at
+        // a known wall-clock instant (`transcript_event_fixture`'s fixed
+        // values: start_time 1.0, received_at_ms 1_700_000_000_000).
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(transcript_event_fixture("span-1", "segment-1"))
+                .expect("seed ledger span");
+        }
+
+        // `Question` builds its extraction locally with no LLM/extractor
+        // heuristics involved, so the graph write is deterministic.
+        let proposal = events::AgentProposalPayload {
+            id: "proposal-1".to_string(),
+            source_segment_id: "segment-1".to_string(),
+            source_id: "source-1".to_string(),
+            speaker_label: Some("Ana".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "Question".to_string(),
+            body: "What is the migration deadline?".to_string(),
+            confidence: 0.8,
+            // 2.5s of wall-clock time after the cited span was recorded.
+            created_at_ms: 1_700_000_002_500,
+        };
+        state
+            .pending_agent_proposals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(proposal.id.clone(), proposal.clone());
+
+        approve_agent_proposal_impl(proposal.id.clone(), app_handle, &state)
+            .expect("approve_agent_proposal_impl should succeed");
+
+        let snapshot = state
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        let question_node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.entity_type == "Question")
+            .expect("a Question node should have been written");
+        // The literal "would fail on master" pin: master's
+        // `proposal.created_at_ms as f64 / 1000.0` would produce
+        // ~1_700_000_002.5 here (epoch seconds).
+        assert!(
+            (question_node.first_seen - 3.5).abs() < 1e-9,
+            "expected the exact-match anchor's start_time (1.0) + 2.5s \
+             wall-clock offset = 3.5, got {} \
+             (looks like raw epoch seconds leaked through — master's bug)",
+            question_node.first_seen
+        );
+
+        drain_test_writers(&state);
+    }
+
+    /// `merge_graph_entities` is the undisclosed sibling site from the
+    /// audio-graph-4b52 review (finding: two `supersede_entity` callers still
+    /// fed epoch seconds into graph edge times). No source segment id exists
+    /// for a manual merge, so this always resolves through the ledger's
+    /// fallback-to-any-span anchor.
+    #[test]
+    fn merge_graph_entities_impl_normalizes_retcon_timestamp_to_session_relative_seconds() {
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+
+        {
+            use crate::graph::entities::ExtractionResult;
+            let mut graph = state
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            graph.process_extraction(
+                &ExtractionResult {
+                    entities: vec![
+                        crate::graph::entities::ExtractedEntity {
+                            name: "Speaker 2".to_string(),
+                            entity_type: "Person".to_string(),
+                            description: None,
+                        },
+                        crate::graph::entities::ExtractedEntity {
+                            name: "Acme".to_string(),
+                            entity_type: "Organization".to_string(),
+                            description: None,
+                        },
+                        crate::graph::entities::ExtractedEntity {
+                            name: "Alice".to_string(),
+                            entity_type: "Person".to_string(),
+                            description: None,
+                        },
+                    ],
+                    relations: vec![crate::graph::entities::ExtractedRelation {
+                        source: "Speaker 2".to_string(),
+                        target: "Acme".to_string(),
+                        relation_type: "works_at".to_string(),
+                        detail: None,
+                    }],
+                },
+                1.0,
+                "spk",
+                "seg-1",
+            );
+        }
+
+        // A live span the merge can anchor against — 5s into the session.
+        let mut fixture = transcript_event_fixture("span-1", "segment-1");
+        fixture.start_time = 5.0;
+        fixture.received_at_ms = unix_millis();
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger.apply_event(fixture).expect("seed ledger span");
+        }
+
+        let invalidated = merge_graph_entities_impl(
+            "Speaker 2".to_string(),
+            "Alice".to_string(),
+            None,
+            app_handle,
+            &state,
+        )
+        .expect("merge_graph_entities_impl should succeed");
+        assert_eq!(invalidated, 1, "exactly one edge retconned");
+
+        let live_from = state
+            .knowledge_graph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live_edge_valid_from_for_test("Alice", "Acme", "works_at")
+            .expect("the re-pointed live edge should exist");
+        // Session-relative seconds close to the fallback anchor's
+        // `start_time` (5.0) — nowhere near epoch scale (~1.7e9), which is
+        // what master's `unix_millis() as f64 / 1000.0` would have produced
+        // here.
+        assert!(
+            (live_from - 5.0).abs() < 5.0,
+            "expected session-relative seconds near 5.0, got {live_from} \
+             (looks like raw epoch seconds leaked through)"
         );
     }
 

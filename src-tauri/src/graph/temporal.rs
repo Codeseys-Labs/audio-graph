@@ -138,6 +138,29 @@ impl TemporalKnowledgeGraph {
         self.graph.edge_count()
     }
 
+    /// Test-only introspection: the `valid_from` of the live (`valid_until ==
+    /// None`) edge of the given `relation_type` connecting `source_name` to
+    /// `target_name`, by name (case-insensitive), if any. `GraphLink` (the
+    /// public snapshot type) does not surface `valid_from`/`valid_until`, so
+    /// callers outside this module have no other way to assert what
+    /// timestamp a producer (e.g. `commands.rs::merge_graph_entities`)
+    /// actually fed into `supersede_entity`/`add_relation` (audio-graph-4b52
+    /// coverage-gap fix).
+    #[cfg(test)]
+    pub(crate) fn live_edge_valid_from_for_test(
+        &self,
+        source_name: &str,
+        target_name: &str,
+        relation_type: &str,
+    ) -> Option<f64> {
+        let source_idx = *self.name_index.get(&source_name.to_lowercase())?;
+        let target_idx = *self.name_index.get(&target_name.to_lowercase())?;
+        self.graph
+            .edges_connecting(source_idx, target_idx)
+            .find(|e| e.weight().relation_type == relation_type && e.weight().valid_until.is_none())
+            .map(|e| e.weight().valid_from)
+    }
+
     /// Get the current episode count.
     pub fn episode_count(&self) -> u64 {
         self.event_counter
@@ -1271,6 +1294,221 @@ mod tests {
         // No dangling references remain in added/updated edge tracking.
         assert!(delta.added_edges.is_empty());
         assert!(delta.updated_edges.is_empty());
+    }
+
+    /// audio-graph-4b52: a manual-proposal write (`approve_agent_proposal` /
+    /// `add_question_to_graph` in `commands.rs`) must land on the SAME
+    /// session-relative-seconds clock the live speech path uses, via
+    /// `TranscriptLedger::session_relative_timestamp` — not raw Unix epoch
+    /// seconds. This drives the EXACT conversion those call sites perform,
+    /// then proves the resulting node is evicted on schedule like any other
+    /// node instead of being immortal (epoch-scale `last_seen` values are
+    /// always the graph's maximum, so `evict_excess_nodes`'s `min_by` never
+    /// selects them — see `temporal.rs`'s eviction doc comment).
+    #[test]
+    fn manual_proposal_node_evicts_on_same_terms_as_live_path_node() {
+        use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
+        use crate::projections::{TranscriptEvent, TranscriptLedger};
+
+        // A ledger with one recorded live-speech span, as the live path would
+        // already have written before the corresponding proposal is
+        // approved.
+        let mut ledger = TranscriptLedger::new("session-1");
+        let asr_span = AsrSpanRevisionPayload {
+            span_id: "span-1".to_string(),
+            provider: "system".to_string(),
+            source_id: "mic".to_string(),
+            provider_item_id: None,
+            transcript_segment_id: Some("segment-1".to_string()),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text: "hello".to_string(),
+            start_time: 5.0, // 5s into the session
+            end_time: 6.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: AsrSpanStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_005_000, // wall clock at receipt
+        };
+        ledger
+            .apply_event(TranscriptEvent::from(asr_span))
+            .expect("seed the live span");
+
+        // The proposal is approved ~2s of wall-clock time after the span was
+        // recorded. `created_at_ms` is Unix epoch ms, exactly as
+        // `AgentProposalPayload::created_at_ms` stores it.
+        let proposal_created_at_ms: u64 = 1_700_000_007_000;
+        let manual_timestamp =
+            ledger.session_relative_timestamp("segment-1", proposal_created_at_ms);
+
+        // The literal "would fail on master" pin: master's
+        // `proposal.created_at_ms as f64 / 1000.0` would produce
+        // ~1_700_000_007.0 here (epoch seconds), which is nowhere near a
+        // plausible session-relative value.
+        assert!(
+            manual_timestamp < 1_000.0,
+            "expected session-relative seconds, got {manual_timestamp} \
+             (looks like raw epoch seconds leaked through)"
+        );
+        assert!(
+            (manual_timestamp - 7.0).abs() < 1e-9,
+            "expected exactly the matching span's start_time (5.0) + 2.0s \
+             wall-clock offset = 7.0, got {manual_timestamp}"
+        );
+
+        let mut g = TemporalKnowledgeGraph::new();
+        // The manual-proposal write: approving a proposal derived from
+        // segment-1.
+        g.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("ManualNode")],
+                relations: vec![],
+            },
+            manual_timestamp,
+            "spk",
+            "segment-1",
+        );
+
+        // Fill the graph with MAX_NODES more live-path nodes, each newer
+        // (larger session-relative timestamp) than the manual node, to push
+        // the graph exactly one node over the eviction threshold.
+        for i in 0..MAX_NODES {
+            g.process_extraction(
+                &ExtractionResult {
+                    entities: vec![entity(&format!("Live{i}"))],
+                    relations: vec![],
+                },
+                100.0 + i as f64,
+                "spk",
+                &format!("seg-live-{i}"),
+            );
+        }
+
+        // `process_extraction` evicts down to MAX_NODES after every call, so
+        // the graph never exceeds it — the manual node (the oldest by
+        // `last_seen`) must have been the one evicted, not immortal.
+        assert!(
+            !g.name_index.contains_key("manualnode"),
+            "the manual-proposal node must be evictable on the same terms as \
+             a live-path node, not immortal under epoch-scale timestamps"
+        );
+        assert_eq!(g.graph.node_count(), MAX_NODES);
+    }
+
+    /// audio-graph-4b52 (undisclosed-sibling fix): `supersede_entity` is the
+    /// SAME epoch-vs-session-relative bug class as `process_extraction`, just
+    /// for edges. Its production callers are `commands.rs::
+    /// merge_graph_entities` (a manual retcon-merge command) and
+    /// `speech/mod.rs`'s live diarization-relabel path — both must now feed a
+    /// ledger-derived session-relative timestamp, not raw epoch seconds. Left
+    /// as epoch seconds, a retconned edge's `valid_from` would always be the
+    /// graph's maximum, and `evict_excess_edges`'s `min_by` (this file, just
+    /// above) could never select it — the exact immortality bug fixed for
+    /// nodes, but for edges. This drives the EXACT conversion
+    /// `merge_graph_entities` performs (fallback-to-any-span anchor, since a
+    /// manual merge has no source segment id to prefer), then proves the
+    /// resulting re-pointed edge is evicted on schedule like any other edge.
+    #[test]
+    fn supersede_entity_repointed_edge_evicts_on_same_terms_as_live_path_edge() {
+        use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
+        use crate::projections::{TranscriptEvent, TranscriptLedger};
+
+        // A ledger with one recorded live-speech span, as the live path would
+        // already have written before the corresponding merge is invoked.
+        let mut ledger = TranscriptLedger::new("session-1");
+        let asr_span = AsrSpanRevisionPayload {
+            span_id: "span-1".to_string(),
+            provider: "system".to_string(),
+            source_id: "mic".to_string(),
+            provider_item_id: None,
+            transcript_segment_id: Some("segment-1".to_string()),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text: "hello".to_string(),
+            start_time: 5.0, // 5s into the session
+            end_time: 6.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: AsrSpanStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_005_000, // wall clock at receipt
+        };
+        ledger
+            .apply_event(TranscriptEvent::from(asr_span))
+            .expect("seed the live span");
+
+        // `merge_graph_entities` has no source segment id to prefer, so it
+        // always resolves through the fallback-to-any-span anchor — 2s of
+        // wall-clock time after the recorded span.
+        let merge_timestamp = ledger.session_relative_timestamp("", 1_700_000_007_000);
+        assert!(
+            merge_timestamp < 1_000.0,
+            "expected session-relative seconds, got {merge_timestamp} \
+             (looks like raw epoch seconds leaked through)"
+        );
+
+        let mut g = TemporalKnowledgeGraph::new();
+        // Build: provisional speaker "Speaker 2" knows "Acme"; canonical
+        // identity "Alice" already exists.
+        let ext = ExtractionResult {
+            entities: vec![entity("Speaker 2"), entity("Acme"), entity("Alice")],
+            relations: vec![relation("Speaker 2", "Acme", "works_at")],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+
+        // The manual-merge write: "Speaker 2" is actually "Alice".
+        let invalidated = g.supersede_entity("Speaker 2", "Alice", merge_timestamp, 1.0);
+        assert_eq!(invalidated, 1, "exactly one edge retconned");
+
+        // Fill the graph with MAX_EDGES more live-path edges between the
+        // SAME two surviving nodes (distinct relation types, so each is a
+        // new edge rather than a weight-fold), each newer (larger
+        // `valid_from`) than the merge timestamp, to push the graph past the
+        // eviction threshold.
+        for i in 0..MAX_EDGES {
+            g.process_extraction(
+                &ExtractionResult {
+                    entities: vec![],
+                    relations: vec![relation("Alice", "Acme", &format!("filler-{i}"))],
+                },
+                100.0 + i as f64,
+                "spk",
+                &format!("seg-live-{i}"),
+            );
+        }
+
+        // `process_extraction` evicts down to MAX_EDGES after every call, so
+        // the graph never exceeds it. Both the invalidated old edge
+        // (valid_from 1.0) and the re-pointed live edge (valid_from
+        // `merge_timestamp`, ~7.0) are session-relative and smaller than
+        // every filler's valid_from (>= 100.0), so both must have been
+        // evicted — the re-pointed edge is NOT immortal.
+        let live_edge_survives = g
+            .graph
+            .edge_indices()
+            .filter_map(|i| g.graph.edge_weight(i))
+            .any(|e| e.relation_type == "works_at");
+        assert!(
+            !live_edge_survives,
+            "the re-pointed edge must be evictable on the same terms as a \
+             live-path edge, not immortal under epoch-scale timestamps"
+        );
+        assert_eq!(g.graph.edge_count(), MAX_EDGES);
     }
 
     /// Finding #55 (P3): on eviction, the name_index key must only be removed if
