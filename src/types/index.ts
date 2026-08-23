@@ -1885,6 +1885,20 @@ export type ProjectionOperation =
       replacement_nodes: GraphNodeDraft[];
     };
 
+/**
+ * Mirrors Rust's `AppliedBasisCurrency` (`src-tauri/src/projections.rs`) —
+ * an internally-tagged enum (`#[serde(tag = "type", rename_all =
+ * "snake_case")]`), so it serializes as an OBJECT
+ * (`{"type":"current"}` / `{"type":"appended_tail","staleness":{...}}`),
+ * never a bare string. `staleness` is left `unknown` deliberately (same
+ * posture as `ProjectionPatch.basis`/`provenance` below) — no reader in
+ * this app needs its shape; `liveWorkspaceTone.ts`'s
+ * `mapBasisCurrencyEvidence` only ever narrows `.type`.
+ */
+export type AppliedBasisCurrency =
+  | { type: "current" }
+  | { type: "appended_tail"; staleness: unknown };
+
 export interface ProjectionPatch {
   sequence: number;
   kind: ProjectionKind;
@@ -1896,6 +1910,18 @@ export interface ProjectionPatch {
   queued_at_ms?: number | null;
   generation_latency_ms?: number | null;
   apply_latency_ms?: number | null;
+  /**
+   * Additive, event-payload-only (ticket W3, audio-graph-a6b5): what the
+   * apply gate proved about this patch's basis when it applied. `Current`
+   * is the ONLY value that can ever earn the recency chips' "success"
+   * tone (`liveWorkspaceTone.ts`); `AppendedTail` is present evidence of
+   * lag and stays honest-neutral. Absent/`null` on every patch this app
+   * emitted before this field existed, AND on the persisted canonical
+   * projection event log forever — the Rust field is populated only on
+   * the frontend-bound event clone, never on the value written to disk
+   * (see `ProjectionPatch::basis_currency_at_apply`'s doc comment).
+   */
+  basis_currency_at_apply?: AppliedBasisCurrency | null;
   created_at_ms: number;
 }
 

@@ -3273,6 +3273,7 @@ mod tests {
             queued_at_ms: Some(1_700_000_000_000 + sequence),
             generation_latency_ms: Some(500 + sequence),
             apply_latency_ms: Some(20 + sequence),
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_050_000 + sequence,
         }
     }
@@ -3755,6 +3756,7 @@ mod tests {
                 queued_at_ms: Some(queued_at_ms),
                 generation_latency_ms: Some(generation_latency_ms),
                 apply_latency_ms: Some(apply_latency_ms),
+                basis_currency_at_apply: None,
                 created_at_ms,
             });
         }

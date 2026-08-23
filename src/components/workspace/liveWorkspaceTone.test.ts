@@ -6,6 +6,7 @@ import {
   type LaneRecencySourceRevision,
   laneRecencyChipTone,
   lastLanePatchAtMs,
+  mapBasisCurrencyEvidence,
   selectLaneRecency,
   selectTurnsBehind,
 } from "./liveWorkspaceTone";
@@ -14,8 +15,14 @@ function patch(
   kind: string,
   createdAtMs: number,
   queuedAtMs?: number | null,
+  basisCurrencyAtApply?: { type: string; staleness?: unknown } | null,
 ): LaneRecencySourcePatch {
-  return { kind, created_at_ms: createdAtMs, queued_at_ms: queuedAtMs };
+  return {
+    kind,
+    created_at_ms: createdAtMs,
+    queued_at_ms: queuedAtMs,
+    basis_currency_at_apply: basisCurrencyAtApply,
+  };
 }
 
 function revision(
@@ -32,7 +39,7 @@ function revision(
   };
 }
 
-describe("liveWorkspaceTone — phase-1-never-success pin (design-a §8, synthesis §2)", () => {
+describe("liveWorkspaceTone — evidence is the ONLY success gate (design-a §8, synthesis §2; ticket W3 wired both real call sites, still pinned at this unit level too)", () => {
   it("evidence:null never renders success even at turnsBehind:0 with a fresh lastAppliedAtMs", () => {
     const result = laneRecencyChipTone({
       lastAppliedAtMs: Date.now(),
@@ -72,7 +79,7 @@ describe("liveWorkspaceTone — phase-1-never-success pin (design-a §8, synthes
     expect(result.tone).toBe("neutral");
   });
 
-  it("evidence:'current' is the ONLY input that can ever unlock success (future W3 call site, not exercised by any real caller today)", () => {
+  it("evidence:'current' is the ONLY input that can ever unlock success (ticket W3: both real call sites — DocRecencyChip, GraphRecencyChip — now exercise this)", () => {
     const result = laneRecencyChipTone({
       lastAppliedAtMs: Date.now(),
       turnsBehind: 0,
@@ -131,6 +138,33 @@ describe("liveWorkspaceTone — render gate", () => {
     });
 
     expect(result.render).toBe(false);
+  });
+});
+
+describe("mapBasisCurrencyEvidence — ticket W3's wire-tag mapping step", () => {
+  it("maps {type: 'current'} to 'current'", () => {
+    expect(mapBasisCurrencyEvidence({ type: "current" })).toBe("current");
+  });
+
+  it("maps {type: 'appended_tail', staleness: {...}} to 'appended_tail'", () => {
+    expect(
+      mapBasisCurrencyEvidence({
+        type: "appended_tail",
+        staleness: { type: "missing_current_span" },
+      }),
+    ).toBe("appended_tail");
+  });
+
+  it("maps undefined (field absent — every pre-W3 patch) to null", () => {
+    expect(mapBasisCurrencyEvidence(undefined)).toBeNull();
+  });
+
+  it("maps null to null", () => {
+    expect(mapBasisCurrencyEvidence(null)).toBeNull();
+  });
+
+  it("maps an unrecognized/malformed .type to null rather than throwing", () => {
+    expect(mapBasisCurrencyEvidence({ type: "some_future_tag" })).toBeNull();
   });
 });
 
@@ -315,6 +349,95 @@ describe("selectLaneRecency — the one shared computation, two call sites", () 
     const notes = selectLaneRecency("notes", patches, revisions);
     expect(notes.lastAppliedAtMs).toBe(500);
     expect(notes.turnsBehind).toBe(1); // only the post-500 revision counts
+  });
+
+  it("ticket W3: derives evidence from the SAME latest patch lastAppliedAtMs/turnsBehind came from — {type: 'current'} maps to 'current'", () => {
+    const patches = [
+      patch("graph", 100), // older graph patch, no evidence — must be ignored
+      patch("notes", 500, null, { type: "current" }),
+    ];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.lastAppliedAtMs).toBe(500);
+    expect(notes.evidence).toBe("current");
+  });
+
+  it("ticket W3: {type: 'appended_tail'} maps to 'appended_tail', not 'current'", () => {
+    const patches = [
+      patch("notes", 500, null, {
+        type: "appended_tail",
+        staleness: { type: "missing_current_span" },
+      }),
+    ];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.evidence).toBe("appended_tail");
+  });
+
+  it("ticket W3: evidence is null when the latest patch never populated basis_currency_at_apply (every pre-W3 patch)", () => {
+    const patches = [patch("notes", 500)];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.evidence).toBeNull();
+  });
+
+  it("ticket W3: evidence is null when the lane has no patches at all", () => {
+    const notes = selectLaneRecency("notes", [], []);
+    expect(notes.evidence).toBeNull();
+  });
+});
+
+// Reviewer adversarial-mutation finding (W3 fix round): a mutant that
+// rewrote `evidence`'s derivation from `mapBasisCurrencyEvidence(latestPatch
+// ?.basis_currency_at_apply)` to
+// `mapBasisCurrencyEvidence(patches.find((p) => p.basis_currency_at_apply)
+// ?.basis_currency_at_apply)` — dropping BOTH the `kind` filter and the
+// latest-patch selection, falling back to "the first patch in array order
+// that has ANY evidence at all" — passed every existing case above, because
+// every fixture there puts evidence only on the one patch that is ALSO the
+// latest same-lane patch. These three cases each isolate one of the two
+// properties that mutant breaks: recency (an older patch's evidence must
+// never outvote the latest same-lane patch's own, possibly-absent, evidence)
+// and lane scoping (a different lane's patch must never leak evidence into
+// this lane's chip at all).
+describe("selectLaneRecency — evidence is scoped to THIS lane's LATEST patch only (not any patch, not an older one)", () => {
+  it("an older notes patch's 'current' must not outvote the latest notes patch's absent evidence", () => {
+    const patches = [
+      patch("notes", 100, null, { type: "current" }),
+      patch("notes", 200), // latest for notes — no evidence yet
+    ];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.lastAppliedAtMs).toBe(200);
+    expect(notes.evidence).toBeNull();
+  });
+
+  it("an older notes patch's 'current' must not outvote the latest notes patch's 'appended_tail'", () => {
+    const patches = [
+      patch("notes", 100, null, { type: "current" }),
+      patch("notes", 200, null, {
+        type: "appended_tail",
+        staleness: { type: "missing_current_span" },
+      }),
+    ];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.lastAppliedAtMs).toBe(200);
+    expect(notes.evidence).toBe("appended_tail");
+  });
+
+  it("a graph patch's 'current' must never leak into the notes lane's evidence, even when it is the globally-latest patch and the notes lane's own latest patch has none", () => {
+    const patches = [
+      patch("notes", 100), // latest for notes — no evidence yet
+      patch("graph", 200, null, { type: "current" }), // globally latest, wrong lane
+    ];
+
+    const notes = selectLaneRecency("notes", patches, []);
+    expect(notes.lastAppliedAtMs).toBe(100);
+    expect(notes.evidence).toBeNull();
+
+    const graph = selectLaneRecency("graph", patches, []);
+    expect(graph.evidence).toBe("current");
   });
 });
 

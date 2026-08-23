@@ -129,21 +129,27 @@ export function LiveDocumentHeaderActions({ vm }: { vm: LiveDocumentVM }) {
 
 /**
  * The document tile's recency chip (ticket W6, synthesis audio-graph-a6b5
- * §2). Renders in `WorkspaceTile`'s `headerSlot` ALONGSIDE
- * `LiveDocumentHeaderActions` (composed by the caller, `App.tsx`) — a
- * SEPARATE component rather than folded into that one because this reads
- * different store state (`asrSpanRevisions`, `loadedSessionId`,
- * `sessionProjectionEvents`) that `LiveDocumentHeaderActions` has no other
- * use for.
+ * §2; evidence wired by ticket W3). Renders in `WorkspaceTile`'s
+ * `headerSlot` ALONGSIDE `LiveDocumentHeaderActions` (composed by the
+ * caller, `App.tsx`) — a SEPARATE component rather than folded into that
+ * one because this reads different store state (`asrSpanRevisions`,
+ * `loadedSessionId`, `sessionProjectionEvents`) that
+ * `LiveDocumentHeaderActions` has no other use for.
  *
- * Honesty (L3/T2 law): `evidence` is always `null` here — W3's
- * `basis_currency_at_apply` has not landed, so `laneRecencyChipTone` can
- * never return `tone: "success"` from this call site (see
- * `liveWorkspaceTone.ts`'s module doc and its pinned test). The visible
- * chip text SWAPS between the neutral "as of HH:MM:SS" observed fact and
- * the warning "−N turns" escalation — never both at once, and never the
- * word "Live" — so a single 18-char-budgeted chip covers both states
- * (synthesis §2: "one component, three honesty tiers, each earned").
+ * Honesty (L3/T2 law): `evidence` comes from `selectLaneRecency`'s own
+ * mapping of the latest notes-lane patch's `basis_currency_at_apply` — so
+ * `laneRecencyChipTone` returns `tone: "success"` ONLY when that patch
+ * actually carried `{type: "current"}` (see `liveWorkspaceTone.ts`'s
+ * module doc and its pinned tests). The visible chip text now has THREE
+ * distinct renderings, one per honesty tier (design-a §2.4/§7,
+ * `document.recency.current` = "Up to date"): the success "Up to date"
+ * claim (`recency.tone === "success"`), the neutral "as of HH:MM:SS"
+ * observed fact (no evidence yet, or evidence present but only proving an
+ * append-only tail — `AppendedTail` stays neutral, never success), and the
+ * warning "−N turns" escalation — never more than one at once, and never
+ * the word "Live". Each rendering carries its own `.sr-only` text too, so
+ * the success tier is never color-only (WCAG 1.4.1) — see this file's and
+ * `liveWorkspaceTone.ts`'s fix-round comments for the gap this closed.
  */
 export function DocRecencyChip() {
   const { t, i18n } = useTranslation();
@@ -157,16 +163,14 @@ export function DocRecencyChip() {
   // (includes `transcriptSegments`, several updates/sec live) — without this,
   // the O(patches+revisions) scan in `selectLaneRecency` would re-run on
   // every transcript tick, not just on the inputs that can change its result.
-  const { lastAppliedAtMs, turnsBehind } = useMemo(
+  const { lastAppliedAtMs, turnsBehind, evidence } = useMemo(
     () => selectLaneRecency("notes", sessionProjectionEvents, asrSpanRevisions),
     [sessionProjectionEvents, asrSpanRevisions],
   );
   const recency = laneRecencyChipTone({
     lastAppliedAtMs,
     turnsBehind,
-    // Always `null` — no real call site can supply W3's evidence until
-    // that ticket lands. See the module doc.
-    evidence: null,
+    evidence,
     isLiveSession: loadedSessionId === null,
   });
 
@@ -182,12 +186,20 @@ export function DocRecencyChip() {
     i18n.language,
     { hour12: false },
   );
+  // `recency.tone === "success"` is the ONLY path that can ever reach here
+  // (`laneRecencyChipTone`'s `automaticProbeAvailable: evidence === "current"`
+  // gate) — `recency.behind` is checked first because the ≥3-turns warning
+  // always wins regardless of evidence (design-a §2.4's table).
   const label = recency.behind
     ? t("document.recency.behind", { count: recency.turnsBehind })
-    : t("document.recency.asOf", { time });
+    : recency.tone === "success"
+      ? t("document.recency.current")
+      : t("document.recency.asOf", { time });
   const ariaLabel = recency.behind
     ? t("document.recency.behindAria", { count: recency.turnsBehind })
-    : t("document.recency.asOfAria", { time });
+    : recency.tone === "success"
+      ? t("document.recency.currentAria", { time })
+      : t("document.recency.asOfAria", { time });
 
   return (
     // `aria-label` on a bare `<span>` (implicit "generic" role) is invalid

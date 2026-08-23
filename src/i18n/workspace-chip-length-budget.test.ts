@@ -45,16 +45,21 @@ interface ChipCase {
   values: Record<string, unknown>;
 }
 
-// `document.recency.asOf`/`document.recency.behind` are the ONLY visible-label
+// `document.recency.asOf`/`.current`/`.behind` are the ONLY visible-label
 // keys for BOTH the document AND graph recency chips — `GraphRecencyChip`
-// (LiveGraphStrip.tsx) reuses these two directly rather than keeping a
-// byte-identical `graphStrip.recency.asOf`/`behind` pair (design-a §7's reuse
-// mandate; see that component's module doc). Only the `*Aria` strings differ
-// per lane, and those aren't width-constrained (`.ag-chip`'s `white-space:
-// nowrap` never applies to `.sr-only` text), so they're out of this file's
-// scope.
+// (LiveGraphStrip.tsx) reuses these three directly rather than keeping a
+// byte-identical `graphStrip.recency.asOf`/`.current`/`.behind` set
+// (design-a §7's reuse mandate; see that component's module doc). Only the
+// `*Aria` strings differ per lane, and those aren't width-constrained
+// (`.ag-chip`'s `white-space: nowrap` never applies to `.sr-only` text), so
+// they're out of this file's scope. `document.recency.current` ("Up to
+// date"/"Atualizado") takes no interpolation values — included here anyway
+// (not just via the raw-literal settings-budget file) so a future edit that
+// adds interpolation to it is re-checked the same way the other two keys
+// are.
 const CHIP_CASES: readonly ChipCase[] = [
   { key: "document.recency.asOf", values: { time: TIME_WORST_CASE } },
+  { key: "document.recency.current", values: {} },
   { key: "document.recency.behind", values: { count: TURNS_WORST_CASE } },
   // Ticket W8: the agent tile's status chip (`AgentStatusChip`,
   // `AgentProposalsPanel.tsx`), routed through `agentOutcomeChipTone`

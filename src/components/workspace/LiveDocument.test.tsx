@@ -572,17 +572,90 @@ describe("DocRecencyChip — the tone-routed freshness chip (ticket W6, synthesi
     expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
   });
 
-  it("never renders data-tone=success at this call site, even given a maximally-healthy-looking store state — phase-1-never-success pin held at the CALL SITE, not just liveWorkspaceTone.ts's own unit tests", () => {
+  it("without W3 evidence, never renders data-tone=success at this call site, even given a maximally-healthy-looking store state — absent-evidence pin held at the CALL SITE, not just liveWorkspaceTone.ts's own unit tests", () => {
     // `laneRecencyChipTone.test.ts` pins that `evidence: null` structurally
     // blocks success. That pin says nothing about whether THIS call site
-    // still passes `evidence: null` — a future edit could thread a real
-    // value through DocRecencyChip's `laneRecencyChipTone(...)` call before
-    // W3 lands, and nothing here would fail. Assert on the rendered output
-    // instead: 0 turns behind, a just-now patch — the most success-looking
-    // real store state phase 1 can produce.
+    // maps a patch with no `basis_currency_at_apply` to `evidence: null` —
+    // a future edit to the mapping step could regress that, and nothing
+    // here would fail. Assert on the rendered output instead: 0 turns
+    // behind, a just-now patch, no `basis_currency_at_apply` on it — the
+    // most success-looking store state that still carries no W3 evidence.
     useAudioGraphStore.setState({
       sessionProjectionEvents: [
         notesPatch({ sequence: 1, created_at_ms: Date.now() }),
+      ],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).not.toHaveAttribute("data-tone", "success");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("ticket W3 fix round: renders data-tone=success AND the 'Up to date' copy (not the color-only regression the fix-round review caught) when the latest notes patch carried {type: 'current'} — the ONLY input that can ever earn it", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({
+          sequence: 1,
+          created_at_ms: Date.now(),
+          basis_currency_at_apply: { type: "current" },
+        }),
+      ],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).toHaveAttribute("data-tone", "success");
+    // The earned tier must be legible without color: a distinct visible
+    // string, never the byte-identical "as of HH:MM:SS" the neutral tier
+    // renders — plus its OWN sr-only text (not shared with the neutral
+    // tier's `asOfAria`).
+    const visible = chip?.querySelector('[aria-hidden="true"]');
+    expect(visible?.textContent).toBe("Up to date");
+    const srOnly = chip?.querySelector(".sr-only");
+    expect(srOnly?.textContent).toMatch(/up to date/i);
+  });
+
+  it("ticket W3: {type: 'appended_tail'} is present evidence of lag, not current-ness — stays neutral, never upgraded to success", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({
+          sequence: 1,
+          created_at_ms: Date.now(),
+          basis_currency_at_apply: {
+            type: "appended_tail",
+            staleness: { type: "missing_current_span" },
+          },
+        }),
+      ],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).not.toHaveAttribute("data-tone", "success");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+    // Copy, not just tone: a known-lagging apply must render the SAME
+    // observed-fact "as of HH:MM:SS" text as "no evidence yet" — never the
+    // "Up to date" claim the success tier alone may make.
+    expect(chip?.textContent).toMatch(/as of/i);
+    expect(chip?.textContent).not.toMatch(/up to date/i);
+  });
+
+  it("ticket W3: a malformed/unrecognized basis_currency_at_apply.type maps to no evidence, not a crash or a success", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({
+          sequence: 1,
+          created_at_ms: Date.now(),
+          // @ts-expect-error — deliberately malformed wire value.
+          basis_currency_at_apply: { type: "not_a_real_tag" },
+        }),
       ],
       asrSpanRevisions: [],
       loadedSessionId: null,

@@ -215,6 +215,7 @@ pub fn run_offline_projection_fixture(
                     queued_at_ms: None,
                     generation_latency_ms: None,
                     apply_latency_ms: None,
+                    basis_currency_at_apply: None,
                     created_at_ms,
                 },
                 tokens_used: plan.tokens_used,
@@ -898,6 +899,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms,
         }
     }
@@ -1535,6 +1537,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_100,
             route: None,
         };

@@ -2910,7 +2910,15 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             patch
                 .generation_latency_ms
                 .get_or_insert(generation_latency_ms);
-            let emitted_patch = patch.clone();
+            // `mut`: the apply-success arm below populates
+            // `basis_currency_at_apply` on THIS clone only (ticket W3,
+            // audio-graph-a6b5) — the `patch` value moved into
+            // `apply_runtime_projection_patch` just below is what gets
+            // persisted to the canonical projection event log, and it is
+            // deliberately never touched, so the persisted log's serialized
+            // bytes stay exactly as they were before this ticket (see
+            // `ProjectionPatch::basis_currency_at_apply`'s doc comment).
+            let mut emitted_patch = patch.clone();
             let apply_started_ms = current_unix_millis();
             // Check ownership, then release the scheduler before validation or
             // disk I/O. Historical Review is read-only and cannot reset live
@@ -2989,6 +2997,13 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                             staleness
                         );
                     }
+                    // Ticket W3 (audio-graph-a6b5): populate the additive,
+                    // event-payload-only field from the classification the
+                    // apply gate already computed and returned above —
+                    // never re-derive it, and never write it onto the
+                    // `patch` value the apply call already persisted.
+                    emitted_patch.basis_currency_at_apply =
+                        Some(result.basis_currency_at_apply.clone());
                     emit_projection_runtime_events(&dispatch, &emitted_patch);
                     finish_projection_scheduler_job(
                         dispatch,
@@ -8763,9 +8778,9 @@ mod tests_status {
     };
     use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulers};
     use crate::projections::{
-        DiarizationEventStability, MaterializedNotes, ProjectionJob, ProjectionKind,
-        ProjectionOperation, ProjectionPatch, ProjectionProvenance, SpeakerTimeline,
-        TranscriptLedger,
+        AppliedBasisCurrency, DiarizationEventStability, MaterializedNotes, ProjectionJob,
+        ProjectionKind, ProjectionOperation, ProjectionPatch, ProjectionProvenance,
+        SpeakerTimeline, TranscriptLedger,
     };
     use crate::settings::LlmProvider;
     use crate::state::{AppState, TranscriptSegment};
@@ -8982,6 +8997,17 @@ mod tests_status {
             self.patches.lock().unwrap_or_else(|p| p.into_inner()).len()
         }
 
+        /// Ticket W3 (audio-graph-a6b5): value-level access to the captured
+        /// patches themselves, not just their count — needed to assert
+        /// `basis_currency_at_apply` landed on the EMITTED clone with the
+        /// real classification the apply gate returned.
+        fn patches_snapshot(&self) -> Vec<ProjectionPatch> {
+            self.patches
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+
         fn notes_count(&self) -> usize {
             self.notes.lock().unwrap_or_else(|p| p.into_inner()).len()
         }
@@ -9173,6 +9199,7 @@ mod tests_status {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms,
         }
     }
@@ -11355,6 +11382,251 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Ticket W3 (audio-graph-a6b5): the additive, event-payload-only
+    /// `basis_currency_at_apply` field. Reuses this file's own
+    /// `runtime_projection_dispatch_applies_fake_notes_and_graph_patches`
+    /// real-dispatch harness (a same-basis apply through the LIVE
+    /// `run_projection_job` wiring, not a synthetic construction) to prove
+    /// the field is populated from the REAL apply-gate classification on the
+    /// frontend-bound emit clone, and NEVER on the value persisted to the
+    /// canonical projection event log.
+    ///
+    /// Mutation-proof: a mutant that drops the
+    /// `emitted_patch.basis_currency_at_apply = Some(...)` assignment in
+    /// `run_projection_job` (leaving the field `None` on every emit) makes
+    /// the first loop's `assert_eq!` fail. A mutant that instead sets the
+    /// field on `patch` (the value moved into
+    /// `apply_runtime_projection_patch`, hence persisted) rather than on the
+    /// separate `emitted_patch` clone makes the second loop's `assert_eq!`
+    /// fail — the persisted log would carry `Some` instead of `None`.
+    #[test]
+    fn runtime_projection_dispatch_populates_basis_currency_only_on_the_emitted_patch_not_the_persisted_log()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-basis-currency");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 37,
+                    no_op_filtered_count: 0,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+        let writer = app.transcript_event_writer.clone();
+        let final_revision =
+            projection_asr_payload("projection-basis-currency-span", 1, "Alice met Bob.", true);
+
+        assert!(record_asr_span_revision_event_and_observe_projection(
+            &app.transcript_ledger,
+            &writer,
+            &app.projection_schedulers,
+            Some(&dispatch),
+            &final_revision
+        ));
+
+        wait_until("notes and graph projection dispatch success", || {
+            event_sink.patch_count() == 2
+        });
+
+        let emitted = event_sink.patches_snapshot();
+        assert_eq!(emitted.len(), 2);
+        for patch in &emitted {
+            assert_eq!(
+                patch.basis_currency_at_apply,
+                Some(AppliedBasisCurrency::Current),
+                "the apply-success emit site must populate this field from \
+                 the real classification the apply gate returned — kind={:?}",
+                patch.kind
+            );
+        }
+
+        drain_app_writers(&app);
+
+        let persisted = load_projection_events(&session_id).expect("load projection events");
+        assert_eq!(persisted.len(), 2);
+        for event in &persisted {
+            assert_eq!(
+                event.basis_currency_at_apply, None,
+                "the PERSISTED canonical log must never gain this field's \
+                 value — it is populated only on the frontend-bound emit \
+                 clone, never on the value that gets written to disk \
+                 (kind={:?})",
+                event.kind
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reviewer adversarial-mutation finding (W3 fix round): the pin above
+    /// exercises only a same-basis apply, whose real gate classification is
+    /// `AppliedBasisCurrency::Current` — so a mutant that hardcodes
+    /// `emitted_patch.basis_currency_at_apply = Some(AppliedBasisCurrency::Current)`
+    /// (dropping the `result.basis_currency_at_apply.clone()` re-derivation
+    /// entirely) still passes it, and passed the full `cargo test --lib`
+    /// suite. This test forces the REAL apply gate to classify as
+    /// `AppendedTail` — a new, never-revising span landing on the LIVE
+    /// `app.transcript_ledger` strictly between the job's basis being pinned
+    /// (`observe_ledger`, synchronous inside
+    /// `record_asr_span_revision_event_and_observe_projection`, before the
+    /// worker thread carrying this job is even spawned — see
+    /// `run_projection_job_notes_snapshot_is_pinned_at_spawn_not_re_read_at_dispatch`)
+    /// and the apply call re-reading the ledger fresh
+    /// (`transcript_ledger_snapshot`, `state.rs`). The mutation happens
+    /// inside the `FnProjectionPatchGenerator` closure itself — the same
+    /// "generation took long enough for a new span to land" window
+    /// `state.rs`'s own
+    /// `runtime_projection_patch_applies_append_only_basis_with_persistence`
+    /// exercises synthetically, reproduced here through the real
+    /// `run_projection_job` dispatch. A `swap`-guarded `AtomicBool` keeps the
+    /// ledger mutation idempotent even though the closure fires once per
+    /// dispatched kind (notes AND graph) for this one ASR revision.
+    #[test]
+    fn runtime_projection_dispatch_emits_appended_tail_when_the_live_ledger_grows_between_job_basis_and_apply()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-basis-currency-appended-tail");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let live_ledger = app.transcript_ledger.clone();
+        let ledger_grown = Arc::new(AtomicBool::new(false));
+        let ledger_grown_for_closure = ledger_grown.clone();
+        let (generator, _calls) = FnProjectionPatchGenerator::new(
+            move |job, _ledger, _notes, sequence, created_at_ms| {
+                if !ledger_grown_for_closure.swap(true, Ordering::SeqCst) {
+                    let mut ledger = match live_ledger.lock() {
+                        Ok(ledger) => ledger,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    ledger
+                        .apply_event(crate::projections::TranscriptEvent {
+                            span_id: "projection-basis-currency-tail-span-2".into(),
+                            provider: "test".into(),
+                            source_id: "test-source".into(),
+                            provider_item_id: None,
+                            transcript_segment_id: Some(
+                                "segment-projection-basis-currency-tail-span-2".into(),
+                            ),
+                            speaker_id: Some("speaker-1".into()),
+                            speaker_label: Some("Speaker 1".into()),
+                            channel: None,
+                            text: "Carol joined too.".into(),
+                            start_time: 5.0,
+                            end_time: 6.0,
+                            confidence: 1.0,
+                            is_final: true,
+                            stability: crate::projections::TranscriptEventStability::Final,
+                            revision_number: 1,
+                            supersedes: None,
+                            turn_id: None,
+                            end_of_turn: true,
+                            raw_event_ref: None,
+                            capture_latency_ms: None,
+                            asr_latency_ms: None,
+                            received_at_ms: 1_700_000_000_500,
+                        })
+                        .expect("append the live-ledger tail span between basis-pin and apply");
+                }
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 37,
+                    no_op_filtered_count: 0,
+                })
+            },
+        );
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+        let writer = app.transcript_event_writer.clone();
+        let final_revision = projection_asr_payload(
+            "projection-basis-currency-tail-span-1",
+            1,
+            "Alice met Bob.",
+            true,
+        );
+
+        assert!(record_asr_span_revision_event_and_observe_projection(
+            &app.transcript_ledger,
+            &writer,
+            &app.projection_schedulers,
+            Some(&dispatch),
+            &final_revision
+        ));
+
+        // `>= 2`, not `== 2`: an `AppendedTail` completion unconditionally
+        // chains a follow-up job per lane (ADR-0045 decision 3/4 — see this
+        // file's `dispatch_projection_decision` comments) to actually
+        // project the newly-appended span, so this scenario legitimately
+        // emits MORE than 2 patches once those follow-ups land. Racing to
+        // read `patches_snapshot()` at the instant `patch_count()` first
+        // hits exactly 2 is exactly what this test must NOT depend on — the
+        // property under test is about the FIRST patch per kind (the one
+        // whose basis is `job.basis`, pinned before this test's mutation),
+        // not about the total count.
+        wait_until(
+            "notes and graph projection dispatch success (appended tail)",
+            || event_sink.patch_count() >= 2,
+        );
+
+        let emitted = event_sink.patches_snapshot();
+        assert!(
+            emitted.len() >= 2,
+            "expected at least the two first-round patches, got {}",
+            emitted.len()
+        );
+        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+            let first_for_kind = emitted
+                .iter()
+                .filter(|patch| patch.kind == kind)
+                .min_by_key(|patch| patch.sequence)
+                .unwrap_or_else(|| panic!("no emitted patch for kind={kind:?}"));
+            assert!(
+                matches!(
+                    first_for_kind.basis_currency_at_apply,
+                    Some(AppliedBasisCurrency::AppendedTail { .. })
+                ),
+                "a live-ledger append strictly between job-basis capture and \
+                 apply must classify through the REAL gate as AppendedTail, \
+                 not a hardcoded Current — got {:?} for kind={:?}",
+                first_for_kind.basis_currency_at_apply,
+                kind
+            );
+        }
+
+        drain_app_writers(&app);
+
+        let persisted = load_projection_events(&session_id).expect("load projection events");
+        assert!(
+            persisted.len() >= 2,
+            "expected at least the two first-round persisted events, got {}",
+            persisted.len()
+        );
+        // Every apply this session persists — first-round AppendedTail
+        // applies AND their unconditional follow-ups alike — must carry
+        // `None` here; the invariant is about which VALUE flows into
+        // persistence, not about which round produced it.
+        for event in &persisted {
+            assert_eq!(
+                event.basis_currency_at_apply, None,
+                "the PERSISTED canonical log must still never gain this \
+                 field's value, even on the AppendedTail apply path \
+                 (kind={:?})",
+                event.kind
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Reviewer adversarial-mutation finding (W2 fix round): a mutant that made
     /// `run_projection_job` silently `finish_projection_scheduler_job` +
     /// `return` on `outcome.patch.operations.is_empty()` — WITHOUT ever calling
@@ -13088,6 +13360,7 @@ mod tests_status {
                         queued_at_ms: None,
                         generation_latency_ms: None,
                         apply_latency_ms: None,
+                        basis_currency_at_apply: None,
                         created_at_ms,
                     };
                     materialized

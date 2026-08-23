@@ -1259,6 +1259,10 @@ pub fn trusted_projection_patch_from_model_json(
             queued_at_ms: Some(job.queued_at_ms),
             generation_latency_ms: None,
             apply_latency_ms: None,
+            // Not known yet — this patch has not been applied. Populated
+            // (on a separate emit-side clone, never here) once the apply
+            // gate classifies the basis; see `ProjectionPatch`'s doc comment.
+            basis_currency_at_apply: None,
             created_at_ms: context.created_at_ms,
         },
         no_op_filtered_count,
@@ -3408,6 +3412,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: sequence,
         }
     }

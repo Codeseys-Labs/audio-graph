@@ -1468,6 +1468,7 @@ mod rotation_tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_100 + sequence,
         }
     }
@@ -1497,6 +1498,7 @@ mod rotation_tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_200 + sequence,
         }
     }

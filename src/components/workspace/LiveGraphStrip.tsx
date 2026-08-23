@@ -407,14 +407,15 @@ export function GraphChangeFeedView({
  * (`LiveDocument.tsx`) — `kind: "graph"` is this call site's only
  * difference from that one (synthesis §2: "one function, two call sites").
  *
- * The visible label ALSO reuses `document.recency.asOf`/`document.recency.behind`
+ * The visible label ALSO reuses `document.recency.asOf`/`.current`/`.behind`
  * directly (design-a §7's i18n budget table specs this chip as reusing the
- * document chip's recency strings) — the two are byte-identical per locale
- * ("as of {{time}}" / "−{{count}} turns" in en; same in pt), so keeping a
- * separate `graphStrip.recency.asOf`/`behind` pair would just be two copies
- * of the same string that could drift apart. Only the `*Aria` variants stay
- * lane-specific (`graphStrip.recency.asOfAria`/`behindAria`) — a screen
- * reader needs to hear "Graph", not "Notes", is behind.
+ * document chip's recency strings) — they are byte-identical per locale
+ * ("as of {{time}}" / "Up to date" / "−{{count}} turns" in en; same in pt),
+ * so keeping a separate `graphStrip.recency.asOf`/`.current`/`.behind` set
+ * would just be copies of the same strings that could drift apart. Only the
+ * `*Aria` variants stay lane-specific (`graphStrip.recency.asOfAria`/
+ * `.currentAria`/`.behindAria`) — a screen reader needs to hear "Graph", not
+ * "Notes", is up to date or behind.
  */
 export function GraphRecencyChip() {
   const { t, i18n } = useTranslation();
@@ -426,16 +427,17 @@ export function GraphRecencyChip() {
   // `useSessionView()`'s subscription (incl. `transcriptSegments`) re-renders
   // this component far more often than `sessionProjectionEvents`/
   // `asrSpanRevisions` actually change.
-  const { lastAppliedAtMs, turnsBehind } = useMemo(
+  const { lastAppliedAtMs, turnsBehind, evidence } = useMemo(
     () => selectLaneRecency("graph", sessionProjectionEvents, asrSpanRevisions),
     [sessionProjectionEvents, asrSpanRevisions],
   );
   const recency = laneRecencyChipTone({
     lastAppliedAtMs,
     turnsBehind,
-    // Always `null` — no real call site can supply W3's evidence until
-    // that ticket lands. See liveWorkspaceTone.ts's module doc.
-    evidence: null,
+    // Ticket W3: mapped from the latest graph-lane patch's
+    // `basis_currency_at_apply` by `selectLaneRecency`. See
+    // liveWorkspaceTone.ts's module doc.
+    evidence,
     isLiveSession: loadedSessionId === null,
   });
 
@@ -448,12 +450,19 @@ export function GraphRecencyChip() {
     i18n.language,
     { hour12: false },
   );
+  // See `DocRecencyChip`'s identical comment: `recency.behind` wins
+  // regardless of evidence, then `recency.tone === "success"` is the only
+  // other path `laneRecencyChipTone` can ever reach.
   const label = recency.behind
     ? t("document.recency.behind", { count: recency.turnsBehind })
-    : t("document.recency.asOf", { time });
+    : recency.tone === "success"
+      ? t("document.recency.current")
+      : t("document.recency.asOf", { time });
   const ariaLabel = recency.behind
     ? t("graphStrip.recency.behindAria", { count: recency.turnsBehind })
-    : t("graphStrip.recency.asOfAria", { time });
+    : recency.tone === "success"
+      ? t("graphStrip.recency.currentAria", { time })
+      : t("graphStrip.recency.asOfAria", { time });
 
   return (
     // See `DocRecencyChip`'s (LiveDocument.tsx) identical comment: `aria-label`

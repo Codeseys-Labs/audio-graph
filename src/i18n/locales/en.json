@@ -1214,6 +1214,8 @@
     "recency": {
       "asOf": "as of {{time}}",
       "asOfAria": "Notes last updated at {{time}}",
+      "current": "Up to date",
+      "currentAria": "Notes are up to date as of {{time}}",
       "behind": "−{{count}} turns",
       "behindAria": "Notes are {{count}} turns behind the conversation"
     }
@@ -1430,6 +1432,7 @@
     "expand": "Expand to full graph",
     "recency": {
       "asOfAria": "Graph last updated at {{time}}",
+      "currentAria": "Graph is up to date as of {{time}}",
       "behindAria": "Graph is {{count}} turns behind the conversation"
     },
     "feed": {

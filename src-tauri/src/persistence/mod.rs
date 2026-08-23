@@ -3236,6 +3236,7 @@ mod shutdown_tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_000 + sequence,
         }
     }
@@ -3666,6 +3667,7 @@ mod local_memory_repository_tests {
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(120),
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms,
         }
     }
@@ -3699,6 +3701,7 @@ mod local_memory_repository_tests {
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(140),
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms,
         }
     }
@@ -3728,6 +3731,7 @@ mod local_memory_repository_tests {
             queued_at_ms: Some(created_at_ms.saturating_sub(25)),
             generation_latency_ms: Some(50),
             apply_latency_ms: Some(5),
+            basis_currency_at_apply: None,
             created_at_ms,
         }
     }

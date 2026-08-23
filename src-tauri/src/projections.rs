@@ -1257,6 +1257,28 @@ pub struct ProjectionPatch {
     pub generation_latency_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_latency_ms: Option<u64>,
+    /// Additive, EVENT-PAYLOAD-ONLY mirror of
+    /// [`crate::state::ProjectionRuntimeApplyResult::basis_currency_at_apply`]
+    /// (ticket W3, audio-graph-a6b5). `ProjectionPatch` is one Rust type that
+    /// serves BOTH the persisted canonical projection event log
+    /// (`ProjectionEventWriter::append` -> `write_projection_event`,
+    /// `persistence/mod.rs`) AND the frontend-bound `PROJECTION_PATCH` Tauri
+    /// event (`TauriProjectionRuntimeEventSink::emit_projection_patch`,
+    /// `speech/mod.rs`) — both take `&ProjectionPatch`. This field is set on
+    /// a SEPARATE clone at the apply-success emit site
+    /// (`emit_projection_runtime_events`'s caller in `speech/mod.rs`), never
+    /// on the value handed to `apply_runtime_projection_patch` that gets
+    /// persisted. Consequence: the canonical log's serialized bytes are
+    /// completely unaffected by this field — `None`/absent is what every
+    /// pre-W3 record deserializes to (`#[serde(default)]`) AND what every
+    /// record this app ever writes to disk continues to deserialize to,
+    /// forever (ADR-0045 replay: byte-identical, not merely tolerant). Only
+    /// the frontend wire clone ever carries `Some`. Downstream: the strip's
+    /// recency chip (`liveWorkspaceTone.ts`) maps this tagged enum's `.type`
+    /// onto its `BasisCurrencyEvidence` — `Current` is the only value that
+    /// can ever earn a "success" tone; `AppendedTail` stays honest-neutral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_currency_at_apply: Option<AppliedBasisCurrency>,
     pub created_at_ms: u64,
 }
 
@@ -1280,6 +1302,7 @@ impl fmt::Debug for ProjectionPatch {
             .field("queued_at_ms", &self.queued_at_ms)
             .field("generation_latency_ms", &self.generation_latency_ms)
             .field("apply_latency_ms", &self.apply_latency_ms)
+            .field("basis_currency_at_apply", &self.basis_currency_at_apply)
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
@@ -4244,6 +4267,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_100,
         };
 
@@ -4318,6 +4342,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_500,
         };
 
@@ -4508,6 +4533,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_100 + sequence,
         }
     }
@@ -4553,6 +4579,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_200 + sequence,
         }
     }
@@ -4606,6 +4633,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_104,
             route: None,
         };
@@ -4633,6 +4661,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_105,
             route: None,
         };
@@ -4748,6 +4777,49 @@ mod tests {
             "a pre-W1 replay's persisted JSON must be byte-identical to what pre-W1 code \
              would have written — no heading_level key may appear anywhere: {persisted}"
         );
+    }
+
+    /// Ticket W3 (audio-graph-a6b5): `ProjectionPatch::basis_currency_at_apply`'s
+    /// wire shape. Pins BOTH directions — same additive/`skip_serializing_if`
+    /// contract W1's `heading_level` pins above
+    /// (`pre_w1_notes_log_replays_byte_identical_materialized_notes`), applied
+    /// to `ProjectionPatch` instead of `MaterializedNote`:
+    /// - `Some(Current)` serializes as a REAL nested tagged object
+    ///   (`{"type":"current"}`, snake_case) — `AppliedBasisCurrency` is
+    ///   `#[serde(tag = "type", rename_all = "snake_case")]`, never a bare
+    ///   string.
+    /// - `None` (every patch this app ever WRITES to the canonical log — see
+    ///   the field's doc comment) leaves the key ABSENT entirely, not `null`.
+    /// - A pre-W3 JSON object (the key never appears at all, simulating a
+    ///   record written before this field existed) still deserializes
+    ///   cleanly to `None`.
+    #[test]
+    fn basis_currency_at_apply_wire_shape_is_additive_and_skips_when_absent() {
+        let mut with_currency = notes_patch(1, "note-1", "Decision", "Ship it.");
+        with_currency.basis_currency_at_apply = Some(AppliedBasisCurrency::Current);
+
+        let json = serde_json::to_string(&with_currency).expect("serialize patch");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            value["basis_currency_at_apply"],
+            serde_json::json!({ "type": "current" }),
+            "Some(Current) must serialize as a nested tagged object, not a bare string: {json}"
+        );
+
+        let without_currency = notes_patch(2, "note-2", "Decision", "Ship it too.");
+        assert_eq!(without_currency.basis_currency_at_apply, None);
+        let json_without = serde_json::to_string(&without_currency).expect("serialize patch");
+        assert!(
+            !json_without.contains("basis_currency_at_apply"),
+            "None must leave the key ABSENT, not null (skip_serializing_if): {json_without}"
+        );
+
+        // A patch from before this field existed (no key at all) must still
+        // deserialize cleanly, defaulting to `None` — the same
+        // `#[serde(default)]` contract W1's `heading_level` relies on.
+        let reloaded: ProjectionPatch =
+            serde_json::from_str(&json_without).expect("pre-W3 patch shape deserializes");
+        assert_eq!(reloaded.basis_currency_at_apply, None);
     }
 
     /// Replay fixture: a MIXED log — some `upsert_note` operations from
@@ -4917,6 +4989,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_103,
         };
         assert_eq!(

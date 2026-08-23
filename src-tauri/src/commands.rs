@@ -3930,6 +3930,7 @@ fn approved_agent_projection_patch(
         queued_at_ms: Some(now_ms),
         generation_latency_ms: Some(0),
         apply_latency_ms: None,
+        basis_currency_at_apply: None,
         created_at_ms: now_ms,
     };
 
@@ -12235,6 +12236,7 @@ mod tests {
             queued_at_ms: Some(1_700_000_050_000 + sequence),
             generation_latency_ms: Some(30 + sequence),
             apply_latency_ms: Some(5 + sequence),
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_100_000 + sequence,
         }
     }
@@ -12267,6 +12269,7 @@ mod tests {
             queued_at_ms: Some(1_700_000_150_000 + sequence),
             generation_latency_ms: Some(40 + sequence),
             apply_latency_ms: Some(6 + sequence),
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_200_000 + sequence,
         }
     }
@@ -12303,6 +12306,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_300_000,
         }
     }
@@ -14614,6 +14618,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_300_001,
         };
         let retcon_graph_patch = crate::projections::ProjectionPatch {
@@ -14637,6 +14642,7 @@ mod tests {
             queued_at_ms: None,
             generation_latency_ms: None,
             apply_latency_ms: None,
+            basis_currency_at_apply: None,
             created_at_ms: 1_700_000_300_002,
         };
 

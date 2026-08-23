@@ -9,25 +9,25 @@
  * but the SAME law: an unevidenced claim demotes to neutral). See
  * `agentOutcomeChipTone` below for the third wrapper.
  *
- * PHASE-1 HONESTY (L3 law, design-a §0/§8): this app has NO observation of
- * either projection lane's health yet — only an inference from event
- * timestamps (`lastAppliedAtMs`) and from ASR turn-finalization events
- * (`turnsBehind`). W3 (`basis_currency_at_apply`, additive on the emitted
- * patch) is the ONLY thing that can ever turn a lane's chip green, and it
- * has NOT landed. `LaneRecencyToneInput.evidence` therefore always arrives
- * as `null` from every real call site in this ticket — the type carries the
- * field now (design-a §8's "one boolean is the entire distance between
- * honest-neutral and an earned green") so a later ticket wires the real
- * value through. NOT a zero-shape-change wire-up, though: the real backend
- * field (`AppliedBasisCurrency`, `src-tauri/src/projections.rs`) is
- * `#[serde(tag = "type", ...)]` — it serializes as an object
- * (`{"type":"current"}` / `{"type":"appended_tail","staleness":{...}}`),
- * not a bare string. `BasisCurrencyEvidence` narrows to the two tag VALUES
- * this module's tone logic cares about; W3's call site will need a
- * `patch.basis_currency_at_apply?.type` mapping step to produce this type,
- * not a direct assignment. `laneRecencyChipTone` is written so
- * `evidence !== "current"` structurally cannot reach `tone: "success"` —
- * see `liveWorkspaceTone.test.ts`'s pin.
+ * PHASE-1 HONESTY (L3 law, design-a §0/§8), UPGRADED BY TICKET W3: this app
+ * had NO observation of either projection lane's health at first — only an
+ * inference from event timestamps (`lastAppliedAtMs`) and from ASR
+ * turn-finalization events (`turnsBehind`). `basis_currency_at_apply`
+ * (additive on the emitted `ProjectionPatch`, `src-tauri/src/projections.rs`)
+ * is the ONLY thing that can ever turn a lane's chip green, and W3 now wires
+ * it through both real call sites (`DocRecencyChip`, `GraphRecencyChip`) via
+ * `selectLaneRecency`'s `evidence` field. NOT a zero-shape-change wire-up:
+ * the real backend field is `#[serde(tag = "type", ...)]` — it serializes as
+ * an object (`{"type":"current"}` / `{"type":"appended_tail","staleness":
+ * {...}}`), not a bare string. `BasisCurrencyEvidence` narrows to the two
+ * tag VALUES this module's tone logic cares about; `mapBasisCurrencyEvidence`
+ * is that mapping step (`patch.basis_currency_at_apply?.type` — absent or any
+ * unrecognized tag both fold to `null`, never a type error). `laneRecencyChipTone`
+ * is written so `evidence !== "current"` structurally cannot reach
+ * `tone: "success"` — see `liveWorkspaceTone.test.ts`'s pin, which still
+ * holds: `evidence: null` (or `"appended_tail"`) never renders success, and
+ * that is exactly what a pre-W3 patch, or a lane whose latest apply was an
+ * append-only tail, produces today.
  *
  * `selectLaneRecency` is the ONE computation design-a §2.4 promises ("one
  * function, two call sites") — `kind: "notes"` drives the document chip,
@@ -83,6 +83,15 @@ export interface LaneRecencySourcePatch {
    * Falls back to `created_at_ms` when absent (matches every existing
    * caller/test unchanged). */
   queued_at_ms?: number | null;
+  /** W3's wire field (`AppliedBasisCurrency`, `src-tauri/src/projections.rs`):
+   * an internally-tagged enum, so this arrives as `{type: "current"}` /
+   * `{type: "appended_tail", staleness: {...}}` — NEVER a bare string.
+   * Loosely typed here (any `type` string) rather than importing the real
+   * `AppliedBasisCurrency` union, to keep this module's declared "zero
+   * import surface" posture; `mapBasisCurrencyEvidence` is the one place
+   * that narrows it, and treats absent/`null`/any unrecognized `type` the
+   * same way — as "no evidence yet", never a type error. */
+  basis_currency_at_apply?: { type: string; staleness?: unknown } | null;
 }
 
 /** Structurally identical to the fields of `AsrSpanRevisionEvent` this
@@ -190,6 +199,23 @@ export function selectTurnsBehind(
   return turns.size;
 }
 
+/**
+ * Maps W3's wire tag (`AppliedBasisCurrency`, an internally-tagged enum —
+ * `{type: "current"}` / `{type: "appended_tail", staleness: {...}}`) onto
+ * the two values `laneRecencyChipTone` cares about. Absent/`null` (every
+ * pre-W3 patch, or a patch this session whose apply never populated the
+ * field) and any unrecognized `.type` string BOTH map to `null` — the SAME
+ * "no evidence yet" input that already renders honest-neutral. Never
+ * throws on malformed data.
+ */
+export function mapBasisCurrencyEvidence(
+  value: { type: string; staleness?: unknown } | null | undefined,
+): BasisCurrencyEvidence | null {
+  if (value?.type === "current") return "current";
+  if (value?.type === "appended_tail") return "appended_tail";
+  return null;
+}
+
 /** The one shared computation (design-a §2.4): `kind: "notes"` drives the
  * document chip, `kind: "graph"` drives the graph chip. Both read from the
  * SAME two arrays (`sessionProjectionEvents`, `asrSpanRevisions`) already
@@ -205,12 +231,22 @@ export function selectTurnsBehind(
  * being generated (`received_at_ms` between `queued_at_ms` and
  * `created_at_ms`) is provably NOT reflected in that patch's content, yet
  * `received_at_ms <= created_at_ms` would silently exclude it from the
- * count, understating how far behind the lane actually is. */
+ * count, understating how far behind the lane actually is.
+ *
+ * `evidence` (ticket W3): the LATEST patch's `basis_currency_at_apply`,
+ * mapped through `mapBasisCurrencyEvidence` — the same patch
+ * `lastAppliedAtMs`/the turn-count cutoff already derive from, so the
+ * three facts this function returns are always about ONE patch, never a
+ * mix of two. */
 export function selectLaneRecency(
   kind: ProjectionLaneKind,
   patches: readonly LaneRecencySourcePatch[],
   revisions: readonly LaneRecencySourceRevision[],
-): { lastAppliedAtMs: number | null; turnsBehind: number } {
+): {
+  lastAppliedAtMs: number | null;
+  turnsBehind: number;
+  evidence: BasisCurrencyEvidence | null;
+} {
   const latestPatch = findLatestLanePatch(patches, kind);
   const lastAppliedAtMs = latestPatch?.created_at_ms ?? null;
   const turnCountSinceMs = latestPatch
@@ -219,6 +255,7 @@ export function selectLaneRecency(
   return {
     lastAppliedAtMs,
     turnsBehind: selectTurnsBehind(revisions, turnCountSinceMs),
+    evidence: mapBasisCurrencyEvidence(latestPatch?.basis_currency_at_apply),
   };
 }
 
@@ -226,11 +263,11 @@ export function selectLaneRecency(
  * chip to warning in phase 1 (design-a §2.4's ratified threshold). */
 export const LANE_RECENCY_WARNING_TURNS_THRESHOLD = 3;
 
-/** W3's (not-yet-landed) `basis_currency_at_apply`, narrowed to the two
- * values that matter for tone (synthesis §2): `"current"` is the ONLY value
- * that can ever unlock `success`; `"appended_tail"` is present evidence of
- * LAG and stays neutral — it is not, by itself, a warning (the
- * `turnsBehind` threshold owns the warning arm independently). */
+/** W3's `basis_currency_at_apply`, narrowed to the two values that matter
+ * for tone (synthesis §2): `"current"` is the ONLY value that can ever
+ * unlock `success`; `"appended_tail"` is present evidence of LAG and stays
+ * neutral — it is not, by itself, a warning (the `turnsBehind` threshold
+ * owns the warning arm independently). */
 export type BasisCurrencyEvidence = "current" | "appended_tail";
 
 export type LaneRecencyStatus = "ready" | "behind";
@@ -242,10 +279,14 @@ export interface LaneRecencyToneInput {
   lastAppliedAtMs: number | null;
   turnsBehind: number;
   /**
-   * W3's evidence field. ALWAYS `null` from every real call site in this
-   * ticket (see module doc) — the ONLY caller that may ever pass a non-null
-   * value is a future ticket that has actually wired
-   * `basis_currency_at_apply` through from the backend.
+   * W3's evidence field — `selectLaneRecency`'s `evidence` (mapped from
+   * the latest patch's `basis_currency_at_apply` via
+   * `mapBasisCurrencyEvidence`) is now threaded through both real call
+   * sites (`DocRecencyChip`, `GraphRecencyChip`). `null` still means
+   * exactly what it always meant: no observation to make a "ready" claim
+   * from — a pre-W3 recorded session, a lane that has not applied a
+   * classified patch yet, or a malformed wire value all land here, and
+   * the law demotes them identically to honest-neutral.
    */
   evidence: BasisCurrencyEvidence | null;
   /** `false` for a loaded/reviewed session — no freshness claim is ever
@@ -277,11 +318,13 @@ export interface LaneRecencyChipResult {
  * through `readinessChipTone` exactly like every other tone-law surface in
  * this repo: `automaticProbeAvailable: evidence === "current"` is the ONE
  * boolean gate that decides whether a `"ready"` status is even reachable —
- * with `evidence` anything other than `"current"` (which is every real call
- * site today: always `null`), the law itself demotes `"ready"` to neutral
- * "unchecked" before this function ever sees a tone, so `tone: "success"`
- * is structurally unreachable in phase 1. `liveWorkspaceTone.test.ts` pins
- * this with a fabricated "looks current" input (turnsBehind: 0, a fresh
+ * with `evidence` anything other than `"current"` (`null`, or
+ * `"appended_tail"`'s present-but-insufficient evidence of lag), the law
+ * itself demotes `"ready"` to neutral "unchecked" before this function ever
+ * sees a tone, so `tone: "success"` is structurally unreachable except
+ * when the lane's latest applied patch actually carried
+ * `{type: "current"}` (ticket W3). `liveWorkspaceTone.test.ts` pins this
+ * with a fabricated "looks current" input (turnsBehind: 0, a fresh
  * `lastAppliedAtMs`) that still must not render success while
  * `evidence: null`.
  */
