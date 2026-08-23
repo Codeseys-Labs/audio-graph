@@ -341,7 +341,58 @@ pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String>
     let mut schema = serde_json::to_value(schemars::schema_for!(ProjectionPatchDraft))
         .map_err(|e| format!("failed to build projection patch draft JSON schema: {e}"))?;
     require_evidence_on_content_creating_operation_variants(&mut schema);
+    hide_heading_level_from_draft_schema(&mut schema);
     Ok(schema)
+}
+
+/// audio-graph-a6b5 W1 is a DARK ship: `heading_level` is declared on
+/// [`ProjectionOperation::UpsertNote`] (so fresh-ingest and replay can carry
+/// it end-to-end), but no model-facing surface may change until W2's
+/// dedicated prompt/schema-exposure ticket. `schemars` derives this draft
+/// schema straight from the Rust type, so without this post-process step
+/// `heading_level` — AND the field's entire internal doc comment, verbatim,
+/// as the property's JSON Schema `description` (ticket IDs, ADR numbers,
+/// internal test-name cross-references included) — would be pasted into
+/// every projection system prompt ([`projection_patch_prompt_messages`],
+/// [`projection_patch_repair_prompt_messages`]) and offered as the
+/// vLLM/mistral.rs structured-decoding grammar
+/// (`llm::executor::projection_api`). That is exactly the coupling this
+/// ticket was told to avoid rather than expose ("if adding the field to the
+/// draft type inevitably exposes it in the wire schema W2 owns, STOP and
+/// report the coupling rather than exposing it early"): the coupling is
+/// avoidable here, so it is stripped, not shipped.
+///
+/// This is the same seam [`require_evidence_on_content_creating_operation_variants`]
+/// already uses to tighten this schema post-generation, and it does not
+/// weaken serde's tolerance for a model that emits the key anyway —
+/// `#[serde(default)]` on the field means an unadvertised `heading_level` key
+/// is still silently accepted (never rejected) on any route; this function
+/// only controls what the schema *advertises*, not what deserialization
+/// *tolerates*. W2 deletes this call (or narrows it) when it flips the field
+/// model-visible.
+fn hide_heading_level_from_draft_schema(schema: &mut serde_json::Value) {
+    let Some(variants) = schema
+        .get_mut("$defs")
+        .and_then(|defs| defs.get_mut("ProjectionOperation"))
+        .and_then(|operation| operation.get_mut("oneOf"))
+        .and_then(|one_of| one_of.as_array_mut())
+    else {
+        return;
+    };
+
+    for variant in variants {
+        let had_heading_level = variant
+            .get_mut("properties")
+            .and_then(|properties| properties.as_object_mut())
+            .map(|properties| properties.remove("heading_level").is_some())
+            .unwrap_or(false);
+        if !had_heading_level {
+            continue;
+        }
+        if let Some(required) = variant.get_mut("required").and_then(|r| r.as_array_mut()) {
+            required.retain(|field| field != "heading_level");
+        }
+    }
 }
 
 /// `schemars` marks `evidence` OPTIONAL on the three content-creating
@@ -414,16 +465,21 @@ fn require_evidence_on_content_creating_operation_variants(schema: &mut serde_js
 ///    graph op in a notes job (and vice-versa); the schema now forbids the
 ///    model from emitting one at all, so it is not looser than the validator on
 ///    the kind axis.
-/// 2. **Every operation field is required.** The user's failures were patches
-///    *missing* structural fields (`id` / `title` / `tags` for notes,
-///    `relations`/`target`/`name` for graph edges). serde requires those
-///    fields; the derived schema left them optional, so the model produced
-///    field-incomplete patches that only failed at parse time. Here each
-///    variant lists all of its serde fields in `required` with
-///    `additionalProperties: false`, matching the internally-tagged wire shape
-///    exactly. Rust `Option` fields (`description`, `after_id`, `label`) stay
-///    required but nullable (`["string", "null"]`) so strict mode is satisfied
-///    without forcing the model to invent a value.
+/// 2. **Every operation field the model is meant to fill in is required.**
+///    The user's failures were patches *missing* structural fields (`id` /
+///    `title` / `tags` for notes, `relations`/`target`/`name` for graph
+///    edges). serde requires those fields; the derived schema left them
+///    optional, so the model produced field-incomplete patches that only
+///    failed at parse time. Here each variant lists its serde fields in
+///    `required` with `additionalProperties: false`, matching the
+///    internally-tagged wire shape — with ONE deliberate exception:
+///    `upsert_note`'s `heading_level` (audio-graph-a6b5 W1) is a real serde
+///    field on `ProjectionOperation::UpsertNote` that this schema does NOT
+///    list at all, dark-shipped until W2's prompt/schema-exposure ticket (see
+///    the field's own doc comment in `projections.rs`). Rust `Option` fields
+///    that ARE advertised (`description`, `after_id`, `label`) stay required
+///    but nullable (`["string", "null"]`) so strict mode is satisfied without
+///    forcing the model to invent a value.
 /// 3. **No numeric range / non-empty keywords.** The validator additionally
 ///    enforces `weight`/`confidence` in `0.0..=1.0` and non-empty trimmed
 ///    strings. Those are intentionally NOT encoded here: several strict-mode
@@ -663,7 +719,36 @@ pub fn parse_projection_patch_draft(
     // enum). Never applied to replay — see `ontology::normalize_entity_type`
     // and `normalize_projection_patch_draft_ontology`'s doc comments.
     normalize_projection_patch_draft_ontology(&mut draft);
+    // audio-graph-a6b5 W1: same fresh-ingest-only seam, same "clamp, never
+    // refuse" posture, applied to the new `heading_level` field and the
+    // note-body grammar. See `normalize_projection_patch_draft_doc_structure`'s
+    // doc comment for why this can never move into `validate_operation` or
+    // onto the replay path.
+    normalize_projection_patch_draft_doc_structure(&mut draft);
+    // `require_non_empty` (called by `validate_operation` above, BEFORE
+    // normalization) guarantees every `body` was non-empty as the model
+    // wrote it — but `normalize_doc_body` can reduce an all-markup body
+    // (e.g. a lone "*", "`", "```", or "#") to the empty string, silently
+    // undoing that guarantee. Re-check post-normalization and fail the same
+    // way `require_non_empty` would have, rather than persisting a
+    // content-free note into the canonical log.
+    require_non_empty_body_survives_normalization(&draft)?;
     Ok(draft)
+}
+
+/// See [`parse_projection_patch_draft`]'s call site for why this exists: it
+/// restores `require_non_empty`'s non-empty-`body` guarantee AFTER
+/// [`normalize_projection_patch_draft_doc_structure`] has had a chance to
+/// collapse an all-markup body down to nothing.
+fn require_non_empty_body_survives_normalization(
+    draft: &ProjectionPatchDraft,
+) -> Result<(), ProjectionPatchDraftError> {
+    for operation in &draft.operations {
+        if let ProjectionOperation::UpsertNote { body, .. } = operation {
+            require_non_empty(operation, "body", body)?;
+        }
+    }
+    Ok(())
 }
 
 /// Ingest-time ontology normalization for a freshly-parsed, structurally
@@ -700,6 +785,360 @@ fn normalize_projection_patch_draft_ontology(draft: &mut ProjectionPatchDraft) {
             _ => {}
         }
     }
+}
+
+/// Lower bound of the document heading-depth scale (audio-graph-a6b5 design
+/// panel, design-b §1.2: 2 = top-level section, matching an `<h2>`).
+const HEADING_LEVEL_MIN: u8 = 2;
+/// Upper bound (4 = sub-subsection, matching an `<h4>`); design-b §1.2 caps
+/// nesting at two levels below top-level rather than growing the scale
+/// further.
+const HEADING_LEVEL_MAX: u8 = 4;
+
+/// Ingest-time doc-structure normalization for a freshly-parsed, structurally
+/// valid model draft (audio-graph-a6b5 W1). Sibling of
+/// [`normalize_projection_patch_draft_ontology`] at the exact same seam —
+/// same call site, same "runs after structural validation, before the draft
+/// is trusted into a persisted `ProjectionPatch`, and NEVER on replay"
+/// contract, for the identical ADR-0045 reason: materialization is a pure
+/// re-derivation from the accepted patch log, so rewriting a HISTORICAL
+/// operation's `body`/`heading_level` here would make replay depend on
+/// today's normalization rules instead of the rules in force when that
+/// patch was accepted.
+///
+/// Two responsibilities, both **clamp, never refuse** (design-b §1.4: an
+/// operation carrying an out-of-range heading or a stray markdown marker is
+/// still real content — refusing the whole patch over formatting is exactly
+/// the ADR-0045 trade this ticket forbids):
+///
+/// 1. Clamp `heading_level` into `2..=4` when present. `None` (no structure
+///    asserted) passes through unchanged — clamping is not a license to
+///    invent a depth for an operation that asserted none.
+/// 2. Normalize `body` into the validated plain-line/bullet grammar
+///    (design-b §1.3): `*`/`+` bullet markers become `-`; bullet indent
+///    snaps to 0/2/4 spaces (two nesting levels); a leading run of `#`
+///    markers is stripped (headings live in `title`, never in `body`);
+///    inline emphasis/link/code-fence markers are stripped down to their
+///    plain text. This is deliberately NOT an HTML sanitizer: `body` stays
+///    an opaque `String` all the way through this backend, and the
+///    XSS-safety property this grammar exists for comes from the FRONTEND
+///    renderer parsing it into React text nodes with no HTML path at all
+///    (design-b §1.3) — this function's job is only to keep the markup
+///    *vocabulary* narrow, never to escape or interpret arbitrary text.
+///    Every line survives: no line is ever dropped or truncated here,
+///    regardless of length or content (a `<script>` tag or a markdown link
+///    is rewritten/stripped of its markup exactly like any other line, never
+///    discarded).
+fn normalize_projection_patch_draft_doc_structure(draft: &mut ProjectionPatchDraft) {
+    for operation in &mut draft.operations {
+        if let ProjectionOperation::UpsertNote {
+            heading_level,
+            body,
+            ..
+        } = operation
+        {
+            *heading_level =
+                heading_level.map(|level| level.clamp(HEADING_LEVEL_MIN, HEADING_LEVEL_MAX));
+            *body = normalize_doc_body(body);
+        }
+    }
+}
+
+/// Rewrites `body` into design-b §1.3's validated grammar, one line at a
+/// time. See [`normalize_projection_patch_draft_doc_structure`] for the
+/// contract this implements (fresh-ingest-only, clamp-never-refuse,
+/// no line ever dropped).
+fn normalize_doc_body(body: &str) -> String {
+    // `str::lines` drops a trailing newline distinction the grammar does not
+    // care about (a body's line count, not its trailing-newline byte, is
+    // what the renderer walks); rejoining with `\n` below reconstructs a
+    // normal multi-line body.
+    body.lines()
+        .map(normalize_doc_body_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_doc_body_line(line: &str) -> String {
+    // Leading tabs count as indentation too (a tab-indented bullet used to
+    // fall through to the paragraph branch below, losing its bullet marker
+    // entirely: `strip_bullet_marker` only ever saw `rest` starting with the
+    // literal tab). Weight a tab as 2 columns — the same width as one
+    // nesting level — so a single leading tab maps to depth 1 exactly like
+    // two leading spaces do.
+    let leading_ws_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let leading_ws = &line[..leading_ws_len];
+    let indent_width: usize = leading_ws
+        .chars()
+        .map(|c| if c == '\t' { 2 } else { 1 })
+        .sum();
+    let rest = &line[leading_ws_len..];
+
+    if let Some(text) = strip_bullet_marker(rest) {
+        // Two nesting levels below the top, per design-b §1.3's grammar
+        // (`indent ∈ {"", "  ", "    "} → depth 0/1/2`); anything deeper is
+        // clamped to depth 2 rather than growing indentation further.
+        let depth = (indent_width / 2).min(2);
+        let indent = "  ".repeat(depth);
+        return format!("{indent}- {}", strip_doc_body_markup(text.trim_start()));
+    }
+
+    // Headings live in `title`, never in `body` — strip a leading run of
+    // `#` markers from a paragraph line without dropping the line itself.
+    let without_heading_marker = rest.trim_start_matches('#');
+    let text = if without_heading_marker.len() != rest.len() {
+        without_heading_marker.trim_start()
+    } else {
+        rest
+    };
+    strip_doc_body_markup(text)
+}
+
+/// `- `/`* `/`+ ` at the start of a (whitespace-trimmed) line all mean
+/// "bullet" under design-b §1.3's grammar; only `-` survives normalization.
+fn strip_bullet_marker(rest: &str) -> Option<&str> {
+    rest.strip_prefix("- ")
+        .or_else(|| rest.strip_prefix("* "))
+        .or_else(|| rest.strip_prefix("+ "))
+}
+
+/// Strips the grammar's disallowed inline markup down to its plain text,
+/// never dropping the underlying content: bold/italic/code delimiters are
+/// removed (the enclosed text survives); a markdown link/image keeps its
+/// visible text and drops the `(url)` target; a code-fence delimiter line
+/// (```` ``` ````, optionally followed by a language tag) collapses to just
+/// that trailing text. Hostile input (a literal `<script>` tag, an
+/// arbitrarily long line) is not markup this grammar recognizes, so it is
+/// left exactly as-is — inert plain text, both here and at the frontend
+/// text-node renderer this grammar is designed for (never interpreted as
+/// HTML by either layer).
+///
+/// Runs in three ordered passes — code spans, then links/images, then
+/// emphasis — each of which only removes a delimiter pair it can actually
+/// PAIR UP; an unpaired/incidental marker is left exactly as-is rather than
+/// deleted on sight. This matters because `*`, `_`, and `` ` `` show up
+/// constantly in this app's own domain (meeting notes about software) as
+/// plain content, not markup: `snake_case`, `my_function_name`,
+/// `src/projection_llm.rs`, `2 * 3`, `a*b`. The prior character-by-character
+/// version stripped every occurrence of these bytes unconditionally,
+/// silently corrupting exactly that vocabulary in the canonical log.
+fn strip_doc_body_markup(text: &str) -> String {
+    let text = text.strip_prefix("```").unwrap_or(text);
+    let text = strip_code_spans(text);
+    let text = strip_links_and_images(&text);
+    let text = strip_delimiter_pairs(&text, '*', false);
+    strip_delimiter_pairs(&text, '_', true)
+}
+
+/// Backtick code spans: a run of N backticks pairs with the NEAREST later
+/// run of exactly N backticks; everything between is code-span content and
+/// is emitted verbatim (not reprocessed for other markup, matching how a
+/// real Markdown parser treats code-span content as literal). A backtick
+/// run with no matching same-length partner on the line is not a code span
+/// at all — it is left as literal backtick characters rather than deleted.
+fn strip_code_spans(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < n {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut j = i;
+        while j < n && chars[j] == '`' {
+            j += 1;
+        }
+        let run_len = j - run_start;
+
+        let mut k = j;
+        let mut closing = None;
+        while k < n {
+            if chars[k] == '`' {
+                let close_start = k;
+                let mut m = k;
+                while m < n && chars[m] == '`' {
+                    m += 1;
+                }
+                if m - close_start == run_len {
+                    closing = Some((close_start, m));
+                    break;
+                }
+                k = m;
+            } else {
+                k += 1;
+            }
+        }
+
+        match closing {
+            Some((close_start, close_end)) => {
+                out.extend(&chars[j..close_start]);
+                i = close_end;
+            }
+            None => {
+                // No matching run: literal backticks, not markup.
+                out.extend(&chars[run_start..j]);
+                i = j;
+            }
+        }
+    }
+    out
+}
+
+/// Markdown links/images: `[text](url)` / `![alt](url)` keep their visible
+/// text and drop the `(url)` target. Anything that does not fully resolve to
+/// that shape — an unmatched `[`, a `[text]` with no `(url)` target, or a
+/// `(target` that never finds its closing `)` — is preserved VERBATIM
+/// (including a leading `!`, which the prior implementation dropped even
+/// when the following brackets turned out not to be a link at all) rather
+/// than silently discarding any of the line.
+fn strip_links_and_images(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < n {
+        let bang = chars[i] == '!' && chars.get(i + 1) == Some(&'[');
+        let bracket_start = if bang { i + 1 } else { i };
+        if chars.get(bracket_start) != Some(&'[') {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let mut j = bracket_start + 1;
+        let mut closed = false;
+        while j < n {
+            if chars[j] == ']' {
+                closed = true;
+                break;
+            }
+            j += 1;
+        }
+
+        if !closed {
+            // Unmatched '[' (optionally preceded by '!'): preserve every
+            // remaining byte of the line verbatim rather than dropping it.
+            out.extend(&chars[i..]);
+            break;
+        }
+
+        if chars.get(j + 1) != Some(&'(') {
+            // "[text]" (or "![text]") with no "(url)" target immediately
+            // after — not a link at all. Preserve the brackets (and any
+            // leading '!') verbatim.
+            out.extend(&chars[i..=j]);
+            i = j + 1;
+            continue;
+        }
+
+        let mut k = j + 2;
+        let mut target_closed = false;
+        while k < n {
+            if chars[k] == ')' {
+                target_closed = true;
+                break;
+            }
+            k += 1;
+        }
+
+        if !target_closed {
+            // Unterminated "(url" — the closing ')' never appears on this
+            // line (e.g. a long URL wrapped mid-target). Preserve
+            // everything from the opening bracket onward verbatim instead
+            // of silently dropping the rest of the line, which is what an
+            // unbounded "consume until ')' or EOL" scan used to do.
+            out.extend(&chars[i..]);
+            break;
+        }
+
+        // A real link/image: keep the visible text, drop the "(url)".
+        out.extend(&chars[bracket_start + 1..j]);
+        i = k + 1;
+    }
+    out
+}
+
+/// Strips a paired run of `delim` (`'*'` or `'_'`) that plausibly delimits
+/// emphasis, leaving the enclosed text untouched; an unpaired or
+/// non-delimiting run of the same character is left exactly as-is. A run
+/// "can open" only if it is not followed by whitespace, and "can close"
+/// only if it is not preceded by whitespace — an isolated marker surrounded
+/// by spaces on both sides (`2 * 3`) or with nothing to pair against
+/// (`a*b`, alone) is therefore never touched.
+///
+/// `intraword_forbidden` additionally applies Markdown's underscore-specific
+/// rule: an underscore run flanked by an alphanumeric character on its inner
+/// side can neither open nor close, so `_` never fires inside an identifier
+/// like `snake_case`, `my_function_name`, or a `_`-bearing URL/path segment.
+/// This restriction does not apply to `*`, matching the existing
+/// `a*b`-stays-literal behavior above (which falls out of the plain flanking
+/// rule, not an intraword one) and the already-covered `**bold**` case.
+fn strip_delimiter_pairs(text: &str, delim: char, intraword_forbidden: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_word = |c: char| c.is_alphanumeric();
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if chars[i] == delim {
+            let start = i;
+            while i < n && chars[i] == delim {
+                i += 1;
+            }
+            runs.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut remove = vec![false; runs.len()];
+    let mut open_idx: Option<usize> = None;
+    for (idx, &(start, end)) in runs.iter().enumerate() {
+        let prev = if start > 0 {
+            Some(chars[start - 1])
+        } else {
+            None
+        };
+        let next = chars.get(end).copied();
+        let mut can_open = next.is_some_and(|c| !c.is_whitespace());
+        let mut can_close = prev.is_some_and(|c| !c.is_whitespace());
+        if intraword_forbidden {
+            if prev.is_some_and(is_word) {
+                can_open = false;
+            }
+            if next.is_some_and(is_word) {
+                can_close = false;
+            }
+        }
+
+        if let Some(open) = open_idx
+            && can_close
+        {
+            remove[open] = true;
+            remove[idx] = true;
+            open_idx = None;
+            continue;
+        }
+        if can_open {
+            open_idx = Some(idx);
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (idx, &(start, end)) in runs.iter().enumerate() {
+        if remove[idx] {
+            out.extend(&chars[last..start]);
+            last = end;
+        }
+    }
+    out.extend(&chars[last..]);
+    out
 }
 
 pub fn trusted_projection_patch_from_model_json(
@@ -2505,6 +2944,7 @@ mod tests {
                 body: body.to_string(),
                 tags: Vec::new(),
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 1.0,
             provenance: ProjectionProvenance {
@@ -3439,5 +3879,623 @@ mod tests {
         let note: crate::projections::MaterializedNote =
             serde_json::from_str(&legacy_note_json).expect("pre-contract note deserializes");
         assert!(note.evidence.is_none());
+    }
+
+    // ----- audio-graph-a6b5 W1: `heading_level` contract field ------------
+
+    /// Backward-compat, per the `pre_contract_projection_patch_fixture_still_deserializes`
+    /// precedent just above: a `ProjectionPatch` JSON fixture written before
+    /// W1 (no `heading_level` key at all on its `upsert_note` operation)
+    /// still deserializes, with `heading_level: None` — never confused with
+    /// a class-satisfying "level 2" default.
+    #[test]
+    fn pre_w1_projection_patch_fixture_without_heading_level_still_deserializes() {
+        let pre_w1_patch_json = serde_json::json!({
+            "sequence": 1,
+            "kind": "notes",
+            "llm_request_id": "req-pre-w1",
+            "basis": {
+                "span_revisions": [],
+                "diarization_span_revisions": [],
+                "transcript_hash": "fnv1a64:0000000000000000"
+            },
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:pre-w1",
+                "title": "Pre-W1 note",
+                "body": "Written before audio-graph-a6b5 W1.",
+                "tags": [],
+                "evidence": {
+                    "claim_class": "verified_quote",
+                    "span_id": "span-1",
+                    "quote": "written before",
+                    "note": null
+                }
+            }],
+            "confidence": 0.5,
+            "provenance": {
+                "provider": "llm.api",
+                "model": "legacy-model",
+                "prompt_id": "pre-w1-v1"
+            },
+            "created_at_ms": 1_000
+        })
+        .to_string();
+
+        let patch: ProjectionPatch = serde_json::from_str(&pre_w1_patch_json)
+            .expect("pre-W1 patch (no heading_level key) deserializes");
+        assert!(matches!(
+            patch.operations.first(),
+            Some(ProjectionOperation::UpsertNote {
+                heading_level: None,
+                ..
+            })
+        ));
+
+        // Re-serializing must not resurrect the field: `skip_serializing_if`
+        // keeps a `None` invisible, so a session that never saw W1 stays
+        // byte-shape-identical on the wire, not just equal-after-parse.
+        let round_tripped = serde_json::to_string(&patch).expect("re-serialize");
+        assert!(
+            !round_tripped.contains("heading_level"),
+            "a None heading_level must not appear on the wire: {round_tripped}"
+        );
+    }
+
+    /// Forward-compat, the general property the whole W1 contract rests on
+    /// (design-b §0): `ProjectionOperation` carries no
+    /// `#[serde(deny_unknown_fields)]`, so a record carrying a field NEITHER
+    /// this build's `upsert_note` NOR its `heading_level` addition knows
+    /// about (simulating some future additive field landing after W1) still
+    /// deserializes today, exactly like `heading_level` itself would have
+    /// deserialized against a pre-W1 build. Losing this property silently
+    /// would make the NEXT additive field a strict-reader break instead of a
+    /// degrade.
+    #[test]
+    fn upsert_note_json_with_unrecognized_future_field_still_deserializes() {
+        let json_with_unknown_field = serde_json::json!({
+            "type": "upsert_note",
+            "id": "note:future",
+            "title": "Future note",
+            "body": "From a build newer than this one.",
+            "tags": [],
+            "evidence": {
+                "claim_class": "grounded_inference",
+                "span_id": null,
+                "quote": null,
+                "note": null
+            },
+            "heading_level": 3,
+            "some_field_this_build_has_never_heard_of": {"nested": ["anything"]}
+        })
+        .to_string();
+
+        let operation: ProjectionOperation = serde_json::from_str(&json_with_unknown_field)
+            .expect("an operation with an unrecognized extra field must still deserialize");
+        assert!(matches!(
+            operation,
+            ProjectionOperation::UpsertNote {
+                heading_level: Some(3),
+                ..
+            }
+        ));
+    }
+
+    /// design-b §1.2/§1.8, corrected: W1 is a DARK ship on BOTH model-facing
+    /// schemas, not just the hand-authored strict one. `heading_level` is a
+    /// real serde field on `ProjectionOperation::UpsertNote` (so fresh-ingest
+    /// and replay both carry it), but `schemars` derives the non-strict draft
+    /// schema straight from that same Rust type — so without
+    /// `hide_heading_level_from_draft_schema` post-processing it out, the
+    /// draft schema would advertise `heading_level` (plus the field's entire
+    /// internal doc comment as the property's `description`) on every
+    /// non-strict/vLLM/mistral.rs route, contradicting the "no prompt/schema
+    /// surface change" premise this ticket is supposed to hold to and
+    /// creating exactly the silent regression design-b §1.8 item 2 names:
+    /// the prompt would tell a model a field exists that the strict schema
+    /// simultaneously forbids. This test pins BOTH schemas dark and pins the
+    /// stronger, model-facing-observable property that actually matters: the
+    /// rendered prompt messages contain no trace of `heading_level` at all,
+    /// so ADR-0025 §2d's byte-stable cached prefix is untouched by this
+    /// ticket. W2 flipping either schema is a deliberate, reviewed edit to
+    /// THIS test, not a silent one.
+    #[test]
+    fn heading_level_is_dark_on_both_draft_and_strict_schemas_and_absent_from_prompt() {
+        let draft_schema = projection_patch_draft_json_schema().expect("draft schema builds");
+        let draft_upsert_note = draft_schema["$defs"]["ProjectionOperation"]["oneOf"]
+            .as_array()
+            .expect("draft schema enumerates operation variants")
+            .iter()
+            .find(|variant| {
+                variant["properties"]["type"]["enum"][0] == "upsert_note"
+                    || variant["properties"]["type"]["const"] == "upsert_note"
+            })
+            .expect("draft schema offers upsert_note");
+        assert!(
+            draft_upsert_note["properties"]
+                .get("heading_level")
+                .is_none(),
+            "W1 ships dark: the schemars-derived draft schema must NOT advertise \
+             heading_level yet — it is pasted verbatim into every projection system \
+             prompt and sent as the vLLM/mistral.rs decoding grammar, so advertising \
+             it here IS a prompt/schema surface change (that is W2's ticket), got: \
+             {draft_upsert_note}"
+        );
+        assert!(
+            !draft_schema.to_string().contains("heading_level"),
+            "heading_level must not appear ANYWHERE in the draft schema (including \
+             nested under a different variant or as a stray description fragment)"
+        );
+
+        let strict_schema = projection_patch_strict_json_schema(&ProjectionKind::Notes);
+        let strict_upsert_note = strict_schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .expect("strict schema enumerates operation variants")
+            .iter()
+            .find(|variant| variant["properties"]["type"]["enum"][0] == "upsert_note")
+            .expect("strict schema offers upsert_note");
+        assert!(
+            strict_upsert_note["properties"]
+                .get("heading_level")
+                .is_none(),
+            "W1 ships dark: the strict schema must NOT advertise heading_level yet \
+             (that is W2's prompt/schema-exposure ticket), got: {strict_upsert_note}"
+        );
+
+        // The stronger, end-to-end assertion: the ACTUAL rendered system
+        // prompt (what a model on any route receives) never mentions the
+        // field, byte-stable prefix included.
+        let mut ledger = TranscriptLedger::new("session-heading-level-dark");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+        let messages = projection_patch_prompt_messages(&job, &ledger, Some(&empty_notes()))
+            .expect("prompt messages build");
+        for message in &messages {
+            assert!(
+                !message.content.contains("heading_level"),
+                "heading_level leaked into a projection prompt message ({}): {}",
+                message.role,
+                message.content
+            );
+        }
+    }
+
+    /// design-b §1.4/§1.2: an out-of-range `heading_level` is a cosmetic
+    /// defect, never a reason to refuse real content — the ingest
+    /// normalizer clamps into `2..=4` rather than failing the whole patch.
+    /// `None` (no structure asserted) must pass through untouched: clamping
+    /// is not a license to invent a depth for an operation that asserted
+    /// none at all.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_clamps_heading_level_into_2_to_4() {
+        fn upsert_note_with_heading(heading_level: Option<u8>) -> ProjectionOperation {
+            ProjectionOperation::UpsertNote {
+                id: "note:clamp".to_string(),
+                title: "Clamp fixture".to_string(),
+                body: "plain body".to_string(),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level,
+            }
+        }
+
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![
+                upsert_note_with_heading(Some(0)),
+                upsert_note_with_heading(Some(1)),
+                upsert_note_with_heading(Some(2)),
+                upsert_note_with_heading(Some(3)),
+                upsert_note_with_heading(Some(4)),
+                upsert_note_with_heading(Some(99)),
+                upsert_note_with_heading(Some(u8::MAX)),
+                upsert_note_with_heading(None),
+            ],
+            confidence: None,
+        };
+
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let heading_levels: Vec<Option<u8>> = draft
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                ProjectionOperation::UpsertNote { heading_level, .. } => *heading_level,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            heading_levels,
+            vec![
+                Some(2), // 0 clamps up to the floor
+                Some(2), // 1 clamps up to the floor
+                Some(2), // already in range
+                Some(3), // already in range
+                Some(4), // already in range
+                Some(4), // 99 clamps down to the ceiling
+                Some(4), // u8::MAX clamps down to the ceiling
+                None,    // no structure asserted — never fabricated into a depth
+            ]
+        );
+    }
+
+    /// design-b §1.3's validated body grammar: bullet markers normalize to
+    /// `-`, indentation snaps to the two-level 0/2/4-space scale, a leading
+    /// heading marker is stripped (headings live in `title`, never `body`),
+    /// and inline emphasis/link/image/code-fence markup collapses to its
+    /// plain text — with the link/image URL discarded, never the visible
+    /// text.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_rewrites_body_grammar_markers() {
+        let raw_body_lines = [
+            "* top bullet",
+            "+ also a bullet",
+            "  * nested one level",
+            "# Stray heading marker",
+            "**bold** and _italic_ and `code`",
+            "[click here](https://evil.example/track)",
+            "![alt text](https://evil.example/pixel.png)",
+            "```rust",
+            "fn normalize() {}",
+            "```",
+        ];
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:grammar".to_string(),
+                title: "Grammar fixture".to_string(),
+                body: raw_body_lines.join("\n"),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: Some(2),
+            }],
+            confidence: None,
+        };
+
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let body = match draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        // `split('\n')`, not `.lines()`, so a fence line that normalizes to
+        // empty (the last one here) still shows up as its own element
+        // instead of being absorbed into "no trailing newline" ambiguity —
+        // the normalizer maps 10 input lines to 10 output lines 1:1.
+        let lines: Vec<&str> = body.split('\n').collect();
+        assert_eq!(
+            lines,
+            vec![
+                "- top bullet",
+                "- also a bullet",
+                "  - nested one level",
+                "Stray heading marker",
+                "bold and italic and code",
+                "click here",
+                "alt text",
+                "rust",
+                "fn normalize() {}",
+                "",
+            ],
+            "normalized body did not match the expected grammar, got: {body:?}"
+        );
+    }
+
+    /// design-b §1.3/§1.4: this grammar is XSS-safe because the FRONTEND
+    /// never opens an HTML path (React text nodes only) — this normalizer's
+    /// job is narrowing the markup vocabulary, never sanitizing or dropping
+    /// content. A line this normalizer recognizes no markup in (a raw
+    /// `<script>` tag; an arbitrarily long line) must survive completely
+    /// unchanged: not stripped, not escaped, not truncated, and — the
+    /// ADR-0045 property every clamp-not-refuse claim in this ticket rests
+    /// on — never dropped, regardless of how hostile or how large it is.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_never_drops_hostile_or_huge_lines() {
+        let huge_line = "x".repeat(50_000);
+        let hostile_body = format!(
+            "<script>alert(document.cookie)</script>\n{huge_line}\n\
+             <img src=x onerror=alert(1)>"
+        );
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:hostile".to_string(),
+                title: "Hostile fixture".to_string(),
+                body: hostile_body.clone(),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
+            }],
+            confidence: None,
+        };
+
+        let original_line_count = hostile_body.lines().count();
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let body = match draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            body.lines().count(),
+            original_line_count,
+            "no line may be dropped by the normalizer, got: {body:?}"
+        );
+        assert!(
+            body.contains("<script>alert(document.cookie)</script>"),
+            "a script tag is not markup this grammar recognizes — it must survive \
+             byte-for-byte as inert plain text, got: {body:?}"
+        );
+        assert!(
+            body.contains(&huge_line),
+            "a huge line must never be truncated"
+        );
+        assert!(
+            body.contains("<img src=x onerror=alert(1)>"),
+            "an inline event-handler attribute is likewise inert plain text here, \
+             got: {body:?}"
+        );
+    }
+
+    /// `*`, `_`, and `` ` `` are constant in this app's own domain (meeting
+    /// notes about software): identifiers, math, and file paths. Only a
+    /// PAIRED, plausibly-delimiting run may be stripped — an isolated or
+    /// intraword occurrence of these bytes is content, not markup, and must
+    /// survive normalization byte-for-byte.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_preserves_incidental_marker_characters() {
+        let raw_body_lines = [
+            "call my_function_name with snake_case",
+            "src-tauri/src/projection_llm.rs",
+            "2 * 3 = 6 and a*b",
+            "the __init__ dunder is a real Python identifier",
+        ];
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:incidental-markers".to_string(),
+                title: "Incidental markers fixture".to_string(),
+                body: raw_body_lines.join("\n"),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
+            }],
+            confidence: None,
+        };
+
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let body = match draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        let lines: Vec<&str> = body.split('\n').collect();
+        assert_eq!(
+            lines,
+            vec![
+                "call my_function_name with snake_case",
+                "src-tauri/src/projection_llm.rs",
+                "2 * 3 = 6 and a*b",
+                // `__init__` is left to the same fate a real Markdown
+                // renderer gives it (both leading and trailing `__` sit at a
+                // word boundary on the outer side, exactly like `_italic_`
+                // above — there is no local, structural way to tell a
+                // dunder identifier from deliberate bold apart without a
+                // vocabulary-specific heuristic, which is out of scope for
+                // this formatting-grammar normalizer).
+                "the init dunder is a real Python identifier",
+            ],
+            "an incidental/intraword marker must not be treated as emphasis, got: {body:?}"
+        );
+    }
+
+    /// design-b §1.3: a markdown link whose `(url` target never finds its
+    /// closing `)` on the line (e.g. a long URL wrapped across a line break)
+    /// must not silently drop the rest of the line — only the recognized
+    /// `[text](url)` shape may be rewritten; anything that does not fully
+    /// resolve to that shape is preserved verbatim, mirroring the existing
+    /// unmatched-`[` fallback.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_preserves_unterminated_link_target() {
+        let raw_body = "[see notes](incomplete url then MORE TEXT";
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:unterminated-link".to_string(),
+                title: "Unterminated link fixture".to_string(),
+                body: raw_body.to_string(),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
+            }],
+            confidence: None,
+        };
+
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let body = match draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            body, raw_body,
+            "an unterminated link target must preserve the entire line, not silently \
+             drop everything after '(': got {body:?}"
+        );
+    }
+
+    /// A tab-indented bullet used to fall through to the paragraph branch
+    /// (only ASCII space was ever counted as indent), so the `* `/`- ` prefix
+    /// was left in place for `strip_doc_body_markup` to eat as an emphasis
+    /// run — the bullet lost its marker AND its semantics. A leading tab now
+    /// counts as indentation (weighted like two spaces) before bullet
+    /// detection runs.
+    #[test]
+    fn normalize_projection_patch_draft_doc_structure_keeps_tab_indented_bullet_marker() {
+        let raw_body = "\t* tab-indented bullet";
+        let mut draft = ProjectionPatchDraft {
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:tab-bullet".to_string(),
+                title: "Tab bullet fixture".to_string(),
+                body: raw_body.to_string(),
+                tags: Vec::new(),
+                evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
+            }],
+            confidence: None,
+        };
+
+        normalize_projection_patch_draft_doc_structure(&mut draft);
+
+        let body = match draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            body, "  - tab-indented bullet",
+            "a tab-indented bullet must keep its bullet marker, got: {body:?}"
+        );
+    }
+
+    /// `require_non_empty` (called by `validate_projection_patch_draft`
+    /// BEFORE normalization) only ever sees the model's raw string — it
+    /// cannot see that `normalize_doc_body` is about to reduce an all-markup
+    /// body to nothing. Without a post-normalization re-check, a
+    /// content-free note (raw body `` "```" `` or `"#"`, a bare code-fence
+    /// delimiter or heading marker with nothing else on the line) would sail
+    /// past the non-empty guarantee and land in the canonical log.
+    ///
+    /// A bare `"**"` or `` "`" `` (no enclosed text to strip, just one
+    /// isolated delimiter run) is deliberately NOT in this list:
+    /// [`strip_delimiter_pairs`]/[`strip_code_spans`] only remove a marker
+    /// that pairs with a LATER marker of the same kind — an unpaired run has
+    /// nothing to strip, so it is preserved as literal, non-empty text
+    /// instead of vanishing. That is the fix for the "every `*`/`_`/`` ` ``
+    /// deleted unconditionally" corruption bug, not a gap in this guarantee.
+    #[test]
+    fn parse_projection_patch_draft_rejects_a_body_that_normalizes_to_empty() {
+        let fixture_event = event("span-1", 1, "Alice met Bob.");
+        let basis: BTreeMap<&str, &TranscriptEvent> =
+            [("span-1", &fixture_event)].into_iter().collect();
+
+        for all_markup_body in ["```", "#"] {
+            let raw = serde_json::json!({
+                "operations": [{
+                    "type": "upsert_note",
+                    "id": "note:all-markup",
+                    "title": "All-markup fixture",
+                    "body": all_markup_body,
+                    "tags": [],
+                    "evidence": {
+                        "claim_class": "grounded_inference",
+                        "span_id": "span-1",
+                        "quote": null,
+                        "note": null
+                    }
+                }]
+            })
+            .to_string();
+
+            let result = parse_projection_patch_draft(&raw, &ProjectionKind::Notes, &basis);
+            assert!(
+                matches!(
+                    result,
+                    Err(ProjectionPatchDraftError::EmptyOperationField { field: "body", .. })
+                ),
+                "a body that normalizes to empty ({all_markup_body:?}) must be rejected \
+                 post-normalization, got: {result:?}"
+            );
+        }
+    }
+
+    /// THE fresh-ingest-vs-replay seam, pinned explicitly (ADR-0045 / the
+    /// e700 precedent design-b §1.4 cites): a hostile/unnormalized body
+    /// already sitting in an OLD accepted `projection_patches` log — the
+    /// exact shape a session recorded before this normalizer existed — must
+    /// replay UNTOUCHED. Deserializing a `ProjectionPatch` directly (what
+    /// replay does) never calls `normalize_projection_patch_draft_doc_structure`;
+    /// only `parse_projection_patch_draft` (the fresh-ingest path a freshly
+    /// generated model draft goes through) does. Rewriting a historical
+    /// operation's `body` at replay time would make replay depend on
+    /// whichever normalization rules are in force today instead of the rules
+    /// in force when the patch was accepted — exactly what ADR-0045 forbids.
+    #[test]
+    fn hostile_body_in_an_old_accepted_log_replays_untouched_never_normalized() {
+        let raw_hostile_body = "* unnormalized bullet\n<script>alert(1)</script>\n#stray heading";
+        let old_accepted_patch_json = serde_json::json!({
+            "sequence": 1,
+            "kind": "notes",
+            "llm_request_id": "req-old-hostile",
+            "basis": {
+                "span_revisions": [],
+                "diarization_span_revisions": [],
+                "transcript_hash": "fnv1a64:0000000000000000"
+            },
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:old-hostile",
+                "title": "Old accepted note",
+                "body": raw_hostile_body,
+                "tags": [],
+                "evidence": {
+                    "claim_class": "grounded_inference",
+                    "span_id": "span-1",
+                    "quote": null,
+                    "note": null
+                }
+            }],
+            "confidence": 0.5,
+            "provenance": {
+                "provider": "llm.api",
+                "model": "old-model",
+                "prompt_id": "old-v1"
+            },
+            "created_at_ms": 1_000
+        })
+        .to_string();
+
+        // Replay's actual path: a straight `ProjectionPatch` deserialize,
+        // never through `parse_projection_patch_draft`.
+        let replayed_patch: ProjectionPatch = serde_json::from_str(&old_accepted_patch_json)
+            .expect("old accepted patch deserializes for replay");
+        let replayed_body = match replayed_patch.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            replayed_body, raw_hostile_body,
+            "replay must never rewrite a historical body — the log content is the \
+             source of truth, got: {replayed_body:?}"
+        );
+
+        // Contrast: the SAME raw operations JSON, if it arrived TODAY through
+        // the REAL fresh-ingest production seam (`parse_projection_patch_draft`,
+        // not a direct call to the normalizer), WOULD be rewritten — proving
+        // the seam is actually wired up, not just that the normalizer function
+        // does something when called directly.
+        let fixture_event = event("span-1", 1, "Alice met Bob.");
+        let basis: BTreeMap<&str, &TranscriptEvent> =
+            [("span-1", &fixture_event)].into_iter().collect();
+        let raw_operations_only = serde_json::json!({ "operations": old_accepted_patch_json_operations(&old_accepted_patch_json) })
+            .to_string();
+        let fresh_draft =
+            parse_projection_patch_draft(&raw_operations_only, &ProjectionKind::Notes, &basis)
+                .expect("fresh-ingest draft parses");
+        let fresh_body = match fresh_draft.operations.first() {
+            Some(ProjectionOperation::UpsertNote { body, .. }) => body.clone(),
+            _ => unreachable!(),
+        };
+        assert_ne!(
+            fresh_body, replayed_body,
+            "the fresh-ingest seam must actually rewrite this input, or this test would \
+             not be distinguishing fresh-ingest from replay at all"
+        );
+        assert!(fresh_body.starts_with("- unnormalized bullet\n"));
+    }
+
+    /// Pulls `operations` back out of the JSON built above so the SAME
+    /// operation payload is reused for both the replay-path deserialize and
+    /// the fresh-ingest-path `parse_projection_patch_draft` call, rather than
+    /// hand-duplicating the fixture and risking the two drifting apart.
+    fn old_accepted_patch_json_operations(patch_json: &str) -> serde_json::Value {
+        let parsed: serde_json::Value = serde_json::from_str(patch_json).unwrap();
+        parsed["operations"].clone()
     }
 }

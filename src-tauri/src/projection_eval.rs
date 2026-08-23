@@ -865,6 +865,7 @@ mod tests {
                 body: format!("{} span(s)", job.basis.span_revisions.len()),
                 tags: vec!["offline".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             ProjectionKind::Graph => vec![ProjectionOperation::UpsertGraphNode {
                 id: "topic:offline-replay".to_string(),
@@ -1527,6 +1528,7 @@ mod tests {
                 body: "cites the provisional speaker span".to_string(),
                 tags: Vec::new(),
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.9,
             provenance: default_fixture_provenance(),

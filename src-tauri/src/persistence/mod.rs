@@ -3223,6 +3223,7 @@ mod shutdown_tests {
                 body: "Persist projection patches.".into(),
                 tags: vec!["decision".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
@@ -3652,6 +3653,7 @@ mod local_memory_repository_tests {
                 body: "Persist the memory repository boundary.".into(),
                 tags: vec!["architecture".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
@@ -3774,6 +3776,7 @@ mod local_memory_repository_tests {
                     body: "Alice owns the launch plan.".into(),
                     tags: vec!["launch".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-b".into(),
@@ -3781,6 +3784,7 @@ mod local_memory_repository_tests {
                     body: "This should be removed by a later diff.".into(),
                     tags: vec!["temporary".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
             ],
             3_000,
@@ -3796,6 +3800,7 @@ mod local_memory_repository_tests {
                     body: "Alice owns the revised launch plan.".into(),
                     tags: vec!["launch".into(), "revised".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-c".into(),
@@ -3803,6 +3808,7 @@ mod local_memory_repository_tests {
                     body: "Confirm launch readiness next week.".into(),
                     tags: vec!["follow-up".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
                 ProjectionOperation::DeleteNote {
                     id: "note-b".into(),
@@ -4477,6 +4483,7 @@ mod local_memory_repository_tests {
                     .into(),
                 tags: vec!["persistence".into(), "projection".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             3_000,
         );
@@ -4524,6 +4531,7 @@ mod local_memory_repository_tests {
                             .into(),
                     tags: vec!["persistence".into(), "projection".into(), "replay".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
                 ProjectionOperation::UpsertNote {
                     id: "note-restore-risk".into(),
@@ -4531,6 +4539,7 @@ mod local_memory_repository_tests {
                     body: "load_session state isolation still needs command-level coverage.".into(),
                     tags: vec!["follow-up".into()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
             ],
             5_000,
@@ -4652,6 +4661,7 @@ mod local_memory_repository_tests {
                 body: "This patch was based on a superseded transcript revision.".into(),
                 tags: vec!["stale".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             3_000,
         );
@@ -4665,6 +4675,7 @@ mod local_memory_repository_tests {
                 body: "This patch uses the corrected transcript revision.".into(),
                 tags: vec!["current".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             4_000,
         );

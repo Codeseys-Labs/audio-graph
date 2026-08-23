@@ -1296,6 +1296,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 body: _,
                 tags,
                 evidence,
+                heading_level,
             } => f
                 .debug_struct("UpsertNote")
                 .field("id", id)
@@ -1303,6 +1304,7 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 .field("body", &REDACTED_DEBUG_VALUE)
                 .field("tags", tags)
                 .field("evidence", &DebugEvidenceAnchor(evidence))
+                .field("heading_level", heading_level)
                 .finish(),
             ProjectionOperation::DeleteNote { id } => {
                 f.debug_struct("DeleteNote").field("id", id).finish()
@@ -1483,6 +1485,41 @@ pub enum ProjectionOperation {
         /// admitted.
         #[serde(default)]
         evidence: crate::claim_evidence::EvidenceAnchor,
+        /// Document heading depth for `title` (audio-graph-a6b5 W1), clamped
+        /// to `2..=4` by [`normalize_projection_patch_draft_doc_structure`]
+        /// at fresh ingest (2 = top-level section, 3 = subsection, 4 =
+        /// sub-subsection). `#[serde(default)]` makes this ADDITIVE and
+        /// OPTIONAL: `ProjectionOperation`/`ProjectionPatch` carry no
+        /// `#[serde(deny_unknown_fields)]` (that attribute lives only on the
+        /// model-facing `ProjectionPatchDraft`, and only gates ITS OWN
+        /// top-level keys — it does not reach into a nested operation's
+        /// fields), so an old build's strict canonical reader tolerates this
+        /// key as an unrecognized field rather than failing the whole
+        /// `projection_patches` stream (ADR-0045; see the strict-reader
+        /// pinning test in `commands.rs`).
+        ///
+        /// `None` is NOT a class-satisfying absence and NOT "level 2" — it
+        /// means this operation asserted no document structure at all: a
+        /// pre-living-document session's card op, or a model that omitted
+        /// the field. The frontend's legacy renderer handles `None`; nothing
+        /// on this path ever fabricates a depth into the materialized
+        /// record. Mirrors the posture of `MaterializedNote::evidence`'s
+        /// `Option` doc comment above. This ticket ships the field dark: no
+        /// model-facing prompt or schema surface changes on ANY route. The
+        /// strict OpenRouter schema (`projection_patch_strict_json_schema`)
+        /// deliberately does NOT advertise `heading_level` yet because it is
+        /// hand-authored and simply omits the field. The `schemars`-derived
+        /// draft schema (`projection_patch_draft_json_schema`) IS
+        /// auto-derived from this very type — including this doc comment,
+        /// which schemars would otherwise paste verbatim into the model
+        /// prompt as the field's JSON Schema `description` — so
+        /// `hide_heading_level_from_draft_schema` explicitly strips the
+        /// property (and this comment) back out post-generation. Both
+        /// schemas therefore withhold the field until W2's dedicated
+        /// prompt/schema-exposure ticket, so no route's model can be nudged
+        /// to emit a value with no guidance behind it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heading_level: Option<u8>,
     },
     DeleteNote {
         id: String,
@@ -1587,6 +1624,15 @@ pub struct MaterializedNote {
     /// class-satisfying absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<crate::claim_evidence::AdmittedClaimEvidence>,
+    /// Carried through unchanged from the source `UpsertNote` operation
+    /// (audio-graph-a6b5 W1) — see that variant's doc comment for the full
+    /// contract. `None` on notes materialized before this field existed, or
+    /// from an operation that asserted no structure; never fabricated into
+    /// a default depth by materialization. Full-replace semantics: a later
+    /// `UpsertNote` for the same id overwrites this field exactly like every
+    /// other field on the record (there is no incremental merge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading_level: Option<u8>,
 }
 
 impl fmt::Debug for MaterializedNote {
@@ -1596,6 +1642,7 @@ impl fmt::Debug for MaterializedNote {
             .field("title", &REDACTED_DEBUG_VALUE)
             .field("body", &REDACTED_DEBUG_VALUE)
             .field("tags", &self.tags)
+            .field("heading_level", &self.heading_level)
             .field("updated_by_sequence", &self.updated_by_sequence)
             .field("updated_at_ms", &self.updated_at_ms)
             .field("basis", &self.basis)
@@ -1670,7 +1717,17 @@ impl MaterializedNotes {
                     body,
                     tags,
                     evidence,
-                } => next.upsert_note(id, title, body, tags, evidence, evidence_basis, patch),
+                    heading_level,
+                } => next.upsert_note(
+                    id,
+                    title,
+                    body,
+                    tags,
+                    *heading_level,
+                    evidence,
+                    evidence_basis,
+                    patch,
+                ),
                 // InvalidateNote is applied identically to DeleteNote today:
                 // `MaterializedNote` carries no `valid_until_ms` the way
                 // `MaterializedGraphNode`/`Edge` do, so there is no
@@ -1715,6 +1772,7 @@ impl MaterializedNotes {
         title: &str,
         body: &str,
         tags: &[String],
+        heading_level: Option<u8>,
         evidence: &crate::claim_evidence::EvidenceAnchor,
         evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
         patch: &ProjectionPatch,
@@ -1724,6 +1782,7 @@ impl MaterializedNotes {
             title: title.to_string(),
             body: body.to_string(),
             tags: tags.to_vec(),
+            heading_level,
             updated_by_sequence: patch.sequence,
             updated_at_ms: patch.created_at_ms,
             basis: patch.basis.clone(),
@@ -4167,6 +4226,7 @@ mod tests {
                 body: "Ship the event-sourced projection model.".to_string(),
                 tags: vec!["decision".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.86,
             provenance: ProjectionProvenance {
@@ -4223,6 +4283,7 @@ mod tests {
                     body: "SENSITIVE NOTE BODY".to_string(),
                     tags: vec!["decision".to_string()],
                     evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
                 },
                 ProjectionOperation::UpsertGraphNode {
                     id: "node-1".to_string(),
@@ -4429,6 +4490,7 @@ mod tests {
                 body: body.to_string(),
                 tags: vec!["decision".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.86,
             provenance: ProjectionProvenance {
@@ -4443,6 +4505,27 @@ mod tests {
             apply_latency_ms: None,
             created_at_ms: 1_700_000_000_100 + sequence,
         }
+    }
+
+    /// [`notes_patch`] with an explicit `heading_level` (audio-graph-a6b5 W1
+    /// fixtures) — the un-suffixed helper stays `heading_level: None` so its
+    /// ~30 existing call sites keep testing the pre-W1 shape unchanged.
+    fn notes_patch_with_heading_level(
+        sequence: u64,
+        id: &str,
+        title: &str,
+        body: &str,
+        heading_level: Option<u8>,
+    ) -> ProjectionPatch {
+        let mut patch = notes_patch(sequence, id, title, body);
+        if let Some(ProjectionOperation::UpsertNote {
+            heading_level: op_heading_level,
+            ..
+        }) = patch.operations.first_mut()
+        {
+            *op_heading_level = heading_level;
+        }
+        patch
     }
 
     fn graph_patch(sequence: u64, operations: Vec<ProjectionOperation>) -> ProjectionPatch {
@@ -4553,6 +4636,233 @@ mod tests {
         assert_eq!(notes.last_sequence, 5);
         assert_eq!(notes.notes.len(), 1);
         assert_eq!(notes.notes[0].id, "note-2");
+    }
+
+    // ----- audio-graph-a6b5 W1: `heading_level` contract field ------------
+
+    /// Field round-trip through the FULL patch -> materialize -> persist ->
+    /// reload cycle: an `UpsertNote` operation carrying `heading_level`
+    /// materializes onto `MaterializedNote`, survives a JSON persist+reload
+    /// (simulating the on-disk materialized-notes snapshot) unchanged, and a
+    /// later full-replace `UpsertNote` for the SAME id with `heading_level:
+    /// None` wipes it — full-replace semantics, unchanged by this field.
+    #[test]
+    fn heading_level_round_trips_through_patch_materialize_persist_reload_cycle() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(
+                &notes_patch_with_heading_level(
+                    1,
+                    "note-1",
+                    "Decision",
+                    "Ship the event-sourced projection model.",
+                    Some(3),
+                ),
+                None,
+            )
+            .expect("insert patch with heading_level");
+
+        assert_eq!(
+            notes.notes.first().and_then(|note| note.heading_level),
+            Some(3)
+        );
+
+        // Persist: serialize the whole materialized-notes snapshot exactly
+        // like the on-disk artifact would.
+        let persisted_json = serde_json::to_string(&notes).expect("persist materialized notes");
+        assert!(
+            persisted_json.contains("\"heading_level\":3"),
+            "a Some(heading_level) must actually reach the persisted JSON, got: {persisted_json}"
+        );
+
+        // Reload: deserialize the persisted artifact back.
+        let reloaded: MaterializedNotes =
+            serde_json::from_str(&persisted_json).expect("reload materialized notes");
+        assert_eq!(
+            reloaded.notes.first().and_then(|note| note.heading_level),
+            Some(3),
+            "heading_level must survive a full persist/reload cycle unchanged"
+        );
+
+        // Full-replace: a later UpsertNote for the SAME id with no
+        // heading_level wipes the field exactly like it wipes every other
+        // field — there is no incremental/partial merge.
+        let mut notes = reloaded;
+        notes
+            .apply_patch(
+                &notes_patch(2, "note-1", "Decision", "Ship materialized notes."),
+                None,
+            )
+            .expect("full-replace upsert");
+        assert_eq!(
+            notes.notes.first().and_then(|note| note.heading_level),
+            None,
+            "a later full-replace UpsertNote with no heading_level must wipe the prior value"
+        );
+    }
+
+    /// Replay fixture: a pre-W1 `projection_patches` log (no `heading_level`
+    /// anywhere, arbitrary body text — no normalization assumed) replays to
+    /// a BYTE-IDENTICAL `MaterializedNotes` before and after W1 — checked at
+    /// the serde level (the persisted JSON shape), not just at the Rust
+    /// value level, since `skip_serializing_if` is exactly what keeps a
+    /// `None` field from resurrecting on the wire.
+    #[test]
+    fn pre_w1_notes_log_replays_byte_identical_materialized_notes() {
+        let pre_w1_log = [
+            notes_patch(
+                1,
+                "note-1",
+                "Decision",
+                "Ship the event-sourced projection model.",
+            ),
+            notes_patch(2, "note-2", "Follow-up", "Keep stable note ids."),
+            notes_patch(
+                3,
+                "note-1",
+                "Decision",
+                "Ship the event-sourced projection model, v2.",
+            ),
+        ];
+
+        let replayed =
+            MaterializedProjectionState::replay_accepted_patches("session-pre-w1", pre_w1_log)
+                .expect("pre-W1 notes log replays");
+
+        assert_eq!(replayed.notes.notes.len(), 2);
+        for note in &replayed.notes.notes {
+            assert_eq!(
+                note.heading_level, None,
+                "a pre-W1 log must never materialize a fabricated heading_level"
+            );
+        }
+
+        let persisted = serde_json::to_string(&replayed.notes).expect("serialize replayed notes");
+        assert!(
+            !persisted.contains("heading_level"),
+            "a pre-W1 replay's persisted JSON must be byte-identical to what pre-W1 code \
+             would have written — no heading_level key may appear anywhere: {persisted}"
+        );
+    }
+
+    /// Replay fixture: a MIXED log — some `upsert_note` operations from
+    /// before W1 (no `heading_level`), interleaved with post-W1 operations
+    /// that DO carry `heading_level` — replays without error, and each
+    /// note's final materialized `heading_level` matches whichever operation
+    /// last touched it (full-replace, not merge).
+    #[test]
+    fn mixed_old_and_new_style_notes_log_replays_without_error() {
+        let mixed_log = [
+            // Pre-W1 style: no heading_level.
+            notes_patch(
+                1,
+                "note-1",
+                "Decision",
+                "Ship the event-sourced projection model.",
+            ),
+            // Post-W1 style: a genuinely new section with heading_level.
+            notes_patch_with_heading_level(
+                2,
+                "note-2",
+                "Follow-up",
+                "Keep stable note ids.",
+                Some(2),
+            ),
+            // Post-W1 style: refines the PRE-W1 note, now asserting structure.
+            notes_patch_with_heading_level(
+                3,
+                "note-1",
+                "Decision",
+                "Ship materialized notes.",
+                Some(3),
+            ),
+        ];
+
+        let replayed =
+            MaterializedProjectionState::replay_accepted_patches("session-mixed", mixed_log)
+                .expect("mixed old/new-style notes log replays without error");
+
+        assert_eq!(replayed.notes.notes.len(), 2);
+        let note_1 = replayed
+            .notes
+            .notes
+            .iter()
+            .find(|note| note.id == "note-1")
+            .expect("note-1 present");
+        let note_2 = replayed
+            .notes
+            .notes
+            .iter()
+            .find(|note| note.id == "note-2")
+            .expect("note-2 present");
+        assert_eq!(
+            note_1.heading_level,
+            Some(3),
+            "note-1's LATEST operation set heading_level — full-replace, not merge"
+        );
+        assert_eq!(note_2.heading_level, Some(2));
+    }
+
+    /// THE load-bearing replay-vs-materialization seam, pinned at the ONLY
+    /// layer that can actually catch a regression here (ADR-0045): unlike
+    /// `hostile_body_in_an_old_accepted_log_replays_untouched_never_normalized`
+    /// in `projection_llm.rs` (which only proves `serde_json::from_str`
+    /// doesn't rewrite a body — vacuously true, since serde can never call a
+    /// normalizer), this test drives the SAME hostile body plus an
+    /// out-of-range `heading_level` through the REAL reachable replay path,
+    /// `MaterializedProjectionState::replay_accepted_patches` ->
+    /// `apply_replayed_patch` -> `MaterializedNotes::apply_patch` ->
+    /// `upsert_note`, and asserts the MATERIALIZED note comes out
+    /// byte-identical to the log: body untouched (no bullet-marker rewrite,
+    /// no heading-marker strip) and `heading_level` unclamped. A mutation
+    /// that calls `projection_llm::normalize_doc_body` or clamps
+    /// `heading_level` inside `upsert_note` — i.e. re-derives materialized
+    /// state using TODAY's normalization rules instead of the rules in force
+    /// when the patch was accepted — fails this test even though every other
+    /// W1 replay fixture (plain-text bodies, in-range heading levels) stays
+    /// green under that exact mutation.
+    #[test]
+    fn hostile_body_and_out_of_range_heading_level_replay_materialized_untouched_never_normalized()
+    {
+        // Same fixture text `projection_llm.rs`'s
+        // `hostile_body_in_an_old_accepted_log_replays_untouched_never_normalized`
+        // already uses (fixture-text reuse constraint) — carries a `*`
+        // bullet marker, a raw `<script>` tag, and a stray `#` heading
+        // marker, all of which `normalize_doc_body` WOULD rewrite if it ever
+        // ran on this path.
+        let hostile_body = "* unnormalized bullet\n<script>alert(1)</script>\n#stray heading";
+        let old_accepted_log = [notes_patch_with_heading_level(
+            1,
+            "note:old-hostile",
+            "Old accepted note",
+            hostile_body,
+            Some(99), // out of the normalizer's 2..=4 clamp range
+        )];
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches(
+            "session-old-hostile",
+            old_accepted_log,
+        )
+        .expect("old accepted hostile log replays");
+
+        let note = replayed
+            .notes
+            .notes
+            .first()
+            .expect("note:old-hostile materialized");
+        assert_eq!(
+            note.body, hostile_body,
+            "replay must never rewrite a historical body at materialization time — \
+             the log content is the source of truth, got: {:?}",
+            note.body
+        );
+        assert_eq!(
+            note.heading_level,
+            Some(99),
+            "replay must never clamp a historical heading_level — an out-of-range \
+             value in the log stays out-of-range when materialized, got: {:?}",
+            note.heading_level
+        );
     }
 
     #[test]
@@ -5260,6 +5570,7 @@ mod tests {
                 body: "Wrong operation.".to_string(),
                 tags: Vec::new(),
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
         );
         assert_eq!(
@@ -5504,6 +5815,7 @@ mod tests {
                 quote: None,
                 note: None,
             },
+            heading_level: None,
         }];
 
         // Live path.
@@ -5590,6 +5902,7 @@ mod tests {
                 quote: None,
                 note: None,
             },
+            heading_level: None,
         }];
 
         let mut state = MaterializedProjectionState::new("session-1");

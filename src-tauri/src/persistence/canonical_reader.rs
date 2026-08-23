@@ -301,6 +301,7 @@ mod tests {
                 body: "Strict reader fixture".into(),
                 tags: vec!["test".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.9,
             provenance: ProjectionProvenance {

@@ -1455,6 +1455,7 @@ mod rotation_tests {
                 body: body.into(),
                 tags: vec!["decision".into()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {

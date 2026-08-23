@@ -3875,6 +3875,11 @@ fn approved_agent_projection_patch(
                 body: proposal.body.clone(),
                 tags: vec!["live-assist".to_string(), "approved".to_string()],
                 evidence: evidence.clone(),
+                // Trusted-code-authored, not model-authored: asserts no
+                // document structure (audio-graph-a6b5 W1 ships dark; a
+                // provenance-class distinction for user/agent-authored
+                // structure is an ADR-0037 question, out of scope here).
+                heading_level: None,
             }],
             "live-assist-note-approval",
         ),
@@ -12217,6 +12222,7 @@ mod tests {
                 body: note_body.to_string(),
                 tags: vec!["private".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
@@ -12332,6 +12338,7 @@ mod tests {
             title: "Stale title".to_string(),
             body: "Stale materialized note should not survive replay repair.".to_string(),
             tags: vec!["stale".to_string()],
+            heading_level: None,
             updated_by_sequence: 0,
             updated_at_ms: 1,
             basis,
@@ -12402,6 +12409,7 @@ mod tests {
                 title: "Leaked title".to_string(),
                 body: "Active-session note must remain isolated from Review load.".to_string(),
                 tags: vec!["leak".to_string()],
+                heading_level: None,
                 updated_by_sequence: 99,
                 updated_at_ms: 99,
                 basis: basis.clone(),

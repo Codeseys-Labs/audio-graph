@@ -9070,6 +9070,7 @@ mod tests_status {
                 ),
                 tags: vec!["test".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             ProjectionKind::Graph => vec![ProjectionOperation::UpsertGraphNode {
                 id: format!("node-{}", job.basis.transcript_hash),
@@ -12749,6 +12750,7 @@ mod tests_status {
                             body: "Applied concurrently, mid-dispatch.".to_string(),
                             tags: vec![],
                             evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                            heading_level: None,
                         }],
                         confidence: 1.0,
                         provenance: ProjectionProvenance {

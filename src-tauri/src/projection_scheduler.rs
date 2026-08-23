@@ -3243,6 +3243,7 @@ mod tests {
                 body: "Fixture body for derive_coverage_heads tests.".to_string(),
                 tags: vec!["fixture".to_string()],
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                heading_level: None,
             }],
             ProjectionKind::Graph => {
                 vec![crate::projections::ProjectionOperation::UpsertGraphNode {
@@ -3653,6 +3654,7 @@ mod tests {
                         body: text.clone(),
                         tags: vec!["synth".to_string()],
                         evidence,
+                        heading_level: None,
                     }]
                 }
                 ProjectionKind::Graph => {
