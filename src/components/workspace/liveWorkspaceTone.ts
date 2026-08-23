@@ -1,9 +1,13 @@
 /**
- * `liveWorkspaceTone` — the recency-chip tone module (ticket W6, synthesis
- * audio-graph-a6b5 §2 "The recency chip, resolved"). Extends the T2 tone
- * law (`settings/readinessTone.ts`) to the two live-workspace tiles that
- * make a freshness claim: the document tile (notes lane) and the graph
- * tile (graph lane).
+ * `liveWorkspaceTone` — the workspace tone-law module (ticket W6, synthesis
+ * audio-graph-a6b5 §2 "The recency chip, resolved"; ticket W8 extended it to
+ * a third surface, §8's "S3"). Extends the T2 tone law
+ * (`settings/readinessTone.ts`) to the live-workspace tiles that make an
+ * OBSERVED-shaped claim: the document tile (notes-lane freshness), the
+ * graph tile (graph-lane freshness), and — as of W8 — the agent tile's
+ * proposal status chip (an "approved" outcome claim, not a freshness claim,
+ * but the SAME law: an unevidenced claim demotes to neutral). See
+ * `agentOutcomeChipTone` below for the third wrapper.
  *
  * PHASE-1 HONESTY (L3 law, design-a §0/§8): this app has NO observation of
  * either projection lane's health yet — only an inference from event
@@ -51,7 +55,9 @@
  * directions (it reads LESS fresh than reality, never more) so it ships as
  * a disclosed limitation rather than blocking on that cross-provider audit.
  */
-import type { BadgeTone } from "../settings/badgeTone";
+
+import type { LiveAssistCardStatus } from "../../types";
+import { agentProposalStatusTone, type BadgeTone } from "../settings/badgeTone";
 import { readinessChipTone } from "../settings/readinessTone";
 
 /** Every projection lane this tone law currently covers. `ProjectionKind`
@@ -310,4 +316,66 @@ export function laneRecencyChipTone(
     turnsBehind: input.turnsBehind,
     lastAppliedAtMs: input.lastAppliedAtMs,
   };
+}
+
+/** The agent chip's post-law axis — `"approved"` is remapped to the law's
+ * `"ready"` sentinel before `readinessChipTone` ever sees it (mirroring
+ * `LaneRecencyStatus`'s own convention above); `"pending"`/`"dismissed"`
+ * pass through unchanged since neither is the OBSERVED-eligible claim the
+ * law gates. */
+export type AgentChipAxisStatus = "ready" | "pending" | "dismissed";
+
+export interface AgentOutcomeChipInput {
+  /** The live-assist card's raw status. */
+  status: LiveAssistCardStatus;
+  /** Whether this card carries a recorded `AgentActionResult` outcome
+   * (`card.outcome != null`). `false` for a null/undefined outcome — an
+   * `"approved"` card with no outcome is NOT evidence of success
+   * (design-a §8/S3: "an `approved` with a null/failed outcome must NOT
+   * claim success"). Only consulted when `status === "approved"`. */
+  hasOutcome: boolean;
+}
+
+export interface AgentOutcomeChipResult {
+  tone: BadgeTone;
+  /** The post-law axis status. Callers key their COPY off THIS field, never
+   * off the raw `status` input — `"unchecked"` is what an unevidenced
+   * `"approved"` demotes to, and the law "gates the claim, not just its
+   * color" (readinessTone.ts): the rendered label must ALSO stop saying
+   * "Approved" when this is `"unchecked"`. */
+  effectiveStatus: AgentChipAxisStatus | "unchecked";
+}
+
+/**
+ * The agent tile's status-chip tone-law wrapper (design-a §8's S3,
+ * synthesis §"Agent tile": "approved-without-outcome demotes to neutral").
+ * `statusClass()` (deleted from `AgentProposalsPanel.tsx`, ticket W8) is
+ * replaced by this + `.ag-chip[data-tone]` + `agentProposalStatusTone`
+ * (badgeTone.ts) for the concrete color, mirroring exactly how
+ * `laneRecencyChipTone` above composes with `readinessChipTone`.
+ *
+ * `active: true` always — unlike the lane-recency chips (Axis 3 gates on
+ * "is anyone actively probing THIS provider"), a proposal's own status is
+ * always a claim about a specific card, not about whether some OTHER thing
+ * is in use, so Axis 3's non-active short-circuit never applies here and
+ * this wrapper always renders a chip.
+ */
+export function agentOutcomeChipTone(
+  input: AgentOutcomeChipInput,
+): AgentOutcomeChipResult {
+  const axisStatus: AgentChipAxisStatus =
+    input.status === "approved" ? "ready" : input.status;
+  const axis = readinessChipTone<AgentChipAxisStatus>(
+    {
+      status: axisStatus,
+      active: true,
+      // Only the "ready" arm of readinessAxisTone ever consults
+      // `stale`/`automaticProbeAvailable` — an unevidenced approval IS
+      // exactly that: a "ready" this app cannot verify actually happened.
+      stale: axisStatus === "ready" && !input.hasOutcome,
+      automaticProbeAvailable: true,
+    },
+    agentProposalStatusTone,
+  );
+  return { tone: axis.tone, effectiveStatus: axis.effectiveStatus };
 }

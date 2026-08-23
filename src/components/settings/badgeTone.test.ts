@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentProposalStatusTone,
   modeReadinessTone,
   readinessTone,
   selectabilityTone,
@@ -43,5 +44,16 @@ describe("badge tone helpers (closed-variant fallback, D3 open-set bug fix)", ()
     expect(selectabilityTone("planned")).toBe("warning");
     expect(selectabilityTone("error")).toBe("danger");
     expect(selectabilityTone("???")).toBe("neutral");
+  });
+
+  it("maps agent-proposal chip axis statuses (ticket W8) — 'ready' is the ONLY success arm; unknown falls back to neutral", () => {
+    expect(agentProposalStatusTone("ready")).toBe("success");
+    expect(agentProposalStatusTone("pending")).toBe("accent");
+    expect(agentProposalStatusTone("dismissed")).toBe("neutral");
+    expect(agentProposalStatusTone("unchecked")).toBe("neutral");
+    // Unlike the other three closed arms, this one is genuinely reachable:
+    // `status` is typed `string` (matching this file's D3 open-set
+    // convention), so an unrecognized value must fall back to neutral too.
+    expect(agentProposalStatusTone("some_future_axis_status")).toBe("neutral");
   });
 });

@@ -1220,7 +1220,6 @@
   },
   "agent": {
     "title": "Agente",
-    "label": "Propostas do agente",
     "clear": "Limpar",
     "working": "Trabalhando",
     "kindGraph": "Grafo",
@@ -1230,7 +1229,18 @@
     "askAi": "Perguntar à IA",
     "dismiss": "Dispensar",
     "applying": "Aplicando",
-    "addToGraph": "Adicionar ao grafo"
+    "addToGraph": "Adicionar ao grafo",
+    "statusApproved": "Aprovada",
+    "statusDismissed": "Dispensada",
+    "statusPending": "Pendente",
+    "statusUnverified": "Não verificada",
+    "outcome": "Resultado",
+    "projectionPatch": "Patch de projeção",
+    "queueTitle": "Precisa de você",
+    "feedTitle": "Atividade recente",
+    "feedEmpty": "Ainda sem atividade",
+    "idleTitle": "Ainda sem sugestões",
+    "idleBody": "O agente vai sugerir notas e atualizações do grafo conforme a conversa continua."
   },
   "projectionDiagnostics": {
     "title": "Diagnósticos de projeção",

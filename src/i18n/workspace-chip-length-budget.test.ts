@@ -56,6 +56,15 @@ interface ChipCase {
 const CHIP_CASES: readonly ChipCase[] = [
   { key: "document.recency.asOf", values: { time: TIME_WORST_CASE } },
   { key: "document.recency.behind", values: { count: TURNS_WORST_CASE } },
+  // Ticket W8: the agent tile's status chip (`AgentStatusChip`,
+  // `AgentProposalsPanel.tsx`), routed through `agentOutcomeChipTone`
+  // (`liveWorkspaceTone.ts`). None of these four interpolate, but they
+  // still belong in this file rather than only in `locale-parity.test.ts` —
+  // this is the file that actually measures the RENDERED chip width.
+  { key: "agent.statusApproved", values: {} },
+  { key: "agent.statusDismissed", values: {} },
+  { key: "agent.statusPending", values: {} },
+  { key: "agent.statusUnverified", values: {} },
 ] as const;
 
 const LOCALES: Record<string, Record<string, unknown>> = {

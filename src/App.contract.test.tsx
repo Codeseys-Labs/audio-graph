@@ -94,6 +94,11 @@ vi.mock("./components/ProjectionRuntimeStatusPanel", () => ({
 }));
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
+  // Ticket W8: the tile's Clear action moved out of the panel body into
+  // `WorkspaceTile`'s `headerSlot` (`App.tsx`) — the mock must export it too,
+  // or mounting the agent tile throws "no such export" under this file's
+  // module-level `vi.mock`.
+  AgentTileHeaderActions: () => null,
 }));
 
 const mockedInvoke = vi.mocked(invoke);

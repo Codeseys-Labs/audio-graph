@@ -1220,7 +1220,6 @@
   },
   "agent": {
     "title": "Agent",
-    "label": "Agent proposals",
     "clear": "Clear",
     "working": "Working",
     "kindGraph": "Graph",
@@ -1230,7 +1229,18 @@
     "askAi": "Ask AI",
     "dismiss": "Dismiss",
     "applying": "Applying",
-    "addToGraph": "Add to graph"
+    "addToGraph": "Add to graph",
+    "statusApproved": "Approved",
+    "statusDismissed": "Dismissed",
+    "statusPending": "Pending",
+    "statusUnverified": "Unverified",
+    "outcome": "Outcome",
+    "projectionPatch": "Projection patch",
+    "queueTitle": "Needs you",
+    "feedTitle": "Recent activity",
+    "feedEmpty": "No activity yet",
+    "idleTitle": "No suggestions yet",
+    "idleBody": "The agent will suggest notes and graph updates as the conversation continues."
   },
   "projectionDiagnostics": {
     "title": "Projection diagnostics",

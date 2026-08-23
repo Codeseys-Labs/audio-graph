@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentOutcomeChipTone,
   LANE_RECENCY_WARNING_TURNS_THRESHOLD,
   type LaneRecencySourcePatch,
   type LaneRecencySourceRevision,
@@ -314,5 +315,57 @@ describe("selectLaneRecency — the one shared computation, two call sites", () 
     const notes = selectLaneRecency("notes", patches, revisions);
     expect(notes.lastAppliedAtMs).toBe(500);
     expect(notes.turnsBehind).toBe(1); // only the post-500 revision counts
+  });
+});
+
+describe("agentOutcomeChipTone — the law's third surface (ticket W8, design-a §8 S3)", () => {
+  it("an approved card WITH a recorded outcome renders success, effectiveStatus 'ready'", () => {
+    const result = agentOutcomeChipTone({
+      status: "approved",
+      hasOutcome: true,
+    });
+    expect(result.tone).toBe("success");
+    expect(result.effectiveStatus).toBe("ready");
+  });
+
+  it("an approved card with NO recorded outcome (null/undefined) does NOT render success — demotes to 'unchecked'/neutral (the pinned regression case)", () => {
+    const result = agentOutcomeChipTone({
+      status: "approved",
+      hasOutcome: false,
+    });
+    expect(result.tone).not.toBe("success");
+    expect(result.tone).toBe("neutral");
+    expect(result.effectiveStatus).toBe("unchecked");
+  });
+
+  it("pending renders accent (a planned action, not yet an observed success/failure), effectiveStatus passes through unchanged", () => {
+    const result = agentOutcomeChipTone({
+      status: "pending",
+      hasOutcome: false,
+    });
+    expect(result.tone).toBe("accent");
+    expect(result.effectiveStatus).toBe("pending");
+  });
+
+  it("dismissed renders neutral, effectiveStatus passes through unchanged", () => {
+    const result = agentOutcomeChipTone({
+      status: "dismissed",
+      hasOutcome: false,
+    });
+    expect(result.tone).toBe("neutral");
+    expect(result.effectiveStatus).toBe("dismissed");
+  });
+
+  it("dismissed ignores hasOutcome entirely — only the 'approved'->'ready' axis arm ever consults it", () => {
+    const withOutcome = agentOutcomeChipTone({
+      status: "dismissed",
+      hasOutcome: true,
+    });
+    const withoutOutcome = agentOutcomeChipTone({
+      status: "dismissed",
+      hasOutcome: false,
+    });
+    expect(withOutcome.tone).toBe(withoutOutcome.tone);
+    expect(withOutcome.effectiveStatus).toBe(withoutOutcome.effectiveStatus);
   });
 });

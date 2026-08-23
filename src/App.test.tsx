@@ -64,6 +64,11 @@ vi.mock("./components/PipelineStatusBar", () => ({
 }));
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
+  // Ticket W8: the tile's Clear action moved out of the panel body into
+  // `WorkspaceTile`'s `headerSlot` (`App.tsx`) — the mock must export it too,
+  // or mounting the agent tile throws "no such export" under this file's
+  // module-level `vi.mock`.
+  AgentTileHeaderActions: () => null,
 }));
 // Ticket W7 (synthesis audio-graph-a6b5): the graph tile's KG strip — its
 // rendered content reads store slices unrelated to the hand-off flow, same
@@ -1340,5 +1345,21 @@ describe("App — KG strip canvas row-swap attribute wiring (ticket W7, synthesi
 
     const capturePanel = document.getElementById("workspace-panel-capture");
     expect(capturePanel).not.toHaveAttribute("data-graph-mode");
+  });
+});
+
+// GREP-PIN (review finding: this file's `AgentProposalsPanel` mock stubs
+// `AgentTileHeaderActions` to `() => null` — same as `LiveDocumentHeaderActions`
+// (W5 precedent) — so a regression that deletes the real headerSlot wiring in
+// App.tsx would render identically here and pass every render-based
+// assertion in this suite. A source-text pin is the cheap way to keep that
+// wiring load-bearing without rearchitecting the header-actions mocking
+// convention this file shares with `App.contract.test.tsx` /
+// `App.shellLayout.test.tsx`.)
+describe("agent tile headerSlot wiring — grep-pin (ticket W8 review finding)", () => {
+  it("App.tsx wires AgentTileHeaderActions into the agent WorkspaceTile's headerSlot", async () => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync("src/App.tsx", "utf8");
+    expect(source).toMatch(/headerSlot=\{<AgentTileHeaderActions\s*\/>\}/);
   });
 });

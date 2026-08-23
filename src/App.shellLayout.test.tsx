@@ -64,6 +64,7 @@ vi.mock("./components/PipelineStatusBar", () => ({
 }));
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
+  AgentTileHeaderActions: () => null,
 }));
 vi.mock("./components/NowStrip", () => ({
   default: () => <div data-testid="controlbar-stub" />,

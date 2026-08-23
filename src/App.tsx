@@ -67,7 +67,13 @@ import { useTranslation } from "react-i18next";
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
 // this call site's error handling is unchanged (audio-graph-3e71).
 import { safeInvoke as invoke } from "./analytics/safeInvoke";
-import AgentProposalsPanel from "./components/AgentProposalsPanel";
+// Agent tile (ticket W8, synthesis audio-graph-a6b5): the panel's own header
+// (the Clear action) now composes into `WorkspaceTile`'s `headerSlot`
+// instead of duplicating the tile's own named region — same split as W5's
+// `LiveDocumentHeaderActions`/`LiveDocument`.
+import AgentProposalsPanel, {
+  AgentTileHeaderActions,
+} from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import IconButton from "./components/IconButton";
 import LiveTranscript from "./components/LiveTranscript";
@@ -424,11 +430,11 @@ interface ShellRailContentAsideProps {
  * (the bento workspace — see ticket W4 below).
  *
  * Ticket W4 (synthesis audio-graph-a6b5): the live/reviewing branch is now a
- * 4-tile bento grid (`WorkspaceTile` per tile; transcript/agent wrap
- * `LiveTranscript`/`AgentProposalsPanel` unchanged). Ticket W5 replaced the
- * document tile's body: it now hosts `LiveDocument` (a typed-outline
- * projection of `materializedNotes`), not `NotesPanel` — `NotesPanel` the
- * file is untouched and still hosts the Sessions detail's Notes lens
+ * 4-tile bento grid (`WorkspaceTile` per tile; transcript wraps
+ * `LiveTranscript` unchanged). Ticket W5 replaced the document tile's body:
+ * it now hosts `LiveDocument` (a typed-outline projection of
+ * `materializedNotes`), not `NotesPanel` — `NotesPanel` the file is
+ * untouched and still hosts the Sessions detail's Notes lens
  * (`SessionsBrowser.tsx`); only this tile's hosting changed. Ticket W7
  * replaced the graph tile's body: `LiveGraphStrip` (focus/canvas/feed
  * modes) instead of W4's node/edge-count placeholder; the mode switcher
@@ -436,7 +442,12 @@ interface ShellRailContentAsideProps {
  * `data-graph-mode` on this `<main>` for the tier-scoped canvas row-swap.
  * Ticket W6 added `DocRecencyChip`/`GraphRecencyChip` — tone-routed
  * freshness chips — into both tiles' `headerSlot`s, composed alongside
- * (never replacing) W5's copy actions and W7's mode switcher.
+ * (never replacing) W5's copy actions and W7's mode switcher. Ticket W8
+ * modernized the agent tile: `AgentTileHeaderActions` (the Clear action,
+ * `AgentProposalsPanel.tsx`) now composes into the agent tile's own
+ * `headerSlot` instead of `AgentProposalsPanel` rendering a second named
+ * region inside the tile (seed 913d's duplicate-landmark half) — the same
+ * split W5 established for the document tile.
  *
  * R3 (ratified): the agent tile is
  * ALWAYS mounted, even with zero activity — `hasAgentActivity` no longer
@@ -599,11 +610,16 @@ function ShellRailContentAside({
                 onModeChange={setGraphStripMode}
               />
             </WorkspaceTile>
-            {/* R3 (ratified): always mounted, empty-state when idle —
-                `AgentProposalsPanel` itself still renders `null` with zero
-                activity (W8 designs the tile's own empty state); the
-                region/shell here must not disappear regardless. */}
-            <WorkspaceTile id="agent" title={t("agent.title")}>
+            {/* R3 (ratified): always mounted. Ticket W8 gave
+                `AgentProposalsPanel` a real designed idle state (icon +
+                honest copy, no "coming soon") instead of the pre-W8 `null`
+                return — the region/shell here never disappears, and now
+                neither does the body's own explanation of why it's empty. */}
+            <WorkspaceTile
+              id="agent"
+              title={t("agent.title")}
+              headerSlot={<AgentTileHeaderActions />}
+            >
               <AgentProposalsPanel />
             </WorkspaceTile>
             <WorkspaceTile
