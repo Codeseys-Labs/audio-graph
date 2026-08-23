@@ -65,6 +65,11 @@ vi.mock("./components/PipelineStatusBar", () => ({
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
   AgentTileHeaderActions: () => null,
+  // Ticket W9: `App.tsx` also calls `useAgentQueueFilter()` and renders
+  // `AgentQueueFilterToggle` in the agent tile's headerSlot — see
+  // `App.test.tsx`'s identical mock addition for the full rationale.
+  AgentQueueFilterToggle: () => null,
+  useAgentQueueFilter: () => ["signal", () => {}],
 }));
 vi.mock("./components/NowStrip", () => ({
   default: () => <div data-testid="controlbar-stub" />,

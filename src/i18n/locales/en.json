@@ -1242,7 +1242,12 @@
     "feedTitle": "Recent activity",
     "feedEmpty": "No activity yet",
     "idleTitle": "No suggestions yet",
-    "idleBody": "The agent will suggest notes and graph updates as the conversation continues."
+    "idleBody": "The agent will suggest notes and graph updates as the conversation continues.",
+    "filterLabel": "Queue filter",
+    "filterSignal": "Signal",
+    "filterAll": "All",
+    "lowSignal": "Low signal",
+    "duplicateCount": "×{{count}}"
   },
   "projectionDiagnostics": {
     "title": "Projection diagnostics",

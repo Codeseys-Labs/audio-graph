@@ -70,9 +70,15 @@ import { safeInvoke as invoke } from "./analytics/safeInvoke";
 // Agent tile (ticket W8, synthesis audio-graph-a6b5): the panel's own header
 // (the Clear action) now composes into `WorkspaceTile`'s `headerSlot`
 // instead of duplicating the tile's own named region — same split as W5's
-// `LiveDocumentHeaderActions`/`LiveDocument`.
+// `LiveDocumentHeaderActions`/`LiveDocument`. Ticket W9 adds the Signal/All
+// queue-filter toggle into that SAME `headerSlot`, and its lifted
+// `useAgentQueueFilter()` value feeds both the toggle and the panel body —
+// see `ShellRailContentAside`'s call site below for why (mirrors
+// `useGraphStripMode`'s exact lift reason).
 import AgentProposalsPanel, {
+  AgentQueueFilterToggle,
   AgentTileHeaderActions,
+  useAgentQueueFilter,
 } from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import IconButton from "./components/IconButton";
@@ -497,6 +503,12 @@ function ShellRailContentAside({
   // `data-graph-mode` attribute below, so a single call site is the only
   // way those two reads can never disagree.
   const [graphStripMode, setGraphStripMode] = useGraphStripMode();
+  // Ticket W9 (synthesis audio-graph-a6b5, ratified R6): lifted for the
+  // identical reason as `graphStripMode` above — the Signal/All toggle
+  // (rendered in the agent tile's `headerSlot`) and `AgentProposalsPanel`
+  // (the tile's body) must read the SAME filter value, or toggling would
+  // desync the header control from what the body actually renders.
+  const [agentQueueFilter, setAgentQueueFilter] = useAgentQueueFilter();
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
@@ -618,9 +630,20 @@ function ShellRailContentAside({
             <WorkspaceTile
               id="agent"
               title={t("agent.title")}
-              headerSlot={<AgentTileHeaderActions />}
+              headerSlot={
+                // Ticket W9: composes with the Clear action in the SAME
+                // slot, same dual-composition shape as the document/graph
+                // tiles' `headerSlot`s above.
+                <span className="flex items-center gap-(--space-3)">
+                  <AgentQueueFilterToggle
+                    mode={agentQueueFilter}
+                    onModeChange={setAgentQueueFilter}
+                  />
+                  <AgentTileHeaderActions />
+                </span>
+              }
             >
-              <AgentProposalsPanel />
+              <AgentProposalsPanel filter={agentQueueFilter} />
             </WorkspaceTile>
             <WorkspaceTile
               id="transcript"

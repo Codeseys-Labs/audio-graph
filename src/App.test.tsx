@@ -62,14 +62,34 @@ vi.mock("./components/workspace/LiveDocument", () => ({
 vi.mock("./components/PipelineStatusBar", () => ({
   default: () => <div data-testid="pipeline-stub" />,
 }));
-vi.mock("./components/AgentProposalsPanel", () => ({
-  default: () => <div data-testid="agent-stub" />,
-  // Ticket W8: the tile's Clear action moved out of the panel body into
-  // `WorkspaceTile`'s `headerSlot` (`App.tsx`) — the mock must export it too,
-  // or mounting the agent tile throws "no such export" under this file's
-  // module-level `vi.mock`.
-  AgentTileHeaderActions: () => null,
-}));
+// Ticket W9 (review finding: the previous version of this mock stubbed
+// `useAgentQueueFilter`/`AgentQueueFilterToggle` to `["signal", () => {}]`/
+// `() => null`, so NO test in this file could observe whether `App.tsx`
+// actually threads `agentQueueFilter` into `AgentProposalsPanel`'s `filter`
+// prop — severing `filter={agentQueueFilter}` entirely still passed every
+// assertion. `useAgentQueueFilter`/`AgentQueueFilterToggle` are kept REAL
+// via `importActual` instead — the exact `useGraphStripMode` precedent
+// below (same file, same rationale) — while only the panel's rendered BODY
+// (`default`) and `AgentTileHeaderActions` are stubbed. The stub renders
+// the received `filter` prop into a `data-agent-queue-filter` attribute so
+// a test can assert end-to-end that clicking the REAL toggle actually
+// changes what's threaded into the REAL panel body prop.
+vi.mock("./components/AgentProposalsPanel", async () => {
+  const actual = await vi.importActual<
+    typeof import("./components/AgentProposalsPanel")
+  >("./components/AgentProposalsPanel");
+  return {
+    ...actual,
+    default: ({ filter }: { filter?: string } = {}) => (
+      <div data-testid="agent-stub" data-agent-queue-filter={filter} />
+    ),
+    // Ticket W8: the tile's Clear action moved out of the panel body into
+    // `WorkspaceTile`'s `headerSlot` (`App.tsx`) — the mock must export it
+    // too, or mounting the agent tile throws "no such export" under this
+    // file's module-level `vi.mock`.
+    AgentTileHeaderActions: () => null,
+  };
+});
 // Ticket W7 (synthesis audio-graph-a6b5): the graph tile's KG strip — its
 // rendered content reads store slices unrelated to the hand-off flow, same
 // rationale as the other panel stubs above. `useGraphStripMode` is kept
@@ -1356,10 +1376,68 @@ describe("App — KG strip canvas row-swap attribute wiring (ticket W7, synthesi
 // wiring load-bearing without rearchitecting the header-actions mocking
 // convention this file shares with `App.contract.test.tsx` /
 // `App.shellLayout.test.tsx`.)
-describe("agent tile headerSlot wiring — grep-pin (ticket W8 review finding)", () => {
-  it("App.tsx wires AgentTileHeaderActions into the agent WorkspaceTile's headerSlot", async () => {
+describe("agent tile headerSlot wiring — grep-pin (ticket W8 review finding, updated ticket W9)", () => {
+  it("App.tsx wires AgentTileHeaderActions AND the ticket W9 Signal/All toggle into the agent WorkspaceTile's headerSlot, with the real filter value threaded to both", async () => {
     const { readFileSync } = await import("node:fs");
     const source = readFileSync("src/App.tsx", "utf8");
-    expect(source).toMatch(/headerSlot=\{<AgentTileHeaderActions\s*\/>\}/);
+    const agentTileSource = source.slice(source.indexOf('id="agent"'));
+    const headerSlotSource = agentTileSource.slice(
+      0,
+      agentTileSource.indexOf("</WorkspaceTile>"),
+    );
+    expect(headerSlotSource).toMatch(/<AgentTileHeaderActions\s*\/>/);
+    expect(headerSlotSource).toMatch(/<AgentQueueFilterToggle\b/);
+    // Review finding: presence of the elements alone doesn't prove the
+    // lifted filter state is actually threaded to either consumer — a
+    // regression severing `filter={agentQueueFilter}` (or hardcoding
+    // `mode="signal"`) left every other assertion in this file green. This
+    // is intentionally belt-and-suspenders with the real end-to-end test
+    // below (which exercises the real hook via `importActual`), not a
+    // substitute for it.
+    expect(headerSlotSource).toMatch(/mode=\{agentQueueFilter\}/);
+    expect(headerSlotSource).toMatch(/onModeChange=\{setAgentQueueFilter\}/);
+    // `filter={agentQueueFilter}` lives on `<AgentProposalsPanel>`, inside
+    // the tile's children — after the `headerSlot` prop closes — so this
+    // checks the WHOLE agent-tile slice, not just the headerSlot substring.
+    expect(agentTileSource).toMatch(
+      /<AgentProposalsPanel\s+filter=\{agentQueueFilter\}/,
+    );
+  });
+
+  /**
+   * REAL END-TO-END WIRING PROOF (review finding, majors: the previous
+   * mock stubbed `useAgentQueueFilter`/`AgentQueueFilterToggle`, so nothing
+   * in this file could ever observe `App.tsx`'s actual composition —
+   * mirrors this SAME file's `useGraphStripMode` precedent, kept real for
+   * the identical reason). `useAgentQueueFilter`/`AgentQueueFilterToggle`
+   * are the REAL implementations here (only the panel BODY is stubbed);
+   * clicking the real toggle must change the `filter` value the real
+   * `AgentProposalsPanel` call site receives. A mutation that severs
+   * `filter={agentQueueFilter}` (stub always sees `undefined`) or that
+   * hardcodes `mode="signal"` (the toggle never flips) fails this test.
+   */
+  it("clicking the real Signal/All toggle changes the filter value threaded into AgentProposalsPanel's real filter prop", async () => {
+    render(<App />);
+    await waitForStartupProbeToSettle();
+
+    const stub = screen.getByTestId("agent-stub");
+    expect(stub).toHaveAttribute("data-agent-queue-filter", "signal");
+
+    const allTab = screen.getByRole("tab", { name: "All" });
+    expect(allTab).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(allTab);
+
+    expect(allTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("agent-stub")).toHaveAttribute(
+      "data-agent-queue-filter",
+      "all",
+    );
+
+    const signalTab = screen.getByRole("tab", { name: "Signal" });
+    fireEvent.click(signalTab);
+    expect(screen.getByTestId("agent-stub")).toHaveAttribute(
+      "data-agent-queue-filter",
+      "signal",
+    );
   });
 });

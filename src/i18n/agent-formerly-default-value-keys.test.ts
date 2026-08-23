@@ -44,6 +44,27 @@ const NEW_W8_KEYS = [
   "agent.idleBody",
 ] as const;
 
+/**
+ * New in W9 (the Signal/All queue-quality toggle). Review finding: three of
+ * these four are INCIDENTALLY covered elsewhere (`filterSignal`/`filterAll`
+ * by `AgentProposalsPanel.test.tsx`'s `getByRole("tab", { name: ... })`
+ * accessible-name assertions, `lowSignal` by its `getByText("Low signal")`
+ * assertion plus the chip-length-budget file) — but `agent.filterLabel`, the
+ * tablist's bare `t("agent.filterLabel")` `aria-label` with no
+ * `defaultValue`, was asserted NOWHERE: deleting it from both catalogs would
+ * silently ship the raw key string as the control's accessible name with
+ * the full gate suite green. `agent.duplicateCount` is listed here too
+ * (interpolated, so it needs its own `count` argument) rather than relying
+ * solely on the chip-length-budget file's coverage, per this file's own
+ * discipline of covering EVERY key a ticket introduces, not just the
+ * ones another file happens to also touch. */
+const NEW_W9_KEYS = [
+  "agent.filterLabel",
+  "agent.filterSignal",
+  "agent.filterAll",
+  "agent.lowSignal",
+] as const;
+
 const LOCALES: Record<"en" | "pt", Record<string, unknown>> = {
   en: en as Record<string, unknown>,
   pt: pt as Record<string, unknown>,
@@ -90,6 +111,31 @@ describe("agent.* keys new in W8 (feed/empty-state copy)", () => {
   }
 });
 
+describe("agent.* keys new in W9 (Signal/All queue-quality toggle)", () => {
+  for (const key of NEW_W9_KEYS) {
+    for (const lng of ["en", "pt"] as const) {
+      it(`${lng}.json resolves "${key}" to a real translation, not the raw key`, () => {
+        const rendered = instance.t(key, { lng });
+        expect(typeof rendered).toBe("string");
+        expect(rendered).not.toBe(key);
+        expect(rendered.length).toBeGreaterThan(0);
+      });
+    }
+  }
+
+  // Interpolated separately (needs a `count` arg to resolve meaningfully) —
+  // same "does it actually resolve" proof, not folded into the plain-key
+  // loop above.
+  for (const lng of ["en", "pt"] as const) {
+    it(`${lng}.json resolves "agent.duplicateCount" to a real translation containing the count, not the raw key`, () => {
+      const rendered = instance.t("agent.duplicateCount", { lng, count: 3 });
+      expect(typeof rendered).toBe("string");
+      expect(rendered).not.toBe("agent.duplicateCount");
+      expect(rendered).toContain("3");
+    });
+  }
+});
+
 describe("regression guard for the test methodology itself", () => {
   it("demonstrates i18next's real missing-key behavior: a key absent from BOTH locales renders as the literal key string", () => {
     const rendered = instance.t("agent.thisKeyDoesNotExistAnywhere", {
@@ -101,7 +147,12 @@ describe("regression guard for the test methodology itself", () => {
   it("every formerly-defaultValue key is present verbatim in BOTH raw locale objects (not just resolvable via fallbackLng)", () => {
     const agentEn = LOCALES.en.agent as Record<string, unknown>;
     const agentPt = LOCALES.pt.agent as Record<string, unknown>;
-    for (const dotted of [...FORMERLY_DEFAULT_VALUE_KEYS, ...NEW_W8_KEYS]) {
+    for (const dotted of [
+      ...FORMERLY_DEFAULT_VALUE_KEYS,
+      ...NEW_W8_KEYS,
+      ...NEW_W9_KEYS,
+      "agent.duplicateCount",
+    ]) {
       const leaf = dotted.split(".")[1];
       expect(agentEn, `en.json agent.${leaf}`).toHaveProperty(leaf);
       expect(agentPt, `pt.json agent.${leaf}`).toHaveProperty(leaf);

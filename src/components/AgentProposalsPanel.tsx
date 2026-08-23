@@ -26,14 +26,179 @@
  * ADR-0013-governed `approve_agent_proposal` write path (4b52 made it
  * timestamp-safe). This ticket only moves markup and tone plumbing around
  * those calls — it never changes what they do or when they fire.
+ *
+ * Ticket W9 (ratified R6) adds the Signal/All queue-quality toggle on top of
+ * that unchanged foundation: `useAgentQueueFilter`/`AgentQueueFilterToggle`
+ * below are this file's second exported pair (mirrors
+ * `LiveGraphStrip.tsx`'s `useGraphStripMode`/`GraphStripModeSwitcher` W7
+ * precedent exactly — same `localStorage`-backed `useState` idiom, same
+ * "lifted once in `App.tsx`, passed down as props" shape, for the identical
+ * reason: the header toggle and this panel's body must never desync, and a
+ * second internal `useState` copy in each would do exactly that). `filter`
+ * defaults to `"signal"` so every pre-W9 render call site (and every
+ * pre-W9 test) keeps compiling and behaving unchanged.
  */
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { AgentProposalEvent, LiveAssistCardRecord } from "../types";
 import Icon from "./Icon";
-import { selectAgentQueue } from "./workspace/agentQueue";
+import { admitToQueue, selectAgentQueue } from "./workspace/agentQueue";
 import { agentOutcomeChipTone } from "./workspace/liveWorkspaceTone";
+
+/** Ticket W9: the persisted Signal/All queue filter. `"signal"` (default,
+ * ratified) applies `admitToQueue`'s fragment-suspect gate; `"all"` shows
+ * every actionable card regardless of classification — filtered entries are
+ * never deleted, only re-admitted (see `agentQueue.ts`'s updated
+ * `admitToQueue` doc comment). */
+export type AgentQueueFilterMode = "signal" | "all";
+
+const AGENT_QUEUE_FILTER_STORAGE_KEY = "ag.agentQueueFilter";
+const AGENT_QUEUE_FILTER_MODES: readonly AgentQueueFilterMode[] = [
+  "signal",
+  "all",
+];
+
+/** The single body region both tabs control — unlike
+ * `GraphStripModeSwitcher`'s three MUTUALLY EXCLUSIVE mounted panels (one
+ * per mode), Signal/All never unmount `AgentProposalsPanel`'s body; both
+ * tabs point `aria-controls` at the SAME region because it is the one DOM
+ * node whose content changes when the selected tab changes — a valid,
+ * well-established `aria-controls` shape for a filter toggle (as opposed to
+ * a view switcher). */
+const AGENT_QUEUE_PANEL_ID = "agent-queue-filter-panel";
+
+/** The real "All" admit predicate — a stable module-level reference (not an
+ * inline arrow) so passing it into `selectAgentQueue` doesn't change
+ * `useMemo`'s dependency identity on every render. */
+const ADMIT_ALL: Parameters<typeof selectAgentQueue>[2] = () => true;
+
+function isAgentQueueFilterMode(
+  value: string | null,
+): value is AgentQueueFilterMode {
+  return (
+    value !== null &&
+    (AGENT_QUEUE_FILTER_MODES as readonly string[]).includes(value)
+  );
+}
+
+function loadAgentQueueFilterMode(): AgentQueueFilterMode {
+  try {
+    const raw = localStorage.getItem(AGENT_QUEUE_FILTER_STORAGE_KEY);
+    return isAgentQueueFilterMode(raw) ? raw : "signal";
+  } catch {
+    return "signal";
+  }
+}
+
+/**
+ * The persisted filter-choice hook — see the module doc for why this is
+ * `localStorage`-backed `useState` (the `processScope`/`useGraphStripMode`
+ * precedent) rather than a store slice, and why it must be called ONCE, up
+ * in `App.tsx`, with the result threaded down as props to both the header
+ * toggle and this panel's body.
+ */
+export function useAgentQueueFilter(): [
+  AgentQueueFilterMode,
+  (mode: AgentQueueFilterMode) => void,
+] {
+  const [mode, setModeState] = useState<AgentQueueFilterMode>(
+    loadAgentQueueFilterMode,
+  );
+  const setMode = (next: AgentQueueFilterMode) => {
+    setModeState(next);
+    try {
+      localStorage.setItem(AGENT_QUEUE_FILTER_STORAGE_KEY, next);
+    } catch {
+      // Persistence failure is non-fatal — the in-memory choice still
+      // applies for the rest of this session, same posture as
+      // `useGraphStripMode`'s setter.
+    }
+  };
+  return [mode, setMode];
+}
+
+/** Header-slot content — the two-way Signal/All toggle (design-a §3.1's
+ * `[Signal|All]`, mounted alongside `AgentTileHeaderActions` in the SAME
+ * `headerSlot` per `App.tsx`'s W6/W7 dual-composition pattern for this tile
+ * head). `role="tablist"`/`role="tab"`/`aria-selected` — the same shape
+ * `AudioSourceSelector.tsx`'s `processScope` toggle and
+ * `LiveGraphStrip.tsx`'s `GraphStripModeSwitcher` both use for an identical
+ * "switch which content this same region shows" control (also sidesteps
+ * `lint/a11y/useSemanticElements`'s `role="group"` -> `<fieldset>`
+ * suggestion, which doesn't fit a toggle that isn't a form). Plain buttons,
+ * not `.ag-chip`s — same reason `GraphStripModeSwitcher` uses plain buttons
+ * (synthesis W7: sidesteps the pt chip-length budget for the control
+ * itself; the marker chip this ticket separately adds to rows IS an
+ * `.ag-chip` and IS budget-checked).
+ *
+ * Implements the FULL WAI-ARIA APG tabs keyboard contract, matching
+ * `GraphStripModeSwitcher` exactly (review finding: an earlier version of
+ * this control copied that switcher's classNames/roles but shipped none of
+ * its roving-`tabIndex`/arrow-key behavior, so it announced itself as
+ * "tab, 1 of 2" to assistive tech while not responding to arrow keys — the
+ * repo's own established contract for this exact tile-header region,
+ * pinned elsewhere for the workspace tablist and the sessions browser) —
+ * roving `tabIndex` (only the selected tab is a Tab stop) plus
+ * ArrowLeft/ArrowRight/Home/End moving both selection and focus together. */
+export function AgentQueueFilterToggle({
+  mode,
+  onModeChange,
+}: {
+  mode: AgentQueueFilterMode;
+  onModeChange: (mode: AgentQueueFilterMode) => void;
+}) {
+  const { t } = useTranslation();
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const NAV = ["ArrowLeft", "ArrowRight", "Home", "End"];
+    if (!NAV.includes(e.key)) return;
+    e.preventDefault();
+    const currentIndex = AGENT_QUEUE_FILTER_MODES.indexOf(mode);
+    const nextIndex =
+      e.key === "Home"
+        ? 0
+        : e.key === "End"
+          ? AGENT_QUEUE_FILTER_MODES.length - 1
+          : e.key === "ArrowLeft"
+            ? (currentIndex - 1 + AGENT_QUEUE_FILTER_MODES.length) %
+              AGENT_QUEUE_FILTER_MODES.length
+            : (currentIndex + 1) % AGENT_QUEUE_FILTER_MODES.length;
+    const next = AGENT_QUEUE_FILTER_MODES[nextIndex];
+    onModeChange(next);
+    const tablist = e.currentTarget.parentElement;
+    const tabs = tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs?.[nextIndex]?.focus();
+  };
+  return (
+    <div
+      role="tablist"
+      aria-label={t("agent.filterLabel")}
+      className="flex items-center gap-(--space-1)"
+    >
+      {AGENT_QUEUE_FILTER_MODES.map((m) => (
+        <button
+          key={m}
+          type="button"
+          role="tab"
+          id={`agent-queue-filter-tab-${m}`}
+          aria-selected={mode === m}
+          aria-controls={AGENT_QUEUE_PANEL_ID}
+          tabIndex={mode === m ? 0 : -1}
+          className={`py-[2px] px-(--space-3) text-xs font-semibold rounded-sm border cursor-pointer whitespace-nowrap ${
+            mode === m
+              ? "bg-bg-elevated text-accent border-accent"
+              : "border-transparent bg-transparent text-text-muted hover:text-text-primary"
+          }`}
+          onClick={() => onModeChange(m)}
+          onKeyDown={handleKeyDown}
+        >
+          {t(m === "signal" ? "agent.filterSignal" : "agent.filterAll")}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function proposalKindKey(kind: AgentProposalEvent["kind"]): string {
   switch (kind) {
@@ -109,18 +274,62 @@ function AgentStatusChip({ card }: { card: LiveAssistCardRecord }) {
 interface AgentQueueRowProps {
   card: LiveAssistCardRecord;
   isApproving: boolean;
+  isFragmentSuspect: boolean;
+  duplicateCount: number;
   onApprove: (proposalId: string) => void;
   onAsk: (proposalId: string) => void;
   onDismiss: (proposalId: string) => void;
 }
 
+/** The W9 "subtle fragment marker" (design-a §3.2): renders on a queue row
+ * ONLY in All mode (a card that Signal mode would have filtered, but is
+ * still shown, still fully actionable) and on a feed row when Signal mode
+ * filtered it there instead. A plain `.ag-chip[data-tone="neutral"]` — this
+ * is a QUALITY flag, not a freshness/status claim, so it deliberately does
+ * NOT route through `agentOutcomeChipTone`/the T2 tone law (that law governs
+ * claims about being current/verified; "low signal" is neither). Reuses the
+ * existing neutral chip styling (`styles.css`) — zero new CSS. */
+function FragmentSuspectMarker() {
+  const { t } = useTranslation();
+  return (
+    <span className="ag-chip" data-tone="neutral">
+      {t("agent.lowSignal")}
+    </span>
+  );
+}
+
+/** design-a §3.2 rule 2's other half: "the original [surviving] row renders
+ * `agent.duplicateCount` — `×{{count}}`". Renders on the SURVIVING row of a
+ * duplicate-collapse group (queue or feed, whichever it landed in) — see
+ * `AgentQueueSelection.duplicateCounts`'s doc for why a duplicate's own
+ * (demoted) row never carries this badge, only the survivor's does. Callers
+ * only mount this for `count > 1`; this component itself doesn't gate on
+ * that so the "when to render at all" decision stays visible at the call
+ * site rather than hidden in this leaf. */
+function DuplicateCountBadge({ count }: { count: number }) {
+  const { t } = useTranslation();
+  return (
+    <span className="ag-chip" data-tone="neutral">
+      {t("agent.duplicateCount", { count })}
+    </span>
+  );
+}
+
 /** A queue row — the exact markup/handlers the pre-W8 panel rendered for an
  * actionable card, unchanged (approve/ask/dismiss per-kind actions). Only
  * ever rendered for `selectAgentQueue`'s `queue` list, i.e. `isActionable`
- * was already `true` at the selector — this component never re-checks it. */
+ * was already `true` at the selector — this component never re-checks it.
+ * Ticket W9: `isFragmentSuspect` is ONLY ever `true` here in All mode (Signal
+ * mode never admits a fragment-suspect card into the queue at all) — see
+ * `FragmentSuspectMarker`'s doc for why this doesn't touch the approve/ask/
+ * dismiss controls below at all (design-a §3.1: "the queue is a priority
+ * filter, never a capability gate" — this ticket does not weaken that for
+ * All mode either). */
 function AgentQueueRow({
   card,
   isApproving,
+  isFragmentSuspect,
+  duplicateCount,
   onApprove,
   onAsk,
   onDismiss,
@@ -133,6 +342,10 @@ function AgentQueueRow({
         <div className="flex min-w-0 flex-wrap items-center gap-(--space-2)">
           <span>{t(proposalKindKey(proposal.kind))}</span>
           <AgentStatusChip card={card} />
+          {isFragmentSuspect ? <FragmentSuspectMarker /> : null}
+          {duplicateCount > 1 ? (
+            <DuplicateCountBadge count={duplicateCount} />
+          ) : null}
         </div>
         <span>{formatConfidence(proposal.confidence)}</span>
       </div>
@@ -200,8 +413,36 @@ function AgentQueueRow({
  * than minting new i18n keys). This keeps the default render a genuine
  * "no content dumps" summary while keeping the review finding's concern
  * satisfied: nothing in the feed is permanently unreachable, it is just
- * collapsed by default. */
-function AgentFeedRow({ card }: { card: LiveAssistCardRecord }) {
+ * collapsed by default.
+ *
+ * Ticket W9: `isFragmentSuspect` is `true` here in Signal mode (the default)
+ * for a card that WOULD be actionable but was filtered — it renders the same
+ * `FragmentSuspectMarker` the queue row does, but this component's own
+ * read-only shape (no approve/ask/dismiss anywhere in this file, for ANY
+ * card) is completely unaffected: adding the marker prop does not, and must
+ * not, add a capability.
+ *
+ * DEVIATION FROM design-a §3.1, NAMED (review finding, ticket item 4/(d)):
+ * that section's feed contract reads "a row's overflow `Popover` still
+ * exposes approve/dismiss, so nothing in the feed is unreachable — the
+ * queue is a priority filter, never a capability gate." This component has
+ * no popover and never has (pre-existing since W8; this ticket only adds
+ * the marker). Before W9, that gap was inert — nothing actionable could
+ * ever land here. As of W9's Signal default, an actionable
+ * `fragment_suspect` card DOES land here routinely, and the ONLY way back
+ * to actionable is the header's Signal/All toggle, not an in-row control —
+ * a narrower guarantee than design-a's, accepted under R6's "recoverable
+ * via All + marker" framing rather than the doc's stronger claim. Recorded
+ * here as a deviation rather than asserted as compliance. */
+function AgentFeedRow({
+  card,
+  isFragmentSuspect,
+  duplicateCount,
+}: {
+  card: LiveAssistCardRecord;
+  isFragmentSuspect: boolean;
+  duplicateCount: number;
+}) {
   const { t } = useTranslation();
   const [bodyExpanded, setBodyExpanded] = useState(false);
   const proposal = card.proposal;
@@ -214,6 +455,10 @@ function AgentFeedRow({ card }: { card: LiveAssistCardRecord }) {
       <div className="flex min-w-0 items-center gap-(--space-2) text-xs text-text-muted">
         <span>{t(proposalKindKey(proposal.kind))}</span>
         <AgentStatusChip card={card} />
+        {isFragmentSuspect ? <FragmentSuspectMarker /> : null}
+        {duplicateCount > 1 ? (
+          <DuplicateCountBadge count={duplicateCount} />
+        ) : null}
       </div>
       <p
         className="m-0 text-sm text-text-secondary truncate"
@@ -290,8 +535,17 @@ export function AgentTileHeaderActions() {
  * nothing to show — not `null` (a `null` body inside an always-mounted tile
  * is an empty room with no explanation) and not "coming soon" (dishonest —
  * there is nothing pending, not something withheld).
+ *
+ * `filter` (ticket W9): optional, defaults to `"signal"` (the ratified
+ * default) so every pre-W9 call site keeps compiling and behaving
+ * identically. The real `App.tsx` call site always passes the lifted
+ * `useAgentQueueFilter()` value explicitly.
  */
-function AgentProposalsPanel() {
+function AgentProposalsPanel({
+  filter = "signal",
+}: {
+  filter?: AgentQueueFilterMode;
+} = {}) {
   const { t } = useTranslation();
   const proposals = useAudioGraphStore((s) => s.agentProposals);
   const liveAssistCards = useAudioGraphStore((s) => s.liveAssistCards);
@@ -305,9 +559,17 @@ function AgentProposalsPanel() {
     (s) => s.dismissAgentProposal,
   );
 
-  const { queue, feed } = useMemo(
-    () => selectAgentQueue(liveAssistCards, proposals),
-    [liveAssistCards, proposals],
+  // Ticket W9: the ONLY thing the toggle changes is which `admit` predicate
+  // `selectAgentQueue` runs — "All" swaps in a stable unconditional
+  // `() => true` (`ADMIT_ALL`), never touching the underlying store data, so
+  // toggling back to "Signal" always reproduces the exact same filtered
+  // view. `admitToQueue` itself (Signal mode) is passed explicitly rather
+  // than relying on `selectAgentQueue`'s default parameter, so this call
+  // site's behavior is legible without cross-referencing that default.
+  const admit = filter === "all" ? ADMIT_ALL : admitToQueue;
+  const { queue, feed, fragmentSuspectIds, duplicateCounts } = useMemo(
+    () => selectAgentQueue(liveAssistCards, proposals, admit),
+    [liveAssistCards, proposals, admit],
   );
   const approving = useMemo(() => new Set(approvingIds), [approvingIds]);
   const isRunning = status?.state === "running";
@@ -315,6 +577,7 @@ function AgentProposalsPanel() {
   if (queue.length === 0 && feed.length === 0 && !isRunning) {
     return (
       <div
+        id={AGENT_QUEUE_PANEL_ID}
         className="flex flex-col items-center justify-center h-full gap-(--space-3) py-(--space-6) px-(--space-4) text-center select-none"
         data-testid="agent-empty"
       >
@@ -335,6 +598,7 @@ function AgentProposalsPanel() {
 
   return (
     <div
+      id={AGENT_QUEUE_PANEL_ID}
       className="h-full overflow-y-auto py-[10px] px-(--space-5)"
       data-testid="agent-body"
     >
@@ -352,6 +616,8 @@ function AgentProposalsPanel() {
                 key={card.proposal.id}
                 card={card}
                 isApproving={approving.has(card.proposal.id)}
+                isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
+                duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
                 onApprove={approveAgentProposal}
                 onAsk={askAgentProposal}
                 onDismiss={dismissAgentProposal}
@@ -367,7 +633,12 @@ function AgentProposalsPanel() {
         ) : (
           <ul className="flex flex-col gap-(--space-2) list-none m-0 p-0">
             {feed.map((card) => (
-              <AgentFeedRow key={card.proposal.id} card={card} />
+              <AgentFeedRow
+                key={card.proposal.id}
+                card={card}
+                isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
+                duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
+              />
             ))}
           </ul>
         )}

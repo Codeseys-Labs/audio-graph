@@ -1242,7 +1242,12 @@
     "feedTitle": "Atividade recente",
     "feedEmpty": "Ainda sem atividade",
     "idleTitle": "Ainda sem sugestões",
-    "idleBody": "O agente vai sugerir notas e atualizações do grafo conforme a conversa continua."
+    "idleBody": "O agente vai sugerir notas e atualizações do grafo conforme a conversa continua.",
+    "filterLabel": "Filtro da fila",
+    "filterSignal": "Sinal",
+    "filterAll": "Todos",
+    "lowSignal": "Sinal baixo",
+    "duplicateCount": "×{{count}}"
   },
   "projectionDiagnostics": {
     "title": "Diagnósticos de projeção",

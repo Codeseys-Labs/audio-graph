@@ -70,6 +70,17 @@ const CHIP_CASES: readonly ChipCase[] = [
   { key: "agent.statusDismissed", values: {} },
   { key: "agent.statusPending", values: {} },
   { key: "agent.statusUnverified", values: {} },
+  // Ticket W9: the fragment-suspect marker chip
+  // (`FragmentSuspectMarker`, `AgentProposalsPanel.tsx`) — an
+  // `.ag-chip[data-tone="neutral"]` rendered on both queue (All mode) and
+  // feed (Signal mode) rows, so it belongs in this file for the same reason
+  // the W8 status chips do.
+  { key: "agent.lowSignal", values: {} },
+  // Ticket W9: the duplicate-count marker chip (`DuplicateCountBadge`,
+  // `AgentProposalsPanel.tsx`) — interpolates `{{count}}`. Worst case is the
+  // store's own `agentProposals` cap (`store/index.ts`'s `.slice(-49)`, 50
+  // max entries), so a single duplicate-collapse group can never exceed 50.
+  { key: "agent.duplicateCount", values: { count: 50 } },
 ] as const;
 
 const LOCALES: Record<string, Record<string, unknown>> = {

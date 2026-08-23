@@ -99,6 +99,10 @@ vi.mock("./components/AgentProposalsPanel", () => ({
   // or mounting the agent tile throws "no such export" under this file's
   // module-level `vi.mock`.
   AgentTileHeaderActions: () => null,
+  // Ticket W9: same reason — `App.tsx` also calls `useAgentQueueFilter()`
+  // and renders `AgentQueueFilterToggle` in the SAME headerSlot.
+  AgentQueueFilterToggle: () => null,
+  useAgentQueueFilter: () => ["signal", () => {}],
 }));
 
 const mockedInvoke = vi.mocked(invoke);
