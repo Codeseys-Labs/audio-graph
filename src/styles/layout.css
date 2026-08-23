@@ -157,6 +157,32 @@
   background: var(--border-color);
 }
 
+/* CANVAS row-swap (ticket W7, synthesis audio-graph-a6b5) — the
+   W4-deferred `[data-graph-mode="canvas"]` override, landing here per the
+   fix agent's exact readout: this override MUST be scoped INSIDE each
+   tier's OWN media query, never left unscoped, because an unscoped
+   `[data-graph-mode="canvas"]` rule has HIGHER specificity than the bare
+   `.workspace-panel--capture` tier rules above/below (one extra attribute
+   selector) and would therefore outrank whichever tier is actually active
+   at ANY viewport width — e.g. a wide-tuned row template silently winning
+   over the standard/compact tier's own rows, or reintroducing a px floor
+   into the compact tier's WCAG-1.4.10-sensitive row axis. Wrapping the
+   WIDE tier's own canvas override in an explicit `@media (width >=
+   1280px)` block (rather than leaving it unscoped just because the base
+   rule above happens to be) makes all three tiers scope identically, so
+   there is exactly one pattern to audit, not two. The graph row grows to
+   `1fr`; the document row keeps design-a §2.3's `min-height: 240px` floor
+   (expressed as the `minmax()` first argument here, same idiom the base
+   rule already uses for the graph row). */
+@media (width >= 1280px) {
+  .workspace-panel--capture[data-graph-mode="canvas"] {
+    grid-template-rows:
+      0px
+      minmax(0, 1fr)
+      minmax(240px, 0.6fr);
+  }
+}
+
 /* design-a §4.3 req 2/3: `grid-area` comes from `[data-tile="…"]` ONLY,
    never an inline style — phase 2's "arrange" rewrites
    `grid-template-areas` on the container above with zero child changes.
@@ -231,6 +257,30 @@
       "transcript graph"
       "transcript document"
       "transcript agent";
+  }
+
+  /* CANVAS row-swap, STANDARD tier (ticket W7) — scoped INSIDE this same
+     `@media` block per the fix agent's readout (see the wide-tier
+     override's comment for why an unscoped rule would be wrong). Derived
+     consistently with the wide tier's fr shares (graph row grows to `1fr`,
+     document row keeps a `0.6fr` share, trailing `auto` agent row this
+     tier alone has is untouched) but, on review, deliberately FLOOR-FREE
+     (`minmax(0, 0.6fr)`, no `240px` px floor unlike the wide tier) — the
+     compact-tier override below carries this same reasoning explicitly;
+     it applies here too, not just there. `.workspace-panel`'s
+     `overflow: hidden` ancestor chain (see the compact-tier comment) is
+     TIER-INDEPENDENT — it is not gated by any media query — so this
+     tier's viewport (1024-1279px) is reachable at ordinary browser zoom
+     exactly the same way the compact tier's is, and a `minmax(240px, …)`
+     floor here would silently clip with no scrollbar to recover it the
+     moment the panel's available height drops below the summed floors,
+     same bug class, same fix. */
+  .workspace-panel--capture[data-graph-mode="canvas"] {
+    grid-template-rows:
+      0px
+      minmax(0, 1fr)
+      minmax(0, 0.6fr)
+      auto;
   }
 
   /* NOW STRIP (seed 88e2, renamed from ControlBar in SHELL-R3 / plan §R3 /
@@ -319,6 +369,26 @@
       "graph"
       "agent"
       "transcript";
+  }
+
+  /* CANVAS row-swap, COMPACT tier (ticket W7) — scoped INSIDE this same
+     `@media` block, same reason as the other two tiers. Derived
+     consistently (swap the document/graph fr shares — 1.2fr/0.5fr becomes
+     0.5fr/1.2fr) rather than left undesigned: design-a specifies wide-tier
+     values only, and leaving compact/standard undefined would be exactly
+     the "landmine" this ticket was told not to leave. Deliberately
+     floor-free (`minmax(0, …fr)`, no `240px` floor unlike the other two
+     tiers): this tier's own base rule is floor-free for the documented
+     WCAG 1.4.10 Reflow reason above (a fixed non-scrolling ancestor chain
+     clips silently below a px floor), and canvas mode must not reintroduce
+     that bug just because it changes which row is bigger. */
+  .workspace-panel--capture[data-graph-mode="canvas"] {
+    grid-template-rows:
+      0px
+      minmax(0, 0.5fr)
+      minmax(0, 1.2fr)
+      minmax(0, 0.6fr)
+      minmax(0, 0.8fr);
   }
 }
 

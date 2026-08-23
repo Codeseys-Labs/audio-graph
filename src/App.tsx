@@ -88,9 +88,6 @@ import ResizeDivider from "./components/ResizeDivider";
 import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
-// Bento workspace (ticket W4, synthesis audio-graph-a6b5): the tile shell
-// + phase-1 graph-tile placeholder content (W7 replaces the latter).
-import GraphTilePlaceholder from "./components/workspace/GraphTilePlaceholder";
 // Living document (ticket W5, synthesis audio-graph-a6b5): replaces
 // `NotesPanel` as the document tile's body. `useLiveDocumentModel()` folds
 // ONCE per render here so `LiveDocumentHeaderActions` (mounted in the
@@ -101,6 +98,16 @@ import {
   LiveDocumentHeaderActions,
   useLiveDocumentModel,
 } from "./components/workspace/LiveDocument";
+// KG strip (ticket W7, synthesis audio-graph-a6b5): replaces W4's
+// `GraphTilePlaceholder` as the graph tile's body. `useGraphStripMode()` is
+// called ONCE here (same reason as `useLiveDocumentModel()` below) because
+// the mode value also drives the grid container's `data-graph-mode`
+// attribute two levels up.
+import {
+  GraphStripModeSwitcher,
+  LiveGraphStrip,
+  useGraphStripMode,
+} from "./components/workspace/LiveGraphStrip";
 import { WorkspaceTile } from "./components/workspace/WorkspaceTile";
 
 // Code-split (ADR-0016 / modernization-audit 2.3): these modals/first-run
@@ -416,12 +423,15 @@ interface ShellRailContentAsideProps {
  *
  * Ticket W4 (synthesis audio-graph-a6b5): the live/reviewing branch is now a
  * 4-tile bento grid (`WorkspaceTile` per tile; transcript/agent wrap
- * `LiveTranscript`/`AgentProposalsPanel` unchanged, graph ships W4's
- * placeholder pending W7). Ticket W5 replaced the document tile's body: it
- * now hosts `LiveDocument` (a typed-outline projection of
- * `materializedNotes`), not `NotesPanel` — `NotesPanel` the file is
- * untouched and still hosts the Sessions detail's Notes lens
- * (`SessionsBrowser.tsx`); only this tile's hosting changed.
+ * `LiveTranscript`/`AgentProposalsPanel` unchanged). Ticket W5 replaced the
+ * document tile's body: it now hosts `LiveDocument` (a typed-outline
+ * projection of `materializedNotes`), not `NotesPanel` — `NotesPanel` the
+ * file is untouched and still hosts the Sessions detail's Notes lens
+ * (`SessionsBrowser.tsx`); only this tile's hosting changed. Ticket W7
+ * replaced the graph tile's body: `LiveGraphStrip` (focus/canvas/feed
+ * modes) instead of W4's node/edge-count placeholder; the mode switcher
+ * lives in the tile's `headerSlot` and the chosen mode also flags
+ * `data-graph-mode` on this `<main>` for the tier-scoped canvas row-swap.
  *
  * R3 (ratified): the agent tile is
  * ALWAYS mounted, even with zero activity — `hasAgentActivity` no longer
@@ -465,6 +475,12 @@ function ShellRailContentAside({
   // folding their own — see that hook's doc comment for why folding twice
   // per render would be wasteful (not incorrect) work.
   const liveDocumentVm = useLiveDocumentModel();
+  // Ticket W7 (synthesis audio-graph-a6b5): lifted for the identical reason
+  // as `liveDocumentVm` above — `graphStripMode` drives BOTH the tile's own
+  // rendering (`LiveGraphStrip`) and the grid container's
+  // `data-graph-mode` attribute below, so a single call site is the only
+  // way those two reads can never disagree.
+  const [graphStripMode, setGraphStripMode] = useGraphStripMode();
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
@@ -527,6 +543,11 @@ function ShellRailContentAside({
             role="tabpanel"
             aria-labelledby="workspace-tab-capture"
             className="workspace-panel workspace-panel--capture"
+            // Ticket W7: drives the tier-scoped `[data-graph-mode="canvas"]`
+            // row-swap (`layout.css`) — present ONLY in canvas mode, absent
+            // (not `"focus"`/`"feed"`) otherwise, so the attribute selector
+            // never accidentally matches a non-canvas mode via string value.
+            data-graph-mode={graphStripMode === "canvas" ? "canvas" : undefined}
           >
             {/* DOM order = the compact single-column stack order (R2 —
                 see layout.css's `(width < 1024px)` rule), NOT the wide
@@ -541,8 +562,20 @@ function ShellRailContentAside({
             >
               <LiveDocument vm={liveDocumentVm} />
             </WorkspaceTile>
-            <WorkspaceTile id="graph" title={t("workspace.tile.graph")}>
-              <GraphTilePlaceholder />
+            <WorkspaceTile
+              id="graph"
+              title={t("workspace.tile.graph")}
+              headerSlot={
+                <GraphStripModeSwitcher
+                  mode={graphStripMode}
+                  onModeChange={setGraphStripMode}
+                />
+              }
+            >
+              <LiveGraphStrip
+                mode={graphStripMode}
+                onModeChange={setGraphStripMode}
+              />
             </WorkspaceTile>
             {/* R3 (ratified): always mounted, empty-state when idle —
                 `AgentProposalsPanel` itself still renders `null` with zero

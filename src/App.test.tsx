@@ -64,12 +64,23 @@ vi.mock("./components/PipelineStatusBar", () => ({
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
 }));
-// Ticket W4 (synthesis audio-graph-a6b5): the graph tile's phase-1
-// placeholder content — reads store slices unrelated to the hand-off flow,
-// same rationale as the other panel stubs above.
-vi.mock("./components/workspace/GraphTilePlaceholder", () => ({
-  default: () => <div data-testid="graph-stub" />,
-}));
+// Ticket W7 (synthesis audio-graph-a6b5): the graph tile's KG strip — its
+// rendered content reads store slices unrelated to the hand-off flow, same
+// rationale as the other panel stubs above. `useGraphStripMode` is kept
+// REAL (via `importActual`), not stubbed: it's a plain `localStorage`-backed
+// hook (the `AudioSourceSelector` `processScope` precedent) with no async
+// I/O, and the canvas row-swap wiring test below needs it to actually read
+// `localStorage`.
+vi.mock("./components/workspace/LiveGraphStrip", async () => {
+  const actual = await vi.importActual<
+    typeof import("./components/workspace/LiveGraphStrip")
+  >("./components/workspace/LiveGraphStrip");
+  return {
+    ...actual,
+    LiveGraphStrip: () => <div data-testid="graph-stub" />,
+    GraphStripModeSwitcher: () => null,
+  };
+});
 // SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip.
 vi.mock("./components/NowStrip", () => ({
   default: () => <div data-testid="controlbar-stub" />,
@@ -1270,5 +1281,63 @@ describe("App — System drawer mount wiring (SHELL-R3, ADR-0046)", () => {
     expect(
       screen.queryByRole("dialog", { name: /system status/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+// Ticket W7 (synthesis audio-graph-a6b5): the W4-deferred canvas row-swap.
+// `useGraphStripMode` is kept real in this file's top-level mock
+// specifically so this reads `localStorage` for real, exercising the exact
+// wiring `App.tsx` ships: the persisted mode choice both renders
+// `LiveGraphStrip` AND flags the grid container's `data-graph-mode`
+// attribute — the fix agent's readout this ticket honors requires the
+// attribute present ONLY for `"canvas"`, never any other mode's string
+// value and never an empty-string placeholder.
+describe("App — KG strip canvas row-swap attribute wiring (ticket W7, synthesis audio-graph-a6b5)", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+    mockedInvoke.mockReset();
+    mockCredentialPresence("openai_api_key");
+    seedStore();
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+  });
+
+  it('sets data-graph-mode="canvas" on the capture container when the persisted graph strip mode is canvas', async () => {
+    localStorage.setItem("ag.graphStripMode", "canvas");
+    render(<App />);
+    await waitForStartupProbeToSettle();
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    const capturePanel = document.getElementById("workspace-panel-capture");
+    expect(capturePanel).toHaveAttribute("data-graph-mode", "canvas");
+  });
+
+  it("omits data-graph-mode entirely for the default (focus) mode — never renders the attribute with a non-canvas value", async () => {
+    render(<App />);
+    await waitForStartupProbeToSettle();
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    const capturePanel = document.getElementById("workspace-panel-capture");
+    expect(capturePanel).not.toHaveAttribute("data-graph-mode");
+  });
+
+  it('omits data-graph-mode entirely for the feed mode too (only "canvas" ever sets it)', async () => {
+    localStorage.setItem("ag.graphStripMode", "feed");
+    render(<App />);
+    await waitForStartupProbeToSettle();
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    const capturePanel = document.getElementById("workspace-panel-capture");
+    expect(capturePanel).not.toHaveAttribute("data-graph-mode");
   });
 });

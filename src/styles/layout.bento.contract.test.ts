@@ -192,3 +192,115 @@ describe("bento workspace grid — CSS source contract (ticket W4)", () => {
     );
   });
 });
+
+describe('canvas row-swap — [data-graph-mode="canvas"] tier scoping (ticket W7, synthesis audio-graph-a6b5)', () => {
+  const CANVAS_SELECTOR = '.workspace-panel--capture[data-graph-mode="canvas"]';
+
+  /** Removes every `@media (...) { ... }` block's FULL SPAN (condition
+   * through matching closing brace, via brace counting — this file's media
+   * blocks are single-level, no nested `@media`) from the source text.
+   * Whatever selector text remains after that is, by construction,
+   * declared OUTSIDE any media query — i.e. unconditionally, at every
+   * viewport width. This is the mutation-provable half of the fix agent's
+   * readout: the canvas override selector must NEVER appear in what this
+   * function returns. */
+  function withoutMediaBlocks(source: string): string {
+    let result = "";
+    let i = 0;
+    while (i < source.length) {
+      const atMedia = source.indexOf("@media", i);
+      if (atMedia === -1) {
+        result += source.slice(i);
+        break;
+      }
+      result += source.slice(i, atMedia);
+      const openBrace = source.indexOf("{", atMedia);
+      expect(
+        openBrace,
+        "expected an opening brace after @media",
+      ).toBeGreaterThan(atMedia);
+      let depth = 1;
+      let j = openBrace + 1;
+      while (depth > 0 && j < source.length) {
+        if (source[j] === "{") depth++;
+        else if (source[j] === "}") depth--;
+        j++;
+      }
+      expect(depth, "unbalanced braces while scanning an @media block").toBe(0);
+      i = j; // skip past the whole @media block, including its closing brace
+    }
+    return result;
+  }
+
+  /** The canvas override rule body nested inside a SPECIFIC `@media`
+   * condition string (e.g. `"@media (width >= 1280px)"`), not just
+   * anywhere in the file — so a wide-tier assertion can't accidentally
+   * pass by matching the compact tier's copy of the same selector.
+   * Bounds the media block's END via brace counting (not by searching for
+   * the next literal "@media" text) — a prose comment inside the SAME
+   * block that happens to mention the word "@media" (this file has
+   * several, describing the sibling tiers) would otherwise be
+   * misidentified as the start of the NEXT block and falsely shrink the
+   * search window. */
+  function canvasRuleBodyWithin(mediaCondition: string): string {
+    const mediaStart = css.indexOf(mediaCondition);
+    expect(
+      mediaStart,
+      `expected to find "${mediaCondition}" in layout.css`,
+    ).toBeGreaterThanOrEqual(0);
+    const openBrace = css.indexOf("{", mediaStart);
+    expect(openBrace, "expected an opening brace after @media").toBeGreaterThan(
+      mediaStart,
+    );
+    let depth = 1;
+    let j = openBrace + 1;
+    while (depth > 0 && j < css.length) {
+      if (css[j] === "{") depth++;
+      else if (css[j] === "}") depth--;
+      j++;
+    }
+    expect(depth, "unbalanced braces while scanning this @media block").toBe(0);
+    const mediaEnd = j; // just past this @media block's matching closing brace
+
+    const ruleStart = css.indexOf(`${CANVAS_SELECTOR} {`, openBrace);
+    expect(
+      ruleStart,
+      `expected to find "${CANVAS_SELECTOR} {" inside the ${mediaCondition} block`,
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      ruleStart,
+      `found "${CANVAS_SELECTOR} {" outside the ${mediaCondition} block's own braces`,
+    ).toBeLessThan(mediaEnd);
+
+    const ruleEnd = css.indexOf("}", ruleStart);
+    return css.slice(ruleStart, ruleEnd);
+  }
+
+  it("never declares the canvas override selector UNSCOPED (outside every @media block) — the exact bug the fix agent flagged: an unscoped override outranks every tier-scoped rule at any viewport", () => {
+    const unscoped = withoutMediaBlocks(css);
+    expect(unscoped).not.toContain(CANVAS_SELECTOR);
+  });
+
+  it("scopes the WIDE-tier canvas override inside an explicit @media (width >= 1280px) block, growing the graph row and giving the document row a 240px floor", () => {
+    const body = canvasRuleBodyWithin("@media (width >= 1280px)");
+    expect(body).toMatch(
+      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(240px,\s*0\.6fr\)/,
+    );
+  });
+
+  it("scopes the STANDARD-tier canvas override inside its own @media (width < 1280px) block, keeping the trailing auto agent row, WITHOUT introducing a px floor (WCAG 1.4.10 — the overflow:hidden ancestor chain is tier-independent, not just a compact-tier concern)", () => {
+    const body = canvasRuleBodyWithin("@media (width < 1280px)");
+    expect(body).toMatch(
+      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*auto/,
+    );
+    expect(body).not.toMatch(/minmax\(\s*\d+px/);
+  });
+
+  it("scopes the COMPACT-tier canvas override inside its own @media (width < 1024px) block, swapping the document/graph fr shares WITHOUT introducing a px floor (WCAG 1.4.10)", () => {
+    const body = canvasRuleBodyWithin("@media (width < 1024px)");
+    expect(body).toMatch(
+      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*0\.5fr\)\s*\n\s*minmax\(0,\s*1\.2fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*minmax\(0,\s*0\.8fr\)/,
+    );
+    expect(body).not.toMatch(/minmax\(\s*\d+px/);
+  });
+});

@@ -1403,6 +1403,35 @@
       "noConnections": "No connections yet — this entity isn’t linked to others."
     }
   },
+  "graphStrip": {
+    "mode": {
+      "label": "Graph display mode",
+      "focus": "Focus",
+      "canvas": "Canvas",
+      "feed": "Changes"
+    },
+    "asOf": "Graph as of {{time}}",
+    "expand": "Expand to full graph",
+    "feed": {
+      "added": "+ {{name}} ({{entityType}})",
+      "renamed": "~ {{name}} renamed",
+      "edge": "{{source}} -> {{target}}",
+      "empty": "No graph changes yet"
+    },
+    "entityType": {
+      "person": "person",
+      "organization": "organization",
+      "location": "location",
+      "event": "event",
+      "topic": "topic",
+      "product": "product",
+      "task": "task",
+      "question": "question",
+      "decision": "decision",
+      "date": "date",
+      "other": "entity"
+    }
+  },
   "speakers": {
     "title": "Speakers",
     "label": "Detected speakers",

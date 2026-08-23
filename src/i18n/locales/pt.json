@@ -1403,6 +1403,35 @@
       "noConnections": "Nenhuma conexão ainda — esta entidade não está vinculada a outras."
     }
   },
+  "graphStrip": {
+    "mode": {
+      "label": "Modo de exibição do grafo",
+      "focus": "Foco",
+      "canvas": "Tela",
+      "feed": "Mudanças"
+    },
+    "asOf": "Grafo às {{time}}",
+    "expand": "Expandir para o grafo completo",
+    "feed": {
+      "added": "+ {{name}} ({{entityType}})",
+      "renamed": "~ {{name}} renomeado",
+      "edge": "{{source}} -> {{target}}",
+      "empty": "Ainda não há mudanças no grafo"
+    },
+    "entityType": {
+      "person": "pessoa",
+      "organization": "organização",
+      "location": "local",
+      "event": "evento",
+      "topic": "tópico",
+      "product": "produto",
+      "task": "tarefa",
+      "question": "pergunta",
+      "decision": "decisão",
+      "date": "data",
+      "other": "entidade"
+    }
+  },
   "speakers": {
     "title": "Falantes",
     "label": "Falantes detectados",

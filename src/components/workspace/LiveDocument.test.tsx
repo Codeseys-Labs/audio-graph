@@ -55,7 +55,7 @@ function DocumentTileHarness() {
 }
 
 // Real store, unwrapped by `SessionViewProvider` — same fallback pattern
-// `GraphTilePlaceholder.test.tsx` uses: `useSessionView()` reads the live
+// `useActiveGraphSnapshot.test.tsx` uses: `useSessionView()` reads the live
 // store directly with no provider present.
 describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
   beforeEach(() => {

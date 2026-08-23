@@ -10,9 +10,13 @@
  *
  * Store bindings: `materializedProjectionGraph` when available, otherwise
  * legacy `graphSnapshot` from `GRAPH_UPDATE` events, plus `exportGraph` and
- * `getSessionId`.
+ * `getSessionId` — read via the shared `useActiveGraphSnapshot` selector
+ * (ticket W7, synthesis audio-graph-a6b5), the ONE place the fallback rule
+ * is written; `LiveGraphStrip`'s three modes read the same hook, so this
+ * component and the KG strip can never disagree about what the graph is.
  *
- * Parent: `App.tsx` main panel. No props.
+ * Parent: `SessionsBrowser`'s replay lens AND (ticket W7) `LiveGraphStrip`'s
+ * `canvas` mode, mounted lazily from both call sites. No props.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D, {
@@ -21,13 +25,12 @@ import ForceGraph2D, {
   type NodeObject,
 } from "react-force-graph-2d";
 import { useTranslation } from "react-i18next";
-import { useSessionView } from "../session/SessionViewProvider";
+import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { useAudioGraphStore } from "../store";
 import type { GraphLink, GraphNode } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
-import { materializedGraphToSnapshot } from "../utils/materializedGraph";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
 
@@ -73,10 +76,11 @@ function escapeHtml(s: string): string {
 
 function KnowledgeGraphViewer() {
   const { t } = useTranslation();
-  const { graphSnapshot } = useSessionView();
-  const materializedProjectionGraph = useAudioGraphStore(
-    (s) => s.materializedProjectionGraph,
-  );
+  // Ticket W7 (synthesis audio-graph-a6b5): the merged-graph fallback rule
+  // used to be hand-written inline here — it now lives in exactly one
+  // place, `useActiveGraphSnapshot`, shared with `LiveGraphStrip`'s three
+  // modes (see that hook's own doc comment for the exact rule).
+  const { snapshot: activeGraphSnapshot } = useActiveGraphSnapshot();
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
   // Cross-component edge focus from the After seek-timeline's related-edges
@@ -93,11 +97,6 @@ function KnowledgeGraphViewer() {
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
-  const activeGraphSnapshot = useMemo(
-    () =>
-      materializedGraphToSnapshot(materializedProjectionGraph) ?? graphSnapshot,
-    [materializedProjectionGraph, graphSnapshot],
-  );
 
   // Theme-aware canvas colors. The react-force-graph canvas is painted in JS,
   // so it cannot consume CSS tokens directly; we resolve the relevant

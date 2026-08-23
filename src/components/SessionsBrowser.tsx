@@ -56,13 +56,15 @@ import SessionDataRoutePanel from "./SessionDataRoutePanel";
 // Same code-split rationale as the old App.tsx-owned import (ADR-0016 /
 // modernization-audit 2.3): react-force-graph-2d stays a deferred chunk.
 // SHELL-R4 deleted App.tsx's own duplicate `lazy()` call along with the
-// "analysis" tab it belonged to (App.tsx no longer imports
-// `KnowledgeGraphViewer` at all) — this is now the ONLY `lazy()` call for
-// this module in the tree, so the "Rollup dedupes duplicate specifiers"
-// concern this comment used to describe no longer applies. Verified via
-// `bun run build:analyze`: the force-graph vendor chunk still stays its own
-// deferred chunk, confirming the graph doesn't get pulled into the eager
-// bundle now that it's loaded from a single site.
+// "analysis" tab it belonged to, making this the ONLY `lazy()` call for this
+// module for a time. Ticket W7 (synthesis audio-graph-a6b5) reintroduced a
+// SECOND call site — `LiveGraphStrip.tsx`'s `canvas` mode mounts this exact
+// component lazily too — but this is NOT a regression of SHELL-R4's fix:
+// Rollup/Vite resolve a dynamic `import()` by module specifier, so both
+// `lazy()` wrappers share the identical underlying chunk file regardless of
+// how many call sites reference it. Re-verified via `bun run build`: the
+// force-graph vendor chunk still stays its own deferred chunk (not inlined
+// into either entry's eager bundle) with the two call sites present.
 const KnowledgeGraphViewer = lazy(() => import("./KnowledgeGraphViewer"));
 
 /** Sort modes. Values double as i18n keys under `sessions.sort.*`. */
