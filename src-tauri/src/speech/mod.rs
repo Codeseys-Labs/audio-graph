@@ -2190,6 +2190,22 @@ fn dispatch_projection_decision(
         // clears it so the next same-basis observation retries immediately
         // instead of silently degrading to event-driven-only with no active
         // signal that it did.
+        //
+        // audio-graph-fa56 known gap (disclosed, not fixed here): this
+        // branch is reachable WHILE `drain_projection_job_workers` is still
+        // joining the projection job thread that hit this failure — a job
+        // still in flight when Stop begins can finish and fail during the
+        // drain. When that happens, `abandon_discarded_deferred_retry`
+        // clears `deferred_retry_at_ms` back to `None` before
+        // `stop_capture_impl`'s post-drain `log_abandoned_deferred_retries_
+        // after_stop` (commands.rs) ever reads it, so this failure is
+        // invisible to that WARN and to the diagnostics snapshot it
+        // persists — the only signal is the `log::debug!` immediately below.
+        // This is the exact same user-facing gap the WARN exists to surface
+        // (a failed apply near Stop whose retry never runs); closing it
+        // needs a signal emitted from THIS discard site (e.g. promoting
+        // this log line, or a sibling one, to `log::warn!`), which is out
+        // of scope for audio-graph-fa56's detection-at-Stop primitive.
         ProjectionSchedulerDecision::FailedCurrent {
             failed_job_id,
             kind,

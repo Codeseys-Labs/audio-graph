@@ -1033,6 +1033,107 @@ fn drain_projection_job_workers(
     }
 }
 
+/// audio-graph-fa56 field bug: a same-basis projection failure under
+/// `PROJECTION_LANE_ATTEMPT_BUDGET` arms exactly one deferred retry
+/// (ADR-0045 decision 3), fired by a one-shot clock thread
+/// (`spawn_deferred_lane_observation`, speech/mod.rs) unless a final ASR
+/// revision drives it event-driven first. That clock thread polls
+/// `projection_lane_stopping` and exits WITHOUT firing the retry the moment
+/// Stop is observed — correct, since firing it is a full re-GENERATION (a
+/// fresh LLM call via `generate_projection_patch`, not a cheap re-apply of
+/// an already-generated patch), and blocking Stop on an unbounded LLM call
+/// would blow well past the existing `PROJECTION_JOB_FLUSH_TIMEOUT` (20s)
+/// shutdown budget. But the ONLY signal that this happened was a
+/// `log::debug!` inside the clock thread itself — invisible under the
+/// default log filter, and exactly the line field evidence (session
+/// c95d21e6) had to go digging for.
+///
+/// Called strictly AFTER `drain_projection_job_workers` has returned (the
+/// caller's contract, not enforced here): at that point every
+/// `projection-retry-<kind>` clock thread for THIS Stop has either exited or
+/// — on the rare `PROJECTION_JOB_FLUSH_TIMEOUT` drain-timeout path — can no
+/// longer fire a retry even if still technically running, so a lane
+/// [`ProjectionSchedulers::kinds_with_armed_deferred_retry`] still reports
+/// is reliably "abandoned", never "still ticking" — see that method's doc
+/// and `ProjectionScheduler::has_armed_deferred_retry`'s for the full
+/// invariant (including its disclosed blind spot for jobs that fail and get
+/// discarded DURING the drain itself).
+///
+/// Logs a single count-only WARN naming the abandoned lane kind(s) — never
+/// the basis, transcript content, or generated patch (ADR-0025's
+/// counts-only-in-logs rule) — so a support session or a future replay/
+/// audit pass has a visible, greppable signal instead of a debug-level line
+/// that is easy to miss. Deliberately a no-op when no lane is armed: most
+/// Stops have nothing to report, and a WARN on every Stop would train
+/// operators to ignore it.
+///
+/// This is the "at minimum" fix (ticket audio-graph-fa56), which asked for
+/// both (a) a visible signal and (b) enough persisted state that a later
+/// session load or replay pass can detect the gap. Forcing a synchronous
+/// heal re-generation into the stop path was rejected (see the report) as
+/// both a shutdown-budget violation and a re-opening of
+/// `dispatch_projection_decision`'s `projection_lane_stopping` race guard
+/// (ADR-0045 decision 4 / audio-graph-9cc1), which is exactly the
+/// detached-thread teardown-ordering territory shared with seeds
+/// `audio-graph-64e3`/`audio-graph-84e0` this ticket is scoped to stay out
+/// of.
+///
+/// (b) is NOT satisfied by the log line alone: this also persists a
+/// [`crate::projection_scheduler::SchedulerQueueState`] diagnostics snapshot
+/// via `persistence::save_scheduler_queue_state` — the same disk artifact
+/// `state.rs`'s `rotate_session` already writes on every session rotation,
+/// extended (audio-graph-fa56) with `notes_deferred_retry_at_ms` /
+/// `graph_deferred_retry_at_ms` fields that mirror
+/// [`ProjectionSchedulers::kinds_with_armed_deferred_retry`]'s output.
+/// ADR-0045 decision 6 rejected reading this snapshot back into a live
+/// scheduler as a second authority — it did NOT reject writing to it, and
+/// the snapshot's writer/loader (`persistence::save_scheduler_queue_state`/
+/// `load_scheduler_queue_state`) already exist and already run in
+/// production today. So a session that ends at this Stop without ever
+/// rotating to a new session still leaves the gap detectable from disk, not
+/// only from the log line — best-effort, like every other
+/// `save_scheduler_queue_state` call: `save_json`'s error path only logs and
+/// never propagates, so a failed write here cannot fail or delay Stop.
+///
+/// One lock acquisition covers both the WARN's read and the snapshot build,
+/// so this adds no additional contention over the pre-fa56 baseline of zero
+/// reads here. It is not, however, a zero-cost no-op: the snapshot write is
+/// a real (small, local, synchronous) JSON file write, run on the same
+/// `spawn_blocking` thread as the drain immediately before it, not on the
+/// async executor.
+///
+/// Known gap, disclosed rather than fixed here (see
+/// [`ProjectionScheduler::has_armed_deferred_retry`]'s doc for the
+/// mechanism): a projection job still in flight when Stop begins can finish
+/// and fail *during* the drain this function runs after. That failure arms
+/// a deferral that `dispatch_projection_decision`'s `projection_lane_stopping`
+/// discard branch clears back to `None` via `abandon_discarded_deferred_retry`
+/// (speech/mod.rs) before this function ever runs — invisible to both the
+/// WARN below and the snapshot it persists, with only a `log::debug!` left
+/// behind. Closing that hole needs a signal at that discard site, not here.
+fn log_abandoned_deferred_retries_after_stop(
+    schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
+    session_id: &str,
+) {
+    let (abandoned_kinds, snapshot) = {
+        let guard = schedulers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            guard.kinds_with_armed_deferred_retry(),
+            guard.snapshot_queue(),
+        )
+    };
+    if !abandoned_kinds.is_empty() {
+        log::warn!(
+            "projection_scheduler.deferred_retry_abandoned_at_stop abandoned_count={} kinds={:?}",
+            abandoned_kinds.len(),
+            abandoned_kinds
+        );
+    }
+    crate::persistence::save_scheduler_queue_state(session_id, &snapshot);
+}
+
 fn register_runtime_processed_audio_consumer(
     registry: &Arc<crate::audio::ProcessedAudioConsumerRegistry>,
     id: &str,
@@ -1864,6 +1965,8 @@ async fn stop_capture_impl(
         // backlog is unbounded by design during continuous speech.
         state.projection_lane_stopping.store(true, Ordering::SeqCst);
         let projection_job_workers = state.projection_job_workers.clone();
+        let projection_schedulers = state.projection_schedulers.clone();
+        let stop_session_id = state.current_session_id();
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(handle) = sp {
                 join_worker_with_timeout(
@@ -1886,6 +1989,12 @@ async fn stop_capture_impl(
                 PROJECTION_JOB_FLUSH_TIMEOUT,
                 &retired_speech_workers,
             );
+            // audio-graph-fa56: MUST run strictly after the drain above —
+            // see `log_abandoned_deferred_retries_after_stop`'s doc for why
+            // that ordering is what makes a still-armed
+            // `deferred_retry_at_ms` mean "abandoned" rather than "clock
+            // still running".
+            log_abandoned_deferred_retries_after_stop(&projection_schedulers, &stop_session_id);
         })
         .await;
         // Also stop Gemini notes if running.
@@ -13628,6 +13737,241 @@ mod tests {
         drain_test_writers(&state);
     }
 
+    /// audio-graph-fa56 field bug (session c95d21e6, build c9f167e): a
+    /// same-basis graph-lane failure under `PROJECTION_LANE_ATTEMPT_BUDGET`
+    /// arms a deferred retry; if Stop begins before the clock thread's ~60s
+    /// deadline, the clock exits without firing and the deferral was left
+    /// with no visible signal beyond a `log::debug!` line. This pins that
+    /// `log_abandoned_deferred_retries_after_stop` is a read-only OBSERVATION
+    /// of scheduler state — the armed deferral must survive the call
+    /// untouched, so the WARN is additive visibility, never a second place
+    /// that silently resolves the gap it reports — AND that it persists the
+    /// diagnostics snapshot (ticket requirement (b)) with the deferral
+    /// captured.
+    ///
+    /// Mutation coverage: (1) a mutant that has this function call
+    /// `abandon_deferred_retry`/`clear_orphaned_deferred_retry` instead of
+    /// only reading is caught directly by the post-call `assert_eq!` below.
+    /// (2) A mutant that reads `notes` instead of `graph` (or vice versa)
+    /// flips which kind survives in the returned Vec. (3) A mutant that
+    /// drops the `save_scheduler_queue_state` call, or builds the snapshot
+    /// from the wrong lane, is caught by the disk round-trip assertion
+    /// below.
+    #[test]
+    fn log_abandoned_deferred_retries_after_stop_leaves_an_armed_deferral_untouched() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("log-abandoned-deferred-retry-untouched");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let session_id = state.current_session_id();
+        let mut ledger = crate::projections::TranscriptLedger::new(&session_id);
+        ledger
+            .apply_event(transcript_event_fixture("span-1", "segment-1"))
+            .expect("seed ledger span");
+
+        let graph_job_id = {
+            let mut schedulers = state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).graph {
+                crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { job } => {
+                    job.id
+                }
+                other => panic!("expected graph start job, got {other:?}"),
+            }
+        };
+        {
+            let mut schedulers = state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                matches!(
+                    schedulers.fail_graph_in_flight(&graph_job_id, &session_id, &ledger, 20),
+                    crate::projection_scheduler::ProjectionSchedulerDecision::FailedCurrent {
+                        deferred_retry_at_ms: Some(_),
+                        ..
+                    }
+                ),
+                "graph failure under budget must arm a deferred retry"
+            );
+        }
+
+        // Simulates `stop_capture_impl` calling this strictly AFTER
+        // `drain_projection_job_workers` has already joined the graph
+        // lane's clock thread, which exited on its own
+        // `projection_lane_stopping` check without touching scheduler state.
+        log_abandoned_deferred_retries_after_stop(&state.projection_schedulers, &session_id);
+
+        assert_eq!(
+            state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kinds_with_armed_deferred_retry(),
+            vec![crate::projections::ProjectionKind::Graph],
+            "the WARN must be read-only: the abandoned deferral must still be armed after \
+             logging it, not silently cleared"
+        );
+
+        // Ticket requirement (b): the diagnostics snapshot persisted to disk
+        // must carry the abandoned deferral too, not just the log line.
+        let persisted = crate::persistence::load_scheduler_queue_state(&session_id)
+            .expect("Stop must persist a scheduler queue snapshot for this session");
+        assert!(
+            persisted.graph_deferred_retry_at_ms.is_some(),
+            "the persisted snapshot must record the abandoned graph lane's deferred retry \
+             deadline, so a later session load or replay pass can detect the gap without the \
+             log line"
+        );
+        assert!(
+            persisted.notes_deferred_retry_at_ms.is_none(),
+            "the notes lane never failed and must not spuriously report a deferral"
+        );
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion to the test above: a fresh session (no failures at all) has
+    /// nothing abandoned. Pins that `log_abandoned_deferred_retries_after_stop`
+    /// does not spuriously warn on the common case — most Stops have no
+    /// pending deferral to report — but that it still persists the
+    /// diagnostics snapshot unconditionally (mirroring `rotate_session`'s
+    /// existing every-rotation write), so a later audit pass sees an
+    /// explicit "nothing was armed" record rather than a missing file. This
+    /// test only asserts the ordinary (non-poisoned) lock path; poisoned-lock
+    /// recovery for this function is not separately exercised.
+    #[test]
+    fn log_abandoned_deferred_retries_after_stop_reports_nothing_when_no_lane_is_armed() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("log-abandoned-deferred-retry-idle");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let session_id = state.current_session_id();
+        // Idle scheduler, freshly constructed by `AppState::new()` — no
+        // observation, no failure, nothing armed.
+        assert_eq!(
+            state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kinds_with_armed_deferred_retry(),
+            Vec::new()
+        );
+
+        log_abandoned_deferred_retries_after_stop(&state.projection_schedulers, &session_id);
+
+        let persisted = crate::persistence::load_scheduler_queue_state(&session_id)
+            .expect("Stop must persist a scheduler queue snapshot even when idle");
+        assert_eq!(
+            persisted.notes_deferred_retry_at_ms, None,
+            "idle notes lane must not report a deferral in the persisted snapshot"
+        );
+        assert_eq!(
+            persisted.graph_deferred_retry_at_ms, None,
+            "idle graph lane must not report a deferral in the persisted snapshot"
+        );
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-fa56: pins that the new abandoned-deferred-retry WARN is
+    /// wired into `stop_capture_impl` strictly AFTER
+    /// `drain_projection_job_workers` — reading `deferred_retry_at_ms`
+    /// BEFORE the drain would observe a clock thread that has not yet had
+    /// its chance to exit (or fire), turning "abandoned" into "possibly
+    /// still ticking" and making the WARN unreliable. Uses the same
+    /// `include_str!` source-order self-inspection technique as
+    /// `start_transcribe_clears_projection_lane_stopping_before_the_speech_thread_spawns`
+    /// above: this pins ORDERING specifically, which a behavioral test
+    /// cannot do any more cheaply, since asserting "strictly after" would
+    /// otherwise require observably delaying the drain itself. A full
+    /// end-to-end behavioral pin that the detection wiring actually executes
+    /// on the real Stop path — driving `stop_capture_impl` against a live
+    /// `AppState` with a real armed deferral — is a separate, existing test:
+    /// see `stop_capture_impl_reports_a_graph_lane_deferred_retry_abandoned_at_stop`
+    /// below.
+    #[test]
+    fn stop_capture_impl_logs_abandoned_deferred_retries_strictly_after_the_drain() {
+        let commands_source = include_str!("commands.rs");
+        let body_start = commands_source
+            .find("async fn stop_capture_impl(")
+            .expect("stop_capture_impl must exist in commands.rs");
+        let body_end = commands_source[body_start..]
+            .find("pub async fn start_transcribe(")
+            .map(|relative| body_start + relative)
+            .expect("start_transcribe must follow stop_capture_impl in commands.rs");
+        let body = strip_whitespace(&strip_comments(&commands_source[body_start..body_end]));
+
+        let drain_marker = strip_whitespace("drain_projection_job_workers(");
+        let drain_pos = find_unique_occurrence(
+            &body,
+            &drain_marker,
+            "stop_capture_impl (drain_projection_job_workers call)",
+        );
+        let warn_marker = strip_whitespace("log_abandoned_deferred_retries_after_stop(");
+        let warn_pos = find_unique_occurrence(
+            &body,
+            &warn_marker,
+            "stop_capture_impl (log_abandoned_deferred_retries_after_stop call)",
+        );
+
+        assert!(
+            drain_pos < warn_pos,
+            "log_abandoned_deferred_retries_after_stop must be called strictly AFTER \
+             drain_projection_job_workers — otherwise a still-running retry clock thread \
+             would be misreported as abandoned"
+        );
+    }
+
+    /// audio-graph-fa56: pins that the WARN body itself (not just the call
+    /// site's position) has not been deleted or gutted — a mutant that
+    /// replaces the `if !abandoned_kinds.is_empty() { log::warn!(...) }`
+    /// block inside `log_abandoned_deferred_retries_after_stop` with a
+    /// no-op (e.g. `let _ = abandoned_kinds;`) makes every behavioral test
+    /// in this file pass, since none of them observe log output (no
+    /// log-capture harness exists in this repo — see
+    /// `logging::tests` for the only `log::set_logger` call, which is
+    /// production init, not a test capture sink). Source-text inspection is
+    /// the cheapest mutation-proof available without adding that
+    /// infrastructure.
+    #[test]
+    fn log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key() {
+        let commands_source = include_str!("commands.rs");
+        let body_start = commands_source
+            .find("fn log_abandoned_deferred_retries_after_stop(")
+            .expect("log_abandoned_deferred_retries_after_stop must exist in commands.rs");
+        let body_end = commands_source[body_start..]
+            .find("fn register_runtime_processed_audio_consumer(")
+            .map(|relative| body_start + relative)
+            .expect(
+                "register_runtime_processed_audio_consumer must follow \
+                 log_abandoned_deferred_retries_after_stop",
+            );
+        let body = &commands_source[body_start..body_end];
+
+        assert!(
+            body.contains("log::warn!"),
+            "log_abandoned_deferred_retries_after_stop must still call log::warn! — deleting \
+             the WARN body is the single most obvious mutation for a logging-only fix, and \
+             nothing else in this suite observes emitted log output"
+        );
+        assert!(
+            body.contains("projection_scheduler.deferred_retry_abandoned_at_stop"),
+            "the WARN must still carry its documented greppable key so a support session or \
+             replay/audit pass can find it"
+        );
+    }
+
     #[test]
     fn missing_canonical_writer_blocks_capture_preflight() {
         let state = AppState::new();
@@ -18008,6 +18352,139 @@ mod tests {
         assert_pipeline_status_idle(&emitted);
 
         app_handle.unlisten(listener_id);
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-fa56: end-to-end behavioral pin that the new
+    /// abandoned-deferred-retry detection actually executes on the REAL
+    /// `stop_capture_impl` path, not just when
+    /// `log_abandoned_deferred_retries_after_stop` is called directly (as
+    /// the unit tests above do). Arms a real graph-lane deferral on a live
+    /// `AppState` the same way
+    /// `log_abandoned_deferred_retries_after_stop_leaves_an_armed_deferral_untouched`
+    /// does, then drives the full async `stop_capture_impl` — the sibling
+    /// `stop_capture_clears_final_source_runtime_state_and_unregisters_runtime_consumers`
+    /// test above already proves this suite CAN drive that path against a
+    /// live capture/ASR-adjacent pipeline; this reuses the same setup rather
+    /// than the source-order self-inspection technique, which can only pin
+    /// call ORDER, not that the call actually observes real scheduler state.
+    ///
+    /// Mutation coverage: deleting the
+    /// `log_abandoned_deferred_retries_after_stop` call from
+    /// `stop_capture_impl`, or wiring it to the wrong `Arc<Mutex<..>>`,
+    /// leaves scheduler state unaffected either way (this function is
+    /// read-only), so the load-bearing assertions are the persisted-snapshot
+    /// ones: they fail if the call is deleted (no snapshot is ever written
+    /// for this session) or if it reads/writes the wrong lane.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn stop_capture_impl_reports_a_graph_lane_deferred_retry_abandoned_at_stop() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("stop-capture-abandoned-deferred-retry");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let session_id = state.current_session_id();
+        let app_handle = crate::speech::shared_test_app_handle();
+        ensure_audio_pipeline_workers(&state, &app_handle).expect("start audio spine");
+        reset_audio_pipeline_session(&state)
+            .await
+            .expect("audio spine ready");
+        state
+            .capture_manager
+            .lock()
+            .expect("capture manager")
+            .insert_synthetic_handle("system", false);
+        *state.is_capturing.write().unwrap() = true;
+        state.is_transcribing.store(true, Ordering::SeqCst);
+        state
+            .projection_lane_stopping
+            .store(false, Ordering::SeqCst);
+
+        // Arm a real graph-lane deferred retry the same way a same-basis
+        // failure under `PROJECTION_LANE_ATTEMPT_BUDGET` would in production
+        // (mirrors `log_abandoned_deferred_retries_after_stop_leaves_an_armed_deferral_untouched`
+        // above).
+        let mut ledger = crate::projections::TranscriptLedger::new(&session_id);
+        ledger
+            .apply_event(transcript_event_fixture("span-1", "segment-1"))
+            .expect("seed ledger span");
+        let graph_job_id = {
+            let mut schedulers = state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).graph {
+                crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { job } => {
+                    job.id
+                }
+                other => panic!("expected graph start job, got {other:?}"),
+            }
+        };
+        {
+            let mut schedulers = state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                matches!(
+                    schedulers.fail_graph_in_flight(&graph_job_id, &session_id, &ledger, 20),
+                    crate::projection_scheduler::ProjectionSchedulerDecision::FailedCurrent {
+                        deferred_retry_at_ms: Some(_),
+                        ..
+                    }
+                ),
+                "precondition: graph failure under budget must arm a deferred retry"
+            );
+        }
+        assert_eq!(
+            state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kinds_with_armed_deferred_retry(),
+            vec![crate::projections::ProjectionKind::Graph],
+            "precondition: the graph lane's deferral must be armed before Stop"
+        );
+
+        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+            .await
+            .expect("final source stop should succeed even with an abandoned deferral");
+
+        // The deferral was never fired (no clock thread was ever registered
+        // for it in this test), so it must still be armed after Stop — the
+        // exact "abandoned" state the new WARN reports.
+        assert_eq!(
+            state
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kinds_with_armed_deferred_retry(),
+            vec![crate::projections::ProjectionKind::Graph],
+            "the graph lane's deferral must still be reported as abandoned after the real \
+             stop_capture_impl path runs, proving the detection wiring executed"
+        );
+
+        // Ticket requirement (b): the real Stop path must have persisted a
+        // diagnostics snapshot that a later session load or replay pass can
+        // read back — not just emitted a log line.
+        let persisted = crate::persistence::load_scheduler_queue_state(&session_id)
+            .expect("stop_capture_impl must persist a scheduler queue snapshot for this session");
+        assert!(
+            persisted.graph_deferred_retry_at_ms.is_some(),
+            "the snapshot persisted by the real stop_capture_impl path must record the \
+             abandoned graph lane's deferred retry deadline"
+        );
+
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);
     }
