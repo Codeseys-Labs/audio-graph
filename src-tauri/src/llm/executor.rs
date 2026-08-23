@@ -220,6 +220,12 @@ enum LlmJobResult {
 pub struct ProjectionPatchOutcome {
     pub patch: ProjectionPatch,
     pub tokens_used: u32,
+    /// Count of `upsert_note` operations the ingest no-op filter dropped from
+    /// `patch.operations` at admission (audio-graph-a6b5 W2 / design-b
+    /// §1.5b) — see `projection_llm::TrustedProjectionPatch`. 0 for a
+    /// Graph-kind patch, or when the caller had no live notes state to
+    /// compare against.
+    pub no_op_filtered_count: u32,
 }
 
 /// One projection-patch dispatch attempt, paired with the identity of the
@@ -754,8 +760,8 @@ fn run_projection_patch_dispatch(
     // `generate_projection_patch` -> here. `None` means either a Graph-kind
     // job (which never renders the notes block) or a Notes-kind caller that
     // could not confirm the snapshot belonged to this job's own session — in
-    // both cases the Notes-kind prompt OMITS the "Current notes state" block
-    // entirely instead of asserting a false "(no notes yet)": an empty
+    // both cases the Notes-kind prompt OMITS the "Document outline" block
+    // entirely instead of asserting a false "(no sections yet)": an empty
     // snapshot is indistinguishable from a real empty session and would
     // license the model to mint ids as if none existed, which is the same
     // overwrite-storm failure mode this seed exists to fix.
@@ -845,6 +851,7 @@ fn run_projection_patch_on_route(
         &output,
         job,
         ledger,
+        notes,
         sequence,
         created_at_ms,
         PROJECTION_PATCH_PROMPT_ID,
@@ -869,6 +876,7 @@ fn run_projection_patch_on_route(
                 &repair_output,
                 job,
                 ledger,
+                notes,
                 sequence,
                 created_at_ms,
                 PROJECTION_PATCH_REPAIR_PROMPT_ID,
@@ -916,10 +924,16 @@ fn ensure_usable_completion(output: &ProjectionBackendOutput) -> Result<(), Stri
     ))
 }
 
+// 8 params, same clippy threshold reason as `run_projection_patch_dispatch`
+// above: the notes-snapshot wiring (seed audio-graph-253c part 2, extended by
+// audio-graph-a6b5 W2 to reach the no-op filter here) pushed this one over
+// clippy's default threshold of 7; bundling would obscure the arguments.
+#[allow(clippy::too_many_arguments)]
 fn projection_outcome_from_output(
     output: &ProjectionBackendOutput,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     sequence: u64,
     created_at_ms: u64,
     prompt_id: &str,
@@ -938,10 +952,11 @@ fn projection_outcome_from_output(
         Some(suffix) => format!("{}:{}:{}:{}", job.id, route_key, sequence, suffix),
         None => format!("{}:{}:{}", job.id, route_key, sequence),
     };
-    let patch = trusted_projection_patch_from_model_json(
+    let trusted = trusted_projection_patch_from_model_json(
         &output.raw_json,
         job,
         ledger,
+        notes,
         ProjectionPatchBuildContext {
             sequence,
             llm_request_id,
@@ -955,8 +970,9 @@ fn projection_outcome_from_output(
         },
     )?;
     Ok(ProjectionPatchOutcome {
-        patch,
+        patch: trusted.patch,
         tokens_used: output.tokens_used,
+        no_op_filtered_count: trusted.no_op_filtered_count,
     })
 }
 

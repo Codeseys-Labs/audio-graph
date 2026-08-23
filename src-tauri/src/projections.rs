@@ -1504,20 +1504,25 @@ pub enum ProjectionOperation {
         /// the field. The frontend's legacy renderer handles `None`; nothing
         /// on this path ever fabricates a depth into the materialized
         /// record. Mirrors the posture of `MaterializedNote::evidence`'s
-        /// `Option` doc comment above. This ticket ships the field dark: no
-        /// model-facing prompt or schema surface changes on ANY route. The
-        /// strict OpenRouter schema (`projection_patch_strict_json_schema`)
-        /// deliberately does NOT advertise `heading_level` yet because it is
-        /// hand-authored and simply omits the field. The `schemars`-derived
-        /// draft schema (`projection_patch_draft_json_schema`) IS
-        /// auto-derived from this very type — including this doc comment,
-        /// which schemars would otherwise paste verbatim into the model
-        /// prompt as the field's JSON Schema `description` — so
-        /// `hide_heading_level_from_draft_schema` explicitly strips the
-        /// property (and this comment) back out post-generation. Both
-        /// schemas therefore withhold the field until W2's dedicated
-        /// prompt/schema-exposure ticket, so no route's model can be nudged
-        /// to emit a value with no guidance behind it.
+        /// `Option` doc comment above.
+        ///
+        /// W1 shipped this field DARK (no model-facing prompt or schema
+        /// surface change on any route). audio-graph-a6b5 W2 is the flip to
+        /// model-visible, landed as one commit across both routes together
+        /// so neither ever tells the model something the other forbids: the
+        /// hand-authored strict OpenRouter schema
+        /// (`projection_patch_strict_json_schema`) now advertises
+        /// `heading_level` as a required-but-nullable integer (matching
+        /// `description`/`after_id`/`label`'s existing posture), and the
+        /// `schemars`-derived draft schema (`projection_patch_draft_json_schema`)
+        /// advertises it too — but with this doc comment's internal
+        /// ticket/ADR prose swapped out for a short model-facing sentence by
+        /// `shorten_heading_level_description_in_draft_schema`, since
+        /// `schemars` would otherwise paste this whole comment verbatim into
+        /// every projection prompt as the property's JSON Schema
+        /// `description`. The Notes-kind operation guidance
+        /// (`projection_patch_prompt_messages`) now names `heading_level` by
+        /// name and explains its 2..=4 depth scale directly.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         heading_level: Option<u8>,
     },

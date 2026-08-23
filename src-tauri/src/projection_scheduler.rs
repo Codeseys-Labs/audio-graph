@@ -3354,6 +3354,75 @@ mod tests {
         assert_eq!(derive_coverage_heads(&[]), (None, None));
     }
 
+    /// audio-graph-a6b5 W2 (design-b §1.5c, the verified trap the no-op
+    /// filter must never fall into): an accepted `operations: []` patch —
+    /// exactly the shape the no-op filter produces when every `upsert_note`
+    /// in a tick filtered to a byte-identical no-op — must still advance
+    /// BOTH the coverage head (`derive_coverage_heads`, which picks the
+    /// max-`sequence` patch per kind blind to operation count) AND the
+    /// materialized `last_sequence` (`MaterializedNotes::apply_patch`, whose
+    /// `for` loop over `operations` simply does not run for an empty list,
+    /// while `next.last_sequence = patch.sequence` still commits
+    /// unconditionally afterward). Suppressing this patch instead of
+    /// persisting it would leave the coverage head un-advanced and the next
+    /// `observe_ledger` tick would re-queue the exact same basis forever —
+    /// this fixture is the ONE assertion that closes that trap for good.
+    #[test]
+    fn empty_ops_projection_patch_advances_the_coverage_head_through_derive_and_apply() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let basis_a = ledger.current_projection_basis();
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        let basis_b = ledger.current_projection_basis();
+
+        // sequence 1 carries a real upsert; sequence 2 is the all-filtered
+        // empty patch this fixture is about.
+        let real_patch = minimal_accepted_patch(1, ProjectionKind::Notes, basis_a);
+        let mut empty_patch = minimal_accepted_patch(2, ProjectionKind::Notes, basis_b.clone());
+        empty_patch.operations = Vec::new();
+
+        let patches = vec![real_patch.clone(), empty_patch.clone()];
+        let (notes_head, graph_head) = derive_coverage_heads(&patches);
+        assert_eq!(
+            notes_head,
+            Some(basis_b),
+            "the empty-ops patch (sequence 2, the higher sequence) must still win the \
+             coverage head over the real patch at sequence 1 — derive_coverage_heads is \
+             ops-count-blind by design"
+        );
+        assert_eq!(graph_head, None, "no graph patches were fed");
+
+        let mut notes = crate::projections::MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&real_patch, None)
+            .expect("real patch applies");
+        assert_eq!(notes.last_sequence, 1);
+        assert_eq!(
+            notes.notes.len(),
+            1,
+            "the real upsert must materialize a note"
+        );
+
+        notes
+            .apply_patch(&empty_patch, None)
+            .expect("an empty-ops patch must apply cleanly, never error");
+        assert_eq!(
+            notes.last_sequence, 2,
+            "last_sequence must advance to the empty patch's sequence even though its \
+             operations list is empty — this is what keeps the lane from re-queuing the \
+             same basis forever"
+        );
+        assert_eq!(
+            notes.notes.len(),
+            1,
+            "an empty-ops patch must not create, delete, or otherwise mutate any note"
+        );
+    }
+
     /// The ACCEPTANCE hand-constructed reopen scenario: reseeding from a
     /// derived coverage head makes `observe_ledger` `Idle` when the current
     /// basis equals the head, and `StartJob` once the ledger has grown past

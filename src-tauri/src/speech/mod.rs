@@ -1822,6 +1822,24 @@ trait ProjectionRuntimeEventSink: Send + Sync {
 /// disk.
 trait ProjectionDataMovementSink: Send + Sync {
     fn record(&self, session_id: &str, event: &crate::persistence::DataMovementEvent);
+
+    /// Test-observability hook (audio-graph-a6b5 W2 fix round): gives tests
+    /// direct value-level visibility into the content-free
+    /// `ProjectionMovementFacts` BEFORE it is folded into (or, for some
+    /// fields, never folded into — see
+    /// `projection_data_movement::ProjectionMovementFacts::no_op_filtered_count`'s
+    /// doc comment) the persisted `DataMovementEvent`. `no_op_filtered_count`
+    /// has no `MovementCounts` sink by design (an ipc-contract change this
+    /// ticket deliberately stays out of), so without this hook nothing
+    /// outside a source-text inspection test could ever observe whether the
+    /// real value reached this struct. Default no-op: production's
+    /// `FileProjectionDataMovementSink` never overrides it, so this call adds
+    /// zero production behavior.
+    fn record_movement_facts(
+        &self,
+        _facts: &crate::projection_data_movement::ProjectionMovementFacts,
+    ) {
+    }
 }
 
 /// Production sink: appends to the per-session data-movement JSONL via the
@@ -2693,8 +2711,9 @@ fn actual_backend_identity(
 /// this call moves off-device is ledgered, not silently omitted from the
 /// privacy report. Content-free like every other field here: only a char
 /// count and an entry count ever leave this function.
-// 8 params since the notes-snapshot wiring (seed audio-graph-253c part 2)
-// pushed this one over clippy's default threshold of 7.
+// 9 params since the notes-snapshot wiring (seed audio-graph-253c part 2,
+// extended by audio-graph-a6b5 W2's no-op-filter count) pushed this one over
+// clippy's default threshold of 7.
 #[allow(clippy::too_many_arguments)]
 fn projection_movement_facts(
     dispatch: &ProjectionDispatchContext,
@@ -2704,6 +2723,11 @@ fn projection_movement_facts(
     notes: Option<&MaterializedNotes>,
     tokens_in: u64,
     tokens_out: u64,
+    // audio-graph-a6b5 W2: 0 at the pre-generation `Started` call site (no
+    // patch exists yet) and at a `FailedRoute` call site (no patch was
+    // built); the real count from `ProjectionPatchOutcome::no_op_filtered_count`
+    // only at the post-generation `Actual` (success) call site.
+    no_op_filtered_count: u32,
     backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
     let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, notes);
@@ -2763,6 +2787,7 @@ fn projection_movement_facts(
         pinned_fact_chars: shape.pinned_fact_chars,
         notes_snapshot_chars: shape.notes_snapshot_chars,
         notes_snapshot_entries: shape.notes_snapshot_entries,
+        no_op_filtered_count,
         tokens_in,
         tokens_out,
     }
@@ -2815,6 +2840,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             notes_snapshot.as_ref(),
             0,
             0,
+            0,
             ProjectionLedgerBackend::Configured,
         );
         dispatch.data_movement_sink.record(
@@ -2846,8 +2872,20 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 notes_snapshot.as_ref(),
                 u64::from(outcome.tokens_used),
                 0,
+                outcome.no_op_filtered_count,
                 ProjectionLedgerBackend::Actual(&outcome.patch.provenance, attempted_route),
             );
+            // Test-observability hook only (no-op in production, see the
+            // trait doc comment): gives tests value-level visibility into
+            // `no_op_filtered_count` before it is folded into (or, for this
+            // field specifically, dropped by) `build_terminal_event` — that
+            // event carries no `no_op_filtered_count` sink, so without this
+            // call nothing outside a source-text inspection test could ever
+            // catch `outcome.no_op_filtered_count` being replaced by a
+            // hardcoded `0` here.
+            dispatch
+                .data_movement_sink
+                .record_movement_facts(&movement_facts);
             dispatch.data_movement_sink.record(
                 &job.session_id,
                 &crate::projection_data_movement::build_terminal_event(&movement_facts, true, None),
@@ -2919,6 +2957,24 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         job.kind,
                         result.outcome
                     );
+                    // audio-graph-a6b5 W2: counts only (ADR-0025), never
+                    // note/section content — makes the no-op filter (§1.5b)
+                    // and the document-order outline replacing the old
+                    // recency-sorted notes snapshot (§2.3) verifiable from
+                    // logs without needing a log-capture harness (this repo
+                    // has none — see the audio-graph-fa56 precedent for why
+                    // source-text inspection is the mutation-proof for a
+                    // logging-only change). `notes_outline_*` is 0 for a
+                    // Graph-kind job (the outline is Notes-kind only).
+                    log::debug!(
+                        "Projection job movement counts job_id={} kind={:?} \
+                         no_op_filtered={} notes_outline_chars={} notes_outline_entries={}",
+                        job.id,
+                        job.kind,
+                        movement_facts.no_op_filtered_count,
+                        movement_facts.notes_snapshot_chars,
+                        movement_facts.notes_snapshot_entries
+                    );
                     // audio-graph-caad / audio-graph-f3d4: the gate now applies a
                     // proven append-only tail instead of discarding it as stale —
                     // split that telemetry from the ordinary current-basis apply
@@ -2984,6 +3040,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 sequence,
                 &ledger,
                 notes_snapshot.as_ref(),
+                0,
                 0,
                 0,
                 ProjectionLedgerBackend::FailedRoute(attempted_route),
@@ -8998,6 +9055,11 @@ mod tests_status {
     #[derive(Clone, Default)]
     struct RecordingProjectionDataMovementSink {
         events: Arc<Mutex<Vec<crate::persistence::DataMovementEvent>>>,
+        /// Raw `ProjectionMovementFacts` captured via `record_movement_facts`
+        /// — value-level visibility that `events` above cannot give for
+        /// fields with no `DataMovementEvent`/`MovementCounts` sink (e.g.
+        /// `no_op_filtered_count`).
+        movement_facts: Arc<Mutex<Vec<crate::projection_data_movement::ProjectionMovementFacts>>>,
     }
 
     impl ProjectionDataMovementSink for RecordingProjectionDataMovementSink {
@@ -9006,6 +9068,16 @@ mod tests_status {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(event.clone());
+        }
+
+        fn record_movement_facts(
+            &self,
+            facts: &crate::projection_data_movement::ProjectionMovementFacts,
+        ) {
+            self.movement_facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(facts.clone());
         }
     }
 
@@ -11213,6 +11285,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 37,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -11282,6 +11355,118 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reviewer adversarial-mutation finding (W2 fix round): a mutant that made
+    /// `run_projection_job` silently `finish_projection_scheduler_job` +
+    /// `return` on `outcome.patch.operations.is_empty()` — WITHOUT ever calling
+    /// `apply_runtime_projection_patch` — survived the full 2121-test suite.
+    /// `projection_scheduler.rs`'s
+    /// `empty_ops_projection_patch_advances_the_coverage_head_through_derive_and_apply`
+    /// already pins the two PURE halves (`derive_coverage_heads` picking the
+    /// empty patch's higher-sequence basis, and `MaterializedNotes::apply_patch`
+    /// committing `last_sequence` unconditionally); this test is the missing
+    /// third pin — it drives an `operations: []` outcome through the LIVE
+    /// `run_projection_job` wiring and asserts the basis actually lands in both
+    /// the in-memory materialized state AND the durable accepted-events log.
+    /// Without this durable advance, a session reopen would re-derive
+    /// `derive_coverage_heads` from the pre-empty-patch basis and re-send the
+    /// same already-fully-covered span forever.
+    #[test]
+    fn empty_ops_projection_patch_still_advances_last_sequence_and_the_accepted_log_through_run_projection_job()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-empty-ops-dispatch-live-wiring");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "projection-empty-ops-span",
+                        1,
+                        "Everything the model said here got filtered as a no-op.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes job, got {other:?}"),
+            }
+        };
+
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
+                let mut patch = test_projection_patch(&job, sequence, created_at_ms);
+                patch.operations.clear();
+                Ok(ProjectionPatchOutcome {
+                    patch,
+                    tokens_used: 11,
+                    no_op_filtered_count: 1,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        run_projection_job(dispatch, notes_job);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let materialized = app
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                materialized.notes.last_sequence, 1,
+                "an all-filtered empty patch must still commit its basis so the \
+                 next tick does not re-derive and re-send the same span"
+            );
+            assert!(
+                materialized.notes.notes.is_empty(),
+                "an empty-ops patch must not create or mutate any note"
+            );
+        }
+
+        assert_eq!(event_sink.patch_count(), 1);
+        assert_eq!(event_sink.notes_count(), 1);
+
+        {
+            let schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(schedulers.notes().metrics().completed_jobs, 1);
+            assert_eq!(schedulers.notes().metrics().accepted_patches, 1);
+            assert!(schedulers.notes().in_flight_job().is_none());
+        }
+
+        drain_app_writers(&app);
+        let notes = load_materialized_notes(&session_id)
+            .expect("load notes")
+            .expect("notes artifact");
+        assert_eq!(notes.last_sequence, 1);
+        assert!(notes.notes.is_empty());
+        let events = load_projection_events(&session_id).expect("load projection events");
+        assert_eq!(
+            events.len(),
+            1,
+            "the accepted log must durably record the empty patch so a session \
+             reopen does not reseed to the pre-empty-patch basis"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn runtime_projection_dispatch_discards_same_session_replaced_worker() {
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -11339,6 +11524,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 73,
+                    no_op_filtered_count: 0,
                 })
             },
         );
@@ -11426,6 +11612,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -11551,6 +11738,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             },
         );
@@ -11679,6 +11867,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             },
         );
@@ -11791,6 +11980,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -11909,6 +12099,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
@@ -12029,6 +12220,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -12142,6 +12334,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
@@ -12241,6 +12434,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
@@ -12459,6 +12653,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch,
                     tokens_used: 55,
+                    no_op_filtered_count: 0,
                 })
             });
         let openrouter = LlmProvider::OpenRouter {
@@ -12509,6 +12704,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 55,
+                    no_op_filtered_count: 0,
                 })
             });
         let openrouter2 = LlmProvider::OpenRouter {
@@ -12545,6 +12741,89 @@ mod tests_status {
         drop(recorded2);
         drain_app_writers(&local_app);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reviewer scope-honesty finding (W2 fix round):
+    /// `ProjectionMovementFacts::no_op_filtered_count`'s doc comment claims
+    /// it is "populated and unit-tested at the `ProjectionMovementFacts`
+    /// level", but before this test nothing asserted a real non-zero value
+    /// ever reached that struct through the live `run_projection_job`
+    /// wiring — the concrete surviving mutant was
+    /// `outcome.no_op_filtered_count` silently replaced by the literal `0`
+    /// at the terminal-event call site (every other test in this module sets
+    /// `no_op_filtered_count: 0` on its `ProjectionPatchOutcome` double, so
+    /// that mutant is indistinguishable from correct code to them). This
+    /// test uses a double returning a distinctive non-zero count and reads
+    /// it back via `record_movement_facts` (see that trait method's doc
+    /// comment for why the ordinary `events` capture cannot see this field at
+    /// all: `no_op_filtered_count` has no `MovementCounts` sink by design).
+    #[test]
+    fn run_projection_job_threads_the_real_no_op_filtered_count_into_movement_facts() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-no-op-filtered-count-movement-facts");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let notes_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "no-op-filtered-count-movement-facts-span",
+                        1,
+                        "Three sections in this tick were byte-identical no-ops.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes job, got {other:?}"),
+            }
+        };
+
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, _notes, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 9,
+                    no_op_filtered_count: 3,
+                })
+            });
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            LlmProvider::LocalLlama,
+            false,
+        );
+
+        run_projection_job(dispatch, notes_job);
+
+        let facts = movements
+            .movement_facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let terminal_facts = facts
+            .last()
+            .expect("the apply-success branch must record movement facts");
+        assert_eq!(
+            terminal_facts.no_op_filtered_count, 3,
+            "the real outcome.no_op_filtered_count must reach ProjectionMovementFacts, \
+             not a hardcoded 0"
+        );
+        drop(facts);
+
+        drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12620,6 +12899,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 1,
+                    no_op_filtered_count: 0,
                 })
             });
         let openrouter = LlmProvider::OpenRouter {
@@ -12679,6 +12959,50 @@ mod tests_status {
 
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-a6b5 W2: pins that the movement-counts `log::debug!` line
+    /// inside `run_projection_job`'s apply-success branch still exists and
+    /// still carries all three ADR-0025-safe counts (`no_op_filtered_count`,
+    /// `notes_snapshot_chars`, `notes_snapshot_entries`). This repo has no
+    /// log-capture test harness (see the audio-graph-fa56 precedent,
+    /// `commands.rs`'s
+    /// `log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`,
+    /// for the same technique applied to a different WARN), so source-text
+    /// inspection is the cheapest mutation-proof available for a
+    /// logging-only change: a mutant that deletes this `log::debug!` call
+    /// (or swaps an argument for a hardcoded `0`) would make every OTHER
+    /// test in this suite pass, since none of them observe emitted log
+    /// output — this is the ONE thing that catches that mutant.
+    #[test]
+    fn run_projection_job_movement_counts_log_line_still_carries_the_no_op_filter_and_outline_counts()
+     {
+        let source = include_str!("mod.rs");
+        let body_start = source
+            .find("fn run_projection_job(")
+            .expect("run_projection_job must exist in speech/mod.rs");
+        let body_end = source[body_start..]
+            .find("fn record_projection_generation_result(")
+            .map(|relative| body_start + relative)
+            .expect("record_projection_generation_result must follow run_projection_job");
+        let body = &source[body_start..body_end];
+
+        assert!(
+            body.contains("Projection job movement counts"),
+            "the movement-counts log line must still exist inside run_projection_job"
+        );
+        assert!(
+            body.contains("movement_facts.no_op_filtered_count"),
+            "the log line must still carry the no-op-filtered count"
+        );
+        assert!(
+            body.contains("movement_facts.notes_snapshot_chars"),
+            "the log line must still carry the notes-outline char count"
+        );
+        assert!(
+            body.contains("movement_facts.notes_snapshot_entries"),
+            "the log line must still carry the notes-outline entry count"
+        );
     }
 
     /// Staleness semantics of the SPAWN-time notes-snapshot clone (seed
@@ -12775,6 +13099,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 1,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
@@ -12881,6 +13206,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 1,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, _event_sink) = projection_dispatch_for_app(&app, generator);
@@ -13265,6 +13591,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch,
                     tokens_used: 42,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
@@ -13592,6 +13919,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch,
                     tokens_used: 12,
+                    no_op_filtered_count: 0,
                 })
             });
         let generator = generator.with_attempted_route(attempted);
@@ -13685,6 +14013,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 5,
+                    no_op_filtered_count: 0,
                 })
             });
 
@@ -13823,6 +14152,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 41,
+                    no_op_filtered_count: 0,
                 })
             },
         );
@@ -13942,6 +14272,7 @@ mod tests_status {
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 37,
+                    no_op_filtered_count: 0,
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);

@@ -14,8 +14,7 @@
 //! Graph-kind job (which never renders the notes block regardless), or a
 //! Notes-kind snapshot whose session id did not match the job's own (see
 //! `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`) — both
-//! omit the "Current notes state" block rather than asserting a fabricated
-//! one.
+//! omit the "Document outline" block rather than asserting a fabricated one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -55,6 +54,16 @@ pub const PROJECTION_STABLE_PREFIX_MESSAGE_COUNT: usize = 2;
 /// message (the byte-stable prefix, `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`),
 /// so the repair prompt (`projection_patch_repair_prompt_messages`, which
 /// extends this same message list) inherits it without needing its own copy.
+///
+/// audio-graph-a6b5 W2 / design-b §2.2 (gate R5): the trailing sentence names
+/// `grounded_inference` as the synthesis default. Field measurement (session
+/// c95d21e6) found 93/93 final notes classified `verified_quote` — largely an
+/// ordering artifact, since `verified_quote` is listed first above and
+/// described most concretely, so a schema-obeying model optimizes for the
+/// class it can most reliably satisfy by quoting rather than synthesizing.
+/// This is a re-rank, not a weakening: no class is added, removed, or
+/// redefined, and `judge_claim_evidence` (ADR-0037) is untouched — the same
+/// admission bar applies to whichever class a model now picks.
 const EVIDENCE_GUIDANCE: &str = "Every upsert_note, upsert_graph_node, and upsert_graph_edge \
      operation requires an `evidence` object anchoring the claim to a span in this prompt's \
      transcript window (see `span_id` in the transcript JSON below). `claim_class` is one of: \
@@ -63,35 +72,54 @@ const EVIDENCE_GUIDANCE: &str = "Every upsert_note, upsert_graph_node, and upser
      ids; no quote needed), or `unavailable_evidence` (set `span_id` to the closest relevant span \
      id AND `note` to a short explanation of what deeper evidence is missing, e.g. audio was not \
      retained for that span). Never use `knowledge_gap` — it is never admitted. A `span_id` \
-     outside the transcript window below is refused.";
+     outside the transcript window below is refused. For a synthesized topic section, the right \
+     class is normally `grounded_inference` anchored to the newest span that motivated THIS edit; \
+     use `verified_quote` only when the section body actually contains that span's words \
+     verbatim.";
 
 /// Max characters of a single older turn kept in the rolling summary digest.
 /// Bounds each folded turn's contribution so the summary stays far smaller than
 /// the full transcript JSON it replaces.
 const SUMMARY_TURN_DIGEST_MAX_CHARS: usize = 160;
 
-/// Max number of existing notes rendered into the Notes-kind prompt's live
-/// notes-state snapshot (seed audio-graph-253c). Selection is by most-recently-
-/// updated (`updated_by_sequence` descending); a session that has accumulated
-/// more notes than this still gets a truncated block plus a count line, rather
-/// than an unbounded prompt.
-const NOTES_SNAPSHOT_MAX_ENTRIES: usize = 30;
+/// Hard cap, in characters, on the whole Notes-kind document-order outline
+/// block (audio-graph-a6b5 W2 / design-b §2.3), replacing the old
+/// recency-sorted `NOTES_SNAPSHOT_*` budget. Degradation when a session would
+/// exceed this: drop body previews first (all of them, see
+/// [`DOC_OUTLINE_PREVIEW_SECTIONS`]), then drop heading lines from the
+/// LEAST-recently-changed end (oldest `updated_by_sequence` first) — document
+/// order among the remaining, retained headings is preserved either way.
+/// [`render_document_outline`] always emits a truthful trailing count line, so
+/// a truncated section is COUNTED even when its heading line is cut, matching
+/// seed audio-graph-253c's original "every id shown or counted, never
+/// silently dropped" guarantee at the char-budget granularity this ticket
+/// moves to.
+const DOC_OUTLINE_MAX_CHARS: usize = 6000;
 
-/// Max characters of a single note's body kept in the one-line summary the
-/// live notes-state snapshot renders per note. Mirrors
-/// `SUMMARY_TURN_DIGEST_MAX_CHARS`'s bounding posture (applied to note bodies
-/// instead of transcript turns) so one long note can never dominate the block.
-const NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS: usize = 160;
+/// Max characters of a single section's `id` kept in the outline's heading
+/// line. `id` is a model-authored `String` with no length validation on the
+/// apply path (`upsert_note` accepts it verbatim), so without this cap one
+/// oversized id would make its outline line — and therefore the whole block —
+/// unbounded despite [`DOC_OUTLINE_MAX_CHARS`] bounding the other axis.
+const DOC_OUTLINE_ID_MAX_CHARS: usize = 48;
 
-/// Max characters of a single note's `id` or `title` kept in the live
-/// notes-state snapshot. Unlike the body, `id` and `title` are model-authored
-/// `String`s with no length validation anywhere on the apply path (`upsert_note`
-/// accepts them verbatim), so without this cap one oversized title/id would
-/// make the per-note line — and therefore the whole block — unbounded despite
-/// [`NOTES_SNAPSHOT_MAX_ENTRIES`] and [`NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS`]
-/// bounding the other two axes. Shorter than the body cap because an id/title
-/// is expected to be short prose, not a paragraph.
-const NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS: usize = 80;
+/// Max characters of a single section's `title` kept in the outline's heading
+/// line. Same rationale as [`DOC_OUTLINE_ID_MAX_CHARS`], applied to `title`.
+const DOC_OUTLINE_TITLE_MAX_CHARS: usize = 64;
+
+/// Number of sections — by most-recently-changed (`updated_by_sequence`
+/// descending, ties broken by id for determinism) — that get an extra body
+/// preview line under their heading line in the outline. Every section still
+/// gets a heading line regardless of this cap; only the preview is limited,
+/// so a long-running document's full structure stays visible even though only
+/// its most recently active topics get a body excerpt.
+const DOC_OUTLINE_PREVIEW_SECTIONS: usize = 8;
+
+/// Max characters of a preview-eligible section's body excerpt kept in the
+/// outline's `recent:` line. Mirrors `SUMMARY_TURN_DIGEST_MAX_CHARS`'s
+/// bounding posture (applied to a note body excerpt instead of a transcript
+/// turn) so one long section can never dominate the block.
+const DOC_OUTLINE_PREVIEW_MAX_CHARS: usize = 120;
 
 /// Incremental extractive rolling summary of the transcript turns that have
 /// left the verbatim hot window (ADR-0025 §2c / seed audio-graph-18ee).
@@ -341,36 +369,42 @@ pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String>
     let mut schema = serde_json::to_value(schemars::schema_for!(ProjectionPatchDraft))
         .map_err(|e| format!("failed to build projection patch draft JSON schema: {e}"))?;
     require_evidence_on_content_creating_operation_variants(&mut schema);
-    hide_heading_level_from_draft_schema(&mut schema);
+    shorten_heading_level_description_in_draft_schema(&mut schema);
     Ok(schema)
 }
 
-/// audio-graph-a6b5 W1 is a DARK ship: `heading_level` is declared on
-/// [`ProjectionOperation::UpsertNote`] (so fresh-ingest and replay can carry
-/// it end-to-end), but no model-facing surface may change until W2's
-/// dedicated prompt/schema-exposure ticket. `schemars` derives this draft
-/// schema straight from the Rust type, so without this post-process step
-/// `heading_level` — AND the field's entire internal doc comment, verbatim,
-/// as the property's JSON Schema `description` (ticket IDs, ADR numbers,
-/// internal test-name cross-references included) — would be pasted into
-/// every projection system prompt ([`projection_patch_prompt_messages`],
-/// [`projection_patch_repair_prompt_messages`]) and offered as the
-/// vLLM/mistral.rs structured-decoding grammar
-/// (`llm::executor::projection_api`). That is exactly the coupling this
-/// ticket was told to avoid rather than expose ("if adding the field to the
-/// draft type inevitably exposes it in the wire schema W2 owns, STOP and
-/// report the coupling rather than exposing it early"): the coupling is
-/// avoidable here, so it is stripped, not shipped.
+/// audio-graph-a6b5 W1 shipped `heading_level` DARK: declared on
+/// [`ProjectionOperation::UpsertNote`] (so fresh-ingest and replay could
+/// carry it end-to-end) but stripped out of every model-facing schema by a
+/// predecessor of this function, `hide_heading_level_from_draft_schema`,
+/// pending this ticket's dedicated prompt/schema-exposure work. W2 flips the
+/// field model-visible (delta A's operation guidance now names it by name;
+/// [`projection_patch_strict_json_schema`] now advertises it too) — but the
+/// field's own Rust doc comment is a long internal paragraph (ticket IDs, ADR
+/// numbers, internal test-name cross-references) that `schemars` would
+/// otherwise paste verbatim into every projection system prompt
+/// ([`projection_patch_prompt_messages`], [`projection_patch_repair_prompt_messages`])
+/// and offer as the vLLM/mistral.rs structured-decoding grammar
+/// (`llm::executor::projection_api`) as the property's JSON Schema
+/// `description`. That is pure prompt-token waste and an internal-implementation
+/// leak with no model-facing value, so this function NARROWS the property's
+/// description down to a short, model-useful sentence instead — it no longer
+/// removes the property (that would silently re-create W1's dark-ship
+/// contradiction design-b §1.8 named: the prompt telling a model a field
+/// exists that the schema forbids it from emitting).
 ///
 /// This is the same seam [`require_evidence_on_content_creating_operation_variants`]
 /// already uses to tighten this schema post-generation, and it does not
-/// weaken serde's tolerance for a model that emits the key anyway —
-/// `#[serde(default)]` on the field means an unadvertised `heading_level` key
-/// is still silently accepted (never rejected) on any route; this function
-/// only controls what the schema *advertises*, not what deserialization
-/// *tolerates*. W2 deletes this call (or narrows it) when it flips the field
-/// model-visible.
-fn hide_heading_level_from_draft_schema(schema: &mut serde_json::Value) {
+/// change serde's tolerance for a model that emits the key — `#[serde(default)]`
+/// on the field means an unadvertised (or shortened-description) `heading_level`
+/// key was, and still is, silently accepted (never rejected) on any route;
+/// this function only controls what the schema *advertises* as guidance, not
+/// what deserialization *tolerates*.
+fn shorten_heading_level_description_in_draft_schema(schema: &mut serde_json::Value) {
+    const SHORT_DESCRIPTION: &str = "Document heading depth for `title`: 2 (top-level \
+         section), 3 (subsection), or 4 (sub-subsection). Omit when this operation asserts no \
+         document structure at all.";
+
     let Some(variants) = schema
         .get_mut("$defs")
         .and_then(|defs| defs.get_mut("ProjectionOperation"))
@@ -381,17 +415,17 @@ fn hide_heading_level_from_draft_schema(schema: &mut serde_json::Value) {
     };
 
     for variant in variants {
-        let had_heading_level = variant
+        let Some(heading_level) = variant
             .get_mut("properties")
-            .and_then(|properties| properties.as_object_mut())
-            .map(|properties| properties.remove("heading_level").is_some())
-            .unwrap_or(false);
-        if !had_heading_level {
+            .and_then(|properties| properties.get_mut("heading_level"))
+            .and_then(|heading_level| heading_level.as_object_mut())
+        else {
             continue;
-        }
-        if let Some(required) = variant.get_mut("required").and_then(|r| r.as_array_mut()) {
-            required.retain(|field| field != "heading_level");
-        }
+        };
+        heading_level.insert(
+            "description".to_string(),
+            serde_json::Value::String(SHORT_DESCRIPTION.to_string()),
+        );
     }
 }
 
@@ -472,14 +506,19 @@ fn require_evidence_on_content_creating_operation_variants(schema: &mut serde_js
 ///    optional, so the model produced field-incomplete patches that only
 ///    failed at parse time. Here each variant lists its serde fields in
 ///    `required` with `additionalProperties: false`, matching the
-///    internally-tagged wire shape — with ONE deliberate exception:
-///    `upsert_note`'s `heading_level` (audio-graph-a6b5 W1) is a real serde
-///    field on `ProjectionOperation::UpsertNote` that this schema does NOT
-///    list at all, dark-shipped until W2's prompt/schema-exposure ticket (see
-///    the field's own doc comment in `projections.rs`). Rust `Option` fields
-///    that ARE advertised (`description`, `after_id`, `label`) stay required
-///    but nullable (`["string", "null"]`) so strict mode is satisfied without
-///    forcing the model to invent a value.
+///    internally-tagged wire shape. Rust `Option` fields that ARE advertised
+///    (`description`, `after_id`, `label`, and — as of audio-graph-a6b5 W2 —
+///    `upsert_note`'s `heading_level`) stay required but nullable
+///    (`["string", "null"]` / `["integer", "null"]`) so strict mode is
+///    satisfied without forcing the model to invent a value. `heading_level`
+///    was dark-shipped by W1 (omitted from this schema entirely, pending
+///    this ticket's dedicated prompt/schema-exposure work — see the field's
+///    own doc comment in `projections.rs`); W2 is the deliberate, reviewed
+///    flip, landed in the SAME commit as delta A's operation-guidance
+///    rewrite so the prompt and this schema agree about the field on the
+///    same tick (design-b §1.8's "silent regression" is a prompt that tells
+///    a model a field exists while the strict schema forbids it — never
+///    landing the two halves separately is how that is avoided).
 /// 3. **No numeric range / non-empty keywords.** The validator additionally
 ///    enforces `weight`/`confidence` in `0.0..=1.0` and non-empty trimmed
 ///    strings. Those are intentionally NOT encoded here: several strict-mode
@@ -506,6 +545,23 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
     }
     fn nullable_string() -> serde_json::Value {
         json!({ "type": ["string", "null"] })
+    }
+    // audio-graph-a6b5 W2: `heading_level` (`Option<u8>` on
+    // `ProjectionOperation::UpsertNote`) follows the exact same
+    // required-but-nullable posture as `nullable_string()` above, applied to
+    // an integer instead of a string. `minimum`/`maximum` mirror
+    // `normalize_projection_patch_draft_doc_structure`'s post-ingest `2..=4`
+    // clamp (design-b §1.4/§1.2) — a schema-enforced/strict-mode provider
+    // can then never emit a value that would need clamping in the first
+    // place. This does NOT close the gap on non-strict/native/vLLM routes,
+    // where this schema is advisory only and an out-of-`u8` or wrong-typed
+    // value still fails `serde_json::from_str::<ProjectionPatchDraft>` for
+    // the WHOLE draft (reviewer W2 fix-round finding; flagged as a
+    // seed-worthy follow-up rather than widening this fix into the shared
+    // `ProjectionOperation` deserializer, which canonical accepted-log replay
+    // also uses).
+    fn nullable_integer_2_to_4() -> serde_json::Value {
+        json!({ "type": ["integer", "null"], "minimum": 2, "maximum": 4 })
     }
     // seed audio-graph-e700 sub-fix 1 (SCHEMA BINDING): `entity_type` is
     // bound to `ontology::ENTITY_TYPES`'s closed ten-name enum at the
@@ -612,6 +668,7 @@ pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json:
                     ("title", string()),
                     ("body", string()),
                     ("tags", string_array()),
+                    ("heading_level", nullable_integer_2_to_4()),
                     ("evidence", evidence()),
                 ],
             ),
@@ -1141,12 +1198,37 @@ fn strip_delimiter_pairs(text: &str, delim: char, intraword_forbidden: bool) -> 
     out
 }
 
+/// Result of [`trusted_projection_patch_from_model_json`]: the trusted patch
+/// itself, plus the (ADR-0025-safe, count-only) no-op-filter metric
+/// (audio-graph-a6b5 W2 / design-b §1.5b) that the caller threads into the
+/// existing movement-facts/log surface — see `speech::mod::run_projection_job`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustedProjectionPatch {
+    pub patch: ProjectionPatch,
+    /// Count of `upsert_note` operations dropped at this admission because
+    /// their (title, body, tags, heading_level) tuple was byte-identical to
+    /// the admission-time materialized note under the same id. 0 when
+    /// `notes` was `None` (nothing to compare against) or for a Graph-kind
+    /// patch (no `upsert_note` operations exist there at all).
+    pub no_op_filtered_count: u32,
+}
+
+/// `notes` is the SAME live materialized-notes snapshot threaded to
+/// [`projection_patch_prompt_messages`] for this job — the admission-time
+/// state this trusted patch is about to be built against (audio-graph-a6b5
+/// W2 / design-b §1.5b, plumbing-corrected: design-b's own claim that this
+/// seam "already has the live materialized notes available" was FALSE as
+/// written — `ProjectionPatchBuildContext` carries sequence/route/prompt
+/// metadata only — so this parameter is the plumbing fix, threaded the same
+/// way `generate_projection_patch` already receives `notes_snapshot.clone()`
+/// from `run_projection_job`).
 pub fn trusted_projection_patch_from_model_json(
     raw: &str,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    notes: Option<&MaterializedNotes>,
     context: ProjectionPatchBuildContext,
-) -> Result<ProjectionPatch, ProjectionPatchDraftError> {
+) -> Result<TrustedProjectionPatch, ProjectionPatchDraftError> {
     // The SAME basis-covered set the repair prompt (`projection_patch_repair_prompt_messages`)
     // and the original draft prompt (`projection_patch_prompt_messages`) were
     // built from — resolving evidence against anything else would let a
@@ -1157,26 +1239,99 @@ pub fn trusted_projection_patch_from_model_json(
         .map(|event| (event.span_id.as_str(), event))
         .collect();
     let draft = parse_projection_patch_draft(raw, &job.kind, &basis)?;
-    Ok(ProjectionPatch {
-        sequence: context.sequence,
-        kind: job.kind.clone(),
-        llm_request_id: context.llm_request_id,
-        basis: job.basis.clone(),
-        operations: draft.operations,
-        confidence: draft.confidence.unwrap_or(1.0),
-        provenance: ProjectionProvenance {
-            provider: context.provider,
-            model: context.model,
-            prompt_id: context.prompt_id,
-            route_id: context.route_id,
-            model_source: context.model_source,
+    let (operations, no_op_filtered_count) = filter_no_op_upsert_notes(draft.operations, notes);
+    Ok(TrustedProjectionPatch {
+        patch: ProjectionPatch {
+            sequence: context.sequence,
+            kind: job.kind.clone(),
+            llm_request_id: context.llm_request_id,
+            basis: job.basis.clone(),
+            operations,
+            confidence: draft.confidence.unwrap_or(1.0),
+            provenance: ProjectionProvenance {
+                provider: context.provider,
+                model: context.model,
+                prompt_id: context.prompt_id,
+                route_id: context.route_id,
+                model_source: context.model_source,
+            },
+            route: context.route,
+            queued_at_ms: Some(job.queued_at_ms),
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: context.created_at_ms,
         },
-        route: context.route,
-        queued_at_ms: Some(job.queued_at_ms),
-        generation_latency_ms: None,
-        apply_latency_ms: None,
-        created_at_ms: context.created_at_ms,
+        no_op_filtered_count,
     })
+}
+
+/// The ingest no-op filter (audio-graph-a6b5 W2 / design-b §1.5b): drops any
+/// `upsert_note` operation whose `(title, body, tags, heading_level)` tuple —
+/// AFTER [`normalize_projection_patch_draft_doc_structure`]'s clamp/grammar
+/// normalization has already run inside [`parse_projection_patch_draft`] —
+/// is byte-identical to the admission-time materialized note under the same
+/// id. Every other operation kind passes through untouched.
+///
+/// Fresh-ingest-only, exactly like the ontology and doc-structure normalizers
+/// at the same seam: this runs once, on a freshly-parsed model draft, never
+/// on replay (replay re-derives materialized state from whatever the
+/// accepted log already contains — rewriting a HISTORICAL patch's operation
+/// list here would make replay depend on today's comparison instead of the
+/// comparison in force when that patch was accepted).
+///
+/// A note absent from `notes` (a genuinely new id, or `notes == None`
+/// entirely) is never filtered — there is nothing to compare it against, and
+/// `None` must never be treated as "every note is unchanged."
+///
+/// CRITICAL (design-b's own verified trap): the caller MUST still persist the
+/// resulting patch even when every operation filters to empty.
+/// `derive_coverage_heads` (`projection_scheduler.rs`) picks the max-`sequence`
+/// patch **per kind, blind to operation count** — so an `operations: []`
+/// patch still advances that lane's coverage head correctly, and
+/// `MaterializedNotes::apply_patch` commits `last_sequence` unconditionally
+/// (the `for` loop over operations simply does not run). Suppressing an
+/// all-filtered patch instead would leave the coverage head un-advanced, and
+/// the next `observe_ledger` tick would re-queue the exact same basis
+/// forever. This function only trims `operations`; it must never be paired
+/// with a caller that then skips persisting the (possibly empty) result — see
+/// `empty_ops_projection_patch_advances_the_coverage_head_through_derive_and_apply`
+/// in `projection_scheduler.rs` for the fixture that pins this.
+fn filter_no_op_upsert_notes(
+    operations: Vec<ProjectionOperation>,
+    notes: Option<&MaterializedNotes>,
+) -> (Vec<ProjectionOperation>, u32) {
+    let Some(notes) = notes else {
+        return (operations, 0);
+    };
+    let mut filtered_count: u32 = 0;
+    let kept = operations
+        .into_iter()
+        .filter(|operation| {
+            let ProjectionOperation::UpsertNote {
+                id,
+                title,
+                body,
+                tags,
+                heading_level,
+                ..
+            } = operation
+            else {
+                return true;
+            };
+            let Some(existing) = notes.notes.iter().find(|note| &note.id == id) else {
+                return true;
+            };
+            let unchanged = existing.title == *title
+                && existing.body == *body
+                && existing.tags == *tags
+                && existing.heading_level == *heading_level;
+            if unchanged {
+                filtered_count += 1;
+            }
+            !unchanged
+        })
+        .collect();
+    (kept, filtered_count)
 }
 
 /// Content-free description of what the projection prompt for `job` would
@@ -1195,15 +1350,22 @@ pub struct ProjectionPromptShape {
     /// Character count of the pinned typed-fact block (graph/transcript-derived
     /// context). 0 when absent.
     pub pinned_fact_chars: u64,
-    /// Character count of the Notes-kind live notes-state snapshot block
-    /// (seed audio-graph-253c), content-free like the other fields here. 0
-    /// when the caller passed `notes: None` (no block rendered at all — see
-    /// [`projection_patch_prompt_messages`]) or for a Graph-kind job.
+    /// Character count of the Notes-kind live document-order outline block
+    /// (seed audio-graph-253c; outline replacing the old recency-sorted
+    /// snapshot as of audio-graph-a6b5 W2), content-free like the other
+    /// fields here. 0 when the caller passed `notes: None` (no block rendered
+    /// at all — see [`projection_patch_prompt_messages`]) or for a Graph-kind
+    /// job. Field name kept from the pre-W2 snapshot on purpose: this feeds
+    /// the ADR-0025 §2g data-movement ledger
+    /// (`projection_data_movement::ProjectionMovementFacts`), which stays a
+    /// counts-only artifact regardless of what produced the count.
     pub notes_snapshot_chars: u64,
-    /// Number of existing notes rendered into the snapshot block (capped at
-    /// [`NOTES_SNAPSHOT_MAX_ENTRIES`]; the true total may be larger — see the
-    /// snapshot's own trailing count line). 0 under the same conditions as
-    /// `notes_snapshot_chars`.
+    /// Number of sections that actually got a heading line in the outline
+    /// block (== the session's total note count unless
+    /// [`DOC_OUTLINE_MAX_CHARS`]'s degradation path had to drop some — see
+    /// [`render_document_outline_with_shown_count`]'s trailing count line,
+    /// which always reports the true total even when this field is smaller).
+    /// 0 under the same conditions as `notes_snapshot_chars`.
     pub notes_snapshot_entries: u32,
 }
 
@@ -1236,10 +1398,10 @@ pub fn projection_prompt_shape_with_notes(
     let pinned = pinned_typed_facts(&events);
     let pinned_chars: usize = pinned.iter().map(|line| line.chars().count()).sum();
     let (notes_snapshot_chars, notes_snapshot_entries) = match notes {
-        Some(notes) if job.kind == ProjectionKind::Notes && !notes.notes.is_empty() => (
-            render_notes_snapshot(notes).chars().count() as u64,
-            notes.notes.len().min(NOTES_SNAPSHOT_MAX_ENTRIES) as u32,
-        ),
+        Some(notes) if job.kind == ProjectionKind::Notes && !notes.notes.is_empty() => {
+            let (block, shown) = render_document_outline_with_shown_count(notes);
+            (block.chars().count() as u64, shown)
+        }
         _ => (0, 0),
     };
     ProjectionPromptShape {
@@ -1252,16 +1414,16 @@ pub fn projection_prompt_shape_with_notes(
 
 /// `notes` is the current Notes projection materialization (seed
 /// audio-graph-253c), when the caller actually has it. `Some(&materialized)`
-/// renders the live "Current notes state" block (via
-/// [`render_notes_snapshot`]) for `ProjectionKind::Notes` jobs — an empty
-/// `MaterializedNotes` there is a truthful "no notes yet" (the caller
+/// renders the live "Document outline" block (via
+/// [`render_document_outline`]) for `ProjectionKind::Notes` jobs — an empty
+/// `MaterializedNotes` there is a truthful "no sections yet" (the caller
 /// affirmatively knows the session has none). `None` means the caller cannot
 /// currently supply the real notes state — the live production call site
 /// (`llm/executor.rs`'s `run_projection_patch_dispatch`) passes `None` only
 /// for a Graph-kind job or a Notes-kind snapshot that failed the session-
 /// identity check (see this module's top-of-file doc and
 /// `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`) — and
-/// OMITS the block entirely rather than rendering a fabricated "(no notes
+/// OMITS the block entirely rather than rendering a fabricated "(no sections
 /// yet)" that would be indistinguishable from a real empty session and would
 /// license the model to mint ids as if none existed. Graph kind never renders
 /// this block regardless of `notes` (seed e700's lane).
@@ -1292,19 +1454,43 @@ pub fn projection_patch_prompt_messages(
         // variable into the theoretically-stable system message and bust the
         // cache prefix (ADR-0025 §2d). It is phrased to stay honest either
         // way instead: a conditional "if a block appears" claim, not an
-        // unconditional "this prompt includes" claim, since the "Current
-        // notes state" block is only rendered below when `notes` is `Some`
-        // (see the doc comment above and this function's `notes == None`
-        // comment further down).
+        // unconditional "this prompt includes" claim, since the "Document
+        // outline" block is only rendered below when `notes` is `Some` (see
+        // the doc comment above and this function's `notes == None` comment
+        // further down).
+        //
+        // audio-graph-a6b5 W2 / design-b §2.1 (delta A), replacing the old
+        // per-utterance quote-capture guidance wholesale. Five behavior
+        // changes, each traceable to a measured defect (session c95d21e6):
+        // section-not-card (93/93 final notes were single-utterance verbatim
+        // quote captures), topic-not-quote (same), emit-only-deltas (72% of
+        // repeat upserts carried zero net information), prefer-new-subsection
+        // -over-rewrite (body oscillation instead of accretion), and
+        // `{"operations": []}` being explicitly legal (nothing in the old
+        // prompt ever said this, so a model with nothing to add invented
+        // something). `heading_level` is now mentioned by name — this is the
+        // schema-exposure half of this same ticket (see
+        // `projection_patch_draft_json_schema` / `projection_patch_strict_json_schema`).
         ProjectionKind::Notes => {
-            "Use only upsert_note, delete_note, and reorder_note operations. If a \"Current \
-             notes state\" block appears below, it lists every existing note's id, title, and \
-             a one-line body summary — check it before minting an id: if a note there already \
-             covers this topic, upsert_note with THAT SAME id to refine it in place; only use \
-             an id absent from that block when the note is genuinely new. If no such block \
-             appears, you have no visibility into already-existing note ids this tick, so only \
-             mint a new id when you are confident this is a genuinely new topic. Keep stable \
-             note ids when refining earlier notes."
+            "Use only upsert_note, delete_note, and reorder_note operations. Maintain ONE \
+             living markdown document for this session. Each upsert_note is one document \
+             SECTION: `title` is the section heading, `heading_level` is its depth (2 = \
+             top-level section, 3 = subsection, 4 = sub-subsection), and `body` is that \
+             section's content as plain lines and `- ` bullets, indenting two spaces per \
+             nesting level, at most two levels deep. Never put headings, links, bold, or code \
+             fences in `body`. Section order IS document order: reorder_note moves a section, \
+             delete_note removes one. A section is a TOPIC that accumulates across many turns \
+             — never one section per utterance and never one section per quote. On each tick \
+             emit an operation ONLY for a section whose title, body, tags, or heading_level \
+             actually changes; re-emitting an unchanged section is a defect. To add one point \
+             to an existing topic, prefer adding a short new subsection under it over \
+             rewriting a long section. If a \"Document outline\" block appears below, it lists \
+             every existing section id in document order with its heading and depth — reuse \
+             those ids exactly, and mint a new id only for a genuinely new topic. If no such \
+             block appears, you have no visibility into already-existing section ids this \
+             tick, so only mint a new id when you are confident this is a genuinely new topic. \
+             Keep stable section ids when refining earlier sections. If this turn adds nothing \
+             to the document, return {\"operations\": []}."
         }
         ProjectionKind::Graph => {
             "Use only graph operations: upsert_graph_node, remove_graph_node, invalidate_graph_node, upsert_graph_edge, remove_graph_edge, invalidate_graph_edge, strengthen_graph_edge, weaken_graph_edge, merge_graph_nodes, and split_graph_node. Upsert nodes before edges that reference them. Prefer retcon operations over duplicate nodes when later transcript context corrects earlier assumptions."
@@ -1367,7 +1553,7 @@ pub fn projection_patch_prompt_messages(
 
     // `notes == None`: the caller does not have the live notes state (see
     // the doc comment above) — the message is omitted rather than rendered
-    // with a fabricated "(no notes yet)" body, since that would be
+    // with a fabricated "(no sections yet)" body, since that would be
     // indistinguishable from a real empty session and would license the
     // model to mint ids as if none existed.
     if job.kind == ProjectionKind::Notes
@@ -1375,12 +1561,7 @@ pub fn projection_patch_prompt_messages(
     {
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: format!(
-                "Current notes state (existing note ids — reuse one of these exactly when \
-                 refining or extending that SAME note; only mint a new id for a genuinely new \
-                 note):\n{notes_block}",
-                notes_block = render_notes_snapshot(notes),
-            ),
+            content: render_document_outline(notes),
         });
     }
 
@@ -1413,10 +1594,11 @@ pub fn projection_patch_prompt_messages(
 /// to the summary. Derived deterministically from the basis events so the block
 /// is byte-stable across turns (append-only), keeping the cache prefix intact.
 /// This is transcript-derived (not a live notes/graph snapshot) to keep this
-/// helper's `&[TranscriptEvent]`-only seam intact. The Notes-kind live notes
-/// snapshot (seed audio-graph-253c) is a SEPARATE block, rendered by
-/// [`render_notes_snapshot`] from the `notes: Option<&MaterializedNotes>`
-/// parameter [`projection_patch_prompt_messages`] takes. As of seed
+/// helper's `&[TranscriptEvent]`-only seam intact. The Notes-kind live
+/// document outline (seed audio-graph-253c, replaced by audio-graph-a6b5 W2)
+/// is a SEPARATE block, rendered by [`render_document_outline`] from the
+/// `notes: Option<&MaterializedNotes>` parameter [`projection_patch_prompt_messages`]
+/// takes. As of seed
 /// audio-graph-253c part 2 the live production dispatch path passes
 /// `Some(&snapshot)` for every Notes-kind tick that can confirm its own
 /// session identity (see this module's top-of-file doc), closing the seam
@@ -1441,72 +1623,155 @@ fn pinned_typed_facts(events: &[TranscriptEvent]) -> Vec<String> {
     facts
 }
 
-/// Render the live Notes-kind notes state into a bounded, deterministic block
-/// (seed audio-graph-253c): every upsert the model emits full-replaces a note
-/// by id (`MaterializedNotes::upsert_note`), but the prompt never showed which
-/// ids already existed, so a model that could not see id `note-1` re-minted it
-/// blind on every tick — measured field impact: 83 patches / 293 upserts over
-/// only 23 final ids in one 16m41s session, 94% of upserts landing on six id
-/// slots, note-1 rewritten 77 times. This block is what makes "keep stable
-/// note ids" (the existing prompt instruction) actually followable.
+/// Header line shared by every non-empty [`render_document_outline`] render —
+/// pulled out as a constant so the operation guidance's literal quote of it
+/// ("If a \"Document outline\" block appears below...") and the render
+/// function can never drift apart.
+const DOC_OUTLINE_HEADER: &str = "Document outline (section ids in document order — reuse \
+     exactly; mint a new id only for a genuinely new topic):";
+
+/// Render the live Notes-kind document state into a bounded, deterministic,
+/// DOCUMENT-ORDER outline (audio-graph-a6b5 W2 / design-b §2.3), replacing the
+/// old recency-sorted `render_notes_snapshot`.
+///
+/// Why document order, not recency: `MaterializedNotes.notes` is itself an
+/// ordered `Vec` that `reorder_note` maintains by index — that Vec order IS
+/// the document's real display order. The old snapshot sorted by
+/// `updated_by_sequence` descending instead, and its own doc comment flagged
+/// the resulting hazard: a `reorder_note` the model emitted from reading that
+/// block would target the real Vec order, not the recency order shown to it.
+/// Measured consequence: `reorder_note` was used **zero** times in the field
+/// data this ticket's prompt rewrite (delta A) is trying to make followable —
+/// a model cannot maintain a structure it is shown scrambled. This function
+/// fixes that by walking `notes.notes` in its own order and never resorting
+/// it for display (only [`DOC_OUTLINE_PREVIEW_SECTIONS`]'s preview-eligibility
+/// check below uses recency, and only to choose which ALREADY-ordered heading
+/// lines get an extra preview line, never to reorder the headings themselves).
+///
+/// Every upsert the model emits full-replaces a note by id
+/// (`MaterializedNotes::upsert_note`), but the prompt must show which ids
+/// already exist for "keep stable ids" (delta A's prompt instruction) to be
+/// followable at all — measured field impact before this existed at all
+/// (seed audio-graph-253c): 83 patches / 293 upserts over only 23 final ids
+/// in one 16m41s session, 94% of upserts landing on six id slots, one note
+/// rewritten 77 times.
 ///
 /// Lives in the prompt's per-job VARIABLE region (after the cache-stable
 /// prefix, `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`), because unlike
-/// `pinned_typed_facts` this is NOT append-only — an existing note's title/body
-/// can be rewritten in place, so folding it into the byte-stable prefix would
-/// bust the prompt cache on every note edit.
+/// `pinned_typed_facts` this is NOT append-only — an existing section's
+/// title/body can be rewritten in place, so folding it into the byte-stable
+/// prefix would bust the prompt cache on every section edit.
 ///
-/// Selection is most-recently-updated first (`updated_by_sequence` descending,
-/// ties broken by id for determinism), capped at
-/// [`NOTES_SNAPSHOT_MAX_ENTRIES`]; a session with more notes than the cap
-/// still gets every note ID **shown or counted**, never silently dropped: the
-/// cut is one deterministic total-order truncation, and the trailing count
-/// line reports the true total so the model is never told a capped session is
-/// complete.
-///
-/// NOTE on ordering vs. `reorder_note`: this list is recency-ordered, which is
-/// NOT necessarily the notes' actual display order (`MaterializedNotes.notes`
-/// is itself an ordered `Vec` that `reorder_note` maintains by index). A
-/// `reorder_note { id, after_id }` operation the model emits from reading this
-/// block targets that real Vec order, not the recency order shown here.
-fn render_notes_snapshot(notes: &MaterializedNotes) -> String {
+/// Degradation when the whole block would exceed [`DOC_OUTLINE_MAX_CHARS`]:
+/// first drop every preview line (all sections keep their heading line),
+/// then — only if STILL over budget — drop heading lines one at a time from
+/// the LEAST-recently-changed end (oldest `updated_by_sequence` first),
+/// preserving document order among whichever headings remain. Either way the
+/// trailing count line always reports the TRUE total, so a section is always
+/// shown or counted, never silently dropped (seed audio-graph-253c's original
+/// guarantee, carried forward at the new char-budget granularity).
+fn render_document_outline(notes: &MaterializedNotes) -> String {
+    render_document_outline_with_shown_count(notes).0
+}
+
+/// [`render_document_outline`], widened to also report how many sections
+/// actually got a heading line in the returned block (== the total unless the
+/// char-budget degradation path had to drop some from the least-recently-
+/// changed end). [`projection_prompt_shape_with_notes`] uses the count half
+/// of this for `notes_snapshot_entries` — see that field's doc comment for
+/// why this must reflect what was ACTUALLY sent, not the session's raw note
+/// count, mirroring the old snapshot's own `NOTES_SNAPSHOT_MAX_ENTRIES` cap
+/// reporting.
+fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (String, u32) {
     if notes.notes.is_empty() {
-        return "(no notes yet)".to_string();
+        return (format!("{DOC_OUTLINE_HEADER}\n(no sections yet)"), 0);
     }
 
-    let total = notes.notes.len();
-    let mut ordered: Vec<&MaterializedNote> = notes.notes.iter().collect();
-    ordered.sort_by(|a, b| {
+    let doc_order: Vec<&MaterializedNote> = notes.notes.iter().collect();
+    let total = doc_order.len();
+
+    // Recency rank (0 = most recently changed), used ONLY to decide (a) which
+    // headings get a preview line and (b) which headings get dropped first
+    // under the char budget — never to reorder the headings themselves.
+    let mut by_recency: Vec<&MaterializedNote> = doc_order.clone();
+    by_recency.sort_by(|a, b| {
         b.updated_by_sequence
             .cmp(&a.updated_by_sequence)
             .then_with(|| a.id.cmp(&b.id))
     });
-    let shown = ordered.len().min(NOTES_SNAPSHOT_MAX_ENTRIES);
-
-    let mut lines: Vec<String> = ordered[..shown]
+    let recency_rank: BTreeMap<&str, usize> = by_recency
         .iter()
-        .map(|note| {
-            format!(
-                "- id: {} | title: {} | body: {}",
-                one_line_bounded(&note.id, NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS),
-                one_line_bounded(&note.title, NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS),
-                one_line_bounded(&note.body, NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS)
-            )
-        })
+        .enumerate()
+        .map(|(rank, note)| (note.id.as_str(), rank))
         .collect();
 
-    if total > shown {
-        lines.push(format!(
-            "(+{} more existing note(s) not shown; {total} total)",
-            total - shown
-        ));
-    }
+    let render = |include_previews: bool, shown_count: usize| -> (String, u32) {
+        let mut lines = vec![DOC_OUTLINE_HEADER.to_string()];
+        let mut shown = 0usize;
+        for note in &doc_order {
+            let rank = recency_rank[note.id.as_str()];
+            if rank >= shown_count {
+                continue;
+            }
+            shown += 1;
+            let heading_level = note.heading_level.unwrap_or(3);
+            let bullets = note
+                .body
+                .lines()
+                .filter(|line| line.trim_start().starts_with('-'))
+                .count();
+            let chars = note.body.chars().count();
+            lines.push(format!(
+                "[{}] h{heading_level}  {} · {bullets} bullet{plural} · {chars} chars",
+                one_line_bounded(&note.id, DOC_OUTLINE_ID_MAX_CHARS),
+                one_line_bounded(&note.title, DOC_OUTLINE_TITLE_MAX_CHARS),
+                plural = if bullets == 1 { "" } else { "s" },
+            ));
+            if include_previews && rank < DOC_OUTLINE_PREVIEW_SECTIONS {
+                let last_line = note.body.lines().next_back().unwrap_or(&note.body);
+                lines.push(format!(
+                    "     recent: \"{}\"",
+                    one_line_bounded(last_line, DOC_OUTLINE_PREVIEW_MAX_CHARS)
+                ));
+            }
+        }
+        lines.push(if shown == total {
+            format!("{total} section(s) total.")
+        } else {
+            format!(
+                "{total} section(s) total; only the {shown} most recently changed shown above \
+                 (their ids are correct; the rest are omitted, not renamed)."
+            )
+        });
+        (lines.join("\n"), shown as u32)
+    };
 
-    lines.join("\n")
+    // Attempt 1: everything. Attempt 2: drop all previews. Attempt 3: also
+    // shrink the shown-heading count from the least-recently-changed end
+    // until the block fits (or there is nothing left to show).
+    let full = render(true, total);
+    if full.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+        return full;
+    }
+    let headings_only = render(false, total);
+    if headings_only.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+        return headings_only;
+    }
+    let mut shown_count = total;
+    loop {
+        if shown_count == 0 {
+            return render(false, 0);
+        }
+        let candidate = render(false, shown_count);
+        if candidate.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+            return candidate;
+        }
+        shown_count -= 1;
+    }
 }
 
 /// One bounded, single-line rendering of a model-authored field (note id,
-/// title, or body) for [`render_notes_snapshot`]. Collapses embedded
+/// title, or body) for [`render_document_outline`]. Collapses embedded
 /// newlines/whitespace and truncates to `max_chars`.
 ///
 /// `id` and `title` are `String`s with no length or newline validation
@@ -1973,8 +2238,9 @@ mod tests {
         })
         .to_string();
 
-        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
-            .expect("valid patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+            .expect("valid patch")
+            .patch;
 
         assert_eq!(patch.sequence, 7);
         assert_eq!(patch.kind, ProjectionKind::Notes);
@@ -2057,7 +2323,7 @@ mod tests {
         // `ProjectionPatchDraft` is `deny_unknown_fields`, so the draft is rejected
         // outright rather than partially honored — the new `route_id` / `route`
         // fields inherit that boundary instead of widening it.
-        let error = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+        let error = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
             .expect_err("a draft carrying trusted route metadata must be rejected");
         assert!(
             matches!(
@@ -2086,7 +2352,7 @@ mod tests {
         })
         .to_string();
 
-        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
             .expect_err("wrong operation kind");
 
         assert_eq!(
@@ -2159,8 +2425,9 @@ mod tests {
         })
         .to_string();
 
-        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
-            .expect("graph patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+            .expect("graph patch")
+            .patch;
 
         assert_eq!(patch.kind, ProjectionKind::Graph);
         assert_eq!(patch.operations.len(), 3);
@@ -2193,8 +2460,9 @@ mod tests {
         })
         .to_string();
 
-        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
-            .expect("invented entity_type must not be rejected outright");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+            .expect("invented entity_type must not be rejected outright")
+            .patch;
 
         assert!(matches!(
             patch.operations.first(),
@@ -2226,8 +2494,9 @@ mod tests {
         })
         .to_string();
 
-        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
-            .expect("valid patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+            .expect("valid patch")
+            .patch;
 
         assert!(matches!(
             patch.operations.first(),
@@ -2280,8 +2549,9 @@ mod tests {
         })
         .to_string();
 
-        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
-            .expect("valid patch");
+        let patch = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+            .expect("valid patch")
+            .patch;
 
         assert!(matches!(
             patch.operations.last(),
@@ -2511,9 +2781,15 @@ mod tests {
             }]
         })
         .to_string();
-        let first_patch =
-            trusted_projection_patch_from_model_json(&first_raw, &first_job, &ledger, context())
-                .expect("first note patch");
+        let first_patch = trusted_projection_patch_from_model_json(
+            &first_raw,
+            &first_job,
+            &ledger,
+            None,
+            context(),
+        )
+        .expect("first note patch")
+        .patch;
 
         ledger
             .apply_event(event(
@@ -2541,9 +2817,11 @@ mod tests {
             &second_raw,
             &second_job,
             &ledger,
+            None,
             second_context,
         )
-        .expect("retcon note patch");
+        .expect("retcon note patch")
+        .patch;
 
         assert!(matches!(
             first_patch.operations.first(),
@@ -2578,9 +2856,15 @@ mod tests {
             }]
         })
         .to_string();
-        let first_patch =
-            trusted_projection_patch_from_model_json(&first_raw, &first_job, &ledger, context())
-                .expect("first graph patch");
+        let first_patch = trusted_projection_patch_from_model_json(
+            &first_raw,
+            &first_job,
+            &ledger,
+            None,
+            context(),
+        )
+        .expect("first graph patch")
+        .patch;
 
         ledger
             .apply_event(event(
@@ -2608,9 +2892,11 @@ mod tests {
             &second_raw,
             &second_job,
             &ledger,
+            None,
             second_context,
         )
-        .expect("updated graph patch");
+        .expect("updated graph patch")
+        .patch;
 
         assert!(matches!(
             first_patch.operations.first(),
@@ -2920,10 +3206,175 @@ mod tests {
         assert!(after[3].content.contains("not production"));
     }
 
+    /// audio-graph-a6b5 W2: `heading_level` is now model-visible (delta A
+    /// names it in the operation guidance, both schemas advertise it), which
+    /// is exactly the kind of change that COULD tempt a future edit into
+    /// branching the system prompt on a per-tick value. Pins that a tick-2
+    /// materialization with a DIFFERENT `heading_level` on the same note id
+    /// still leaves messages `[0]`/`[1]` byte-identical to tick 1 — the
+    /// prefix stays stable across a variable-content dimension this ticket
+    /// specifically added, mirroring
+    /// `notes_snapshot_placement_never_busts_the_cache_stable_prefix` above
+    /// for the pre-existing body-content dimension.
+    #[test]
+    fn heading_level_change_between_ticks_never_busts_the_stable_prefix() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+
+        let mut notes_v1 = empty_notes();
+        notes_v1
+            .apply_patch(
+                &notes_patch_with_heading(1, "note:1", "Choice", "- Alice chose Soniox.", 2),
+                None,
+            )
+            .expect("apply first note version");
+        let before = projection_patch_prompt_messages(&job, &ledger, Some(&notes_v1))
+            .expect("prompt with first note version");
+
+        // SAME note id, SAME body/title, only `heading_level` changed (2 -> 4).
+        let mut notes_v2 = notes_v1.clone();
+        notes_v2
+            .apply_patch(
+                &notes_patch_with_heading(2, "note:1", "Choice", "- Alice chose Soniox.", 4),
+                None,
+            )
+            .expect("apply re-nested note version");
+        let after = projection_patch_prompt_messages(&job, &ledger, Some(&notes_v2))
+            .expect("prompt with re-nested note version");
+
+        assert_eq!(
+            before[0].content, after[0].content,
+            "system block (message 0) must stay byte-identical when only heading_level changes"
+        );
+        assert_eq!(
+            before[1].content, after[1].content,
+            "pinned-facts/summary block (message 1) must stay byte-identical when only \
+             heading_level changes"
+        );
+        // The outline message (message 3) DOES change — the depth marker
+        // must actually reflect the new heading_level.
+        assert_ne!(
+            before[3].content, after[3].content,
+            "outline message must reflect the changed heading_level"
+        );
+        assert!(before[3].content.contains("h2"));
+        assert!(after[3].content.contains("h4"));
+    }
+
+    /// Reviewer adversarial-mutation finding (W2 fix round): every existing
+    /// prefix-stability test above holds the note COUNT constant across the
+    /// two compared ticks (`stable_prefix_is_byte_identical_across_appended_turns`
+    /// uses `empty_notes()` both ticks;
+    /// `notes_snapshot_placement_never_busts_the_cache_stable_prefix` and
+    /// `heading_level_change_between_ticks_never_busts_the_stable_prefix` both
+    /// hold exactly one note both ticks). A mutant that appended
+    /// `notes.map_or(0, |n| n.notes.len())` into the system message
+    /// (`messages[0]`) — leaking a per-tick variable into the theoretically
+    /// stable cache anchor, exactly the class the doc comment above
+    /// [`projection_patch_prompt_messages`] warns against — survived every one
+    /// of them. This test varies the count itself: a 1-section tick compared
+    /// to a 2-section tick over the SAME ledger/job, plus a `None`-vs-`Some`
+    /// comparison, so a section being ADDED between ticks (the most common
+    /// tick-over-tick change in this feature) cannot silently bust the cache.
+    #[test]
+    fn note_count_change_between_ticks_never_busts_the_stable_prefix() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+
+        let mut notes_one = empty_notes();
+        notes_one
+            .apply_patch(
+                &notes_patch(1, "note:1", "Choice", "Alice chose Soniox."),
+                None,
+            )
+            .expect("apply first section");
+        let one_section = projection_patch_prompt_messages(&job, &ledger, Some(&notes_one))
+            .expect("prompt with one section");
+
+        // SAME ledger/job/basis — only a brand-new second section (different
+        // id) was added to the materialized notes between ticks.
+        let mut notes_two = notes_one.clone();
+        notes_two
+            .apply_patch(
+                &notes_patch(2, "note:2", "Provider decision", "Bob chose Postgres."),
+                None,
+            )
+            .expect("apply second section");
+        let two_sections = projection_patch_prompt_messages(&job, &ledger, Some(&notes_two))
+            .expect("prompt with two sections");
+
+        assert_eq!(
+            one_section[0].content, two_sections[0].content,
+            "system block (message 0) must stay byte-identical when only the \
+             note COUNT changes between ticks"
+        );
+        assert_eq!(
+            one_section[1].content, two_sections[1].content,
+            "pinned-facts/summary block (message 1) must stay byte-identical \
+             when only the note COUNT changes between ticks"
+        );
+        // The outline message (message 3) DOES change — proving the count
+        // change is actually visible where it is supposed to be, so this
+        // isn't a vacuous pass from a broken fixture.
+        assert_ne!(
+            one_section[3].content, two_sections[3].content,
+            "outline message must reflect the newly-added second section"
+        );
+        assert!(two_sections[3].content.contains("Provider decision"));
+
+        // Belt-and-suspenders: `notes: None` vs `notes: Some(_)` is an even
+        // starker count change (0 vs 1) and must clear the same bar.
+        let none_tick = projection_patch_prompt_messages(&job, &ledger, None)
+            .expect("prompt with notes state absent");
+        assert_eq!(
+            none_tick[0].content, one_section[0].content,
+            "system block (message 0) must stay byte-identical between a \
+             notes:None tick and a notes:Some(_) tick"
+        );
+        assert_eq!(
+            none_tick[1].content, one_section[1].content,
+            "pinned-facts/summary block (message 1) must stay byte-identical \
+             between a notes:None tick and a notes:Some(_) tick"
+        );
+    }
+
     /// Helper: a one-operation Notes patch, used to build a
     /// `MaterializedNotes` fixture by direct `apply_patch` calls (no ledger,
     /// no LLM route — pure, synchronous, no cross-thread state).
     fn notes_patch(sequence: u64, id: &str, title: &str, body: &str) -> ProjectionPatch {
+        notes_patch_with_heading(sequence, id, title, body, None)
+    }
+
+    /// Widened form of [`notes_patch`] that also sets `heading_level`
+    /// (audio-graph-a6b5 W2), for fixtures that need to exercise the
+    /// now-model-visible field end to end.
+    fn notes_patch_with_heading(
+        sequence: u64,
+        id: &str,
+        title: &str,
+        body: &str,
+        heading_level: impl Into<Option<u8>>,
+    ) -> ProjectionPatch {
+        notes_patch_full(sequence, id, title, body, &[], heading_level)
+    }
+
+    /// Fully-widened form of [`notes_patch`] that also sets `tags` and
+    /// `heading_level` (audio-graph-a6b5 W2), for fixtures exercising the
+    /// no-op filter's four-field comparison end to end.
+    fn notes_patch_full(
+        sequence: u64,
+        id: &str,
+        title: &str,
+        body: &str,
+        tags: &[&str],
+        heading_level: impl Into<Option<u8>>,
+    ) -> ProjectionPatch {
         ProjectionPatch {
             route: None,
             sequence,
@@ -2942,9 +3393,9 @@ mod tests {
                 id: id.to_string(),
                 title: title.to_string(),
                 body: body.to_string(),
-                tags: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
                 evidence: crate::claim_evidence::EvidenceAnchor::default(),
-                heading_level: None,
+                heading_level: heading_level.into(),
             }],
             confidence: 1.0,
             provenance: ProjectionProvenance {
@@ -2999,7 +3450,7 @@ mod tests {
                 .any(|m| m.content.contains("note:decision")),
             "Notes-kind prompt must show the existing note's id somewhere"
         );
-        assert!(notes_messages[3].content.contains("Current notes state"));
+        assert!(notes_messages[3].content.contains("Document outline"));
         assert!(notes_messages[3].content.contains("note:decision"));
         assert!(notes_messages[3].content.contains("Provider decision"));
 
@@ -3020,7 +3471,7 @@ mod tests {
         assert!(
             graph_messages
                 .iter()
-                .all(|m| !m.content.contains("Current notes state")),
+                .all(|m| !m.content.contains("Document outline")),
             "the snapshot block itself must be absent, not merely empty, for Graph kind"
         );
     }
@@ -3058,11 +3509,13 @@ mod tests {
         assert!(
             messages[1..]
                 .iter()
-                .all(|m| !m.content.contains("Current notes state")),
+                .all(|m| !m.content.contains("Document outline")),
             "notes=None must render no per-tick notes-state message, got: {messages:?}"
         );
         assert!(
-            messages.iter().all(|m| !m.content.contains("no notes yet")),
+            messages
+                .iter()
+                .all(|m| !m.content.contains("no sections yet")),
             "notes=None must never fabricate a \"(no notes yet)\" claim, got: {messages:?}"
         );
     }
@@ -3114,17 +3567,57 @@ mod tests {
         assert_eq!(graph_shape.notes_snapshot_chars, 0);
     }
 
-    /// A session with more notes than [`NOTES_SNAPSHOT_MAX_ENTRIES`] still
-    /// gets a bounded block: every note beyond the cap is folded into one
-    /// trailing count line rather than growing the prompt unbounded.
+    /// audio-graph-a6b5 W2 / design-b §2.3: the outline's PRIMARY axis is
+    /// document order (`MaterializedNotes.notes`'s own `Vec` order, the same
+    /// order `reorder_note` maintains), never recency — the old
+    /// `render_notes_snapshot`'s own doc comment flagged this as a hazard
+    /// (a `reorder_note` the model emits from reading a recency-ordered list
+    /// targets the real Vec order, not what it was shown), and it explains
+    /// the field data's measured **zero** `reorder_note` uses. This is the
+    /// direct inversion of the old snapshot's
+    /// `notes_snapshot_has_stable_deterministic_ordering` test, which pinned
+    /// recency ordering as correct; it is now the wrong order to pin.
     #[test]
-    fn notes_snapshot_is_bounded_at_the_cap_with_a_count_line() {
-        let mut ledger = TranscriptLedger::new("session-1");
-        ledger
-            .apply_event(event("span-1", 1, "Many topics discussed."))
-            .unwrap();
+    fn document_outline_orders_sections_by_document_order_not_recency() {
         let mut notes = empty_notes();
-        let total = NOTES_SNAPSHOT_MAX_ENTRIES + 5;
+        // Applied in this order (ascending sequence), so document/Vec order
+        // is c, a, b — but RECENCY order (by `updated_by_sequence` descending)
+        // would be b (seq 3), a (seq 2), c (seq 1).
+        for (i, id) in ["note:c", "note:a", "note:b"].iter().enumerate() {
+            notes
+                .apply_patch(&notes_patch((i + 1) as u64, id, "Title", "Body."), None)
+                .expect("apply note");
+        }
+
+        let first = render_document_outline(&notes);
+        let second = render_document_outline(&notes);
+        assert_eq!(
+            first, second,
+            "rendering must be a pure, deterministic function of the notes state"
+        );
+
+        let c_index = first.find("note:c").expect("note:c present");
+        let a_index = first.find("note:a").expect("note:a present");
+        let b_index = first.find("note:b").expect("note:b present");
+        assert!(
+            c_index < a_index && a_index < b_index,
+            "outline must list sections in DOCUMENT order (c, a, b), not recency order \
+             (b, a, c), got: {first}"
+        );
+    }
+
+    /// Degradation order under [`DOC_OUTLINE_MAX_CHARS`] (design-b §2.3):
+    /// drop every preview line FIRST (all sections keep their heading line),
+    /// and only fall back to dropping heading lines — from the
+    /// LEAST-recently-changed end — if the block is still over budget without
+    /// any previews at all. Either way the trailing count line always
+    /// reports the true total, so a dropped section is counted, never
+    /// silently missing.
+    #[test]
+    fn document_outline_degrades_previews_then_least_recently_changed_headings_under_the_char_budget()
+     {
+        let mut notes = empty_notes();
+        let total = 200usize;
         for i in 0..total {
             notes
                 .apply_patch(
@@ -3132,40 +3625,45 @@ mod tests {
                         (i + 1) as u64,
                         &format!("note:{i}"),
                         &format!("Topic {i}"),
-                        &format!("Body of note {i}."),
+                        "Body.",
                     ),
                     None,
                 )
                 .expect("apply note");
         }
 
-        let block = render_notes_snapshot(&notes);
-        let shown_lines = block.lines().count();
-        // NOTES_SNAPSHOT_MAX_ENTRIES note lines + one trailing count line.
-        assert_eq!(shown_lines, NOTES_SNAPSHOT_MAX_ENTRIES + 1);
+        let block = render_document_outline(&notes);
+        let shown_chars = block.chars().count();
         assert!(
-            block.contains(&format!(
-                "+5 more existing note(s) not shown; {total} total"
-            )),
-            "got: {block}"
+            shown_chars <= DOC_OUTLINE_MAX_CHARS,
+            "outline block must never exceed the hard char budget, got {shown_chars} chars"
         );
-        // The most-recently-applied notes (highest sequence) must be the ones
-        // actually shown, never silently dropped in favor of older ones.
-        assert!(block.contains(&format!("note:{}", total - 1)));
         assert!(
-            !block.contains("note:0 |"),
-            "the oldest note past the cap must not be individually listed"
+            !block.contains("recent:"),
+            "at this size every preview must be dropped before any heading is, got: {block}"
+        );
+        assert!(
+            block.contains("[note:199]"),
+            "the most-recently-changed section must survive truncation, got: {block}"
+        );
+        assert!(
+            !block.contains("[note:0]"),
+            "the least-recently-changed section must be the one dropped, got: {block}"
+        );
+        assert!(
+            block.contains(&format!("{total} section(s) total;")),
+            "the true total must still be reported even though not every heading is shown, \
+             got: {block}"
         );
     }
 
-    /// Prompt-size bound, demonstrated in bytes rather than asserted in the
-    /// abstract. Independent growth axes, each checked against a fixed byte
-    /// ceiling derived from the documented caps — this is what makes the
-    /// per-tick token cost bounded, not O(session length), the same growth
-    /// failure mode ADR-0025 already fixed for the transcript feed.
+    /// Prompt-size bound, demonstrated directly against the documented hard
+    /// cap rather than an estimated ceiling — this is what makes the per-tick
+    /// token cost bounded, not O(session length), the same growth failure
+    /// mode ADR-0025 already fixed for the transcript feed.
     #[test]
-    fn notes_snapshot_prompt_size_is_bounded_independent_of_session_growth() {
-        fn snapshot_len(note_count: usize, body: &str) -> usize {
+    fn document_outline_stays_within_the_char_budget_independent_of_session_growth() {
+        fn outline_chars(note_count: usize, body: &str) -> usize {
             let mut notes = empty_notes();
             for i in 0..note_count {
                 notes
@@ -3180,83 +3678,54 @@ mod tests {
                     )
                     .expect("apply note");
             }
-            render_notes_snapshot(&notes).len()
+            render_document_outline(&notes).chars().count()
         }
 
-        // Generous fixed ceiling derived from the documented caps: at most
-        // NOTES_SNAPSHOT_MAX_ENTRIES lines, each well under 400 bytes once
-        // the per-body cap is applied, plus a short trailing count line.
-        const CEILING_BYTES: usize = NOTES_SNAPSHOT_MAX_ENTRIES * 400 + 200;
-
-        // Axis 1 — note COUNT: a 200x increase (10 -> 2,000 notes, same short
-        // body each) must stay under the ceiling and must not grow anywhere
-        // close to proportionally, because the cap stops adding lines past
-        // NOTES_SNAPSHOT_MAX_ENTRIES.
-        let few_notes = snapshot_len(10, "A short note body.");
-        let many_notes = snapshot_len(2_000, "A short note body.");
+        // Axis 1 — note COUNT: a 2,000-note session must still fit the hard
+        // budget, not merely stay "small relative to" it.
         assert!(
-            many_notes < CEILING_BYTES,
-            "2,000-note snapshot is {many_notes} bytes, over the {CEILING_BYTES}-byte ceiling — \
-             the cap is not actually bounding note-count growth"
-        );
-        assert!(
-            many_notes < few_notes * 4,
-            "snapshot size grew from {few_notes} to {many_notes} bytes across a 200x note-count \
-             increase (same body each) — this is not the roughly-flat growth the cap is supposed \
-             to give past NOTES_SNAPSHOT_MAX_ENTRIES"
+            outline_chars(2_000, "A short note body.") <= DOC_OUTLINE_MAX_CHARS,
+            "a 2,000-note outline exceeded DOC_OUTLINE_MAX_CHARS"
         );
 
         // Axis 2 — per-note BODY LENGTH: a ~260x increase in one note's body
-        // (5,000 chars vs. 19) must stay under the ceiling and must not grow
-        // anywhere close to proportionally, because `one_line_bounded`
-        // truncates every body to `NOTES_SNAPSHOT_BODY_SUMMARY_MAX_CHARS`
-        // regardless of input length.
-        let short_bodies = snapshot_len(10, "A short note body.");
-        let long_bodies = snapshot_len(10, &"x".repeat(5_000));
+        // (5,000 chars vs. 19) must not blow the budget either — the heading
+        // line reports a body char COUNT, not the body text itself, so a
+        // longer body only changes a few digits, never the line's shape.
         assert!(
-            long_bodies < CEILING_BYTES,
-            "long-body snapshot is {long_bodies} bytes, over the {CEILING_BYTES}-byte ceiling — \
-             the per-body cap is not actually bounding body-length growth"
-        );
-        assert!(
-            long_bodies < short_bodies * 4,
-            "snapshot size grew from {short_bodies} to {long_bodies} bytes across a ~260x \
-             per-note body-length increase (same note count) — the per-body cap is not bounding"
+            outline_chars(10, &"x".repeat(5_000)) <= DOC_OUTLINE_MAX_CHARS,
+            "a long-body outline exceeded DOC_OUTLINE_MAX_CHARS"
         );
 
         // Axis 3 — per-note ID/TITLE LENGTH: unlike the body, `id` and `title`
         // are model-authored `String`s with no length validation anywhere on
         // the apply path (`upsert_note` accepts them verbatim). A single
         // oversized id or title must not make the block unbounded either.
-        fn snapshot_len_with_id_and_title(id: &str, title: &str) -> usize {
-            let mut notes = empty_notes();
-            notes
-                .apply_patch(&notes_patch(1, id, title, "A short note body."), None)
-                .expect("apply note");
-            render_notes_snapshot(&notes).len()
-        }
-        let short_id_title = snapshot_len_with_id_and_title("n", "Topic");
-        let long_id_title = snapshot_len_with_id_and_title(&"i".repeat(5_000), &"t".repeat(5_000));
-        const ID_TITLE_CEILING_BYTES: usize = 2 * NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS * 4 + 200;
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch(
+                    1,
+                    &"i".repeat(5_000),
+                    &"t".repeat(5_000),
+                    "A short note body.",
+                ),
+                None,
+            )
+            .expect("apply note");
         assert!(
-            long_id_title < ID_TITLE_CEILING_BYTES,
-            "single-note snapshot with a 5,000-char id AND title is {long_id_title} bytes, over \
-             the {ID_TITLE_CEILING_BYTES}-byte ceiling — id/title are not actually bounded"
-        );
-        assert!(
-            long_id_title < short_id_title * 20,
-            "snapshot size grew from {short_id_title} to {long_id_title} bytes across a 5,000x \
-             id/title-length increase (same note count) — id/title are not bounded independent \
-             of session growth"
+            render_document_outline(&notes).chars().count() <= DOC_OUTLINE_MAX_CHARS,
+            "a single oversized id/title outline exceeded DOC_OUTLINE_MAX_CHARS"
         );
     }
 
     /// A note title containing an embedded newline must not break the
-    /// one-line-per-note invariant [`notes_snapshot_is_bounded_at_the_cap_with_a_count_line`]
-    /// relies on (`block.lines().count()`), and must not let note content be
-    /// misparsed as a separate snapshot entry.
+    /// one-heading-line-per-section invariant the outline's degradation math
+    /// relies on (`shown` counted by heading-line, not raw line, in
+    /// [`render_document_outline_with_shown_count`]), and must not let note
+    /// content be misparsed as a separate outline entry.
     #[test]
-    fn notes_snapshot_collapses_newlines_in_title_and_id() {
+    fn document_outline_collapses_newlines_in_title_and_id() {
         let mut notes = empty_notes();
         notes
             .apply_patch(
@@ -3270,39 +3739,17 @@ mod tests {
             )
             .expect("apply note");
 
-        let block = render_notes_snapshot(&notes);
+        let block = render_document_outline(&notes);
+        // header line + one heading line + one preview line (this note is
+        // the only one, so it is always within DOC_OUTLINE_PREVIEW_SECTIONS)
+        // + one trailing count line — an embedded newline in the title (or
+        // the collapsed preview text) must not add extra lines.
         assert_eq!(
             block.lines().count(),
-            1,
+            4,
             "an embedded newline in the title must not add extra lines to the block, got: {block}"
         );
         assert!(block.contains("Multi-line title with embedded newlines"));
-    }
-
-    /// Determinism: the same `MaterializedNotes` renders byte-identically on
-    /// every call (no `HashMap` iteration, no wall-clock/random tie-break).
-    #[test]
-    fn notes_snapshot_has_stable_deterministic_ordering() {
-        let mut notes = empty_notes();
-        for (i, id) in ["note:c", "note:a", "note:b"].iter().enumerate() {
-            notes
-                .apply_patch(&notes_patch((i + 1) as u64, id, "Title", "Body."), None)
-                .expect("apply note");
-        }
-
-        let first = render_notes_snapshot(&notes);
-        let second = render_notes_snapshot(&notes);
-        assert_eq!(
-            first, second,
-            "rendering must be a pure, deterministic function of the notes state"
-        );
-
-        // Most-recently-updated first: note:b (sequence 3) precedes note:a
-        // (sequence 2) precedes note:c (sequence 1).
-        let b_index = first.find("note:b").expect("note:b present");
-        let a_index = first.find("note:a").expect("note:a present");
-        let c_index = first.find("note:c").expect("note:c present");
-        assert!(b_index < a_index && a_index < c_index, "got: {first}");
     }
 
     /// Regression proof for the measured overwrite storm (session ae528252):
@@ -3346,7 +3793,7 @@ mod tests {
         );
         // The id-stability instruction must actually point at this block, not
         // just assert stability in the abstract.
-        assert!(messages[0].content.contains("Current notes state"));
+        assert!(messages[0].content.contains("Document outline"));
     }
 
     // ----- a324: provider-strict structured-output schema -------------------
@@ -3578,9 +4025,15 @@ mod tests {
             "confidence": 0.9
         })
         .to_string();
-        let notes_patch =
-            trusted_projection_patch_from_model_json(&notes_raw, &notes_job, &ledger, context())
-                .expect("verified-quote note admits");
+        let notes_patch = trusted_projection_patch_from_model_json(
+            &notes_raw,
+            &notes_job,
+            &ledger,
+            None,
+            context(),
+        )
+        .expect("verified-quote note admits")
+        .patch;
         assert_eq!(notes_patch.operations.len(), 1);
 
         let graph_job = job(ProjectionKind::Graph, &ledger);
@@ -3612,9 +4065,15 @@ mod tests {
             "confidence": 0.85
         })
         .to_string();
-        let graph_patch =
-            trusted_projection_patch_from_model_json(&graph_raw, &graph_job, &ledger, context())
-                .expect("evidence-annotated graph ops admit");
+        let graph_patch = trusted_projection_patch_from_model_json(
+            &graph_raw,
+            &graph_job,
+            &ledger,
+            None,
+            context(),
+        )
+        .expect("evidence-annotated graph ops admit")
+        .patch;
         assert_eq!(graph_patch.operations.len(), 2);
     }
 
@@ -3643,7 +4102,7 @@ mod tests {
         })
         .to_string();
 
-        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
             .expect_err("missing span_id must refuse the whole patch");
 
         assert_eq!(
@@ -3711,7 +4170,7 @@ mod tests {
         })
         .to_string();
 
-        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, context())
+        let err = trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
             .expect_err("a span outside the job's basis must be rejected");
 
         assert_eq!(
@@ -3981,26 +4440,23 @@ mod tests {
         ));
     }
 
-    /// design-b §1.2/§1.8, corrected: W1 is a DARK ship on BOTH model-facing
-    /// schemas, not just the hand-authored strict one. `heading_level` is a
-    /// real serde field on `ProjectionOperation::UpsertNote` (so fresh-ingest
-    /// and replay both carry it), but `schemars` derives the non-strict draft
-    /// schema straight from that same Rust type — so without
-    /// `hide_heading_level_from_draft_schema` post-processing it out, the
-    /// draft schema would advertise `heading_level` (plus the field's entire
-    /// internal doc comment as the property's `description`) on every
-    /// non-strict/vLLM/mistral.rs route, contradicting the "no prompt/schema
-    /// surface change" premise this ticket is supposed to hold to and
-    /// creating exactly the silent regression design-b §1.8 item 2 names:
-    /// the prompt would tell a model a field exists that the strict schema
-    /// simultaneously forbids. This test pins BOTH schemas dark and pins the
-    /// stronger, model-facing-observable property that actually matters: the
-    /// rendered prompt messages contain no trace of `heading_level` at all,
-    /// so ADR-0025 §2d's byte-stable cached prefix is untouched by this
-    /// ticket. W2 flipping either schema is a deliberate, reviewed edit to
-    /// THIS test, not a silent one.
+    /// audio-graph-a6b5 W2, deliberately inverting W1's own
+    /// `heading_level_is_dark_on_both_draft_and_strict_schemas_and_absent_from_prompt`
+    /// test (design-b §1.8's flip must land as one reviewed edit to both the
+    /// schemas AND this test, never silently). `heading_level` is now
+    /// advertised on BOTH model-facing schemas together — the hand-authored
+    /// strict schema (as a required-but-nullable integer, matching
+    /// `description`/`after_id`/`label`'s existing posture) and the
+    /// `schemars`-derived draft schema (with its narrowed, model-useful
+    /// description, not the full internal doc-comment paragraph, which
+    /// would be pure prompt-token waste and an implementation-detail leak).
+    /// Also pins the stronger, model-facing-observable property that
+    /// actually matters: the rendered SYSTEM prompt (message 0, the
+    /// byte-stable prefix) now names `heading_level` by name as part of
+    /// delta A's operation guidance, and a live outline block containing a
+    /// section shows its depth as `h{level}`.
     #[test]
-    fn heading_level_is_dark_on_both_draft_and_strict_schemas_and_absent_from_prompt() {
+    fn heading_level_is_model_visible_on_both_draft_and_strict_schemas_and_present_in_the_prompt() {
         let draft_schema = projection_patch_draft_json_schema().expect("draft schema builds");
         let draft_upsert_note = draft_schema["$defs"]["ProjectionOperation"]["oneOf"]
             .as_array()
@@ -4011,20 +4467,25 @@ mod tests {
                     || variant["properties"]["type"]["const"] == "upsert_note"
             })
             .expect("draft schema offers upsert_note");
+        let draft_heading_level = draft_upsert_note["properties"]
+            .get("heading_level")
+            .expect("W2 must advertise heading_level on the schemars-derived draft schema");
         assert!(
-            draft_upsert_note["properties"]
-                .get("heading_level")
-                .is_none(),
-            "W1 ships dark: the schemars-derived draft schema must NOT advertise \
-             heading_level yet — it is pasted verbatim into every projection system \
-             prompt and sent as the vLLM/mistral.rs decoding grammar, so advertising \
-             it here IS a prompt/schema surface change (that is W2's ticket), got: \
-             {draft_upsert_note}"
+            draft_heading_level["type"] == serde_json::json!(["integer", "null"])
+                || draft_heading_level["type"] == serde_json::json!("integer"),
+            "heading_level must be an integer-typed property, got: {draft_heading_level}"
         );
+        let draft_description = draft_heading_level["description"]
+            .as_str()
+            .unwrap_or_default();
         assert!(
-            !draft_schema.to_string().contains("heading_level"),
-            "heading_level must not appear ANYWHERE in the draft schema (including \
-             nested under a different variant or as a stray description fragment)"
+            draft_description.len() < 200
+                && !draft_description.contains("audio-graph-")
+                && !draft_description.contains("ADR-"),
+            "heading_level's draft-schema description must be a short, model-useful sentence, \
+             not the field's full internal doc comment (ticket IDs / ADR numbers included) — \
+             got a {}-char description: {draft_description}",
+            draft_description.len()
         );
 
         let strict_schema = projection_patch_strict_json_schema(&ProjectionKind::Notes);
@@ -4034,32 +4495,53 @@ mod tests {
             .iter()
             .find(|variant| variant["properties"]["type"]["enum"][0] == "upsert_note")
             .expect("strict schema offers upsert_note");
+        assert_eq!(
+            strict_upsert_note["properties"]["heading_level"],
+            serde_json::json!({ "type": ["integer", "null"], "minimum": 2, "maximum": 4 }),
+            "W2 must advertise heading_level on the strict schema as a required-but-nullable \
+             integer bounded to the 2..=4 depth scale (reviewer W2 fix-round finding: an \
+             unbounded schema lets a strict-mode provider emit a value that fails \
+             deserialization for the WHOLE draft instead of just getting clamped), got: \
+             {strict_upsert_note}"
+        );
         assert!(
-            strict_upsert_note["properties"]
-                .get("heading_level")
-                .is_none(),
-            "W1 ships dark: the strict schema must NOT advertise heading_level yet \
-             (that is W2's prompt/schema-exposure ticket), got: {strict_upsert_note}"
+            strict_upsert_note["required"]
+                .as_array()
+                .expect("strict variant lists required fields")
+                .iter()
+                .any(|field| field == "heading_level"),
+            "heading_level must be in the strict schema's required list (nullable, not \
+             absent) — matching description/after_id/label's existing posture, got: \
+             {strict_upsert_note}"
         );
 
         // The stronger, end-to-end assertion: the ACTUAL rendered system
-        // prompt (what a model on any route receives) never mentions the
-        // field, byte-stable prefix included.
-        let mut ledger = TranscriptLedger::new("session-heading-level-dark");
+        // prompt (what a model on any route receives) now names the field.
+        let mut ledger = TranscriptLedger::new("session-heading-level-exposed");
         ledger
             .apply_event(event("span-1", 1, "Alice chose Soniox."))
             .unwrap();
         let job = job(ProjectionKind::Notes, &ledger);
-        let messages = projection_patch_prompt_messages(&job, &ledger, Some(&empty_notes()))
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch_with_heading(1, "note:decision", "Provider decision", "- Soniox.", 2),
+                None,
+            )
+            .expect("apply note");
+        let messages = projection_patch_prompt_messages(&job, &ledger, Some(&notes))
             .expect("prompt messages build");
-        for message in &messages {
-            assert!(
-                !message.content.contains("heading_level"),
-                "heading_level leaked into a projection prompt message ({}): {}",
-                message.role,
-                message.content
-            );
-        }
+        assert!(
+            messages[0].content.contains("heading_level"),
+            "delta A's operation guidance (system message, byte-stable prefix) must name \
+             heading_level by name, got: {}",
+            messages[0].content
+        );
+        assert!(
+            messages[3].content.contains("h2"),
+            "the live outline block must show a level-2 section's depth as h2, got: {}",
+            messages[3].content
+        );
     }
 
     /// design-b §1.4/§1.2: an out-of-range `heading_level` is a cosmetic
@@ -4497,5 +4979,580 @@ mod tests {
     fn old_accepted_patch_json_operations(patch_json: &str) -> serde_json::Value {
         let parsed: serde_json::Value = serde_json::from_str(patch_json).unwrap();
         parsed["operations"].clone()
+    }
+
+    // ----- audio-graph-a6b5 W2: ingest no-op filter (design-b §1.5b) --------
+
+    /// Raw model-draft JSON for one `upsert_note` operation, with every field
+    /// the no-op filter compares individually controllable — used to drive
+    /// [`trusted_projection_patch_from_model_json`] end to end for the no-op
+    /// filter tests below, rather than constructing a `ProjectionPatch`
+    /// directly (which would skip the actual admission seam under test).
+    fn upsert_note_draft_json(
+        id: &str,
+        title: &str,
+        body: &str,
+        tags: &[&str],
+        heading_level: Option<u8>,
+    ) -> String {
+        let mut operation = serde_json::json!({
+            "type": "upsert_note",
+            "id": id,
+            "title": title,
+            "body": body,
+            "tags": tags,
+            "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+        });
+        if let Some(level) = heading_level {
+            operation["heading_level"] = serde_json::json!(level);
+        }
+        serde_json::json!({ "operations": [operation], "confidence": 0.9 }).to_string()
+    }
+
+    fn ledger_and_job_with_one_span() -> (TranscriptLedger, ProjectionJob) {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+        (ledger, job)
+    }
+
+    /// A patch whose ONE operation's `(title, body, tags, heading_level)`
+    /// tuple is byte-identical to the admission-time materialized note under
+    /// the same id must be dropped entirely — `operations` ends up empty,
+    /// and the filtered count is exactly 1.
+    #[test]
+    fn no_op_filter_drops_a_byte_identical_upsert_note() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider decision",
+            "Alice chose Soniox.",
+            &["decision"],
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("byte-identical upsert must still admit, just filtered");
+
+        assert!(
+            trusted.patch.operations.is_empty(),
+            "the byte-identical upsert must be filtered out, got: {:?}",
+            trusted.patch.operations
+        );
+        assert_eq!(trusted.no_op_filtered_count, 1);
+    }
+
+    /// A changed `title` (everything else identical) must survive the
+    /// filter — one of the four compared fields, isolated.
+    #[test]
+    fn no_op_filter_keeps_an_upsert_note_with_a_changed_title() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider choice", // changed
+            "Alice chose Soniox.",
+            &["decision"],
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("changed title must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "a changed title must survive the filter"
+        );
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// A changed `body` (everything else identical) must survive the filter.
+    #[test]
+    fn no_op_filter_keeps_an_upsert_note_with_a_changed_body() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider decision",
+            "Alice chose Soniox for the realtime pilot, not production.", // changed
+            &["decision"],
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("changed body must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "a changed body must survive the filter"
+        );
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// A changed `tags` set (everything else identical) must survive the
+    /// filter — this is the field the tags-only-churn class of the field
+    /// measurement lives on, and it must NOT be treated as a no-op.
+    #[test]
+    fn no_op_filter_keeps_an_upsert_note_with_changed_tags() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider decision",
+            "Alice chose Soniox.",
+            &["decision", "revisit"], // changed
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("changed tags must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "changed tags must survive the filter"
+        );
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// A changed `heading_level` (everything else identical) must survive
+    /// the filter — the newly-exposed field is a full first-class member of
+    /// the comparison tuple, not an afterthought.
+    #[test]
+    fn no_op_filter_keeps_an_upsert_note_with_a_changed_heading_level() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider decision",
+            "Alice chose Soniox.",
+            &["decision"],
+            Some(3), // changed: 2 -> 3
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("changed heading_level must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "a changed heading_level must survive the filter"
+        );
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// `notes == None` (no admission-time state to compare against) must
+    /// never filter anything, even an operation that WOULD be byte-identical
+    /// to some hypothetical prior state — `None` must never be silently
+    /// treated as "every note is unchanged."
+    #[test]
+    fn no_op_filter_never_filters_when_notes_state_is_absent() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let raw = upsert_note_draft_json(
+            "note:decision",
+            "Provider decision",
+            "Alice chose Soniox.",
+            &["decision"],
+            Some(2),
+        );
+        let trusted =
+            trusted_projection_patch_from_model_json(&raw, &job, &ledger, None, context())
+                .expect("upsert must admit with no notes state to compare against");
+
+        assert_eq!(trusted.patch.operations.len(), 1);
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// A genuinely new note id (absent from the admission-time state) must
+    /// never be filtered, regardless of what it happens to say.
+    #[test]
+    fn no_op_filter_never_filters_a_genuinely_new_note_id() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+
+        let raw = upsert_note_draft_json(
+            "note:research", // different id entirely
+            "Provider research",
+            "Alice mentioned GraphQL.",
+            &[],
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("a genuinely new note must admit");
+
+        assert_eq!(trusted.patch.operations.len(), 1);
+        assert_eq!(trusted.no_op_filtered_count, 0);
+    }
+
+    /// A patch carrying BOTH a byte-identical no-op AND a genuinely changed
+    /// upsert must drop only the no-op — the filter is per-operation, and
+    /// the count reflects exactly what was dropped, never the whole patch.
+    #[test]
+    fn no_op_filter_counts_only_the_operations_it_actually_drops_in_a_mixed_patch() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed existing note");
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    2,
+                    "note:research",
+                    "Provider research",
+                    "Alice mentioned GraphQL.",
+                    &[],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed second existing note");
+
+        let unchanged = serde_json::json!({
+            "type": "upsert_note",
+            "id": "note:decision",
+            "title": "Provider decision",
+            "body": "Alice chose Soniox.",
+            "tags": ["decision"],
+            "heading_level": 2,
+            "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+        });
+        let changed = serde_json::json!({
+            "type": "upsert_note",
+            "id": "note:research",
+            "title": "Provider research",
+            "body": "Alice mentioned GraphQL.\nAlice met Bob.",
+            "tags": [],
+            "heading_level": 2,
+            "evidence": {"claim_class": "grounded_inference", "span_id": "span-1"}
+        });
+        let raw = serde_json::json!({
+            "operations": [unchanged, changed],
+            "confidence": 0.9
+        })
+        .to_string();
+
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("mixed patch must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "only the changed operation must survive, got: {:?}",
+            trusted.patch.operations
+        );
+        assert_eq!(trusted.no_op_filtered_count, 1);
+        assert!(matches!(
+            &trusted.patch.operations[0],
+            ProjectionOperation::UpsertNote { id, .. } if id == "note:research"
+        ));
+    }
+
+    /// Reviewer scope-honesty finding (W2 fix round): every prior no-op-filter
+    /// test above seeds either one note, or two notes whose content never
+    /// happens to equal an UNRELATED note's content, so replacing the id-keyed
+    /// lookup at the filter's comparison seam (`notes.notes.iter().find(|note|
+    /// &note.id == id)`) with `notes.notes.first()` — or with a title-keyed
+    /// `find` — passes every one of them. This fixture seeds two notes with
+    /// DIFFERENT content, then emits a genuine rewrite of `note:research`
+    /// whose new (title, body, tags, heading_level) happens to be
+    /// byte-identical to the UNRELATED `note:decision`'s content. Correct
+    /// (id-keyed) code compares the op against `note:research`'s own prior
+    /// content, sees a real change, and keeps it. A `.first()` or
+    /// title-keyed mutant would instead compare against (or match by title
+    /// onto) `note:decision`, see an accidental content match, and wrongly
+    /// drop a genuine edit.
+    #[test]
+    fn no_op_filter_compares_against_the_operations_own_id_not_the_first_or_a_titled_match() {
+        let (ledger, job) = ledger_and_job_with_one_span();
+        let mut existing = empty_notes();
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    1,
+                    "note:decision",
+                    "Provider decision",
+                    "Alice chose Soniox.",
+                    &["decision"],
+                    2,
+                ),
+                None,
+            )
+            .expect("seed first existing note");
+        existing
+            .apply_patch(
+                &notes_patch_full(
+                    2,
+                    "note:research",
+                    "Provider research",
+                    "Alice mentioned GraphQL.",
+                    &[],
+                    3,
+                ),
+                None,
+            )
+            .expect("seed second existing note");
+
+        // A genuine rewrite of `note:research` — its title/body/tags/heading
+        // all change relative to note:research's OWN prior content — but the
+        // NEW content happens to be byte-identical to the unrelated
+        // `note:decision`'s content. Only an id-keyed comparison can tell
+        // these apart.
+        let raw = upsert_note_draft_json(
+            "note:research",
+            "Provider decision",
+            "Alice chose Soniox.",
+            &["decision"],
+            Some(2),
+        );
+        let trusted = trusted_projection_patch_from_model_json(
+            &raw,
+            &job,
+            &ledger,
+            Some(&existing),
+            context(),
+        )
+        .expect("genuine rewrite of note:research must admit");
+
+        assert_eq!(
+            trusted.patch.operations.len(),
+            1,
+            "a genuine rewrite of note:research must survive the filter even \
+             though its new content collides with an unrelated note's content, got: {:?}",
+            trusted.patch.operations
+        );
+        assert_eq!(trusted.no_op_filtered_count, 0);
+        assert!(matches!(
+            &trusted.patch.operations[0],
+            ProjectionOperation::UpsertNote { id, .. } if id == "note:research"
+        ));
+    }
+
+    /// Measures design-b §2.3's "the prompt gets smaller" claim directly
+    /// against a representative 30-section fixture, rather than trusting the
+    /// design doc's abstract arithmetic. `old_snapshot_chars_for` reimplements
+    /// the EXACT pre-W2 `render_notes_snapshot` algorithm inline (format
+    /// string, `NOTES_SNAPSHOT_ID_TITLE_MAX_CHARS`/`_BODY_SUMMARY_MAX_CHARS`
+    /// caps — both since deleted along with the function itself) so this
+    /// test can compute a real "before" number without resurrecting dead
+    /// code, and calls the ACTUAL current [`render_document_outline`] for
+    /// "after". Run with `--nocapture` to see the measured delta.
+    #[test]
+    fn measured_char_delta_between_the_old_notes_snapshot_and_the_new_document_outline() {
+        const OLD_ID_TITLE_MAX_CHARS: usize = 80;
+        const OLD_BODY_MAX_CHARS: usize = 160;
+        const OLD_MAX_ENTRIES: usize = 30;
+
+        fn old_snapshot_chars_for(notes: &MaterializedNotes) -> usize {
+            let mut ordered: Vec<&MaterializedNote> = notes.notes.iter().collect();
+            ordered.sort_by(|a, b| {
+                b.updated_by_sequence
+                    .cmp(&a.updated_by_sequence)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let total = ordered.len();
+            let shown = total.min(OLD_MAX_ENTRIES);
+            let mut lines: Vec<String> = ordered[..shown]
+                .iter()
+                .map(|note| {
+                    format!(
+                        "- id: {} | title: {} | body: {}",
+                        one_line_bounded(&note.id, OLD_ID_TITLE_MAX_CHARS),
+                        one_line_bounded(&note.title, OLD_ID_TITLE_MAX_CHARS),
+                        one_line_bounded(&note.body, OLD_BODY_MAX_CHARS)
+                    )
+                })
+                .collect();
+            if total > shown {
+                lines.push(format!(
+                    "(+{} more existing note(s) not shown; {total} total)",
+                    total - shown
+                ));
+            }
+            lines.join("\n").chars().count()
+        }
+
+        // 30 sections (matching design-b's own worst-case entry count), with
+        // typical rather than maximal id/title/body lengths — the point is a
+        // REALISTIC session, not the abstract per-field ceiling. Content
+        // reuses this file's existing fixture vocabulary (Alice/Bob/Soniox/
+        // GraphQL/Postgres/provider decision) rather than inventing new
+        // fixture prose, indexed only to keep 30 ids/titles distinct.
+        let mut notes = empty_notes();
+        for i in 0..30 {
+            let id = format!("note:decision-{i}");
+            let title = format!("Provider decision {i}: Soniox vs. Postgres tooling");
+            let body = format!(
+                "- Alice chose Soniox for topic {i}\n\
+                 - Bob confirmed Postgres for topic {i}\n\
+                 - Alice mentioned GraphQL again for topic {i}"
+            );
+            notes
+                .apply_patch(
+                    &notes_patch_with_heading((i + 1) as u64, &id, &title, &body, 2),
+                    None,
+                )
+                .expect("apply representative section");
+        }
+
+        let old_chars = old_snapshot_chars_for(&notes);
+        let new_chars = render_document_outline(&notes).chars().count();
+        let delta = old_chars as isize - new_chars as isize;
+
+        eprintln!(
+            "measured_char_delta_between_the_old_notes_snapshot_and_the_new_document_outline: \
+             old={old_chars} new={new_chars} delta={delta} chars (~{} tokens at ~4 chars/token)",
+            delta / 4
+        );
+
+        assert!(
+            new_chars < old_chars,
+            "the document outline must be smaller than the old recency snapshot on a \
+             representative 30-section fixture, got old={old_chars} new={new_chars}"
+        );
+        // Regression guard on the DIRECTION and rough MAGNITUDE of the claimed
+        // savings (design-b §2.3: "net ≈ −3,600 chars ≈ −900 prompt
+        // tokens/tick" on a worst-case fixture) — not a byte-exact pin, since
+        // the outline's exact bytes depend on incidental formatting.
+        assert!(
+            delta > 500,
+            "expected a substantial (not marginal) reduction on this representative fixture, \
+             got only {delta} chars"
+        );
     }
 }

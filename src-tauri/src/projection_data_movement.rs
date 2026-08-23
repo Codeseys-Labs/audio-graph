@@ -65,15 +65,16 @@ pub struct ProjectionMovementFacts {
     /// Char count of the pinned typed-fact block (graph-derived context). 0
     /// when absent.
     pub pinned_fact_chars: u64,
-    /// Char count of the Notes-kind live notes-state snapshot block (seed
-    /// audio-graph-253c part 2) — content-free like every other field here:
-    /// a count only, never the note text itself. 0 for a Graph-kind call, when
-    /// no snapshot was available for this tick, OR when a snapshot was
-    /// available but held zero notes — a fresh session's first Notes tick
-    /// still renders a static "(no notes yet)" block into the prompt
-    /// (`projection_llm`'s prompt builder), but that block is boilerplate with
-    /// no note content, so this field (and `notes_snapshot_entries`) reports 0
-    /// rather than counting it (see
+    /// Char count of the Notes-kind live document-order outline block (seed
+    /// audio-graph-253c part 2, outline replacing the old recency-sorted
+    /// snapshot as of audio-graph-a6b5 W2) — content-free like every other
+    /// field here: a count only, never the note text itself. 0 for a
+    /// Graph-kind call, when no snapshot was available for this tick, OR when
+    /// a snapshot was available but held zero notes — a fresh session's first
+    /// Notes tick still renders a static "(no sections yet)" block into the
+    /// prompt (`projection_llm`'s prompt builder), but that block is
+    /// boilerplate with no note content, so this field (and
+    /// `notes_snapshot_entries`) reports 0 rather than counting it (see
     /// `projection_llm::ProjectionPromptShape::notes_snapshot_chars`, which
     /// this is copied from).
     pub notes_snapshot_chars: u64,
@@ -92,6 +93,17 @@ pub struct ProjectionMovementFacts {
     /// ever needs an entry count alongside `text_chars`, that is a follow-up
     /// ipc-contract change, not a bug in this field.
     pub notes_snapshot_entries: u32,
+    /// Count of `upsert_note` operations the ingest no-op filter dropped from
+    /// this patch at admission (audio-graph-a6b5 W2 / design-b §1.5b) — see
+    /// `projection_llm::TrustedProjectionPatch::no_op_filtered_count`. 0 for
+    /// a Graph-kind call, or when the caller had no live notes state to
+    /// compare against. Same posture as `notes_snapshot_entries` above: a
+    /// count only, populated and unit-tested at the `ProjectionMovementFacts`
+    /// level, with no dedicated `MovementCounts` sink (an ipc-contract change
+    /// this ticket deliberately stays out of) — surfaced instead via the
+    /// `speech::mod::run_projection_job` apply-success log line, which is
+    /// what makes the no-op-filter fix verifiable from logs.
+    pub no_op_filtered_count: u32,
     /// Total input token count as reported by the provider (0 when unknown).
     pub tokens_in: u64,
     /// Total output token count (0 when unknown).
@@ -291,6 +303,7 @@ mod tests {
             pinned_fact_chars: 120,
             notes_snapshot_chars: 0,
             notes_snapshot_entries: 0,
+            no_op_filtered_count: 0,
             tokens_in: 300,
             tokens_out: 80,
         }
