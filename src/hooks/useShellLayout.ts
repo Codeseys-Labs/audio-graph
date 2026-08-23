@@ -31,6 +31,13 @@ import { useEffect, useState } from "react";
 
 export type ShellLayoutTier = "wide" | "standard" | "compact";
 
+// RECIPROCAL with the bento workspace grid's tier boundaries (ticket W4,
+// synthesis audio-graph-a6b5) at `src/styles/layout.css`'s
+// `.workspace-panel--capture` rule + its `(width < 1280px)`/
+// `(width < 1024px)` media queries. Keep both in sync — a change to one
+// without the other reintroduces the exact "two disagreeing layout
+// authorities" bug the bento's R1 ratification fixed (the old CSS-only
+// 1120px workspace tier vs. this hook's 1280/1024).
 const WIDE_QUERY = "(min-width: 1280px)";
 const STANDARD_QUERY = "(min-width: 1024px)";
 

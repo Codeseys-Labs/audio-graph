@@ -113,62 +113,137 @@
   background: var(--bg-primary);
 }
 
+/* ==========================================================================
+   Bento workspace grid (ticket W4, synthesis audio-graph-a6b5).
+   Architecture: responsive-memo-72d4 — viewport tiers own grid SHAPE
+   (this block); per-tile container queries (added by whichever ticket
+   first needs one) would own tile-INTERNAL layout. Boundaries are
+   RECIPROCAL with `useShellLayout.ts:34-35` (1280/1024) — a change to one
+   without the other reintroduces the exact two-authorities bug R1 fixed
+   (the old 1120px tier below disagreed with the hook's 1280/1024).
+
+   WIDE tier (>=1280px, the unquery'd base rule — memo §1: "keep >=1280 in
+   the unquery'd base rule so the ratified default layout is what you get
+   with no media query evaluated at all"). REPLACES the old two-column
+   `.workspace-panel--capture` wholesale (0922: the old
+   `grid-template-columns`/`grid-template-rows` values, and the
+   `.workspace-panel__primary`/`__transcript`/`__assist` rules below them,
+   are DELETED here, not shadowed by a later rule — verify in the
+   production bundle, not dev). Matches the ratified layout exactly:
+   transcript left, KG strip above the document, agent right sidebar
+   (design-a §4.1). ========================================================================== */
 .workspace-panel--capture {
   display: grid;
-  grid-template-columns: minmax(300px, 1.08fr) minmax(280px, 0.92fr);
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-columns:
+    minmax(320px, var(--tile-fr-transcript, 1.05fr))
+    minmax(320px, var(--tile-fr-center, 1.15fr))
+    minmax(260px, var(--tile-fr-agent, 0.5fr));
+  /* `notice` (synthesis §W4 tripwire: "leave an unclaimed named row for
+     586b's future notice banner" / "W4 reserves the grid row, nothing
+     more") is `0px` on purpose at every tier — it claims zero visual
+     footprint today (verified: no extra gutter line at any screenshot
+     tier). 586b's implementer changes this one token (`0px` -> `auto` or a
+     fixed height) plus assigns `grid-area: notice` to its banner element;
+     nothing else in this file should need to move. */
+  grid-template-rows:
+    0px
+    minmax(120px, var(--tile-fr-graph, 0.34fr))
+    minmax(0, 1fr);
+  grid-template-areas:
+    "notice     notice    notice"
+    "transcript graph    agent"
+    "transcript document agent";
+  gap: 1px;
+  background: var(--border-color);
 }
 
-.workspace-panel__primary {
-  min-height: 0;
-  overflow: hidden;
-  background: var(--bg-secondary);
+/* design-a §4.3 req 2/3: `grid-area` comes from `[data-tile="…"]` ONLY,
+   never an inline style — phase 2's "arrange" rewrites
+   `grid-template-areas` on the container above with zero child changes.
+   Area names are the tile ids, 1:1. */
+[data-tile="transcript"] {
+  grid-area: transcript;
+}
+[data-tile="graph"] {
+  grid-area: graph;
+}
+[data-tile="document"] {
+  grid-area: document;
+}
+[data-tile="agent"] {
+  grid-area: agent;
 }
 
-.workspace-panel__transcript {
+/* The shared bento tile shell (`WorkspaceTile.tsx`). `container: tile /
+   inline-size` lands on EVERY tile root from phase 1 (memo §2/§4 item 8)
+   even though phase 1 ships no resize: retrofitting containment after
+   phase-2 resize ships would mean re-auditing every rule already inside
+   every tile for the containing-block/stacking-context side effects
+   `container-type` brings. `inline-size`, never `size` — a `size`
+   container collapses in an `auto`-sized track (the standard tier's agent
+   row is `auto`). Named `tile` (not anonymous): tiles never nest, so one
+   shared name is unambiguous and guards a future unnamed container added
+   inside a tile's own content from silently capturing a query written for
+   the tile root. */
+.workspace-tile {
+  container: tile / inline-size;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
   background: var(--bg-secondary);
 }
 
-.workspace-panel__assist {
-  grid-column: 1 / -1;
-  max-height: min(260px, 38vh);
+.workspace-tile__head {
+  flex-shrink: 0;
+}
+
+/* design-a §4.3 req 6: each tile owns its own scroll container so a
+   phase-2 resize can never blow out the grid — mirrors the pre-W4
+   `.workspace-panel__primary`/`__transcript` convention (deleted above),
+   since every phase-1 child (`NotesPanel`/`LiveTranscript`/
+   `AgentProposalsPanel`) already manages its own internal scroll region.
+   `overflow: auto`, not `hidden`: today's three children are all sized to
+   exactly fill this box (`h-full`) and scroll themselves internally, so
+   this never shows a visible scrollbar for them — but it means the
+   "every tile owns its own scroll container" contract is SELF-ENFORCING
+   (a future child that forgets to self-scroll gets a real scrollbar here
+   instead of silent clipping) rather than holding only because every
+   current child happens to cooperate. `.workspace-tile` above still frames
+   the grid with `overflow: hidden` so this is the only scroll surface. */
+.workspace-tile__body {
+  min-height: 0;
+  flex: 1;
   overflow: auto;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
 }
 
-@media (max-width: 1120px) {
-  .workspace-switcher {
-    padding-inline: var(--space-5);
-  }
-
+/* STANDARD tier (1024-1279px, memo §2 table / design-a §4.2): agent drops
+   under the document; two columns. */
+@media (width < 1280px) {
   .workspace-panel--capture {
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(280px, 0.95fr) minmax(280px, 1.05fr);
-  }
-
-  .workspace-panel__primary {
-    border-right: 0;
-    border-bottom: 1px solid var(--border-color);
-  }
-
-  .workspace-panel__transcript {
-    border-left: 0;
+    grid-template-columns: minmax(280px, 1fr) minmax(280px, 1.3fr);
+    /* `notice` row (see the wide-tier rule's comment above) stays `0px`
+       and unclaimed at this tier too. */
+    grid-template-rows: 0px minmax(120px, 0.3fr) minmax(0, 1fr) auto;
+    grid-template-areas:
+      "notice     notice"
+      "transcript graph"
+      "transcript document"
+      "transcript agent";
   }
 
   /* NOW STRIP (seed 88e2, renamed from ControlBar in SHELL-R3 / plan §R3 /
-     ADR-0046 — same reflow, same reason): the single-row header has no room
-     for the center group below ~1120px, so the green Start button + idle
-     hint get painted over by the demoted mode/Gemini group and the
-     settings/sessions cluster. Stack into two rows — brand + right-hand
-     actions share the top row, the center group drops to a full-width
-     wrapping row beneath — so the primary Start action is never occluded.
-     Mirrors the 1120/900 workspace reflow above. (Unlayered: overrides the
-     Tailwind utilities in @layer.) */
+     ADR-0046 — same reflow, same reason) — MOVED UP from the old
+     max-width:1120px tier to this one (responsive-memo-72d4 §3 amendment):
+     the single-row header has no room for the center group below the
+     boundary where it was observed occluding the Start button, so stack
+     into two rows — brand + right-hand actions share the top row, the
+     center group drops to a full-width wrapping row beneath. 1280 > 1120,
+     so the header now reflows STRICTLY EARLIER than the width where the
+     occlusion was measured — moving the boundary up cannot regress the fix
+     it protects. (Unlayered: overrides the Tailwind utilities in
+     @layer.) */
   .now-strip {
     height: auto;
     min-height: 52px;
@@ -193,6 +268,57 @@
     justify-content: flex-start;
     row-gap: var(--space-3);
     column-gap: var(--space-4);
+  }
+}
+
+/* COMPACT tier (<1024px): single column.
+   Stack order — document, graph, agent, transcript — is RATIFIED R2 and
+   OVERRIDES responsive-memo-72d4 §2's table (which wrote graph-first): the
+   maintainer's later explicit ratification (ticket W4) puts the document
+   first instead, matching ratified decision 1 ("the document is the
+   product") more directly than the memo's own draft order did. `App.tsx`'s
+   DOM order matches this exactly, so source order is correct at the one
+   tier WCAG 1.3.2 can measure a bento against (memo §4 item 9) and wide/
+   standard reorder purely via the `grid-template-areas` above — never
+   `order:` (memo §4 item 10).
+   `minmax(0, 1fr)` columns, no px floor: the `minmax(320px, …)` column
+   floors above are a WIDE-tier device (three fixed-width columns); carrying
+   them into this single-column template would overflow horizontally below
+   320px and break WCAG 1.4.10 Reflow (memo §3 "Floor obligations").
+   ROWS are `minmax(0, …fr)` for the identical reason on the block axis:
+   `.workspace-panel` is a fixed, non-scrolling, `overflow: hidden` box all
+   the way up (`.app-container{height:100vh}` >
+   `.main-layout{flex:1;overflow:hidden}` > `.workspace-panel{overflow:
+   hidden}`), so a `minmax(240px, …)`-style PX FLOOR on these rows is the
+   exact same overflow bug the memo's own quote warns about, just on the
+   other axis — four floors summed to 783px of hard minimum, which clips
+   the bottom tiles with no scrollbar to recover them the moment the panel
+   drops below that (any window at ~150%+ browser zoom, e.g. the memo's own
+   ~700x450 200%-zoom figure — verified: 783px scrollHeight vs a ~288px
+   clientHeight at that viewport, ~495px silently clipped). `minmax(0,
+   …fr)` never overflows; it only ever shrinks, same fix shape as the
+   columns above. */
+@media (width < 1024px) {
+  .workspace-switcher {
+    padding-inline: var(--space-5);
+  }
+
+  .workspace-panel--capture {
+    grid-template-columns: minmax(0, 1fr);
+    /* `notice` row (see the wide-tier rule's comment) stays `0px` and
+       unclaimed at this tier too. */
+    grid-template-rows:
+      0px
+      minmax(0, 1.2fr)
+      minmax(0, 0.5fr)
+      minmax(0, 0.6fr)
+      minmax(0, 0.8fr);
+    grid-template-areas:
+      "notice"
+      "document"
+      "graph"
+      "agent"
+      "transcript";
   }
 }
 

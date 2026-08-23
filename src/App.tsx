@@ -88,6 +88,10 @@ import ResizeDivider from "./components/ResizeDivider";
 import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
+// Bento workspace (ticket W4, synthesis audio-graph-a6b5): the tile shell
+// + phase-1 graph-tile placeholder content (W7 replaces the latter).
+import GraphTilePlaceholder from "./components/workspace/GraphTilePlaceholder";
+import { WorkspaceTile } from "./components/workspace/WorkspaceTile";
 
 // Code-split (ADR-0016 / modernization-audit 2.3): these modals/first-run
 // flows are rendered conditionally — lazy-loading them keeps the initial
@@ -374,7 +378,6 @@ interface ShellRailContentAsideProps {
   openSettings: () => void;
   probeRetrying: boolean;
   probeUnreadable: boolean;
-  hasAgentActivity: boolean;
   // SHELL-R7 (plan §R7, ADR-0046): `useShellLayout()`'s tier drives whether
   // the rail (`AudioSourceSelector`) and aside (`SpeakerPanel`) regions are
   // pinned inline here or collapsed behind a drawer `App()` renders itself
@@ -398,7 +401,18 @@ interface ShellRailContentAsideProps {
  * `GetStartedFallback`'s exact role), `showPreflightCard` (genuinely idle —
  * `PreflightCard` replaces the pre-R5 "empty live cockpit" of rendering
  * NotesPanel/LiveTranscript with nothing in them yet), or live/reviewing
- * (the original NotesPanel + LiveTranscript + AgentProposalsPanel trio).
+ * (the bento workspace — see ticket W4 below).
+ *
+ * Ticket W4 (synthesis audio-graph-a6b5): the live/reviewing branch is now a
+ * 4-tile bento grid (`WorkspaceTile` per tile; transcript/document/agent
+ * wrap `LiveTranscript`/`NotesPanel`/`AgentProposalsPanel` unchanged, graph
+ * ships W4's placeholder pending W7). R3 (ratified): the agent tile is
+ * ALWAYS mounted, even with zero activity — `hasAgentActivity` no longer
+ * gates it here; that flag survives ONLY for `showPreflightCard`'s
+ * get-started exclusion above. DOM order (document, graph, agent,
+ * transcript) matches the compact single-column stack order exactly — see
+ * `layout.css`'s `(width < 1024px)` rule for the R2 citation — so wide/
+ * standard tiers reorder purely via `grid-template-areas`, never `order`.
  *
  * SHELL-R7 (plan §R7, ADR-0046): at the `wide` tier this renders BYTE-
  * IDENTICAL to the pre-R7 shape — `AudioSourceSelector` + `SpeakerPanel`
@@ -421,7 +435,6 @@ function ShellRailContentAside({
   openSettings,
   probeRetrying,
   probeUnreadable,
-  hasAgentActivity,
   railPinned,
   asidePinned,
   onOpenSourcesDrawer,
@@ -491,26 +504,31 @@ function ShellRailContentAside({
             aria-labelledby="workspace-tab-capture"
             className="workspace-panel workspace-panel--capture"
           >
-            <section
-              className="workspace-panel__primary"
-              aria-label={t("workspace.duringNotes")}
-            >
+            {/* DOM order = the compact single-column stack order (R2 —
+                see layout.css's `(width < 1024px)` rule), NOT the wide
+                visual order: `grid-template-areas` (layout.css) places
+                each `[data-tile]` visually at the `standard`/`wide`
+                tiers, so this source order only reads literally at
+                `compact`. */}
+            <WorkspaceTile id="document" title={t("notes.title")}>
               <NotesPanel />
-            </section>
-            <section
-              className="workspace-panel__transcript"
-              aria-label={t("workspace.duringTranscript")}
+            </WorkspaceTile>
+            <WorkspaceTile id="graph" title={t("workspace.tile.graph")}>
+              <GraphTilePlaceholder />
+            </WorkspaceTile>
+            {/* R3 (ratified): always mounted, empty-state when idle —
+                `AgentProposalsPanel` itself still renders `null` with zero
+                activity (W8 designs the tile's own empty state); the
+                region/shell here must not disappear regardless. */}
+            <WorkspaceTile id="agent" title={t("agent.title")}>
+              <AgentProposalsPanel />
+            </WorkspaceTile>
+            <WorkspaceTile
+              id="transcript"
+              title={t("workspace.duringTranscript")}
             >
               <LiveTranscript />
-            </section>
-            {hasAgentActivity && (
-              <section
-                className="workspace-panel__assist"
-                aria-label={t("workspace.liveAssist")}
-              >
-                <AgentProposalsPanel />
-              </section>
-            )}
+            </WorkspaceTile>
           </main>
         ))}
       {workspaceView === "sessions" && (
@@ -1086,7 +1104,6 @@ function App() {
           openSettings={openSettings}
           probeRetrying={probeRetrying}
           probeUnreadable={probeUnreadable}
-          hasAgentActivity={hasAgentActivity}
           railPinned={railPinned}
           asidePinned={asidePinned}
           onOpenSourcesDrawer={openSourcesDrawer}

@@ -51,6 +51,12 @@ vi.mock("./components/PipelineStatusBar", () => ({
 vi.mock("./components/AgentProposalsPanel", () => ({
   default: () => <div data-testid="agent-stub" />,
 }));
+// Ticket W4 (synthesis audio-graph-a6b5): the graph tile's phase-1
+// placeholder content — reads store slices unrelated to the hand-off flow,
+// same rationale as the other panel stubs above.
+vi.mock("./components/workspace/GraphTilePlaceholder", () => ({
+  default: () => <div data-testid="graph-stub" />,
+}));
 // SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip.
 vi.mock("./components/NowStrip", () => ({
   default: () => <div data-testid="controlbar-stub" />,
@@ -774,6 +780,59 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     render(<App />);
 
     expect(screen.getByTestId("agent-stub")).toBeInTheDocument();
+  });
+
+  // Ticket W4 (synthesis audio-graph-a6b5), ratified R3: the agent tile
+  // region is now ALWAYS mounted, even with zero agent activity — the old
+  // `hasAgentActivity &&` gate around it is gone (that flag survives only
+  // for `showPreflightCard`'s get-started exclusion, covered above by
+  // "starts in the Ready workspace showing the preflight card"). This is
+  // the mutation-probe complement to the test above: that one proves
+  // agent-stub renders WITH activity; this one proves it also renders
+  // WITHOUT activity, so a regression that reintroduces the gate is caught
+  // regardless of which direction it breaks.
+  it("mounts all four bento tile regions during a live capture, including the agent tile with zero agent activity (R3)", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+  });
+
+  // DOM-order pin (ticket W4, responsive-memo-72d4 §4 item 9, RATIFIED R2
+  // override): the compact single-column stack order is document, graph,
+  // agent, transcript — NOT the memo's own draft order (graph-first) — and
+  // `App.tsx`'s source order must match it exactly so wide/standard tiers
+  // can reorder purely via `grid-template-areas` (never `order:`) while
+  // compact's reading order stays correct by construction.
+  it("orders the bento tiles in the DOM as document, graph, agent, transcript (compact stack order, R2)", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    const capturePanel = document.getElementById("workspace-panel-capture");
+    const tiles = Array.from(
+      capturePanel?.querySelectorAll("[data-tile]") ?? [],
+    );
+    expect(tiles.map((tile) => tile.getAttribute("data-tile"))).toEqual([
+      "document",
+      "graph",
+      "agent",
+      "transcript",
+    ]);
   });
 
   it("re-shows the hand-off for a configured user after re-arming via the help modal (App.tsx:159)", async () => {

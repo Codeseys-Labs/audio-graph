@@ -128,7 +128,7 @@ function AgentProposalsPanel() {
 
   return (
     <section
-      className="border-t border-(--edge) py-[10px] px-(--space-5) max-h-[240px] overflow-y-auto shrink-0"
+      className="h-full overflow-y-auto py-[10px] px-(--space-5)"
       aria-label={t("agent.label")}
     >
       <div className="flex items-center justify-between gap-(--space-4) mb-(--space-4)">

@@ -84,7 +84,11 @@
     "stateIdle": "Pronto",
     "liveAssist": "Assistência ao vivo",
     "duringNotes": "Notas ao vivo",
-    "duringTranscript": "Transcrição ao vivo"
+    "duringTranscript": "Transcrição ao vivo",
+    "tile": {
+      "graph": "Grafo",
+      "graphEmpty": "Nenhuma atividade no grafo ainda"
+    }
   },
   "seekTimeline": {
     "label": "Linha do tempo de navegação da sessão",

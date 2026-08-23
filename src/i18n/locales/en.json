@@ -84,7 +84,11 @@
     "stateIdle": "Ready",
     "liveAssist": "Live assist",
     "duringNotes": "Live notes",
-    "duringTranscript": "Live transcript"
+    "duringTranscript": "Live transcript",
+    "tile": {
+      "graph": "Graph",
+      "graphEmpty": "No graph activity yet"
+    }
   },
   "seekTimeline": {
     "label": "Session seek-timeline",

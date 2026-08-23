@@ -119,6 +119,23 @@
   --z-banner: 1100;
   --z-notification: 1200;
 
+  /* ---- Structural: bento workspace tile fr-multipliers (ticket W4,
+     synthesis audio-graph-a6b5) ------------------------------------------
+     Not a visual design token — the phase-1 default `grid-template-
+     columns`/`-rows` weights for `.workspace-panel--capture`
+     (`layout.css`). Declared here (not only as an inline `var(…, fallback)`
+     default) so `src/styles.no-ghost-tokens.test.ts`'s repo-wide gate
+     treats them as real, and so there's one canonical default even though
+     `layout.css`'s `var()` call sites also carry the same value as a
+     belt-and-suspenders fallback. Phase 2's resize writes an override for
+     one or more of these as an inline custom property on the grid
+     container — see `WorkspaceTile.tsx`'s `WorkspaceLayoutPrefs` doc
+     comment; these four :root values are what renders until it does. */
+  --tile-fr-transcript: 1.05fr;
+  --tile-fr-center: 1.15fr;
+  --tile-fr-agent: 0.5fr;
+  --tile-fr-graph: 0.34fr;
+
   /* ---- Primitive: motion scale (exactly 4 tokens, UI-T3/audio-graph-99aa)
      -----------------------------------------------------------------------
      3 durations (120/180/260ms) + 1 easing curve. --motion-slow moves

@@ -117,6 +117,16 @@ describe("AgentProposalsPanel", () => {
     expect(screen.getByText("42%")).toBeInTheDocument();
   });
 
+  it("fills its container's full height and carries no bottom-strip cap or border (ticket W4: the panel now lives inside a full-height bento sidebar tile, not a bottom strip)", () => {
+    resetStore({ agentProposals: [proposal()] });
+    render(<AgentProposalsPanel />);
+    const region = screen.getByLabelText("Agent proposals");
+    expect(region).toHaveClass("h-full");
+    expect(region).not.toHaveClass("max-h-[240px]");
+    expect(region).not.toHaveClass("border-t");
+    expect(region).not.toHaveClass("shrink-0");
+  });
+
   it("orders proposals newest-first by created_at_ms", () => {
     resetStore({
       agentProposals: [
