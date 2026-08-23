@@ -1218,6 +1218,14 @@
       "currentAria": "As notas estão atualizadas às {{time}}",
       "behind": "−{{count}} turnos",
       "behindAria": "As notas estão {{count}} turnos atrasadas em relação à conversa"
+    },
+    "changeAnchor": {
+      "above": "{{count}} novas acima",
+      "below": "{{count}} novas abaixo"
+    },
+    "a11y": {
+      "changed_one": "Notas atualizadas: {{count}} trecho refinado",
+      "changed_other": "Notas atualizadas: {{count}} trechos refinados"
     }
   },
   "agent": {

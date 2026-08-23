@@ -113,6 +113,21 @@
   }
 }
 
+/* Consumed by `.ag-doc-refined` (layout.css) — the living-document
+   refinement pulse (ticket W10, synthesis audio-graph-a6b5; design-a §1.4).
+   A tint fade, not a shape/position change — the node's TEXT never moves,
+   only its background tints in and fades back out, so the pulse can never
+   itself cause a layout shift. Gated on prefers-reduced-motion at the
+   consumer rule, mirroring `settings-landed-pulse`'s own convention above. */
+@keyframes doc-refined-pulse {
+  0% {
+    background-color: var(--accent-blue-muted);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
 /* Consumed by `.shell-drawer` (layout.css) — SHELL-R7's rail/aside drawers.
    Two directions (mirrored translateX) so the panel slides in from whichever
    edge it's anchored to; gated on prefers-reduced-motion at the consumer

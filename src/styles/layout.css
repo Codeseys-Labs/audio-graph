@@ -244,6 +244,84 @@
   overflow: auto;
 }
 
+/* Refinement pulse (ticket W10, synthesis audio-graph-a6b5; design-a §1.4).
+   `LiveDocument.tsx` adds this class to a node row ONLY while
+   `vm.changedNodeIds` (this fold's own, never-accumulated set) contains
+   that node's id — see that file's `DocBullet` doc comment for why that
+   alone is what keeps an unrelated re-render from ever re-triggering the
+   animation below. Unlayered (same barrel as `.workspace-tile` above), same
+   reasoning `.settings-landed` (settings.css) already established for a
+   deep-link highlight: these are new node classes, not a BEM property
+   being replaced, so the 0922 "delete, don't shadow" trap doesn't apply
+   here either. */
+.ag-doc-refined {
+  animation: doc-refined-pulse 1.5s ease-out;
+  border-radius: var(--radius-sm);
+}
+
+/* The out-of-viewport change anchor (ticket W10, design-a §1.6). ALWAYS
+   present in the DOM (`LiveDocument.tsx` never conditionally unmounts it —
+   see that file's `DocChangeAnchor` doc); visibility is the `opacity`/
+   `pointer-events` INLINE style toggle that component sets, and this
+   `transition` is what turns that toggle into a dissolve instead of a hard
+   cut. `position: sticky` keeps it glued to the visible top/bottom edge of
+   `.workspace-tile__body`'s own scroll container while the document
+   scrolls past underneath it — `z-index: 1` keeps it above the outline
+   content it's stuck over. */
+.ag-doc-anchor {
+  position: sticky;
+  z-index: 1;
+  display: block;
+  margin-inline: auto;
+  width: fit-content;
+  max-height: 32px;
+  overflow: hidden;
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-md);
+  border: none;
+  background: var(--accent-blue);
+  color: var(--on-accent-blue);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    opacity 0.2s ease-out,
+    max-height 0.2s ease-out,
+    padding-block 0.2s ease-out,
+    margin-block 0.2s ease-out;
+}
+
+.ag-doc-anchor[data-direction="above"] {
+  top: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.ag-doc-anchor[data-direction="below"] {
+  bottom: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* At rest (`count === 0` — either never yet triggered, or dissolved after a
+   jump) the anchor must reserve ZERO layout space: design-a §1.6 places
+   `DocChangeAnchor` in `DocumentHead`, outside the scrolling body,
+   precisely so it never costs the reading surface anything, but W10 keeps
+   it mounted in-flow inside the scroll container instead (`LiveDocument.tsx`'s
+   `DocChangeAnchor` doc explains why: a dissolve transition needs something
+   in-flow to animate FROM). Collapsing padding/margin/`max-height` to `0`
+   whenever `aria-hidden` is `"true"` (the SAME `count === 0` check that
+   drives the opacity fade — `LiveDocument.tsx`) recovers the "no reserved
+   space" property without unmounting the button; `overflow: hidden` above
+   keeps the label text from spilling out mid-collapse. Same specificity as
+   the two direction rules above (one class + one attribute selector each) —
+   this rule must stay declared AFTER them so its `margin-block: 0` wins by
+   source order. */
+.ag-doc-anchor[aria-hidden="true"] {
+  max-height: 0;
+  padding-block: 0;
+  margin-block: 0;
+}
+
 /* STANDARD tier (1024-1279px, memo §2 table / design-a §4.2): agent drops
    under the document; two columns. */
 @media (width < 1280px) {
@@ -476,10 +554,24 @@
 
 /* Reduced-motion: the drawers still open/close instantly, just without the
    slide (mirrors the `.settings-overlay`/`.settings-landed` convention in
-   settings.css). */
+   settings.css). Ticket W10 joins the same block: the refinement pulse
+   plays no animation at all (a node that changed is simply rendered with
+   its new text, no motion, per design-a §1.4/this ticket's point 4 — "no
+   motion, a static tint fade or nothing"; nothing was chosen over a static
+   tint because a tint with no fade-out would look like a stuck highlight,
+   which is a worse artifact than no effect at all), and the change
+   anchor's dissolve becomes an instant show/hide instead of a fade. */
 @media (prefers-reduced-motion: reduce) {
   .shell-drawer {
     animation: none;
+  }
+
+  .ag-doc-refined {
+    animation: none;
+  }
+
+  .ag-doc-anchor {
+    transition: none;
   }
 }
 

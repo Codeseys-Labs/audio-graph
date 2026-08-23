@@ -81,6 +81,15 @@ const CHIP_CASES: readonly ChipCase[] = [
   // store's own `agentProposals` cap (`store/index.ts`'s `.slice(-49)`, 50
   // max entries), so a single duplicate-collapse group can never exceed 50.
   { key: "agent.duplicateCount", values: { count: 50 } },
+  // Ticket W10: the out-of-viewport change anchor (`DocChangeAnchor`,
+  // `LiveDocument.tsx`) — styled as a small pill in `layout.css`
+  // (`.ag-doc-anchor`), so it belongs in this file even though it's a
+  // `<button>`, not an `.ag-chip[data-tone]`. Worst case is bounded by the
+  // outline's own node count, not an unbounded counter — `TURNS_WORST_CASE`
+  // is reused here too rather than inventing a second "big number" constant
+  // for the same purpose.
+  { key: "document.changeAnchor.above", values: { count: TURNS_WORST_CASE } },
+  { key: "document.changeAnchor.below", values: { count: TURNS_WORST_CASE } },
 ] as const;
 
 const LOCALES: Record<string, Record<string, unknown>> = {
