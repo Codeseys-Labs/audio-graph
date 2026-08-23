@@ -380,13 +380,23 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     // English here, bypassing this crate's existing typed + translated
     // degradation vocabulary; the frontend now renders a real translation
     // keyed off this code in every locale.
+    // The expected code is feature-dependent: the CI optional-feature smoke
+    // compiles `diarization-clustering`, where the honest reason for a bare
+    // test environment is the missing clustering assets, not a missing engine.
+    #[cfg(feature = "diarization-clustering")]
+    let expected_reason = "clustering_assets_not_downloaded";
+    #[cfg(all(feature = "diarization", not(feature = "diarization-clustering")))]
+    let expected_reason = "asset_not_downloaded";
+    #[cfg(not(any(feature = "diarization", feature = "diarization-clustering")))]
+    let expected_reason = "engine_not_compiled";
     assert!(
         matches!(
             &status.diarization,
-            StageStatus::Degraded { reason } if reason == "engine_not_compiled"
+            StageStatus::Degraded { reason } if reason == expected_reason
         ),
-        "a build without the neural diarization engine compiled in must \
-         report Degraded, not a healthy-looking Running, got {:?}",
+        "a session whose configured diarization engine cannot run must report \
+         Degraded {{ reason: {expected_reason:?} }}, not a healthy-looking \
+         Running, got {:?}",
         status.diarization
     );
 }
