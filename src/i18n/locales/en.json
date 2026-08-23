@@ -1210,7 +1210,13 @@
     "copied": "Copied",
     "gutterLabel": "Note details",
     "empty": "Notes build automatically from the conversation and appear here as an outline as people speak.",
-    "buildingNotes": "Building notes…"
+    "buildingNotes": "Building notes…",
+    "recency": {
+      "asOf": "as of {{time}}",
+      "asOfAria": "Notes last updated at {{time}}",
+      "behind": "−{{count}} turns",
+      "behindAria": "Notes are {{count}} turns behind the conversation"
+    }
   },
   "agent": {
     "title": "Agent",
@@ -1412,6 +1418,10 @@
     },
     "asOf": "Graph as of {{time}}",
     "expand": "Expand to full graph",
+    "recency": {
+      "asOfAria": "Graph last updated at {{time}}",
+      "behindAria": "Graph is {{count}} turns behind the conversation"
+    },
     "feed": {
       "added": "+ {{name}} ({{entityType}})",
       "renamed": "~ {{name}} renamed",

@@ -1,8 +1,14 @@
 import { act, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../../store";
-import type { MaterializedNote, MaterializedNotes } from "../../types";
+import type {
+  AsrSpanRevisionEvent,
+  MaterializedNote,
+  MaterializedNotes,
+  ProjectionPatch,
+} from "../../types";
 import {
+  DocRecencyChip,
   LiveDocument,
   LiveDocumentHeaderActions,
   useLiveDocumentModel,
@@ -34,6 +40,43 @@ function materializedNotes(
     session_id: "live",
     last_sequence: lastSequence,
     notes,
+  };
+}
+
+function notesPatch(overrides: Partial<ProjectionPatch>): ProjectionPatch {
+  return {
+    sequence: 1,
+    kind: "notes",
+    llm_request_id: "r1",
+    basis: null,
+    operations: [],
+    confidence: 1,
+    provenance: null,
+    created_at_ms: 0,
+    ...overrides,
+  };
+}
+
+/** A finalized-turn ASR revision fixture (ticket W6) — `is_final: true` by
+ * default so callers only need `received_at_ms`/`turn_id` to build a
+ * `turnsBehind`-driving revision. Mirrors the real wire shape
+ * `useTauriEvents.test.ts` builds for `asr-span-revision`. */
+function finalizedRevision(
+  overrides: Partial<AsrSpanRevisionEvent> & { received_at_ms: number },
+): AsrSpanRevisionEvent {
+  return {
+    span_id: `span-${overrides.received_at_ms}`,
+    provider: "deepgram",
+    source_id: "system-default",
+    text: "",
+    start_time: 0,
+    end_time: 0,
+    confidence: 1,
+    is_final: true,
+    stability: "final",
+    revision_number: 1,
+    end_of_turn: true,
+    ...overrides,
   };
 }
 
@@ -437,5 +480,145 @@ describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
     const [markdown] = writeText.mock.calls[0] as [string];
     expect(markdown).toContain("**A** alpha");
     expect(markdown).toContain("**B** bravo");
+  });
+});
+
+describe("DocRecencyChip — the tone-routed freshness chip (ticket W6, synthesis audio-graph-a6b5 §2)", () => {
+  beforeEach(() => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+  });
+
+  it("renders data-tone=neutral with the 'as of' text when fewer than 3 finalized turns have passed since the last notes patch", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+    expect(chip?.textContent).toMatch(/as of/i);
+    // Regression guard for the "toLocaleTimeString() with no args uses the
+    // OS/runtime locale, not the app language" bug: this test's own runtime
+    // (Node/vitest) resolves to en-US, which renders AM/PM unless the call
+    // site pins an explicit locale + `hour12: false`. Asserting "no AM/PM"
+    // here fails if that pin regresses, closing a gap the interpolating
+    // i18n budget test (which never calls the real `Date` API) cannot.
+    expect(chip?.textContent).not.toMatch(/AM|PM/i);
+  });
+
+  it("renders data-tone=warning with '-N turns' at the ratified >=3 threshold", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+        finalizedRevision({ received_at_ms: 1_700_000_002_000, turn_id: "t2" }),
+        finalizedRevision({ received_at_ms: 1_700_000_003_000, turn_id: "t3" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toHaveAttribute("data-tone", "warning");
+    expect(chip?.textContent).toMatch(/3/);
+    expect(chip?.textContent).not.toMatch(/as of/i);
+  });
+
+  it("2 finalized turns behind stays neutral (the warning threshold is exclusive below 3)", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+        finalizedRevision({ received_at_ms: 1_700_000_002_000, turn_id: "t2" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    expect(document.querySelector("[data-tone]")).toHaveAttribute(
+      "data-tone",
+      "neutral",
+    );
+  });
+
+  it("renders nothing when the notes lane has never produced an accepted patch this session", () => {
+    render(<DocRecencyChip />);
+    expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
+  });
+
+  it("renders nothing for a loaded/reviewed session — no freshness claim about a finished session's own history", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+      ],
+      loadedSessionId: "recorded-session-1",
+    });
+    render(<DocRecencyChip />);
+    expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
+  });
+
+  it("never renders data-tone=success at this call site, even given a maximally-healthy-looking store state — phase-1-never-success pin held at the CALL SITE, not just liveWorkspaceTone.ts's own unit tests", () => {
+    // `laneRecencyChipTone.test.ts` pins that `evidence: null` structurally
+    // blocks success. That pin says nothing about whether THIS call site
+    // still passes `evidence: null` — a future edit could thread a real
+    // value through DocRecencyChip's `laneRecencyChipTone(...)` call before
+    // W3 lands, and nothing here would fail. Assert on the rendered output
+    // instead: 0 turns behind, a just-now patch — the most success-looking
+    // real store state phase 1 can produce.
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        notesPatch({ sequence: 1, created_at_ms: Date.now() }),
+      ],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).not.toHaveAttribute("data-tone", "success");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("only counts the NOTES lane's patches, not the graph lane's, when deriving lastAppliedAtMs", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        // A graph patch, much more recent than any notes patch — must be
+        // ignored entirely by the notes chip (kind-scoped derivation, W6's
+        // "one function, two call sites" contract).
+        {
+          sequence: 1,
+          kind: "graph",
+          llm_request_id: "r1",
+          basis: null,
+          operations: [],
+          confidence: 1,
+          provenance: null,
+          created_at_ms: 9_000_000_000_000,
+        },
+        notesPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<DocRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
   });
 });

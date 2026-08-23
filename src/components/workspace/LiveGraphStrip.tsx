@@ -33,10 +33,13 @@
  * second internal copy inside this component would desync from the
  * container the moment they read different renders).
  *
- * Honesty (L3/T2 law, synthesis W7 binding note): phase 1 has no
- * lane-health evidence. This component renders AT MOST a neutral, plain
- * "as of HH:MM:SS" timestamp text — never a tone-routed chip, never the
- * word "Live" anywhere. W6 owns the actual freshness CHIPS.
+ * Honesty (L3/T2 law): phase 1 has no lane-health evidence, so this file
+ * never renders the word "Live" anywhere. Ticket W6 (synthesis
+ * audio-graph-a6b5 §2) added the actual tone-routed freshness chip
+ * (`GraphRecencyChip`, exported below, mounted in this tile's `headerSlot`
+ * by `App.tsx`) and removed this component's own pre-W6 plain, untoned
+ * "Graph as of HH:MM:SS" text — one source of truth for the graph lane's
+ * freshness claim, not two.
  */
 import { lazy, Suspense, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -56,6 +59,7 @@ import {
   selectFocusEdges,
   selectTouchedNodeIds,
 } from "./graphFocus";
+import { laneRecencyChipTone, selectLaneRecency } from "./liveWorkspaceTone";
 
 // Ticket W7: SECOND `lazy()` call site for this module — see
 // `SessionsBrowser.tsx`'s updated comment on its own call site for why this
@@ -391,17 +395,76 @@ export function GraphChangeFeedView({
   );
 }
 
-function lastGraphPatchAtMs(
-  patches: readonly ProjectionPatch[],
-): number | null {
-  let latest: number | null = null;
-  for (const patch of patches) {
-    if (patch.kind !== "graph") continue;
-    if (latest === null || patch.created_at_ms > latest) {
-      latest = patch.created_at_ms;
-    }
-  }
-  return latest;
+/**
+ * The graph tile's recency chip (ticket W6, synthesis audio-graph-a6b5 §2).
+ * Renders in the tile's `headerSlot` ALONGSIDE `GraphStripModeSwitcher`
+ * (composed by the caller, `App.tsx`) — replaces W7's plain, untoned
+ * "Graph as of HH:MM:SS" text that used to render inside this component's
+ * own stats row (see the removed `graphStrip.asOf` render site below this
+ * component). One source of truth for the graph lane's freshness claim.
+ *
+ * Shares `selectLaneRecency`/`laneRecencyChipTone` with `DocRecencyChip`
+ * (`LiveDocument.tsx`) — `kind: "graph"` is this call site's only
+ * difference from that one (synthesis §2: "one function, two call sites").
+ *
+ * The visible label ALSO reuses `document.recency.asOf`/`document.recency.behind`
+ * directly (design-a §7's i18n budget table specs this chip as reusing the
+ * document chip's recency strings) — the two are byte-identical per locale
+ * ("as of {{time}}" / "−{{count}} turns" in en; same in pt), so keeping a
+ * separate `graphStrip.recency.asOf`/`behind` pair would just be two copies
+ * of the same string that could drift apart. Only the `*Aria` variants stay
+ * lane-specific (`graphStrip.recency.asOfAria`/`behindAria`) — a screen
+ * reader needs to hear "Graph", not "Notes", is behind.
+ */
+export function GraphRecencyChip() {
+  const { t, i18n } = useTranslation();
+  const { sessionProjectionEvents } = useSessionView();
+  const asrSpanRevisions = useAudioGraphStore((s) => s.asrSpanRevisions);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+
+  // Memoized: see `DocRecencyChip`'s (LiveDocument.tsx) identical comment —
+  // `useSessionView()`'s subscription (incl. `transcriptSegments`) re-renders
+  // this component far more often than `sessionProjectionEvents`/
+  // `asrSpanRevisions` actually change.
+  const { lastAppliedAtMs, turnsBehind } = useMemo(
+    () => selectLaneRecency("graph", sessionProjectionEvents, asrSpanRevisions),
+    [sessionProjectionEvents, asrSpanRevisions],
+  );
+  const recency = laneRecencyChipTone({
+    lastAppliedAtMs,
+    turnsBehind,
+    // Always `null` — no real call site can supply W3's evidence until
+    // that ticket lands. See liveWorkspaceTone.ts's module doc.
+    evidence: null,
+    isLiveSession: loadedSessionId === null,
+  });
+
+  if (!recency.render || recency.lastAppliedAtMs === null) return null;
+
+  // See `DocRecencyChip`'s identical comment: explicit locale + `hour12:
+  // false` keeps the rendered time language-consistent AND fixed-width,
+  // rather than resolving to the OS/runtime locale's default formatting.
+  const time = new Date(recency.lastAppliedAtMs).toLocaleTimeString(
+    i18n.language,
+    { hour12: false },
+  );
+  const label = recency.behind
+    ? t("document.recency.behind", { count: recency.turnsBehind })
+    : t("document.recency.asOf", { time });
+  const ariaLabel = recency.behind
+    ? t("graphStrip.recency.behindAria", { count: recency.turnsBehind })
+    : t("graphStrip.recency.asOfAria", { time });
+
+  return (
+    // See `DocRecencyChip`'s (LiveDocument.tsx) identical comment: `aria-label`
+    // on a bare `<span>` is invalid ARIA (generic role excludes naming) —
+    // this mirrors `PipelineStatusBar.tsx`'s aria-hidden-visible +
+    // `.sr-only`-explanation idiom instead.
+    <span className="ag-chip" data-tone={recency.tone}>
+      <span aria-hidden="true">{label}</span>
+      <span className="sr-only">{ariaLabel}</span>
+    </span>
+  );
 }
 
 /** The tile body. `mode`/`onModeChange` are lifted (see module doc) so the
@@ -454,12 +517,6 @@ export function LiveGraphStrip({
     .filter((node): node is GraphNode => node !== undefined);
   const focusEdges = selectFocusEdges(focusIds, view.snapshot.links);
 
-  // Honesty (L3/T2 law): a neutral, OBSERVED timestamp only — never a tone,
-  // never the word "Live" — and never rendered for a loaded/reviewed
-  // session (no freshness claim about a finished session's own history).
-  const asOfMs = lastGraphPatchAtMs(sessionProjectionEvents);
-  const showAsOf = loadedSessionId === null && asOfMs !== null;
-
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center gap-(--space-3) py-(--space-2) px-(--space-4) text-xs text-text-muted shrink-0 border-b border-(--edge)">
@@ -486,13 +543,6 @@ export function LiveGraphStrip({
         <span aria-hidden={mode === "canvas" ? "true" : undefined}>
           {t("graph.stats.edges", { count: view.snapshot.links.length })}
         </span>
-        {showAsOf && asOfMs !== null && (
-          <span>
-            {t("graphStrip.asOf", {
-              time: new Date(asOfMs).toLocaleTimeString(),
-            })}
-          </span>
-        )}
         {mode !== "canvas" && (
           <IconButton
             icon="fit"

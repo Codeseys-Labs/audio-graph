@@ -94,6 +94,7 @@ import SpeakerPanel from "./components/SpeakerPanel";
 // tile's `headerSlot`) and `LiveDocument` (the tile's body) share the
 // exact same `LiveDocumentVM` instance instead of each folding their own.
 import {
+  DocRecencyChip,
   LiveDocument,
   LiveDocumentHeaderActions,
   useLiveDocumentModel,
@@ -104,6 +105,7 @@ import {
 // the mode value also drives the grid container's `data-graph-mode`
 // attribute two levels up.
 import {
+  GraphRecencyChip,
   GraphStripModeSwitcher,
   LiveGraphStrip,
   useGraphStripMode,
@@ -432,6 +434,9 @@ interface ShellRailContentAsideProps {
  * modes) instead of W4's node/edge-count placeholder; the mode switcher
  * lives in the tile's `headerSlot` and the chosen mode also flags
  * `data-graph-mode` on this `<main>` for the tier-scoped canvas row-swap.
+ * Ticket W6 added `DocRecencyChip`/`GraphRecencyChip` — tone-routed
+ * freshness chips — into both tiles' `headerSlot`s, composed alongside
+ * (never replacing) W5's copy actions and W7's mode switcher.
  *
  * R3 (ratified): the agent tile is
  * ALWAYS mounted, even with zero activity — `hasAgentActivity` no longer
@@ -558,7 +563,17 @@ function ShellRailContentAside({
             <WorkspaceTile
               id="document"
               title={t("notes.title")}
-              headerSlot={<LiveDocumentHeaderActions vm={liveDocumentVm} />}
+              headerSlot={
+                // Ticket W6 (synthesis audio-graph-a6b5 §2): the recency
+                // chip composes ALONGSIDE the existing note-count/copy
+                // actions in this one `headerSlot` — a second `headerSlot`
+                // prop doesn't exist, and `WorkspaceTile`'s contract (W4
+                // §4.3 req 5) is one slot per tile.
+                <span className="flex items-center gap-(--space-3)">
+                  <DocRecencyChip />
+                  <LiveDocumentHeaderActions vm={liveDocumentVm} />
+                </span>
+              }
             >
               <LiveDocument vm={liveDocumentVm} />
             </WorkspaceTile>
@@ -566,10 +581,17 @@ function ShellRailContentAside({
               id="graph"
               title={t("workspace.tile.graph")}
               headerSlot={
-                <GraphStripModeSwitcher
-                  mode={graphStripMode}
-                  onModeChange={setGraphStripMode}
-                />
+                // Ticket W6: composes with W7's mode switcher in the SAME
+                // slot rather than colliding with it — see that ticket's
+                // stop-condition note (the graph header must host both
+                // without a tile-header-contract redesign).
+                <span className="flex items-center gap-(--space-3)">
+                  <GraphRecencyChip />
+                  <GraphStripModeSwitcher
+                    mode={graphStripMode}
+                    onModeChange={setGraphStripMode}
+                  />
+                </span>
               }
             >
               <LiveGraphStrip

@@ -2,11 +2,13 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAudioGraphStore } from "../../store";
 import type {
+  AsrSpanRevisionEvent,
   GraphSnapshot,
   MaterializedGraph,
   ProjectionPatch,
 } from "../../types";
 import {
+  GraphRecencyChip,
   type GraphStripMode,
   GraphStripModeSwitcher,
   LiveGraphStrip,
@@ -78,6 +80,29 @@ function graphPatch(overrides: Partial<ProjectionPatch>): ProjectionPatch {
     confidence: 1,
     provenance: null,
     created_at_ms: 0,
+    ...overrides,
+  };
+}
+
+/** A finalized-turn ASR revision fixture (ticket W6) — `is_final: true` by
+ * default so callers only need `received_at_ms`/`turn_id` to build a
+ * `turnsBehind`-driving revision. Mirrors the real wire shape
+ * `useTauriEvents.test.ts` builds for `asr-span-revision`. */
+function finalizedRevision(
+  overrides: Partial<AsrSpanRevisionEvent> & { received_at_ms: number },
+): AsrSpanRevisionEvent {
+  return {
+    span_id: `span-${overrides.received_at_ms}`,
+    provider: "deepgram",
+    source_id: "system-default",
+    text: "",
+    start_time: 0,
+    end_time: 0,
+    confidence: 1,
+    is_final: true,
+    stability: "final",
+    revision_number: 1,
+    end_of_turn: true,
     ...overrides,
   };
 }
@@ -272,12 +297,13 @@ describe("LiveGraphStrip — hysteresis ticks are patch-scoped, not merged-snaps
   });
 });
 
-describe("LiveGraphStrip — honesty: the as-of timestamp never contains 'Live' (ticket W7, L3/T2 law)", () => {
+describe("LiveGraphStrip — honesty: never contains 'Live'; the OLD inline as-of text is gone (ticket W6, synthesis audio-graph-a6b5 §2)", () => {
   beforeEach(() => {
     localStorage.setItem(GRAPH_STRIP_MODE_STORAGE_KEY, "focus");
+    useAudioGraphStore.setState({ asrSpanRevisions: [] });
   });
 
-  it("renders a plain 'as of' timestamp with no readiness chip and no 'Live' text when a graph patch has landed", () => {
+  it("LiveGraphStrip's own body renders NO 'as of' text and NO [data-tone] chip — ticket W6 moved the freshness claim to GraphRecencyChip in the tile's headerSlot, so there is exactly one source of truth, not two", () => {
     useAudioGraphStore.setState({
       materializedProjectionGraph: materializedGraph({
         nodes: [materializedNode("n1", 1)],
@@ -290,32 +316,16 @@ describe("LiveGraphStrip — honesty: the as-of timestamp never contains 'Live' 
     });
     render(<LiveGraphStripHarness />);
     // The whole rendered strip — header row, chips, everything — must never
-    // contain "Live" anywhere, not just the timestamp span specifically.
-    // Word-boundary-joined (NOT raw `.textContent`, which glues adjacent
-    // elements' text together with no separator and would let an
-    // element-adjacent `<span>Live</span>` badge escape detection — see
-    // `allTextJoinedWithSpaces`'s doc comment).
+    // contain "Live" anywhere. Word-boundary-joined (NOT raw `.textContent`,
+    // which glues adjacent elements' text together with no separator and
+    // would let an element-adjacent `<span>Live</span>` badge escape
+    // detection — see `allTextJoinedWithSpaces`'s doc comment).
     expect(allTextJoinedWithSpaces(document.body)).not.toMatch(/\bLive\b/);
-    // And an "as of" line IS present (the honest observed-fact text).
-    expect(screen.getByText(/Graph as of/)).toBeInTheDocument();
-    // No tone-routed chip element backs it — plain text only.
+    // Pre-W6, `LiveGraphStrip` rendered its OWN plain "Graph as of ..." text
+    // and no chip. W6 deletes that render site outright (not just adds a
+    // second one) — this is the "old text is gone" acceptance criterion.
+    expect(screen.queryByText(/as of/i)).not.toBeInTheDocument();
     expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
-  });
-
-  it("renders no as-of timestamp for a loaded/reviewed session — no freshness claim about a finished session", () => {
-    useAudioGraphStore.setState({
-      materializedProjectionGraph: materializedGraph({
-        nodes: [materializedNode("n1", 1)],
-      }),
-      graphSnapshot: EMPTY_SNAPSHOT,
-      sessionProjectionEvents: [
-        graphPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
-      ],
-      loadedSessionId: "recorded-session-1",
-    });
-    render(<LiveGraphStripHarness />);
-    expect(screen.queryByText(/Graph as of/)).not.toBeInTheDocument();
-    expect(allTextJoinedWithSpaces(document.body)).not.toMatch(/\bLive\b/);
   });
 
   it("mutation-proof: a 'Live' badge adjacent to another element (no separator in raw textContent) is still caught", () => {
@@ -340,6 +350,118 @@ describe("LiveGraphStrip — honesty: the as-of timestamp never contains 'Live' 
     // `document.body.textContent`, is the one that must be used.
     expect(document.body.textContent).toMatch(/Live/);
     expect(allTextJoinedWithSpaces(document.body)).toMatch(/\bLive\b/);
+  });
+});
+
+describe("GraphRecencyChip — the tone-routed freshness chip (ticket W6, synthesis audio-graph-a6b5 §2)", () => {
+  beforeEach(() => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+  });
+
+  it("renders data-tone=neutral with the 'as of' text when fewer than 3 finalized turns have passed since the last graph patch", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        graphPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<GraphRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+    expect(chip?.textContent).toMatch(/as of/i);
+    expect(allTextJoinedWithSpaces(document.body)).not.toMatch(/\bLive\b/);
+    // See `DocRecencyChip`'s (LiveDocument.tsx) identical regression guard:
+    // this test's runtime resolves to en-US, which renders AM/PM unless the
+    // call site pins an explicit locale + `hour12: false`.
+    expect(chip?.textContent).not.toMatch(/AM|PM/i);
+  });
+
+  it("renders data-tone=warning with '-N turns' at the ratified >=3 threshold", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        graphPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+        finalizedRevision({ received_at_ms: 1_700_000_002_000, turn_id: "t2" }),
+        finalizedRevision({ received_at_ms: 1_700_000_003_000, turn_id: "t3" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<GraphRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toHaveAttribute("data-tone", "warning");
+    expect(chip?.textContent).toMatch(/3/);
+    expect(chip?.textContent).not.toMatch(/as of/i);
+  });
+
+  it("2 finalized turns behind stays neutral (the warning threshold is exclusive below 3)", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        graphPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+        finalizedRevision({ received_at_ms: 1_700_000_002_000, turn_id: "t2" }),
+      ],
+      loadedSessionId: null,
+    });
+    render(<GraphRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("never renders data-tone=success at this call site, even given a maximally-healthy-looking store state — phase-1-never-success pin held at the CALL SITE, not just liveWorkspaceTone.ts's own unit tests", () => {
+    // See `DocRecencyChip`'s (LiveDocument.tsx) identical test: the module's
+    // own unit tests pin that `evidence: null` blocks success, but nothing
+    // previously asserted that THIS call site keeps passing `evidence: null`.
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        graphPatch({ sequence: 1, created_at_ms: Date.now() }),
+      ],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<GraphRecencyChip />);
+    const chip = document.querySelector("[data-tone]");
+    expect(chip).toBeInTheDocument();
+    expect(chip).not.toHaveAttribute("data-tone", "success");
+    expect(chip).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("renders nothing when the graph lane has never produced an accepted patch this session", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [],
+      asrSpanRevisions: [],
+      loadedSessionId: null,
+    });
+    render(<GraphRecencyChip />);
+    expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
+  });
+
+  it("renders nothing for a loaded/reviewed session — no freshness claim about a finished session's own history", () => {
+    useAudioGraphStore.setState({
+      sessionProjectionEvents: [
+        graphPatch({ sequence: 1, created_at_ms: 1_700_000_000_000 }),
+      ],
+      asrSpanRevisions: [
+        finalizedRevision({ received_at_ms: 1_700_000_001_000, turn_id: "t1" }),
+        finalizedRevision({ received_at_ms: 1_700_000_002_000, turn_id: "t2" }),
+        finalizedRevision({ received_at_ms: 1_700_000_003_000, turn_id: "t3" }),
+      ],
+      loadedSessionId: "recorded-session-1",
+    });
+    render(<GraphRecencyChip />);
+    expect(document.querySelector("[data-tone]")).not.toBeInTheDocument();
+    expect(allTextJoinedWithSpaces(document.body)).not.toMatch(/\bLive\b/);
   });
 });
 

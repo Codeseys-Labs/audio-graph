@@ -78,6 +78,7 @@ vi.mock("./components/TokenUsagePanel", () => ({
 vi.mock("./components/workspace/LiveDocument", () => ({
   LiveDocument: () => <div data-testid="live-document-stub" />,
   LiveDocumentHeaderActions: () => null,
+  DocRecencyChip: () => null,
   useLiveDocumentModel: () => ({
     sections: [],
     lastSequence: 0,

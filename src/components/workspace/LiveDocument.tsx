@@ -18,7 +18,7 @@
  * site's result via props from their shared caller (`App.tsx`) so there is
  * exactly one fold per render, not two.
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSessionView } from "../../session/SessionViewProvider";
 import { useAudioGraphStore } from "../../store";
@@ -33,6 +33,7 @@ import {
   notesToOutline,
   outlineToMarkdown,
 } from "./liveDocumentModel";
+import { laneRecencyChipTone, selectLaneRecency } from "./liveWorkspaceTone";
 
 /**
  * Incrementally folds `materializedNotes` into a `LiveDocumentVM`, keyed on
@@ -122,6 +123,84 @@ export function LiveDocumentHeaderActions({ vm }: { vm: LiveDocumentVM }) {
         onClick={handleCopy}
         disabled={count === 0}
       />
+    </span>
+  );
+}
+
+/**
+ * The document tile's recency chip (ticket W6, synthesis audio-graph-a6b5
+ * §2). Renders in `WorkspaceTile`'s `headerSlot` ALONGSIDE
+ * `LiveDocumentHeaderActions` (composed by the caller, `App.tsx`) — a
+ * SEPARATE component rather than folded into that one because this reads
+ * different store state (`asrSpanRevisions`, `loadedSessionId`,
+ * `sessionProjectionEvents`) that `LiveDocumentHeaderActions` has no other
+ * use for.
+ *
+ * Honesty (L3/T2 law): `evidence` is always `null` here — W3's
+ * `basis_currency_at_apply` has not landed, so `laneRecencyChipTone` can
+ * never return `tone: "success"` from this call site (see
+ * `liveWorkspaceTone.ts`'s module doc and its pinned test). The visible
+ * chip text SWAPS between the neutral "as of HH:MM:SS" observed fact and
+ * the warning "−N turns" escalation — never both at once, and never the
+ * word "Live" — so a single 18-char-budgeted chip covers both states
+ * (synthesis §2: "one component, three honesty tiers, each earned").
+ */
+export function DocRecencyChip() {
+  const { t, i18n } = useTranslation();
+  const { sessionProjectionEvents } = useSessionView();
+  const asrSpanRevisions = useAudioGraphStore((s) => s.asrSpanRevisions);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+
+  // Memoized: `sessionProjectionEvents`/`asrSpanRevisions` only change when
+  // the store actually appends a patch/revision, but this component's OWN
+  // re-render cadence is driven by `useSessionView()`'s wider subscription
+  // (includes `transcriptSegments`, several updates/sec live) — without this,
+  // the O(patches+revisions) scan in `selectLaneRecency` would re-run on
+  // every transcript tick, not just on the inputs that can change its result.
+  const { lastAppliedAtMs, turnsBehind } = useMemo(
+    () => selectLaneRecency("notes", sessionProjectionEvents, asrSpanRevisions),
+    [sessionProjectionEvents, asrSpanRevisions],
+  );
+  const recency = laneRecencyChipTone({
+    lastAppliedAtMs,
+    turnsBehind,
+    // Always `null` — no real call site can supply W3's evidence until
+    // that ticket lands. See the module doc.
+    evidence: null,
+    isLiveSession: loadedSessionId === null,
+  });
+
+  if (!recency.render || recency.lastAppliedAtMs === null) return null;
+
+  // Explicit locale + `hour12: false`: an unqualified `toLocaleTimeString()`
+  // resolves to the OS/runtime locale, not the app's i18n language — on an
+  // en-US host that renders "11:59:59 PM" (AM/PM, 3 chars wider than the
+  // budget test's assumed worst case) inside a pt sentence for a pt user.
+  // Pinning both the locale and `hour12` keeps the rendered value
+  // language-consistent AND fixed-width (`workspace-chip-length-budget.test.ts`).
+  const time = new Date(recency.lastAppliedAtMs).toLocaleTimeString(
+    i18n.language,
+    { hour12: false },
+  );
+  const label = recency.behind
+    ? t("document.recency.behind", { count: recency.turnsBehind })
+    : t("document.recency.asOf", { time });
+  const ariaLabel = recency.behind
+    ? t("document.recency.behindAria", { count: recency.turnsBehind })
+    : t("document.recency.asOfAria", { time });
+
+  return (
+    // `aria-label` on a bare `<span>` (implicit "generic" role) is invalid
+    // ARIA — the accessible-name computation excludes generic roles, and
+    // biome's `useAriaPropsSupportedByRole` lint catches it. Mirrors
+    // `PipelineStatusBar.tsx`'s established idiom for a text-bearing chip
+    // (A11Y-1): the visible label stays `aria-hidden`, and a `.sr-only`
+    // sibling carries the fuller explanation — no `role="img"` (that's
+    // reserved for genuinely empty/color-only elements, per that file's own
+    // comment), no `aria-live` (W10 owns announcements).
+    <span className="ag-chip" data-tone={recency.tone}>
+      <span aria-hidden="true">{label}</span>
+      <span className="sr-only">{ariaLabel}</span>
     </span>
   );
 }

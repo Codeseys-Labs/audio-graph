@@ -1210,7 +1210,13 @@
     "copied": "Copiado",
     "gutterLabel": "Detalhes da nota",
     "empty": "As notas são criadas automaticamente a partir da conversa e aparecem aqui como um esboço conforme as pessoas falam.",
-    "buildingNotes": "Criando notas…"
+    "buildingNotes": "Criando notas…",
+    "recency": {
+      "asOf": "às {{time}}",
+      "asOfAria": "Notas atualizadas às {{time}}",
+      "behind": "−{{count}} turnos",
+      "behindAria": "As notas estão {{count}} turnos atrasadas em relação à conversa"
+    }
   },
   "agent": {
     "title": "Agente",
@@ -1412,6 +1418,10 @@
     },
     "asOf": "Grafo às {{time}}",
     "expand": "Expandir para o grafo completo",
+    "recency": {
+      "asOfAria": "Grafo atualizado às {{time}}",
+      "behindAria": "O grafo está {{count}} turnos atrasado em relação à conversa"
+    },
     "feed": {
       "added": "+ {{name}} ({{entityType}})",
       "renamed": "~ {{name}} renomeado",
