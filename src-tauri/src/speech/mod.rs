@@ -1703,6 +1703,8 @@ pub(crate) struct TranscriptProcessingContext {
     pub active_session_id: Arc<RwLock<String>>,
     pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    /// See `AppState::display_transcript_write_misses`.
+    pub display_transcript_write_misses: Arc<AtomicU64>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     pub transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
     pub speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
@@ -1929,6 +1931,7 @@ fn shared_to_transcript_context(
         active_session_id: shared.active_session_id,
         transcript_buffer: shared.transcript_buffer,
         transcript_writer: shared.transcript_writer,
+        display_transcript_write_misses: shared.display_transcript_write_misses,
         transcript_event_writer: shared.transcript_event_writer,
         transcript_ledger: shared.transcript_ledger,
         speaker_timeline: shared.speaker_timeline,
@@ -3144,6 +3147,53 @@ fn projection_kind_key(kind: &ProjectionKind) -> &'static str {
     }
 }
 
+/// Append `segment` to the display transcript's writer slot if one is
+/// present; otherwise count the miss in `misses` (audio-graph-64e3). Shared
+/// by every call site that persists a final to the display transcript
+/// (currently `emit_transcript_and_extract_with_meta`'s streaming tail and
+/// `run_speech_processor_diarization_only`'s local-diarization path) so the
+/// miss-counting logic can't independently drift out of sync between them.
+///
+/// Returns `true` iff the segment was actually persisted.
+///
+/// What actually produces a miss here: `writer` is a `std::sync::Mutex`, so
+/// `rotate_session` (state.rs) holding its lock for the whole writer swap
+/// makes a concurrent caller BLOCK on `.lock()`, not observe `None` -- once
+/// unblocked it sees `Some(new writer)` and (if this really is a stale final
+/// racing a rotation) would misattribute the write into the NEW session's
+/// file, not miss it -- so a rotation race is NOT what this counter catches.
+/// A `None` slot with the OLD session id still published is produced by
+/// `lib.rs`'s `graceful_shutdown` (`take_writer` clears the slot without
+/// ever joining the speech-processor/receiver threads first) -- i.e. a quit
+/// while transcribing. That path is not covered by the deepgram receiver
+/// join, and its miss is never surfaced because
+/// `warn_if_display_transcript_rows_missing_at_stop` is only called from
+/// `stop_capture_impl`/`stop_transcribe`, neither of which `graceful_shutdown`
+/// invokes.
+///
+/// This is a write-ATTEMPT miss counter, not a ledger-finals-vs-display-rows
+/// parity check: a final that lands under the WRONG session's writer (writer
+/// present, just the wrong session's) is counted as persisted here, not as a
+/// miss — see `AppState::display_transcript_write_misses`'s doc for that
+/// scoping.
+fn persist_display_transcript_segment(
+    writer: &Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    misses: &Arc<AtomicU64>,
+    segment: &TranscriptSegment,
+) -> bool {
+    let mut persisted = false;
+    if let Ok(writer_guard) = writer.lock()
+        && let Some(ref w) = *writer_guard
+    {
+        w.append(segment);
+        persisted = true;
+    }
+    if !persisted {
+        misses.fetch_add(1, Ordering::Relaxed);
+    }
+    persisted
+}
+
 /// Store, emit, update status, and spawn extraction for a final transcript
 /// segment. Shared by every ASR worker implementation to eliminate the
 /// ~60-line tail that used to be copied inline at each call site.
@@ -3227,11 +3277,19 @@ fn emit_transcript_and_extract_with_meta(
         }
     }
     // 2. Persist transcript segment.
-    if let Ok(writer_guard) = ctx.transcript_writer.lock()
-        && let Some(ref writer) = *writer_guard
-    {
-        writer.append(&segment);
-    }
+    //
+    // A miss here is deliberately NOT logged per-event: the ledger write
+    // below still succeeds for this same final (this function only reaches
+    // here once the caller's ledger accept already returned true), so a
+    // per-segment WARN would fire on every miss and could drown the signal.
+    // Instead count it — see `persist_display_transcript_segment`'s doc for
+    // what actually produces a miss here and what this counter does and does
+    // not cover.
+    persist_display_transcript_segment(
+        &ctx.transcript_writer,
+        &ctx.display_transcript_write_misses,
+        &segment,
+    );
 
     // 3. Emit Tauri events.
     emit_asr_span_revision(&ctx.app_handle, asr_payload);
@@ -5250,12 +5308,16 @@ pub(crate) fn run_speech_processor_diarization_only(
                 buffer.pop_front();
             }
         }
-        // Persist transcript segment asynchronously
-        if let Ok(writer_guard) = shared.transcript_writer.lock()
-            && let Some(ref writer) = *writer_guard
-        {
-            writer.append(&final_segment);
-        }
+        // Persist transcript segment asynchronously. This is a second,
+        // independent display-write site (local diarization-in-place ASR),
+        // not routed through `emit_transcript_and_extract_with_meta`'s shared
+        // tail, so it shares `persist_display_transcript_segment` rather than
+        // duplicating the miss-counting logic (audio-graph-64e3).
+        persist_display_transcript_segment(
+            &shared.transcript_writer,
+            &shared.display_transcript_write_misses,
+            &final_segment,
+        );
 
         let final_meta = final_only_revision_meta(
             "local_diarization",
@@ -5682,9 +5744,14 @@ pub(crate) fn run_deepgram_speech_processor(
 
     // Spawn the Deepgram event receiver thread (processes transcript results).
     // It outlives `is_transcribing` flipping false by design -- see
-    // `run_deepgram_event_receiver`'s doc comment (audio-graph-653a).
+    // `run_deepgram_event_receiver`'s doc comment (audio-graph-653a). Its
+    // handle is joined (bounded) below, AFTER the sender loop exits and the
+    // client disconnects -- see that join's doc comment (audio-graph-64e3)
+    // for why a detached, never-joined handle here let tail-of-session
+    // finals reach the speaker ledger but silently miss the display
+    // transcript.
     let pipeline_status_for_status_update = shared.pipeline_status.clone();
-    let _receiver_handle = std::thread::Builder::new()
+    let receiver_handle = match std::thread::Builder::new()
         .name("deepgram-event-rx".to_string())
         .spawn({
             let shared_for_receiver = shared.clone();
@@ -5700,7 +5767,13 @@ pub(crate) fn run_deepgram_speech_processor(
                     max_speakers,
                 );
             }
-        });
+        }) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("Deepgram streaming: failed to spawn event receiver thread: {e}");
+            None
+        }
+    };
 
     if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
@@ -5758,11 +5831,131 @@ pub(crate) fn run_deepgram_speech_processor(
     // Disconnect the client.
     client.disconnect();
 
+    // audio-graph-64e3: drop `client` explicitly (rather than waiting for
+    // this function's own end-of-scope drop) so the tokio runtime backing
+    // it shuts down NOW and every clone of `event_tx` it held goes with it.
+    // `run_deepgram_event_receiver`'s loop only breaks out of its
+    // `Disconnected` arm once `event_rx.recv_timeout` observes every sender
+    // gone -- dropping `client` here, before the join below, is what makes
+    // that observation happen instead of hanging until this whole function
+    // returns (which used to happen at the SAME point, but after the
+    // receiver was already detached and un-joined).
+    drop(client);
+
+    // Bounded join on the receiver thread. `disconnect()` above already
+    // blocked until Deepgram's close-drain finished, so every tail-of-
+    // utterance final is already sitting in `event_rx`'s buffer; the
+    // receiver only has to drain it (fast: extraction submission is
+    // fire-and-forget, see `coalesce_submit`/`spawn_extraction_task`) and
+    // run its own session-end interim-promotion pass. Without this join,
+    // `stop_capture_impl` could finish tearing down and release
+    // `session_lifecycle` WHILE the receiver was still mid-drain; a
+    // `new_session_cmd` racing in right after Stop would then rotate
+    // `transcript_writer` (audio-graph-64e3 field evidence: 6 finals landed
+    // in `.speaker.jsonl` but never reached the display transcript, no WARN
+    // anywhere). Bounded rather than unbounded so Stop stays fast even in
+    // the pathological case: on timeout, `join_worker_with_bounded_wait`
+    // itself pushes the handle into `shared.retired_session_workers` --
+    // NOT a claim that this function's OWN join by `stop_capture_impl` will
+    // do it transitively. That distinction matters: the sender loop above
+    // typically observes the cleared `is_transcribing` flag and returns from
+    // `disconnect()`/`drop(client)` fast enough that THIS function's thread
+    // joins well inside `stop_capture_impl`'s 3s bound even when the
+    // receiver itself is still draining, so relying on the outer join alone
+    // would leave the receiver fully detached with no fencing at all for
+    // exactly the pathological case this bound exists for.
+    if let Some(handle) = receiver_handle {
+        join_worker_with_bounded_wait(
+            handle,
+            DEEPGRAM_RECEIVER_DRAIN_TIMEOUT,
+            "Deepgram event receiver",
+            &shared.retired_session_workers,
+        );
+    }
+
     log::info!(
         "Deepgram streaming: audio sender exiting. Chunks sent={}",
         chunks_sent
     );
 }
+
+/// Wait up to `timeout` for `handle` to finish, polling every 20ms, then join
+/// it if it did (propagating a panic only as a WARN log) or retain it in
+/// `retired_workers` if it didn't (audio-graph-64e3) -- the SAME idiom
+/// `join_worker_with_timeout` (commands.rs) uses for the sp/asr/projection-job
+/// joins, so a straggler receiver fences a subsequent Start/New Session via
+/// `ensure_session_workers_quiesced` exactly like a timed-out sp/asr worker,
+/// instead of being left fully detached.
+///
+/// Returns `true` iff the thread finished (and was joined) within `timeout`.
+/// Never blocks past `timeout` + one poll tick — pushing into
+/// `retired_workers` on timeout (rather than blocking here) is what keeps
+/// this bounded while still closing the race: the caller's own thread
+/// returns immediately either way, but a subsequent session boundary command
+/// now sees the still-running handle and refuses to proceed until it drains.
+fn join_worker_with_bounded_wait(
+    handle: std::thread::JoinHandle<()>,
+    timeout: Duration,
+    label: &str,
+    retired_workers: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if handle.is_finished() {
+        if let Err(e) = handle.join() {
+            log::warn!("{label} panicked during shutdown: {e:?}");
+        }
+        true
+    } else {
+        log::warn!(
+            "{label} did not finish within {:?}; retaining handle in \
+             retired_session_workers so it fences a subsequent session start/rotation \
+             instead of racing it",
+            timeout
+        );
+        let mut retired = retired_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retired.push(handle);
+        false
+    }
+}
+
+/// Bound on how long `run_deepgram_speech_processor` waits, after
+/// disconnecting the Deepgram client, for the event receiver thread to drain
+/// its already-buffered tail events and exit (audio-graph-64e3).
+///
+/// Chosen because: by the time this wait starts, `disconnect()` has already
+/// blocked (up to `DEEPGRAM_CLOSE_DRAIN_TIMEOUT` + 500ms, ~1.4s) until every
+/// tail-of-utterance event is sitting in the channel buffer, so the receiver
+/// only has to drain what's already there -- writing a handful of JSONL rows
+/// and dispatching fire-and-forget extraction/projection work, not waiting on
+/// any network or LLM round-trip. 2s is generous headroom over that (same
+/// order of magnitude as the existing 3s sp/asr join bound in
+/// `stop_capture_impl` and the 5s `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT`) while
+/// keeping Stop's added worst-case latency bounded.
+///
+/// Disclosed composed worst case (not accounted for by the paragraph above):
+/// the explicit `drop(client)` immediately before this wait runs
+/// `DeepgramStreamingClient`'s `Drop`, which calls
+/// `rt.shutdown_timeout(Duration::from_secs(3))` -- so the sender-loop
+/// thread's total worst case is disconnect's ~1.4s + up to 3s of runtime
+/// shutdown + this 2s wait, ~6.4s, which EXCEEDS `stop_capture_impl`'s own
+/// 3s join bound on that thread. When that happens `join_worker_with_timeout`
+/// spills the sender-loop handle into `retired_session_workers` too (the
+/// safe failure mode: `ensure_session_workers_quiesced` then rejects the next
+/// Start/New Session with a retry-in-a-moment error instead of racing it) --
+/// but that user-visible retry window is a real, newly-introduced consequence
+/// of this bound, not merely a theoretical one.
+///
+/// A timeout on THIS wait specifically does not hang Stop: this function
+/// pushes the receiver's handle into `shared.retired_session_workers` itself
+/// (see `join_worker_with_bounded_wait`) and returns immediately, so a
+/// subsequent Start/New Session is fenced on the receiver directly rather
+/// than depending on the outer sp/asr join happening to also time out.
+const DEEPGRAM_RECEIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Remap a raw Deepgram speaker id to a capped 0-based speaker index.
 ///
@@ -9002,6 +9195,8 @@ mod tests_status {
             active_session_id: app.session_id.clone(),
             transcript_buffer: app.transcript_buffer.clone(),
             transcript_writer: app.transcript_writer.clone(),
+            display_transcript_write_misses: app.display_transcript_write_misses.clone(),
+            retired_session_workers: app.retired_session_workers.clone(),
             transcript_event_writer: app.transcript_event_writer.clone(),
             transcript_ledger: app.transcript_ledger.clone(),
             speaker_timeline: app.speaker_timeline.clone(),

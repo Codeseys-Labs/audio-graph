@@ -1134,6 +1134,53 @@ fn log_abandoned_deferred_retries_after_stop(
     crate::persistence::save_scheduler_queue_state(session_id, &snapshot);
 }
 
+/// Count-only detector for audio-graph-64e3 (field evidence: session
+/// c95d21e6, 6 finalized spans landed in the speaker ledger's
+/// `.speaker.jsonl` but never reached the display transcript's
+/// `<session>.jsonl` — no WARN fired anywhere).
+///
+/// Reads-and-resets `AppState::display_transcript_write_misses`, which
+/// `emit_transcript_and_extract_with_meta` increments every time a final ASR
+/// span revision is accepted into the ledgers but the display-transcript
+/// writer had no writer available at that instant. Must run AFTER the
+/// speech-processor/ASR-worker joins above (same ordering requirement as
+/// `log_abandoned_deferred_retries_after_stop`): those joins are what give
+/// the deepgram receiver thread (and, transitively, this counter) a chance
+/// to reach its final value before Stop reports the session's tally. Logs
+/// session id and the row-count gap only — never transcript content.
+///
+/// Called from both `stop_capture_impl` and `stop_transcribe` (the two
+/// session-end transitions that join sp/asr through this same tail); NOT
+/// called from `rotate_session` (a rotation deliberately does not reset the
+/// counter) or from `lib.rs`'s `graceful_shutdown` (quit while transcribing
+/// clears the writer slot without ever joining sp/asr/receiver first, and
+/// without calling this function at all — a miss on that path is silently
+/// carried forward and never reported until, if ever, capture resumes and
+/// later stops).
+///
+/// Attribution caveat: `session_id` here is the session active AT THIS
+/// STOP, not necessarily the session whose row actually went missing. A
+/// straggler that increments the counter after this read (e.g. a receiver
+/// still draining past its own bounded join, or one of the three ASR
+/// providers whose receiver handle is still fully detached — see the
+/// audio-graph-84e0 residual) has its miss reported at the NEXT stop, under
+/// the NEXT session's id, not the one that actually missed the row. A grep
+/// for this WARN's `session_id=` should be read as "reported at this
+/// session's stop", not "this session is missing rows".
+fn warn_if_display_transcript_rows_missing_at_stop(
+    display_transcript_write_misses: &Arc<AtomicU64>,
+    session_id: &str,
+) {
+    let missing = display_transcript_write_misses.swap(0, Ordering::SeqCst);
+    if missing > 0 {
+        log::warn!(
+            "transcript.display_rows_missing_at_stop session_id={} missing_rows={}",
+            session_id,
+            missing
+        );
+    }
+}
+
 fn register_runtime_processed_audio_consumer(
     registry: &Arc<crate::audio::ProcessedAudioConsumerRegistry>,
     id: &str,
@@ -1966,6 +2013,7 @@ async fn stop_capture_impl(
         state.projection_lane_stopping.store(true, Ordering::SeqCst);
         let projection_job_workers = state.projection_job_workers.clone();
         let projection_schedulers = state.projection_schedulers.clone();
+        let display_transcript_write_misses = state.display_transcript_write_misses.clone();
         let stop_session_id = state.current_session_id();
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(handle) = sp {
@@ -1995,6 +2043,14 @@ async fn stop_capture_impl(
             // `deferred_retry_at_ms` mean "abandoned" rather than "clock
             // still running".
             log_abandoned_deferred_retries_after_stop(&projection_schedulers, &stop_session_id);
+            // audio-graph-64e3: same ordering requirement as the call above —
+            // must run strictly after the sp/asr joins so a still-draining
+            // deepgram receiver has already had its bounded chance to catch
+            // up before this reads the tally.
+            warn_if_display_transcript_rows_missing_at_stop(
+                &display_transcript_write_misses,
+                &stop_session_id,
+            );
         })
         .await;
         // Also stop Gemini notes if running.
@@ -2591,6 +2647,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             }
 
             let transcript_writer = state.transcript_writer.clone();
+            let display_transcript_write_misses = state.display_transcript_write_misses.clone();
             let transcript_event_writer = state.transcript_event_writer.clone();
             let transcript_ledger = state.transcript_ledger.clone();
             let speaker_timeline = state.speaker_timeline.clone();
@@ -2599,6 +2656,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let projection_job_workers = state.projection_job_workers.clone();
             let projection_lane_stopping = state.projection_lane_stopping.clone();
             let active_session_id = state.session_id.clone();
+            let retired_session_workers = state.retired_session_workers.clone();
 
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
@@ -2610,6 +2668,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                     let shared = speech::SpeechShared {
                         transcript_buffer,
                         transcript_writer,
+                        display_transcript_write_misses,
                         transcript_event_writer,
                         transcript_ledger,
                         speaker_timeline,
@@ -2628,6 +2687,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         mistralrs_engine,
                         llm_executor,
                         pending_agent_proposals,
+                        retired_session_workers,
                     };
                     let config = speech::SpeechConfig {
                         models_dir,
@@ -2698,6 +2758,14 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 /// on its next `recv_timeout` cycle (Bug 2 fix), then cleans up the thread handle.
 #[tauri::command]
 pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
+    stop_transcribe_impl(state.inner(), &app).await
+}
+
+/// Implementation behind the `stop_transcribe` Tauri command, split out so
+/// tests can drive it directly against a plain `&AppState` (same convention
+/// as `stop_capture`/`stop_capture_impl`) instead of needing a constructible
+/// `tauri::State`.
+async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_transcribe called");
     let _session_lifecycle = state.session_lifecycle.lock().await;
 
@@ -2721,6 +2789,8 @@ pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) 
         .ok()
         .and_then(|mut g| g.take());
     let retired_speech_workers = state.retired_session_workers.clone();
+    let display_transcript_write_misses = state.display_transcript_write_misses.clone();
+    let stop_session_id = state.current_session_id();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = sp {
             join_worker_with_timeout(
@@ -2738,6 +2808,18 @@ pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) 
                 &retired_speech_workers,
             );
         }
+        // audio-graph-64e3: `stop_capture_impl` is not the only session-end
+        // transition that joins sp/asr through the same bounded-join/receiver
+        // tail — a transcribe-only session ends here instead. Without this
+        // call a miss counted during THIS session was only ever reported at
+        // the next capture-session's stop_capture_impl, under the WRONG
+        // session id. Must run strictly after the joins above for the same
+        // reason `stop_capture_impl` orders it after its own joins — see
+        // `warn_if_display_transcript_rows_missing_at_stop`'s doc.
+        warn_if_display_transcript_rows_missing_at_stop(
+            &display_transcript_write_misses,
+            &stop_session_id,
+        );
     })
     .await;
 
@@ -11848,6 +11930,78 @@ mod tests {
         );
     }
 
+    /// audio-graph-64e3: pins that `start_transcribe` — the ONE production
+    /// site that constructs a `SpeechShared` (every other `SpeechShared {`
+    /// literal in the crate is a `#[cfg(test)]` fixture) — actually wires
+    /// `state.display_transcript_write_misses` and
+    /// `state.retired_session_workers` into the literal it hands to the
+    /// speech-processor thread, rather than a fresh/dangling `Arc`.
+    ///
+    /// Without this pin, mutating either of those two lines to construct a
+    /// fresh `Arc` instead of cloning the shared one survives every other
+    /// test in the suite: the repro test
+    /// (`deepgram_final_after_writer_cleared_reaches_ledger_but_is_counted_as_display_miss`)
+    /// and the `stop_capture_impl` counter tests all build their own
+    /// `SpeechShared`/`AppState` directly, so none of them exercise this
+    /// literal. A dangling `display_transcript_write_misses` would make the
+    /// 64e3 gap silent again in production even though every other test
+    /// stays green; a dangling `retired_session_workers` would silently
+    /// disable the receiver-join fencing this ticket's fix depends on.
+    #[test]
+    fn start_transcribe_wires_the_shared_counter_and_retired_workers_arcs_into_speech_shared() {
+        let body = start_transcribe_body_whitespace_stripped();
+
+        let shared_literal_marker = strip_whitespace("let shared = speech::SpeechShared {");
+        let shared_pos = find_unique_occurrence(
+            &body,
+            &shared_literal_marker,
+            "start_transcribe (SpeechShared literal)",
+        );
+
+        let misses_clone_marker = strip_whitespace(
+            "let display_transcript_write_misses = state.display_transcript_write_misses.clone();",
+        );
+        let misses_clone_pos = find_unique_occurrence(
+            &body,
+            &misses_clone_marker,
+            "start_transcribe (display_transcript_write_misses cloned from state)",
+        );
+        let misses_field_marker = strip_whitespace("display_transcript_write_misses,");
+        let misses_field_pos = find_unique_occurrence(
+            &body,
+            &misses_field_marker,
+            "start_transcribe (display_transcript_write_misses field in SpeechShared literal)",
+        );
+
+        let retired_clone_marker = strip_whitespace(
+            "let retired_session_workers = state.retired_session_workers.clone();",
+        );
+        let retired_clone_pos = find_unique_occurrence(
+            &body,
+            &retired_clone_marker,
+            "start_transcribe (retired_session_workers cloned from state)",
+        );
+        let retired_field_marker = strip_whitespace("retired_session_workers,");
+        let retired_field_pos = find_unique_occurrence(
+            &body,
+            &retired_field_marker,
+            "start_transcribe (retired_session_workers field in SpeechShared literal)",
+        );
+
+        assert!(
+            misses_clone_pos < shared_pos && misses_field_pos > shared_pos,
+            "display_transcript_write_misses must be cloned from `state` BEFORE the \
+             SpeechShared literal and used as a field INSIDE it, not shadowed by a fresh Arc"
+        );
+        assert!(
+            retired_clone_pos < shared_pos && retired_field_pos > shared_pos,
+            "retired_session_workers must be cloned from `state` BEFORE the SpeechShared \
+             literal and used as a field INSIDE it, not shadowed by a fresh Arc — otherwise \
+             a timed-out Deepgram receiver join spills into a vec `ensure_session_workers_\
+             quiesced` never looks at"
+        );
+    }
+
     fn projection_status_test_event(span_id: &str) -> crate::projections::TranscriptEvent {
         crate::projections::TranscriptEvent {
             span_id: span_id.to_string(),
@@ -13970,6 +14124,117 @@ mod tests {
             "the WARN must still carry its documented greppable key so a support session or \
              replay/audit pass can find it"
         );
+    }
+
+    /// audio-graph-64e3: pins that the new display-transcript-rows-missing
+    /// WARN is wired into `stop_capture_impl` strictly AFTER
+    /// `log_abandoned_deferred_retries_after_stop` — same technique and same
+    /// underlying reason as
+    /// `stop_capture_impl_logs_abandoned_deferred_retries_strictly_after_the_drain`
+    /// above: both calls need the sp/asr joins to have already run so the
+    /// deepgram receiver thread (which increments
+    /// `display_transcript_write_misses` and persists the ledger-side rows
+    /// this WARN's count depends on) has had its bounded chance to finish
+    /// before either tally is read.
+    #[test]
+    fn stop_capture_impl_warns_display_transcript_rows_missing_strictly_after_the_deferred_retry_warn()
+     {
+        let commands_source = include_str!("commands.rs");
+        let body_start = commands_source
+            .find("async fn stop_capture_impl(")
+            .expect("stop_capture_impl must exist in commands.rs");
+        let body_end = commands_source[body_start..]
+            .find("pub async fn start_transcribe(")
+            .map(|relative| body_start + relative)
+            .expect("start_transcribe must follow stop_capture_impl");
+        let body = strip_whitespace(&strip_comments(&commands_source[body_start..body_end]));
+
+        let deferred_retry_marker = strip_whitespace("log_abandoned_deferred_retries_after_stop(");
+        let deferred_retry_pos = find_unique_occurrence(
+            &body,
+            &deferred_retry_marker,
+            "stop_capture_impl (log_abandoned_deferred_retries_after_stop call)",
+        );
+        let display_warn_marker =
+            strip_whitespace("warn_if_display_transcript_rows_missing_at_stop(");
+        let display_warn_pos = find_unique_occurrence(
+            &body,
+            &display_warn_marker,
+            "stop_capture_impl (warn_if_display_transcript_rows_missing_at_stop call)",
+        );
+
+        assert!(
+            deferred_retry_pos < display_warn_pos,
+            "warn_if_display_transcript_rows_missing_at_stop must be called strictly AFTER \
+             log_abandoned_deferred_retries_after_stop — both share the same ordering \
+             requirement of running after the sp/asr joins"
+        );
+    }
+
+    /// audio-graph-64e3: same mutation-proof rationale as
+    /// `log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`
+    /// above — no log-capture harness exists in this repo, so source-text
+    /// inspection is the cheapest way to pin that the WARN body (not just the
+    /// call site) has not been gutted, and that it is still gated on a
+    /// non-zero mismatch rather than firing unconditionally.
+    #[test]
+    fn warn_if_display_transcript_rows_missing_at_stop_emits_the_documented_warn_key() {
+        let commands_source = include_str!("commands.rs");
+        let body_start = commands_source
+            .find("fn warn_if_display_transcript_rows_missing_at_stop(")
+            .expect("warn_if_display_transcript_rows_missing_at_stop must exist in commands.rs");
+        let body_end = commands_source[body_start..]
+            .find("fn register_runtime_processed_audio_consumer(")
+            .map(|relative| body_start + relative)
+            .expect(
+                "register_runtime_processed_audio_consumer must follow \
+                 warn_if_display_transcript_rows_missing_at_stop",
+            );
+        let body = &commands_source[body_start..body_end];
+
+        assert!(
+            body.contains("log::warn!"),
+            "warn_if_display_transcript_rows_missing_at_stop must still call log::warn! — \
+             deleting the WARN body is the single most obvious mutation for a logging-only \
+             fix, and nothing else in this suite observes emitted log output"
+        );
+        assert!(
+            body.contains("transcript.display_rows_missing_at_stop"),
+            "the WARN must still carry its documented greppable key so a support session or \
+             replay/audit pass can find it"
+        );
+        assert!(
+            body.contains("missing > 0"),
+            "the WARN must still be gated on a non-zero mismatch, not fire unconditionally"
+        );
+    }
+
+    /// audio-graph-64e3: behavioral pin on the helper itself — seeds the
+    /// counter with a nonzero value (as `emit_transcript_and_extract_with_meta`
+    /// would after detecting real misses), calls the helper directly, and
+    /// checks the swap-based read-and-reset actually reset it. A mutation
+    /// that swaps `swap(0, ...)` for `load(...)` (read without reset) would
+    /// leave stale counts from a prior session bleeding into the next one's
+    /// tally — this is the one piece of behavior a pure source-text
+    /// inspection can't distinguish from the correct code, so it gets a
+    /// behavioral assertion instead.
+    #[test]
+    fn warn_if_display_transcript_rows_missing_at_stop_resets_the_counter() {
+        let counter = Arc::new(AtomicU64::new(3));
+        warn_if_display_transcript_rows_missing_at_stop(&counter, "test-session");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "the helper must reset the counter after reading it, so a straggler final that \
+             arrives after the NEXT stop is counted fresh instead of double-counting this \
+             session's tally"
+        );
+
+        // Zero must stay a no-op: calling the helper again on an already-zero
+        // counter (the common, healthy case) must not panic, underflow, or
+        // otherwise misbehave.
+        warn_if_display_transcript_rows_missing_at_stop(&counter, "test-session");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -18483,6 +18748,124 @@ mod tests {
             persisted.graph_deferred_retry_at_ms.is_some(),
             "the snapshot persisted by the real stop_capture_impl path must record the \
              abandoned graph lane's deferred retry deadline"
+        );
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-64e3: end-to-end behavioral pin that
+    /// `warn_if_display_transcript_rows_missing_at_stop` actually executes on
+    /// the REAL `stop_capture_impl` path — same rationale and same reused
+    /// setup as `stop_capture_impl_reports_a_graph_lane_deferred_retry_abandoned_at_stop`
+    /// above. Seeds `display_transcript_write_misses` as if the deepgram
+    /// receiver had already detected 2 misses during the session, drives the
+    /// full async `stop_capture_impl`, and checks the counter was read and
+    /// reset. Mutation coverage: deleting the
+    /// `warn_if_display_transcript_rows_missing_at_stop` call from
+    /// `stop_capture_impl`, or wiring it to a DIFFERENT `Arc<AtomicU64>`,
+    /// leaves this seeded counter non-zero after Stop — the load-bearing
+    /// assertion below.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn stop_capture_impl_reads_and_resets_display_transcript_write_misses() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("stop-capture-display-rows-missing");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        ensure_audio_pipeline_workers(&state, &app_handle).expect("start audio spine");
+        reset_audio_pipeline_session(&state)
+            .await
+            .expect("audio spine ready");
+        state
+            .capture_manager
+            .lock()
+            .expect("capture manager")
+            .insert_synthetic_handle("system", false);
+        *state.is_capturing.write().unwrap() = true;
+        state.is_transcribing.store(true, Ordering::SeqCst);
+        state
+            .projection_lane_stopping
+            .store(false, Ordering::SeqCst);
+
+        // Seed the counter as if the deepgram receiver thread had already
+        // detected 2 finals that reached the ledger but missed the display
+        // writer during this session.
+        state
+            .display_transcript_write_misses
+            .store(2, Ordering::SeqCst);
+
+        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+            .await
+            .expect("final source stop should succeed even with pending display-row misses");
+
+        assert_eq!(
+            state.display_transcript_write_misses.load(Ordering::SeqCst),
+            0,
+            "the real stop_capture_impl path must have read (and reset) the seeded counter, \
+             proving warn_if_display_transcript_rows_missing_at_stop actually ran"
+        );
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-64e3 (finding: stop_transcribe never read the counter):
+    /// end-to-end behavioral pin that a transcribe-only session (no capture
+    /// involved) ALSO surfaces `transcript.display_rows_missing_at_stop`,
+    /// via the real `stop_transcribe_impl` path — same technique as
+    /// `stop_capture_impl_reads_and_resets_display_transcript_write_misses`
+    /// above. Before this fix, `stop_transcribe` never called
+    /// `warn_if_display_transcript_rows_missing_at_stop` at all, so a miss
+    /// counted during a transcribe-only session surfaced (if ever) under a
+    /// LATER, unrelated capture session's stop — this test pins that the
+    /// counter is read-and-reset at THIS stop instead.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn stop_transcribe_impl_reads_and_resets_display_transcript_write_misses() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("stop-transcribe-display-rows-missing");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        state.is_transcribing.store(true, Ordering::SeqCst);
+
+        // Seed the counter as if a display-write site had already detected 3
+        // finals that reached a ledger but missed the display writer during
+        // this transcribe-only session.
+        state
+            .display_transcript_write_misses
+            .store(3, Ordering::SeqCst);
+
+        stop_transcribe_impl(&state, &app_handle)
+            .await
+            .expect("stop_transcribe should succeed even with pending display-row misses");
+
+        assert_eq!(
+            state.display_transcript_write_misses.load(Ordering::SeqCst),
+            0,
+            "the real stop_transcribe_impl path must have read (and reset) the seeded \
+             counter, proving warn_if_display_transcript_rows_missing_at_stop actually ran \
+             on this path too, not just on stop_capture_impl's"
         );
 
         drain_test_writers(&state);

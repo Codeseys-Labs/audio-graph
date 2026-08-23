@@ -294,6 +294,8 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         SpeechShared {
             transcript_buffer: transcript_buffer.clone(),
             transcript_writer: Arc::new(Mutex::new(None)),
+            display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
+            retired_session_workers: Arc::new(Mutex::new(Vec::new())),
             transcript_event_writer: Arc::new(Mutex::new(None)),
             transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
                 "test-session",
@@ -431,6 +433,8 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
     let shared = SpeechShared {
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),
+        display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
+        retired_session_workers: Arc::new(Mutex::new(Vec::new())),
         transcript_event_writer,
         transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
             session_id,
@@ -637,6 +641,8 @@ fn deepgram_multi_speaker_final_splits_into_per_run_segments() {
     let shared = SpeechShared {
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),
+        display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
+        retired_session_workers: Arc::new(Mutex::new(Vec::new())),
         transcript_event_writer,
         transcript_ledger: transcript_ledger.clone(),
         speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
@@ -939,6 +945,7 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         active_session_id,
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),
+        display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
         transcript_event_writer: transcript_event_writer.clone(),
         transcript_ledger: transcript_ledger.clone(),
         speaker_timeline,
@@ -1435,9 +1442,19 @@ struct DeepgramReceiverHarness {
     receiver_thread: Option<std::thread::JoinHandle<()>>,
     transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+    /// Real display-transcript writer slot (audio-graph-64e3), mirroring
+    /// `AppState::transcript_writer` exactly — the other tests in this file
+    /// leave this `Arc::new(Mutex::new(None))` for their whole run because
+    /// they never exercise the display-write path at all. Tests that need
+    /// to model the writer becoming unavailable mid-drain (the field
+    /// evidence's actual mechanism) call `clear_transcript_writer`.
+    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    /// See `AppState::display_transcript_write_misses`.
+    display_transcript_write_misses: Arc<AtomicU64>,
     projection_job_workers: crate::state::ProjectionJobRegistry,
     projection_lane_stopping: Arc<AtomicBool>,
     source_id: String,
+    session_id: String,
     models_dir: PathBuf,
     _data_dir_guard: DataDirGuard,
 }
@@ -1479,9 +1496,24 @@ impl DeepgramReceiverHarness {
             Arc::new(Mutex::new(Vec::new()));
         let projection_lane_stopping = Arc::new(AtomicBool::new(false));
         let transcript_ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone())));
+        // audio-graph-64e3: a REAL writer, not the `Arc::new(Mutex::new(None))`
+        // every other harness-driven test in this file uses — those tests
+        // never look at the display transcript, but this section's tests
+        // need a genuine writer whose slot can be cleared mid-drain to model
+        // the field-evidence race.
+        let transcript_writer = Arc::new(Mutex::new(crate::persistence::TranscriptWriter::spawn(
+            &session_id,
+        )));
+        assert!(
+            transcript_writer.lock().unwrap().is_some(),
+            "integration fixture requires an accepting display-transcript writer"
+        );
+        let display_transcript_write_misses = Arc::new(AtomicU64::new(0));
         let shared = SpeechShared {
             transcript_buffer: transcript_buffer.clone(),
-            transcript_writer: Arc::new(Mutex::new(None)),
+            transcript_writer: transcript_writer.clone(),
+            display_transcript_write_misses: display_transcript_write_misses.clone(),
+            retired_session_workers: Arc::new(Mutex::new(Vec::new())),
             transcript_event_writer,
             transcript_ledger: transcript_ledger.clone(),
             speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
@@ -1533,12 +1565,56 @@ impl DeepgramReceiverHarness {
             receiver_thread: Some(receiver_thread),
             transcript_buffer,
             transcript_ledger,
+            transcript_writer,
+            display_transcript_write_misses,
             projection_job_workers,
             projection_lane_stopping,
             source_id,
+            session_id,
             models_dir,
             _data_dir_guard: data_dir_guard,
         }
+    }
+
+    /// Model the field-evidence race (audio-graph-64e3): the display-
+    /// transcript writer becomes unavailable while the receiver thread is
+    /// still mid-drain. Shuts the writer down (bounded, matching
+    /// `rotate_session`'s own graceful-shutdown posture) and leaves the slot
+    /// `None`, so any final sent afterward is accepted by the ledger but
+    /// counted as a display-transcript miss instead of persisted.
+    fn clear_transcript_writer(&self) {
+        let taken = self
+            .transcript_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(writer) = taken {
+            assert!(
+                writer.shutdown_with_timeout(Duration::from_secs(3)),
+                "transcript writer must flush and join within the test's bounded shutdown"
+            );
+        }
+    }
+
+    /// Row count of the display transcript's `<session>.jsonl` currently on
+    /// disk. Only meaningful after `clear_transcript_writer` (or
+    /// `disconnect_and_join`, which flushes everything still pending) has
+    /// ensured the writer's `BufWriter` has actually flushed — reading while
+    /// the writer thread might still hold unflushed bytes would under-count.
+    fn display_transcript_row_count(&self) -> usize {
+        let path = crate::user_data::transcript_path(&self.session_id)
+            .expect("resolve display transcript path");
+        crate::persistence::load_jsonl::<TranscriptSegment>(&path)
+            .expect("read display transcript jsonl")
+            .len()
+    }
+
+    /// Row count of the speaker/diarization ledger's `<session>.speaker.jsonl`
+    /// currently on disk — the field evidence's "ledger accepted it" side.
+    fn speaker_ledger_row_count(&self) -> usize {
+        crate::persistence::load_diarization_span_revisions(&self.session_id)
+            .expect("read speaker ledger jsonl")
+            .len()
     }
 
     fn send(&self, event: crate::asr::deepgram::DeepgramEvent) {
@@ -2294,4 +2370,297 @@ fn deepgram_final_clears_pending_before_it_can_corrupt_speaker_cap() {
          interim (raw 7) would be promoted-then-rejected at session end but would \
          still remap raw 7 into slot 1 first, pushing C's raw 9 to slot 2 (\"Speaker 2\")"
     );
+}
+
+// ---------------------------------------------------------------------------
+// audio-graph-64e3: a final that reaches the receiver while the display-
+// transcript writer is unavailable lands in the speaker ledger but is
+// silently skipped on the display transcript -- unless the miss is counted.
+// ---------------------------------------------------------------------------
+//
+// Field evidence (session c95d21e6): 6 finalized spans reached
+// `.speaker.jsonl` (107 rows) but never reached the display transcript's
+// `<session>.jsonl` (101 rows), with no WARN anywhere and both counts under
+// the SAME session id. This test reproduces the divergence directly (via
+// `clear_transcript_writer`) rather than through the specific production
+// mechanism that empties the slot -- `ctx.transcript_writer` is a
+// `std::sync::Mutex`, so a real `rotate_session` race would BLOCK a
+// concurrent caller on `.lock()` and then hand it `Some(new writer)`, not
+// `None`; the production path that leaves the slot `None` while the OLD
+// session id is still published is `lib.rs`'s `graceful_shutdown` (quit
+// while transcribing), see its doc comment. What this test pins is the
+// counting behavior itself -- a final can always reach the ledger via
+// `record_asr_span_revision_event_and_observe_projection` and STILL miss the
+// display writer whenever `ctx.transcript_writer`'s slot is empty, and that
+// miss is now counted via `AppState::display_transcript_write_misses`
+// instead of vanishing with no signal at all.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn deepgram_final_after_writer_cleared_reaches_ledger_but_is_counted_as_display_miss() {
+    let mut harness = DeepgramReceiverHarness::new("64e3-display-write-miss", 0);
+
+    let word = |word: &str, speaker: u32| crate::asr::deepgram::DeepgramWord {
+        word: word.to_string(),
+        punctuated_word: None,
+        start: 0.0,
+        end: 1.0,
+        confidence: 0.9,
+        speaker: Some(speaker),
+    };
+
+    // Final #1: writer is present -- both the ledger and the display
+    // transcript must accept it, and the miss counter must stay at 0.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "first final".to_string(),
+        confidence: 0.9,
+        is_final: true,
+        speech_final: true,
+        start: 0.0,
+        duration: 1.0,
+        words: vec![word("first", 0)],
+    });
+    harness.wait_for_buffer_len("first final lands", 1);
+
+    assert_eq!(
+        harness
+            .display_transcript_write_misses
+            .load(Ordering::SeqCst),
+        0,
+        "a final persisted while the writer is present must not be counted as a miss"
+    );
+
+    // Model the race: the display-transcript writer becomes unavailable
+    // while the receiver thread is still running (the exact window
+    // `stop_capture_impl`'s missing join on the deepgram receiver used to
+    // leave open for a racing `rotate_session`).
+    harness.clear_transcript_writer();
+
+    // Final #2: writer is gone. The ledger write is independent of the
+    // display writer's slot (it opens `.speaker.jsonl` fresh per call by
+    // session id), so it must still succeed; the display write must miss and
+    // be counted, not silently dropped.
+    harness.send(crate::asr::deepgram::DeepgramEvent::Transcript {
+        text: "second final".to_string(),
+        confidence: 0.9,
+        is_final: true,
+        speech_final: true,
+        start: 2.0,
+        duration: 1.0,
+        words: vec![word("second", 0)],
+    });
+    harness.wait_for_buffer_len("second final lands", 2);
+
+    harness.disconnect_and_join();
+
+    assert_eq!(
+        harness.speaker_ledger_row_count(),
+        2,
+        "the speaker ledger must have accepted BOTH finals -- its persistence is not \
+         gated on the display-transcript writer's slot"
+    );
+    assert_eq!(
+        harness.display_transcript_row_count(),
+        1,
+        "the display transcript must be missing exactly the final that arrived after the \
+         writer was cleared -- this is the field-evidence divergence, reproduced"
+    );
+    assert_eq!(
+        harness
+            .display_transcript_write_misses
+            .load(Ordering::SeqCst),
+        1,
+        "the miss must be counted exactly once so `stop_capture_impl` can surface it as a \
+         `transcript.display_rows_missing_at_stop` WARN instead of it vanishing silently"
+    );
+}
+
+/// audio-graph-64e3: no-hang pin for `join_worker_with_bounded_wait`'s bound,
+/// AND a behavioral pin of the fencing fix itself: on timeout the handle must
+/// be retained in `retired_workers`, not detached. Detaching (the pre-fix
+/// behavior) is exactly what let a still-draining Deepgram receiver escape
+/// `ensure_session_workers_quiesced`'s fence entirely, since the outer
+/// `run_deepgram_speech_processor` thread routinely joins within
+/// `stop_capture_impl`'s own 3s bound even while the receiver is still
+/// draining (see the doc comment on the join call site in `mod.rs`) --
+/// so relying on that OUTER join to transitively fence the receiver was
+/// false. This test proves the fencing lives in THIS helper instead.
+///
+/// `run_deepgram_speech_processor` calls this helper to join the event
+/// receiver before returning (closing the gap that used to let
+/// `stop_capture_impl` release `session_lifecycle` while the receiver was
+/// still mid-drain). Stop must stay fast even if the receiver is wedged, so
+/// this also pins that the wait truly returns AT the bound rather than
+/// blocking for however long the worker actually takes.
+#[test]
+fn join_worker_with_bounded_wait_returns_at_the_bound_when_the_thread_is_slow() {
+    let handle = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let retired: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let started = std::time::Instant::now();
+    let joined = super::join_worker_with_bounded_wait(
+        handle,
+        Duration::from_millis(50),
+        "slow-worker-test",
+        &retired,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        !joined,
+        "a thread that outlives the bound must be reported as not joined"
+    );
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "the wait must return at (approximately) the 50ms bound, not block for anywhere \
+         near the worker's full 500ms sleep -- got {elapsed:?}"
+    );
+    assert_eq!(
+        retired.lock().unwrap().len(),
+        1,
+        "a handle that outlives the bound must be spilled into `retired_workers` (the SAME \
+         idiom `join_worker_with_timeout` uses in commands.rs) instead of being detached, so \
+         `ensure_session_workers_quiesced` fences the next Start/New Session on it"
+    );
+}
+
+/// Companion to the no-hang pin above: a worker that finishes well inside the
+/// bound must be joined (not just timed out and detached), must NOT be
+/// spilled into `retired_workers`, and must not make the caller wait
+/// anywhere near the full bound either.
+#[test]
+fn join_worker_with_bounded_wait_joins_promptly_when_the_thread_finishes_quickly() {
+    let handle = std::thread::spawn(|| {});
+    let retired: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let started = std::time::Instant::now();
+    let joined = super::join_worker_with_bounded_wait(
+        handle,
+        Duration::from_secs(2),
+        "fast-worker-test",
+        &retired,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        joined,
+        "a thread that finishes well inside the bound must be reported as joined"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "a thread that finishes almost immediately must not make the caller wait anywhere \
+         near the full 2s bound -- got {elapsed:?}"
+    );
+    assert_eq!(
+        retired.lock().unwrap().len(),
+        0,
+        "a promptly-joined handle must not be left in retired_workers -- only a genuine \
+         timeout spills into the fencing vec"
+    );
+}
+
+/// audio-graph-64e3: source-order pin (same technique as
+/// `stop_capture_impl_logs_abandoned_deferred_retries_strictly_after_the_drain`
+/// in `commands.rs`) that `run_deepgram_speech_processor` actually joins the
+/// event receiver, and does so AFTER disconnecting/dropping the client --
+/// not before. Joining before disconnect would just hang forever (the
+/// receiver only exits once `event_rx` observes every sender gone), and
+/// omitting the join entirely reopens the exact gap this ticket closes: a
+/// `new_session_cmd` racing in right after `stop_capture_impl` returns can
+/// rotate `transcript_writer` while the receiver is still mid-drain. A
+/// behavioral pin of this exact ordering would require a live network
+/// connection to Deepgram (`DeepgramStreamingClient::connect()`), which is
+/// why this suite otherwise drives `run_deepgram_event_receiver` directly
+/// via `DeepgramReceiverHarness` instead of the full sender+receiver
+/// function -- source inspection is the cheapest mutation-proof available
+/// for the sender-loop wiring specifically.
+#[test]
+fn run_deepgram_speech_processor_joins_the_event_receiver_after_disconnecting_the_client() {
+    let source = include_str!("mod.rs");
+    let body_start = source
+        .find("pub(crate) fn run_deepgram_speech_processor(")
+        .expect("run_deepgram_speech_processor must exist in speech/mod.rs");
+    let body_end = source[body_start..]
+        .find("fn join_worker_with_bounded_wait(")
+        .map(|relative| body_start + relative)
+        .expect("join_worker_with_bounded_wait must follow run_deepgram_speech_processor");
+    let body = &source[body_start..body_end];
+
+    let disconnect_pos = body
+        .find("client.disconnect();")
+        .expect("run_deepgram_speech_processor must call client.disconnect()");
+    let drop_pos = body
+        .find("drop(client);")
+        .expect("run_deepgram_speech_processor must explicitly drop the client before joining");
+    let join_pos = body.find("join_worker_with_bounded_wait(").expect(
+        "run_deepgram_speech_processor must join the event receiver handle before returning",
+    );
+
+    assert!(
+        disconnect_pos < drop_pos && drop_pos < join_pos,
+        "the ordering must be disconnect() -> drop(client) -> join -- dropping the client is \
+         what makes `event_rx` observe every sender gone, which is what lets the join's \
+         bounded wait actually resolve instead of always hitting its timeout"
+    );
+}
+
+/// audio-graph-64e3: behavioral pin for `persist_display_transcript_segment`,
+/// the helper shared by `emit_transcript_and_extract_with_meta`'s streaming
+/// tail AND `run_speech_processor_diarization_only`'s local-diarization
+/// display write. Exercising the helper directly (rather than only through
+/// the full ASR-worker loop, which needs a real diarization model to drive)
+/// gives real behavioral coverage of the second display-write site's miss
+/// counting, not just the source-inspection style pin the streaming tail
+/// otherwise relies on.
+#[test]
+fn persist_display_transcript_segment_counts_a_miss_only_when_the_writer_slot_is_empty() {
+    let data_dir = unique_tempdir("64e3-persist-display-segment");
+    let _guard = DataDirGuard::set(&data_dir);
+    let session_id = "64e3-persist-display-segment-session";
+
+    let segment = TranscriptSegment {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_id: "integration-test".to_string(),
+        speaker_id: None,
+        speaker_label: None,
+        text: "hello".to_string(),
+        start_time: 0.0,
+        end_time: 1.0,
+        confidence: 0.9,
+    };
+
+    // No writer present: must count a miss and report `false`.
+    let empty_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>> =
+        Arc::new(Mutex::new(None));
+    let misses = Arc::new(AtomicU64::new(0));
+    let persisted = super::persist_display_transcript_segment(&empty_writer, &misses, &segment);
+    assert!(
+        !persisted,
+        "an empty writer slot must be reported as not persisted"
+    );
+    assert_eq!(
+        misses.load(Ordering::SeqCst),
+        1,
+        "an empty writer slot must count exactly one miss"
+    );
+
+    // A real writer present: must persist and must NOT count a miss.
+    let real_writer = crate::persistence::TranscriptWriter::spawn(session_id);
+    assert!(
+        real_writer.is_some(),
+        "integration fixture requires an accepting display-transcript writer"
+    );
+    let writer_slot = Arc::new(Mutex::new(real_writer));
+    let misses = Arc::new(AtomicU64::new(0));
+    let persisted = super::persist_display_transcript_segment(&writer_slot, &misses, &segment);
+    assert!(persisted, "a present writer must be reported as persisted");
+    assert_eq!(
+        misses.load(Ordering::SeqCst),
+        0,
+        "a present writer must not count a miss"
+    );
+
+    if let Some(writer) = writer_slot.lock().unwrap().take() {
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(3)));
+    }
 }

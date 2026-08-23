@@ -7,7 +7,7 @@
 //! defaults are parsed from `config/default.toml` through `crate::config`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -94,6 +94,45 @@ pub struct AppState {
 
     /// Async transcript writer (appends to JSONL file on disk).
     pub transcript_writer: Arc<Mutex<Option<TranscriptWriter>>>,
+
+    /// Count-only detector for audio-graph-64e3: incremented by
+    /// `emit_transcript_and_extract_with_meta` every time a final ASR span
+    /// revision is accepted into the transcript/diarization ledgers (so the
+    /// speaker-ledger row for it WILL be persisted) but `transcript_writer`
+    /// above has no writer available at that instant, so the display
+    /// transcript's `<session>.jsonl` row for it is silently skipped.
+    ///
+    /// Field evidence (session c95d21e6): 6 finalized spans landed in
+    /// `.speaker.jsonl` (107 rows) but never reached the display transcript
+    /// (101 rows) — a tail-of-session gap that produced no WARN anywhere,
+    /// with both counts attributed to the SAME session id (no rotation
+    /// observed). `stop_capture_impl` reads-and-resets this counter after
+    /// joining the speech-processor/receiver threads and logs a `transcript.
+    /// display_rows_missing_at_stop` WARN (session id + count only — never
+    /// transcript content) whenever it is non-zero. This closes the specific
+    /// gap a detached, never-joined Deepgram receiver JoinHandle left open
+    /// around `stop_capture_impl` (a straggler could keep draining after
+    /// `stop_capture_impl` returned and race a subsequent rotation) — it does
+    /// NOT cover every way `transcript_writer`'s slot can be unavailable.
+    /// `lib.rs`'s `graceful_shutdown` (quit while transcribing) clears the
+    /// writer slot via `take_writer` without ever joining the speech-
+    /// processor/ASR/receiver threads first and never calls this counter's
+    /// reader, so a miss on that path increments the counter but is never
+    /// reported. `rotate_session` does not reset this counter — only
+    /// `stop_capture_impl`'s own read-and-reset does — so a straggler final
+    /// that arrives after a rotation and still misses the display writer is
+    /// counted at the NEXT stop, under the NEXT session's id, rather than
+    /// silently dropped or attributed to the session that actually missed
+    /// the row.
+    ///
+    /// Scope: this counts display-write ATTEMPT misses (no writer present),
+    /// incremented at two independent sites — the shared streaming tail
+    /// (`emit_transcript_and_extract_with_meta`) and the local-diarization
+    /// path (`run_speech_processor_diarization_only`). It is NOT a
+    /// ledger-finals-vs-display-rows parity check: a final that lands under
+    /// the WRONG session's `<id>.jsonl` (writer present, just the wrong
+    /// session's writer) is not detected here at all.
+    pub display_transcript_write_misses: Arc<AtomicU64>,
 
     /// Async transcript event writer (appends immutable span revisions to JSONL).
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
@@ -808,6 +847,7 @@ impl AppState {
             session_id: Arc::new(RwLock::new(session_id)),
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
+            display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
             transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
             transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
             speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Receiver;
@@ -44,6 +44,18 @@ pub(crate) struct SpeechShared {
     pub active_session_id: Arc<RwLock<String>>,
     pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    /// See `AppState::display_transcript_write_misses`.
+    pub display_transcript_write_misses: Arc<AtomicU64>,
+    /// Same `Arc` as `AppState::retired_session_workers`. A receiver thread
+    /// (e.g. the Deepgram event receiver spawned by
+    /// `run_deepgram_speech_processor`) that outlives its own bounded drain
+    /// wait is pushed here — via `join_worker_with_bounded_wait` — instead of
+    /// being detached, so `ensure_session_workers_quiesced` (commands.rs)
+    /// fences a subsequent Start/New Session on it exactly like a timed-out
+    /// sp/asr worker (audio-graph-64e3). Detaching instead of spilling here
+    /// used to let a still-draining receiver's stale-session writes race a
+    /// rotation that had already been allowed to proceed.
+    pub retired_session_workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     pub transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
     pub speaker_timeline: Arc<Mutex<crate::projections::SpeakerTimeline>>,
