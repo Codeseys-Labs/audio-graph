@@ -484,3 +484,15 @@ does *not* already have materialized notes (`ProjectionPatchBuildContext`,
 timestamp + turnsBehind + W3 upgrade ladder. **B §4.2** — the shared
 snapshot-only selector cannot compute B's own sequence-based recency; selector
 exposes the materialized graph too.
+
+---
+
+> **Correction (2026-08-23, W6 landing, wf_f52b748d-a82).** design-a §2.4 and
+> §2 of this document state the backend turn-finalization gate as
+> `is_final && end_of_turn`. The real gate
+> (`observe_projection_schedulers_for_asr_revision`, speech/mod.rs) is
+> `is_final || end_of_turn || stability == Final` — an OR of three conditions.
+> Behaviorally inert today: every production emitter sets the three flags in
+> lockstep, so neither form miscounts on real wire data. W6's
+> `selectTurnsBehind` mirrors the verified OR form, with per-condition tests
+> as a tripwire should any emitter ever break lockstep.
