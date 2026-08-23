@@ -386,12 +386,20 @@ function projectionPatchNote(
   title: string,
   body: string,
   tags: string[],
+  headingLevel: number | null | undefined,
 ): MaterializedNote {
   return {
     id,
     title,
     body,
     tags,
+    // W1 (audio-graph-a6b5) still in flight on the Rust side — carried
+    // through byte-faithfully so `MaterializedNotes` stays a truthful
+    // mirror of the wire patch (`liveDocumentModel.ts` is the only reader
+    // today). `undefined`/`null` on the wire both collapse to `null` here
+    // rather than leaving `undefined`, so this field never silently
+    // reappears as "present but unset" after a spread/copy.
+    heading_level: headingLevel ?? null,
     updated_by_sequence: patch.sequence,
     updated_at_ms: patch.created_at_ms,
     basis: patch.basis,
@@ -430,6 +438,7 @@ function applyProjectionNotesPatch(
           operation.title,
           operation.body,
           operation.tags,
+          operation.heading_level,
         );
         const index = notes.notes.findIndex((note) => note.id === operation.id);
         if (index >= 0) notes.notes[index] = next;

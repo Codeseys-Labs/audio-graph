@@ -1204,6 +1204,14 @@
     "error": "Não foi possível sintetizar as notas: {{message}}",
     "dismissError": "Dispensar erro"
   },
+  "document": {
+    "noteCount": "Notas: {{count}}",
+    "copy": "Copiar notas como texto",
+    "copied": "Copiado",
+    "gutterLabel": "Detalhes da nota",
+    "empty": "As notas são criadas automaticamente a partir da conversa e aparecem aqui como um esboço conforme as pessoas falam.",
+    "buildingNotes": "Criando notas…"
+  },
   "agent": {
     "title": "Agente",
     "label": "Propostas do agente",

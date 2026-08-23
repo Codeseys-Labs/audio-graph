@@ -69,8 +69,21 @@ vi.mock("./components/ChatSidebar", () => ({
 vi.mock("./components/TokenUsagePanel", () => ({
   default: () => <div data-testid="tokens-stub" />,
 }));
-vi.mock("./components/NotesPanel", () => ({
-  default: () => <div data-testid="notes-stub" />,
+// Ticket W5 (synthesis audio-graph-a6b5): the document tile stopped hosting
+// `NotesPanel` (untouched — mocked wholesale above as `sessions-stub` via
+// `SessionsBrowser`) and now hosts `LiveDocument`/`LiveDocumentHeaderActions`,
+// matching `App.test.tsx`'s stub — none of this file's e2e-pinned facts
+// concern the document tile's internals, so mount no real
+// `useLiveDocumentModel()`/outline/Popover tree here either.
+vi.mock("./components/workspace/LiveDocument", () => ({
+  LiveDocument: () => <div data-testid="live-document-stub" />,
+  LiveDocumentHeaderActions: () => null,
+  useLiveDocumentModel: () => ({
+    sections: [],
+    lastSequence: 0,
+    changedNodeIds: [],
+    appendedAtTail: false,
+  }),
 }));
 vi.mock("./components/PipelineStatusBar", () => ({
   default: () => <div data-testid="pipeline-stub" />,

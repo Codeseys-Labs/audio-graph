@@ -23,7 +23,8 @@
  *         `GetStartedFallback` (the credential-presence probe threw),
  *         `PreflightCard` (genuinely idle — SHELL-R5, ADR-0046: a pass/fail
  *         checklist replacing the pre-R5 "empty live cockpit"), or the live/
- *         reviewing NotesPanel + LiveTranscript + AgentProposalsPanel trio.
+ *         reviewing bento workspace (`WorkspaceTile`s: `LiveDocument` +
+ *         graph + `AgentProposalsPanel` + `LiveTranscript`, ticket W4/W5).
  *         Sessions is `SessionsBrowser`'s list→detail + lenses — the old
  *         Inspect tab's graph/diagnostics reach now lives in the Sessions
  *         Graph/Route lenses (R2) and the NowStrip System drawer (R3)
@@ -70,7 +71,6 @@ import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import IconButton from "./components/IconButton";
 import LiveTranscript from "./components/LiveTranscript";
-import NotesPanel from "./components/NotesPanel";
 // SHELL-R3 (plan §R3, ADR-0046): ControlBar -> NowStrip (restyle + one Start
 // + composite health chip; see NowStrip.tsx's doc comment).
 import NowStrip from "./components/NowStrip";
@@ -91,6 +91,16 @@ import SpeakerPanel from "./components/SpeakerPanel";
 // Bento workspace (ticket W4, synthesis audio-graph-a6b5): the tile shell
 // + phase-1 graph-tile placeholder content (W7 replaces the latter).
 import GraphTilePlaceholder from "./components/workspace/GraphTilePlaceholder";
+// Living document (ticket W5, synthesis audio-graph-a6b5): replaces
+// `NotesPanel` as the document tile's body. `useLiveDocumentModel()` folds
+// ONCE per render here so `LiveDocumentHeaderActions` (mounted in the
+// tile's `headerSlot`) and `LiveDocument` (the tile's body) share the
+// exact same `LiveDocumentVM` instance instead of each folding their own.
+import {
+  LiveDocument,
+  LiveDocumentHeaderActions,
+  useLiveDocumentModel,
+} from "./components/workspace/LiveDocument";
 import { WorkspaceTile } from "./components/workspace/WorkspaceTile";
 
 // Code-split (ADR-0016 / modernization-audit 2.3): these modals/first-run
@@ -393,8 +403,9 @@ interface ShellRailContentAsideProps {
  * right transcript/chat aside — `analysisContextPanel` — is deleted outright
  * along with the `analysis` tab it belonged to; every occupant already has a
  * home in R2's Sessions lenses / R3's System drawer). The session-scoped
- * readers under here (`NotesPanel`, `LiveTranscript`) are wrapped in
- * `SessionViewProvider` by the caller.
+ * readers under here (`LiveDocument` — W5 replaced `NotesPanel` as this
+ * subtree's document reader, see ticket W5 below — and `LiveTranscript`)
+ * are wrapped in `SessionViewProvider` by the caller.
  *
  * SHELL-R5 (plan §R5, ADR-0046): the capture branch is now a 3-way choice,
  * not 2-way — `showGetStartedFallback` (probe threw; unchanged, still
@@ -404,9 +415,15 @@ interface ShellRailContentAsideProps {
  * (the bento workspace — see ticket W4 below).
  *
  * Ticket W4 (synthesis audio-graph-a6b5): the live/reviewing branch is now a
- * 4-tile bento grid (`WorkspaceTile` per tile; transcript/document/agent
- * wrap `LiveTranscript`/`NotesPanel`/`AgentProposalsPanel` unchanged, graph
- * ships W4's placeholder pending W7). R3 (ratified): the agent tile is
+ * 4-tile bento grid (`WorkspaceTile` per tile; transcript/agent wrap
+ * `LiveTranscript`/`AgentProposalsPanel` unchanged, graph ships W4's
+ * placeholder pending W7). Ticket W5 replaced the document tile's body: it
+ * now hosts `LiveDocument` (a typed-outline projection of
+ * `materializedNotes`), not `NotesPanel` — `NotesPanel` the file is
+ * untouched and still hosts the Sessions detail's Notes lens
+ * (`SessionsBrowser.tsx`); only this tile's hosting changed.
+ *
+ * R3 (ratified): the agent tile is
  * ALWAYS mounted, even with zero activity — `hasAgentActivity` no longer
  * gates it here; that flag survives ONLY for `showPreflightCard`'s
  * get-started exclusion above. DOM order (document, graph, agent,
@@ -441,6 +458,13 @@ function ShellRailContentAside({
   onOpenSpeakersDrawer,
 }: ShellRailContentAsideProps) {
   const { t } = useTranslation();
+  // Ticket W5 (synthesis audio-graph-a6b5): folded ONCE per render here
+  // (rules-of-hooks-safe to call unconditionally, mirroring this file's own
+  // "always call, conditionally render" convention) so the document tile's
+  // `headerSlot` and body consume the SAME `LiveDocumentVM` instead of each
+  // folding their own — see that hook's doc comment for why folding twice
+  // per render would be wasteful (not incorrect) work.
+  const liveDocumentVm = useLiveDocumentModel();
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
@@ -510,8 +534,12 @@ function ShellRailContentAside({
                 each `[data-tile]` visually at the `standard`/`wide`
                 tiers, so this source order only reads literally at
                 `compact`. */}
-            <WorkspaceTile id="document" title={t("notes.title")}>
-              <NotesPanel />
+            <WorkspaceTile
+              id="document"
+              title={t("notes.title")}
+              headerSlot={<LiveDocumentHeaderActions vm={liveDocumentVm} />}
+            >
+              <LiveDocument vm={liveDocumentVm} />
             </WorkspaceTile>
             <WorkspaceTile id="graph" title={t("workspace.tile.graph")}>
               <GraphTilePlaceholder />

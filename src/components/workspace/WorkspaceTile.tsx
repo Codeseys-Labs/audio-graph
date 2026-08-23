@@ -71,8 +71,10 @@ export interface WorkspaceTileProps {
  *    (requirement 6); the tile's own content owns its scroll behavior
  *    inside `.workspace-tile__body` (mirrors the pre-W4
  *    `workspace-panel__primary`/`__transcript` convention, since every
- *    phase-1 child — `NotesPanel`/`LiveTranscript`/`AgentProposalsPanel` —
- *    already manages its own internal scroll region).
+ *    child — `LiveTranscript`/`LiveDocument`/`AgentProposalsPanel` (W5,
+ *    synthesis audio-graph-a6b5, replaced the document tile's original
+ *    phase-1 `NotesPanel` body) — already manages its own internal scroll
+ *    region).
  */
 export function WorkspaceTile({
   id,

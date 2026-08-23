@@ -12,6 +12,28 @@
 > runs "with a provider fallback chain". That is **narrowed by
 > [ADR-0038](0038-route-llm-operations-through-a-single-skin-named-route-table.md)**:
 > the chain is gone. `chat_with_history` resolves exactly one authorized route.
+>
+> **Note (2026-08-23):** ratification R4 of the live-workspace design panel
+> (`docs/agentic-runs/2026-08-23-live-workspace-design/synthesis.md` §3/§4,
+> epic `audio-graph-a6b5`, ticket W5) further narrows this record's Option A,
+> which is still otherwise live: "NotesPanel keeps its cheap live categorized
+> chips as the base layer and renders synthesized prose above them" no longer
+> describes the bento workspace's document tile. That tile now renders
+> `LiveDocument` (`src/components/workspace/LiveDocument.tsx`) — a typed
+> outline projected from `MaterializedNotes`, per ADR-0024 — with **no**
+> client-derived ontology sections (participants/questions/tasks/decisions/
+> topics) and **no** inline `synthesize_notes` output. The tile's header
+> "copy" action exports that same typed outline as markdown — it is **not**
+> synthesized prose and does not invoke `synthesize_notes`. The
+> `synthesize_notes` command itself remains reachable only via
+> `SessionsBrowser`'s "Generate prose summary" action, which is gated off
+> while a session is capturing/transcribing (`reviewLocked`) — so for a
+> session still being captured, `synthesize_notes` cannot be invoked from
+> anywhere; it becomes reachable again once capture ends and the session is
+> reviewed. `NotesPanel` the file is unchanged and still ships this ADR's
+> original base-layer + synthesized-prose shape exactly as described above,
+> in the Sessions detail's Notes lens (`SessionsBrowser.tsx`) — this
+> narrowing is scoped to the live/reviewing bento surface only.
 
 ## Status
 

@@ -1204,6 +1204,14 @@
     "error": "Could not synthesize notes: {{message}}",
     "dismissError": "Dismiss error"
   },
+  "document": {
+    "noteCount": "Notes: {{count}}",
+    "copy": "Copy notes as text",
+    "copied": "Copied",
+    "gutterLabel": "Note details",
+    "empty": "Notes build automatically from the conversation and appear here as an outline as people speak.",
+    "buildingNotes": "Building notes…"
+  },
   "agent": {
     "title": "Agent",
     "label": "Agent proposals",

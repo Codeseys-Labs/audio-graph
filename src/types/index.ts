@@ -1812,6 +1812,16 @@ export type ProjectionOperation =
       title: string;
       body: string;
       tags: string[];
+      /**
+       * Mirrors the `Option<u8>` W1 (audio-graph-a6b5) will add to Rust's
+       * `ProjectionOperation::UpsertNote` — additive/optional so this type
+       * tolerates today's wire data (the field does not exist yet; every
+       * live session sends `undefined`/omitted) and W1's eventual payload
+       * without a second edit. `undefined`/`null` means "no structure
+       * asserted," never a default depth — never coerce it to a level.
+       * `liveDocumentModel.ts`'s `notesToOutline` is the only reader.
+       */
+      heading_level?: number | null;
     }
   | {
       type: "delete_note";
@@ -1894,6 +1904,14 @@ export interface MaterializedNote {
   title: string;
   body: string;
   tags: string[];
+  /**
+   * Additive/optional, same contract as `ProjectionOperation`'s
+   * `upsert_note.heading_level` above (W1, audio-graph-a6b5, still in
+   * flight on the Rust side as of this field's addition). Absent/`null` =
+   * legacy: the note carries no asserted structure and
+   * `notesToOutline` renders it as a flat, unsectioned bullet.
+   */
+  heading_level?: number | null;
   updated_by_sequence: number;
   updated_at_ms: number;
   basis: unknown;

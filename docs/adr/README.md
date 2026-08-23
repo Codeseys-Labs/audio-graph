@@ -20,7 +20,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0011] | Unified Feedback / Notification System | accepted | — | 2026-05-29 |
 | [0012] | Turn-Gated Incremental Prefill on the Local llama.cpp Engine for Entity Extraction | accepted | Phase 0a complete | 2026-05-29 |
 | [0013] | Conversation Modes — Notes/Graph vs Converse (native + pipelined S2S) | accepted | — | 2026-05-29 |
-| [0014] | On-demand Notes Synthesis (narrative parallel to the graph) | superseded | Superseded by ADR-0024 | 2026-05-29 |
+| [0014] | On-demand Notes Synthesis (narrative parallel to the graph) | superseded | Superseded by ADR-0024; further narrowed 2026-08-23 (bento document tile drops ontology sections + inline synthesize output, ticket W5) | 2026-05-29 |
 | [0015] | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn | superseded | Superseded by ADR-0016 | 2026-05-29 |
 | [0016] | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally | accepted | 2026-06-29 "two channels only" clause amended by ADR-0047 (third channel: `.ag-*` recipes) | 2026-05-29 |
 | [0017] | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering | accepted | Engine, worker, downloads, and pipeline wiring landed; multi-speaker accuracy gate pending | 2026-05-30 |
@@ -30,7 +30,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0021] | Storage Architecture — File-Canonical Event Logs, DB Gated on Evidence | superseded | Superseded by ADR-0027 | 2026-06-27 |
 | [0022] | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; symphonia Only at the Fixture/Import Edge | accepted | symphonia adoption gated on first import consumer; relates to ADR-0020, ADR-0004, ADR-0007 | 2026-06-28 |
 | [0023] | Anonymous Analytics — Raw Sentry Rust SDK over tauri-plugin-sentry | accepted | Opt-in and PII-off; WebView JS capture and sourcemap upload deferred; relates to ADR-0019 | 2026-06-28 |
-| [0024] | Event-sourced transcript → notes/graph projections | accepted | Supersedes ADR-0014; relates to ADR-0021, ADR-0008, ADR-0012 | 2026-06-30 |
+| [0024] | Event-sourced transcript → notes/graph projections | accepted | Supersedes ADR-0014; relates to ADR-0021, ADR-0008, ADR-0012; live document tile (ticket W5, 2026-08-23) renders `LiveDocument` over this projection with no ontology sections | 2026-06-30 |
 | [0025] | STT→LLM context efficiency + diff-based note/graph retroactive updates | proposed | Extends ADR-0024; relates to ADR-0023 and ADR-0017; epic `d7bb` | 2026-07-04 |
 | [0026] | Session timeline — who said what when, in relation to what | proposed | Extends ADR-0024; relates to ADR-0025 and ADR-0017; epic `0d72` | 2026-07-04 |
 | [0027] | Adopt File-Canonical Durable Session Storage | accepted | Supersedes ADR-0021 | 2026-07-09 |

@@ -42,8 +42,21 @@ vi.mock("./components/LiveTranscript", () => ({
 vi.mock("./components/TokenUsagePanel", () => ({
   default: () => <div data-testid="tokens-stub" />,
 }));
-vi.mock("./components/NotesPanel", () => ({
-  default: () => <div data-testid="notes-stub" />,
+// Ticket W5 (synthesis audio-graph-a6b5): the document tile's body/header
+// stopped hosting `NotesPanel` (that file is untouched — it still hosts the
+// Sessions detail's Notes lens, mocked wholesale above as `sessions-stub`)
+// and now hosts `LiveDocument`/`LiveDocumentHeaderActions`. `useLiveDocumentModel`
+// is stubbed to an empty VM so the body stub below doesn't need a seeded
+// `materializedNotes` store shape.
+vi.mock("./components/workspace/LiveDocument", () => ({
+  LiveDocument: () => <div data-testid="live-document-stub" />,
+  LiveDocumentHeaderActions: () => null,
+  useLiveDocumentModel: () => ({
+    sections: [],
+    lastSequence: 0,
+    changedNodeIds: [],
+    appendedAtTail: false,
+  }),
 }));
 vi.mock("./components/PipelineStatusBar", () => ({
   default: () => <div data-testid="pipeline-stub" />,
@@ -638,7 +651,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
       "true",
     );
     expect(screen.getByTestId("preflight-card")).toBeInTheDocument();
-    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("live-document-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
   });
 
@@ -662,7 +675,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     });
 
     expect(screen.queryByTestId("preflight-card")).not.toBeInTheDocument();
-    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("live-document-stub")).toBeInTheDocument();
     expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
   });
 
@@ -692,7 +705,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     // wholesale like every other heavy/lazy child in this file (see the
     // file-level `vi.mock` block), so `sessions-stub` is the fact to pin.
     expect(screen.getByTestId("sessions-stub")).toBeInTheDocument();
-    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("live-document-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
   });
 
@@ -801,7 +814,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
       useAudioGraphStore.setState({ isCapturing: true });
     });
 
-    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("live-document-stub")).toBeInTheDocument();
     expect(screen.getByTestId("graph-stub")).toBeInTheDocument();
     expect(screen.getByTestId("agent-stub")).toBeInTheDocument();
     expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
@@ -919,7 +932,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     expect(
       await screen.findByTestId("get-started-fallback"),
     ).toBeInTheDocument();
-    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("live-document-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     // The During phase tab stays selected — the shell is intact, just recovered.
     expect(screen.getByRole("tab", { name: /ready/i })).toHaveAttribute(
@@ -982,7 +995,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
       ).not.toBeInTheDocument(),
     );
     expect(screen.getByTestId("preflight-card")).toBeInTheDocument();
-    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("live-document-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     // A runnable saved pair keeps ExpressSetup suppressed.
     expect(
