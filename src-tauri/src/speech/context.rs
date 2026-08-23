@@ -103,6 +103,12 @@ pub(crate) struct SpeechConfig {
     /// gain, so the name is kept and its reach is narrowed.
     pub llm_allow_cloud_fallbacks: bool,
     pub provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+    /// The user's global diarization policy (`AppSettings.diarization.mode`).
+    /// Consulted by `make_diarization_config` (audio-graph-586b) so local
+    /// backend selection can honor an explicit `Off` and so a degradation
+    /// (neural backend requested but unavailable) is reported only when the
+    /// user actually asked for diarization.
+    pub diarization_mode: crate::settings::DiarizationMode,
 }
 
 /// Borrowed dependencies for entity extraction + graph update + event emit.

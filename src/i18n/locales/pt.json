@@ -88,6 +88,9 @@
     "tile": {
       "graph": "Grafo",
       "graphEmpty": "Nenhuma atividade no grafo ainda"
+    },
+    "notice": {
+      "diarizationDegradedTitle": "Detecção de locutor degradada"
     }
   },
   "seekTimeline": {
@@ -1392,6 +1395,13 @@
     "statusIdle": "Ocioso",
     "statusRunning": "Em execução — {{count}} processados",
     "statusError": "Erro: {{message}}",
+    "statusDegraded": "Degradado: {{reason}}",
+    "diarizationDegradedReason": {
+      "engine_not_compiled": "A detecção de locutor está em modo básico — esta versão não inclui o motor neural de diarização.",
+      "clustering_assets_not_downloaded": "A detecção de locutor está em modo básico — os modelos de agrupamento de locutores ilimitado não foram baixados. Baixe-os em Configurações → Modelos.",
+      "asset_not_downloaded": "A detecção de locutor está em modo básico — o modelo neural de diarização não foi baixado. Baixe-o em Configurações → Modelos.",
+      "asset_invalid": "A detecção de locutor está em modo básico — o arquivo do modelo neural de diarização está inválido ou incompleto. Baixe-o novamente em Configurações → Modelos."
+    },
     "tooltipWithLatency": "{{tooltip}} • última latência {{latency}}",
     "stageLatency": "{{stage}} última latência {{latency}}",
     "stageStatus": "{{stage}}: {{tooltip}}",

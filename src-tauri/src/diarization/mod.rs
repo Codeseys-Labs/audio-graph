@@ -509,8 +509,8 @@ impl DiarizationWorker {
         durations
             .iter()
             .enumerate()
-            .filter(|(_, &d)| d > 0)
-            .max_by_key(|(_, &d)| d)
+            .filter(|&(_, &d)| d > 0)
+            .max_by_key(|&(_, &d)| d)
             .map(|(id, _)| id)
     }
 

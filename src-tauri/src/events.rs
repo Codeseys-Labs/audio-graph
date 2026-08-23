@@ -197,6 +197,27 @@ pub enum StageStatus {
     Error {
         message: String,
     },
+    /// The stage is running, but not with the backend/fidelity the user's
+    /// configuration asked for — e.g. diarization silently fell back from a
+    /// missing/invalid neural model asset to the crude Simple heuristic
+    /// (audio-graph-586b: `DiarizationSettings.mode` must never be silently
+    /// overridden with no notice).
+    ///
+    /// `reason` is a stable, `snake_case` degradation-class code (e.g.
+    /// `"asset_not_downloaded"` — see `speech::DiarizationDegradationReason`,
+    /// the sole producer), NOT free-text prose: it is never transcript
+    /// content, provider error bodies, or anything else session-content-
+    /// bearing, and — review follow-up (audio-graph-586b) — it is also no
+    /// longer hardcoded English composed in Rust. The frontend looks the code
+    /// up against its OWN fully translated string table
+    /// (`pipeline.diarizationDegradedReason.<code>`, matching this crate's
+    /// existing typed+translated `SttFidelityDegradation` vocabulary
+    /// pattern) rather than rendering Rust-composed prose verbatim, so a
+    /// non-English UI gets a real translation instead of an English
+    /// sentence bolted onto a translated title.
+    Degraded {
+        reason: String,
+    },
 }
 
 /// Overall pipeline status, combining all stages.

@@ -142,11 +142,20 @@
      586b's future notice banner" / "W4 reserves the grid row, nothing
      more") is `0px` on purpose at every tier — it claims zero visual
      footprint today (verified: no extra gutter line at any screenshot
-     tier). 586b's implementer changes this one token (`0px` -> `auto` or a
-     fixed height) plus assigns `grid-area: notice` to its banner element;
-     nothing else in this file should need to move. */
+     tier). Ticket 586b turns this into `var(--notice-row, 0px)` — a CSS
+     custom property, not a literal `0px` — flipped to `auto` by the
+     `[data-diarization-degraded="true"]` rule below ONLY while
+     `DiarizationDegradationNotice` (`grid-area: notice` via the
+     `.workspace-notice` class) is actually rendered. A custom property
+     (rather than duplicating every tier's full `grid-template-rows` in an
+     attribute-scoped override, the way the `[data-graph-mode="canvas"]`
+     overrides below do) is deliberate: it composes for free with EVERY
+     tier x canvas-mode combination without a 3-tiers-x-2-canvas-states
+     rule matrix, since every `grid-template-rows` declaration in this file
+     — base and canvas-override alike, at all three tiers — references the
+     same `var(--notice-row, 0px)` as its first row. */
   grid-template-rows:
-    0px
+    var(--notice-row, 0px)
     minmax(120px, var(--tile-fr-graph, 0.34fr))
     minmax(0, 1fr);
   grid-template-areas:
@@ -155,6 +164,17 @@
     "transcript document agent";
   gap: 1px;
   background: var(--border-color);
+}
+
+/* Ticket 586b: the ONE rule that reserves real space for the notice row —
+   unscoped (applies at every tier, and in combination with EVERY
+   `[data-graph-mode="canvas"]` override below) because it only ever touches
+   the `--notice-row` custom property, never `grid-template-rows` wholesale.
+   Present on the container ONLY while `DiarizationDegradationNotice` is
+   actually rendered (`App.tsx`) — absent (not `"false"`) otherwise, mirroring
+   `data-graph-mode`'s own "only present when true" convention. */
+.workspace-panel--capture[data-diarization-degraded="true"] {
+  --notice-row: auto;
 }
 
 /* CANVAS row-swap (ticket W7, synthesis audio-graph-a6b5) — the
@@ -177,7 +197,7 @@
 @media (width >= 1280px) {
   .workspace-panel--capture[data-graph-mode="canvas"] {
     grid-template-rows:
-      0px
+      var(--notice-row, 0px)
       minmax(0, 1fr)
       minmax(240px, 0.6fr);
   }
@@ -198,6 +218,36 @@
 }
 [data-tile="agent"] {
   grid-area: agent;
+}
+
+/* Ticket 586b: the `notice` grid row's ONE consumer
+   (`DiarizationDegradationNotice.tsx`). Deliberately its OWN class rather
+   than a `[data-tile="notice"]` selector — `data-tile`'s value space is the
+   frozen `WorkspaceTileId` union (`WorkspaceTile.tsx`, a real phase-2
+   persistence contract via `WorkspaceLayoutPrefs`); the notice is not a
+   `WorkspaceTile` (no `WorkspaceTile.test.tsx` frozen-contract test covers
+   it, no phase-2 order/hide/resize applies to it), so giving it a `data-tile`
+   value would imply a membership it doesn't have. Only rendered while
+   degraded (`App.tsx`), so this rule's `grid-area: notice` is inert the rest
+   of the time — the row itself costs zero space (`--notice-row` above). */
+.workspace-notice {
+  grid-area: notice;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.4;
+}
+
+.workspace-notice__reason {
+  /* Wraps naturally (never truncated) — the row is `auto`-sized, so a
+     longer remedy string just grows the row rather than losing text a user
+     may need to act on it (e.g. "Download it from Settings → Models"). */
+  min-width: 0;
+  flex: 1;
 }
 
 /* The shared bento tile shell (`WorkspaceTile.tsx`). `container: tile /
@@ -327,9 +377,11 @@
 @media (width < 1280px) {
   .workspace-panel--capture {
     grid-template-columns: minmax(280px, 1fr) minmax(280px, 1.3fr);
-    /* `notice` row (see the wide-tier rule's comment above) stays `0px`
-       and unclaimed at this tier too. */
-    grid-template-rows: 0px minmax(120px, 0.3fr) minmax(0, 1fr) auto;
+    /* `notice` row (see the wide-tier rule's comment above) shares the SAME
+       `--notice-row` custom property at this tier too, flipped by the SAME
+       unscoped `[data-diarization-degraded="true"]` rule. */
+    grid-template-rows:
+      var(--notice-row, 0px) minmax(120px, 0.3fr) minmax(0, 1fr) auto;
     grid-template-areas:
       "notice     notice"
       "transcript graph"
@@ -355,7 +407,7 @@
      same bug class, same fix. */
   .workspace-panel--capture[data-graph-mode="canvas"] {
     grid-template-rows:
-      0px
+      var(--notice-row, 0px)
       minmax(0, 1fr)
       minmax(0, 0.6fr)
       auto;
@@ -433,10 +485,10 @@
 
   .workspace-panel--capture {
     grid-template-columns: minmax(0, 1fr);
-    /* `notice` row (see the wide-tier rule's comment) stays `0px` and
-       unclaimed at this tier too. */
+    /* `notice` row (see the wide-tier rule's comment) shares the SAME
+       `--notice-row` custom property at this tier too. */
     grid-template-rows:
-      0px
+      var(--notice-row, 0px)
       minmax(0, 1.2fr)
       minmax(0, 0.5fr)
       minmax(0, 0.6fr)
@@ -462,7 +514,7 @@
      that bug just because it changes which row is bigger. */
   .workspace-panel--capture[data-graph-mode="canvas"] {
     grid-template-rows:
-      0px
+      var(--notice-row, 0px)
       minmax(0, 0.5fr)
       minmax(0, 1.2fr)
       minmax(0, 0.6fr)

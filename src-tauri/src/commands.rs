@@ -2578,6 +2578,26 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             .projection_lane_stopping
             .store(false, Ordering::SeqCst);
 
+        // audio-graph-586b review follow-up: this pipeline-status pre-set
+        // used to live in step 3, below, AFTER the speech-processor thread
+        // spawned. `apply_diarization_degradation` runs on that thread and
+        // can write `StageStatus::Degraded` to the same lock before step 3
+        // executes; if it won that race, step 3's unconditional
+        // `Running{0}` write clobbered the Degraded status right back to
+        // healthy-looking, and nothing downstream ever re-derives it (the
+        // per-segment sites only PRESERVE an existing Degraded, they never
+        // restore one) — silently reproducing the exact pre-586b failure
+        // mode for the rest of the session. Moving the pre-set here, before
+        // the spawn, closes the race the same way the
+        // `projection_lane_stopping` clear above already does: nothing that
+        // could write a competing status exists yet at this line.
+        if let Ok(mut status) = state.pipeline_status.write() {
+            status.asr = StageStatus::Running { processed_count: 0 };
+            status.diarization = StageStatus::Running { processed_count: 0 };
+            status.entity_extraction = StageStatus::Running { processed_count: 0 };
+            status.graph = StageStatus::Running { processed_count: 0 };
+        }
+
         if sp_handle.is_none() {
             // Bug 1 fix: read from per-consumer channel, not shared processed_rx
             let speech_rx = state.speech_audio_rx.clone();
@@ -2602,6 +2622,10 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let diarization_override =
                 asr_provider.apply_diarization_settings(&settings.diarization);
             diarization_override.log_overrides(asr_provider.runtime_provider_id());
+            // audio-graph-586b: threaded into `SpeechConfig` so
+            // `make_diarization_config` can consult the user's global
+            // diarization policy instead of ignoring it entirely.
+            let diarization_mode = settings.diarization.mode;
             let whisper_model = settings.whisper_model.clone();
             let llm_provider = settings.llm_provider.clone();
             let llm_allow_cloud_fallbacks = settings
@@ -2694,6 +2718,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         llm_provider,
                         llm_allow_cloud_fallbacks,
                         provider_content_egress_policy,
+                        diarization_mode,
                     };
                     speech::run_speech_processor(
                         channels,
@@ -2737,13 +2762,15 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // exists post-restart until a new failure creates one). Re-arming a
     // clock at restart time for a live, under-budget `last_failed_basis` is
     // a real follow-up, not something this fix does.
-    if let Ok(mut status) = state.pipeline_status.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-        status.diarization = StageStatus::Running { processed_count: 0 };
-        status.entity_extraction = StageStatus::Running { processed_count: 0 };
-        status.graph = StageStatus::Running { processed_count: 0 };
-    }
-
+    //
+    // The `pipeline_status` `Running{0}` pre-set used to live here too, and
+    // for the same reason as `projection_lane_stopping` above, it doesn't
+    // anymore (audio-graph-586b review follow-up) — see the comment at its
+    // new call site, before the speech-processor thread spawns in step 1.
+    // This read+emit still belongs here: it reflects whatever the spawned
+    // thread's own status writes (including a legitimate `Degraded`) have
+    // settled to by now, rather than re-asserting a fixed "healthy" snapshot
+    // that could race and overwrite them.
     if let Ok(status) = state.pipeline_status.read() {
         let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
     }
@@ -11892,6 +11919,51 @@ mod tests {
              freshly spawned thread processes almost immediately can still observe the flag \
              set from the prior Stop and get its dispatch discarded into a phantom in-flight \
              state (audio-graph-1609)"
+        );
+    }
+
+    /// audio-graph-586b review follow-up: pins that the `pipeline_status`
+    /// `Running{0}` pre-set (asr/diarization/entity_extraction/graph) runs
+    /// BEFORE the speech processor thread spawns, not after. Before this
+    /// fix, that pre-set lived in "step 3" after the spawn, so
+    /// `apply_diarization_degradation` (running on the freshly spawned
+    /// thread) could lose a race and have its honest `Degraded` write
+    /// clobbered right back to a healthy-looking `Running{0}` by this
+    /// function's own step-3 write, with nothing downstream ever restoring
+    /// it — silently reproducing the pre-586b failure mode for the rest of
+    /// the session. Same ordering reasoning, and same test technique, as
+    /// `start_transcribe_clears_projection_lane_stopping_before_the_speech_thread_spawns`
+    /// above.
+    #[test]
+    fn start_transcribe_presets_pipeline_status_before_the_speech_thread_spawns() {
+        let body = start_transcribe_body_whitespace_stripped();
+
+        let preset_marker =
+            strip_whitespace("status.diarization = StageStatus::Running { processed_count: 0 };");
+        let preset_pos = find_unique_occurrence(
+            &body,
+            &preset_marker,
+            "start_transcribe (pipeline_status Running{0} pre-set)",
+        );
+
+        // Same real-spawn anchor as the tests above — see their comments for
+        // why the trailing `log::info!` line is the wrong anchor.
+        let spawn_marker = strip_whitespace(
+            "let handle = std::thread::Builder::new()\
+             .name(\"speech-processor\".to_string())",
+        );
+        let spawn_pos = find_unique_occurrence(
+            &body,
+            &spawn_marker,
+            "start_transcribe (speech processor thread spawn)",
+        );
+
+        assert!(
+            preset_pos < spawn_pos,
+            "the pipeline_status Running{{0}} pre-set must run BEFORE the speech processor \
+             thread spawns — pre-setting it after leaves a window where the spawned thread's \
+             own `apply_diarization_degradation` call can lose a race and have its Degraded \
+             status silently clobbered back to Running (audio-graph-586b)"
         );
     }
 

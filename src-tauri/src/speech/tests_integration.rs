@@ -328,6 +328,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             llm_provider: LlmProvider::default(),
             llm_allow_cloud_fallbacks: true,
             provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+            diarization_mode: crate::settings::DiarizationMode::default(),
         },
         AsrProvider::LocalWhisper,
         "missing-whisper.bin".to_string(),
@@ -362,12 +363,30 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         "missing local model should mark ASR as an error, got {:?}",
         status.asr
     );
+    // audio-graph-586b: this test's default-features build compiles neither
+    // `diarization` nor `diarization-clustering`, so the honest selection
+    // path in `make_diarization_config` reports the Simple fallback as
+    // `Degraded` rather than a healthy-looking `Running` — the segment above
+    // still gets a `speaker_id`/`speaker_label` (Simple ran), but the stage
+    // status must say so, not hide it. See
+    // `diarization_mode_provider_without_engine_compiled_reports_degradation`
+    // in `speech::tests_status` for a config-only assertion on the exact
+    // reason code (review follow-up: the previous pointer here,
+    // `diarization_degradation_message`, named a test that never existed).
+    //
+    // `reason` is the stable `snake_case` wire code
+    // (`DiarizationDegradationReason::as_wire_code`), NOT English prose —
+    // review follow-up, audio-graph-586b: the original fix shipped hardcoded
+    // English here, bypassing this crate's existing typed + translated
+    // degradation vocabulary; the frontend now renders a real translation
+    // keyed off this code in every locale.
     assert!(
         matches!(
-            status.diarization,
-            StageStatus::Running { processed_count: 1 }
+            &status.diarization,
+            StageStatus::Degraded { reason } if reason == "engine_not_compiled"
         ),
-        "diarization should process exactly one accumulated segment, got {:?}",
+        "a build without the neural diarization engine compiled in must \
+         report Degraded, not a healthy-looking Running, got {:?}",
         status.diarization
     );
 }
@@ -465,13 +484,18 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
         llm_provider: LlmProvider::default(),
         llm_allow_cloud_fallbacks: true,
         provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+        diarization_mode: crate::settings::DiarizationMode::default(),
     };
     let source_id_hint = Arc::new(RwLock::new(Some("integration-source".to_string())));
 
     let (event_tx, event_rx) =
         crossbeam_channel::bounded::<crate::asr::deepgram::DeepgramEvent>(16);
     let receiver_thread = std::thread::spawn(move || {
-        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0);
+        // `false`: no real `DeepgramConfig` is involved in this direct-drive
+        // test, so there is no provider-native-diarization signal to thread
+        // through — see the longer comment at the other call site in this
+        // file for why `false` matches this suite's pre-existing behavior.
+        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0, false);
     });
 
     let transcript_event =
@@ -671,6 +695,7 @@ fn deepgram_multi_speaker_final_splits_into_per_run_segments() {
         llm_provider: LlmProvider::default(),
         llm_allow_cloud_fallbacks: true,
         provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+        diarization_mode: crate::settings::DiarizationMode::default(),
     };
     let source_id = "integration-source".to_string();
     let source_id_hint = Arc::new(RwLock::new(Some(source_id.clone())));
@@ -680,7 +705,11 @@ fn deepgram_multi_speaker_final_splits_into_per_run_segments() {
     // max_speakers = 0 ("no cap") so the raw Deepgram speaker indices pass
     // through unchanged (0 -> "Speaker 0", 1 -> "Speaker 1").
     let receiver_thread = std::thread::spawn(move || {
-        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0);
+        // `false`: no real `DeepgramConfig` is involved in this direct-drive
+        // test, so there is no provider-native-diarization signal to thread
+        // through — see the longer comment at the other call site in this
+        // file for why `false` matches this suite's pre-existing behavior.
+        super::run_deepgram_event_receiver(event_rx, shared, config, source_id_hint, 0, false);
     });
 
     // --- Check 1: fixture-sourced multi-speaker final --------------------
@@ -1544,6 +1573,7 @@ impl DeepgramReceiverHarness {
             llm_provider: LlmProvider::default(),
             llm_allow_cloud_fallbacks: true,
             provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+            diarization_mode: crate::settings::DiarizationMode::default(),
         };
         let source_id = "integration-source".to_string();
         let source_id_hint = Arc::new(RwLock::new(Some(source_id.clone())));
@@ -1551,12 +1581,19 @@ impl DeepgramReceiverHarness {
         let (event_tx, event_rx) =
             crossbeam_channel::bounded::<crate::asr::deepgram::DeepgramEvent>(16);
         let receiver_thread = std::thread::spawn(move || {
+            // `false`: this test drives the receiver directly with a raw
+            // event channel, bypassing `run_deepgram_speech_processor` (and
+            // its real `DeepgramConfig::enable_diarization`), so there is no
+            // actual provider-native-diarization signal to thread through —
+            // matches this suite's pre-existing behavior of always letting
+            // the local-engine probe's own reason apply.
             super::run_deepgram_event_receiver(
                 event_rx,
                 shared,
                 config,
                 source_id_hint,
                 max_speakers,
+                false,
             );
         });
 

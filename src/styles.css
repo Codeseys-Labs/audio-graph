@@ -136,6 +136,16 @@
   --tile-fr-agent: 0.5fr;
   --tile-fr-graph: 0.34fr;
 
+  /* ---- Structural: notice-row reservation (ticket 586b) ----------------
+     The W4-reserved `notice` grid row's height. `0px` by default (zero
+     visual footprint); `layout.css`'s
+     `.workspace-panel--capture[data-diarization-degraded="true"]` rule
+     flips it to `auto` ONLY while `DiarizationDegradationNotice` is
+     actually rendered. Declared here for the same reason the four
+     `--tile-fr-*` tokens above are: so `no-ghost-tokens.test.ts` treats it
+     as real, with one canonical default. */
+  --notice-row: 0px;
+
   /* ---- Primitive: motion scale (exactly 4 tokens, UI-T3/audio-graph-99aa)
      -----------------------------------------------------------------------
      3 durations (120/180/260ms) + 1 easing curve. --motion-slow moves

@@ -466,7 +466,19 @@ export interface GraphSnapshot {
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
-  | { type: "Error"; message: string };
+  | { type: "Error"; message: string }
+  /**
+   * The stage is running, but not with the backend/fidelity the user's
+   * configuration asked for (audio-graph-586b) — e.g. diarization silently
+   * fell back from a missing/invalid neural model asset to the basic Simple
+   * heuristic. `reason` is a stable `snake_case` degradation-class code
+   * (e.g. `"asset_not_downloaded"`, `speech::DiarizationDegradationReason`
+   * on the Rust side) — never transcript content, and (review follow-up)
+   * never English prose composed in Rust; consumers translate it via
+   * `pipeline.diarizationDegradedReason.<code>`, matching this app's
+   * existing typed + translated `SttFidelityDegradation` vocabulary.
+   */
+  | { type: "Degraded"; reason: string };
 
 export interface PipelineStatus {
   capture: StageStatus;

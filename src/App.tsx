@@ -105,6 +105,9 @@ import SpeakerPanel from "./components/SpeakerPanel";
 // ONCE per render here so `LiveDocumentHeaderActions` (mounted in the
 // tile's `headerSlot`) and `LiveDocument` (the tile's body) share the
 // exact same `LiveDocumentVM` instance instead of each folding their own.
+// audio-graph-586b: the W4-reserved `notice` grid row's one consumer — see
+// that component's doc comment for the full contract.
+import { DiarizationDegradationNotice } from "./components/workspace/DiarizationDegradationNotice";
 import {
   DocRecencyChip,
   LiveDocument,
@@ -472,7 +475,16 @@ interface ShellRailContentAsideProps {
  * `AudioSourceSelector` (the rail) follows it, replaced by a matching
  * leading-edge trigger. Neither trigger renders `ResizeDivider` alongside
  * it — dragging a divider next to a collapsed trigger strip has nothing to
- * resize. */
+ * resize.
+ *
+ * Ticket 586b filled in W4's reserved-but-unclaimed `notice` grid row:
+ * `DiarizationDegradationNotice` renders there ONLY while the backend
+ * reports `pipelineStatus.diarization.type === "Degraded"` (a configured
+ * neural diarization backend silently falling back to the basic Simple
+ * heuristic — e.g. a missing/invalid model asset). `data-diarization-degraded`
+ * on this same container flips `layout.css`'s `notice` row from `0px` to
+ * `auto` in lockstep, so the row costs zero layout space the rest of the
+ * time — see that component's and `layout.css`'s doc comments. */
 function ShellRailContentAside({
   workspaceView,
   leftWidth,
@@ -509,6 +521,15 @@ function ShellRailContentAside({
   // (the tile's body) must read the SAME filter value, or toggling would
   // desync the header control from what the body actually renders.
   const [agentQueueFilter, setAgentQueueFilter] = useAgentQueueFilter();
+  // audio-graph-586b: lifted for the identical reason as `graphStripMode`
+  // above — drives BOTH the grid container's `data-diarization-degraded`
+  // attribute (which flips the W4-reserved `notice` row from `0px` to
+  // `auto`, `layout.css`) and the `DiarizationDegradationNotice` banner
+  // rendered into that row, so the two can never disagree about whether
+  // diarization is currently degraded.
+  const diarizationStatus = useAudioGraphStore(
+    (s) => s.pipelineStatus.diarization,
+  );
 
   return (
     <div className={`main-layout main-layout--${workspaceView}`}>
@@ -576,7 +597,17 @@ function ShellRailContentAside({
             // (not `"focus"`/`"feed"`) otherwise, so the attribute selector
             // never accidentally matches a non-canvas mode via string value.
             data-graph-mode={graphStripMode === "canvas" ? "canvas" : undefined}
+            // audio-graph-586b: flips the W4-reserved `notice` row (`layout.css`)
+            // from `0px` to `auto` ONLY while diarization is actually degraded —
+            // present exclusively for `"Degraded"`, mirroring the canvas-mode
+            // attribute's "only present when true" convention immediately above.
+            data-diarization-degraded={
+              diarizationStatus.type === "Degraded" ? "true" : undefined
+            }
           >
+            {diarizationStatus.type === "Degraded" && (
+              <DiarizationDegradationNotice status={diarizationStatus} />
+            )}
             {/* DOM order = the compact single-column stack order (R2 —
                 see layout.css's `(width < 1024px)` rule), NOT the wide
                 visual order: `grid-template-areas` (layout.css) places

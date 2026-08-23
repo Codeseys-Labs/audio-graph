@@ -78,6 +78,21 @@ describe("computeCompositeHealth", () => {
     ).toBe("degraded");
   });
 
+  it("is degraded when the diarization stage reports Degraded (audio-graph-586b)", () => {
+    expect(
+      computeCompositeHealth({
+        ...baseInput(),
+        pipelineStatus: {
+          ...idle,
+          diarization: {
+            type: "Degraded",
+            reason: "Speaker detection is running in basic mode",
+          },
+        },
+      }),
+    ).toBe("degraded");
+  });
+
   it("error outranks degraded when both conditions hold", () => {
     expect(
       computeCompositeHealth({
@@ -87,6 +102,19 @@ describe("computeCompositeHealth", () => {
           capture: { type: "Error", message: "boom" },
         },
         consumerDroppedChunks: 3,
+      }),
+    ).toBe("error");
+  });
+
+  it("error outranks a Degraded stage when both conditions hold", () => {
+    expect(
+      computeCompositeHealth({
+        ...baseInput(),
+        pipelineStatus: {
+          ...idle,
+          capture: { type: "Error", message: "boom" },
+          diarization: { type: "Degraded", reason: "basic mode" },
+        },
       }),
     ).toBe("error");
   });

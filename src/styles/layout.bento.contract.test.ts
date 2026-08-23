@@ -43,22 +43,44 @@ describe("bento workspace grid — CSS source contract (ticket W4)", () => {
   });
 
   it("reserves an unclaimed, zero-height `notice` row at every tier for 586b's future notice banner (synthesis §W4 tripwire)", () => {
+    // 586b: the literal `0px` this test used to pin became
+    // `var(--notice-row, 0px)` — a CSS custom property (declared in
+    // `styles.css`, defaulting to `0px`) that
+    // `[data-diarization-degraded="true"]` flips to `auto`, rather than a
+    // hardcoded literal — see that rule's own comment in `layout.css` for
+    // why a custom property, not a duplicated attribute-scoped override
+    // per tier, composes correctly with the canvas-mode overrides below.
     const wideBody = ruleBody(".workspace-panel--capture");
-    expect(wideBody).toMatch(/grid-template-rows:\s*\n\s*0px/);
+    expect(wideBody).toMatch(
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)/,
+    );
 
     const standardStart = css.indexOf("@media (width < 1280px)");
     const standardEnd = css.indexOf("@media (width < 1024px)");
     const standardBlock = css.slice(standardStart, standardEnd);
-    expect(standardBlock).toMatch(/grid-template-rows:\s*0px/);
+    expect(standardBlock).toMatch(
+      /grid-template-rows:\s*\n?\s*var\(--notice-row, 0px\)/,
+    );
     expect(standardBlock).toMatch(
       /grid-template-areas:\s*\n\s*"notice\s+notice"/,
     );
 
     const compactStart = css.indexOf("@media (width < 1024px)");
     const compactBlock = css.slice(compactStart);
-    expect(compactBlock).toMatch(/grid-template-rows:\s*\n\s*0px/);
+    expect(compactBlock).toMatch(
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)/,
+    );
     expect(compactBlock).toMatch(
       /grid-template-areas:\s*\n\s*"notice"\s*\n\s*"document"/,
+    );
+  });
+
+  it('declares --notice-row as a real token in styles.css, defaulting to 0px, and flips it to auto ONLY via [data-diarization-degraded="true"] (audio-graph-586b)', () => {
+    const tokens = readFileSync("src/styles.css", "utf8");
+    expect(tokens).toMatch(/--notice-row:\s*0px;/);
+
+    expect(css).toMatch(
+      /\.workspace-panel--capture\[data-diarization-degraded="true"\]\s*\{\s*--notice-row:\s*auto;/,
     );
   });
 
@@ -169,7 +191,7 @@ describe("bento workspace grid — CSS source contract (ticket W4)", () => {
       ),
     );
     const rowsMatch = captureBody.match(
-      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*1\.2fr\)\s*\n\s*minmax\(0,\s*0\.5fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*minmax\(0,\s*0\.8fr\)/,
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)\s*\n\s*minmax\(0,\s*1\.2fr\)\s*\n\s*minmax\(0,\s*0\.5fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*minmax\(0,\s*0\.8fr\)/,
     );
     expect(
       rowsMatch,
@@ -283,15 +305,18 @@ describe('canvas row-swap — [data-graph-mode="canvas"] tier scoping (ticket W7
 
   it("scopes the WIDE-tier canvas override inside an explicit @media (width >= 1280px) block, growing the graph row and giving the document row a 240px floor", () => {
     const body = canvasRuleBodyWithin("@media (width >= 1280px)");
+    // 586b: `0px` -> `var(--notice-row, 0px)` — see the sibling `notice` row
+    // test's comment above; the canvas-mode row-swap composes with the
+    // degraded state for free because both reference the same token.
     expect(body).toMatch(
-      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(240px,\s*0\.6fr\)/,
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(240px,\s*0\.6fr\)/,
     );
   });
 
   it("scopes the STANDARD-tier canvas override inside its own @media (width < 1280px) block, keeping the trailing auto agent row, WITHOUT introducing a px floor (WCAG 1.4.10 — the overflow:hidden ancestor chain is tier-independent, not just a compact-tier concern)", () => {
     const body = canvasRuleBodyWithin("@media (width < 1280px)");
     expect(body).toMatch(
-      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*auto/,
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)\s*\n\s*minmax\(0,\s*1fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*auto/,
     );
     expect(body).not.toMatch(/minmax\(\s*\d+px/);
   });
@@ -299,7 +324,7 @@ describe('canvas row-swap — [data-graph-mode="canvas"] tier scoping (ticket W7
   it("scopes the COMPACT-tier canvas override inside its own @media (width < 1024px) block, swapping the document/graph fr shares WITHOUT introducing a px floor (WCAG 1.4.10)", () => {
     const body = canvasRuleBodyWithin("@media (width < 1024px)");
     expect(body).toMatch(
-      /grid-template-rows:\s*\n\s*0px\s*\n\s*minmax\(0,\s*0\.5fr\)\s*\n\s*minmax\(0,\s*1\.2fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*minmax\(0,\s*0\.8fr\)/,
+      /grid-template-rows:\s*\n\s*var\(--notice-row, 0px\)\s*\n\s*minmax\(0,\s*0\.5fr\)\s*\n\s*minmax\(0,\s*1\.2fr\)\s*\n\s*minmax\(0,\s*0\.6fr\)\s*\n\s*minmax\(0,\s*0\.8fr\)/,
     );
     expect(body).not.toMatch(/minmax\(\s*\d+px/);
   });

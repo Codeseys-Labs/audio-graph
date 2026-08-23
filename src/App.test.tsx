@@ -885,6 +885,54 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     ]);
   });
 
+  // audio-graph-586b review follow-up: the notice render condition and the
+  // `data-diarization-degraded` grid-row attribute flip had zero behavioral
+  // coverage — both were only pinned by CSS-source-regex contract tests
+  // (`layout.bento.contract.test.ts`) plus a manual `dist/` grep, so a
+  // mutation that dropped either the notice's render guard or the attribute
+  // entirely (App.tsx) survived the full suite. This pair proves the real
+  // banner mounts (and the attribute flips) ONLY while
+  // `pipelineStatus.diarization.type === "Degraded"`, and that both are
+  // absent otherwise — catching a regression in either direction.
+  it("mounts the diarization degradation notice and flips data-diarization-degraded when the backend reports Degraded", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    const capturePanel = document.getElementById("workspace-panel-capture");
+    expect(capturePanel).not.toHaveAttribute("data-diarization-degraded");
+    expect(
+      screen.queryByTestId("diarization-degradation-notice"),
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      const current = useAudioGraphStore.getState().pipelineStatus;
+      useAudioGraphStore.setState({
+        pipelineStatus: {
+          ...current,
+          // `reason` is the backend's stable snake_case code (review
+          // follow-up, audio-graph-586b — see
+          // `DiarizationDegradationNotice.tsx`'s doc comment), not English
+          // prose; the component translates it via
+          // `pipeline.diarizationDegradedReason.<code>`.
+          diarization: { type: "Degraded", reason: "engine_not_compiled" },
+        },
+      });
+    });
+
+    expect(capturePanel).toHaveAttribute("data-diarization-degraded", "true");
+    const notice = screen.getByTestId("diarization-degradation-notice");
+    expect(notice).toBeInTheDocument();
+    expect(notice).toHaveTextContent(
+      "Speaker detection is running in basic mode",
+    );
+  });
+
   it("re-shows the hand-off for a configured user after re-arming via the help modal (App.tsx:159)", async () => {
     // Configured user: a complete durable cloud credential pair exists, so
     // ExpressSetup never pops and the hand-off was previously seen (flag set).

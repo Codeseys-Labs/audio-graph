@@ -123,6 +123,23 @@ function stageStatusInfo(
         modifier: "error",
         tooltip: t("pipeline.statusError", { message: status.message }),
       };
+    case "Degraded":
+      // audio-graph-586b: reuses the already-provisioned `warning` dot
+      // modifier (yellow — distinct from healthy `running` green and
+      // `error` red) rather than adding a new color.
+      //
+      // `status.reason` is a stable snake_case code (review follow-up,
+      // audio-graph-586b: not English prose composed in Rust — see
+      // `DiarizationDegradationNotice.tsx`'s doc comment for the full
+      // rationale), so it's translated via `pipeline.diarizationDegradedReason.<code>`
+      // before being interpolated into the tooltip, exactly like
+      // `DiarizationDegradationNotice` renders the same code.
+      return {
+        modifier: "warning",
+        tooltip: t("pipeline.statusDegraded", {
+          reason: t(`pipeline.diarizationDegradedReason.${status.reason}`),
+        }),
+      };
   }
 }
 

@@ -89,7 +89,33 @@ const LLM_EXPECTED_SIZE: u64 = 229_000_000; // ~218MB Q4_K_M
 const SORTFORMER_MODEL_URL: &str = "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.onnx";
 /// Public: canonical Sortformer ONNX model filename for diarization.
 pub const SORTFORMER_MODEL_FILENAME: &str = "diar_streaming_sortformer_4spk-v2.onnx";
-const SORTFORMER_EXPECTED_SIZE: u64 = 31_500_000; // ~30MB
+/// `pub(crate)` (rather than private) so `speech::tests_status`'s
+/// `make_diarization_config` tests can size a fixture file to exactly this
+/// value without duplicating the magic number.
+///
+/// audio-graph-586b review follow-up: this used to read `31_500_000`
+/// (~30MB), a value the pinned asset has never actually been. Re-verified
+/// live against the upstream repo (`x-linked-size` on the `resolve/main`
+/// HEAD, and the `/api/models/.../commits/main` history) while fixing the
+/// review findings: the file was uploaded exactly once, 2025-11-22, at
+/// 492,243,002 bytes (fp32, `sha256:cc520901a8cc25a8d7f7c2c8561a465709b67dd4f1df0572a97530087f3fbc73`
+/// per `x-linked-etag`), and the commit that first registered this constant
+/// (`b28c368`, 2026-04-02) postdates that upload — so the 31.5MB value was
+/// simply wrong from introduction, not a later "drift". With the old wrong
+/// constant, `sortformer_readiness` could never return `Ready` for the real
+/// asset: a user who had manually placed the genuine (correctly-sized) file
+/// regressed from a working neural backend (pre-586b's bare `.exists()`
+/// check accepted it) to a permanent, unfixable "re-download it" banner
+/// (the in-app download also targets this exact URL+size and would reject
+/// the very asset it just downloaded). Correcting the constant restores
+/// `Ready` for the genuine file without changing the verification mechanism
+/// (still 1%-tolerance size-only — see `verify_model_file` — so a
+/// truncated/corrupt download is still honestly `Invalid`). This does NOT
+/// reopen the ticket's own `(c)` BLOCKED call on shipping/recommending this
+/// download by default — that call stands on independent grounds (492MB
+/// unquantized hobbyist re-export, no in-app SHA-256 pinning yet); see the
+/// follow-up ticket for pinning `resolve/<sha>/` + the now-known SHA-256.
+pub(crate) const SORTFORMER_EXPECTED_SIZE: u64 = 492_243_002; // ~492MB fp32 (verified 2026-08-23)
 
 /// Sherpa-onnx streaming Zipformer model directory name.
 pub const SHERPA_ZIPFORMER_20M: &str = "streaming-zipformer-en-20M";
@@ -342,7 +368,7 @@ pub struct DownloadProgress {
 }
 
 /// Readiness state for a single model.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ModelReadiness {
     Ready,
     NotDownloaded,
@@ -447,6 +473,33 @@ fn check_model_readiness(
     } else {
         ModelReadiness::Invalid
     }
+}
+
+/// Readiness of the Sortformer diarization ONNX asset at `models_dir`, using
+/// the same size-tolerance verification `get_model_status` uses — NOT a bare
+/// existence check (audio-graph-586b).
+///
+/// `speech::make_diarization_config` used to select the Sortformer backend
+/// via `sortformer_path.exists()` alone: a truncated download or an
+/// interrupted extraction would still pass `.exists()`, get handed to the
+/// ONNX loader, and fail there with no honest degradation reported anywhere.
+/// Routing through the exact same `verify_model_file` check `get_model_status`
+/// uses makes the two paths agree: a file this function calls `Ready` is a
+/// file `list_models`/`get_model_status` would also call ready, and a corrupt
+/// or wrong-sized file is honestly `Invalid`, not silently accepted.
+///
+/// (Review follow-up, not this ticket's own finding: an earlier revision of
+/// this comment claimed the pinned upstream URL had "silently started
+/// serving a different-sized file" — re-verified against the live repo's
+/// commit history and that is false; the file has been served at its current
+/// size since its one and only upload. See `SORTFORMER_EXPECTED_SIZE`'s doc
+/// comment for the corrected provenance.)
+pub fn sortformer_readiness(models_dir: &Path) -> ModelReadiness {
+    check_model_readiness(
+        models_dir,
+        SORTFORMER_MODEL_FILENAME,
+        Some(SORTFORMER_EXPECTED_SIZE),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1194,35 @@ mod tests {
         assert_eq!(p.elapsed_ms, 250);
         assert_eq!(p.percent, 0.0);
         assert_eq!(p.status, "downloading");
+    }
+
+    #[test]
+    fn sortformer_readiness_distinguishes_missing_from_corrupt_from_ready() {
+        // audio-graph-586b: `speech::make_diarization_config` must consult
+        // this (size-verified) readiness, not a bare `.exists()` — a
+        // truncated/wrong-sized file on disk must never be waved through as
+        // "the neural backend is ready" only to fail inside the ONNX loader
+        // with no honest degradation reported anywhere.
+        let root = std::env::temp_dir().join(format!(
+            "audiograph-sortformer-readiness-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(sortformer_readiness(&root), ModelReadiness::NotDownloaded);
+
+        let path = root.join(SORTFORMER_MODEL_FILENAME);
+        fs::write(&path, vec![0u8; 1024]).unwrap(); // far below the expected size
+        assert_eq!(sortformer_readiness(&root), ModelReadiness::Invalid);
+
+        // Sparse file: exercises the exact-size branch without allocating or
+        // writing real bytes at `SORTFORMER_EXPECTED_SIZE`.
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(SORTFORMER_EXPECTED_SIZE).unwrap();
+        drop(file);
+        assert_eq!(sortformer_readiness(&root), ModelReadiness::Ready);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

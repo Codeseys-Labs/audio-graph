@@ -68,6 +68,7 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{
     ApiClient, LlmEngine, LlmExecutor, LlmPriority, MistralRsEngine, ProjectionPatchAttempt,
 };
+#[cfg(not(feature = "diarization-clustering"))]
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulersObservation};
@@ -777,6 +778,72 @@ fn set_asr_status_and_emit(
     emit_pipeline_status(app_handle, pipeline_status);
 }
 
+/// Apply a diarization backend selection's degradation (if any) to the shared
+/// pipeline status and notify the UI, once, at worker startup — mirrors
+/// `set_asr_status_and_emit` above (audio-graph-586b: `mode=provider` must
+/// never be silently overridden by an unannounced Simple-backend fallback).
+///
+/// No-op when `reason` is `None` (the selected backend matched what `mode`
+/// asked for, or diarization is off) — the caller's existing `Running{0}`
+/// pre-set (from `start_transcribe`) is left as-is.
+///
+/// Per-segment status updates (`emit_transcript_and_extract_with_meta`,
+/// `run_speech_processor_diarization_only`'s loop) must never clobber a
+/// `Degraded` set here back to `Running` — both sites guard on
+/// `!matches!(status.diarization, StageStatus::Degraded { .. })` before
+/// overwriting, so this call's honest state persists for the whole session.
+fn apply_diarization_degradation(
+    app_handle: &AppHandle,
+    pipeline_status: &Arc<RwLock<PipelineStatus>>,
+    reason: Option<DiarizationDegradationReason>,
+) {
+    let Some(reason) = reason else {
+        return;
+    };
+    log::warn!(
+        "Diarization degraded ({}): {}",
+        reason.as_wire_code(),
+        reason.diagnostic_text()
+    );
+    {
+        let mut status = pipeline_status.write().unwrap_or_else(|e| e.into_inner());
+        status.diarization = StageStatus::Degraded {
+            reason: reason.as_wire_code().to_string(),
+        };
+    }
+    emit_pipeline_status(app_handle, pipeline_status);
+}
+
+/// Suppress a local-backend degradation reason when the ACTIVE provider is
+/// already delivering native speaker labels for this session
+/// (audio-graph-586b review follow-up).
+///
+/// `make_diarization_config` only knows about the local engine/asset — it has
+/// no visibility into whether the selected cloud provider is diarizing on its
+/// own. For providers like Deepgram, `mode=Provider` (the settings default)
+/// enables provider-native `diarize=true`, and the receiver's per-segment
+/// logic (`speaker_label.is_some()`) then never touches the local worker at
+/// all — so reporting "this build doesn't include the neural diarization
+/// engine" in that case is a false "basic mode" claim: no neural engine was
+/// needed because the provider already labeled the speakers.
+///
+/// `provider_native_diarization_active` is true iff this session's provider
+/// socket was actually opened with diarization requested (e.g.
+/// `DeepgramConfig::enable_diarization`, captured by the caller before the
+/// provider config moved into its client). When true, this always returns
+/// `None` regardless of what the local engine/asset probe found. When false,
+/// the local probe's reason (if any) passes through unchanged.
+fn diarization_degradation_for_provider_labeled_session(
+    provider_native_diarization_active: bool,
+    local_engine_degradation: Option<DiarizationDegradationReason>,
+) -> Option<DiarizationDegradationReason> {
+    if provider_native_diarization_active {
+        None
+    } else {
+        local_engine_degradation
+    }
+}
+
 fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallback: &str) -> String {
     source_id_hint
         .read()
@@ -1157,7 +1224,88 @@ const OVERLAP_FRAMES: usize = 16_000 / 2;
 // Diarization config helper
 // ---------------------------------------------------------------------------
 
-/// Build the best available `DiarizationConfig` for the given models directory.
+/// Stable, machine-readable classification of why `make_diarization_config`
+/// fell back to the Simple heuristic instead of the backend `mode` asked for
+/// (audio-graph-586b review follow-up).
+///
+/// Review finding: the original 586b fix composed hardcoded English prose in
+/// Rust and shipped it verbatim to the UI, bypassing this crate's existing
+/// typed + translated degradation vocabulary (`SttFidelityDegradation`,
+/// `commands.rs`, rendered via
+/// `t(\`settings.providerReadiness.fidelity.degradation.${value}\`)`). This
+/// enum is that same pattern applied here: `as_wire_code` is the ONLY thing
+/// that reaches `StageStatus::Degraded.reason` (never English prose), and the
+/// frontend renders `pipeline.diarizationDegradedReason.<code>` — a real
+/// translated string in every locale — keyed off it. `diagnostic_text` stays
+/// Rust-side only, for `log::warn!`; it is never sent over the wire.
+///
+/// `#[allow(dead_code)]`: which variants are constructible is
+/// build-feature-dependent (`diarization` vs. `diarization-clustering` vs.
+/// neither are mutually exclusive build configurations — see
+/// `make_diarization_config`), so exactly one of `ClusteringAssetsNotDownloaded`
+/// vs. `{EngineNotCompiled, AssetNotDownloaded, AssetInvalid}` is genuinely
+/// unconstructed in any single build. Per-variant `cfg_attr` would be more
+/// precise but each build direction needs the OPPOSITE gate, so a single
+/// blanket allow on the enum is clearer than either half being silently
+/// right and the other silently wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum DiarizationDegradationReason {
+    /// Neither neural diarization engine (`diarization` nor
+    /// `diarization-clustering`) is compiled into this build — today's
+    /// shipped configuration (`Cargo.toml`'s `default` features, `release.yml`).
+    EngineNotCompiled,
+    /// `diarization-clustering` IS compiled, but its two-file pyannote
+    /// segmentation + embedding asset pair hasn't been downloaded — distinct
+    /// from `EngineNotCompiled` because a neural engine genuinely is present
+    /// here, just missing its own asset (review finding: the pre-fix
+    /// fallthrough reported "doesn't include the neural diarization engine"
+    /// for this case too, which is false under `--features diarization-clustering`).
+    ClusteringAssetsNotDownloaded,
+    /// `diarization` is compiled, but the Sortformer ONNX asset hasn't been
+    /// downloaded (`models::ModelReadiness::NotDownloaded`).
+    AssetNotDownloaded,
+    /// `diarization` is compiled, and the Sortformer ONNX asset exists but
+    /// failed size verification — truncated or corrupt
+    /// (`models::ModelReadiness::Invalid`).
+    AssetInvalid,
+}
+
+impl DiarizationDegradationReason {
+    /// The ONLY form of this value that reaches the frontend
+    /// (`StageStatus::Degraded.reason`) — a stable `snake_case` code, never
+    /// prose. Must have a matching `pipeline.diarizationDegradedReason.<code>`
+    /// key in EVERY locale (`i18n/locale-parity.test.ts` enforces parity
+    /// across locales generally; this string is the join key).
+    fn as_wire_code(self) -> &'static str {
+        match self {
+            Self::EngineNotCompiled => "engine_not_compiled",
+            Self::ClusteringAssetsNotDownloaded => "clustering_assets_not_downloaded",
+            Self::AssetNotDownloaded => "asset_not_downloaded",
+            Self::AssetInvalid => "asset_invalid",
+        }
+    }
+
+    /// Human-readable diagnostic text for `log::warn!` only — Rust-side, never
+    /// serialized, never sent to the UI.
+    fn diagnostic_text(self) -> &'static str {
+        match self {
+            Self::EngineNotCompiled => {
+                "neither neural diarization engine is compiled into this build"
+            }
+            Self::ClusteringAssetsNotDownloaded => {
+                "diarization-clustering is compiled but its pyannote asset pair isn't downloaded"
+            }
+            Self::AssetNotDownloaded => "the Sortformer ONNX asset isn't downloaded",
+            Self::AssetInvalid => {
+                "the Sortformer ONNX asset failed size verification (corrupt or incomplete)"
+            }
+        }
+    }
+}
+
+/// Build the best available `DiarizationConfig` for the given models
+/// directory and the user's global diarization policy.
 ///
 /// Backend selection (highest available first):
 /// 1. **Clustering** (sherpa-onnx, unbounded) when the `diarization-clustering`
@@ -1166,12 +1314,64 @@ const OVERLAP_FRAMES: usize = 16_000 / 2;
 ///    `diarization::worker::LiveDiarizationWorker`, spawned + fed separately —
 ///    see [`maybe_spawn_clustering_diarization`].
 /// 2. **Sortformer** (parakeet-rs, ≤4 speakers) when the `diarization` feature
-///    is compiled in and the Sortformer ONNX file exists.
+///    is compiled in and the Sortformer ONNX asset is `Ready` per
+///    [`crate::models::sortformer_readiness`] — NOT a bare `Path::exists()`
+///    (audio-graph-586b: a truncated download or an upstream-drifted file
+///    used to pass `.exists()` and only fail once handed to the ONNX loader).
 /// 3. **Simple** signal-based fallback otherwise.
 ///
 /// Clustering and Sortformer are mutually exclusive at build time (ORT link
 /// conflict, enforced in `lib.rs`), so at most one neural branch is reachable.
-fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
+///
+/// Returns the config to hand to `DiarizationWorker::new`, plus
+/// `Some(DiarizationDegradationReason)` when the backend that's actually
+/// about to run falls short of what `mode` asked for — e.g. the neural
+/// engine isn't compiled in, or its model asset is missing/invalid, so the
+/// crude Simple heuristic runs instead with no other signal anywhere that
+/// this happened (audio-graph-586b — field evidence: phantom speakers /
+/// mid-word speaker splits, entirely attributable to Simple running where
+/// Sortformer was expected, silently). `None` when the selected backend
+/// matches expectations, OR when `mode == Off` — a user who explicitly
+/// disabled diarization gets no model-asset probing and no degradation report
+/// for a backend they didn't ask to run well.
+///
+/// Two known scope boundaries (review follow-up, audio-graph-586b — evidence-
+/// backed decisions to leave as-is rather than fix here):
+///
+/// 1. `mode == Off` returns the `Simple`-backend `DiarizationConfig::default()`
+///    unconditionally, WITHOUT probing for a compiled+ready neural engine
+///    first. In a non-default `diarization`/`diarization-clustering` build
+///    (neither is in `Cargo.toml`'s `default` features) with the asset
+///    already present, this means `Off` can select a plainer backend than
+///    the build would otherwise use — a real, narrow (non-shipping-config)
+///    behavior difference from a mode-unaware caller, but the ALTERNATIVE
+///    (probe anyway, just suppress the report) contradicts this function's
+///    own tested intent (`tests_status::diarization_mode_off_skips_asset_probing_and_never_degrades`,
+///    whose doc comment is explicit: probing for an asset the user didn't
+///    ask to use would itself be a dishonest claim about what they
+///    configured). Reversing that design is a product decision, not a
+///    review-fix.
+/// 2. This function governs backend SELECTION only. It does not gate
+///    whether `DiarizationWorker::process_input` runs at all — that call is
+///    unconditional at every one of this function's 7 call sites, `mode`
+///    or no `mode`, so a `Simple`-backend worker still writes a
+///    `speaker_id`/`speaker_label` onto every segment even when the user
+///    picked `Off`. This is pre-existing (verified: `DiarizationMode::Off`
+///    has never gated worker invocation, before or after this ticket) and
+///    would require touching call-site wiring at all 7 sites — a materially
+///    larger change than this ticket's actual scope (honest DEGRADATION
+///    REPORTING for a backend that already runs).
+fn make_diarization_config(
+    models_dir: &std::path::Path,
+    mode: crate::settings::DiarizationMode,
+) -> (DiarizationConfig, Option<DiarizationDegradationReason>) {
+    if mode == crate::settings::DiarizationMode::Off {
+        log::info!(
+            "Diarization mode is Off — using Simple backend without probing neural model assets."
+        );
+        return (DiarizationConfig::default(), None);
+    }
+
     #[cfg(feature = "diarization-clustering")]
     {
         let seg = models_dir
@@ -1185,10 +1385,13 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
                 seg.display(),
                 emb.display()
             );
-            return DiarizationConfig::clustering(
-                seg,
-                emb,
-                crate::diarization::clustering::DEFAULT_CLUSTERING_THRESHOLD,
+            return (
+                DiarizationConfig::clustering(
+                    seg,
+                    emb,
+                    crate::diarization::clustering::DEFAULT_CLUSTERING_THRESHOLD,
+                ),
+                None,
             );
         }
         log::info!(
@@ -1197,23 +1400,83 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
             seg.display(),
             emb.display()
         );
+        // Returns directly here (review fix, audio-graph-586b: previously
+        // fell through to the `diarization`-feature check below, which
+        // reported `EngineNotCompiled` — false under this exact build
+        // configuration, since we are inside a `#[cfg(feature =
+        // "diarization-clustering")]` block: a neural engine IS compiled, only
+        // its OWN two-file asset pair is missing).
+        //
+        // This is this block's (and, under `diarization-clustering`, this
+        // FUNCTION's) tail expression, not a `return` — clippy's
+        // `needless_return` correctly flags a `return` here as redundant:
+        // the `diarization`-feature check + Sortformer match below are
+        // gated `#[cfg(not(feature = "diarization-clustering"))]`, so under
+        // THIS build this cfg-active block is the last thing in the
+        // function body and its trailing expression already IS the
+        // function's return value with no `return` needed. Kept as a
+        // trailing expression rather than restructured further specifically
+        // so an unconditional `return` here does not make the
+        // `diarization`-feature check below provably-dead code under THIS
+        // build (which `rustc`'s unreachable-code lint — run under
+        // `-D warnings` — would otherwise flag). `diarization` and
+        // `diarization-clustering` are mutually exclusive at build time (ORT
+        // link conflict, `lib.rs`) regardless of this `cfg` split, so no
+        // build's actual backend-selection behavior changes.
+        (
+            DiarizationConfig::default(),
+            Some(DiarizationDegradationReason::ClusteringAssetsNotDownloaded),
+        )
     }
 
-    let sortformer_path = models_dir.join(SORTFORMER_MODEL_FILENAME);
+    #[cfg(not(feature = "diarization-clustering"))]
+    {
+        if !cfg!(feature = "diarization") {
+            log::info!(
+                "Neural diarization engine (`diarization` feature) not compiled into this \
+                 build — using Simple backend."
+            );
+            return (
+                DiarizationConfig::default(),
+                Some(DiarizationDegradationReason::EngineNotCompiled),
+            );
+        }
 
-    if sortformer_path.exists() {
-        log::info!(
-            "Sortformer model found at '{}' — using neural diarization backend",
-            sortformer_path.display()
-        );
-        DiarizationConfig::sortformer(sortformer_path)
-    } else {
-        log::info!(
-            "Sortformer model not found at '{}' — using Simple diarization backend. \
-             Download via Settings → Models for improved speaker identification.",
-            sortformer_path.display()
-        );
-        DiarizationConfig::default()
+        let sortformer_path = models_dir.join(SORTFORMER_MODEL_FILENAME);
+        // Trailing expression (not `return ...;`), same `needless_return`
+        // reasoning as the clustering block above — this is the tail of
+        // this `#[cfg(not(feature = "diarization-clustering"))]` block, and
+        // under THIS build that block is the function's own tail position.
+        match crate::models::sortformer_readiness(models_dir) {
+            crate::models::ModelReadiness::Ready => {
+                log::info!(
+                    "Sortformer model ready at '{}' — using neural diarization backend",
+                    sortformer_path.display()
+                );
+                (DiarizationConfig::sortformer(sortformer_path), None)
+            }
+            crate::models::ModelReadiness::NotDownloaded => {
+                log::info!(
+                    "Sortformer model not found at '{}' — using Simple diarization backend.",
+                    sortformer_path.display()
+                );
+                (
+                    DiarizationConfig::default(),
+                    Some(DiarizationDegradationReason::AssetNotDownloaded),
+                )
+            }
+            crate::models::ModelReadiness::Invalid => {
+                log::warn!(
+                    "Sortformer model at '{}' failed size verification (corrupt or incomplete \
+                     download) — using Simple diarization backend.",
+                    sortformer_path.display()
+                );
+                (
+                    DiarizationConfig::default(),
+                    Some(DiarizationDegradationReason::AssetInvalid),
+                )
+            }
+        }
     }
 }
 
@@ -3404,9 +3667,15 @@ fn emit_transcript_and_extract_with_meta(
         status.asr = StageStatus::Running {
             processed_count: asr_count,
         };
-        status.diarization = StageStatus::Running {
-            processed_count: diarization_count,
-        };
+        // audio-graph-586b: a `Degraded` diarization status (set once, at
+        // worker startup, by `apply_diarization_degradation`) must persist
+        // for the whole session — this per-segment count update must never
+        // clobber it back to a healthy-looking `Running`.
+        if !matches!(status.diarization, StageStatus::Degraded { .. }) {
+            status.diarization = StageStatus::Running {
+                processed_count: diarization_count,
+            };
+        }
     }
 
     // 5. Knowledge Graph Extraction — fire-and-forget, COALESCED. Consecutive
@@ -4932,7 +5201,13 @@ fn run_asr_worker(
 
     let mut asr_worker = AsrWorker::new(asr_config);
 
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
 
     // ADR-0017 / B16: when the unbounded clustering backend is selected, spawn
     // its live rolling-window worker fed by the same 16 kHz mono segment audio
@@ -5216,7 +5491,13 @@ pub(crate) fn run_speech_processor_diarization_only(
     crate::persistence::register_app_handle(shared.app_handle.clone());
 
     // Auto-detect Sortformer / clustering models; falls back to Simple if none.
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
 
     // ADR-0017 / B16: spawn the live clustering worker when that backend is
     // selected, fed the same 16 kHz mono segment audio used for the placeholder
@@ -5473,9 +5754,14 @@ pub(crate) fn run_speech_processor_diarization_only(
         );
 
         if let Ok(mut status) = shared.pipeline_status.write() {
-            status.diarization = StageStatus::Running {
-                processed_count: count,
-            };
+            // audio-graph-586b: see the identical guard's comment in
+            // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
+            // worker startup must survive every per-segment count update.
+            if !matches!(status.diarization, StageStatus::Degraded { .. }) {
+                status.diarization = StageStatus::Running {
+                    processed_count: count,
+                };
+            }
         }
 
         // Knowledge Graph Extraction — fire-and-forget
@@ -5619,7 +5905,13 @@ fn run_cloud_asr_worker(
     cloud_config: CloudAsrConfig,
 ) {
     let provider_content_egress_policy = config.provider_content_egress_policy;
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -5789,6 +6081,16 @@ pub(crate) fn run_deepgram_speech_processor(
         is_transcribing,
     } = channels;
 
+    // audio-graph-586b review follow-up: captured before `deepgram_config` is
+    // moved into the client below. This is the flag that actually gates
+    // `diarize=true` on the socket (asr/deepgram.rs) — when it's set, Deepgram
+    // labels segments with provider-native speaker ids and the event
+    // receiver's own per-segment branch (`speaker_label.is_some()`) skips the
+    // local diarization worker entirely for those segments. Reporting a
+    // local-engine "basic mode" degradation in that case would be false —
+    // see `run_deepgram_event_receiver`'s use of this flag.
+    let provider_native_diarization_active = deepgram_config.enable_diarization;
+
     // Create and connect the Deepgram client.
     let mut client = DeepgramStreamingClient::new(deepgram_config);
     match client.connect() {
@@ -5837,6 +6139,7 @@ pub(crate) fn run_deepgram_speech_processor(
                     config_for_receiver,
                     source_id_hint_for_receiver,
                     max_speakers,
+                    provider_native_diarization_active,
                 );
             }
         }) {
@@ -6431,17 +6734,43 @@ fn promote_pending_interim(
 /// exit (or discard an already-dequeued event) before the Deepgram client's
 /// close-drain has delivered the last utterance's finals. See the loop body
 /// below for the full audio-graph-653a rationale.
+///
+/// `provider_native_diarization_active` (audio-graph-586b review follow-up):
+/// true iff this session's Deepgram socket was opened with `diarize=true`
+/// (`DeepgramConfig::enable_diarization`, captured by the caller before it
+/// moved the config into the client). When true, Deepgram itself labels most
+/// segments and the per-segment branch below (`speaker_label.is_some()`)
+/// takes the provider-label path, never touching the local diarization
+/// worker — so a "this build doesn't include the neural diarization engine"
+/// banner would be false: no neural engine was needed. The local worker is
+/// still constructed as a fallback for the rare segment Deepgram doesn't
+/// label (e.g. a run with no speaker info at all), but that fallback firing
+/// occasionally does not mean the *session* is running in degraded basic
+/// mode, so no `Degraded` status is reported in that case. When false (mode
+/// forced `enable_diarization` off, e.g. `DiarizationMode::Local`), every
+/// segment falls through to the local worker and the ordinary
+/// engine/asset-availability degradation reporting applies.
 fn run_deepgram_event_receiver(
     event_rx: crossbeam_channel::Receiver<crate::asr::deepgram::DeepgramEvent>,
     shared: SpeechShared,
     config: SpeechConfig,
     source_id_hint: Arc<RwLock<Option<String>>>,
     max_speakers: u32,
+    provider_native_diarization_active: bool,
 ) {
     use crate::asr::deepgram::{DeepgramEvent, DeepgramTurnKind};
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation_for_provider_labeled_session(
+            provider_native_diarization_active,
+            diarization_degradation,
+        ),
+    );
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -7843,7 +8172,13 @@ fn run_openai_realtime_event_receiver(
     use crate::asr::openai_realtime::OpenAiRealtimeEvent;
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -8091,7 +8426,13 @@ pub(crate) fn run_aws_transcribe_speech_processor(
         is_transcribing,
     } = channels;
 
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -8348,7 +8689,13 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
         is_transcribing,
     } = channels;
 
-    let diarization_config = make_diarization_config(&config.models_dir);
+    let (diarization_config, diarization_degradation) =
+        make_diarization_config(&config.models_dir, config.diarization_mode);
+    apply_diarization_degradation(
+        &shared.app_handle,
+        &shared.pipeline_status,
+        diarization_degradation,
+    );
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -8747,17 +9094,19 @@ mod tests_provider_dispatch {
 #[cfg(test)]
 mod tests_status {
     use super::{
-        DiarizationDispatchContext, DiarizationEventSink, ExtractionDeps, PipelineStatus,
-        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchAttempt,
-        ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
-        SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
-        aws_error_for_diagnostic_event, cloud_error_code, current_unix_millis,
-        deregister_projection_job, diarization_span_revision_for_transcript,
-        dispatch_projection_decision, emit_and_dispatch_diarization_span_revision,
+        DiarizationDegradationReason, DiarizationDispatchContext, DiarizationEventSink,
+        ExtractionDeps, PipelineStatus, ProjectionDataMovementSink, ProjectionDispatchContext,
+        ProjectionPatchAttempt, ProjectionPatchGenerator, ProjectionRuntimeEventSink,
+        SpeechChannels, SpeechConfig, SpeechShared, StageStatus,
+        apply_extraction_result_if_current, aws_error_diagnostic, aws_error_for_diagnostic_event,
+        cloud_error_code, current_unix_millis, deregister_projection_job,
+        diarization_degradation_for_provider_labeled_session,
+        diarization_span_revision_for_transcript, dispatch_projection_decision,
+        emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
-        final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
-        next_span_revision, provider_item_span_id, provider_sequence_span_id,
-        provider_start_span_id, record_asr_span_revision_event,
+        final_span_revision, make_diarization_config, moonshine_final_transcript_segment,
+        moonshine_revision_meta, next_span_revision, provider_item_span_id,
+        provider_sequence_span_id, provider_start_span_id, record_asr_span_revision_event,
         record_asr_span_revision_event_and_observe_projection, revision_ref,
         run_agent_proposal_task, run_moonshine_speech_processor_with_worker, run_projection_job,
         set_asr_status, spawn_deferred_lane_observation, spawn_projection_job,
@@ -8807,6 +9156,219 @@ mod tests_status {
         ));
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir
+    }
+
+    // ── audio-graph-586b: diarization backend-selection honesty ─────────
+
+    #[test]
+    fn diarization_mode_off_skips_asset_probing_and_never_degrades() {
+        // A user who explicitly turned diarization off must get Simple with
+        // no degradation report — probing for (and warning about) a neural
+        // model asset they never asked to use would be a false claim about
+        // what they configured.
+        let models_dir = unique_tempdir("mode-off");
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Off);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Simple
+        ));
+        assert_eq!(degradation, None);
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    // Review follow-up (audio-graph-586b): this test is specifically about
+    // the "no neural engine AT ALL" configuration — it must NOT run under
+    // `--features diarization-clustering`, where a neural engine genuinely
+    // IS compiled and an empty temp dir now correctly (per the
+    // `ClusteringAssetsNotDownloaded` fix below) reports the
+    // clustering-specific code instead. Nor under `--features diarization`,
+    // where the same empty temp dir reports `AssetNotDownloaded`. Previously
+    // unguarded, this test only stayed green under `diarization-clustering`
+    // by accident, via the exact fallthrough bug that finding fixes.
+    #[cfg(not(any(feature = "diarization", feature = "diarization-clustering")))]
+    #[test]
+    fn diarization_mode_provider_without_engine_compiled_reports_degradation() {
+        // This test binary's default features compile neither `diarization`
+        // nor `diarization-clustering` (see `Cargo.toml`'s `[features]`
+        // block — verified against `release.yml`, which passes no feature
+        // flags either, so this is also today's SHIPPED configuration, not
+        // just the test build). `mode = Provider` (the settings default)
+        // must not silently accept the Simple fallback — the caller has to
+        // learn about it via the returned reason.
+        let models_dir = unique_tempdir("mode-provider-no-engine");
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Provider);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Simple
+        ));
+        let reason = degradation.expect(
+            "a build with no neural diarization engine compiled in must report a degradation",
+        );
+        // Review follow-up (audio-graph-586b): exact-equality on the typed
+        // code, not a substring match on composed English — the wire value
+        // is now a stable `snake_case` code (see
+        // `DiarizationDegradationReason::as_wire_code`), not prose.
+        assert_eq!(
+            reason,
+            DiarizationDegradationReason::EngineNotCompiled,
+            "reason should name the degraded state, got {reason:?}"
+        );
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn diarization_mode_local_with_missing_sortformer_asset_reports_not_downloaded() {
+        let models_dir = unique_tempdir("mode-local-missing-asset");
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Local);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Simple
+        ));
+        let reason = degradation.expect("a missing Sortformer asset must report a degradation");
+        assert_eq!(
+            reason,
+            DiarizationDegradationReason::AssetNotDownloaded,
+            "reason should name the missing-asset remedy, got {reason:?}"
+        );
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn diarization_mode_hybrid_with_corrupt_sortformer_asset_reports_invalid() {
+        let models_dir = unique_tempdir("mode-hybrid-corrupt-asset");
+        let path = models_dir.join(crate::models::SORTFORMER_MODEL_FILENAME);
+        std::fs::write(&path, vec![0u8; 1024]).expect("write truncated model file");
+
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Hybrid);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Simple
+        ));
+        let reason = degradation.expect("a corrupt Sortformer asset must report a degradation");
+        assert_eq!(
+            reason,
+            DiarizationDegradationReason::AssetInvalid,
+            "reason should name the corrupt-asset remedy, got {reason:?}"
+        );
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn diarization_mode_provider_with_ready_sortformer_asset_never_degrades() {
+        let models_dir = unique_tempdir("mode-provider-ready-asset");
+        let path = models_dir.join(crate::models::SORTFORMER_MODEL_FILENAME);
+        let file = std::fs::File::create(&path).expect("create model file");
+        file.set_len(crate::models::SORTFORMER_EXPECTED_SIZE)
+            .expect("size sparse model file");
+        drop(file);
+
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Provider);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Sortformer { .. }
+        ));
+        assert_eq!(degradation, None);
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[cfg(feature = "diarization-clustering")]
+    #[test]
+    fn diarization_mode_hybrid_with_missing_clustering_assets_reports_clustering_not_downloaded() {
+        // Review fix (audio-graph-586b): under a build that DOES compile
+        // `diarization-clustering`, missing assets must report the
+        // clustering-specific code, not the generic "no engine compiled"
+        // one — a neural engine genuinely IS present here.
+        let models_dir = unique_tempdir("mode-hybrid-missing-clustering-assets");
+        let (config, degradation) =
+            make_diarization_config(&models_dir, crate::settings::DiarizationMode::Hybrid);
+        assert!(matches!(
+            config.backend,
+            crate::diarization::DiarizationBackend::Simple
+        ));
+        assert_eq!(
+            degradation,
+            Some(DiarizationDegradationReason::ClusteringAssetsNotDownloaded),
+            "a diarization-clustering build with missing assets must name that specific \
+             degradation, not claim no neural engine is compiled"
+        );
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    // Review follow-up (audio-graph-586b): every degradation code must be a
+    // distinct, stable `snake_case` string — the frontend keys a translated
+    // string off it (`pipeline.diarizationDegradedReason.<code>`), so a
+    // mutation that collapses two variants onto the same code, or drifts the
+    // format, would silently corrupt an unrelated locale's message.
+    #[test]
+    fn diarization_degradation_reason_wire_codes_are_distinct_snake_case() {
+        let all = [
+            DiarizationDegradationReason::EngineNotCompiled,
+            DiarizationDegradationReason::ClusteringAssetsNotDownloaded,
+            DiarizationDegradationReason::AssetNotDownloaded,
+            DiarizationDegradationReason::AssetInvalid,
+        ];
+        let codes: Vec<&str> = all.iter().map(|r| r.as_wire_code()).collect();
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "every DiarizationDegradationReason variant must have a distinct wire code, got {codes:?}"
+        );
+        for code in &codes {
+            assert!(
+                code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "wire code {code:?} must be snake_case ASCII to match the i18n key convention"
+            );
+        }
+    }
+
+    // ── audio-graph-586b review follow-up: provider-native diarization
+    // (e.g. Deepgram `diarize=true`) must suppress the local-engine
+    // degradation report, since the local worker was never needed. ────────
+
+    #[test]
+    fn provider_native_diarization_active_suppresses_local_engine_degradation() {
+        // Default settings (mode=Provider, Deepgram enable_diarization=true)
+        // on a shipped build with no neural engine compiled: the local probe
+        // legitimately finds "basic mode", but Deepgram is labeling segments
+        // natively, so no banner should reach the UI.
+        let local_reason = Some(DiarizationDegradationReason::EngineNotCompiled);
+        assert_eq!(
+            diarization_degradation_for_provider_labeled_session(true, local_reason),
+            None,
+            "a session where the provider is delivering native speaker labels must never \
+             report the local-engine degradation, even when the local probe found one"
+        );
+    }
+
+    #[test]
+    fn provider_native_diarization_inactive_passes_through_local_engine_degradation() {
+        // mode=Local (or any config that forced Deepgram's enable_diarization
+        // off): every segment falls through to the local worker, so the
+        // ordinary honesty behavior from audio-graph-586b's original fix
+        // must still apply unchanged.
+        let local_reason = Some(DiarizationDegradationReason::EngineNotCompiled);
+        assert_eq!(
+            diarization_degradation_for_provider_labeled_session(false, local_reason),
+            local_reason,
+            "when the provider isn't diarizing, the local probe's reason must pass through \
+             verbatim"
+        );
+        assert_eq!(
+            diarization_degradation_for_provider_labeled_session(false, None),
+            None,
+            "no local reason means no degradation report regardless of provider state"
+        );
     }
 
     /// Real accepting writer fixture for ledger-only tests. `None` now means
@@ -9553,6 +10115,7 @@ mod tests_status {
             llm_provider: LlmProvider::default(),
             llm_allow_cloud_fallbacks: true,
             provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+            diarization_mode: crate::settings::DiarizationMode::default(),
         }
     }
 

@@ -88,6 +88,9 @@
     "tile": {
       "graph": "Graph",
       "graphEmpty": "No graph activity yet"
+    },
+    "notice": {
+      "diarizationDegradedTitle": "Speaker detection degraded"
     }
   },
   "seekTimeline": {
@@ -1392,6 +1395,13 @@
     "statusIdle": "Idle",
     "statusRunning": "Running — {{count}} processed",
     "statusError": "Error: {{message}}",
+    "statusDegraded": "Degraded: {{reason}}",
+    "diarizationDegradedReason": {
+      "engine_not_compiled": "Speaker detection is running in basic mode — this build doesn't include the neural diarization engine.",
+      "clustering_assets_not_downloaded": "Speaker detection is running in basic mode — the unbounded speaker-clustering models haven't been downloaded. Download them from Settings → Models.",
+      "asset_not_downloaded": "Speaker detection is running in basic mode — the neural diarization model isn't downloaded. Download it from Settings → Models.",
+      "asset_invalid": "Speaker detection is running in basic mode — the neural diarization model file is invalid or incomplete. Re-download it from Settings → Models."
+    },
     "tooltipWithLatency": "{{tooltip}} • last latency {{latency}}",
     "stageLatency": "{{stage}} last latency {{latency}}",
     "stageStatus": "{{stage}}: {{tooltip}}",

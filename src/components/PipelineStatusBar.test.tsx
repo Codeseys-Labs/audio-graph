@@ -396,6 +396,35 @@ describe("PipelineStatusBar", () => {
     ).toBeInTheDocument();
   });
 
+  // ── audio-graph-586b: honest diarization degradation reporting ─────────
+  it("expands to per-stage detail and shows the warning (not healthy) dot when diarization reports Degraded", () => {
+    resetStore({
+      pipelineStatus: {
+        ...allIdle(),
+        // `reason` is the backend's stable snake_case code (review
+        // follow-up, audio-graph-586b), not English prose — the tooltip
+        // translates it via `pipeline.diarizationDegradedReason.<code>`.
+        diarization: { type: "Degraded", reason: "engine_not_compiled" },
+      },
+    });
+    render(<PipelineStatusBar />);
+
+    // The 50e3 fold must NOT collapse this to "all systems normal" — a
+    // Degraded stage is exactly the kind of problem the fold exists to
+    // surface (see `computeCompositeHealth`'s "Degraded" classification).
+    expect(screen.queryByText(/all systems normal/i)).not.toBeInTheDocument();
+
+    const diarizationDot = screen.getByRole("img", {
+      name: /Diarization: Degraded: Speaker detection is running in basic mode/i,
+    });
+    expect(diarizationDot).toBeInTheDocument();
+    // Warning-yellow modifier, NOT the healthy-green "running" one — a
+    // mutation that relabels Degraded as "running" (a success-tone leak)
+    // must fail this assertion.
+    expect(diarizationDot).toHaveClass("bg-accent-yellow");
+    expect(diarizationDot).not.toHaveClass("bg-accent-green");
+  });
+
   it("surfaces persistence queue pressure distinctly from storage-full (and this alone triggers expansion)", () => {
     resetStore({
       persistenceQueueBackpressure: {

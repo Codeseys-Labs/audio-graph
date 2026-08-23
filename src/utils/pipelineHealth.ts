@@ -9,11 +9,12 @@
  *     during healthy capture; per-stage dots return on error).
  *
  * Deliberately narrow: a `Running` stage or a latency/turn-event sample is
- * NOT a problem — only an actual `Error` stage, or queue pressure that is
- * already dropping data (persistence writer backpressure, a processed-audio
- * consumer dropping chunks, or a capture source's ring buffer dropping
- * chunks — the same three signals the pre-fold footer already surfaced
- * separately) counts as `"degraded"`.
+ * NOT a problem — only an actual `Error` stage, a `Degraded` stage (honest
+ * fallback reporting, e.g. audio-graph-586b's diarization degradation), or
+ * queue pressure that is already dropping data (persistence writer
+ * backpressure, a processed-audio consumer dropping chunks, or a capture
+ * source's ring buffer dropping chunks — the same three signals the
+ * pre-fold footer already surfaced separately) counts as `"degraded"`.
  */
 import type {
   PersistenceQueueBackpressurePayload,
@@ -49,6 +50,7 @@ export function computeCompositeHealth({
     0,
   );
   if (
+    stages.some((stage) => stage.type === "Degraded") ||
     consumerDroppedChunks > 0 ||
     persistenceDropped > 0 ||
     backpressuredSourceCount > 0
