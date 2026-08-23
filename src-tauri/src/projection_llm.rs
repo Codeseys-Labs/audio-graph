@@ -121,6 +121,112 @@ const DOC_OUTLINE_PREVIEW_SECTIONS: usize = 8;
 /// turn) so one long section can never dominate the block.
 const DOC_OUTLINE_PREVIEW_MAX_CHARS: usize = 120;
 
+/// Spaces of indentation added per heading depth level beyond the top
+/// (`heading_level == 2`) in [`render_document_outline`]'s heading lines
+/// (audio-graph-626c / field session d97bfcc3's "D6" finding). `heading_level`
+/// has been model-visible since W2 (both the `h{level}` inline marker and the
+/// operation guidance name it), but the outline rendered every heading line at
+/// the SAME indentation regardless of depth — a flat wall of same-indent
+/// lines with only the inline marker distinguishing them. Measured
+/// consequence: 94.8% of the session's 371 notes ended up at level 4 with
+/// only 2 level-2 sections total — a model given no visual scaffold for the
+/// hierarchy it already has access to defaults to the deepest level rather
+/// than building real structure. Two spaces per level (2 = 0 indent, 3 = 2,
+/// 4 = 4) makes the EXISTING hierarchy visible at a glance without changing
+/// `heading_level`'s stored semantics or clamping (`HEADING_LEVEL_MIN`/`MAX`
+/// below still own that).
+const DOC_OUTLINE_INDENT_SPACES_PER_LEVEL: usize = 2;
+
+/// Header line for [`render_document_outline`]'s ids-only tail block
+/// (audio-graph-626c), appended after the budgeted full-entry outline when
+/// [`DOC_OUTLINE_MAX_CHARS`]'s degradation path had to drop some heading
+/// lines entirely. Pulled out as a constant for the same reason as
+/// [`DOC_OUTLINE_HEADER`]: so the render function's literal text and any
+/// future prose referencing it cannot drift apart.
+///
+/// Field session d97bfcc3 (371 notes, 1h) measured the cost of NOT having
+/// this block: the budget saturated at ~26% of the session, outline entries
+/// peaked at 83 then declined to 66, and ~82% of notes were invisible by
+/// session end — with the old degradation path dropping a heading line's id
+/// ENTIRELY once it fell off the recency window. The model could not "keep
+/// stable ids" for a topic it could not see, so it re-minted covered topics
+/// and generated degenerate ids: 38.3% of second-half new ids were
+/// collision-suffix chains (`note-21050new..newY`) or placeholders
+/// (`note-99999`), first appearing exactly after saturation. This tail keeps
+/// every id addressable regardless of the full-entry budget.
+const DOC_OUTLINE_TAIL_HEADER: &str = "Additional existing section ids, not shown above with a \
+     full entry (ids-only — no heading depth, body, or preview). Reuse one of these ids exactly \
+     if you are continuing that topic; mint a new id only for a genuinely new one:";
+
+/// Max number of dropped section ids listed in [`render_document_outline`]'s
+/// ids-only tail block (audio-graph-626c). Every listed id/title-stub line is
+/// itself bounded ([`DOC_OUTLINE_ID_MAX_CHARS`] / [`DOC_OUTLINE_TAIL_TITLE_MAX_CHARS`]),
+/// so this count cap is also a de facto CHAR cap on the whole tail block —
+/// see [`render_ids_only_tail`]'s doc comment for the exact worst-case
+/// arithmetic. This ticket's STOP condition is that an id is counted,
+/// truthfully, past this cap rather than ever truncated mid-id to force a
+/// fit. Field session d97bfcc3's 371-note session drops ~310 ids from the
+/// full-entry budget (see [`DOC_OUTLINE_TAIL_HEADER`]'s doc comment) —
+/// verified against a post-fix run of
+/// `document_outline_371_note_field_fixture_stays_within_budget_and_tail_bound`.
+///
+/// A prior version of this cap was 2000, chosen only to comfortably clear the
+/// field-measured 371-note session with generous headroom, without anyone
+/// computing or disclosing what the cap's own worst case cost at that value
+/// (audio-graph-626c review finding, "major"): with every listed id/title at
+/// its own max length, the analytic ceiling for the tail alone was ~154K
+/// chars (~38.5K tokens) in the per-tick, UNCACHED variable region of the
+/// prompt — an order of magnitude beyond what the 371-note field case
+/// (~11.6K chars, ~2.9K tokens) actually needs, and far larger than the
+/// "sane bound" comparison this ticket's own report leaned on. 500 keeps
+/// ~1.6x headroom over the field-measured drop count (so the realistic case
+/// is still never itself truncated — verified: the 371-note fixture's ~310
+/// dropped ids are all listed, not one is merely counted) while bringing the
+/// disclosed worst case for the WHOLE block (entries + tail) down to a
+/// measured 44,821 chars (~11.2K tokens) against an analytic ceiling of
+/// 44,981 chars (~11.2K tokens) — verified by
+/// `document_outline_pathological_hostile_ids_tail_stays_within_disclosed_bound`,
+/// which drives 1,100 notes all with maximal-length (48-char) ids and titles.
+const DOC_OUTLINE_TAIL_MAX_IDS: usize = 500;
+
+/// audio-graph-626c review fix ("major"): pins an upper bound directly on
+/// [`DOC_OUTLINE_TAIL_MAX_IDS`]'s VALUE, not just on a downstream computed
+/// ceiling that scales with it — see that constant's own doc comment for
+/// why: a prior value of 2000 admitted a ~154K-char (~38.5K-token) analytic
+/// worst case that was never measured or disclosed. Silently raising this
+/// constant back toward that value would re-open that regression without
+/// failing `document_outline_pathological_hostile_ids_tail_stays_within_disclosed_bound`
+/// (whose own ceiling scales with the same constant), so this compile-time
+/// assertion exists to force a maintainer to consciously re-justify the size
+/// tradeoff (raising this bound too) rather than bumping the cap in
+/// isolation and having nothing but a slow-to-notice prompt-size regression.
+const _: () = assert!(
+    DOC_OUTLINE_TAIL_MAX_IDS <= 600,
+    "DOC_OUTLINE_TAIL_MAX_IDS grew past its reviewed bound — re-check its doc comment and \
+     document_outline_pathological_hostile_ids_tail_stays_within_disclosed_bound's measured \
+     worst case before raising it further; this cap's whole point is bounding the per-tick, \
+     uncached prompt cost of a pathological session"
+);
+
+/// Max characters of a tail entry's title-stub in
+/// [`render_document_outline`]'s ids-only tail block (audio-graph-626c).
+/// Deliberately tighter than [`DOC_OUTLINE_TITLE_MAX_CHARS`] (the full-entry
+/// heading's title cap): a tail entry carries no body/preview and no heading
+/// depth, so its only job is a short reminder of what topic the id is, not a
+/// readable section heading.
+///
+/// audio-graph-626c review (minor, scope_honesty): raising this toward
+/// [`DOC_OUTLINE_TITLE_MAX_CHARS`] would give the model more topic-
+/// distinguishing text per tail entry (the field's own title vocabulary
+/// shares a long common prefix, so 24 chars is mostly that shared prefix) at
+/// the cost of a proportionally larger tail block. Explicit decision: left at
+/// 24 for this fix. [`DOC_OUTLINE_TAIL_MAX_IDS`]'s cap reduction above
+/// already trades headroom for a much smaller disclosed worst case, and
+/// stacking a second, independent budget increase on top of that in the same
+/// change is a separate, better-isolated tuning decision — revisit if field
+/// data shows the model still can't tell which tail id is which topic.
+const DOC_OUTLINE_TAIL_TITLE_MAX_CHARS: usize = 24;
+
 /// Incremental extractive rolling summary of the transcript turns that have
 /// left the verbatim hot window (ADR-0025 §2c / seed audio-graph-18ee).
 ///
@@ -1489,12 +1595,17 @@ pub fn projection_patch_prompt_messages(
              actually changes; re-emitting an unchanged section is a defect. To add one point \
              to an existing topic, prefer adding a short new subsection under it over \
              rewriting a long section. If a \"Document outline\" block appears below, it lists \
-             every existing section id in document order with its heading and depth — reuse \
-             those ids exactly, and mint a new id only for a genuinely new topic. If no such \
-             block appears, you have no visibility into already-existing section ids this \
-             tick, so only mint a new id when you are confident this is a genuinely new topic. \
-             Keep stable section ids when refining earlier sections. If this turn adds nothing \
-             to the document, return {\"operations\": []}."
+             every existing section id in document order with its heading and depth (shown by \
+             indentation) — reuse those ids exactly, and mint a new id only for a genuinely new \
+             topic. That block may also list further existing ids in an ids-only tail with no \
+             heading or depth shown; reuse one of those exactly too when continuing that topic. \
+             If no such block appears, you have no visibility into already-existing section ids \
+             this tick, so only mint a new id when you are confident this is a genuinely new \
+             topic. Keep stable section ids when refining earlier sections. Prefer a level-2 or \
+             level-3 `heading_level` for a genuinely new topic, reserving level 4 for a true \
+             sub-subsection of an existing one, so the document keeps real structure instead of \
+             one flat level. If this turn adds nothing to the document, return \
+             {\"operations\": []}."
         }
         ProjectionKind::Graph => {
             "Use only graph operations: upsert_graph_node, remove_graph_node, invalidate_graph_node, upsert_graph_edge, remove_graph_edge, invalidate_graph_edge, strengthen_graph_edge, weaken_graph_edge, merge_graph_nodes, and split_graph_node. Upsert nodes before edges that reference them. Prefer retcon operations over duplicate nodes when later transcript context corrects earlier assumptions."
@@ -1670,10 +1781,20 @@ const DOC_OUTLINE_HEADER: &str = "Document outline (section ids in document orde
 /// first drop every preview line (all sections keep their heading line),
 /// then — only if STILL over budget — drop heading lines one at a time from
 /// the LEAST-recently-changed end (oldest `updated_by_sequence` first),
-/// preserving document order among whichever headings remain. Either way the
-/// trailing count line always reports the TRUE total, so a section is always
-/// shown or counted, never silently dropped (seed audio-graph-253c's original
-/// guarantee, carried forward at the new char-budget granularity).
+/// preserving document order among whichever headings remain.
+///
+/// audio-graph-626c: unlike the pre-existing behavior this doc comment used
+/// to describe, a heading line dropped by that third step is no longer gone
+/// from the model's view — every id it drops is instead listed, ids-only, in
+/// the tail block [`render_ids_only_tail`] appends (bounded separately by
+/// [`DOC_OUTLINE_TAIL_MAX_IDS`]). This is what closes the field-measured
+/// defect: the old behavior dropped a heading line's id ENTIRELY once it fell
+/// out of the char budget, so the model could not "keep stable ids" for a
+/// topic it could no longer see, and re-minted it instead (see
+/// [`DOC_OUTLINE_TAIL_HEADER`]'s doc comment for the measured numbers). A
+/// section is now always shown with a full entry, OR listed ids-only in the
+/// tail, OR (only past the tail's own generous count cap) truthfully counted
+/// — never silently dropped.
 fn render_document_outline(notes: &MaterializedNotes) -> String {
     render_document_outline_with_shown_count(notes).0
 }
@@ -1718,7 +1839,29 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
                 continue;
             }
             shown += 1;
-            let heading_level = note.heading_level.unwrap_or(3);
+            // audio-graph-626c review (minor): ingest normalization
+            // (`normalize_projection_patch_draft_doc_structure`) clamps
+            // `heading_level` into `HEADING_LEVEL_MIN..=HEADING_LEVEL_MAX`
+            // for any FRESH patch, but deliberately never runs on replay
+            // (materialization must stay a pure function of the accepted
+            // patch log — see that function's doc comment) — so a
+            // historical/hand-crafted patch carrying an out-of-range level
+            // could otherwise reach here uncapped and inflate the indent
+            // without bound. Clamp again at render time, defense-in-depth,
+            // so the indent (and the inline `h{level}` marker) can never
+            // exceed what a valid level would produce.
+            let heading_level = note
+                .heading_level
+                .unwrap_or(3)
+                .clamp(HEADING_LEVEL_MIN, HEADING_LEVEL_MAX);
+            // audio-graph-626c / D6: indent per depth so the EXISTING
+            // hierarchy is visible at a glance, not just via the inline
+            // `h{level}` marker — see `DOC_OUTLINE_INDENT_SPACES_PER_LEVEL`'s
+            // doc comment for the measured motivation.
+            let indent = " ".repeat(
+                usize::from(heading_level.saturating_sub(HEADING_LEVEL_MIN))
+                    * DOC_OUTLINE_INDENT_SPACES_PER_LEVEL,
+            );
             let bullets = note
                 .body
                 .lines()
@@ -1726,7 +1869,7 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
                 .count();
             let chars = note.body.chars().count();
             lines.push(format!(
-                "[{}] h{heading_level}  {} · {bullets} bullet{plural} · {chars} chars",
+                "{indent}[{}] h{heading_level}  {} · {bullets} bullet{plural} · {chars} chars",
                 one_line_bounded(&note.id, DOC_OUTLINE_ID_MAX_CHARS),
                 one_line_bounded(&note.title, DOC_OUTLINE_TITLE_MAX_CHARS),
                 plural = if bullets == 1 { "" } else { "s" },
@@ -1734,7 +1877,7 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
             if include_previews && rank < DOC_OUTLINE_PREVIEW_SECTIONS {
                 let last_line = note.body.lines().next_back().unwrap_or(&note.body);
                 lines.push(format!(
-                    "     recent: \"{}\"",
+                    "{indent}     recent: \"{}\"",
                     one_line_bounded(last_line, DOC_OUTLINE_PREVIEW_MAX_CHARS)
                 ));
             }
@@ -1742,9 +1885,20 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
         lines.push(if shown == total {
             format!("{total} section(s) total.")
         } else {
+            // audio-graph-626c: the rest are no longer omitted — they are
+            // listed OR truthfully counted, ids-only, in the tail block the
+            // caller appends (see `render_ids_only_tail`). "listed or
+            // counted" (not an unconditional "listed") because the tail has
+            // its own separate cap: a pathological session can still push
+            // some of these past that cap, in which case they are counted,
+            // never silently dropped and never truncated — but also never
+            // claimed as "listed" here when they are not (review finding,
+            // "minor": the prior wording was falsified by the tail's own
+            // disclosure line whenever the tail itself overflowed).
             format!(
-                "{total} section(s) total; only the {shown} most recently changed shown above \
-                 (their ids are correct; the rest are omitted, not renamed)."
+                "{total} section(s) total; the {shown} most recently changed shown above with \
+                 full entries; the remaining {} listed or counted ids-only below.",
+                total - shown
             )
         });
         (lines.join("\n"), shown as u32)
@@ -1754,24 +1908,141 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
     // shrink the shown-heading count from the least-recently-changed end
     // until the block fits (or there is nothing left to show).
     let full = render(true, total);
-    if full.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
-        return full;
-    }
-    let headings_only = render(false, total);
-    if headings_only.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
-        return headings_only;
-    }
-    let mut shown_count = total;
-    loop {
-        if shown_count == 0 {
-            return render(false, 0);
+    let (entries_text, shown) = if full.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+        full
+    } else {
+        let headings_only = render(false, total);
+        if headings_only.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+            headings_only
+        } else {
+            let mut shown_count = total;
+            loop {
+                if shown_count == 0 {
+                    break render(false, 0);
+                }
+                let candidate = render(false, shown_count);
+                if candidate.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
+                    break candidate;
+                }
+                shown_count -= 1;
+            }
         }
-        let candidate = render(false, shown_count);
-        if candidate.0.chars().count() <= DOC_OUTLINE_MAX_CHARS {
-            return candidate;
-        }
-        shown_count -= 1;
+    };
+
+    if shown as usize >= total {
+        return (entries_text, shown);
     }
+
+    // audio-graph-626c: whatever the third attempt above had to drop from the
+    // full-entry outline is NOT omitted from the prompt — every one of those
+    // ids is listed, ids-only, in the tail block below (bounded separately by
+    // `DOC_OUTLINE_TAIL_MAX_IDS`), so the model can still address it.
+    let dropped: Vec<&MaterializedNote> = doc_order
+        .iter()
+        .filter(|note| recency_rank[note.id.as_str()] >= shown as usize)
+        .copied()
+        .collect();
+    let tail = render_ids_only_tail(&dropped);
+    (format!("{entries_text}\n\n{tail}"), shown)
+}
+
+/// Render [`render_document_outline`]'s ids-only tail block for the sections
+/// that [`DOC_OUTLINE_MAX_CHARS`]'s degradation path dropped from the
+/// full-entry outline above (audio-graph-626c). `dropped` must already be in
+/// document order (the caller filters `doc_order`, which already is). Each
+/// entry is `id — title-stub`, with NO body, preview, or heading depth — see
+/// [`DOC_OUTLINE_TAIL_HEADER`] and [`DOC_OUTLINE_TAIL_MAX_IDS`] for the
+/// rationale. Callers must only call this with a non-empty `dropped`; an
+/// empty tail is never appended (see the caller).
+///
+/// Two review-driven ("major") corrections over the first version of this
+/// function:
+///
+/// 1. **Never truncate an id.** The first version ran `id` through the same
+///    [`one_line_bounded`] truncate-with-ellipsis helper used for the
+///    full-entry heading line, at [`DOC_OUTLINE_ID_MAX_CHARS`]. That is fine
+///    for a full entry (id is one of several fields), but this tail's ENTIRE
+///    purpose is "reuse this id exactly" — truncating it silently mints an
+///    unaddressable fragment, and worse, two distinct ids sharing a >48-char
+///    prefix (exactly the field-measured collision-suffix-chain pattern this
+///    ticket exists to stop) collapse onto the identical truncated line. An
+///    id that does not fit within [`DOC_OUTLINE_ID_MAX_CHARS`] intact is now
+///    never listed at all — it is counted via `further` below, the same
+///    truthful-count treatment the cap overflow already got.
+/// 2. **Prioritize the most-recently-appended ids for a slot, not the
+///    document-order-first ones.** The first version took the first
+///    [`DOC_OUTLINE_TAIL_MAX_IDS`] of `dropped` in document order. In the
+///    append-heavy sessions this ticket targets, document order approximates
+///    creation order, so that always sacrificed the NEWEST dropped sections
+///    to the cap — precisely the ones a model still actively extending the
+///    document is most likely to keep appending to, and the population whose
+///    re-minting this ticket is trying to stop. Walking from the tail end of
+///    `dropped` backward instead means it is always the OLDEST dropped
+///    sections that get counted-only once the cap binds.
+///
+/// Worst-case size arithmetic (feeds [`DOC_OUTLINE_TAIL_MAX_IDS`]'s doc
+/// comment and the char-budget tests): every listed line is
+/// `id — title-stub\n` with `id.chars().count() <= DOC_OUTLINE_ID_MAX_CHARS`
+/// (skipped otherwise, per point 1) and
+/// `title-stub.chars().count() <= DOC_OUTLINE_TAIL_TITLE_MAX_CHARS + 1` (the
+/// `+1` for [`one_line_bounded`]'s ellipsis), so each line is at most
+/// `DOC_OUTLINE_ID_MAX_CHARS + 3 (" — ") + DOC_OUTLINE_TAIL_TITLE_MAX_CHARS + 1 + 1 (newline)`
+/// chars — with the current constants, 77. At the cap, the whole block is
+/// bounded by `DOC_OUTLINE_TAIL_HEADER.len() + DOC_OUTLINE_TAIL_MAX_IDS * 77 +
+/// (one disclosure line)`.
+fn render_ids_only_tail(dropped: &[&MaterializedNote]) -> String {
+    debug_assert!(
+        !dropped.is_empty(),
+        "render_ids_only_tail must not be called with nothing dropped"
+    );
+    let total_dropped = dropped.len();
+
+    let mut selected: Vec<&MaterializedNote> = Vec::new();
+    for note in dropped.iter().rev().copied() {
+        if selected.len() >= DOC_OUTLINE_TAIL_MAX_IDS {
+            break;
+        }
+        if collapse_whitespace(&note.id).chars().count() > DOC_OUTLINE_ID_MAX_CHARS {
+            // Too long to list without truncating it — counted via
+            // `further` below instead, never silently dropped.
+            continue;
+        }
+        selected.push(note);
+    }
+    selected.reverse(); // restore document order for display.
+
+    let mut lines = vec![DOC_OUTLINE_TAIL_HEADER.to_string()];
+    for note in &selected {
+        lines.push(format!(
+            "{} — {}",
+            collapse_whitespace(&note.id),
+            one_line_bounded(&note.title, DOC_OUTLINE_TAIL_TITLE_MAX_CHARS),
+        ));
+    }
+    let listed = selected.len();
+    let further = total_dropped - listed;
+
+    // Truthful count line: an id past the cap, OR too long to list intact,
+    // is COUNTED, never silently dropped and never truncated mid-id to force
+    // a fit (this ticket's STOP condition).
+    lines.push(if further == 0 {
+        format!("{listed} additional id(s) listed above.")
+    } else {
+        format!(
+            "{listed} of {total_dropped} additional id(s) listed above; {further} further \
+             id(s) exist and are counted here, not listed (an id is always listed in full and \
+             exactly, or not listed at all — never truncated mid-id)."
+        )
+    });
+    lines.join("\n")
+}
+
+/// Collapse a model-authored field's embedded whitespace/newlines into single
+/// spaces, without truncating it. Shared by [`one_line_bounded`] (which adds
+/// truncation on top) and [`render_ids_only_tail`] (which deliberately never
+/// truncates an id — see that function's doc comment for why).
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// One bounded, single-line rendering of a model-authored field (note id,
@@ -1786,7 +2057,7 @@ fn render_document_outline_with_shown_count(notes: &MaterializedNotes) -> (Strin
 /// therefore the whole block) unbounded, and an embedded newline would break
 /// the one-line-per-note invariant the snapshot's line-count bound relies on.
 fn one_line_bounded(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(text);
     let truncated: String = collapsed.chars().take(max_chars).collect();
     if collapsed.chars().count() > max_chars {
         format!("{truncated}…")
@@ -3615,9 +3886,15 @@ mod tests {
     /// drop every preview line FIRST (all sections keep their heading line),
     /// and only fall back to dropping heading lines — from the
     /// LEAST-recently-changed end — if the block is still over budget without
-    /// any previews at all. Either way the trailing count line always
-    /// reports the true total, so a dropped section is counted, never
-    /// silently missing.
+    /// any previews at all.
+    ///
+    /// audio-graph-626c: a dropped heading line no longer means the id is
+    /// gone from the model's view — it must reappear in the ids-only tail
+    /// [`render_ids_only_tail`] appends. This is the ticket's core
+    /// mutation-proof assertion: a mutant that dropped the tail-append call
+    /// entirely (reverting to the old "just omit it" behavior) makes the
+    /// `for id in 0..total` loop below fail on the first dropped id, since
+    /// that id would then appear nowhere in the block at all.
     #[test]
     fn document_outline_degrades_previews_then_least_recently_changed_headings_under_the_char_budget()
      {
@@ -3638,10 +3915,11 @@ mod tests {
         }
 
         let block = render_document_outline(&notes);
-        let shown_chars = block.chars().count();
+        let (entries_chars, _whole_chars) = split_entries_and_whole_block(&block);
         assert!(
-            shown_chars <= DOC_OUTLINE_MAX_CHARS,
-            "outline block must never exceed the hard char budget, got {shown_chars} chars"
+            entries_chars <= DOC_OUTLINE_MAX_CHARS,
+            "the full-entry portion must never exceed the hard char budget, got {entries_chars} \
+             chars"
         );
         assert!(
             !block.contains("recent:"),
@@ -3649,26 +3927,107 @@ mod tests {
         );
         assert!(
             block.contains("[note:199]"),
-            "the most-recently-changed section must survive truncation, got: {block}"
+            "the most-recently-changed section must survive truncation as a FULL entry, got: \
+             {block}"
         );
         assert!(
             !block.contains("[note:0]"),
-            "the least-recently-changed section must be the one dropped, got: {block}"
+            "the least-recently-changed section must not get a full entry, got: {block}"
         );
         assert!(
             block.contains(&format!("{total} section(s) total;")),
             "the true total must still be reported even though not every heading is shown, \
              got: {block}"
         );
+        assert!(
+            block.contains("listed or counted ids-only below."),
+            "the count line must point at the ids-only tail, not claim an omission, got: {block}"
+        );
+        assert!(
+            block.contains(DOC_OUTLINE_TAIL_HEADER),
+            "an ids-only tail block must actually be appended when headings were dropped, got: \
+             {block}"
+        );
+        // Mutation-proof: EVERY dropped id (note:0's least-recently-changed
+        // end) must still be addressable SOMEWHERE in the block, via the
+        // ids-only tail, even though it lost its full entry above. Anchored
+        // via `id_is_addressable_in` so e.g. `note:1` cannot be satisfied by
+        // `note:10`/`note:19`/`note:100`'s line.
+        for i in 0..total {
+            let id = format!("note:{i}");
+            assert!(
+                id_is_addressable_in(&block, &id),
+                "id {id} is missing from the outline entirely — a dropped heading must still \
+                 appear in the ids-only tail, got: {block}"
+            );
+        }
+    }
+
+    /// Splits a rendered outline block into (entries portion, whole block),
+    /// at the ids-only tail's header (present only when something was
+    /// dropped from the full-entry budget — see [`DOC_OUTLINE_TAIL_HEADER`]).
+    /// When no tail is present both halves are identical. Test-only helper
+    /// shared by the char-budget tests below, since audio-graph-626c split
+    /// what used to be one hard bound (the whole block) into two: the
+    /// full-entry portion still bounded by [`DOC_OUTLINE_MAX_CHARS`] alone,
+    /// and the whole block (entries + tail) bounded by that budget PLUS the
+    /// tail's own separate, generous cap.
+    fn split_entries_and_whole_block(block: &str) -> (usize, usize) {
+        let whole = block.chars().count();
+        match block.find(DOC_OUTLINE_TAIL_HEADER) {
+            Some(idx) => (block[..idx].trim_end().chars().count(), whole),
+            None => (whole, whole),
+        }
+    }
+
+    /// Anchored "is `id` addressable somewhere in `block`" check for the
+    /// mutation-proof loops below. audio-graph-626c review fix (minor): a
+    /// bare `block.contains(id)` aliases across ids sharing a numeric prefix
+    /// — `note:1` is a substring of `note:10`/`note:19`/`note:100`, so a
+    /// mutant that actually dropped `note:1` entirely could still pass a bare
+    /// `contains` check by accident, as long as some other id containing it
+    /// as a substring survived. A full-entry heading line always brackets
+    /// the id (`[id]`, closed immediately by `]`) and a tail line always
+    /// follows it with the exact `" — "` separator — both delimiters anchor
+    /// the match so `note:1` cannot be satisfied by `note:10`'s line.
+    fn id_is_addressable_in(block: &str, id: &str) -> bool {
+        block.contains(&format!("[{id}]")) || block.contains(&format!("{id} — "))
+    }
+
+    /// Analytic worst-case char ceiling for [`render_ids_only_tail`]'s output
+    /// with up to `listed` entries — used only to bound test assertions, not
+    /// duplicated as production logic. Deliberately generous (assumes every
+    /// title-stub is truncated to its max and gets an ellipsis, and
+    /// over-counts the header/disclosure-line overhead) so a test asserting
+    /// against it is checking "the tail cannot blow up unboundedly", not
+    /// pinning an exact byte count. No ellipsis term on the id: audio-graph-
+    /// 626c review fix — an id is never truncated into the tail (an
+    /// over-length id is skipped, counted-only, instead), so a listed id is
+    /// always <= `DOC_OUTLINE_ID_MAX_CHARS` chars exactly, never that plus an
+    /// ellipsis.
+    fn worst_case_tail_block_chars(listed: usize) -> usize {
+        let header = DOC_OUTLINE_TAIL_HEADER.chars().count();
+        let per_line = DOC_OUTLINE_ID_MAX_CHARS
+            + 3 /* " — " */
+            + DOC_OUTLINE_TAIL_TITLE_MAX_CHARS + 1 /* ellipsis */
+            + 1 /* newline */;
+        header + 1 + listed * per_line + 256 /* generous disclosure-line slack */
     }
 
     /// Prompt-size bound, demonstrated directly against the documented hard
     /// cap rather than an estimated ceiling — this is what makes the per-tick
     /// token cost bounded, not O(session length), the same growth failure
     /// mode ADR-0025 already fixed for the transcript feed.
+    ///
+    /// audio-graph-626c: the full-entry PORTION alone must still fit
+    /// [`DOC_OUTLINE_MAX_CHARS`] exactly as before — that hard budget did not
+    /// move. What changed is that the WHOLE block (entries + the new
+    /// ids-only tail) is no longer required to fit that same budget: the tail
+    /// intentionally adds more chars in exchange for keeping every id
+    /// addressable, bounded instead by [`worst_case_tail_block_chars`].
     #[test]
     fn document_outline_stays_within_the_char_budget_independent_of_session_growth() {
-        fn outline_chars(note_count: usize, body: &str) -> usize {
+        fn outline_chars(note_count: usize, body: &str) -> (usize, usize) {
             let mut notes = empty_notes();
             for i in 0..note_count {
                 notes
@@ -3683,23 +4042,41 @@ mod tests {
                     )
                     .expect("apply note");
             }
-            render_document_outline(&notes).chars().count()
+            split_entries_and_whole_block(&render_document_outline(&notes))
         }
 
-        // Axis 1 — note COUNT: a 2,000-note session must still fit the hard
-        // budget, not merely stay "small relative to" it.
+        // Axis 1 — note COUNT: a 2,000-note session's full-entry PORTION must
+        // still fit the hard budget, not merely stay "small relative to" it,
+        // and the WHOLE block (now including the ids-only tail for whatever
+        // got dropped) must stay within that budget plus the tail's own
+        // analytic worst case — never unbounded.
+        let (entries_chars, whole_chars) = outline_chars(2_000, "A short note body.");
         assert!(
-            outline_chars(2_000, "A short note body.") <= DOC_OUTLINE_MAX_CHARS,
-            "a 2,000-note outline exceeded DOC_OUTLINE_MAX_CHARS"
+            entries_chars <= DOC_OUTLINE_MAX_CHARS,
+            "a 2,000-note outline's full-entry portion exceeded DOC_OUTLINE_MAX_CHARS, got \
+             {entries_chars}"
+        );
+        assert!(
+            whole_chars
+                <= DOC_OUTLINE_MAX_CHARS + worst_case_tail_block_chars(DOC_OUTLINE_TAIL_MAX_IDS),
+            "a 2,000-note outline's whole block (entries + tail) exceeded the documented \
+             budget+tail-bound ceiling, got {whole_chars}"
         );
 
         // Axis 2 — per-note BODY LENGTH: a ~260x increase in one note's body
         // (5,000 chars vs. 19) must not blow the budget either — the heading
         // line reports a body char COUNT, not the body text itself, so a
         // longer body only changes a few digits, never the line's shape.
+        // Only 10 notes here, so no degradation (and no tail) triggers at
+        // all — entries and whole block are the same.
+        let (entries_chars, whole_chars) = outline_chars(10, &"x".repeat(5_000));
         assert!(
-            outline_chars(10, &"x".repeat(5_000)) <= DOC_OUTLINE_MAX_CHARS,
+            whole_chars <= DOC_OUTLINE_MAX_CHARS,
             "a long-body outline exceeded DOC_OUTLINE_MAX_CHARS"
+        );
+        assert_eq!(
+            entries_chars, whole_chars,
+            "only 10 notes must never trigger the ids-only tail at all"
         );
 
         // Axis 3 — per-note ID/TITLE LENGTH: unlike the body, `id` and `title`
@@ -3755,6 +4132,522 @@ mod tests {
             "an embedded newline in the title must not add extra lines to the block, got: {block}"
         );
         assert!(block.contains("Multi-line title with embedded newlines"));
+    }
+
+    /// audio-graph-626c: [`DOC_OUTLINE_TAIL_MAX_IDS`] bounds the ids-only tail
+    /// so a pathological session (thousands of notes in one sitting) cannot
+    /// blow up the prompt — but per this ticket's STOP condition, an id past
+    /// that cap must be COUNTED truthfully, never silently dropped and never
+    /// truncated mid-id to force a fit. This test drives note count well past
+    /// the cap and checks the disclosure math is exact, and also that the
+    /// ids sacrificed to the cap are the OLDEST dropped ones, not the newest
+    /// (review fix — see [`render_ids_only_tail`]'s doc comment).
+    #[test]
+    fn document_outline_ids_only_tail_is_bounded_and_discloses_truthful_count() {
+        let mut notes = empty_notes();
+        // Comfortably clears DOC_OUTLINE_MAX_CHARS's degradation AND
+        // DOC_OUTLINE_TAIL_MAX_IDS's cap: enough dropped ids that the tail
+        // itself must truncate its own listing.
+        let total = DOC_OUTLINE_TAIL_MAX_IDS + 500;
+        for i in 0..total {
+            notes
+                .apply_patch(
+                    &notes_patch(
+                        (i + 1) as u64,
+                        &format!("note:{i}"),
+                        &format!("Topic {i}"),
+                        "Body.",
+                    ),
+                    None,
+                )
+                .expect("apply note");
+        }
+
+        let block = render_document_outline(&notes);
+        assert!(
+            block.contains(DOC_OUTLINE_TAIL_HEADER),
+            "a session this large must produce an ids-only tail, got: {block}"
+        );
+        assert!(
+            block.contains("further id(s) exist and are counted here, not listed"),
+            "past the tail's own cap, the overflow must be truthfully disclosed, got: {block}"
+        );
+        // Exact accounting: entries-shown + tail-listed + tail-overflow ==
+        // total. Parse the two counts the disclosure line reports back out
+        // of the block rather than re-deriving them, so this test actually
+        // exercises what the model would read.
+        let entries_line = block
+            .lines()
+            .find(|line| line.contains("section(s) total;"))
+            .expect("entries trailing count line present");
+        let shown_in_entries: usize = entries_line
+            .split_whitespace()
+            .nth(4)
+            .expect("shown count token present")
+            .parse()
+            .expect("shown count is a number");
+        let disclosure_line = block
+            .lines()
+            .find(|line| line.contains("further id(s) exist"))
+            .expect("tail disclosure line present");
+        let mut tokens = disclosure_line.split_whitespace();
+        let listed_in_tail: usize = tokens
+            .next()
+            .expect("listed count")
+            .parse()
+            .expect("number");
+        // tokens: listed "of" total_dropped "additional" "id(s)" "listed"
+        // "above;" further "further" ...
+        let total_dropped: usize = disclosure_line
+            .split_whitespace()
+            .nth(2)
+            .expect("total-dropped token present")
+            .parse()
+            .expect("total-dropped count is a number");
+        let further: usize = disclosure_line
+            .split(';')
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("further-count token present")
+            .parse()
+            .expect("further count is a number");
+
+        assert_eq!(
+            listed_in_tail, DOC_OUTLINE_TAIL_MAX_IDS,
+            "the tail must list exactly its documented cap once past it"
+        );
+        assert_eq!(
+            total_dropped,
+            total - shown_in_entries,
+            "total-dropped disclosed by the tail must equal (session total - entries shown)"
+        );
+        assert_eq!(
+            further,
+            total_dropped - DOC_OUTLINE_TAIL_MAX_IDS,
+            "the disclosed overflow count must be exact, not an approximation"
+        );
+        assert_eq!(
+            shown_in_entries + listed_in_tail + further,
+            total,
+            "every id must be shown, listed, or truthfully counted — none silently dropped"
+        );
+        // audio-graph-626c review fix (scope_honesty): once the tail's own
+        // cap binds, it must sacrifice the OLDEST dropped ids to counted-only
+        // — not the newest, which is what a model still appending to the
+        // document is most likely to keep extending. In this fixture,
+        // sequence number tracks index, so "oldest dropped" is note:0 and
+        // "newest dropped" is the one immediately below the entries cutoff.
+        assert!(
+            !id_is_addressable_in(&block, "note:0"),
+            "the oldest dropped id must be sacrificed to counted-only once the tail's own cap \
+             binds, but it is still listed, got: {block}"
+        );
+        let newest_dropped_id = format!("note:{}", total - shown_in_entries - 1);
+        assert!(
+            id_is_addressable_in(&block, &newest_dropped_id),
+            "the most-recently-dropped id ({newest_dropped_id}) must still get a tail slot in \
+             preference to older dropped ids, got: {block}"
+        );
+    }
+
+    /// audio-graph-626c review fix ("major"): an id longer than
+    /// [`DOC_OUTLINE_ID_MAX_CHARS`] must NEVER appear in the ids-only tail,
+    /// truncated or otherwise — the tail's entire point is "reuse this id
+    /// exactly," so truncating an oversized id with an ellipsis would
+    /// silently mint an unaddressable fragment, and two distinct oversized
+    /// ids sharing a 48-char prefix (the field's own measured
+    /// collision-suffix-chain shape, `note-21050new..newY`) would collapse
+    /// onto one identical, ambiguous line. Two oversized ids are given the
+    /// OLDEST sequence numbers (guaranteeing they are dropped from the
+    /// full-entry budget) so this test isolates the length check from the
+    /// recency-priority selection covered by the previous test.
+    #[test]
+    fn document_outline_ids_only_tail_never_lists_a_truncated_id() {
+        let mut notes = empty_notes();
+        let long_prefix = format!("note-21050{}", "x".repeat(38)); // 48 chars exactly
+        assert_eq!(long_prefix.chars().count(), DOC_OUTLINE_ID_MAX_CHARS);
+        let long_id_a = format!("{long_prefix}newA");
+        let long_id_b = format!("{long_prefix}newB");
+
+        notes
+            .apply_patch(&notes_patch(1, &long_id_a, "Long A", "Body."), None)
+            .expect("apply oversized id a");
+        notes
+            .apply_patch(&notes_patch(2, &long_id_b, "Long B", "Body."), None)
+            .expect("apply oversized id b");
+
+        // Enough short-id filler, all with LATER sequence numbers than the
+        // two oversized ids above, to force the char-budget degradation
+        // (mirrors the 200-note fixture already proven to trigger it).
+        let filler_total = 250usize;
+        for i in 0..filler_total {
+            notes
+                .apply_patch(
+                    &notes_patch(
+                        (i + 3) as u64,
+                        &format!("short:{i}"),
+                        &format!("Topic {i}"),
+                        "Body.",
+                    ),
+                    None,
+                )
+                .expect("apply filler note");
+        }
+
+        let block = render_document_outline(&notes);
+        assert!(
+            block.contains(DOC_OUTLINE_TAIL_HEADER),
+            "this fixture must trigger the ids-only tail, got: {block}"
+        );
+        // Neither oversized id — nor even their shared 48-char prefix, which
+        // is exactly what a truncate-with-ellipsis policy would have
+        // rendered for both — appears anywhere in the block.
+        assert!(
+            !block.contains(&long_id_a) && !block.contains(&long_id_b),
+            "an id longer than DOC_OUTLINE_ID_MAX_CHARS must never be rendered at all, got: \
+             {block}"
+        );
+        assert!(
+            !block.contains(&long_prefix),
+            "the two oversized ids' shared prefix must not appear either — a truncated form \
+             would have collapsed both onto this identical, ambiguous substring, got: {block}"
+        );
+        // Both oversized ids are dropped from the full-entry budget (oldest
+        // sequence numbers) and the tail's own count cap is nowhere near
+        // binding at this fixture's size (~130 dropped, cap is
+        // DOC_OUTLINE_TAIL_MAX_IDS), so the ONLY reason anything is
+        // "further, not listed" is the length check — exactly 2.
+        let disclosure_line = block
+            .lines()
+            .find(|line| line.contains("additional id(s) listed above"))
+            .expect("tail disclosure line present");
+        assert!(
+            disclosure_line.contains("2 further id(s) exist and are counted here, not listed"),
+            "exactly the two oversized ids must be the only ones counted-only, got: \
+             {disclosure_line:?}"
+        );
+    }
+
+    /// audio-graph-626c / D6: the outline's heading lines must indent per
+    /// `heading_level` so the EXISTING hierarchy is visible at a glance —
+    /// mutation-proof for "indentation rendering": a mutant that stripped the
+    /// indent (rendering every level flush-left) would make the level-3 and
+    /// level-4 assertions below fail, since they check for the exact leading
+    /// whitespace `DOC_OUTLINE_INDENT_SPACES_PER_LEVEL` implies.
+    #[test]
+    fn document_outline_indents_headings_by_heading_level() {
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch_with_heading(1, "note:top", "Top", "Body.", 2),
+                None,
+            )
+            .expect("apply level-2 note");
+        notes
+            .apply_patch(
+                &notes_patch_with_heading(2, "note:mid", "Mid", "Body.", 3),
+                None,
+            )
+            .expect("apply level-3 note");
+        notes
+            .apply_patch(
+                &notes_patch_with_heading(3, "note:deep", "Deep", "Body.", 4),
+                None,
+            )
+            .expect("apply level-4 note");
+
+        let block = render_document_outline(&notes);
+        let top_line = block
+            .lines()
+            .find(|line| line.contains("[note:top]"))
+            .expect("level-2 heading line present");
+        let mid_line = block
+            .lines()
+            .find(|line| line.contains("[note:mid]"))
+            .expect("level-3 heading line present");
+        let deep_line = block
+            .lines()
+            .find(|line| line.contains("[note:deep]"))
+            .expect("level-4 heading line present");
+
+        assert!(
+            top_line.starts_with("[note:top]"),
+            "a level-2 (top-level) heading must have NO leading indent, got: {top_line:?}"
+        );
+        assert!(
+            mid_line.starts_with("  [note:mid]"),
+            "a level-3 heading must be indented by exactly one level \
+             ({DOC_OUTLINE_INDENT_SPACES_PER_LEVEL} spaces), got: {mid_line:?}"
+        );
+        assert!(
+            deep_line.starts_with("    [note:deep]"),
+            "a level-4 heading must be indented by exactly two levels \
+             ({} spaces), got: {deep_line:?}",
+            2 * DOC_OUTLINE_INDENT_SPACES_PER_LEVEL
+        );
+    }
+
+    /// audio-graph-626c review fix (minor, defense-in-depth): ingest
+    /// normalization (`normalize_projection_patch_draft_doc_structure`)
+    /// clamps `heading_level` into `2..=4` for any FRESHLY-parsed draft, but
+    /// deliberately never runs on replay (materialization must stay a pure
+    /// function of the accepted patch log). `notes_patch_with_heading` models
+    /// exactly that already-accepted/replayed seam — it builds a
+    /// `ProjectionPatch` directly, the same shape a hand-crafted or
+    /// historical log entry would replay through, with no normalization in
+    /// between. An out-of-range level reaching the render function this way
+    /// must not inflate the indent unboundedly.
+    #[test]
+    fn document_outline_clamps_an_out_of_range_heading_level_at_render_time() {
+        let mut notes = empty_notes();
+        notes
+            .apply_patch(
+                &notes_patch_with_heading(1, "note:corrupted", "Corrupted", "Body.", 255u8),
+                None,
+            )
+            .expect("apply out-of-range heading level");
+
+        let block = render_document_outline(&notes);
+        let line = block
+            .lines()
+            .find(|line| line.contains("[note:corrupted]"))
+            .expect("heading line present");
+        let max_indent = " ".repeat(
+            usize::from(HEADING_LEVEL_MAX - HEADING_LEVEL_MIN)
+                * DOC_OUTLINE_INDENT_SPACES_PER_LEVEL,
+        );
+        assert!(
+            line.starts_with(&format!("{max_indent}[note:corrupted]")),
+            "an out-of-range heading_level (255) must be clamped to HEADING_LEVEL_MAX's indent \
+             ({} spaces), not left to inflate indent unboundedly, got: {line:?}",
+            max_indent.len()
+        );
+        assert!(
+            line.contains(&format!("h{HEADING_LEVEL_MAX}")),
+            "the inline marker must reflect the clamped level too, got: {line:?}"
+        );
+    }
+
+    /// audio-graph-626c: this ticket both (a) added the ids-only tail, a
+    /// per-tick VARIABLE-region change, and (b) added a static sentence to
+    /// the Notes operation guidance steering toward level-2/3 sections for
+    /// new topics — a change to the byte-stable SYSTEM prefix
+    /// (`messages[0]`), disclosed rather than snuck in (see the ticket).
+    /// Because that sentence is static (not branched on any per-tick value),
+    /// the prefix must still be byte-identical across ticks AFTER this
+    /// change ships — exactly the invariant
+    /// `heading_level_change_between_ticks_never_busts_the_stable_prefix` and
+    /// `note_count_change_between_ticks_never_busts_the_stable_prefix` pin for
+    /// the pre-existing dimensions. This test pins it for the two NEW
+    /// variable dimensions this ticket introduces: whether the ids-only tail
+    /// is present at all, and which heading levels are in play.
+    #[test]
+    fn ids_only_tail_and_hierarchy_indentation_never_bust_the_stable_prefix() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "Alice chose Soniox."))
+            .unwrap();
+        let job = job(ProjectionKind::Notes, &ledger);
+
+        // Tick 1: a handful of sections, well under the char budget — no
+        // ids-only tail, one heading level.
+        let mut notes_small = empty_notes();
+        for i in 0..3 {
+            notes_small
+                .apply_patch(
+                    &notes_patch_with_heading(
+                        (i + 1) as u64,
+                        &format!("note:{i}"),
+                        &format!("Topic {i}"),
+                        "Body.",
+                        2,
+                    ),
+                    None,
+                )
+                .expect("apply small-session note");
+        }
+        let small = projection_patch_prompt_messages(&job, &ledger, Some(&notes_small))
+            .expect("prompt for small session");
+
+        // Tick 2: SAME ledger/job/basis, but enough sections at mixed
+        // heading levels to force the ids-only tail into existence.
+        let mut notes_large = empty_notes();
+        for i in 0..300u64 {
+            notes_large
+                .apply_patch(
+                    &notes_patch_with_heading(
+                        i + 1,
+                        &format!("note:{i}"),
+                        &format!("Topic {i}"),
+                        "Body.",
+                        2 + (i % 3) as u8,
+                    ),
+                    None,
+                )
+                .expect("apply large-session note");
+        }
+        let large = projection_patch_prompt_messages(&job, &ledger, Some(&notes_large))
+            .expect("prompt for large session");
+
+        assert_eq!(
+            small[0].content, large[0].content,
+            "system block (message 0) must stay byte-identical whether or not this tick's \
+             outline needed the new ids-only tail"
+        );
+        assert_eq!(
+            small[1].content, large[1].content,
+            "pinned-facts/summary block (message 1) must stay byte-identical across the same \
+             comparison"
+        );
+        // Proves this isn't a vacuous pass: the large session's outline
+        // message DOES contain the new tail, the small one does not.
+        assert!(large[3].content.contains(DOC_OUTLINE_TAIL_HEADER));
+        assert!(!small[3].content.contains(DOC_OUTLINE_TAIL_HEADER));
+    }
+
+    /// audio-graph-626c: the field-measured fixture this whole ticket is
+    /// scoped to. Mirrors field session d97bfcc3's shape (371 notes, 1h) as
+    /// closely as a synchronous unit test can — same note count, a title
+    /// length in the same ballpark as the field vocabulary reused elsewhere
+    /// in this file, and a heading-level distribution matching the field's
+    /// own D6 measurement (94.8% level 4, a small handful of level 2/3) —
+    /// and reports the measured total outline size (entries + ids-only tail)
+    /// so the ticket's "verify and refine the ~6-8KB estimate" instruction
+    /// has an actual number attached, not just the pre-implementation
+    /// estimate. Also proves the "no note ever fully vanishes" claim end to
+    /// end on the exact fixture shape the ticket was filed against.
+    #[test]
+    fn document_outline_371_note_field_fixture_stays_within_budget_and_tail_bound() {
+        let total = 371usize;
+        let mut notes = empty_notes();
+        for i in 0..total {
+            // Field D6 measurement: 94.8% level 4, 2 level-2 sections in 371.
+            // Reproduce that shape rather than a uniform distribution: the
+            // first two get level 2, the rest level 4.
+            let heading_level: u8 = if i < 2 { 2 } else { 4 };
+            notes
+                .apply_patch(
+                    &notes_patch_with_heading(
+                        (i + 1) as u64,
+                        &format!("note:{i}"),
+                        &format!("Provider decision {i}: Soniox vs. Postgres tooling"),
+                        "- Alice raised a point on this topic\n- Bob responded with a counterpoint",
+                        heading_level,
+                    ),
+                    None,
+                )
+                .expect("apply field-shape note");
+        }
+
+        let block = render_document_outline(&notes);
+        let (entries_chars, whole_chars) = split_entries_and_whole_block(&block);
+
+        assert!(
+            entries_chars <= DOC_OUTLINE_MAX_CHARS,
+            "the 371-note fixture's full-entry portion exceeded DOC_OUTLINE_MAX_CHARS, got \
+             {entries_chars}"
+        );
+        assert!(
+            whole_chars
+                <= DOC_OUTLINE_MAX_CHARS + worst_case_tail_block_chars(DOC_OUTLINE_TAIL_MAX_IDS),
+            "the 371-note fixture's whole outline (entries + tail) exceeded the documented \
+             budget+tail-bound ceiling, got {whole_chars}"
+        );
+        // Every one of the 371 field-shape ids must be addressable somewhere
+        // in the block — the ticket's headline guarantee, on the exact
+        // fixture shape it was filed against. Anchored check (see
+        // `id_is_addressable_in`) so multi-digit ids can't alias each other.
+        for i in 0..total {
+            let id = format!("note:{i}");
+            assert!(
+                id_is_addressable_in(&block, &id),
+                "field-shape fixture is missing id {id} entirely, got a block of {whole_chars} \
+                 chars"
+            );
+        }
+
+        // Reported, not asserted against a magic number: this IS the ticket's
+        // "measure the token delta on a 371-note fixture" deliverable. ~4
+        // chars/token matches this file's own existing convention (see
+        // `measured_char_delta_between_the_old_notes_snapshot_and_the_new_document_outline`).
+        let old_behavior_chars = entries_chars; // pre-626c: tail did not exist.
+        let tail_added_chars = whole_chars - old_behavior_chars;
+        eprintln!(
+            "document_outline_371_note_field_fixture_stays_within_budget_and_tail_bound: \
+             entries={entries_chars} whole={whole_chars} tail_added={tail_added_chars} chars \
+             (~{} tokens at ~4 chars/token) for {total} notes",
+            tail_added_chars / 4
+        );
+    }
+
+    /// audio-graph-626c review fix ("major", scope_honesty): the first
+    /// version of this ticket disclosed only the 371-note field fixture's
+    /// measured size (~17.6KB / ~4.4K tokens) and never computed or reported
+    /// what the tail's OWN cap costs at its worst case — the exact number
+    /// its STOP condition asked for. This test drives a session well past
+    /// [`DOC_OUTLINE_TAIL_MAX_IDS`] with every dropped id/title at its
+    /// bounded maximum (48-char ids, title-stubs long enough to force the
+    /// tail's own ellipsis) — the specific hostile shape a prior review pass
+    /// measured at ~156KB / ~39K tokens against the ORIGINAL 2000-id cap —
+    /// and reports what it costs now, proving it stays within the disclosed,
+    /// analytic ceiling instead of merely asserting a pass/fail.
+    ///
+    /// Note this test alone cannot catch [`DOC_OUTLINE_TAIL_MAX_IDS`] being
+    /// silently raised back toward its old value — its own ceiling
+    /// (`worst_case_tail_block_chars(DOC_OUTLINE_TAIL_MAX_IDS)`) scales with
+    /// that same constant. See the `const _: () = assert!(...)` immediately
+    /// after that constant's definition for the compile-time-enforced guard
+    /// against exactly that (raising it past the reviewed bound is a build
+    /// failure, not merely a test failure).
+    #[test]
+    fn document_outline_pathological_hostile_ids_tail_stays_within_disclosed_bound() {
+        let mut notes = empty_notes();
+        let total = DOC_OUTLINE_TAIL_MAX_IDS + 600;
+        for i in 0..total {
+            // 48-char, unique, zero-padded numeric ids — at
+            // DOC_OUTLINE_ID_MAX_CHARS exactly, so every dropped one is
+            // eligible to be LISTED (this test is about the cap's own cost
+            // at its worst case, not the separate length-skip path already
+            // covered by `document_outline_ids_only_tail_never_lists_a_truncated_id`).
+            let id = format!("{i:048}");
+            assert_eq!(id.chars().count(), DOC_OUTLINE_ID_MAX_CHARS);
+            notes
+                .apply_patch(
+                    &notes_patch(
+                        (i + 1) as u64,
+                        &id,
+                        "A long, field-vocabulary-style title far past the tail's title-stub cap",
+                        "Body.",
+                    ),
+                    None,
+                )
+                .expect("apply hostile note");
+        }
+
+        let block = render_document_outline(&notes);
+        let (entries_chars, whole_chars) = split_entries_and_whole_block(&block);
+        assert!(
+            entries_chars <= DOC_OUTLINE_MAX_CHARS,
+            "the full-entry portion exceeded DOC_OUTLINE_MAX_CHARS, got {entries_chars}"
+        );
+        let ceiling = DOC_OUTLINE_MAX_CHARS + worst_case_tail_block_chars(DOC_OUTLINE_TAIL_MAX_IDS);
+        assert!(
+            whole_chars <= ceiling,
+            "the hostile-id whole block exceeded the documented budget+tail-bound ceiling, got \
+             {whole_chars}, ceiling {ceiling}"
+        );
+        assert!(
+            block.contains(DOC_OUTLINE_TAIL_HEADER),
+            "this fixture must trigger the ids-only tail, got a block of {whole_chars} chars"
+        );
+        eprintln!(
+            "document_outline_pathological_hostile_ids_tail_stays_within_disclosed_bound: \
+             entries={entries_chars} whole={whole_chars} chars (~{} tokens at ~4 chars/token) \
+             for {total} notes, all with maximal-length ids/titles — analytic ceiling {ceiling} \
+             chars (~{} tokens)",
+            whole_chars / 4,
+            ceiling / 4
+        );
     }
 
     /// Regression proof for the measured overwrite storm (session ae528252):
