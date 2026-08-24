@@ -3,10 +3,12 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./analytics/ErrorBoundary";
 import { captureFrontendError } from "./analytics/sentry";
+import RootErrorFallback from "./components/RootErrorFallback";
 import "./styles.css";
 // Initialize i18next before React mounts so the first render has
 // translations available. Side-effect import — do not remove.
 import "./i18n";
+import { useAudioGraphStore } from "./store";
 import { applyTheme, readStoredTheme } from "./theme";
 
 // Apply the persisted theme before the first paint so there is no
@@ -57,7 +59,27 @@ async function bootstrap() {
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <ErrorBoundary>
+      {/* audio-graph-16e2: a real default fallback, wired at the root mount
+          (see ErrorBoundary.tsx's module doc for why this WAS the gap — a
+          caught render error used to blank the window permanently). Reload
+          resets the frontend WebView only (the Tauri backend is untouched
+          — see RootErrorFallback.tsx's doc); "back to Capture" forces a nav
+          write (`setNavDest` has no same-value bailout, unlike
+          `setWorkspaceView`, so this always produces a fresh `nav`
+          reference even if the crash happened while already on Capture) —
+          `ErrorBoundary`'s nav-change listener is what actually clears the
+          caught state in response. */}
+      <ErrorBoundary
+        fallback={(errorName) => (
+          <RootErrorFallback
+            errorName={errorName}
+            onReload={() => window.location.reload()}
+            onBackToCapture={() =>
+              useAudioGraphStore.getState().setNavDest("capture")
+            }
+          />
+        )}
+      >
         <App />
       </ErrorBoundary>
     </React.StrictMode>,

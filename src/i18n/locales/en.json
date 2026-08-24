@@ -1149,6 +1149,13 @@
       "recordingStarted": "Recording started",
       "recordingStopped": "Recording stopped",
       "phaseEntered": "{{phase}} view"
+    },
+    "errorBoundary": {
+      "title": "Something went wrong",
+      "body": "AudioGraph hit an unexpected error and stopped this view rather than continue in a broken state. Reload the app, or head back to Capture to keep going.",
+      "errorClass": "Error type: {{name}}",
+      "reload": "Reload AudioGraph",
+      "backToCapture": "Back to Capture"
     }
   },
   "transcript": {

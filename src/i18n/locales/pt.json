@@ -1149,6 +1149,13 @@
       "recordingStarted": "Gravação iniciada",
       "recordingStopped": "Gravação encerrada",
       "phaseEntered": "Visão {{phase}}"
+    },
+    "errorBoundary": {
+      "title": "Algo deu errado",
+      "body": "O AudioGraph encontrou um erro inesperado e interrompeu esta visualização em vez de continuar em um estado corrompido. Recarregue o aplicativo ou volte para Captura para continuar.",
+      "errorClass": "Tipo de erro: {{name}}",
+      "reload": "Recarregar o AudioGraph",
+      "backToCapture": "Voltar para Captura"
     }
   },
   "transcript": {
