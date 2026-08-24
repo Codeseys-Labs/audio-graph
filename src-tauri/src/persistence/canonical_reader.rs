@@ -291,6 +291,7 @@ mod tests {
                     span_id: "span-1".into(),
                     revision_number: sequence,
                 }],
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: format!("fnv1a64:{sequence:016x}"),
                 summarized_through_revision: None,

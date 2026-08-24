@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::events::{
     AsrSpanRevisionPayload, AsrSpanStability, DiarizationSpanRevisionPayload,
@@ -213,9 +214,81 @@ pub enum TranscriptHashVersion {
     V1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Compact pointer to the covered-but-summarized prefix of a
+/// [`ProjectionBasis`] (audio-graph-cfa1): everything at or before
+/// [`ProjectionBasis::summarized_through_revision`], folded into the rolling
+/// summary window (ADR-0025 §2c) and therefore never re-sent to the
+/// projection LLM verbatim. `span_revisions` used to carry every one of
+/// these spans individually (`(span_id, revision_number)` per entry), which
+/// grows without bound across a long session — field evidence showed one
+/// basis carrying 933 entries despite a `summarized_through_revision` of 12.
+/// This digest replaces that per-span identity list with a count and a
+/// content hash, computed the same way
+/// [`ProjectionBasis::from_transcript_events_and_speaker_spans`] always has
+/// (`transcript_events_hash_v1` over the exact prefix events in canonical
+/// order) so any revision, reorder, or deletion inside the prefix still
+/// changes the digest and is still caught as [`BasisCurrency::Revised`] —
+/// see `classify_basis_currency`'s prefix-reconstruction branch.
+///
+/// Never carries span ids or text: this is deliberately opaque provenance,
+/// not a smaller identity list.
+///
+/// `content_hash` has no `hash_version` tag of its own, unlike
+/// [`ProjectionBasis::transcript_hash`]. This is a deliberate, disclosed gap
+/// rather than an oversight: `content_hash` is always produced by the exact
+/// same frozen `transcript_events_hash_v1` call, in the same constructor
+/// invocation, as `transcript_hash` itself — there is only ever one hash
+/// algorithm active for a given `ProjectionBasis` instance, so the digest's
+/// algorithm is definitionally the instance's own `hash_version` today.
+/// `covered_prefix` is an audio-graph-cfa1 addition with exactly one
+/// algorithm that has ever existed for it, so adding a version field now
+/// would tag a value with no second variant to dispatch on. When
+/// [`TranscriptHashVersion`] grows a v2 (ADR-0042), `ProjectionBasis`'s own
+/// exhaustive `Deserialize` match on `hash_version` will already force every
+/// call site that constructs or verifies a `covered_prefix` to be revisited
+/// in lockstep — that is the natural point to decide whether the digest
+/// needs its own explicit version tag, not before v2 exists.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CoveredPrefixDigest {
+    pub span_count: usize,
+    pub content_hash: String,
+}
+
+/// Compaction is enforced by construction, not by field privacy: fields stay
+/// `pub` (matching this module's convention for plain value types such as
+/// [`TranscriptEvent`]) and the manual [`Deserialize`](serde::Deserialize)
+/// impl below copies `span_revisions` through byte-verbatim with no
+/// re-truncation, because a historical basis's untruncated list is exactly
+/// what ADR-0042 byte-stability requires it to keep. What IS guaranteed:
+/// every basis a *production* caller ever constructs goes through
+/// [`Self::from_transcript_events_and_speaker_spans`] (the sole constructor
+/// `TranscriptLedger::current_basis`/`current_projection_basis` call), so
+/// compaction lands there unconditionally. A hand-built struct literal with a
+/// long `span_revisions` and `covered_prefix: None` is still constructible —
+/// audited (not type-enforced) to be confined to `#[cfg(test)]` fixture code
+/// today. Deserialize cannot add that enforcement either: legacy on-disk
+/// bases must round-trip with their original (possibly long) `span_revisions`
+/// intact, so a blanket length assertion at deserialize time would itself
+/// violate ADR-0042.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProjectionBasis {
+    /// Spans NOT covered by `covered_prefix` — i.e. the whole covered set
+    /// for a basis that predates compaction or hasn't grown past the
+    /// rolling-summary hot window yet, or just the verbatim hot-window tail
+    /// once `covered_prefix` is `Some`. `covered_prefix.is_none()` is this
+    /// struct's own "legacy/uncompacted" encoding marker — deliberately NOT
+    /// layered onto `hash_version`/[`TranscriptHashVersion`], which
+    /// ADR-0042 reserves exclusively for the `session_semantics_version`-
+    /// floor-gated transcript-hash algorithm; compaction is an orthogonal
+    /// storage concern and must not ride the same dispatch rule.
     pub span_revisions: Vec<ProjectionBasisSpan>,
+    /// `Some` once the covered set has grown past the rolling-summary hot
+    /// window ([`ROLLING_SUMMARY_HOT_WINDOW_TURNS`]); see
+    /// [`CoveredPrefixDigest`]. `None` for every basis this crate ever wrote
+    /// before audio-graph-cfa1 (and for any basis, old or new, whose covered
+    /// set still fits inside the hot window) — those keep the exact
+    /// pre-compaction `span_revisions` shape.
+    pub covered_prefix: Option<CoveredPrefixDigest>,
     pub diarization_span_revisions: Vec<ProjectionBasisSpan>,
     pub transcript_hash: String,
     /// Highest transcript revision folded into the rolling summary of older
@@ -228,6 +301,34 @@ pub struct ProjectionBasis {
     pub summarized_through_revision: Option<u64>,
 }
 
+/// Compact, bounded Debug representation (audio-graph-cfa1): counts and
+/// boundary revisions only, never the `span_revisions`/`covered_prefix`
+/// identity content. `ProjectionBasis` is embedded in `ProjectionJob` and
+/// `ProjectionSchedulerDecision`, both of which derive `Debug` and both of
+/// which reach production `log::debug!` sites (`speech/mod.rs`'s
+/// `observe_asr_revision` and scheduler-completion logs) — a derived Debug
+/// here would dump every covered span id on every tick, which is exactly the
+/// field-observed 80KB-single-line log bloat this ticket exists to fix.
+/// Mirrors the existing redaction precedent on `TranscriptEvent`/
+/// `MaterializedNote`/etc. in this same module.
+impl fmt::Debug for ProjectionBasis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectionBasis")
+            .field("span_revisions_count", &self.span_revisions.len())
+            .field("covered_prefix", &self.covered_prefix)
+            .field(
+                "diarization_span_revisions_count",
+                &self.diarization_span_revisions.len(),
+            )
+            .field("transcript_hash", &self.transcript_hash)
+            .field(
+                "summarized_through_revision",
+                &self.summarized_through_revision,
+            )
+            .finish()
+    }
+}
+
 impl serde::Serialize for ProjectionBasis {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -235,13 +336,14 @@ impl serde::Serialize for ProjectionBasis {
     {
         use serde::ser::SerializeStruct as _;
 
-        let field_count = if self.summarized_through_revision.is_some() {
-            5
-        } else {
-            4
-        };
+        let field_count = 4
+            + usize::from(self.covered_prefix.is_some())
+            + usize::from(self.summarized_through_revision.is_some());
         let mut state = serializer.serialize_struct("ProjectionBasis", field_count)?;
         state.serialize_field("span_revisions", &self.span_revisions)?;
+        if let Some(covered_prefix) = &self.covered_prefix {
+            state.serialize_field("covered_prefix", covered_prefix)?;
+        }
         state.serialize_field(
             "diarization_span_revisions",
             &self.diarization_span_revisions,
@@ -263,6 +365,8 @@ impl<'de> serde::Deserialize<'de> for ProjectionBasis {
         #[derive(serde::Deserialize)]
         struct Wire {
             span_revisions: Vec<ProjectionBasisSpan>,
+            #[serde(default)]
+            covered_prefix: Option<CoveredPrefixDigest>,
             diarization_span_revisions: Vec<ProjectionBasisSpan>,
             transcript_hash: String,
             #[serde(default)]
@@ -275,6 +379,7 @@ impl<'de> serde::Deserialize<'de> for ProjectionBasis {
         match wire.hash_version {
             TranscriptHashVersion::V1 => Ok(Self {
                 span_revisions: wire.span_revisions,
+                covered_prefix: wire.covered_prefix,
                 diarization_span_revisions: wire.diarization_span_revisions,
                 transcript_hash: wire.transcript_hash,
                 summarized_through_revision: wire.summarized_through_revision,
@@ -292,29 +397,188 @@ impl ProjectionBasis {
         Self::from_transcript_events_and_speaker_spans(events, &[])
     }
 
+    /// Total number of transcript spans this basis covers, counting both the
+    /// verbatim tail in `span_revisions` and any compacted prefix recorded in
+    /// `covered_prefix` (audio-graph-cfa1). Equal to `span_revisions.len()`
+    /// for every basis that predates compaction, or whose covered set never
+    /// grew past the rolling-summary hot window. Callers that use
+    /// `span_revisions.len()` as a stand-in for "how much this basis covers"
+    /// (coalescing thresholds, telemetry) must use this instead so they keep
+    /// seeing the true covered size rather than a value permanently capped at
+    /// [`ROLLING_SUMMARY_HOT_WINDOW_TURNS`].
+    pub fn covered_span_count(&self) -> usize {
+        self.span_revisions.len()
+            + self
+                .covered_prefix
+                .as_ref()
+                .map_or(0, |prefix| prefix.span_count)
+    }
+
+    /// Reconstruct every transcript event this basis covers by resolving
+    /// against `ledger_events` (typically [`TranscriptLedger::latest_spans`]).
+    ///
+    /// For an uncompacted basis this is exactly the existing exact-identity
+    /// lookup every caller already did directly against `span_revisions`. For
+    /// a compacted basis, the prefix is reconstructed by chronological
+    /// position (the same [`ordered_for_window`] order used to build it) and
+    /// verified against [`CoveredPrefixDigest::content_hash`] before being
+    /// trusted — see [`reconstruct_verified_covered_prefix`]. A basis built
+    /// with partials included (`current_basis` — rare on the automatic
+    /// projection path, but a real production caller:
+    /// `commands.rs`'s `approved_agent_projection_patch`, behind the
+    /// `approve_agent_proposal` Tauri command, builds its patch basis this
+    /// way) and one built eligible-only (`current_projection_basis`, the
+    /// common case) both resolve correctly: this tries the eligible-only
+    /// candidate universe first and falls back to every ledger event —
+    /// pinned by
+    /// `resolve_covered_events_falls_back_to_the_full_ledger_when_a_partial_lives_in_the_summarized_prefix`.
+    ///
+    /// Returns fewer events than [`Self::covered_span_count`] only when
+    /// `ledger_events` cannot reproduce what this basis recorded (a caller
+    /// resolving against a stale or foreign ledger) — it never fabricates or
+    /// returns unverified content, matching the tolerant
+    /// filter-out-what's-missing behavior every caller already had for a
+    /// missing tail entry.
+    pub fn resolve_covered_events(
+        &self,
+        ledger_events: &[TranscriptEvent],
+    ) -> Vec<TranscriptEvent> {
+        let tail_ids: std::collections::BTreeSet<&str> = self
+            .span_revisions
+            .iter()
+            .map(|span| span.span_id.as_str())
+            .collect();
+
+        let mut resolved: Vec<TranscriptEvent> = match &self.covered_prefix {
+            Some(prefix) => {
+                let eligible: Vec<TranscriptEvent> = ledger_events
+                    .iter()
+                    .filter(|event| projection_event_is_eligible(event))
+                    .cloned()
+                    .collect();
+                reconstruct_verified_covered_prefix(&eligible, &tail_ids, prefix)
+                    .or_else(|| {
+                        reconstruct_verified_covered_prefix(ledger_events, &tail_ids, prefix)
+                    })
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+
+        let latest_by_identity: BTreeMap<(&str, u64), &TranscriptEvent> = ledger_events
+            .iter()
+            .map(|event| ((event.span_id.as_str(), event.revision_number), event))
+            .collect();
+        resolved.extend(self.span_revisions.iter().filter_map(|span| {
+            latest_by_identity
+                .get(&(span.span_id.as_str(), span.revision_number))
+                .map(|event| (*event).clone())
+        }));
+        resolved
+    }
+
     /// Build a basis from the canonical transcript revisions plus the current
     /// speaker-timeline span revisions. The speaker spans are provider-neutral
     /// [`ProjectionBasisSpan`]s (typically [`SpeakerTimeline::current_basis_spans`]);
     /// passing an empty slice yields a transcript-only basis identical to
     /// [`Self::from_transcript_events`].
+    ///
+    /// Compaction (audio-graph-cfa1): everything at or before the rolling
+    /// summary boundary ([`summarized_through_revision`]) is folded into
+    /// `covered_prefix` instead of being listed in `span_revisions`, exactly
+    /// mirroring [`ROLLING_SUMMARY_HOT_WINDOW_TURNS`]'s own split. This is the
+    /// ONLY basis constructor every production caller uses
+    /// (`TranscriptLedger::current_basis` / `current_projection_basis`), so
+    /// compaction lands for free at every embedding site without a scattered
+    /// per-caller truncation call. `transcript_hash` still covers the whole
+    /// set (prefix and tail) exactly as before — compaction changes what
+    /// `span_revisions` stores, never the hash-v1 algorithm or its value.
     pub fn from_transcript_events_and_speaker_spans(
         events: &[TranscriptEvent],
         speaker_spans: &[ProjectionBasisSpan],
     ) -> Self {
         let latest_events = latest_transcript_events(events);
+        let ordered = ordered_for_window(&latest_events);
+        let hot_window_len = ordered.len().min(ROLLING_SUMMARY_HOT_WINDOW_TURNS);
+        let prefix_len = ordered.len() - hot_window_len;
+
+        let covered_prefix = if prefix_len == 0 {
+            None
+        } else {
+            let prefix_events: Vec<TranscriptEvent> = ordered[..prefix_len]
+                .iter()
+                .map(|event| (*event).clone())
+                .collect();
+            Some(CoveredPrefixDigest {
+                span_count: prefix_events.len(),
+                content_hash: transcript_events_hash_v1(&prefix_events),
+            })
+        };
+        let tail_ids: std::collections::BTreeSet<&str> = ordered[prefix_len..]
+            .iter()
+            .map(|event| event.span_id.as_str())
+            .collect();
 
         Self {
+            // Preserve the pre-compaction span_id-lexicographic order
+            // (`latest_events` is a `BTreeMap`-derived Vec) rather than the
+            // chronological `ordered` order used only to find the split —
+            // `classify_basis_currency`'s per-index tail comparison and every
+            // existing snapshot/test assume this ordering.
             span_revisions: latest_events
                 .iter()
+                .filter(|event| tail_ids.contains(event.span_id.as_str()))
                 .map(|event| ProjectionBasisSpan {
                     span_id: event.span_id.clone(),
                     revision_number: event.revision_number,
                 })
                 .collect(),
+            covered_prefix,
             diarization_span_revisions: speaker_spans.to_vec(),
             transcript_hash: transcript_events_hash_v1(&latest_events),
             summarized_through_revision: summarized_through_revision(&latest_events),
         }
+    }
+}
+
+/// Attempt to reconstruct a [`CoveredPrefixDigest`]'s covered events from
+/// `candidates`, verifying the reconstruction against the recorded digest
+/// before returning it (audio-graph-cfa1).
+///
+/// `candidates` should already be deduped to one (latest) event per
+/// `span_id` — both call sites pass either `TranscriptLedger::latest_spans`
+/// or an eligibility-filtered copy of it, which is already deduped by
+/// construction. The prefix is exactly the events NOT in `tail_ids`, taken
+/// in the same [`ordered_for_window`] chronological order used to build the
+/// digest, up to `prefix.span_count`. Returns `None` (never partial,
+/// unverified content) when `candidates` has fewer than `prefix.span_count`
+/// eligible non-tail events, or when the reconstructed set's content hash
+/// does not match — either means `candidates` is not the universe this
+/// basis was built from (wrong ledger, or the caller needs to retry with a
+/// different eligibility filter).
+fn reconstruct_verified_covered_prefix(
+    candidates: &[TranscriptEvent],
+    tail_ids: &std::collections::BTreeSet<&str>,
+    prefix: &CoveredPrefixDigest,
+) -> Option<Vec<TranscriptEvent>> {
+    let others: Vec<TranscriptEvent> = candidates
+        .iter()
+        .filter(|event| !tail_ids.contains(event.span_id.as_str()))
+        .cloned()
+        .collect();
+    let ordered = ordered_for_window(&others);
+    if ordered.len() < prefix.span_count {
+        return None;
+    }
+    let reconstructed: Vec<TranscriptEvent> = ordered
+        .into_iter()
+        .take(prefix.span_count)
+        .cloned()
+        .collect();
+    if transcript_events_hash_v1(&reconstructed) == prefix.content_hash {
+        Some(reconstructed)
+    } else {
+        None
     }
 }
 
@@ -906,25 +1170,46 @@ impl TranscriptLedger {
             .iter()
             .map(|span| (span.span_id.as_str(), span.revision_number))
             .collect();
+        let projection_events = self.latest_spans.clone();
+
+        // audio-graph-cfa1: reconstruct the FULL set this basis covers (its
+        // verbatim tail plus, when compacted, the summarized-away prefix)
+        // before deciding anything else. `resolve_covered_events` verifies
+        // any recorded `covered_prefix` digest against `projection_events`
+        // internally and silently drops the prefix on a verification
+        // failure (revised/reordered/deleted content, or a shrunk ledger) —
+        // safe here because that always shows up as a covered-count
+        // mismatch a few lines below, before `basis_tracks_partial` (also
+        // derived from this reconstruction) is ever read. For a basis that
+        // predates compaction (`covered_prefix: None`), this is exactly the
+        // original tail-only-identity lookup with no behavior change.
+        let covered_events = basis.resolve_covered_events(&projection_events);
+        let covered_ids: std::collections::BTreeSet<&str> = covered_events
+            .iter()
+            .map(|event| event.span_id.as_str())
+            .collect();
+
         // Projection jobs created by the current scheduler never include
         // provisional events. Historical bases may legitimately contain them,
         // so remember that distinction for the extra-span classification below
-        // while validating every covered span against the full ledger.
-        let basis_tracks_partial = self.latest_spans.iter().any(|event| {
-            !projection_event_is_eligible(event)
-                && basis_spans.get(event.span_id.as_str()) == Some(&event.revision_number)
-        });
-        let projection_events = self.latest_spans.clone();
-        let current_basis = ProjectionBasis::from_transcript_events(&projection_events);
-        let current_spans: BTreeMap<&str, u64> = current_basis
-            .span_revisions
+        // while validating every covered span against the full ledger. Reads
+        // the reconstructed covered set (not just the tail) so a partial
+        // hidden inside a compacted prefix is still detected.
+        let basis_tracks_partial = covered_events
             .iter()
-            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .any(|event| !projection_event_is_eligible(event));
+
+        let current_spans: BTreeMap<&str, u64> = projection_events
+            .iter()
+            .map(|event| (event.span_id.as_str(), event.revision_number))
             .collect();
 
-        // First prove that every span the patch actually covered still exists
-        // at the exact revision it saw. A revision or removal invalidates the
-        // patch even when unrelated spans were also appended later.
+        // First prove that every span the basis names in its verbatim tail
+        // still exists at the exact revision it saw. A revision or removal
+        // invalidates the basis even when unrelated spans were also appended
+        // later. The summarized-away prefix (if any) is proven below by hash
+        // reconstruction instead — compaction never exposes its identities
+        // for a per-span check.
         for (span_id, basis_revision) in &basis_spans {
             match current_spans.get(*span_id) {
                 Some(current_revision) if current_revision == basis_revision => {}
@@ -944,26 +1229,55 @@ impl TranscriptLedger {
             }
         }
 
-        // Hash exactly the current-ledger subset covered by the basis before
-        // inspecting later appends. Comparing against the full current hash
-        // would misclassify every legitimate append, while skipping this check
-        // would let a forged/corrupt hash through when ids and revisions match.
-        let covered_events: Vec<TranscriptEvent> = projection_events
-            .iter()
-            .filter(|event| basis_spans.contains_key(event.span_id.as_str()))
-            .cloned()
-            .collect();
-        let covered_basis = ProjectionBasis::from_transcript_events(&covered_events);
-
-        if covered_basis.span_revisions.len() != basis.span_revisions.len() {
+        // Prove the reconstructed covered set is exactly the size the basis
+        // recorded before hashing it. A prefix whose verification failed
+        // inside `resolve_covered_events` always shows up here first,
+        // because `resolve_covered_events` drops the whole prefix rather
+        // than return unverified content.
+        if covered_events.len() != basis.covered_span_count() {
             return BasisCurrency::Revised(ProjectionBasisStaleness::CoveredSpanCountMismatch {
-                current_count: covered_basis.span_revisions.len(),
-                basis_count: basis.span_revisions.len(),
+                current_count: covered_events.len(),
+                basis_count: basis.covered_span_count(),
             });
         }
 
-        for (index, (current_span, basis_span)) in covered_basis
-            .span_revisions
+        // Prove the exposed per-span order of the basis's verbatim tail
+        // (`span_revisions`) matches the current ledger's own deterministic
+        // order (ADR-0031 step 3/4's "reordered" check). For a legacy
+        // (uncompacted) basis, `span_revisions` names the WHOLE covered set,
+        // so `tail_ids` below is every covered id and this proves the whole
+        // set's order — exactly the original pre-cfa1 behavior. For a
+        // compacted basis it proves only the exposed tail's order.
+        //
+        // audio-graph-cfa1 (post-adversarial-review fix): this check used to
+        // be skipped ENTIRELY whenever `covered_prefix.is_some()`, silently
+        // narrowing ADR-0031's "reordered ... covered span" detection to
+        // legacy bases only — a hand-corrupted `span_revisions` permutation
+        // on a compacted basis's tail passed undetected, because neither the
+        // per-id `basis_spans` map (order-independent) nor the covered-hash
+        // check below (which canonicalizes by chronological order, not
+        // vector order) is sensitive to on-disk vector order. Filtering to
+        // `tail_ids` (rather than gating the whole block on
+        // `covered_prefix.is_none()`) restores the check uniformly. The
+        // summarized-away prefix still has no exposed per-span order to
+        // compare here: its content — and therefore its order — is proven by
+        // the hash check below instead, and `transcript_events_hash_v1`
+        // canonicalizes by chronological order internally, so a prefix built
+        // from the same event set always hashes identically regardless of
+        // input order. There is no separate "prefix order" fact for a
+        // corrupted vector to misrepresent that the hash wouldn't already
+        // catch as a content change.
+        let tail_ids: std::collections::BTreeSet<&str> = basis_spans.keys().copied().collect();
+        let covered_span_revisions: Vec<ProjectionBasisSpan> =
+            latest_transcript_events(&covered_events)
+                .iter()
+                .filter(|event| tail_ids.contains(event.span_id.as_str()))
+                .map(|event| ProjectionBasisSpan {
+                    span_id: event.span_id.clone(),
+                    revision_number: event.revision_number,
+                })
+                .collect();
+        for (index, (current_span, basis_span)) in covered_span_revisions
             .iter()
             .zip(&basis.span_revisions)
             .enumerate()
@@ -979,9 +1293,19 @@ impl TranscriptLedger {
             }
         }
 
-        if covered_basis.transcript_hash != basis.transcript_hash {
+        // Hash exactly the current-ledger subset covered by the basis before
+        // inspecting later appends. Comparing against the full current hash
+        // would misclassify every legitimate append, while skipping this
+        // check would let a forged/corrupt hash through when ids and
+        // revisions match. `transcript_hash` is always computed over the
+        // WHOLE covered set regardless of how `span_revisions` represents it
+        // (ADR-0042's hash-v1 algorithm never changed), so hashing the
+        // reconstructed set directly is the correct comparison for both a
+        // legacy and a compacted basis.
+        let current_covered_hash = transcript_events_hash_v1(&covered_events);
+        if current_covered_hash != basis.transcript_hash {
             return BasisCurrency::Revised(ProjectionBasisStaleness::TranscriptHashMismatch {
-                current_hash: covered_basis.transcript_hash,
+                current_hash: current_covered_hash,
                 basis_hash: basis.transcript_hash.clone(),
             });
         }
@@ -989,18 +1313,19 @@ impl TranscriptLedger {
         // Preserve legacy bases whose summary boundary field was absent, but
         // reject an explicit boundary that disagrees with the exact covered
         // subset. This check also happens before append-only classification.
+        let covered_summarized_through = summarized_through_revision(&covered_events);
         if let (Some(basis_summarized), Some(covered_summarized)) = (
             basis.summarized_through_revision,
-            covered_basis.summarized_through_revision,
+            covered_summarized_through,
         ) && basis_summarized != covered_summarized
         {
             return BasisCurrency::Revised(ProjectionBasisStaleness::SummaryWindowMismatch {
-                current_summarized_through: covered_basis.summarized_through_revision,
+                current_summarized_through: covered_summarized_through,
                 basis_summarized_through: basis.summarized_through_revision,
             });
         }
 
-        if current_basis.span_revisions.len() == basis.span_revisions.len() {
+        if projection_events.len() == basis.covered_span_count() {
             return BasisCurrency::Current;
         }
 
@@ -1009,10 +1334,9 @@ impl TranscriptLedger {
         // revisions but are intentionally invisible to the projection queue.
         // Keep legacy partial-bearing and empty bases on the full-ledger rule.
         if !basis_tracks_partial
-            && !basis_spans.is_empty()
+            && !covered_ids.is_empty()
             && projection_events.iter().all(|event| {
-                basis_spans.contains_key(event.span_id.as_str())
-                    || !projection_event_is_eligible(event)
+                covered_ids.contains(event.span_id.as_str()) || !projection_event_is_eligible(event)
             })
         {
             return BasisCurrency::Current;
@@ -1023,23 +1347,27 @@ impl TranscriptLedger {
         // id, so its vector position cannot prove audio chronology. Inspect the
         // current events in the same timestamp order used by transcript hashes
         // and rolling windows instead. An uncovered event inside the first N
-        // events is a non-tail insertion, not a harmless append.
+        // events is a non-tail insertion, not a harmless append. Membership is
+        // checked against `covered_ids` (tail + reconstructed prefix), not
+        // just `basis_spans` (tail only) — a compacted basis's covered set is
+        // mostly the (chronologically earliest) prefix.
         let currency_events: Vec<TranscriptEvent> = projection_events
             .iter()
             .filter(|event| {
-                basis_spans.is_empty()
+                covered_ids.is_empty()
                     || basis_tracks_partial
-                    || basis_spans.contains_key(event.span_id.as_str())
+                    || covered_ids.contains(event.span_id.as_str())
                     || projection_event_is_eligible(event)
             })
             .cloned()
             .collect();
         let ordered_current = ordered_for_window(&currency_events);
+        let covered_count = basis.covered_span_count();
         if let Some((_, inserted)) = ordered_current
             .iter()
-            .take(basis_spans.len())
+            .take(covered_count)
             .enumerate()
-            .find(|(_, event)| !basis_spans.contains_key(event.span_id.as_str()))
+            .find(|(_, event)| !covered_ids.contains(event.span_id.as_str()))
         {
             return BasisCurrency::Revised(ProjectionBasisStaleness::MissingCurrentSpan {
                 span_id: inserted.span_id.clone(),
@@ -1047,7 +1375,7 @@ impl TranscriptLedger {
             });
         }
 
-        let extra = ordered_current[basis_spans.len()];
+        let extra = ordered_current[covered_count];
         BasisCurrency::AppendOnlyStale(ProjectionBasisStaleness::MissingCurrentSpan {
             span_id: extra.span_id.clone(),
             current_revision: extra.revision_number,
@@ -1636,7 +1964,15 @@ pub struct MaterializedNote {
     pub tags: Vec<String>,
     pub updated_by_sequence: u64,
     pub updated_at_ms: u64,
-    pub basis: ProjectionBasis,
+    /// Shared, not owned per-note (audio-graph-cfa1): one `ProjectionPatch`
+    /// commonly touches many notes/nodes/edges in a single apply cycle, and
+    /// every touched item used to deep-clone the WHOLE
+    /// [`ProjectionBasis`] (span identities, prefix digest, hash) out of
+    /// `patch.basis` independently. `apply_patch` now clones `patch.basis`
+    /// into one `Arc` once per patch and every mutator clones the `Arc`
+    /// (a refcount bump) instead. Serializes/deserializes byte-identically
+    /// to an owned `ProjectionBasis` (`serde`'s `rc` feature).
+    pub basis: Arc<ProjectionBasis>,
     pub provenance: ProjectionProvenance,
     /// Admitted per-item claim evidence (ADR-0037), re-judged at apply time
     /// via [`resolve_admitted_claim_evidence`] against the SAME basis-covered
@@ -1737,6 +2073,11 @@ impl MaterializedNotes {
         }
 
         let mut next = self.clone();
+        // audio-graph-cfa1: clone `patch.basis` into an `Arc` exactly ONCE
+        // per patch, not once per touched note. A single patch can carry
+        // many `UpsertNote` operations, and every one used to deep-clone the
+        // whole `ProjectionBasis` independently out of `patch.basis`.
+        let basis = Arc::new(patch.basis.clone());
         for operation in &patch.operations {
             match operation {
                 ProjectionOperation::UpsertNote {
@@ -1754,6 +2095,7 @@ impl MaterializedNotes {
                     *heading_level,
                     evidence,
                     evidence_basis,
+                    &basis,
                     patch,
                 ),
                 // InvalidateNote is applied identically to DeleteNote today:
@@ -1803,6 +2145,7 @@ impl MaterializedNotes {
         heading_level: Option<u8>,
         evidence: &crate::claim_evidence::EvidenceAnchor,
         evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) {
         let next = MaterializedNote {
@@ -1813,7 +2156,7 @@ impl MaterializedNotes {
             heading_level,
             updated_by_sequence: patch.sequence,
             updated_at_ms: patch.created_at_ms,
-            basis: patch.basis.clone(),
+            basis: Arc::clone(basis),
             provenance: patch.provenance.clone(),
             evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
@@ -1870,7 +2213,9 @@ pub struct MaterializedGraphNode {
     pub valid_until_ms: Option<u64>,
     pub updated_by_sequence: u64,
     pub updated_at_ms: u64,
-    pub basis: ProjectionBasis,
+    /// See [`MaterializedNote::basis`] — shared across every node/edge one
+    /// apply cycle touches instead of deep-cloned per item.
+    pub basis: Arc<ProjectionBasis>,
     pub provenance: ProjectionProvenance,
     /// See [`MaterializedNote::evidence`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1915,7 +2260,9 @@ pub struct MaterializedGraphEdge {
     pub valid_until_ms: Option<u64>,
     pub updated_by_sequence: u64,
     pub updated_at_ms: u64,
-    pub basis: ProjectionBasis,
+    /// See [`MaterializedNote::basis`] — shared across every node/edge one
+    /// apply cycle touches instead of deep-cloned per item.
+    pub basis: Arc<ProjectionBasis>,
     pub provenance: ProjectionProvenance,
     /// See [`MaterializedNote::evidence`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2036,6 +2383,11 @@ impl MaterializedGraph {
         // literally own the raw id). Local to one `apply_patch` call, never
         // stored on `self`.
         let mut id_overrides: BTreeMap<String, String> = BTreeMap::new();
+        // audio-graph-cfa1: clone `patch.basis` into an `Arc` exactly ONCE
+        // per patch, not once per touched node/edge. A single patch can
+        // touch many nodes and edges, and every one used to deep-clone the
+        // whole `ProjectionBasis` independently out of `patch.basis`.
+        let basis = Arc::new(patch.basis.clone());
 
         for operation in &patch.operations {
             match operation {
@@ -2053,6 +2405,7 @@ impl MaterializedGraph {
                         description.clone(),
                         evidence,
                         evidence_basis,
+                        &basis,
                         patch,
                     );
                     if final_id != *id {
@@ -2077,7 +2430,7 @@ impl MaterializedGraph {
                 }
                 ProjectionOperation::InvalidateGraphNode { id } => {
                     let id = resolve_graph_node_id(&next, &id_overrides, id);
-                    next.invalidate_node(&id, patch)?;
+                    next.invalidate_node(&id, &basis, patch)?;
                 }
                 ProjectionOperation::UpsertGraphEdge {
                     id,
@@ -2111,6 +2464,7 @@ impl MaterializedGraph {
                         *weight,
                         evidence,
                         evidence_basis,
+                        &basis,
                         patch,
                     );
                 }
@@ -2118,13 +2472,25 @@ impl MaterializedGraph {
                     next.edges.retain(|edge| edge.id != *id);
                 }
                 ProjectionOperation::InvalidateGraphEdge { id } => {
-                    next.invalidate_edge(id, patch)?;
+                    next.invalidate_edge(id, &basis, patch)?;
                 }
                 ProjectionOperation::StrengthenGraphEdge { id, weight_delta } => {
-                    next.adjust_edge_weight("strengthen_graph_edge", id, *weight_delta, patch)?;
+                    next.adjust_edge_weight(
+                        "strengthen_graph_edge",
+                        id,
+                        *weight_delta,
+                        &basis,
+                        patch,
+                    )?;
                 }
                 ProjectionOperation::WeakenGraphEdge { id, weight_delta } => {
-                    next.adjust_edge_weight("weaken_graph_edge", id, -*weight_delta, patch)?;
+                    next.adjust_edge_weight(
+                        "weaken_graph_edge",
+                        id,
+                        -*weight_delta,
+                        &basis,
+                        patch,
+                    )?;
                 }
                 ProjectionOperation::MergeGraphNodes {
                     source_id,
@@ -2147,7 +2513,7 @@ impl MaterializedGraph {
                     // `applyProjectionGraphPatch`'s existing
                     // `sourceId === targetId` no-op guard.
                     if source_id != target_id {
-                        next.merge_nodes(&source_id, &target_id, patch)?;
+                        next.merge_nodes(&source_id, &target_id, &basis, patch)?;
                     }
                 }
                 ProjectionOperation::SplitGraphNode {
@@ -2155,7 +2521,7 @@ impl MaterializedGraph {
                     replacement_nodes,
                 } => {
                     let id = resolve_graph_node_id(&next, &id_overrides, id);
-                    next.split_node(&id, replacement_nodes, patch)?;
+                    next.split_node(&id, replacement_nodes, &basis, patch)?;
                 }
                 ProjectionOperation::UpsertNote { .. }
                 | ProjectionOperation::DeleteNote { .. }
@@ -2249,6 +2615,7 @@ impl MaterializedGraph {
         description: Option<String>,
         evidence: &crate::claim_evidence::EvidenceAnchor,
         evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> String {
         let same_id_match = self
@@ -2278,7 +2645,7 @@ impl MaterializedGraph {
             valid_until_ms: None,
             updated_by_sequence: patch.sequence,
             updated_at_ms: patch.created_at_ms,
-            basis: patch.basis.clone(),
+            basis: Arc::clone(basis),
             provenance: patch.provenance.clone(),
             evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
@@ -2325,6 +2692,7 @@ impl MaterializedGraph {
         weight: f32,
         evidence: &crate::claim_evidence::EvidenceAnchor,
         evidence_basis: Option<&BTreeMap<&str, &TranscriptEvent>>,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) {
         let next = MaterializedGraphEdge {
@@ -2339,7 +2707,7 @@ impl MaterializedGraph {
             valid_until_ms: None,
             updated_by_sequence: patch.sequence,
             updated_at_ms: patch.created_at_ms,
-            basis: patch.basis.clone(),
+            basis: Arc::clone(basis),
             provenance: patch.provenance.clone(),
             evidence: resolve_admitted_claim_evidence(evidence, evidence_basis),
         };
@@ -2354,6 +2722,7 @@ impl MaterializedGraph {
     fn invalidate_node(
         &mut self,
         id: &str,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> Result<(), ProjectionApplyError> {
         let Some(index) = self.active_node_index(id) else {
@@ -2363,11 +2732,11 @@ impl MaterializedGraph {
             });
         };
 
-        self.invalidate_node_at(index, patch);
+        self.invalidate_node_at(index, basis, patch);
         for edge_index in 0..self.edges.len() {
             let edge = &self.edges[edge_index];
             if edge.valid_until_ms.is_none() && (edge.source == id || edge.target == id) {
-                self.invalidate_edge_at(edge_index, patch);
+                self.invalidate_edge_at(edge_index, basis, patch);
             }
         }
         Ok(())
@@ -2376,6 +2745,7 @@ impl MaterializedGraph {
     fn invalidate_edge(
         &mut self,
         id: &str,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> Result<(), ProjectionApplyError> {
         let Some(index) = self.active_edge_index(id) else {
@@ -2385,7 +2755,7 @@ impl MaterializedGraph {
             });
         };
 
-        self.invalidate_edge_at(index, patch);
+        self.invalidate_edge_at(index, basis, patch);
         Ok(())
     }
 
@@ -2394,6 +2764,7 @@ impl MaterializedGraph {
         operation: &'static str,
         id: &str,
         weight_delta: f32,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> Result<(), ProjectionApplyError> {
         if !weight_delta.is_finite() || !(-1.0..=1.0).contains(&weight_delta) {
@@ -2415,7 +2786,7 @@ impl MaterializedGraph {
         edge.confidence = patch.confidence;
         edge.updated_by_sequence = patch.sequence;
         edge.updated_at_ms = patch.created_at_ms;
-        edge.basis = patch.basis.clone();
+        edge.basis = Arc::clone(basis);
         edge.provenance = patch.provenance.clone();
         Ok(())
     }
@@ -2424,6 +2795,7 @@ impl MaterializedGraph {
         &mut self,
         source_id: &str,
         target_id: &str,
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> Result<(), ProjectionApplyError> {
         if source_id == target_id {
@@ -2445,7 +2817,7 @@ impl MaterializedGraph {
             });
         }
 
-        self.invalidate_node_at(source_index, patch);
+        self.invalidate_node_at(source_index, basis, patch);
         for edge_index in 0..self.edges.len() {
             let edge = &mut self.edges[edge_index];
             if edge.valid_until_ms.is_some() {
@@ -2458,17 +2830,17 @@ impl MaterializedGraph {
                 edge.target = target_id.to_string();
             }
             if edge.source == edge.target {
-                self.invalidate_edge_at(edge_index, patch);
+                self.invalidate_edge_at(edge_index, basis, patch);
             } else if self.edges[edge_index].source == target_id
                 || self.edges[edge_index].target == target_id
             {
                 self.edges[edge_index].updated_by_sequence = patch.sequence;
                 self.edges[edge_index].updated_at_ms = patch.created_at_ms;
-                self.edges[edge_index].basis = patch.basis.clone();
+                self.edges[edge_index].basis = Arc::clone(basis);
                 self.edges[edge_index].provenance = patch.provenance.clone();
             }
         }
-        self.invalidate_duplicate_active_edges(patch);
+        self.invalidate_duplicate_active_edges(basis, patch);
         Ok(())
     }
 
@@ -2476,6 +2848,7 @@ impl MaterializedGraph {
         &mut self,
         id: &str,
         replacement_nodes: &[GraphNodeDraft],
+        basis: &Arc<ProjectionBasis>,
         patch: &ProjectionPatch,
     ) -> Result<(), ProjectionApplyError> {
         if replacement_nodes.len() < 2 {
@@ -2500,11 +2873,11 @@ impl MaterializedGraph {
             });
         };
 
-        self.invalidate_node_at(index, patch);
+        self.invalidate_node_at(index, basis, patch);
         for edge_index in 0..self.edges.len() {
             let edge = &self.edges[edge_index];
             if edge.valid_until_ms.is_none() && (edge.source == id || edge.target == id) {
-                self.invalidate_edge_at(edge_index, patch);
+                self.invalidate_edge_at(edge_index, basis, patch);
             }
         }
         // `SplitGraphNode`'s synthesized replacement nodes carry no evidence
@@ -2522,6 +2895,7 @@ impl MaterializedGraph {
                 replacement.description.clone(),
                 &crate::claim_evidence::EvidenceAnchor::default(),
                 None,
+                basis,
                 patch,
             );
         }
@@ -2540,27 +2914,41 @@ impl MaterializedGraph {
             .position(|edge| edge.id == id && edge.valid_until_ms.is_none())
     }
 
-    fn invalidate_node_at(&mut self, index: usize, patch: &ProjectionPatch) {
+    fn invalidate_node_at(
+        &mut self,
+        index: usize,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) {
         let node = &mut self.nodes[index];
         node.valid_until_ms = Some(patch.created_at_ms);
         node.confidence = patch.confidence;
         node.updated_by_sequence = patch.sequence;
         node.updated_at_ms = patch.created_at_ms;
-        node.basis = patch.basis.clone();
+        node.basis = Arc::clone(basis);
         node.provenance = patch.provenance.clone();
     }
 
-    fn invalidate_edge_at(&mut self, index: usize, patch: &ProjectionPatch) {
+    fn invalidate_edge_at(
+        &mut self,
+        index: usize,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) {
         let edge = &mut self.edges[index];
         edge.valid_until_ms = Some(patch.created_at_ms);
         edge.confidence = patch.confidence;
         edge.updated_by_sequence = patch.sequence;
         edge.updated_at_ms = patch.created_at_ms;
-        edge.basis = patch.basis.clone();
+        edge.basis = Arc::clone(basis);
         edge.provenance = patch.provenance.clone();
     }
 
-    fn invalidate_duplicate_active_edges(&mut self, patch: &ProjectionPatch) {
+    fn invalidate_duplicate_active_edges(
+        &mut self,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) {
         let mut winners: BTreeMap<(String, String, String), usize> = BTreeMap::new();
         for edge_index in 0..self.edges.len() {
             if self.edges[edge_index].valid_until_ms.is_some() {
@@ -2583,9 +2971,9 @@ impl MaterializedGraph {
                     .max(self.edges[edge_index].confidence);
                 self.edges[winner_index].updated_by_sequence = patch.sequence;
                 self.edges[winner_index].updated_at_ms = patch.created_at_ms;
-                self.edges[winner_index].basis = patch.basis.clone();
+                self.edges[winner_index].basis = Arc::clone(basis);
                 self.edges[winner_index].provenance = patch.provenance.clone();
-                self.invalidate_edge_at(edge_index, patch);
+                self.invalidate_edge_at(edge_index, basis, patch);
             } else {
                 winners.insert(key, edge_index);
             }
@@ -3060,35 +3448,32 @@ pub(crate) fn resolve_claim_evidence_basis_events(
     ledger: &TranscriptLedger,
     speaker_timeline: Option<&SpeakerTimeline>,
 ) -> Vec<TranscriptEvent> {
-    let latest_by_span: BTreeMap<(&str, u64), &TranscriptEvent> = ledger
-        .latest_spans
-        .iter()
-        .map(|event| ((event.span_id.as_str(), event.revision_number), event))
-        .collect();
     let attribution = speaker_timeline.map(crate::timeline::speaker_attribution_index);
 
+    // audio-graph-cfa1: resolve the basis's FULL covered set (verbatim tail
+    // plus, when compacted, the reconstructed-and-verified summarized
+    // prefix) rather than only the exact-identity tail lookup this used to
+    // do directly against `patch_basis.span_revisions`. An evidence anchor
+    // can legitimately point at a span the rolling summary folded away —
+    // `resolve_covered_events` is the one place that reconstruction is
+    // allowed to happen, so evidence for older covered content keeps
+    // resolving instead of silently downgrading to unsatisfied once a
+    // session outgrows the hot window.
     patch_basis
-        .span_revisions
-        .iter()
-        .filter_map(|span| {
-            latest_by_span
-                .get(&(span.span_id.as_str(), span.revision_number))
-                .map(|event| {
-                    let mut event = (*event).clone();
-                    if let Some(attribution) = attribution.as_ref() {
-                        let keys = crate::timeline::candidate_keys(
-                            event.transcript_segment_id.as_deref(),
-                            event.span_id.as_str(),
-                        );
-                        if let Some(winner) =
-                            keys.iter().find_map(|key| attribution.get(key.as_str()))
-                        {
-                            event.speaker_id = winner.speaker_id.clone();
-                            event.speaker_label = winner.speaker_label.clone();
-                        }
-                    }
-                    event
-                })
+        .resolve_covered_events(&ledger.latest_spans)
+        .into_iter()
+        .map(|mut event| {
+            if let Some(attribution) = attribution.as_ref() {
+                let keys = crate::timeline::candidate_keys(
+                    event.transcript_segment_id.as_deref(),
+                    event.span_id.as_str(),
+                );
+                if let Some(winner) = keys.iter().find_map(|key| attribution.get(key.as_str())) {
+                    event.speaker_id = winner.speaker_id.clone();
+                    event.speaker_label = winner.speaker_label.clone();
+                }
+            }
+            event
         })
         .collect()
 }
@@ -3840,6 +4225,228 @@ mod tests {
         assert_eq!(inserted_ledger.validate_basis(&prefix_basis), Err(non_tail));
     }
 
+    /// audio-graph-cfa1 (post-adversarial-review fix): before this fix,
+    /// `classify_basis_currency`'s `CoveredSpanOrderMismatch` check was
+    /// skipped ENTIRELY whenever `basis.covered_prefix.is_some()`, so a
+    /// hand-corrupted permutation of a COMPACTED basis's tail
+    /// `span_revisions` vector (same identities/revisions, different
+    /// positions) passed classification undetected — neither the per-id
+    /// `basis_spans` map (order-independent) nor the whole-covered-set
+    /// `transcript_hash` check (which canonicalizes by chronological order,
+    /// not vector order) is sensitive to on-disk vector order. This pins the
+    /// fix: the order check now runs against the exposed tail
+    /// unconditionally, mirroring
+    /// `basis_currency_rejects_deletion_reorder_and_non_tail_insertion`'s
+    /// legacy-basis reorder coverage above for the compacted case.
+    #[test]
+    fn basis_currency_rejects_a_reordered_tail_even_when_the_basis_is_compacted() {
+        let events: Vec<TranscriptEvent> = (0..(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 2))
+            .map(|i| {
+                let mut event = TranscriptEvent::from(asr_payload(&format!("span-{i}"), 1, "turn"));
+                event.start_time = i as f64;
+                event.end_time = i as f64 + 0.5;
+                event
+            })
+            .collect();
+        let ledger = TranscriptLedger::replay("session-1", events).expect("ledger replay");
+        let basis = ledger.current_basis();
+        assert!(
+            basis.covered_prefix.is_some(),
+            "session must exceed the hot window for this test to exercise the compacted path"
+        );
+        assert!(
+            basis.span_revisions.len() >= 2,
+            "the verbatim tail must have at least two entries to permute"
+        );
+
+        let mut reordered = basis.clone();
+        reordered.span_revisions.swap(0, 1);
+        match ledger.classify_basis_currency(&reordered, None) {
+            BasisCurrency::Revised(ProjectionBasisStaleness::CoveredSpanOrderMismatch {
+                ..
+            }) => {}
+            other => panic!(
+                "expected CoveredSpanOrderMismatch for a reordered compacted-basis tail, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// audio-graph-cfa1: a compacted basis exposes its summarized-away
+    /// prefix only as a `(span_count, content_hash)` digest. This proves the
+    /// fix above doesn't quietly weaken detection of a revision or deletion
+    /// INSIDE that prefix (as opposed to the tail, covered by the test
+    /// above): both must still classify `Revised`, whether via
+    /// `reconstruct_verified_covered_prefix`'s digest check dropping the
+    /// unverifiable prefix (surfacing as `CoveredSpanCountMismatch`) or, if
+    /// that inner layer were ever bypassed, the outer whole-covered-set
+    /// `transcript_hash` check (`TranscriptHashMismatch`) —
+    /// `reconstruct_verified_covered_prefix_rejects_a_content_mismatch`
+    /// below pins that inner layer directly. Never `Current` or
+    /// `AppendOnlyStale`.
+    #[test]
+    fn basis_currency_rejects_revision_and_deletion_inside_a_compacted_prefix() {
+        fn build_events() -> Vec<TranscriptEvent> {
+            (0..(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 2))
+                .map(|i| {
+                    let mut event =
+                        TranscriptEvent::from(asr_payload(&format!("span-{i}"), 1, "turn"));
+                    event.start_time = i as f64;
+                    event.end_time = i as f64 + 0.5;
+                    event
+                })
+                .collect()
+        }
+        let baseline_ledger =
+            TranscriptLedger::replay("session-1", build_events()).expect("baseline ledger");
+        let basis = baseline_ledger.current_basis();
+        assert!(
+            basis.covered_prefix.is_some(),
+            "session must exceed the hot window for this test to exercise the compacted path"
+        );
+
+        // `span-0` sits chronologically first — well inside the summarized
+        // prefix, since the tail is only the last `ROLLING_SUMMARY_HOT_WINDOW_TURNS`
+        // spans.
+        let mut revised_events = build_events();
+        revised_events[0] = {
+            let mut event = TranscriptEvent::from(asr_payload("span-0", 2, "turn, revised"));
+            event.start_time = 0.0;
+            event.end_time = 0.5;
+            event
+        };
+        let revised_ledger =
+            TranscriptLedger::replay("session-1", revised_events).expect("revised ledger");
+        assert!(
+            matches!(
+                revised_ledger.classify_basis_currency(&basis, None),
+                BasisCurrency::Revised(_)
+            ),
+            "revising a span folded into the summarized prefix must still classify Revised"
+        );
+
+        let mut deleted_events = build_events();
+        deleted_events.remove(0);
+        let deleted_ledger = TranscriptLedger::replay("session-1", deleted_events)
+            .expect("ledger missing a prefix span");
+        assert!(
+            matches!(
+                deleted_ledger.classify_basis_currency(&basis, None),
+                BasisCurrency::Revised(_)
+            ),
+            "deleting a span folded into the summarized prefix must still classify Revised"
+        );
+    }
+
+    /// audio-graph-cfa1 (post-adversarial-review fix): direct pin of the
+    /// digest-verification layer itself, independent of the outer
+    /// whole-covered-set `transcript_hash` check
+    /// `classify_basis_currency` also runs. A mutation probe that replaced
+    /// this comparison with an unconditional `Some(reconstructed)` passed
+    /// the full test suite before this test existed, because the outer hash
+    /// check alone still happens to catch a revision — this test pins the
+    /// inner layer directly so that defense-in-depth stays real rather than
+    /// just accidentally true.
+    #[test]
+    fn reconstruct_verified_covered_prefix_rejects_a_content_mismatch() {
+        let mut span_a = TranscriptEvent::from(asr_payload("span-a", 1, "prefix text a"));
+        span_a.start_time = 0.0;
+        span_a.end_time = 0.5;
+        let mut span_b = TranscriptEvent::from(asr_payload("span-b", 1, "prefix text b"));
+        span_b.start_time = 1.0;
+        span_b.end_time = 1.5;
+        let candidates = vec![span_a.clone(), span_b.clone()];
+        let tail_ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+        let genuine_digest = CoveredPrefixDigest {
+            span_count: 2,
+            content_hash: transcript_events_hash_v1(&[span_a.clone(), span_b.clone()]),
+        };
+        assert_eq!(
+            reconstruct_verified_covered_prefix(&candidates, &tail_ids, &genuine_digest),
+            Some(vec![span_a.clone(), span_b.clone()])
+        );
+
+        let mut tampered_span_a = span_a.clone();
+        tampered_span_a.text = "tampered".to_string();
+        let tampered_candidates = vec![tampered_span_a, span_b.clone()];
+        assert_eq!(
+            reconstruct_verified_covered_prefix(&tampered_candidates, &tail_ids, &genuine_digest),
+            None,
+            "a content mismatch inside the prefix must be rejected, never returned as if verified"
+        );
+
+        let short_digest = CoveredPrefixDigest {
+            span_count: 5,
+            content_hash: genuine_digest.content_hash.clone(),
+        };
+        assert_eq!(
+            reconstruct_verified_covered_prefix(&candidates, &tail_ids, &short_digest),
+            None,
+            "fewer eligible candidates than the digest's recorded span_count must be rejected, \
+             never returned as a partial/unverified set"
+        );
+    }
+
+    /// audio-graph-cfa1: `TranscriptLedger::current_basis` (used by the
+    /// live-assist approval path, `commands.rs`'s
+    /// `approved_agent_projection_patch`) includes partial/ineligible events,
+    /// unlike `current_projection_basis`'s eligible-only view.
+    /// `resolve_covered_events` tries the eligibility-filtered candidate
+    /// universe FIRST and falls back to the raw ledger only when that
+    /// fails — this pins the fallback branch against the one basis shape
+    /// that actually needs it (contra a prior review pass's belief that
+    /// `current_basis` had no production caller; `approve_agent_proposal`
+    /// is a live `#[tauri::command]`).
+    #[test]
+    fn resolve_covered_events_falls_back_to_the_full_ledger_when_a_partial_lives_in_the_summarized_prefix()
+     {
+        let mut ledger = TranscriptLedger::new("session-1");
+        let mut partial = TranscriptEvent::from(asr_payload("span-0", 1, "still forming"));
+        partial.start_time = 0.0;
+        partial.end_time = 0.5;
+        ledger.apply_event(partial).expect("partial span accepted");
+
+        for i in 1..=(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 2) {
+            let mut event =
+                TranscriptEvent::from(asr_payload(&format!("span-{i}"), 2, "final turn"));
+            event.start_time = i as f64;
+            event.end_time = i as f64 + 0.5;
+            ledger.apply_event(event).expect("final span accepted");
+        }
+
+        let basis = ledger.current_basis();
+        assert!(
+            basis.covered_prefix.is_some(),
+            "session must exceed the hot window for this test to exercise the compacted path"
+        );
+
+        let eligible_only_count = ledger
+            .latest_spans
+            .iter()
+            .filter(|event| projection_event_is_eligible(event))
+            .count();
+        assert!(
+            eligible_only_count < basis.covered_span_count(),
+            "the eligibility-filtered candidate universe must be short by exactly the partial \
+             span for this test to genuinely exercise resolve_covered_events' all-events \
+             fallback, not just have its first attempt succeed anyway"
+        );
+
+        let covered = basis.resolve_covered_events(&ledger.latest_spans);
+        assert_eq!(
+            covered.len(),
+            basis.covered_span_count(),
+            "resolve_covered_events must recover the partial-bearing prefix via its all-events \
+             fallback rather than silently dropping it because the eligible-only attempt alone \
+             cannot reproduce it"
+        );
+        assert!(
+            covered.iter().any(|event| event.span_id == "span-0"),
+            "the partial event folded into the summarized prefix must still resolve"
+        );
+    }
+
     #[test]
     fn append_only_uses_audio_chronology_not_span_id_sort_order() {
         let mut first = TranscriptEvent::from(asr_payload("span-z", 1, "first"));
@@ -4093,7 +4700,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["final transcript"; fixtures.len()]
         );
-        assert_eq!(ledger.current_basis().span_revisions.len(), fixtures.len());
+        // audio-graph-cfa1: 8 covered spans is past `ROLLING_SUMMARY_HOT_WINDOW_TURNS`
+        // (6), so `span_revisions` alone (the verbatim tail) no longer names
+        // every covered span — `covered_span_count()` is the compaction-aware
+        // total (tail + summarized prefix) that still equals `fixtures.len()`.
+        let basis = ledger.current_basis();
+        assert_eq!(basis.covered_span_count(), fixtures.len());
+
+        // audio-graph-cfa1 (post-adversarial-review fix): pin the exact
+        // tail/prefix SPLIT, not just the total. A `hot_window_len`/
+        // `prefix_len` off-by-one in the constructor would leave
+        // `covered_span_count()` unchanged (both sides still sum to the same
+        // total) but would leave one extra or missing span exposed in the
+        // verbatim tail versus opaque in the prefix — invisible to every
+        // other assertion in this test.
+        let prefix = basis
+            .covered_prefix
+            .as_ref()
+            .expect("8 covered spans must exceed the hot window and produce a prefix");
+        assert_eq!(
+            basis.span_revisions.len(),
+            ROLLING_SUMMARY_HOT_WINDOW_TURNS,
+            "the verbatim tail must be exactly the hot window size once the covered set exceeds \
+             it"
+        );
+        assert_eq!(
+            prefix.span_count,
+            fixtures.len() - ROLLING_SUMMARY_HOT_WINDOW_TURNS,
+            "the summarized prefix must carry exactly the spans NOT in the verbatim tail"
+        );
     }
 
     #[test]
@@ -4141,6 +4776,7 @@ mod tests {
 
         let missing_current_span = ProjectionBasis {
             span_revisions: Vec::new(),
+            covered_prefix: None,
             diarization_span_revisions: Vec::new(),
             transcript_hash: ProjectionBasis::from_transcript_events(&[]).transcript_hash,
             summarized_through_revision: None,
@@ -4211,9 +4847,20 @@ mod tests {
         );
 
         // A pre-18ee persisted patch: same spans + hash, but the field is
-        // absent on disk → deserializes to None.
+        // absent on disk → deserializes to None. `span_revisions` here must
+        // be the FULL covered set (audio-graph-cfa1 predates compaction too:
+        // a genuine legacy record never had a `covered_prefix`, so it named
+        // every covered span individually) — `current_basis.span_revisions`
+        // alone is now only the compacted tail and would silently mismatch
+        // `current_basis.transcript_hash`, which still covers everything.
         let legacy_json = serde_json::json!({
-            "span_revisions": current_basis.span_revisions,
+            "span_revisions": latest_transcript_events(&ledger.latest_spans)
+                .iter()
+                .map(|event| ProjectionBasisSpan {
+                    span_id: event.span_id.clone(),
+                    revision_number: event.revision_number,
+                })
+                .collect::<Vec<_>>(),
             "diarization_span_revisions": [],
             "transcript_hash": current_basis.transcript_hash,
         });
@@ -4301,6 +4948,7 @@ mod tests {
                     span_id: "span-1".to_string(),
                     revision_number: 1,
                 }],
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "fnv1a64:000000".to_string(),
                 summarized_through_revision: None,
@@ -4365,6 +5013,66 @@ mod tests {
         assert!(!debug.contains("SECRET RELATION"));
         assert!(!debug.contains("SECRET LABEL"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    /// audio-graph-cfa1 deliverable (c): the two production `log::debug!`
+    /// sites that reach a `ProjectionBasis` (`speech/mod.rs`'s
+    /// `observe_asr_revision`, via `ProjectionSchedulersObservation`, and the
+    /// scheduler-completion log, via `ProjectionSchedulerDecision::StartJob`)
+    /// must never dump the full span-revision vector or prefix digest
+    /// content — that pattern was 95% of a 46MB field log, single lines up
+    /// to 80KB. Neither log site has ANY bespoke redaction code; both derive
+    /// `Debug` on `ProjectionJob`/`ProjectionSchedulerDecision` and recurse
+    /// into `ProjectionBasis`'s own manual `Debug` impl for free.
+    #[test]
+    fn projection_basis_debug_stays_bounded_and_never_dumps_span_identities_or_prefix_digest() {
+        let many_span_revisions: Vec<ProjectionBasisSpan> = (0..50)
+            .map(|i| ProjectionBasisSpan {
+                span_id: format!("span-id-that-should-never-appear-in-a-debug-log-{i}"),
+                revision_number: i,
+            })
+            .collect();
+        let basis = ProjectionBasis {
+            span_revisions: many_span_revisions,
+            covered_prefix: Some(CoveredPrefixDigest {
+                span_count: 927,
+                content_hash: "fnv1a64:deadbeefcafef00d".to_string(),
+            }),
+            diarization_span_revisions: Vec::new(),
+            transcript_hash: "fnv1a64:0123456789abcdef".to_string(),
+            summarized_through_revision: Some(12),
+        };
+
+        let debug = format!("{basis:?}");
+        assert!(
+            !debug.contains("span-id-that-should-never-appear-in-a-debug-log"),
+            "Debug output must never contain a raw span identity: {debug}"
+        );
+        assert!(
+            debug.len() < 400,
+            "Debug output should stay small and constant-sized regardless of how many spans \
+             this basis covers, got {} bytes: {debug}",
+            debug.len()
+        );
+        assert!(debug.contains("span_revisions_count"));
+        assert!(debug.contains("50"));
+        assert!(debug.contains("927"));
+        assert!(debug.contains("12"));
+
+        let job = ProjectionJob {
+            id: "projection:session-1:notes:1".to_string(),
+            session_id: "session-1".to_string(),
+            kind: ProjectionKind::Notes,
+            basis: basis.clone(),
+            priority: ProjectionPriority::Realtime,
+            queued_at_ms: 10,
+        };
+        let job_debug = format!("{job:?}");
+        assert!(!job_debug.contains("span-id-that-should-never-appear-in-a-debug-log"));
+
+        let decision = crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { job };
+        let decision_debug = format!("{decision:?}");
+        assert!(!decision_debug.contains("span-id-that-should-never-appear-in-a-debug-log"));
     }
 
     #[test]
@@ -8060,6 +8768,295 @@ mod tests {
                 span_id: "d-span-ghost".to_string(),
                 basis_revision: 1,
             })
+        );
+    }
+
+    /// audio-graph-cfa1 (P1 FATAL, field session d97bfcc3): before this
+    /// ticket, `ProjectionBasis::span_revisions` carried every covered span
+    /// individually forever — one field node accumulated 933 entries despite
+    /// `summarized_through_revision: 12`, and growth was
+    /// O(items touched × live spans), superlinear per session hour. This
+    /// drives a synthetic session well past `ROLLING_SUMMARY_HOT_WINDOW_TURNS`,
+    /// repeatedly re-touching the SAME small set of facts (mirroring the
+    /// field pattern of one entity revised on nearly every tick), and proves
+    /// the persisted per-item basis size stays bounded regardless of how
+    /// long the session has run.
+    ///
+    /// Mutation-proof: if `ProjectionBasis`'s constructor stops folding the
+    /// covered-but-summarized prefix into `covered_prefix` (compaction
+    /// disabled — every covered span once again listed individually in
+    /// `span_revisions`), the bounded-size assertion below fails, and the
+    /// closing cross-check against a manually-constructed uncompacted
+    /// equivalent basis fails too.
+    ///
+    /// Deliberately measures the touched item's `basis` field alone, not
+    /// `serde_json::to_vec(&graph)`: the field evidence and this ticket's
+    /// deliverables are about `ProjectionBasis`'s own unbounded growth
+    /// (78% of the field artifact's bytes), and `TOUCHED_FACTS` fixes the
+    /// node count here, so a whole-graph byte bound would pass trivially
+    /// regardless of whether per-item compaction works. This does NOT pin
+    /// `Arc<ProjectionBasis>` sharing across items one patch touches
+    /// (deliverable (d)): serde's `rc` feature serializes the pointee per
+    /// item, so sharing vs. independent deep clones is byte-identical on
+    /// the wire — see
+    /// `apply_patch_shares_one_basis_arc_across_every_touched_note_and_graph_item`
+    /// for that separate, `Arc::ptr_eq`-based pin.
+    #[test]
+    fn materialized_artifact_basis_size_stays_bounded_as_a_long_session_grows_past_the_hot_window()
+    {
+        let mut ledger = TranscriptLedger::new("session-cfa1-size-regression");
+        let mut graph = MaterializedGraph::new("session-cfa1-size-regression");
+        const TOUCHED_FACTS: u64 = 5;
+        const TICKS: u64 = 80;
+        let mut per_tick_basis_bytes: Vec<usize> = Vec::new();
+
+        for tick in 0..TICKS {
+            // A new final transcript span arrives every tick —
+            // `summarized_through_revision` keeps advancing once the ledger
+            // outgrows the hot window.
+            let span_id = format!("span-{tick}");
+            ledger
+                .apply_event(TranscriptEvent::from(provider_payload(
+                    "openrouter",
+                    "system-default",
+                    &span_id,
+                    None,
+                    tick + 1,
+                    "hello from the field session",
+                    true,
+                )))
+                .expect("final span accepted");
+
+            let basis = ledger.current_projection_basis();
+            // Touch the SAME small set of facts over and over — the exact
+            // field pattern (one node revised on nearly every tick).
+            let fact_id = format!("fact-{}", tick % TOUCHED_FACTS);
+            let patch = ProjectionPatch {
+                route: None,
+                sequence: tick + 1,
+                kind: ProjectionKind::Graph,
+                llm_request_id: format!("llm-graph-req-{tick}"),
+                basis,
+                // Distinct name per fact (not a shared "Repeatedly touched
+                // fact" name) so `MaterializedGraph::upsert_node`'s
+                // fuzzy-name/entity_type tier-2 matching cannot merge these
+                // 5 distinct facts into one node — each id keeps its own row.
+                operations: vec![ProjectionOperation::UpsertGraphNode {
+                    id: fact_id.clone(),
+                    name: format!("Repeatedly touched fact {}", tick % TOUCHED_FACTS),
+                    entity_type: "fact".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                }],
+                confidence: 0.9,
+                provenance: ProjectionProvenance {
+                    provider: "openrouter".to_string(),
+                    model: "anthropic/claude-sonnet-4".to_string(),
+                    prompt_id: "graph-v1".to_string(),
+                    route_id: None,
+                    model_source: crate::llm::route::ModelIdentitySource::Requested,
+                },
+                queued_at_ms: None,
+                generation_latency_ms: None,
+                apply_latency_ms: None,
+                basis_currency_at_apply: None,
+                created_at_ms: 1_700_000_000_000 + tick,
+            };
+            graph
+                .apply_patch(&patch, None)
+                .expect("graph patch applies");
+
+            let touched = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == fact_id)
+                .expect("touched node exists");
+            let bytes = serde_json::to_vec(&touched.basis)
+                .expect("basis serializes")
+                .len();
+            per_tick_basis_bytes.push(bytes);
+        }
+
+        // Deliverable (a): once the ledger has outgrown the hot window,
+        // every subsequent per-item basis stays SMALL and CONSTANT — not
+        // proportional to how many ticks have elapsed. Compare the last ten
+        // ticks (deep past the hot window) against a small fixed ceiling.
+        let late_window = &per_tick_basis_bytes[per_tick_basis_bytes.len() - 10..];
+        let max_late = *late_window.iter().max().unwrap();
+        let min_late = *late_window.iter().min().unwrap();
+        assert!(
+            max_late < 700,
+            "compacted per-item basis size should stay small and bounded regardless of \
+             session length, got {max_late} bytes for a basis built {TICKS} ticks into the \
+             session — span_revisions is no longer being truncated at \
+             summarized_through_revision"
+        );
+        assert_eq!(
+            max_late, min_late,
+            "once past the hot window every per-item basis should serialize to the SAME \
+             bounded size (fixed tail length + fixed-shape digest), not grow with tick count"
+        );
+
+        // Mutation-proof cross-check: reconstruct what the FINAL basis would
+        // have serialized to WITHOUT compaction (every covered span named
+        // individually in `span_revisions`, `covered_prefix: None`) and
+        // prove the actual, compacted artifact is dramatically smaller. If
+        // compaction is ever disabled, the actual basis converges to this
+        // uncompacted shape and this assertion fails.
+        let uncompacted_equivalent = ProjectionBasis {
+            span_revisions: (0..TICKS)
+                .map(|tick| ProjectionBasisSpan {
+                    span_id: format!("span-{tick}"),
+                    revision_number: tick + 1,
+                })
+                .collect(),
+            covered_prefix: None,
+            diarization_span_revisions: Vec::new(),
+            transcript_hash: "irrelevant-for-size-comparison".to_string(),
+            summarized_through_revision: None,
+        };
+        let uncompacted_bytes = serde_json::to_vec(&uncompacted_equivalent)
+            .expect("uncompacted comparison basis serializes")
+            .len();
+        assert!(
+            max_late.saturating_mul(4) < uncompacted_bytes,
+            "compacted basis ({max_late} bytes) should be far smaller than the pre-fix \
+             embed-every-covered-span shape ({uncompacted_bytes} bytes for the same \
+             {TICKS}-span session)"
+        );
+    }
+
+    /// audio-graph-cfa1 deliverable (d): `MaterializedNotes::apply_patch`
+    /// and `MaterializedGraph::apply_patch` each build exactly ONE
+    /// `Arc<ProjectionBasis>` per patch and share it (a refcount bump) across
+    /// every note/node the patch touches, instead of each one independently
+    /// deep-cloning `patch.basis`. Nothing else in this suite observes that
+    /// directly: `serde`'s `rc` feature serializes the pointee per item
+    /// (wire bytes identical to independent deep clones) and
+    /// `ProjectionBasis`'s derived `PartialEq` compares values, not
+    /// pointers, so a regression back to per-item cloning would pass every
+    /// other test in this file. This pins the sharing itself via
+    /// `Arc::ptr_eq`.
+    #[test]
+    fn apply_patch_shares_one_basis_arc_across_every_touched_note_and_graph_item() {
+        let basis = ProjectionBasis::from_transcript_events(&[TranscriptEvent::from(asr_payload(
+            "span-1",
+            1,
+            "shared basis source",
+        ))]);
+
+        let mut notes = MaterializedNotes::new("session-1");
+        let notes_patch = ProjectionPatch {
+            route: None,
+            sequence: 1,
+            kind: ProjectionKind::Notes,
+            llm_request_id: "llm-req-shared-notes".to_string(),
+            basis: basis.clone(),
+            operations: vec![
+                ProjectionOperation::UpsertNote {
+                    id: "note-1".to_string(),
+                    title: "First".to_string(),
+                    body: "First body".to_string(),
+                    tags: vec![],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
+                },
+                ProjectionOperation::UpsertNote {
+                    id: "note-2".to_string(),
+                    title: "Second".to_string(),
+                    body: "Second body".to_string(),
+                    tags: vec![],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
+                },
+            ],
+            confidence: 0.9,
+            provenance: ProjectionProvenance {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4".to_string(),
+                prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            basis_currency_at_apply: None,
+            created_at_ms: 1_700_000_000_000,
+        };
+        notes
+            .apply_patch(&notes_patch, None)
+            .expect("notes patch applies");
+        let note_1 = notes
+            .notes
+            .iter()
+            .find(|note| note.id == "note-1")
+            .expect("note-1 exists");
+        let note_2 = notes
+            .notes
+            .iter()
+            .find(|note| note.id == "note-2")
+            .expect("note-2 exists");
+        assert!(
+            Arc::ptr_eq(&note_1.basis, &note_2.basis),
+            "two notes touched by the SAME patch must share one Arc<ProjectionBasis>, not each \
+             hold an independently cloned copy"
+        );
+
+        let mut graph = MaterializedGraph::new("session-1");
+        let graph_patch = ProjectionPatch {
+            route: None,
+            sequence: 1,
+            kind: ProjectionKind::Graph,
+            llm_request_id: "llm-req-shared-graph".to_string(),
+            basis,
+            operations: vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node-1".to_string(),
+                    name: "Node One".to_string(),
+                    entity_type: "fact".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "node-2".to_string(),
+                    name: "Node Two".to_string(),
+                    entity_type: "fact".to_string(),
+                    description: None,
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                },
+            ],
+            confidence: 0.9,
+            provenance: ProjectionProvenance {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4".to_string(),
+                prompt_id: "graph-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            basis_currency_at_apply: None,
+            created_at_ms: 1_700_000_000_000,
+        };
+        graph
+            .apply_patch(&graph_patch, None)
+            .expect("graph patch applies");
+        let node_1 = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "node-1")
+            .expect("node-1 exists");
+        let node_2 = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "node-2")
+            .expect("node-2 exists");
+        assert!(
+            Arc::ptr_eq(&node_1.basis, &node_2.basis),
+            "two graph nodes touched by the SAME patch must share one Arc<ProjectionBasis>, not \
+             each hold an independently cloned copy"
         );
     }
 }

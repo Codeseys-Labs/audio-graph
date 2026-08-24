@@ -459,12 +459,12 @@ impl ProjectionScheduler {
             in_flight_span_count: self
                 .in_flight
                 .as_ref()
-                .map(|job| job.basis.span_revisions.len())
+                .map(|job| job.basis.covered_span_count())
                 .unwrap_or(0),
             pending_span_count: self
                 .pending_basis
                 .as_ref()
-                .map(|basis| basis.span_revisions.len())
+                .map(|basis| basis.covered_span_count())
                 .unwrap_or(0),
             oldest_pending_since_ms: self.pending_since_ms,
             oldest_pending_age_ms: self
@@ -487,10 +487,11 @@ impl ProjectionScheduler {
 
         if let Some(in_flight) = self.in_flight.as_ref() {
             let in_flight_age_ms = now_ms.saturating_sub(in_flight.queued_at_ms);
-            let queued_span_count = basis.span_revisions.len();
+            let queued_span_count = basis.covered_span_count();
             let reason = self.coalescing_reason(in_flight_age_ms, queued_span_count);
             let previous_pending_basis = self.pending_basis.as_ref().unwrap_or(&in_flight.basis);
-            let coalesced_span_delta = basis_revision_delta_count(previous_pending_basis, &basis);
+            let coalesced_span_delta =
+                basis_revision_delta_count(previous_pending_basis, &basis, ledger);
             if self.pending_basis.as_ref() != Some(&basis) {
                 self.pending_basis = Some(basis.clone());
                 self.metrics.coalesced_updates += 1;
@@ -1028,15 +1029,45 @@ impl ProjectionScheduler {
     }
 }
 
-fn basis_revision_delta_count(previous: &ProjectionBasis, next: &ProjectionBasis) -> usize {
+/// Count of transcript + diarization spans `next` covers that `previous`
+/// did not, for the coalesced-updates telemetry counter.
+///
+/// audio-graph-cfa1: resolves each basis's FULL covered transcript set (tail
+/// plus any summarized-away prefix) against `ledger` via
+/// [`ProjectionBasis::resolve_covered_events`] before diffing, rather than
+/// diffing `span_revisions` directly. `span_revisions` alone is only the
+/// hot-window tail once a basis compacts, capped at
+/// `ROLLING_SUMMARY_HOT_WINDOW_TURNS` — a tail-only diff would silently
+/// under-count (or, once both sides' tails have rolled past the same
+/// boundary, miss entirely) genuinely new coalesced revisions in a long
+/// session, changing this metric's meaning without changing its call site.
+/// Diarization spans are left as a direct list diff: `diarization_span_revisions`
+/// is not compacted (out of this ticket's scope; field evidence and the
+/// deliverable list named only transcript `span_revisions`).
+///
+/// Cost trade-off, disclosed rather than fixed: this reconstructs (and
+/// hashes) each basis's covered prefix against `ledger`, an O(covered set
+/// size) operation, once per `observe_ledger` coalescing tick — reusing the
+/// same mechanism `classify_basis_currency` already runs on every apply, not
+/// a new class of cost, but still linear per tick rather than the
+/// previous O(hot-window-tail) diff. Acceptable today (`observe_ledger` is
+/// driven by transcript events, not artifact size), but worth revisiting if
+/// a future session profile makes per-tick reconstruction cost measurable.
+fn basis_revision_delta_count(
+    previous: &ProjectionBasis,
+    next: &ProjectionBasis,
+    ledger: &TranscriptLedger,
+) -> usize {
+    let previous_covered: std::collections::BTreeSet<(String, u64)> = previous
+        .resolve_covered_events(&ledger.latest_spans)
+        .into_iter()
+        .map(|event| (event.span_id, event.revision_number))
+        .collect();
     let transcript_delta = next
-        .span_revisions
-        .iter()
+        .resolve_covered_events(&ledger.latest_spans)
+        .into_iter()
         .filter(|candidate| {
-            !previous
-                .span_revisions
-                .iter()
-                .any(|current| current == *candidate)
+            !previous_covered.contains(&(candidate.span_id.clone(), candidate.revision_number))
         })
         .count();
     let diarization_delta = next
@@ -1590,6 +1621,61 @@ mod tests {
         // at 0 rather than underflowing.
         assert_eq!(telemetry.oldest_pending_age_ms, Some(0));
         assert_eq!(telemetry.failed_attempts, 0);
+    }
+
+    /// audio-graph-cfa1 (post-scope-honesty-review fix): `basis_revision_delta_count`
+    /// used to diff `span_revisions` directly — only ever the verbatim tail,
+    /// capped at `ROLLING_SUMMARY_HOT_WINDOW_TURNS`, once a basis compacts.
+    /// This drives a coalescing lane from a 1-span in-flight basis straight
+    /// to an 11-span basis (well past the hot window) in one tick and proves
+    /// `coalesced_span_delta` counts every genuinely new covered span
+    /// (10 — span-1 through span-10), not just however many happen to fit in
+    /// the compacted tail's fixed 6-entry window.
+    #[test]
+    fn coalesced_span_delta_counts_every_newly_covered_span_not_just_the_compacted_tail() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-0", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::with_config(
+            "session-1",
+            ProjectionKind::Notes,
+            ProjectionSchedulerConfig {
+                ttft_estimate_ms: 900,
+                coalesce_span_threshold: 2,
+            },
+        );
+        match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => {
+                assert_eq!(job.basis.covered_span_count(), 1);
+            }
+            other => panic!("expected start job, got {other:?}"),
+        }
+
+        // Grow the ledger well past the hot window in one tick: 10 more
+        // spans, for 11 total covered once observed — `next`'s basis
+        // compacts into a 5-span prefix plus a 6-span verbatim tail.
+        for i in 1..=10 {
+            ledger
+                .apply_event(event(&format!("span-{i}"), (i + 1) as u64, "later"))
+                .expect("later event");
+        }
+
+        match scheduler.observe_ledger(&ledger, 20) {
+            ProjectionSchedulerDecision::Coalesced {
+                queued_span_count,
+                coalesced_span_delta,
+                ..
+            } => {
+                assert_eq!(queued_span_count, 11);
+                assert_eq!(
+                    coalesced_span_delta, 10,
+                    "must count every newly covered span against the previous basis's FULL \
+                     covered set, not just diff the compacted tail's fixed-size window"
+                );
+            }
+            other => panic!("expected Coalesced, got {other:?}"),
+        }
     }
 
     #[test]

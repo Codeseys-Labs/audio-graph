@@ -7232,11 +7232,24 @@ fn projection_replay_latency_metrics(
     let mut metrics = ProjectionReplayLatencyMetrics::default();
     for patch in projection_events {
         let mut latest_basis_timing: Option<BasisTiming> = None;
-        let mut missing_timestamp = patch.basis.span_revisions.is_empty();
+        // audio-graph-cfa1: resolve the basis's FULL covered set (tail plus
+        // any summarized-away prefix) via `resolve_covered_events` rather
+        // than iterating `span_revisions` directly, which is only ever the
+        // verbatim tail once a basis is compacted. `resolve_covered_events`
+        // returns fewer events than `covered_span_count()` only when the
+        // basis names a span this `transcript_events` slice cannot
+        // reproduce (a genuinely missing/unresolvable timestamp for this
+        // metric, same as the pre-cfa1 tail-only lookup miss below) — so a
+        // length shortfall here carries exactly the same
+        // `missing_timestamp` meaning the old per-span lookup-miss branch
+        // had.
+        let covered_events = patch.basis.resolve_covered_events(transcript_events);
+        let mut missing_timestamp = patch.basis.covered_span_count() == 0
+            || covered_events.len() != patch.basis.covered_span_count();
 
-        for span in &patch.basis.span_revisions {
+        for event in &covered_events {
             match timing_by_span_revision
-                .get(&(span.span_id.clone(), span.revision_number))
+                .get(&(event.span_id.clone(), event.revision_number))
                 .copied()
             {
                 Some(timing) => {
@@ -11922,6 +11935,71 @@ mod tests {
         );
     }
 
+    /// audio-graph-cfa1 (post-scope-honesty-review fix):
+    /// `projection_replay_latency_metrics` used to compute `missing_timestamp`
+    /// by walking `patch.basis.span_revisions` directly — only ever the
+    /// verbatim tail once a basis compacts — so a patch whose
+    /// SUMMARIZED-AWAY PREFIX cannot be resolved against `transcript_events`
+    /// (e.g. an upstream log-retention prune of early, already-summarized
+    /// revisions) silently reported a measured `basis_to_patch_ms` lag
+    /// instead of `missing_basis_timestamp_count`, even though the basis's
+    /// true covered set could not be reconstructed.
+    #[test]
+    fn projection_replay_latency_metrics_flags_missing_timestamp_when_a_compacted_prefix_cannot_resolve()
+     {
+        let all_events: Vec<crate::projections::TranscriptEvent> = (0..8)
+            .map(|i| {
+                let mut event =
+                    transcript_event_fixture(&format!("span-{i}"), &format!("segment-{i}"));
+                event.start_time = i as f64;
+                event.end_time = i as f64 + 0.5;
+                event.received_at_ms = 1_700_000_000_000 + i as u64;
+                event
+            })
+            .collect();
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(&all_events);
+        assert!(
+            basis.covered_prefix.is_some(),
+            "8 covered spans must exceed the hot window and produce a prefix"
+        );
+
+        // Only the TAIL's underlying events are available to this replay
+        // call — the prefix's (span-0 and span-1's) underlying events are
+        // pruned/unavailable — so the prefix cannot be reconstructed.
+        let available_events: Vec<crate::projections::TranscriptEvent> = all_events[2..].to_vec();
+
+        let patch = crate::projections::ProjectionPatch {
+            route: None,
+            sequence: 1,
+            kind: crate::projections::ProjectionKind::Notes,
+            llm_request_id: "llm-req-1".to_string(),
+            basis,
+            operations: vec![],
+            confidence: 0.9,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4".to_string(),
+                prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            basis_currency_at_apply: None,
+            created_at_ms: 1_700_000_000_100,
+        };
+
+        let metrics = projection_replay_latency_metrics(&available_events, &[patch]);
+        assert_eq!(
+            metrics.missing_basis_timestamp_count, 1,
+            "a patch whose compacted prefix cannot be resolved against the available \
+             transcript events must be flagged as a missing timestamp, not silently measured \
+             against the tail alone"
+        );
+        assert_eq!(metrics.measured_patch_count, 0);
+    }
+
     // -------------------------------------------------------------------
     // audio-graph-4b52 fix-pass: handler-level coverage for the two
     // command-handler call sites that wire `TranscriptLedger::
@@ -13026,6 +13104,7 @@ mod tests {
             route: None,
             basis: crate::projections::ProjectionBasis {
                 span_revisions: Vec::new(),
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "empty".to_string(),
                 summarized_through_revision: None,
@@ -13089,7 +13168,7 @@ mod tests {
             heading_level: None,
             updated_by_sequence: 0,
             updated_at_ms: 1,
-            basis,
+            basis: Arc::new(basis),
             provenance: crate::projections::ProjectionProvenance {
                 provider: "test".to_string(),
                 model: "stale-artifact".to_string(),
@@ -13119,7 +13198,7 @@ mod tests {
             valid_until_ms: None,
             updated_by_sequence: 0,
             updated_at_ms: 1,
-            basis,
+            basis: Arc::new(basis),
             provenance: crate::projections::ProjectionProvenance {
                 provider: "test".to_string(),
                 model: "stale-artifact".to_string(),
@@ -13134,12 +13213,13 @@ mod tests {
 
     fn leaked_active_projection_state() -> crate::projections::MaterializedProjectionState {
         let session_id = "active-session-before-load";
-        let basis = crate::projections::ProjectionBasis {
+        let basis = Arc::new(crate::projections::ProjectionBasis {
             span_revisions: Vec::new(),
+            covered_prefix: None,
             diarization_span_revisions: Vec::new(),
             transcript_hash: "active-before-load".to_string(),
             summarized_through_revision: None,
-        };
+        });
         let provenance = crate::projections::ProjectionProvenance {
             provider: "test".to_string(),
             model: "active-before-load".to_string(),
@@ -13160,7 +13240,7 @@ mod tests {
                 heading_level: None,
                 updated_by_sequence: 99,
                 updated_at_ms: 99,
-                basis: basis.clone(),
+                basis: Arc::clone(&basis),
                 provenance: provenance.clone(),
                 evidence: None,
             });

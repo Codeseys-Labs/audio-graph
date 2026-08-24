@@ -527,7 +527,7 @@ fn record_latency(
         kind: job.kind.clone(),
         job_id: job.id.clone(),
         accepted,
-        basis_span_count: job.basis.span_revisions.len(),
+        basis_span_count: job.basis.covered_span_count(),
         basis_latest_received_at_ms,
         queued_at_ms: job.queued_at_ms,
         completed_at_ms,
@@ -605,20 +605,18 @@ fn record_kind_latency(
         .max(projection_queue_lag_ms);
 }
 
+/// audio-graph-cfa1: resolves the basis's FULL covered set (verbatim tail
+/// plus, once compacted, the summarized-away prefix) via
+/// [`ProjectionBasis::resolve_covered_events`] rather than reading
+/// `span_revisions` directly. The pre-fix version only ever looked at the
+/// tail, so once a session outgrew `ROLLING_SUMMARY_HOT_WINDOW_TURNS`, a
+/// late-arriving revision of a summarized-away span would silently stop
+/// contributing to this latency metric.
 fn basis_latest_received_at_ms(job: &ProjectionJob, ledger: &TranscriptLedger) -> Option<u64> {
     job.basis
-        .span_revisions
+        .resolve_covered_events(&ledger.latest_spans)
         .iter()
-        .filter_map(|basis_span| {
-            ledger
-                .latest_spans
-                .iter()
-                .find(|event| {
-                    event.span_id == basis_span.span_id
-                        && event.revision_number == basis_span.revision_number
-                })
-                .map(|event| event.received_at_ms)
-        })
+        .map(|event| event.received_at_ms)
         .max()
 }
 
@@ -659,8 +657,8 @@ mod tests {
     use super::*;
     use crate::llm::{LlmExecutor, OpenRouterClient, OpenRouterConfig};
     use crate::projections::{
-        DiarizationEventStability, ProjectionBasis, ProjectionBasisSpan, ProjectionOperation,
-        ProjectionPriority, ProjectionProvenance, TranscriptEventStability,
+        DiarizationEventStability, ProjectionBasis, ProjectionBasisSpan, ProjectionJob,
+        ProjectionOperation, ProjectionPriority, ProjectionProvenance, TranscriptEventStability,
     };
     use crate::settings::LlmProvider;
     use std::sync::{Arc, Mutex};
@@ -883,6 +881,7 @@ mod tests {
             llm_request_id: format!("offline:{}:{sequence}", job.id),
             basis: ProjectionBasis {
                 span_revisions: job.basis.span_revisions.clone(),
+                covered_prefix: job.basis.covered_prefix.clone(),
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: job.basis.transcript_hash.clone(),
                 summarized_through_revision: None,
@@ -1635,6 +1634,63 @@ mod tests {
                 .speaker_id
                 .as_deref(),
             Some("spk-b")
+        );
+    }
+
+    /// audio-graph-cfa1 (post-scope-honesty-review fix): before this fix,
+    /// `basis_latest_received_at_ms` iterated `job.basis.span_revisions`
+    /// directly — only ever the verbatim tail once a basis compacts — so a
+    /// late-arriving/out-of-order receipt of a span folded into the
+    /// summarized prefix silently stopped contributing to
+    /// `asr_event_to_job_queued_ms`/`projection_queue_lag_ms`. This drives a
+    /// session past the hot window, gives the CHRONOLOGICALLY EARLIEST span
+    /// (which lands in the compacted prefix, not the tail) the LATEST
+    /// `received_at_ms`, and proves the max resolves across the whole
+    /// covered set, not just the tail.
+    #[test]
+    fn basis_latest_received_at_ms_resolves_a_summarized_prefix_span_not_just_the_tail() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        let total = crate::projections::ROLLING_SUMMARY_HOT_WINDOW_TURNS + 2;
+        for i in 0..total {
+            // `span-0` is chronologically first (start_time == revision_number
+            // == 1) so it falls inside the summarized-away prefix once the
+            // session exceeds the hot window — but it is received LAST,
+            // simulating an out-of-order/backfilled receipt.
+            let revision_number = (i + 1) as u64;
+            let received_at_ms = if i == 0 {
+                9_999
+            } else {
+                1_000 + revision_number * 10
+            };
+            ledger
+                .apply_event(event(
+                    &format!("span-{i}"),
+                    revision_number,
+                    "turn",
+                    received_at_ms,
+                ))
+                .expect("event accepted");
+        }
+        let basis = ledger.current_projection_basis();
+        assert!(
+            basis.covered_prefix.is_some(),
+            "session must exceed the hot window for this test to exercise the compacted path"
+        );
+
+        let job = ProjectionJob {
+            id: "job-1".to_string(),
+            session_id: "session-1".to_string(),
+            kind: ProjectionKind::Notes,
+            basis,
+            priority: ProjectionPriority::Realtime,
+            queued_at_ms: 20_000,
+        };
+
+        assert_eq!(
+            basis_latest_received_at_ms(&job, &ledger),
+            Some(9_999),
+            "the max received_at_ms must resolve across the FULL covered set (tail + \
+             summarized prefix), not just the verbatim tail"
         );
     }
 }

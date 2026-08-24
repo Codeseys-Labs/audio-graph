@@ -353,6 +353,20 @@ pub enum ProjectionPatchDraftError {
         span_id: String,
         revision_number: u64,
     },
+    /// audio-graph-cfa1: the basis's `covered_prefix` (the summarized-away
+    /// older turns, folded past [`crate::projections::ROLLING_SUMMARY_HOT_WINDOW_TURNS`])
+    /// could not be reconstructed and hash-verified against the ledger — a
+    /// revision, reorder, or deletion inside the summarized prefix, or a
+    /// ledger the basis was not actually built from. Distinct from
+    /// `MissingBasisSpan` because a compacted prefix carries no per-span
+    /// identity to name individually; every job basis this scheduler builds
+    /// is proven current against the ledger before dispatch, so reaching
+    /// this in production indicates the same class of internal-invariant
+    /// violation `MissingBasisSpan` already guards against, not an expected
+    /// staleness outcome.
+    MissingBasisSummarizedPrefix {
+        expected_span_count: usize,
+    },
     InvalidConfidence {
         confidence: f32,
     },
@@ -416,6 +430,12 @@ impl fmt::Display for ProjectionPatchDraftError {
             } => write!(
                 f,
                 "projection job references missing transcript span {span_id}@{revision_number}"
+            ),
+            Self::MissingBasisSummarizedPrefix {
+                expected_span_count,
+            } => write!(
+                f,
+                "projection job's summarized basis prefix ({expected_span_count} spans) could not be reconstructed from the ledger"
             ),
             Self::InvalidConfidence { confidence } => write!(
                 f,
@@ -1339,6 +1359,21 @@ pub fn trusted_projection_patch_from_model_json(
     // and the original draft prompt (`projection_patch_prompt_messages`) were
     // built from — resolving evidence against anything else would let a
     // `Revised` span (ADR-0031) launder a stale claim into a proof.
+    //
+    // audio-graph-cfa1 (disclosed behavior nuance, not a defect): unlike
+    // `projection_patch_prompt_messages`, this call site has no preceding
+    // `validate_basis`/`classify_basis_currency` check. Pre-compaction, a
+    // basis whose covered set no longer matched the ledger (a backfilled
+    // early final, or a partial that finalized mid-generation) still
+    // resolved its tail spans by exact identity here, the patch got built,
+    // and the caller's own apply gate classified it `Revised` and discarded
+    // it. Post-compaction, `basis_events`'s prefix-reconstruction attempt can
+    // now fail earlier, at THIS call site, returning
+    // `MissingBasisSummarizedPrefix` before a patch is even constructed. The
+    // end state is the same either way (Replay repair, since `fail_in_flight`
+    // also classifies `Revised`), but the route differs: `metrics.failed_jobs`
+    // increments instead of `metrics.completed_jobs`, and the failure surfaces
+    // as a typed draft error instead of a stale discard downstream.
     let events = basis_events(job, ledger)?;
     let basis: BTreeMap<&str, &TranscriptEvent> = events
         .iter()
@@ -1694,7 +1729,7 @@ pub fn projection_patch_prompt_messages(
             session_id = job.session_id,
             kind = projection_kind_key(&job.kind),
             basis_hash = job.basis.transcript_hash,
-            span_count = job.basis.span_revisions.len(),
+            span_count = job.basis.covered_span_count(),
         ),
     });
 
@@ -2381,29 +2416,53 @@ fn operation_identity(operation: &ProjectionOperation) -> (&'static str, &str) {
     }
 }
 
+/// Every basis-covered [`TranscriptEvent`] this job's basis pins — its
+/// verbatim hot-window tail AND, once the covered set has grown past
+/// [`crate::projections::ROLLING_SUMMARY_HOT_WINDOW_TURNS`], the
+/// reconstructed-and-hash-verified summarized prefix (audio-graph-cfa1).
+///
+/// [`split_summary_window`] (the caller two frames up, via
+/// [`projection_patch_prompt_messages`]) needs the FULL covered set, not just
+/// the tail: it does its own older/hot split on whatever this returns, and a
+/// tail-only return would make every session that outgrows the hot window
+/// silently drop its rolling summary instead of feeding it to the model —
+/// exactly the O(n²) re-feed problem seed audio-graph-18ee already fixed,
+/// regressing back in a different shape.
 fn basis_events(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
 ) -> Result<Vec<TranscriptEvent>, ProjectionPatchDraftError> {
+    let events = job.basis.resolve_covered_events(&ledger.latest_spans);
+    if events.len() == job.basis.covered_span_count() {
+        return Ok(events);
+    }
+
+    // Resolution came up short. Prefer the precise per-span error this has
+    // always raised when it is a genuinely missing TAIL identity; only a
+    // shortfall inside the opaque, identity-free summarized prefix falls
+    // back to the aggregate error.
     let latest_by_span: BTreeMap<(&str, u64), &TranscriptEvent> = ledger
         .latest_spans
         .iter()
         .map(|event| ((event.span_id.as_str(), event.revision_number), event))
         .collect();
-
-    job.basis
-        .span_revisions
-        .iter()
-        .map(|span| {
-            latest_by_span
-                .get(&(span.span_id.as_str(), span.revision_number))
-                .map(|event| (*event).clone())
-                .ok_or_else(|| ProjectionPatchDraftError::MissingBasisSpan {
-                    span_id: span.span_id.clone(),
-                    revision_number: span.revision_number,
-                })
+    if let Some(span) =
+        job.basis.span_revisions.iter().find(|span| {
+            !latest_by_span.contains_key(&(span.span_id.as_str(), span.revision_number))
         })
-        .collect()
+    {
+        return Err(ProjectionPatchDraftError::MissingBasisSpan {
+            span_id: span.span_id.clone(),
+            revision_number: span.revision_number,
+        });
+    }
+    Err(ProjectionPatchDraftError::MissingBasisSummarizedPrefix {
+        expected_span_count: job
+            .basis
+            .covered_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.span_count),
+    })
 }
 
 fn format_transcript_events_json(events: &[TranscriptEvent]) -> String {
@@ -3204,6 +3263,7 @@ mod tests {
                     span_id: "span-1".to_string(),
                     revision_number: 1,
                 }],
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "stale".to_string(),
                 summarized_through_revision: None,
@@ -3660,6 +3720,7 @@ mod tests {
                     span_id: "span-1".to_string(),
                     revision_number: 1,
                 }],
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: format!("fnv1a64:{sequence:016x}"),
                 summarized_through_revision: None,

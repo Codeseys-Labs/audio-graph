@@ -1659,6 +1659,7 @@ mod tests {
                     span_id: "span-1".to_string(),
                     revision_number: 2,
                 }],
+                covered_prefix: None,
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "sha256:transcript".to_string(),
                 summarized_through_revision: None,
