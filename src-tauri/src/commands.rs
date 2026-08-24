@@ -8024,10 +8024,19 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
 /// validation. Shared by [`load_session_notes_artifacts_cmd`] and
 /// [`load_session_graph_artifact_cmd`] — each lens replays independently when
 /// it activates (seed audio-graph-4fa5 deliverable a); a shared cache across
-/// lenses is explicitly out of scope here (seed audio-graph-927a owns the
-/// O(patches × events) algorithmic fix this replay still pays per call —
-/// deliverable f mitigates only by moving it off the UI thread and behind a
-/// lens fetch, never restructuring `projections.rs`).
+/// lenses is explicitly out of scope here. Seed audio-graph-4fa5 deliverable
+/// f moved this replay off the UI thread and behind a lens fetch WITHOUT
+/// restructuring `projections.rs`'s own algorithm; seed audio-graph-927a
+/// landed that algorithmic fix (`LedgerHistory`'s forward cursors,
+/// `projections.rs`) — each lens activation still pays one replay call, but
+/// that call no longer re-folds the same raw transcript/speaker event
+/// across patches: it is now O(events + patches × distinct_spans) instead
+/// of O(patches × events), because `classify_basis_currency` /
+/// `resolve_claim_evidence_basis_events` (deliberately left unmodified by
+/// that ticket) still clone/re-derive the current ledger once per patch —
+/// bounded by the DISTINCT-span count, not the raw event count, and paid
+/// once either way. See `projections.rs`'s `LedgerHistory` doc comment for
+/// the precise accounting.
 fn replay_projection_state_or_invalid(
     session_id: &str,
     transcript_events: Vec<crate::projections::TranscriptEvent>,
@@ -8138,8 +8147,10 @@ fn gather_projection_lens_state(
 /// byte ceiling below, not lens-gating.
 ///
 /// `async fn` (seed audio-graph-e8a5) so the canonical-replay work (seed
-/// audio-graph-927a's O(patches × events) hot path, deliberately
-/// un-restructured here per deliverable f) runs off the message-pump thread.
+/// audio-graph-927a's `LedgerHistory` forward-cursor replay, `projections.rs`
+/// — O(events + patches × distinct_spans), not O(patches × events); see
+/// `replay_projection_state_or_invalid`'s doc comment above) runs off the
+/// message-pump thread.
 #[tauri::command]
 pub async fn load_session_notes_artifacts_cmd(
     session_id: String,

@@ -3666,9 +3666,12 @@ mod tests {
     /// `ProjectionKind`s. Parameterized by `finals` (a multiple of
     /// `SYNTH_FINALS_PER_JOB`) so the default `cargo test` run can use a
     /// small variant instead of paying the full ~2-hour/1440-final shape's
-    /// O(patches x events) replay cost unconditionally (audio-graph-5fd1
-    /// review finding) — see `DEFAULT_SYNTH_SESSION_FINALS` and
-    /// `FULL_SYNTH_SESSION_FINALS` below.
+    /// replay cost unconditionally (audio-graph-5fd1 review finding) — see
+    /// `DEFAULT_SYNTH_SESSION_FINALS` and `FULL_SYNTH_SESSION_FINALS`
+    /// below. That cost used to be O(patches x events) pre-audio-graph-927a;
+    /// it is now O(events + patches x distinct_spans) (see
+    /// `LedgerHistory`'s doc comment in `projections.rs`), but the fixture
+    /// stays downsized for default-run speed regardless.
     ///
     /// Every patch carries realistic `created_at_ms`/`generation_latency_ms`/
     /// `apply_latency_ms` through the same struct-literal shape production
@@ -3706,10 +3709,11 @@ mod tests {
     const FULL_SYNTH_SESSION_FINALS: u64 = 1_440;
     /// Small fixture size for the default `cargo test` run: the same cadence
     /// and one-in-three `AppendOnlyStale` job spacing as the full fixture, at
-    /// 1/24th the scale, so `replay_accepted_patches_with_history`'s
-    /// O(patches x events) cost stays cheap (tens of ms, not the ~13s debug
-    /// the full size costs) while every correctness property — including the
-    /// `AppendOnlyStale` classification property — still holds.
+    /// 1/24th the scale, so `replay_accepted_patches_with_history`'s cost
+    /// stays cheap (single-digit ms, not the multi-second debug cost the
+    /// full size incurs even post-audio-graph-927a) while every correctness
+    /// property — including the `AppendOnlyStale` classification property —
+    /// still holds.
     const DEFAULT_SYNTH_SESSION_FINALS: u64 = 60;
     const PROJECTION_REPLAY_BENCH_ENV: &str = "PROJECTION_REPLAY_BENCH";
 
@@ -4007,8 +4011,11 @@ mod tests {
     /// benchmark below is measured against. `#[ignore]` + env-gated on the
     /// same `PROJECTION_REPLAY_BENCH=1` variable as that benchmark (and
     /// following the same precedent as `rotation_under_concurrent_load` /
-    /// `RSAC_TORTURE=1` in `state.rs`): `replay_accepted_patches_with_history`'s
-    /// O(patches x events) cost makes this ~12-13s in debug, too slow to pay
+    /// `RSAC_TORTURE=1` in `state.rs`): `replay_accepted_patches_with_history`
+    /// still costs multiple seconds in debug at this size (down from
+    /// ~12-13s pre-audio-graph-927a, but not free — see `LedgerHistory`'s
+    /// doc comment in `projections.rs` for the residual
+    /// O(events + patches x distinct_spans) accounting), too slow to pay
     /// unconditionally in every default `cargo test` run across 3 OSes in CI
     /// (audio-graph-5fd1 review finding). The small default-run test above
     /// keeps every one of these same assertions — including the
@@ -4053,27 +4060,31 @@ mod tests {
     /// (`state.rs`) — this is a real-wall-clock measurement, not a
     /// correctness test, so it stays out of the default `cargo test` run.
     ///
-    /// MEASURED REALITY (2df3/5fd1 adversarial-review pass, this box, debug
-    /// profile): p95 lands around 13-14s, ~7x over the original 2s target.
-    /// `replay_accepted_patches_with_history` (`projections.rs`) rebuilds a
-    /// fresh `TranscriptLedger`/`SpeakerTimeline` from event 0 for *every*
-    /// patch (twice — once for the evidence-bound ledger, once via
-    /// `replay_ledger_and_timeline_up_to` for currency classification),
-    /// i.e. O(patches x events) rather than the O(session length) the ADR's
-    /// consequences section assumes. That code predates this ticket
-    /// (audio-graph-f3d4, commit 0cee712) and carries its own dense set of
-    /// basis-currency/evidence invariants, so this benchmark does not
-    /// rewrite it — rewriting a hot loop inside correctness-critical,
-    /// ADR-0037/ADR-0031-linked replay code is out of this ticket's scope
-    /// (FILES: projection_scheduler.rs, commands.rs, state.rs doc) and
-    /// belongs in its own reviewed change. Per decision 5's own text, this
-    /// is exactly a "measured breach" — see the loud `eprintln!` below,
-    /// which fires every time this benchmark actually runs, and file a
-    /// follow-up seed to either optimize the replay path or formally
-    /// reopen ADR-0029. The in-memory fixture also clones straight from a
-    /// `Vec` rather than paying the disk read + deserialize a real session
-    /// open incurs, so production reopen latency is at least this, not
-    /// bounded by it.
+    /// MEASURED REALITY, UPDATED (audio-graph-927a, this box, debug
+    /// profile): p95 now lands around 2.7-3.5s, still ~1.3-1.7x over the
+    /// original 2s target but a ~4x improvement over the pre-927a
+    /// 13-14s baseline (2df3/5fd1 adversarial-review pass) this doc
+    /// previously described. `replay_accepted_patches_with_history`
+    /// (`projections.rs`) used to rebuild a fresh `TranscriptLedger`/
+    /// `SpeakerTimeline` from event 0 for *every* patch, twice per patch
+    /// (once for the evidence-bound ledger, once for currency
+    /// classification) — that O(patches x events) raw-event re-fold is
+    /// exactly what audio-graph-927a's `LedgerHistory` forward-cursor
+    /// rewrite (`projections.rs`) eliminated. The residual cost is now
+    /// O(events + patches x distinct_spans): `classify_basis_currency` /
+    /// `resolve_claim_evidence_basis_events` (deliberately left unmodified
+    /// by that ticket, per its own scope boundary — see `LedgerHistory`'s
+    /// doc comment) still clone/re-derive the current ledger once per
+    /// patch, bounded by the DISTINCT-span count rather than the raw event
+    /// count, which is why the improvement is a large constant-factor win
+    /// rather than a full linear collapse. Per decision 5's own text, the
+    /// remaining gap to the original 2s target is still a "measured
+    /// breach" — see the loud `eprintln!` below, which fires every time
+    /// this benchmark actually runs, and file a follow-up seed rather than
+    /// editing this assertion if that gap needs closing further. The
+    /// in-memory fixture also clones straight from a `Vec` rather than
+    /// paying the disk read + deserialize a real session open incurs, so
+    /// production reopen latency is at least this, not bounded by it.
     ///
     /// The hard assertion below therefore guards against *regressing past
     /// the measured baseline*, not the original 2s aspiration — a

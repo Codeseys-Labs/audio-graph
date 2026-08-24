@@ -3035,51 +3035,544 @@ pub enum HistoricalProjectionValidationError {
     },
 }
 
-/// Reconstruct the transcript ledger and (when the speaker stream is
-/// present) the speaker timeline from the canonical replay streams, folding
-/// in every event received at or before `bound_ms`.
+/// Cheap, semantics-preserving equivalent of [`TranscriptLedger::apply_event`]
+/// for [`LedgerHistory`]'s persistent forward-fold map (audio-graph-927a):
+/// an O(log n) `BTreeMap` find/insert keyed by `span_id`, instead of
+/// `apply_event`'s O(n) linear `Vec` find plus a full `Vec::sort_by`
+/// re-sort after every event. Stale/conflict detection and their exact
+/// error payloads are identical — only the storage/cost shape differs.
+/// [`TranscriptLedger::apply_event`] itself is untouched, so the
+/// live-capture path that shares it keeps its exact pre-existing cost
+/// profile (see [`LedgerHistory`]'s doc comment for why that's safe to
+/// leave alone).
 ///
-/// Used by [`MaterializedProjectionState::replay_accepted_patches_with_history`]
-/// to widen the basis-currency check past a patch's `created_at_ms` toward
-/// the live apply gate's actual apply-time view (audio-graph-f3d4 review
-/// fix). Unlike the `created_at_ms`-bounded evidence ledger built alongside
-/// it, a failure to fold an event here degrades to whatever was already
-/// folded rather than invalidating the patch: the authoritative validity
-/// check for the accepted transcript/speaker streams already happened while
-/// building that `created_at_ms`-bounded ledger, and every event considered
-/// here was already folded there too (or arrived later in the same
-/// monotonic, pre-sorted stream) — this reconstruction only ever extends
-/// coverage, so it degrades safely, not lossily, for a currency
-/// determination that solely needs to prove the basis-covered spans still
-/// resolve.
-fn replay_ledger_and_timeline_up_to(
-    session_id: &str,
-    transcript_events: &[TranscriptEvent],
-    speaker_events: &[DiarizationSpanRevision],
-    speaker_history_present: bool,
-    bound_ms: u64,
-) -> (TranscriptLedger, Option<SpeakerTimeline>) {
-    let mut ledger = TranscriptLedger::new(session_id);
-    for event in transcript_events
-        .iter()
-        .take_while(|event| event.received_at_ms <= bound_ms)
-    {
-        if ledger.apply_event(event.clone()).is_err() {
-            break;
+/// Deliberately does NOT reproduce `apply_event`'s `sort_latest_spans` call:
+/// callers materialize a `TranscriptLedger` from this map via
+/// [`LedgerHistory::materialize_transcript_ledger`], whose `latest_spans`
+/// vector order this module's only two consumers —
+/// [`TranscriptLedger::classify_basis_currency`] and
+/// [`resolve_claim_evidence_basis_events`] — never depend on: every place
+/// either function needs a deterministic order (windowing, hashing,
+/// order-mismatch detection) re-derives it explicitly via
+/// [`ordered_for_window`] rather than trusting incoming slice order.
+fn fast_apply_transcript_event(
+    map: &mut BTreeMap<String, TranscriptEvent>,
+    event: TranscriptEvent,
+) -> Result<(), TranscriptLedgerError> {
+    #[cfg(test)]
+    LEDGER_HISTORY_FOLD_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match map.get(&event.span_id) {
+        Some(current) if event.revision_number < current.revision_number => {
+            Err(TranscriptLedgerError::StaleTranscriptRevision {
+                span_id: event.span_id,
+                current_revision: current.revision_number,
+                incoming_revision: event.revision_number,
+            })
+        }
+        Some(current) if event.revision_number == current.revision_number && event != *current => {
+            Err(TranscriptLedgerError::ConflictingTranscriptRevision {
+                span_id: event.span_id,
+                revision_number: event.revision_number,
+            })
+        }
+        _ => {
+            map.insert(event.span_id.clone(), event);
+            Ok(())
         }
     }
-    let mut timeline = speaker_history_present.then(|| SpeakerTimeline::new(session_id));
-    if let Some(timeline) = timeline.as_mut() {
-        for event in speaker_events
-            .iter()
-            .take_while(|event| event.received_at_ms <= bound_ms)
-        {
-            if timeline.apply_event(event.clone()).is_err() {
-                break;
+}
+
+/// [`fast_apply_transcript_event`]'s [`SpeakerTimeline`] counterpart. Mirrors
+/// [`SpeakerTimeline::apply_event`]'s stale/conflict semantics exactly;
+/// deliberately drops the `Option<SpeakerLabelRemap>` return value because
+/// neither replay caller of the original speaker fold loops
+/// (`replay_accepted_patches_with_history`'s evidence fold nor the old
+/// classify-bound reconstruction) ever read it — both only checked
+/// `.is_err()`.
+fn fast_apply_speaker_event(
+    map: &mut BTreeMap<String, DiarizationSpanRevision>,
+    event: DiarizationSpanRevision,
+) -> Result<(), SpeakerTimelineError> {
+    #[cfg(test)]
+    LEDGER_HISTORY_FOLD_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match map.get(&event.span_id) {
+        Some(current) if event.revision_number < current.revision_number => {
+            Err(SpeakerTimelineError::StaleDiarizationRevision {
+                span_id: event.span_id,
+                current_revision: current.revision_number,
+                incoming_revision: event.revision_number,
+            })
+        }
+        Some(current) if event.revision_number == current.revision_number && event != *current => {
+            Err(SpeakerTimelineError::ConflictingDiarizationRevision {
+                span_id: event.span_id,
+                revision_number: event.revision_number,
+            })
+        }
+        _ => {
+            map.insert(event.span_id.clone(), event);
+            Ok(())
+        }
+    }
+}
+
+/// Work-counter for the complexity pinning test
+/// (`ledger_history_folds_each_event_a_bounded_number_of_times_not_once_per_patch`,
+/// audio-graph-927a deliverable c). Counts every call into
+/// [`fast_apply_transcript_event`] / [`fast_apply_speaker_event`] — i.e.
+/// every time a raw event is actually folded, by either cursor, whether via
+/// the persistent forward advance or an isolated regression/poison fresh
+/// fold. `#[cfg(test)]`-only: zero footprint in the shipped binary, and
+/// mutation-proof by construction — a revert to rebuilding a fresh
+/// [`TranscriptLedger`]/[`SpeakerTimeline`] per patch via
+/// [`TranscriptLedger::apply_event`]/[`SpeakerTimeline::apply_event`]
+/// directly (bypassing this module) never touches this counter at all, so
+/// the test's lower bound (every event folded at least once) catches that
+/// silently, and the upper bound catches a revert that routes the old
+/// per-patch-refold shape through these functions instead.
+///
+/// SERIAL-ONLY precondition (audio-graph-927a review finding): this is a
+/// single process-global counter with no per-test isolation. Every
+/// prescribed gate in this repo runs `cargo test -- --test-threads=1`
+/// (grep `.github/workflows/ci.yml` and this ticket's own gate commands),
+/// so no other test's fold operations can land between a reset and a read.
+/// A parallel (default-threaded) `cargo test --lib` run can flake this
+/// counter's exact-equality assertion if some OTHER test that also calls
+/// `replay_accepted_patches_with_history` happens to interleave — this is
+/// an accepted, documented constraint of the counter's design, not a bug in
+/// the test itself.
+#[cfg(test)]
+static LEDGER_HISTORY_FOLD_OPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn reset_ledger_history_fold_ops_counter() {
+    LEDGER_HISTORY_FOLD_OPS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn ledger_history_fold_ops_counter() -> usize {
+    LEDGER_HISTORY_FOLD_OPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forward-cursor reconstruction of the transcript ledger / speaker timeline
+/// used by [`MaterializedProjectionState::replay_accepted_patches_with_history`]
+/// (audio-graph-927a; supersedes the old free function
+/// `replay_ledger_and_timeline_up_to`, which rebuilt a fresh
+/// [`TranscriptLedger`]/[`SpeakerTimeline`] from event zero on every call).
+///
+/// # The problem this replaces
+///
+/// The previous implementation rebuilt a fresh ledger/timeline from event
+/// zero for EVERY patch, TWICE per patch (once for the draft-time evidence
+/// bound, once for the classify-time currency bound) — O(patches × events)
+/// — and each [`TranscriptLedger::apply_event`]/[`SpeakerTimeline::apply_event`]
+/// call inside that rebuild is itself O(current ledger size) (linear
+/// span-id find) plus a full `Vec` re-sort. On a field session with 1,215
+/// patches and 4,697 transcript events that is ~5.7M redundant
+/// `TranscriptEvent` clones (plus ~1.14M speaker-revision clones) per
+/// session-open.
+///
+/// # The fix
+///
+/// `LedgerHistory` folds each raw event AT MOST ONCE across the whole
+/// replay by keeping a persistent `BTreeMap<span_id, latest event>` (O(log
+/// n) find/update via [`fast_apply_transcript_event`] /
+/// [`fast_apply_speaker_event`] — no `Vec` re-sort at all) plus a monotonic
+/// "how far has this track been folded" cursor (`*_applied_len`).
+/// Snapshotting at a bound means: advance the cursor to that bound (folding
+/// only events not yet seen) and materialize the currently-visible spans
+/// into a [`TranscriptLedger`]/[`SpeakerTimeline`] for the existing
+/// [`TranscriptLedger::classify_basis_currency`] /
+/// [`resolve_claim_evidence_basis_events`] call sites — deliberately left
+/// unmodified by this ticket. Their own O(current ledger size) per-call cost
+/// (both start by cloning the full `latest_spans`) is NOT what this ticket
+/// targets: that cost is bounded by the number of DISTINCT spans, is paid
+/// once per patch either way, and shrinks strictly relative to the old
+/// per-patch RAW EVENT re-fold (which reprocessed every revision, not just
+/// the latest one per span). What this module eliminates is the redundant
+/// *re-folding of the same raw events* across patches.
+///
+/// One sort DOES still happen, once per snapshot rather than once per raw
+/// event: [`Self::materialize_transcript_ledger`] /
+/// [`Self::materialize_speaker_timeline`] (and their fresh-fold
+/// counterparts) re-sort the materialized `latest_spans` into
+/// [`TranscriptLedger::sort_latest_spans`]/[`SpeakerTimeline::sort_latest_spans`]'s
+/// chronological order before returning — the persistent `BTreeMap`'s
+/// natural iteration order is span-id-lexicographic, which
+/// `timeline::speaker_attribution_index`'s exact-tie-break reads directly
+/// and must not diverge from what the live `apply_event` path would have
+/// produced (audio-graph-927a review fix). This is O(m log m) over the
+/// DISTINCT-span count `m`, batched at snapshot points exactly as this
+/// module's own doc above invites ("amortize: sorted insert or batch-sort
+/// at snapshot points") — it is not a regression back to a per-event
+/// re-sort.
+///
+/// # Two independent cursors, not one
+///
+/// The evidence bound (`created_at_ms`) and the classify bound
+/// (`created_at_ms + generation_latency_ms`) are drawn from the same event
+/// stream but do not advance together. `created_at_ms` is non-decreasing
+/// across sequence-ordered patches in real sessions, but `classify_bound_ms`
+/// is NOT — a slow generation on patch N can push its classify bound past a
+/// fast patch N+1's, so patch N+1's classify bound can regress relative to
+/// patch N's even when nothing else is unusual. (`created_at_ms` itself can
+/// also regress in a defensively-tested, if not realistic, input shape —
+/// see `materialized_projection_history_uses_each_patch_time_when_timestamps_regress`,
+/// which feeds patches with deliberately out-of-order `created_at_ms`.) A
+/// single shared cursor fed both bound sequences interleaved would
+/// manufacture spurious regressions (patch N+1's smaller evidence bound
+/// arriving right after patch N's larger classify bound), so each bound
+/// sequence gets its own `LedgerHistory` instance, each independently
+/// monotonic.
+///
+/// # Regression handling
+///
+/// When a requested bound falls behind this cursor's own high-water mark
+/// (`*_applied_len`), this falls back to an ISOLATED fresh fold over just
+/// that smaller prefix — the same cost the old implementation always paid,
+/// scoped to one bound — rather than corrupting the running cursor state.
+/// Correctness over cleverness for the rare/adversarial case; the
+/// monotonic-advance path above is what carries the complexity win for the
+/// realistic (non-regressing) case this ticket's field evidence describes.
+/// A genuine fold failure (a stale/conflicting revision actually present in
+/// the raw event stream) "poisons" the cursor at the first index it occurs:
+/// the cursor freezes there forever (matching the old implementation, which
+/// hit the identical deterministic failure at the identical index on every
+/// fresh rebuild reaching that far) — see
+/// [`Self::advance_transcript`]/[`Self::advance_speaker`].
+struct LedgerHistory<'a> {
+    session_id: &'a str,
+    transcript_events: &'a [TranscriptEvent],
+    speaker_events: &'a [DiarizationSpanRevision],
+    speaker_history_present: bool,
+
+    transcript_applied_len: usize,
+    transcript_map: BTreeMap<String, TranscriptEvent>,
+    transcript_accepted: u64,
+    /// `(index, error)` of the first transcript fold failure ever hit while
+    /// advancing, if any. Once set, `transcript_applied_len == index`
+    /// forever — the persistent map never advances past a genuine failure.
+    transcript_poison: Option<(usize, TranscriptLedgerError)>,
+
+    speaker_applied_len: usize,
+    speaker_map: BTreeMap<String, DiarizationSpanRevision>,
+    speaker_accepted: u64,
+    speaker_poison: Option<(usize, SpeakerTimelineError)>,
+}
+
+impl<'a> LedgerHistory<'a> {
+    fn new(
+        session_id: &'a str,
+        transcript_events: &'a [TranscriptEvent],
+        speaker_events: &'a [DiarizationSpanRevision],
+        speaker_history_present: bool,
+    ) -> Self {
+        Self {
+            session_id,
+            transcript_events,
+            speaker_events,
+            speaker_history_present,
+            transcript_applied_len: 0,
+            transcript_map: BTreeMap::new(),
+            transcript_accepted: 0,
+            transcript_poison: None,
+            speaker_applied_len: 0,
+            speaker_map: BTreeMap::new(),
+            speaker_accepted: 0,
+            speaker_poison: None,
+        }
+    }
+
+    /// Number of `transcript_events` with `received_at_ms <= bound_ms` —
+    /// exactly the prefix `take_while(|e| e.received_at_ms <= bound_ms)`
+    /// would produce. `transcript_events` is sorted ascending by
+    /// `received_at_ms` (the caller's pre-sort, unchanged by this module),
+    /// so that prefix is a genuine, well-defined `Vec` prefix and this
+    /// binary search over exactly that field reproduces its length in
+    /// O(log n) instead of a linear scan.
+    fn transcript_prefix_len(&self, bound_ms: u64) -> usize {
+        self.transcript_events
+            .partition_point(|event| event.received_at_ms <= bound_ms)
+    }
+
+    fn speaker_prefix_len(&self, bound_ms: u64) -> usize {
+        self.speaker_events
+            .partition_point(|event| event.received_at_ms <= bound_ms)
+    }
+
+    /// Advance the persistent transcript fold to `target_len`, folding only
+    /// events not yet seen. No-ops immediately if already poisoned (nothing
+    /// further can ever be folded past a genuine failure) or if
+    /// `target_len` does not exceed `transcript_applied_len` (nothing new to
+    /// fold — including every regression case, left to the caller to
+    /// resolve via an isolated fresh fold).
+    fn advance_transcript(&mut self, target_len: usize) {
+        if self.transcript_poison.is_some() {
+            return;
+        }
+        while self.transcript_applied_len < target_len {
+            let event = self.transcript_events[self.transcript_applied_len].clone();
+            match fast_apply_transcript_event(&mut self.transcript_map, event) {
+                Ok(()) => {
+                    self.transcript_applied_len += 1;
+                    self.transcript_accepted += 1;
+                }
+                Err(error) => {
+                    self.transcript_poison = Some((self.transcript_applied_len, error));
+                    break;
+                }
             }
         }
     }
-    (ledger, timeline)
+
+    fn advance_speaker(&mut self, target_len: usize) {
+        if self.speaker_poison.is_some() {
+            return;
+        }
+        while self.speaker_applied_len < target_len {
+            let event = self.speaker_events[self.speaker_applied_len].clone();
+            match fast_apply_speaker_event(&mut self.speaker_map, event) {
+                Ok(()) => {
+                    self.speaker_applied_len += 1;
+                    self.speaker_accepted += 1;
+                }
+                Err(error) => {
+                    self.speaker_poison = Some((self.speaker_applied_len, error));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Materializes `self.transcript_map`'s values into a [`TranscriptLedger`],
+    /// then re-sorts `latest_spans` into [`TranscriptLedger::sort_latest_spans`]'s
+    /// chronological `(start_time, end_time, span_id)` order — the SAME order
+    /// [`TranscriptLedger::apply_event`] (the live-capture path) always
+    /// produces. Without this, `latest_spans` would carry the persistent
+    /// `BTreeMap`'s span-id-lexicographic key order instead (audio-graph-927a
+    /// review finding, blocker): harmless for every consumer that re-derives
+    /// order explicitly via [`ordered_for_window`], but
+    /// `timeline::speaker_attribution_index`'s exact-tie-break ("first
+    /// iterated wins" when two spans share both `revision_number` AND
+    /// `received_at_ms`) reads `SpeakerTimeline::latest_spans`' vector order
+    /// directly and would silently pick a different winner than the live
+    /// path on that tie. This sort is O(m log m) over the DISTINCT-span
+    /// count `m` (not the raw event count) — it does not reintroduce the
+    /// O(n) per-EVENT re-sort this ticket removed from the fold hot path;
+    /// it runs once per snapshot, exactly like [`TranscriptLedger::apply_event`]'s
+    /// own re-sort would have, just batched instead of per-event.
+    fn materialize_transcript_ledger(&self) -> TranscriptLedger {
+        let mut ledger = TranscriptLedger {
+            schema_version: TranscriptLedger::SCHEMA_VERSION,
+            session_id: self.session_id.to_string(),
+            accepted_event_count: self.transcript_accepted,
+            latest_spans: self.transcript_map.values().cloned().collect(),
+        };
+        ledger.sort_latest_spans();
+        ledger
+    }
+
+    /// [`Self::materialize_transcript_ledger`]'s speaker counterpart — see
+    /// that method's doc comment for why the chronological re-sort is
+    /// required, not optional. This is the fix for the reported blocker:
+    /// `speaker_attribution_index`'s tie-break is exact-order-sensitive, so
+    /// this snapshot must reproduce [`SpeakerTimeline::apply_event`]'s
+    /// `(start_time, end_time, span_id)` order exactly.
+    fn materialize_speaker_timeline(&self) -> SpeakerTimeline {
+        let mut timeline = SpeakerTimeline {
+            schema_version: SpeakerTimeline::SCHEMA_VERSION,
+            session_id: self.session_id.to_string(),
+            accepted_event_count: self.speaker_accepted,
+            latest_spans: self.speaker_map.values().cloned().collect(),
+        };
+        timeline.sort_latest_spans();
+        timeline
+    }
+
+    fn fresh_fold_transcript_or_error(
+        session_id: &str,
+        events_prefix: &[TranscriptEvent],
+    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            fast_apply_transcript_event(&mut map, event.clone())?;
+            accepted += 1;
+        }
+        let mut ledger = TranscriptLedger {
+            schema_version: TranscriptLedger::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        ledger.sort_latest_spans();
+        Ok(ledger)
+    }
+
+    fn fresh_fold_speaker_or_error(
+        session_id: &str,
+        events_prefix: &[DiarizationSpanRevision],
+    ) -> Result<SpeakerTimeline, SpeakerTimelineError> {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            fast_apply_speaker_event(&mut map, event.clone())?;
+            accepted += 1;
+        }
+        let mut timeline = SpeakerTimeline {
+            schema_version: SpeakerTimeline::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        timeline.sort_latest_spans();
+        Ok(timeline)
+    }
+
+    fn fresh_fold_transcript_degrading(
+        session_id: &str,
+        events_prefix: &[TranscriptEvent],
+    ) -> TranscriptLedger {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            match fast_apply_transcript_event(&mut map, event.clone()) {
+                Ok(()) => accepted += 1,
+                Err(_) => break,
+            }
+        }
+        let mut ledger = TranscriptLedger {
+            schema_version: TranscriptLedger::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        ledger.sort_latest_spans();
+        ledger
+    }
+
+    fn fresh_fold_speaker_degrading(
+        session_id: &str,
+        events_prefix: &[DiarizationSpanRevision],
+    ) -> SpeakerTimeline {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            match fast_apply_speaker_event(&mut map, event.clone()) {
+                Ok(()) => accepted += 1,
+                Err(_) => break,
+            }
+        }
+        let mut timeline = SpeakerTimeline {
+            schema_version: SpeakerTimeline::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        timeline.sort_latest_spans();
+        timeline
+    }
+
+    /// Snapshot the transcript ledger at `bound_ms`, propagating the first
+    /// fold failure at or before this bound as an error. Mirrors the
+    /// draft-time evidence-ledger loop in
+    /// [`MaterializedProjectionState::replay_accepted_patches_with_history`],
+    /// which abandons the whole patch on a fold error rather than degrading.
+    fn transcript_snapshot_or_error(
+        &mut self,
+        bound_ms: u64,
+    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
+        let target_len = self.transcript_prefix_len(bound_ms);
+        self.advance_transcript(target_len);
+        if let Some((poison_index, error)) = &self.transcript_poison
+            && target_len > *poison_index
+        {
+            return Err(error.clone());
+        }
+        if target_len == self.transcript_applied_len {
+            Ok(self.materialize_transcript_ledger())
+        } else {
+            debug_assert!(target_len < self.transcript_applied_len);
+            Self::fresh_fold_transcript_or_error(
+                self.session_id,
+                &self.transcript_events[..target_len],
+            )
+        }
+    }
+
+    /// [`Self::transcript_snapshot_or_error`]'s speaker counterpart.
+    /// Returns `Ok(None)` unconditionally when the speaker stream is not
+    /// present, matching the old `speaker_history_present.then(...)` gate.
+    fn speaker_snapshot_or_error(
+        &mut self,
+        bound_ms: u64,
+    ) -> Result<Option<SpeakerTimeline>, SpeakerTimelineError> {
+        if !self.speaker_history_present {
+            return Ok(None);
+        }
+        let target_len = self.speaker_prefix_len(bound_ms);
+        self.advance_speaker(target_len);
+        if let Some((poison_index, error)) = &self.speaker_poison
+            && target_len > *poison_index
+        {
+            return Err(error.clone());
+        }
+        if target_len == self.speaker_applied_len {
+            Ok(Some(self.materialize_speaker_timeline()))
+        } else {
+            debug_assert!(target_len < self.speaker_applied_len);
+            Self::fresh_fold_speaker_or_error(self.session_id, &self.speaker_events[..target_len])
+                .map(Some)
+        }
+    }
+
+    /// Snapshot the transcript ledger at `bound_ms`, degrading to whatever
+    /// was already folded on a fold failure rather than erroring. Mirrors
+    /// the old `replay_ledger_and_timeline_up_to`'s classify-bound
+    /// reconstruction (audio-graph-f3d4 review fix): the authoritative
+    /// validity check already happened in the evidence-bound fold, so a
+    /// failure widening PAST that already-proven prefix degrades safely
+    /// rather than invalidating the patch a second time.
+    ///
+    /// Once poisoned at index `p`, ANY `bound_ms` whose prefix reaches at or
+    /// past `p` degrades to the SAME frozen state (a fresh rebuild that
+    /// always dies at the identical `p` can never produce anything past
+    /// it, no matter how large the requested bound), so this returns the
+    /// live cursor snapshot directly with no repeated re-fold — only a
+    /// genuine regression (`target_len` behind ground already covered)
+    /// pays for an isolated fresh fold.
+    fn transcript_snapshot_degrading(&mut self, bound_ms: u64) -> TranscriptLedger {
+        let target_len = self.transcript_prefix_len(bound_ms);
+        self.advance_transcript(target_len);
+        if target_len >= self.transcript_applied_len {
+            self.materialize_transcript_ledger()
+        } else {
+            Self::fresh_fold_transcript_degrading(
+                self.session_id,
+                &self.transcript_events[..target_len],
+            )
+        }
+    }
+
+    /// [`Self::transcript_snapshot_degrading`]'s speaker counterpart.
+    /// Returns `None` unconditionally when the speaker stream is not
+    /// present.
+    fn speaker_snapshot_degrading(&mut self, bound_ms: u64) -> Option<SpeakerTimeline> {
+        if !self.speaker_history_present {
+            return None;
+        }
+        let target_len = self.speaker_prefix_len(bound_ms);
+        self.advance_speaker(target_len);
+        if target_len >= self.speaker_applied_len {
+            Some(self.materialize_speaker_timeline())
+        } else {
+            Some(Self::fresh_fold_speaker_degrading(
+                self.session_id,
+                &self.speaker_events[..target_len],
+            ))
+        }
+    }
 }
 
 impl MaterializedProjectionState {
@@ -3181,7 +3674,7 @@ impl MaterializedProjectionState {
     /// that gates acceptance instead widens to `created_at_ms +
     /// generation_latency_ms` so it agrees with the live apply gate, which
     /// re-checks against a fresh snapshot taken after generation completes,
-    /// not the draft-time one (see `replay_ledger_and_timeline_up_to`).
+    /// not the draft-time one (see [`LedgerHistory::transcript_snapshot_degrading`]).
     ///
     /// `None` means the canonical speaker stream is unavailable. `Some(vec![])`
     /// means that stream is present and authoritatively empty.
@@ -3210,33 +3703,47 @@ impl MaterializedProjectionState {
         // start/end earlier, so timeline fields must not break timestamp ties.
         speaker_events.sort_by_key(|event| event.received_at_ms);
 
+        // Two independent forward cursors (audio-graph-927a) — see
+        // `LedgerHistory`'s doc comment for why one shared cursor cannot
+        // serve both bound sequences. `evidence_history` tracks the
+        // draft-time `created_at_ms` bound; `classify_history` tracks the
+        // classify-time `created_at_ms + generation_latency_ms` bound. Each
+        // folds every transcript/speaker event AT MOST ONCE across the
+        // whole replay instead of the old per-patch full re-fold.
+        let mut evidence_history = LedgerHistory::new(
+            &session_id,
+            &transcript_events,
+            &speaker_events,
+            speaker_history_present,
+        );
+        let mut classify_history = LedgerHistory::new(
+            &session_id,
+            &transcript_events,
+            &speaker_events,
+            speaker_history_present,
+        );
+
         'patches: for patch in patches {
             validation.checked_patch_count += 1;
-            let mut evidence_ledger = TranscriptLedger::new(&session_id);
-            for event in transcript_events
-                .iter()
-                .take_while(|event| event.received_at_ms <= patch.created_at_ms)
-            {
-                if let Err(error) = evidence_ledger.apply_event(event.clone()) {
-                    validation.invalid_patch_count += 1;
-                    validation
-                        .errors
-                        .push(HistoricalProjectionValidationError::TranscriptReplay {
-                            sequence: patch.sequence,
-                            error,
-                        });
-                    continue 'patches;
-                }
-            }
+            let evidence_ledger =
+                match evidence_history.transcript_snapshot_or_error(patch.created_at_ms) {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        validation.invalid_patch_count += 1;
+                        validation.errors.push(
+                            HistoricalProjectionValidationError::TranscriptReplay {
+                                sequence: patch.sequence,
+                                error,
+                            },
+                        );
+                        continue 'patches;
+                    }
+                };
 
-            let mut evidence_speaker_timeline =
-                speaker_history_present.then(|| SpeakerTimeline::new(&session_id));
-            if let Some(timeline) = evidence_speaker_timeline.as_mut() {
-                for event in speaker_events
-                    .iter()
-                    .take_while(|event| event.received_at_ms <= patch.created_at_ms)
-                {
-                    if let Err(error) = timeline.apply_event(event.clone()) {
+            let evidence_speaker_timeline =
+                match evidence_history.speaker_snapshot_or_error(patch.created_at_ms) {
+                    Ok(timeline) => timeline,
+                    Err(error) => {
                         validation.invalid_patch_count += 1;
                         validation.errors.push(
                             HistoricalProjectionValidationError::SpeakerReplay {
@@ -3246,8 +3753,7 @@ impl MaterializedProjectionState {
                         );
                         continue 'patches;
                     }
-                }
-            }
+                };
 
             // The live gate (`apply_validated_patch_with_speaker_timeline_opt`)
             // classifies basis currency against a snapshot taken at actual
@@ -3276,13 +3782,8 @@ impl MaterializedProjectionState {
             let classify_bound_ms = patch
                 .created_at_ms
                 .saturating_add(patch.generation_latency_ms.unwrap_or(0));
-            let (ledger, speaker_timeline) = replay_ledger_and_timeline_up_to(
-                &session_id,
-                &transcript_events,
-                &speaker_events,
-                speaker_history_present,
-                classify_bound_ms,
-            );
+            let ledger = classify_history.transcript_snapshot_degrading(classify_bound_ms);
+            let speaker_timeline = classify_history.speaker_snapshot_degrading(classify_bound_ms);
 
             match ledger.classify_basis_currency(&patch.basis, speaker_timeline.as_ref()) {
                 BasisCurrency::Current | BasisCurrency::AppendOnlyStale(_) => {}
@@ -6641,6 +7142,127 @@ mod tests {
         );
     }
 
+    /// Pins the audio-graph-927a review blocker: `LedgerHistory`'s
+    /// materialized speaker snapshot must reproduce
+    /// [`SpeakerTimeline::apply_event`]'s chronological `(start_time,
+    /// end_time, span_id)` `latest_spans` order, not the persistent
+    /// `BTreeMap`'s span-id-lexicographic order.
+    ///
+    /// `timeline::speaker_attribution_index`'s winner rule is strict
+    /// (`revision_number >`, tie-broken by `received_at_ms >`), so on an
+    /// EXACT tie (equal `revision_number` AND equal `received_at_ms` — a
+    /// diarization batch flushing multiple overlapping first-revision spans
+    /// in the same wall-clock millisecond, each attributing the SAME
+    /// transcript span) neither candidate satisfies `wins` and the
+    /// FIRST-ITERATED span keeps the key. `"dz-b"` sorts AFTER `"dz-a"`
+    /// lexicographically but starts EARLIER (`start_time` 1.0 vs 3.0), so a
+    /// lexicographic snapshot flips the winner relative to the live path's
+    /// chronological one — silently, because `judge_claim_evidence` still
+    /// admits evidence either way, it just stamps the wrong `speaker_ref`.
+    #[test]
+    fn ledger_history_speaker_snapshot_breaks_exact_ties_in_chronological_not_lexicographic_order()
+    {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Shared span."));
+        transcript.received_at_ms = 1_000;
+
+        let mut dz_b = DiarizationSpanRevision::from(diarization_payload(
+            "dz-b",
+            "deepgram",
+            1,
+            "spk-B",
+            DiarizationSpanStability::Stable,
+        ));
+        dz_b.start_time = 1.0;
+        dz_b.end_time = 2.0;
+        dz_b.received_at_ms = 5_000;
+        dz_b.basis_asr_span_ids = vec!["span-1".to_string()];
+
+        let mut dz_a = DiarizationSpanRevision::from(diarization_payload(
+            "dz-a",
+            "deepgram",
+            1,
+            "spk-A",
+            DiarizationSpanStability::Stable,
+        ));
+        dz_a.start_time = 3.0;
+        dz_a.end_time = 4.0;
+        dz_a.received_at_ms = 5_000;
+        dz_a.basis_asr_span_ids = vec!["span-1".to_string()];
+
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-1",
+            "Tie-break",
+            "Shared span.",
+        );
+        patch.operations = vec![ProjectionOperation::UpsertNote {
+            id: "note-1".to_string(),
+            title: "Tie-break".to_string(),
+            body: "Shared span.".to_string(),
+            tags: vec!["decision".to_string()],
+            evidence: crate::claim_evidence::EvidenceAnchor {
+                claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+                span_id: Some("span-1".to_string()),
+                quote: None,
+                note: None,
+            },
+            heading_level: None,
+        }];
+        patch.created_at_ms = 10_000;
+
+        // Live path: builds the `SpeakerTimeline` via `apply_event`
+        // (chronological `sort_latest_spans` order) — the ground truth this
+        // replay must match.
+        let mut ledger = TranscriptLedger::new("session-tie");
+        ledger.apply_event(transcript.clone()).unwrap();
+        let live_speakers =
+            SpeakerTimeline::replay("session-tie", [dz_b.clone(), dz_a.clone()]).unwrap();
+        let mut live_state = MaterializedProjectionState::new("session-tie");
+        live_state
+            .apply_validated_patch_with_speaker_timeline(&ledger, &live_speakers, &patch)
+            .expect("live apply");
+        let live_speaker_ref = live_state.notes.notes[0]
+            .evidence
+            .clone()
+            .expect("live apply admits GroundedInference evidence")
+            .span()
+            .expect("span resolved")
+            .speaker_ref
+            .clone();
+        assert_eq!(
+            live_speaker_ref.as_deref(),
+            Some("spk-B"),
+            "sanity check: the chronologically-first span (start_time=1.0) wins the tie"
+        );
+
+        // Replay path: must agree with the live path exactly, not flip to
+        // "spk-A" because `LedgerHistory`'s internal storage happens to be
+        // span_id-lexicographic.
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-tie",
+            [transcript],
+            Some(vec![dz_b, dz_a]),
+            [patch],
+        )
+        .expect("replay");
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        let replayed_speaker_ref = replayed.state.notes.notes[0]
+            .evidence
+            .clone()
+            .expect("replay must admit GroundedInference evidence")
+            .span()
+            .expect("span resolved")
+            .speaker_ref
+            .clone();
+        assert_eq!(
+            replayed_speaker_ref, live_speaker_ref,
+            "replay's speaker-attribution tie-break must match the live apply path exactly \
+             (chronological order), not silently flip because the forward-cursor's persistent \
+             storage is BTreeMap span_id order"
+        );
+    }
+
     /// ADR-0026 §3/§4: a diarization span's latest-wins attribution overrides
     /// the transcript event's untrusted inline ASR speaker label. Before
     /// `resolve_claim_evidence_basis_events` existed, `judge_claim_evidence`
@@ -6769,6 +7391,553 @@ mod tests {
         assert_eq!(replayed.validation.invalid_patch_count, 0);
         assert_eq!(replayed.state.notes.last_sequence, 2);
         assert_eq!(replayed.state.notes.notes.len(), 2);
+    }
+
+    /// Direct-construction transcript event for the `LedgerHistory`
+    /// regression/complexity fixtures below — bypasses `asr_payload`'s
+    /// `is_final: revision_number > 1` coupling so every synthetic event is
+    /// eligible for projection regardless of the revision number chosen.
+    fn ledger_history_test_transcript_event(
+        span_id: &str,
+        revision_number: u64,
+        received_at_ms: u64,
+        text: &str,
+    ) -> TranscriptEvent {
+        TranscriptEvent {
+            span_id: span_id.to_string(),
+            provider: "test".to_string(),
+            source_id: "test-source".to_string(),
+            provider_item_id: None,
+            transcript_segment_id: None,
+            speaker_id: Some("speaker-1".to_string()),
+            speaker_label: Some("Speaker 1".to_string()),
+            channel: None,
+            text: text.to_string(),
+            start_time: (received_at_ms as f64) / 1000.0,
+            end_time: (received_at_ms as f64) / 1000.0 + 1.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: TranscriptEventStability::Final,
+            revision_number,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms,
+        }
+    }
+
+    /// Deliverable (d) — audio-graph-927a: a regressing `classify_bound_ms`
+    /// (this patch's classify-time bound is EARLIER than the immediately
+    /// preceding patch's) must still classify correctly via an isolated
+    /// fresh fold for that one bound, not `LedgerHistory`'s forward
+    /// cursor's later, frozen state.
+    ///
+    /// `generation_latency_ms` genuinely varies in production, so
+    /// `classify_bound_ms` is not guaranteed monotone across
+    /// sequence-ordered patches even when `created_at_ms` is (the ticket's
+    /// CRITICAL SEMANTIC CONSTRAINT). This fixture regresses BOTH bounds at
+    /// once (patch B's `created_at_ms` also regresses relative to patch
+    /// A's), exercising both cursors' regression paths in one pass —
+    /// mirroring
+    /// `materialized_projection_history_uses_each_patch_time_when_timestamps_regress`'s
+    /// pre-existing out-of-order `created_at_ms` shape above, but for a
+    /// retcon whose visibility genuinely depends on getting the regressed
+    /// bound right (a buggy "use the forward-frozen state" implementation
+    /// would see the retcon a patch three timestamps earlier should never
+    /// see, and misclassify it as `Revised`).
+    #[test]
+    fn ledger_history_handles_a_regressing_classify_bound_via_an_isolated_fresh_fold() {
+        let span_1_v1 = ledger_history_test_transcript_event("span-1", 2, 1_000, "Original text.");
+        let span_2_v1 = ledger_history_test_transcript_event("span-2", 2, 2_000, "Other span.");
+        let span_1_v2 = ledger_history_test_transcript_event("span-1", 3, 3_000, "Corrected text.");
+
+        // Ground truth at t=3000 (after the retcon): span-1 is at rev3,
+        // span-2 at rev2.
+        let mut ledger_at_3000 = TranscriptLedger::new("session-regress");
+        ledger_at_3000
+            .apply_event(span_1_v1.clone())
+            .expect("span-1 v1");
+        ledger_at_3000
+            .apply_event(span_2_v1.clone())
+            .expect("span-2 v1");
+        ledger_at_3000
+            .apply_event(span_1_v2.clone())
+            .expect("span-1 v2 (retcon)");
+
+        // Ground truth at t=2000 (before the retcon): span-1 is still at
+        // rev2, span-2 at rev2.
+        let mut ledger_at_2000 = TranscriptLedger::new("session-regress");
+        ledger_at_2000
+            .apply_event(span_1_v1.clone())
+            .expect("span-1 v1");
+        ledger_at_2000
+            .apply_event(span_2_v1.clone())
+            .expect("span-2 v1");
+
+        // Patch A: created and classified at t=3000, AFTER the retcon.
+        let mut patch_a = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&span_1_v1),
+            "note-a",
+            "After retcon",
+            "Corrected text.",
+        );
+        patch_a.basis = ledger_at_3000.current_basis();
+        patch_a.created_at_ms = 3_000;
+        patch_a.generation_latency_ms = Some(0);
+
+        // Patch B: created and classified at t=2000, BEFORE the retcon.
+        // Both `created_at_ms` (2000 < 3000) and `classify_bound_ms`
+        // (2000 < 3000) regress relative to patch A.
+        let mut patch_b = notes_patch_for_basis(
+            2,
+            std::slice::from_ref(&span_1_v1),
+            "note-b",
+            "Before retcon",
+            "Original text.",
+        );
+        patch_b.basis = ledger_at_2000.current_basis();
+        patch_b.created_at_ms = 2_000;
+        patch_b.generation_latency_ms = Some(0);
+
+        // The correct snapshot at the regressed bound (t=2000) classifies
+        // patch B's basis as `Current`.
+        assert!(matches!(
+            ledger_at_2000.classify_basis_currency(&patch_b.basis, None),
+            BasisCurrency::Current
+        ));
+        // The WRONG (forward-frozen, t=3000) state disagrees — exactly the
+        // divergence a regression-handling bug would produce.
+        assert!(matches!(
+            ledger_at_3000.classify_basis_currency(&patch_b.basis, None),
+            BasisCurrency::Revised(ProjectionBasisStaleness::StaleSpanRevision { .. })
+        ));
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-regress",
+            [span_1_v1, span_2_v1, span_1_v2],
+            None,
+            [patch_a, patch_b],
+        )
+        .expect("regressing classify bound replays");
+
+        assert_eq!(replayed.validation.checked_patch_count, 2);
+        assert_eq!(
+            replayed.validation.invalid_patch_count, 0,
+            "patch B's regressed classify bound must be resolved via an isolated fresh fold, \
+             not the forward cursor's later, frozen state: {:?}",
+            replayed.validation.errors
+        );
+        assert_eq!(
+            replayed
+                .state
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-a", "note-b"]
+        );
+    }
+
+    /// Major review finding: the EVIDENCE cursor's regression fallback
+    /// (`LedgerHistory::transcript_snapshot_or_error`'s isolated-fresh-fold
+    /// branch) was implemented correctly but had zero test coverage — a
+    /// mutant that replaced it with `Ok(self.materialize_transcript_ledger())`
+    /// (returning the LATER, forward-frozen cursor state instead of an
+    /// isolated fold at the regressed bound) survived the full default
+    /// suite, because [`ledger_history_handles_a_regressing_classify_bound_via_an_isolated_fresh_fold`]
+    /// only exercises the CLASSIFY cursor's regression branch, and every
+    /// existing regression fixture's evidence anchor is the default
+    /// `EvidenceAnchor` (`KnowledgeGap`, unconditionally refused either way,
+    /// so the evidence ledger's content never surfaces in the output).
+    ///
+    /// This test gives patch B a real, span-citing `GroundedInference`
+    /// anchor pinned to the PRE-retcon revision, so the dual-bound semantic
+    /// constraint ("claim evidence stays pinned to draft-time visibility")
+    /// is actually observable: a forward-frozen mutant resolves the anchor
+    /// against the POST-retcon ledger, where the pinned (revision 2) span
+    /// no longer exists — `resolve_covered_events`'s exact-identity
+    /// `(span_id, revision_number)` lookup misses, and the note's evidence
+    /// silently degrades from `Some(..)` to `None` instead of resolving.
+    #[test]
+    fn ledger_history_evidence_cursor_regression_resolves_evidence_against_the_regressed_snapshot()
+    {
+        let span_1_v1 = ledger_history_test_transcript_event("span-1", 2, 1_000, "Original text.");
+        let span_2_v1 = ledger_history_test_transcript_event("span-2", 2, 2_000, "Other span.");
+        let span_1_v2 = ledger_history_test_transcript_event("span-1", 3, 3_000, "Corrected text.");
+
+        let mut ledger_at_3000 = TranscriptLedger::new("session-regress-evidence");
+        ledger_at_3000
+            .apply_event(span_1_v1.clone())
+            .expect("span-1 v1");
+        ledger_at_3000
+            .apply_event(span_2_v1.clone())
+            .expect("span-2 v1");
+        ledger_at_3000
+            .apply_event(span_1_v2.clone())
+            .expect("span-1 v2 (retcon)");
+
+        let mut ledger_at_2000 = TranscriptLedger::new("session-regress-evidence");
+        ledger_at_2000
+            .apply_event(span_1_v1.clone())
+            .expect("span-1 v1");
+        ledger_at_2000
+            .apply_event(span_2_v1.clone())
+            .expect("span-2 v1");
+
+        // Patch A: created (and evidence-bound) at t=3000, AFTER the
+        // retcon — forward-advances the shared evidence cursor past
+        // span-1's rev3.
+        let mut patch_a = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&span_1_v1),
+            "note-a",
+            "After retcon",
+            "Corrected text.",
+        );
+        patch_a.basis = ledger_at_3000.current_basis();
+        patch_a.created_at_ms = 3_000;
+        patch_a.generation_latency_ms = Some(0);
+
+        // Patch B: created (and evidence-bound) at t=2000 — BEFORE the
+        // retcon, regressed relative to patch A. Its `GroundedInference`
+        // anchor cites span-1, which draft-time visibility (ADR-0037/
+        // ADR-0031) demands resolve at the PRE-retcon revision (2), matching
+        // what patch B's author actually saw — never the post-retcon
+        // revision (3) patch A's later bound exposed.
+        let mut patch_b = notes_patch_for_basis(
+            2,
+            std::slice::from_ref(&span_1_v1),
+            "note-b",
+            "Before retcon",
+            "Original text.",
+        );
+        patch_b.basis = ledger_at_2000.current_basis();
+        patch_b.created_at_ms = 2_000;
+        patch_b.generation_latency_ms = Some(0);
+        patch_b.operations = vec![ProjectionOperation::UpsertNote {
+            id: "note-b".to_string(),
+            title: "Before retcon".to_string(),
+            body: "Original text.".to_string(),
+            tags: vec!["decision".to_string()],
+            evidence: crate::claim_evidence::EvidenceAnchor {
+                claim_class: crate::claim_evidence::ClaimClass::GroundedInference,
+                span_id: Some("span-1".to_string()),
+                quote: None,
+                note: None,
+            },
+            heading_level: None,
+        }];
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-regress-evidence",
+            [span_1_v1, span_2_v1, span_1_v2],
+            None,
+            [patch_a, patch_b],
+        )
+        .expect("regressing evidence bound replays");
+
+        assert_eq!(replayed.validation.checked_patch_count, 2);
+        assert_eq!(
+            replayed.validation.invalid_patch_count, 0,
+            "both patches' bases must classify as current: {:?}",
+            replayed.validation.errors
+        );
+
+        let note_b = replayed
+            .state
+            .notes
+            .notes
+            .iter()
+            .find(|note| note.id == "note-b")
+            .expect("note-b materialized");
+        let evidence = note_b.evidence.clone().expect(
+            "patch B's GroundedInference anchor must resolve against the regressed (t=2000) \
+             evidence snapshot, not the evidence cursor's later, forward-frozen state — a \
+             forward-frozen mutant resolves nothing here (revision mismatch) instead",
+        );
+        let span = evidence.span().expect("GroundedInference resolves a span");
+        assert_eq!(span.span_id, "span-1");
+        assert_eq!(
+            span.revision_number, 2,
+            "must pin span-1 at its pre-retcon revision (2), matching what patch B's author saw \
+             at draft time — a forward-frozen mutant would see rev3 (post-retcon) and therefore \
+             fail to resolve at all"
+        );
+    }
+
+    /// Minor review finding: the dedicated regression test above regresses
+    /// BOTH `created_at_ms` and `classify_bound_ms` together. The ticket's
+    /// own named non-monotone shape — `created_at_ms` staying
+    /// NON-DECREASING across sequence-ordered patches while
+    /// `classify_bound_ms` regresses purely because `generation_latency_ms`
+    /// varies (a slow patch followed by a fast one) — was previously only a
+    /// prose claim plus an observation about the synth fixture's own
+    /// latency arithmetic, never its own pinned test. This builds that
+    /// exact shape: patch A is slow (5000ms latency, classify bound 6000),
+    /// patch B is fast (0ms latency) and created LATER (2000 >= 1000) but
+    /// classified EARLIER (2000 < 6000) — a genuine classify-only
+    /// regression with the evidence cursor advancing normally throughout.
+    #[test]
+    fn ledger_history_classify_bound_regresses_while_created_at_ms_advances_via_varying_generation_latency()
+     {
+        let span_0 = ledger_history_test_transcript_event("span-0", 1, 100, "Baseline.");
+        let span_1_v1 =
+            ledger_history_test_transcript_event("span-1", 1, 500, "Original attribution.");
+        let span_1_v2 =
+            ledger_history_test_transcript_event("span-1", 2, 4_000, "Corrected attribution.");
+
+        // Patch A: created at t=1000, classified at t=1000+5000=6000 — its
+        // basis cites only span-0 (chronologically first, never revised),
+        // so the later span-1 retcon is a harmless append relative to it.
+        // Processing it forward-advances the shared classify cursor all the
+        // way to t=6000.
+        let mut patch_a = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&span_0),
+            "note-a",
+            "Baseline",
+            "Baseline.",
+        );
+        patch_a.created_at_ms = 1_000;
+        patch_a.generation_latency_ms = Some(5_000);
+
+        // Patch B: created at t=2000 (>= patch A's 1000 — `created_at_ms`
+        // is non-decreasing) but classified at t=2000+0=2000 — ITS classify
+        // bound (2000) regresses relative to patch A's (6000) purely
+        // because `generation_latency_ms` varies, not because `created_at_ms`
+        // itself went backward. Its basis is the full ledger snapshot at
+        // t=2000 (span-0 + span-1 at its pre-retcon revision 1), matching
+        // what was visible before the retcon lands at t=4000.
+        let mut patch_b = notes_patch_for_basis(
+            2,
+            &[span_0.clone(), span_1_v1.clone()],
+            "note-b",
+            "Attribution",
+            "Original attribution.",
+        );
+        patch_b.created_at_ms = 2_000;
+        patch_b.generation_latency_ms = Some(0);
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-classify-regress-only",
+            [span_0, span_1_v1, span_1_v2],
+            None,
+            [patch_a, patch_b],
+        )
+        .expect("classify-bound-only regression replays");
+
+        assert_eq!(replayed.validation.checked_patch_count, 2);
+        assert_eq!(
+            replayed.validation.invalid_patch_count, 0,
+            "patch B's regressed classify bound (2000, behind patch A's 6000) must resolve via \
+             an isolated fresh fold even though patch B's OWN created_at_ms (2000) never \
+             regressed relative to patch A's (1000): {:?}",
+            replayed.validation.errors
+        );
+        assert_eq!(
+            replayed
+                .state
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-a", "note-b"]
+        );
+    }
+
+    /// Synthetic-fixture sizes for
+    /// `ledger_history_folds_each_event_a_bounded_number_of_times_not_once_per_patch`
+    /// (audio-graph-927a deliverable c): large enough that the pre-927a
+    /// per-patch full-refold algorithm's fold-operation count (~patches x
+    /// events / 2, for bounds spread evenly across the stream) is clearly
+    /// superlinear relative to `events + patches`, while staying fast
+    /// enough for the default `cargo test` run — this is a deterministic
+    /// work-counter assertion, not a wall-clock benchmark, so it needs no
+    /// `#[ignore]` gate.
+    const LEDGER_HISTORY_COMPLEXITY_FIXTURE_EVENTS: usize = 900;
+    const LEDGER_HISTORY_COMPLEXITY_FIXTURE_PATCHES: usize = 300;
+
+    /// Builds `num_events` transcript events, `num_events` speaker
+    /// (diarization) revisions, and `num_patches` notes patches spread
+    /// evenly across them: `created_at_ms` and `classify_bound_ms` both
+    /// strictly increasing across patches (the realistic, non-regressing
+    /// shape this ticket's field evidence describes — the regression path
+    /// has its own dedicated test above). Every patch's basis is the
+    /// ledger's own running current basis at that point (transcript-only —
+    /// the speaker revisions are NOT cited by any basis, so they cannot
+    /// affect currency classification; they exist purely to exercise the
+    /// SPEAKER cursor's fold-op counting, addressing the review finding
+    /// that the original fixture built transcript events only and so could
+    /// never detect a reverted-to-per-patch-refold speaker cursor), and
+    /// every patch upserts a distinct note id, so the whole log applies
+    /// without a single invalid patch.
+    fn ledger_history_complexity_fixture(
+        num_events: usize,
+        num_patches: usize,
+    ) -> (
+        Vec<TranscriptEvent>,
+        Vec<DiarizationSpanRevision>,
+        Vec<ProjectionPatch>,
+    ) {
+        assert!(
+            num_events.is_multiple_of(num_patches),
+            "fixture size must be a multiple of the patch count"
+        );
+        let events_per_patch = num_events / num_patches;
+        let mut ledger = TranscriptLedger::new("complexity-fixture");
+        let mut events = Vec::with_capacity(num_events);
+        let mut speaker_events = Vec::with_capacity(num_events);
+        let mut patches = Vec::with_capacity(num_patches);
+
+        for i in 0..num_events {
+            let event = ledger_history_test_transcript_event(
+                &format!("complexity-span-{i}"),
+                1,
+                1_700_000_000_000 + (i as u64) * 10,
+                &format!("Complexity fixture line {i}."),
+            );
+            ledger
+                .apply_event(event.clone())
+                .expect("complexity fixture events apply cleanly");
+            events.push(event);
+
+            // Independent speaker stream, strictly increasing `received_at_ms`
+            // in lockstep with the transcript stream, never cited by any
+            // patch basis — see this fixture's doc comment above.
+            let mut speaker_event = DiarizationSpanRevision::from(diarization_payload(
+                &format!("complexity-speaker-{i}"),
+                "test",
+                1,
+                "speaker-1",
+                DiarizationSpanStability::Stable,
+            ));
+            speaker_event.received_at_ms = 1_700_000_000_000 + (i as u64) * 10;
+            speaker_events.push(speaker_event);
+
+            if !(i + 1).is_multiple_of(events_per_patch) {
+                continue;
+            }
+            let patch_index = (i + 1) / events_per_patch - 1;
+            let created_at_ms = 1_700_000_000_000 + (i as u64) * 10;
+            patches.push(ProjectionPatch {
+                route: None,
+                sequence: patch_index as u64 + 1,
+                kind: ProjectionKind::Notes,
+                llm_request_id: format!("complexity-req-{patch_index}"),
+                basis: ledger.current_projection_basis(),
+                operations: vec![ProjectionOperation::UpsertNote {
+                    id: format!("complexity-note-{patch_index}"),
+                    title: "Complexity fixture".to_string(),
+                    body: format!("Complexity fixture line {i}."),
+                    tags: vec!["complexity".to_string()],
+                    evidence: crate::claim_evidence::EvidenceAnchor::default(),
+                    heading_level: None,
+                }],
+                confidence: 0.9,
+                provenance: ProjectionProvenance {
+                    provider: "synth-bench".to_string(),
+                    model: "complexity-fixture".to_string(),
+                    prompt_id: "complexity_v1".to_string(),
+                    route_id: None,
+                    model_source: crate::llm::route::ModelIdentitySource::Requested,
+                },
+                queued_at_ms: Some(created_at_ms),
+                generation_latency_ms: Some(5),
+                apply_latency_ms: Some(5),
+                basis_currency_at_apply: None,
+                created_at_ms,
+            });
+        }
+
+        (events, speaker_events, patches)
+    }
+
+    /// Deliverable (c) — audio-graph-927a: proves `LedgerHistory` folds
+    /// each raw transcript AND speaker event a BOUNDED number of times
+    /// across the whole replay (at most once per cursor — evidence and
+    /// classify — i.e. exactly `2 x (events + speaker_events)` on this
+    /// non-regressing fixture), not once per patch. The speaker stream is
+    /// included specifically because an earlier version of this fixture
+    /// built transcript events only, so it could never detect a revert of
+    /// the SPEAKER cursor alone back to a per-patch full re-fold (review
+    /// finding).
+    ///
+    /// The pre-927a implementation rebuilt a fresh `TranscriptLedger`/
+    /// `SpeakerTimeline` pair from event zero for every patch, twice per
+    /// patch, so its fold-operation count on this fixture would be on the
+    /// order of `patches x (events + speaker_events)` (bounds spread evenly
+    /// average out to roughly half the full prefix per patch) — orders of
+    /// magnitude more than this test allows.
+    ///
+    /// No wall-clock timing: this counts actual fold operations via a
+    /// `#[cfg(test)]` atomic counter incremented only inside
+    /// `fast_apply_transcript_event`/`fast_apply_speaker_event`.
+    /// Mutation-proof in both directions — a revert to a per-patch full
+    /// re-fold (even if routed through this counter) blows past the
+    /// exact-equality upper bound, and bypassing `LedgerHistory` entirely
+    /// leaves the counter at zero, tripping the same exact-equality
+    /// assertion from below.
+    #[test]
+    fn ledger_history_folds_each_event_a_bounded_number_of_times_not_once_per_patch() {
+        let (events, speaker_events, patches) = ledger_history_complexity_fixture(
+            LEDGER_HISTORY_COMPLEXITY_FIXTURE_EVENTS,
+            LEDGER_HISTORY_COMPLEXITY_FIXTURE_PATCHES,
+        );
+        let events_len = events.len();
+        let speaker_events_len = speaker_events.len();
+        let patches_len = patches.len();
+
+        reset_ledger_history_fold_ops_counter();
+        let replay = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "complexity-fixture",
+            events,
+            Some(speaker_events),
+            patches,
+        )
+        .expect("complexity fixture replays cleanly");
+        let fold_ops = ledger_history_fold_ops_counter();
+
+        assert_eq!(
+            replay.validation.invalid_patch_count, 0,
+            "complexity fixture must apply cleanly (every basis stays current): {:?}",
+            replay.validation.errors
+        );
+        assert_eq!(replay.validation.checked_patch_count, patches_len);
+
+        // Exact bound: the evidence cursor and the classify cursor each
+        // fold every one of `events_len` transcript events AND every one of
+        // `speaker_events_len` speaker events AT MOST ONCE across the WHOLE
+        // replay (both bound sequences are strictly non-decreasing by
+        // construction here), so the total fold-op count is exactly
+        // `2 * (events_len + speaker_events_len)` — never a function of
+        // `patches_len`.
+        let total_raw_events = events_len + speaker_events_len;
+        assert_eq!(
+            fold_ops,
+            2 * total_raw_events,
+            "LedgerHistory must fold each transcript/speaker event at most once per cursor \
+             across the whole replay, not once per patch (got {fold_ops} fold ops for \
+             {events_len} transcript events + {speaker_events_len} speaker events / \
+             {patches_len} patches)"
+        );
+
+        // Make the "the old algorithm would be superlinear here" claim
+        // explicit and self-checking, not just asserted in prose: a
+        // per-patch full re-fold rebuilding from event zero for every
+        // patch, with bounds spread evenly across the stream, pays
+        // roughly half the full prefix per patch on average.
+        let old_algorithm_estimated_fold_ops = patches_len * total_raw_events / 2;
+        assert!(
+            old_algorithm_estimated_fold_ops >= 50 * fold_ops,
+            "fixture is not large enough to demonstrate superlinearity: old-shape estimate \
+             {old_algorithm_estimated_fold_ops} is not >= 50x the new fold-op count {fold_ops}"
+        );
     }
 
     #[test]
@@ -7133,6 +8302,175 @@ mod tests {
 
         let diagnostics = format!("{:?}{:?}", conflict.validation, stale_replay.validation);
         assert!(!diagnostics.contains("PRIVATE-SPEAKER-LABEL"));
+    }
+
+    /// Major review finding: the TRANSCRIPT side of `LedgerHistory`'s
+    /// fold-failure/poison machinery had zero test coverage — nothing in
+    /// the crate ever produced `HistoricalProjectionValidationError::TranscriptReplay`
+    /// before this test, unlike the speaker side (mirrored/twinned here,
+    /// see [`materialized_projection_history_reports_content_free_speaker_replay_failures`]
+    /// just above). A mutant that silently accepted a stale transcript
+    /// revision (`fast_apply_transcript_event`'s stale arm returning
+    /// `Ok(())` instead of erroring) survived the full default suite before
+    /// this test existed.
+    #[test]
+    fn materialized_projection_history_reports_content_free_transcript_replay_failures() {
+        let mut base = TranscriptEvent::from(asr_payload("span-base", 1, "Ship notes."));
+        base.received_at_ms = 1_700_000_010_000;
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&base),
+            "note-transcript-error",
+            "Transcript error",
+            "Invalid transcript history must fail closed.",
+        );
+        patch.created_at_ms = 1_700_000_010_100;
+
+        let mut conflict_a =
+            TranscriptEvent::from(asr_payload("span-conflict", 1, "PRIVATE-TRANSCRIPT-TEXT-A"));
+        conflict_a.received_at_ms = 1_700_000_010_010;
+        let mut conflict_b = conflict_a.clone();
+        conflict_b.text = "PRIVATE-TRANSCRIPT-TEXT-B".to_string();
+        conflict_b.received_at_ms = 1_700_000_010_020;
+
+        let conflict = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [conflict_a, conflict_b],
+            None,
+            [patch.clone()],
+        )
+        .expect("conflicting transcript replay report");
+        assert!(matches!(
+            conflict.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::TranscriptReplay {
+                sequence: 1,
+                error: TranscriptLedgerError::ConflictingTranscriptRevision {
+                    span_id,
+                    revision_number: 1,
+                },
+            }) if span_id == "span-conflict"
+        ));
+
+        let mut current =
+            TranscriptEvent::from(asr_payload("span-stale", 2, "PRIVATE-TRANSCRIPT-TEXT-C"));
+        current.received_at_ms = 1_700_000_010_010;
+        let mut stale =
+            TranscriptEvent::from(asr_payload("span-stale", 1, "PRIVATE-TRANSCRIPT-TEXT-D"));
+        stale.received_at_ms = 1_700_000_010_020;
+
+        let stale_replay = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [current, stale],
+            None,
+            [patch],
+        )
+        .expect("stale transcript replay report");
+        assert!(matches!(
+            stale_replay.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::TranscriptReplay {
+                sequence: 1,
+                error: TranscriptLedgerError::StaleTranscriptRevision {
+                    span_id,
+                    current_revision: 2,
+                    incoming_revision: 1,
+                },
+            }) if span_id == "span-stale"
+        ));
+
+        let diagnostics = format!("{:?}{:?}", conflict.validation, stale_replay.validation);
+        assert!(!diagnostics.contains("PRIVATE-TRANSCRIPT-TEXT"));
+    }
+
+    /// Major review finding (boundary predicate): pins
+    /// `LedgerHistory::transcript_snapshot_or_error`'s poison-propagation
+    /// check (`target_len > poison_index`) at its exact edge. A patch whose
+    /// bound's prefix length lands EXACTLY AT the poisoning event's index
+    /// (i.e. its window ends strictly BEFORE that event, since `target_len`
+    /// is a prefix LENGTH) must NOT see the failure; a patch whose prefix
+    /// reaches past it must. Both branches of the `>` comparison are
+    /// exercised by a single poisoned event stream shared across two
+    /// sequence-ordered patches, matching how a real corrupted event log
+    /// would be discovered mid-replay.
+    #[test]
+    fn ledger_history_transcript_poison_boundary_predicate_pins_patches_before_and_at_the_poison_index()
+     {
+        let span_a_v1 = ledger_history_test_transcript_event("span-a", 1, 1_000, "Original.");
+        let span_a_v2 = ledger_history_test_transcript_event("span-a", 2, 2_000, "Retconned.");
+        // Stale: revision_number=1, lower than the already-applied rev2 —
+        // folding this poisons the cursor at index 2 (the event's own
+        // index, since two events before it applied cleanly).
+        let span_a_stale =
+            ledger_history_test_transcript_event("span-a", 1, 3_000, "Stale replay.");
+
+        let ledger_at_2000 = {
+            let mut ledger = TranscriptLedger::new("session-poison-boundary");
+            ledger.apply_event(span_a_v1.clone()).expect("v1");
+            ledger.apply_event(span_a_v2.clone()).expect("v2");
+            ledger
+        };
+
+        // Patch 1: bound=2000 — prefix length 2, EXACTLY EQUAL to the
+        // poison index (2). Must NOT see the poison (its window ends
+        // strictly before the poisoning event).
+        let mut patch_1 = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&span_a_v1),
+            "note-before-poison",
+            "Before poison",
+            "Retconned.",
+        );
+        patch_1.basis = ledger_at_2000.current_basis();
+        patch_1.created_at_ms = 2_000;
+        patch_1.generation_latency_ms = Some(0);
+
+        // Patch 2: bound=3000 — prefix length 3, STRICTLY GREATER than the
+        // poison index (2). Must surface the poisoning error.
+        let mut patch_2 = notes_patch_for_basis(
+            2,
+            std::slice::from_ref(&span_a_v1),
+            "note-at-poison",
+            "At poison",
+            "Should never materialize.",
+        );
+        patch_2.created_at_ms = 3_000;
+        patch_2.generation_latency_ms = Some(0);
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-poison-boundary",
+            [span_a_v1, span_a_v2, span_a_stale],
+            None,
+            [patch_1, patch_2],
+        )
+        .expect("poison-boundary replay report");
+
+        assert_eq!(replayed.validation.checked_patch_count, 2);
+        assert_eq!(
+            replayed.validation.invalid_patch_count, 1,
+            "exactly patch 2 (whose prefix reaches the poison index) must fail: {:?}",
+            replayed.validation.errors
+        );
+        assert!(matches!(
+            replayed.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::TranscriptReplay {
+                sequence: 2,
+                error: TranscriptLedgerError::StaleTranscriptRevision {
+                    span_id,
+                    current_revision: 2,
+                    incoming_revision: 1,
+                },
+            }) if span_id == "span-a"
+        ));
+        assert_eq!(
+            replayed
+                .state
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-before-poison"],
+            "patch 1 (before the poison index) must materialize; patch 2 (at/past it) must not"
+        );
     }
 
     #[test]
