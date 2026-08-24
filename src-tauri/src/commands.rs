@@ -37,6 +37,24 @@ use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 use crate::speech;
 use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 
+/// Transcript-lens payload for a past session (seed audio-graph-4fa5
+/// deliverable a). `notes`, `materialized_graph`, and the raw
+/// `projection_events` log used to be bundled in here too — that bundle,
+/// materialized 3x (Rust structs → Rust JSON `String` → JS `JSON.parse`) on
+/// the synchronous main thread, is what the seed audio-graph-4fa5 field
+/// report traced to a silent renderer-OOM/allocator-abort on a 208MB legacy
+/// session (figures below are drawn from that report, not from a file that
+/// ships in this tree — the seed record, not a repo path, is the source of
+/// truth for them). Those three artifacts now have their own commands
+/// (`load_session_notes_artifacts_cmd`, `load_session_graph_artifact_cmd`),
+/// each fetched only once its own lens activates — genuinely deferred for
+/// the Graph lens (not the default-active one), but the Notes lens IS
+/// `SessionsBrowser`'s default (`useState<DetailLens>("notes")`), so in
+/// practice `load_session_notes_artifacts_cmd` fires immediately after most
+/// session opens too. What actually protects both artifacts is the byte
+/// ceiling (deliverable b), not lens-gating; only the materialized graph is
+/// genuinely deferred by lens activation (fix-round finding: this comment
+/// used to claim otherwise for both).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LoadedSession {
     pub transcript: Vec<TranscriptSegment>,
@@ -49,10 +67,170 @@ pub struct LoadedSession {
     /// instead of silently falling back to the untrusted inline ASR labels
     /// (audio-graph-0b33; ADR-0026 §3/§4). Missing log → empty vec.
     pub diarization_events: Vec<crate::projections::DiarizationSpanRevision>,
-    pub projection_events: Vec<crate::projections::ProjectionPatch>,
     pub live_assist_cards: Vec<crate::events::LiveAssistCardRecord>,
+}
+
+/// `build_session_timeline_cmd`'s response (fix-round finding): `entries` is
+/// tail-capped to the caller's `limit`, but `total_count` is the fold's full
+/// length BEFORE that cap. Without this, `SeekTimeline`'s "showing the last N
+/// of TOTAL utterances" notice could never fire once the backend started
+/// tail-capping to exactly the frontend's own render window
+/// (`TRANSCRIPT_WINDOW_SIZE`) — `entries.len()` alone can never again exceed
+/// what `SeekTimeline` shows, so it needs the pre-cap count from here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionTimelineFold {
+    pub entries: Vec<crate::timeline::TimelineEntry>,
+    pub total_count: usize,
+}
+
+/// Notes-lens artifacts for a past session (seed audio-graph-4fa5 deliverable
+/// a): the materialized notes `NotesPanel` renders plus the raw
+/// projection-patch log it derives `noteRevisionCounts` from. Fetched only
+/// when the Notes lens activates — `load_session` no longer carries either.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionNotesArtifacts {
     pub notes: Option<crate::projections::MaterializedNotes>,
-    pub materialized_graph: Option<crate::projections::MaterializedGraph>,
+    pub projection_events: Vec<crate::projections::ProjectionPatch>,
+}
+
+/// Byte-size ceilings for the historical-session read path (seed
+/// audio-graph-4fa5, field round 5: an unbounded ~208MB `load_session`
+/// response killed the app). Each ceiling is checked with a single
+/// `fs::metadata` stat call — see [`enforce_artifact_ceiling`] — BEFORE the
+/// artifact is ever read into memory, so an oversized legacy artifact is
+/// never materialized even once, let alone the 3x the old bundled response
+/// paid for.
+///
+/// Calibration: the field session that crashed the app carried a 2.1MB
+/// transcript event log (must keep loading — every ceiling below leaves it
+/// generous headroom) alongside a 156.6MB materialized graph, a 33.3MB
+/// projection-patch log, and a 19.1MB notes artifact — all three predate the
+/// artifact-size fix (seed audio-graph-cfa1: unbounded per-fact
+/// `basis.span_revisions` growth) and must refuse rather than load. Every
+/// ceiling here sits comfortably above realistic post-cfa1 artifact sizes
+/// and comfortably below the field-crash sizes.
+mod session_artifact_ceilings {
+    /// Live knowledge-graph snapshot (`graphs/<id>.json`). Already
+    /// structurally capped at write time
+    /// ([`crate::graph::temporal`]'s `MAX_NODES`/`MAX_EDGES`, seed
+    /// audio-graph-67cd), so this is defense-in-depth, not the primary guard.
+    pub const MAX_LIVE_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
+    /// Transcript event log (`transcripts/<id>.events.jsonl`). The field
+    /// transcript that must keep loading is 2.1MB.
+    pub const MAX_TRANSCRIPT_EVENTS_BYTES: u64 = 8 * 1024 * 1024;
+    /// Diarization span-revision log (`transcripts/<id>.speaker.jsonl`).
+    pub const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
+    /// Materialized projection graph (`graphs/<id>.materialized.json`), the
+    /// artifact the field crash's ~156.6MB response was dominated by.
+    pub const MAX_MATERIALIZED_GRAPH_BYTES: u64 = 24 * 1024 * 1024;
+    /// Materialized notes artifact (`notes/<id>.json`). The field artifact
+    /// that must refuse is 19.1MB.
+    pub const MAX_MATERIALIZED_NOTES_BYTES: u64 = 8 * 1024 * 1024;
+    /// Projection-patch log (`projections/<id>.events.jsonl`), read both
+    /// standalone (Notes lens) and as canonical-replay input (Notes/Graph
+    /// lenses). The field artifact that must refuse is 33.3MB.
+    pub const MAX_PROJECTION_EVENTS_BYTES: u64 = 12 * 1024 * 1024;
+    /// Live-assist current-cards snapshot (`live_assist/<id>.current.json`),
+    /// read by `load_session` on every open (fix-round finding: this artifact
+    /// had no ceiling and no byte-count logging at all). No field-crash
+    /// measurement exists for this artifact the way the other five do — it
+    /// wasn't part of the incident that motivated this seed — so this
+    /// ceiling is defense-in-depth calibrated by analogy to
+    /// `MAX_MATERIALIZED_NOTES_BYTES` (both are a JSON array of LLM-authored
+    /// text growing with session length) rather than a field measurement.
+    pub const MAX_LIVE_ASSIST_CARDS_BYTES: u64 = 8 * 1024 * 1024;
+    /// Data-movement ledger (`ledgers/<id>.movements.jsonl`), read by
+    /// `load_session_data_movement_cmd` for the Route lens (fix-round
+    /// finding: this artifact had no ceiling either). Rows are compact
+    /// (data class + boundary hop + provider/model id + hashed path, no
+    /// payloads), so this ceiling is comfortably higher than the
+    /// text-artifact ceilings above — defense-in-depth, not a field
+    /// measurement, same caveat as `MAX_LIVE_ASSIST_CARDS_BYTES`.
+    pub const MAX_DATA_MOVEMENT_EVENTS_BYTES: u64 = 16 * 1024 * 1024;
+}
+use session_artifact_ceilings::{
+    MAX_DATA_MOVEMENT_EVENTS_BYTES, MAX_DIARIZATION_EVENTS_BYTES, MAX_LIVE_ASSIST_CARDS_BYTES,
+    MAX_LIVE_GRAPH_BYTES, MAX_MATERIALIZED_GRAPH_BYTES, MAX_MATERIALIZED_NOTES_BYTES,
+    MAX_PROJECTION_EVENTS_BYTES, MAX_TRANSCRIPT_EVENTS_BYTES,
+};
+
+/// Refuse to read `path` into memory when it exceeds `ceiling_bytes`. Stats
+/// the file only — never opens or reads its contents — so the check is O(1)
+/// regardless of artifact size; the entire point is to never call
+/// `fs::read_to_string` on a 156MB legacy graph (seed audio-graph-4fa5).
+///
+/// A missing file is NOT a ceiling violation: every caller's existing
+/// "missing artifact → empty/`None`" fallback still applies, so a session
+/// that never wrote this artifact is unaffected. `artifact_class` is a
+/// stable snake_case identifier the frontend keys its translated copy off of
+/// (never raw prose).
+/// Returns the artifact's observed byte size (0 for a missing file) on
+/// success, so callers can fold the same stat into their own read-path
+/// instrumentation (seed audio-graph-6633 deliverable d) without a second
+/// `fs::metadata` call.
+fn enforce_artifact_ceiling(
+    path: &std::path::Path,
+    ceiling_bytes: u64,
+    artifact_class: &'static str,
+) -> AppResult<u64> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(0);
+    };
+    let size_bytes = metadata.len();
+    if size_bytes > ceiling_bytes {
+        return Err(AppError::ArtifactTooLarge {
+            artifact_class: artifact_class.to_string(),
+            size_bytes,
+            ceiling_bytes,
+        });
+    }
+    Ok(size_bytes)
+}
+
+/// Byte size of `path`, or 0 if it does not exist / cannot be stat'd.
+/// Logging-only helper (seed audio-graph-6633 deliverable d) for artifacts
+/// whose ceiling check happens somewhere else in the call chain (e.g. the
+/// transcript event log, checked inside `read_session_transcript_snapshot`)
+/// — never used to gate a read, only to report a byte count.
+fn artifact_len_for_log(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Response-size warning threshold for historical-session read commands
+/// (seed audio-graph-6633 deliverable d): above this, `log::warn!` instead of
+/// `log::info!` so a field log flags an unusually large IPC response without
+/// needing the artifact-size regression this ceiling already guards against.
+const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+
+/// A `std::io::Write` sink that discards every byte and only counts them.
+/// Lets [`response_len_for_log`] measure a response's serialized size
+/// without allocating a second full copy of it (fix-round finding: this
+/// module's whole point is to stop materializing an artifact more times
+/// than necessary — `serde_json::to_string` for a logging-only byte count
+/// was doing exactly that, doubling peak Rust-side memory for
+/// `session_export_bundle` at the ceiling limits).
+struct CountingSink(usize);
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized byte length of `value`, or 0 if serialization fails. Logging
+/// only — never used to decide whether to send the response. Serializes
+/// into a counting sink (see [`CountingSink`]) rather than a `String`, so
+/// this never holds a second full copy of the response in memory.
+fn response_len_for_log<T: serde::Serialize>(value: &T) -> usize {
+    let mut sink = CountingSink(0);
+    match serde_json::to_writer(&mut sink, value) {
+        Ok(()) => sink.0,
+        Err(_) => 0,
+    }
 }
 
 /// Schema version for the session export bundle. Bump when the bundle's shape
@@ -7438,6 +7616,17 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
     if !path.exists() {
         return Ok(Vec::new());
     }
+    // Byte ceiling (seed audio-graph-4fa5 fix round: this legacy fallback is
+    // the OTHER branch of the same fork `read_session_transcript_snapshot`
+    // gates — a pre-event-log session takes THIS path instead of the
+    // canonical `transcripts/<id>.events.jsonl` read, so it needs its own
+    // stat-before-read guard rather than inheriting the canonical read's.
+    // Reuses the same ceiling/class as the canonical transcript-events read:
+    // both represent the same logical "the transcript" budget, and this is
+    // the pre-event-log-only fork of it, never read alongside it for the
+    // same session.
+    enforce_artifact_ceiling(&path, MAX_TRANSCRIPT_EVENTS_BYTES, "transcript_events")
+        .map_err(|e| e.to_string())?;
     let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
     let mut segments = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
@@ -7480,6 +7669,25 @@ fn read_session_transcript_snapshot(
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
     validate_session_id(session_id)?;
+    // Byte ceiling (seed audio-graph-4fa5): stat before ever reading the
+    // canonical transcript event log into memory. The 2.1MB transcript that
+    // must keep loading sits far under this. Unlike the three SIDE artifacts
+    // `load_session_impl` degrades on a ceiling violation (live graph,
+    // diarization log, live-assist cards — see the comments there), this
+    // artifact IS the transcript lens's own content: there is no reasonable
+    // "missing" fallback for an oversized transcript, so exceeding this
+    // ceiling still fails the whole read, same as before this fix round.
+    // Collapsing to a `String` here (rather than propagating
+    // `AppError::ArtifactTooLarge` intact) trades away the typed refusal
+    // notice for this one artifact — accepted because the transcript lens
+    // has no dedicated refusal-notice UI the way the Notes/Graph lenses do,
+    // not because this path is expected to fail in practice.
+    enforce_artifact_ceiling(
+        &crate::user_data::resolve_transcript_events_path(session_id)?,
+        MAX_TRANSCRIPT_EVENTS_BYTES,
+        "transcript_events",
+    )
+    .map_err(|error| error.to_string())?;
     let data_root = crate::user_data::resolve_data_root()?;
     crate::persistence::session_semantics::open_session_for_content(
         &data_root,
@@ -7530,17 +7738,41 @@ fn session_has_any_artifact(session_id: &str) -> Result<bool, String> {
 /// Load a past session's transcript from disk. Replays the canonical revision
 /// log when present and falls back to legacy `TranscriptSegment` JSONL only for
 /// pre-event-log sessions.
+///
+/// `async fn` (seed audio-graph-e8a5): disk I/O + ledger replay now run off
+/// the win32 message-pump thread instead of inline in the IPC handler.
 #[tauri::command]
-pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
+pub async fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
+    load_session_transcript_impl(session_id)
+}
+
+/// Read-only implementation of [`load_session_transcript`].
+fn load_session_transcript_impl(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
     validate_session_id(&session_id)?;
     if !session_has_any_artifact(&session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {session_id}"),
         });
     }
-    read_session_transcript_snapshot(&FileMemoryRepository::user_data(), &session_id)
-        .map(|snapshot| snapshot.transcript)
-        .map_err(AppError::from)
+    let read_start = std::time::Instant::now();
+    let transcript_bytes = artifact_len_for_log(
+        &crate::user_data::resolve_transcript_events_path(&session_id).unwrap_or_default(),
+    );
+    let transcript =
+        read_session_transcript_snapshot(&FileMemoryRepository::user_data(), &session_id)
+            .map(|snapshot| snapshot.transcript)
+            .map_err(AppError::from)?;
+    let response_bytes = response_len_for_log(&transcript);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "load_session_transcript session_id={session_id} transcript_events_bytes={transcript_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(transcript)
 }
 
 /// Load a past session's data-movement ledger (seed audio-graph-70a3) for the
@@ -7554,18 +7786,47 @@ pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSe
 /// the user verbatim. A missing or empty ledger yields an empty vec; because
 /// production coverage is not yet exhaustive, the UI must render that as
 /// Unknown rather than proof that no content left the device.
+///
+/// `async fn` (fix-round finding: this command was the one session-scoped
+/// historical read left sync, unbounded, and uninstrumented outside every
+/// other seed audio-graph-4fa5 deliverable) — moves the ledger read off the
+/// win32 message-pump thread, same as every sibling session command.
 #[tauri::command]
-pub fn load_session_data_movement_cmd(
+pub async fn load_session_data_movement_cmd(
+    session_id: String,
+) -> AppResult<Vec<crate::persistence::DataMovementEvent>> {
+    load_session_data_movement_impl(session_id)
+}
+
+/// Read-only implementation of [`load_session_data_movement_cmd`].
+fn load_session_data_movement_impl(
     session_id: String,
 ) -> AppResult<Vec<crate::persistence::DataMovementEvent>> {
     // Defense-in-depth: reject path-traversal session ids before joining the id
     // into the ledgers directory (audio-graph-e692). Mirrors every sibling
     // session command, which all validate first.
     validate_session_id(&session_id)?;
-    FileMemoryRepository::user_data()
+    let read_start = std::time::Instant::now();
+    let ledger_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_data_movement_ledger_path(&session_id)?,
+        MAX_DATA_MOVEMENT_EVENTS_BYTES,
+        "data_movement_events",
+    )?;
+    let events = FileMemoryRepository::user_data()
         .load_data_movement_event_stream(&session_id)
         .map(crate::persistence::canonical_reader::StrictCanonicalRead::into_payloads)
-        .map_err(AppError::from)
+        .map_err(AppError::from)?;
+    let response_bytes = response_len_for_log(&events);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "load_session_data_movement session_id={session_id} data_movement_events_bytes={ledger_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(events)
 }
 
 fn choose_materialized_notes(
@@ -7595,8 +7856,14 @@ fn choose_materialized_graph(
 /// This command is deliberately read-only with respect to the live capture
 /// runtime. Opening history must never rotate the active transcript ledger,
 /// projection schedulers, or graph while capture and autosave continue.
+///
+/// `async fn` (seed audio-graph-e8a5): disk I/O now runs off the win32
+/// message-pump thread instead of inline in the IPC handler. The response
+/// itself is transcript-lens-only (seed audio-graph-4fa5 deliverable a) — see
+/// [`load_session_notes_artifacts_cmd`] / [`load_session_graph_artifact_cmd`]
+/// for the artifacts this command used to bundle.
 #[tauri::command]
-pub fn load_session(session_id: String) -> AppResult<LoadedSession> {
+pub async fn load_session(session_id: String) -> AppResult<LoadedSession> {
     load_session_impl(session_id)
 }
 
@@ -7609,77 +7876,105 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
             reason: format!("Session files not found: {}", session_id),
         });
     }
+    let read_start = std::time::Instant::now();
     let repository = FileMemoryRepository::user_data();
+    let transcript_bytes = artifact_len_for_log(
+        &crate::user_data::resolve_transcript_events_path(&session_id).unwrap_or_default(),
+    );
     let transcript_snapshot = read_session_transcript_snapshot(&repository, &session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
-    let loaded_graph = if graph_path.exists() {
-        crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
-    } else {
-        crate::graph::temporal::TemporalKnowledgeGraph::new()
+
+    // `load_session` bundles several artifacts behind one response, all
+    // gated by `?` — but only `transcript`/`transcript_events` (via
+    // `read_session_transcript_snapshot` above) is the artifact this command
+    // exists to keep loading no matter what. The three side artifacts below
+    // (live graph, diarization log, live-assist cards) degrade to their
+    // "missing" fallback — logging a warning, never a silent no-op — rather
+    // than failing the WHOLE session open when one of them alone exceeds its
+    // ceiling (fix-round finding: a side-artifact ceiling refusal used to
+    // take the transcript lens down with it, which is strictly worse than
+    // the pre-ceiling behavior of loading it, slowly, in full). Each has its
+    // own dedicated lens/consumer that can still show a visible refusal
+    // (Graph lens: `load_session_graph_artifact_cmd`; this command has none
+    // for these three, so a warn log is the only signal — acceptable because
+    // all three are supplementary to the transcript, and two of the three
+    // are already structurally capped at write time).
+    let live_graph_ceiling =
+        enforce_artifact_ceiling(&graph_path, MAX_LIVE_GRAPH_BYTES, "live_graph");
+    let (live_graph_bytes, snapshot) = match live_graph_ceiling {
+        Ok(bytes) => {
+            let loaded_graph = if graph_path.exists() {
+                crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
+            } else {
+                crate::graph::temporal::TemporalKnowledgeGraph::new()
+            };
+            (bytes, loaded_graph.snapshot())
+        }
+        Err(AppError::ArtifactTooLarge {
+            size_bytes,
+            ceiling_bytes,
+            ..
+        }) => {
+            log::warn!(
+                "load_session session_id={session_id} artifact_class=live_graph size_bytes={size_bytes} ceiling_bytes={ceiling_bytes} degrading_to=empty_snapshot"
+            );
+            (
+                size_bytes,
+                crate::graph::temporal::TemporalKnowledgeGraph::new().snapshot(),
+            )
+        }
+        Err(other) => return Err(other),
     };
-    let snapshot = loaded_graph.snapshot();
     // Diarization span revisions (audio-graph-0b33): the persisted speaker log
     // the live path now writes (audio-graph-719d). Surfacing it lets the
     // frontend resolve trusted latest-wins speaker attribution on reload rather
     // than trusting the inline ASR labels. A session that never emitted
-    // diarization rows loads an empty vec.
-    let speaker_history =
-        strict_speaker_history(repository.load_speaker_revision_stream(&session_id)?);
-    let diarization_events = speaker_history.clone().unwrap_or_default();
-    let projection_stream = repository.load_projection_patch_stream(&session_id)?;
-    // The opened snapshot presence, not a row count or second filesystem probe,
-    // marks canonical-era projection authority. An empty canonical log
-    // must not let an orphan materialized cache become user-visible truth after
-    // a crash between cache replacement and async event persistence.
-    let canonical_projection_stream_exists = matches!(
-        &projection_stream,
-        crate::persistence::canonical_reader::StrictCanonicalRead::Present(_)
+    // diarization rows loads an empty vec — same fallback an oversized log
+    // degrades to (see the comment above `live_graph_ceiling`).
+    let diarization_ceiling = enforce_artifact_ceiling(
+        &crate::user_data::resolve_diarization_events_path(&session_id)?,
+        MAX_DIARIZATION_EVENTS_BYTES,
+        "diarization_events",
     );
-    let projection_events = projection_stream.into_payloads();
-    let live_assist_cards = repository.load_live_assist_cards(&session_id)?;
-    let notes = repository.load_materialized_notes(&session_id)?;
-    let materialized_graph = repository.load_materialized_graph(&session_id)?;
-    let replayed_projection_state = if canonical_projection_stream_exists {
-        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
-            &session_id,
-            transcript_events.clone(),
-            speaker_history,
-            projection_events.clone(),
-        ) {
-            Ok(replay) => {
-                if replay.validation.invalid_patch_count > 0 {
-                    return Err(AppError::SessionInvalid {
-                        reason: format!(
-                            "Canonical projection replay rejected {} patch(es); derived caches were not loaded",
-                            replay.validation.invalid_patch_count
-                        ),
-                    });
-                }
-                Some(replay.state)
-            }
-            Err(e) => {
-                return Err(AppError::SessionInvalid {
-                    reason: format!(
-                        "Canonical projection replay failed for session {}: {:?}",
-                        session_id, e
-                    ),
-                });
-            }
+    let (diarization_bytes, diarization_events) = match diarization_ceiling {
+        Ok(bytes) => {
+            let events =
+                strict_speaker_history(repository.load_speaker_revision_stream(&session_id)?)
+                    .unwrap_or_default();
+            (bytes, events)
         }
-    } else {
-        None
+        Err(AppError::ArtifactTooLarge {
+            size_bytes,
+            ceiling_bytes,
+            ..
+        }) => {
+            log::warn!(
+                "load_session session_id={session_id} artifact_class=diarization_events size_bytes={size_bytes} ceiling_bytes={ceiling_bytes} degrading_to=empty_vec"
+            );
+            (size_bytes, Vec::new())
+        }
+        Err(other) => return Err(other),
     };
-    let notes = choose_materialized_notes(
-        notes,
-        replayed_projection_state.as_ref(),
-        canonical_projection_stream_exists,
+    let live_assist_ceiling = enforce_artifact_ceiling(
+        &crate::user_data::resolve_live_assist_current_path(&session_id)?,
+        MAX_LIVE_ASSIST_CARDS_BYTES,
+        "live_assist_cards",
     );
-    let materialized_graph = choose_materialized_graph(
-        materialized_graph,
-        replayed_projection_state.as_ref(),
-        canonical_projection_stream_exists,
-    );
+    let (live_assist_bytes, live_assist_cards) = match live_assist_ceiling {
+        Ok(bytes) => (bytes, repository.load_live_assist_cards(&session_id)?),
+        Err(AppError::ArtifactTooLarge {
+            size_bytes,
+            ceiling_bytes,
+            ..
+        }) => {
+            log::warn!(
+                "load_session session_id={session_id} artifact_class=live_assist_cards size_bytes={size_bytes} ceiling_bytes={ceiling_bytes} degrading_to=empty_vec"
+            );
+            (size_bytes, Vec::new())
+        }
+        Err(other) => return Err(other),
+    };
     // Replay validates the persisted transcript history before returning it,
     // but the historical ledger is never installed into live AppState.
     let _validated_ledger =
@@ -7691,16 +7986,280 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
                 )
             })?;
 
-    Ok(LoadedSession {
+    let loaded = LoadedSession {
         transcript,
         graph: snapshot,
         transcript_events,
         diarization_events,
-        projection_events,
         live_assist_cards,
+    };
+    let response_bytes = response_len_for_log(&loaded);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "load_session session_id={session_id} transcript_events_bytes={transcript_bytes} live_graph_bytes={live_graph_bytes} diarization_events_bytes={diarization_bytes} live_assist_cards_bytes={live_assist_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(loaded)
+}
+
+/// Replay the canonical projection log against the transcript/speaker
+/// histories, refusing (typed `SessionInvalid`) if any patch fails
+/// validation. Shared by [`load_session_notes_artifacts_cmd`] and
+/// [`load_session_graph_artifact_cmd`] — each lens replays independently when
+/// it activates (seed audio-graph-4fa5 deliverable a); a shared cache across
+/// lenses is explicitly out of scope here (seed audio-graph-927a owns the
+/// O(patches × events) algorithmic fix this replay still pays per call —
+/// deliverable f mitigates only by moving it off the UI thread and behind a
+/// lens fetch, never restructuring `projections.rs`).
+fn replay_projection_state_or_invalid(
+    session_id: &str,
+    transcript_events: Vec<crate::projections::TranscriptEvent>,
+    speaker_history: Option<Vec<crate::projections::DiarizationSpanRevision>>,
+    projection_events: Vec<crate::projections::ProjectionPatch>,
+) -> AppResult<crate::projections::MaterializedProjectionState> {
+    match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
+        session_id,
+        transcript_events,
+        speaker_history,
+        projection_events,
+    ) {
+        Ok(replay) => {
+            if replay.validation.invalid_patch_count > 0 {
+                Err(AppError::SessionInvalid {
+                    reason: format!(
+                        "Canonical projection replay rejected {} patch(es); derived caches were not loaded",
+                        replay.validation.invalid_patch_count
+                    ),
+                })
+            } else {
+                Ok(replay.state)
+            }
+        }
+        Err(e) => Err(AppError::SessionInvalid {
+            reason: format!(
+                "Canonical projection replay failed for session {}: {:?}",
+                session_id, e
+            ),
+        }),
+    }
+}
+
+/// Gather the projection-patch log plus (when a canonical stream exists) the
+/// replayed [`crate::projections::MaterializedProjectionState`] shared by the
+/// Notes-lens and Graph-lens artifact commands. Every artifact this touches
+/// is ceiling-checked before being read into memory (seed audio-graph-4fa5
+/// deliverable b).
+fn gather_projection_lens_state(
+    session_id: &str,
+) -> AppResult<(
+    Vec<crate::projections::ProjectionPatch>,
+    Option<crate::projections::MaterializedProjectionState>,
+    bool,
+)> {
+    let repository = FileMemoryRepository::user_data();
+    enforce_artifact_ceiling(
+        &crate::user_data::resolve_projection_events_path(session_id)?,
+        MAX_PROJECTION_EVENTS_BYTES,
+        "projection_events",
+    )?;
+    let projection_stream = repository.load_projection_patch_stream(session_id)?;
+    // The opened snapshot presence, not a row count or second filesystem probe,
+    // marks canonical-era projection authority. An empty canonical log
+    // must not let an orphan materialized cache become user-visible truth after
+    // a crash between cache replacement and async event persistence.
+    let canonical_projection_stream_exists = matches!(
+        &projection_stream,
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(_)
+    );
+    let projection_events = projection_stream.into_payloads();
+
+    let replayed_projection_state = if canonical_projection_stream_exists {
+        enforce_artifact_ceiling(
+            &crate::user_data::resolve_transcript_events_path(session_id)?,
+            MAX_TRANSCRIPT_EVENTS_BYTES,
+            "transcript_events",
+        )?;
+        let transcript_events = repository
+            .load_transcript_event_stream(session_id)?
+            .into_payloads();
+        enforce_artifact_ceiling(
+            &crate::user_data::resolve_diarization_events_path(session_id)?,
+            MAX_DIARIZATION_EVENTS_BYTES,
+            "diarization_events",
+        )?;
+        let speaker_history =
+            strict_speaker_history(repository.load_speaker_revision_stream(session_id)?);
+        Some(replay_projection_state_or_invalid(
+            session_id,
+            transcript_events,
+            speaker_history,
+            projection_events.clone(),
+        )?)
+    } else {
+        None
+    };
+
+    Ok((
+        projection_events,
+        replayed_projection_state,
+        canonical_projection_stream_exists,
+    ))
+}
+
+/// Load a past session's Notes-lens artifacts: the materialized notes
+/// (replayed against the canonical projection log when present, exactly like
+/// `load_session` used to do inline) plus the raw projection-patch log
+/// `NotesPanel` derives `noteRevisionCounts` from. Deferred out of
+/// `load_session` (seed audio-graph-4fa5 deliverable a) so a session open
+/// alone never pays for these — 19.1MB + 33.3MB for the field session that
+/// OOM'd the app. NOTE this is genuinely deferred only relative to
+/// `load_session` itself: the Notes lens is `SessionsBrowser`'s
+/// default-active lens (`useState<DetailLens>("notes")`), so in practice
+/// this fires immediately after most session opens too — only the Graph
+/// lens (`load_session_graph_artifact_cmd`) is deferred until the user picks
+/// a non-default tab. The real protection for THIS artifact pair is the
+/// byte ceiling below, not lens-gating.
+///
+/// `async fn` (seed audio-graph-e8a5) so the canonical-replay work (seed
+/// audio-graph-927a's O(patches × events) hot path, deliberately
+/// un-restructured here per deliverable f) runs off the message-pump thread.
+#[tauri::command]
+pub async fn load_session_notes_artifacts_cmd(
+    session_id: String,
+) -> AppResult<SessionNotesArtifacts> {
+    load_session_notes_artifacts_impl(session_id)
+}
+
+fn load_session_notes_artifacts_impl(session_id: String) -> AppResult<SessionNotesArtifacts> {
+    validate_session_id(&session_id)?;
+    if !session_has_any_artifact(&session_id)? {
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {}", session_id),
+        });
+    }
+    // Floor-admitted (fix-round finding): both new lens commands used to read
+    // canonical content directly, bypassing the same
+    // `open_session_for_content` seam `load_session_transcript` and
+    // `session_timeline` gate their reads behind. Routed through it now so
+    // an unreadable/unsupported control plane refuses here too, not just on
+    // the transcript-lens path.
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        &session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| load_session_notes_artifacts_for_admitted_session(&session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn load_session_notes_artifacts_for_admitted_session(
+    session_id: &str,
+) -> AppResult<SessionNotesArtifacts> {
+    let read_start = std::time::Instant::now();
+    let repository = FileMemoryRepository::user_data();
+    let notes_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_notes_path(session_id)?,
+        MAX_MATERIALIZED_NOTES_BYTES,
+        "materialized_notes",
+    )?;
+    let loaded_notes = repository.load_materialized_notes(session_id)?;
+    let (projection_events, replayed_projection_state, canonical_projection_stream_exists) =
+        gather_projection_lens_state(session_id)?;
+    let notes = choose_materialized_notes(
+        loaded_notes,
+        replayed_projection_state.as_ref(),
+        canonical_projection_stream_exists,
+    );
+    let artifacts = SessionNotesArtifacts {
         notes,
-        materialized_graph,
-    })
+        projection_events,
+    };
+    let response_bytes = response_len_for_log(&artifacts);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "load_session_notes_artifacts session_id={session_id} materialized_notes_bytes={notes_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(artifacts)
+}
+
+/// Load a past session's materialized (Graph-lens) knowledge graph —
+/// replayed against the canonical projection log when present, exactly like
+/// `load_session` used to do inline. Deferred out of `load_session` (seed
+/// audio-graph-4fa5 deliverable a) so opening a session never pays for it —
+/// 156.6MB for the field session that OOM'd the app — unless the Graph lens
+/// actually activates.
+///
+/// `async fn` (seed audio-graph-e8a5); see [`load_session_notes_artifacts_cmd`]
+/// for why the canonical replay itself stays un-restructured (deliverable f).
+#[tauri::command]
+pub async fn load_session_graph_artifact_cmd(
+    session_id: String,
+) -> AppResult<Option<crate::projections::MaterializedGraph>> {
+    load_session_graph_artifact_impl(session_id)
+}
+
+fn load_session_graph_artifact_impl(
+    session_id: String,
+) -> AppResult<Option<crate::projections::MaterializedGraph>> {
+    validate_session_id(&session_id)?;
+    if !session_has_any_artifact(&session_id)? {
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {}", session_id),
+        });
+    }
+    // Floor-admitted — see the matching comment in
+    // `load_session_notes_artifacts_impl`.
+    let data_root = crate::user_data::resolve_data_root()
+        .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        &session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| load_session_graph_artifact_for_admitted_session(&session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn load_session_graph_artifact_for_admitted_session(
+    session_id: &str,
+) -> AppResult<Option<crate::projections::MaterializedGraph>> {
+    let read_start = std::time::Instant::now();
+    let repository = FileMemoryRepository::user_data();
+    let materialized_graph_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_materialized_graph_path(session_id)?,
+        MAX_MATERIALIZED_GRAPH_BYTES,
+        "materialized_graph",
+    )?;
+    let loaded_graph = repository.load_materialized_graph(session_id)?;
+    let (_projection_events, replayed_projection_state, canonical_projection_stream_exists) =
+        gather_projection_lens_state(session_id)?;
+    let materialized_graph = choose_materialized_graph(
+        loaded_graph,
+        replayed_projection_state.as_ref(),
+        canonical_projection_stream_exists,
+    );
+    let response_bytes = response_len_for_log(&materialized_graph);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "load_session_graph_artifact session_id={session_id} materialized_graph_bytes={materialized_graph_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(materialized_graph)
 }
 
 /// Assemble the version-1 core [`SessionExportBundle`] from durable artifacts.
@@ -7722,6 +8281,17 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
 /// at least one artifact on disk, otherwise this returns
 /// [`AppError::SessionInvalid`] (the same guard `load_session` uses) so the
 /// caller does not silently export an empty bundle for a bad ID.
+///
+/// Every artifact above is ceiling-checked (seed audio-graph-4fa5 deliverable
+/// b) before being read, same as `load_session`/the lens commands — but
+/// UNLIKE `load_session_impl`, an over-ceiling artifact here still fails the
+/// whole export (fix-round finding: this removes the one escape hatch that
+/// could get a field-crash-sized session's data out of the app for backup or
+/// repair). Deliberately left as-is rather than adding a partial/step-down
+/// export: which artifacts to drop from an export and how to signal that to
+/// the user is a product decision, not a mechanical fix, and is out of scope
+/// for this unit — flagged as a seed-worthy follow-up rather than silently
+/// left broken.
 fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     validate_session_id(session_id)?;
 
@@ -7731,11 +8301,15 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         });
     }
 
+    let read_start = std::time::Instant::now();
     let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
     let repository = FileMemoryRepository::user_data();
     let transcript_snapshot = read_session_transcript_snapshot(&repository, session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
+
+    let live_graph_bytes =
+        enforce_artifact_ceiling(&graph_path, MAX_LIVE_GRAPH_BYTES, "live_graph")?;
     let graph = if graph_path.exists() {
         Some(
             crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?.snapshot(),
@@ -7744,16 +8318,36 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         None
     };
 
+    let diarization_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_diarization_events_path(session_id)?,
+        MAX_DIARIZATION_EVENTS_BYTES,
+        "diarization_events",
+    )?;
     let diarization_events = repository
         .load_speaker_revision_stream(session_id)?
         .into_payloads();
+    let projection_events_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_projection_events_path(session_id)?,
+        MAX_PROJECTION_EVENTS_BYTES,
+        "projection_events",
+    )?;
     let projection_events = repository
         .load_projection_patch_stream(session_id)?
         .into_payloads();
+    let notes_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_notes_path(session_id)?,
+        MAX_MATERIALIZED_NOTES_BYTES,
+        "materialized_notes",
+    )?;
     let notes = repository.load_materialized_notes(session_id)?;
+    let materialized_graph_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_materialized_graph_path(session_id)?,
+        MAX_MATERIALIZED_GRAPH_BYTES,
+        "materialized_graph",
+    )?;
     let materialized_graph = repository.load_materialized_graph(session_id)?;
 
-    Ok(SessionExportBundle {
+    let bundle = SessionExportBundle {
         schema_version: SESSION_EXPORT_SCHEMA_VERSION,
         session_id: session_id.to_string(),
         metadata: crate::sessions::find_session_resolve_only(session_id),
@@ -7764,7 +8358,18 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         notes,
         materialized_graph,
         graph,
-    })
+    };
+    let response_bytes = response_len_for_log(&bundle);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "session_export_bundle session_id={session_id} live_graph_bytes={live_graph_bytes} diarization_events_bytes={diarization_bytes} projection_events_bytes={projection_events_bytes} materialized_notes_bytes={notes_bytes} materialized_graph_bytes={materialized_graph_bytes} response_bytes={response_bytes} elapsed_ms={elapsed_ms}"
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(bundle)
 }
 
 /// Export the version-1 portable core session bundle: transcript segments +
@@ -7777,8 +8382,11 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
 /// / `export_graph` commands: it works on any on-disk session (not just the
 /// active one) and captures the whole event-sourced lifecycle boundary rather
 /// than only the legacy graph snapshot.
+///
+/// `async fn` (seed audio-graph-e8a5): disk I/O now runs off the win32
+/// message-pump thread instead of inline in the IPC handler.
 #[tauri::command]
-pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundle> {
+pub async fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundle> {
     session_export_bundle(&session_id)
 }
 
@@ -7805,7 +8413,14 @@ pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundl
 /// `export_session_bundle` use), so the caller does not silently fold an empty
 /// timeline for a bad ID. Missing individual logs collapse to empty
 /// collections / an empty graph so a transcript-only session still folds.
-fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
+///
+/// `limit` (seed audio-graph-1f85) caps the response to the last `limit`
+/// entries by media-clock order — the same tail `SeekTimeline` renders
+/// (`MAX_BLOCKS` / `TRANSCRIPT_WINDOW_SIZE = 200`) — so a long session's full
+/// span log is never serialized just to be sliced client-side. `None` keeps
+/// every entry (used by tests and `export_session_bundle`-adjacent callers
+/// that need the whole fold).
+fn session_timeline(session_id: &str, limit: Option<usize>) -> AppResult<SessionTimelineFold> {
     validate_session_id(session_id)?;
 
     if !session_has_any_artifact(session_id)? {
@@ -7822,19 +8437,31 @@ fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::Timeline
         &data_root,
         session_id,
         crate::persistence::session_semantics::SessionSemanticsVersion::V1,
-        |_admitted| session_timeline_for_admitted_session(session_id),
+        |_admitted| session_timeline_for_admitted_session(session_id, limit),
     )
     .map_err(unadmitted_session_error)
 }
 
 fn session_timeline_for_admitted_session(
     session_id: &str,
-) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
+    limit: Option<usize>,
+) -> AppResult<SessionTimelineFold> {
+    let read_start = std::time::Instant::now();
     let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
     let repository = FileMemoryRepository::user_data();
+    let transcript_events_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_transcript_events_path(session_id)?,
+        MAX_TRANSCRIPT_EVENTS_BYTES,
+        "transcript_events",
+    )?;
     let transcript_events = repository
         .load_transcript_event_stream(session_id)?
         .into_payloads();
+    let diarization_events_bytes = enforce_artifact_ceiling(
+        &crate::user_data::resolve_diarization_events_path(session_id)?,
+        MAX_DIARIZATION_EVENTS_BYTES,
+        "diarization_events",
+    )?;
     let diarization_events = repository
         .load_speaker_revision_stream(session_id)?
         .into_payloads();
@@ -7847,17 +8474,56 @@ fn session_timeline_for_admitted_session(
         .map_err(|e| {
             format!("Failed to replay speaker timeline for session {session_id}: {e:?}")
         })?;
+    // This re-parses the same live graph file `load_session` already parsed
+    // for the `graph` field of its own (separate, earlier) response — a
+    // known duplicate the fold's module doc calls out (`timeline.rs:18-25`
+    // explains why it needs the LIVE graph, not the materialized one, so the
+    // parse itself cannot be skipped). Seed audio-graph-4fa5 deliverable e
+    // does NOT resolve this duplicate: `store/index.ts`'s `loadSession`
+    // still fires this fold unconditionally, fire-and-forget, in the same
+    // interaction as `load_session` itself (`void
+    // get().loadSessionTimeline(sessionId)`), not gated on the Timeline
+    // lens activating — an earlier version of this comment claimed
+    // otherwise, which was inaccurate (fix-round finding). Deliverable e's
+    // actually-shipped mitigation is `limit` alone: it bounds the RESPONSE
+    // SIZE of this second parse, which is what field round 5's crash was
+    // about, but the parse itself still runs twice per session open. Fully
+    // decoupling this fetch from `load_session` (lens-gating it the way
+    // Notes/Graph are) remains a real, undone follow-up — declined for this
+    // unit because it would touch `SessionsBrowser`'s lens-effect wiring and
+    // the existing timeline-fold test suite for a performance win, not a
+    // crash-safety one; `limit` already bounds the crash-safety exposure.
+    let live_graph_bytes =
+        enforce_artifact_ceiling(&graph_path, MAX_LIVE_GRAPH_BYTES, "live_graph")?;
     let live_graph = if graph_path.exists() {
         crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
     } else {
         crate::graph::temporal::TemporalKnowledgeGraph::new()
     };
 
-    Ok(crate::timeline::build_session_timeline(
-        &ledger,
-        &speakers,
-        &live_graph,
-    ))
+    let mut entries = crate::timeline::build_session_timeline(&ledger, &speakers, &live_graph);
+    let full_count = entries.len();
+    if let Some(limit) = limit
+        && entries.len() > limit
+    {
+        entries = entries.split_off(entries.len() - limit);
+    }
+    let fold = SessionTimelineFold {
+        entries,
+        total_count: full_count,
+    };
+    let response_bytes = response_len_for_log(&fold);
+    let elapsed_ms = read_start.elapsed().as_millis();
+    let log_line = format!(
+        "build_session_timeline_cmd session_id={session_id} transcript_events_bytes={transcript_events_bytes} diarization_events_bytes={diarization_events_bytes} live_graph_bytes={live_graph_bytes} full_entry_count={full_count} returned_entry_count={} response_bytes={response_bytes} elapsed_ms={elapsed_ms}",
+        fold.entries.len()
+    );
+    if response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
+    Ok(fold)
 }
 
 /// Fold a session's durable logs into its [`crate::timeline::TimelineEntry`]
@@ -7865,11 +8531,17 @@ fn session_timeline_for_admitted_session(
 /// ADR-0026 §4.1). Ordered by media-clock start time, duplicate-free, with
 /// latest-wins speaker attribution and forward links to the live graph edges
 /// each utterance produced.
+///
+/// `limit` (seed audio-graph-1f85) tail-caps the response — pass the
+/// frontend's `TRANSCRIPT_WINDOW_SIZE` (200) so the fold never serializes
+/// more entries than `SeekTimeline` renders. `async fn` (seed
+/// audio-graph-e8a5) moves the disk I/O + replay off the message-pump thread.
 #[tauri::command]
-pub fn build_session_timeline_cmd(
+pub async fn build_session_timeline_cmd(
     session_id: String,
-) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
-    session_timeline(&session_id)
+    limit: Option<usize>,
+) -> AppResult<SessionTimelineFold> {
+    session_timeline(&session_id, limit)
 }
 
 /// Soft-delete a session: flag it as trashed in the sessions index but keep
@@ -12625,7 +13297,7 @@ mod tests {
             .expect("write malformed sessions index");
         let before = snapshot_tree(&dir);
 
-        let bundle = export_session_bundle(session_id.to_string())
+        let bundle = session_export_bundle(session_id)
             .expect("export should ignore an unavailable rebuildable index");
         assert_eq!(bundle.transcript.len(), 1);
         assert!(bundle.metadata.is_none());
@@ -12674,7 +13346,7 @@ mod tests {
         let secret = "private-standalone-transcript";
         seed_malformed_legacy_transcript(session_id, secret);
 
-        let error = load_session_transcript(session_id.to_string())
+        let error = load_session_transcript_impl(session_id.to_string())
             .expect_err("standalone transcript must fail closed");
         assert!(!error.to_string().contains(secret));
 
@@ -12692,8 +13364,8 @@ mod tests {
         let secret = "private-review-transcript";
         seed_malformed_legacy_transcript(session_id, secret);
 
-        let error =
-            load_session(session_id.to_string()).expect_err("historical Review must fail closed");
+        let error = load_session_impl(session_id.to_string())
+            .expect_err("historical Review must fail closed");
         assert!(!error.to_string().contains(secret));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -12710,8 +13382,7 @@ mod tests {
         let secret = "private-export-transcript";
         seed_malformed_legacy_transcript(session_id, secret);
 
-        let error = export_session_bundle(session_id.to_string())
-            .expect_err("session export must fail closed");
+        let error = session_export_bundle(session_id).expect_err("session export must fail closed");
         assert!(!error.to_string().contains(secret));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -12735,7 +13406,7 @@ mod tests {
         let secret = "legacy text must stay behind the floor gate";
 
         seed_legacy_transcript(session_id, secret);
-        let transcript = load_session_transcript(session_id.to_string())
+        let transcript = load_session_transcript_impl(session_id.to_string())
             .expect("a session with no control plane still loads");
         assert_eq!(transcript.len(), 1, "the baseline read is unchanged");
 
@@ -12745,7 +13416,7 @@ mod tests {
                 .expect("control paths");
         std::fs::create_dir_all(&paths.manifest).expect("unreadable control plane");
 
-        let error = load_session_transcript(session_id.to_string())
+        let error = load_session_transcript_impl(session_id.to_string())
             .expect_err("an unreadable control plane must refuse the read");
         assert!(
             !error.to_string().contains(secret),
@@ -12754,7 +13425,7 @@ mod tests {
 
         std::fs::remove_dir(&paths.manifest).expect("clear the obstruction");
         assert_eq!(
-            load_session_transcript(session_id.to_string())
+            load_session_transcript_impl(session_id.to_string())
                 .expect("the read converges once the control plane is gone")
                 .len(),
             1
@@ -12780,7 +13451,7 @@ mod tests {
         )
         .expect("write present-empty canonical transcript stream");
 
-        let transcript = load_session_transcript(session_id.to_string())
+        let transcript = load_session_transcript_impl(session_id.to_string())
             .expect("present-empty canonical transcript should load");
         assert!(
             transcript.is_empty(),
@@ -12863,7 +13534,7 @@ mod tests {
         )
         .expect("write corrupt canonical transcript stream");
 
-        let error = load_session_transcript(session_id.to_string())
+        let error = load_session_transcript_impl(session_id.to_string())
             .expect_err("canonical corruption must fail closed");
         let message = error.to_string();
         assert!(message.contains("deserialize") || message.contains("canonical"));
@@ -12948,7 +13619,7 @@ mod tests {
         std::fs::write(dir.join("sessions.json"), b"{ malformed index")
             .expect("write malformed sessions index");
 
-        let transcript = load_session_transcript(session_id.to_string())
+        let transcript = load_session_transcript_impl(session_id.to_string())
             .expect("resolve-only transcript read should ignore malformed index");
         assert_eq!(transcript.len(), 1);
         let backup_exists = std::fs::read_dir(&dir)
@@ -12979,7 +13650,7 @@ mod tests {
         // A local-only session that never moved any data has no ledger file;
         // the command surfaces that as an empty vec, not an error, so the UI
         // can render "no content left the device".
-        let events = load_session_data_movement_cmd("never-recorded".to_string())
+        let events = load_session_data_movement_impl("never-recorded".to_string())
             .expect("empty ledger loads as empty vec");
         assert!(events.is_empty());
 
@@ -13049,7 +13720,7 @@ mod tests {
 
         seed_data_movement_ledger(session_id, &[local.clone(), egress.clone()]);
 
-        let loaded = load_session_data_movement_cmd(session_id.to_string()).expect("ledger loads");
+        let loaded = load_session_data_movement_impl(session_id.to_string()).expect("ledger loads");
         assert_eq!(loaded, vec![local, egress]);
 
         // Round-tripped events must never carry a raw secret. The serialized
@@ -13077,7 +13748,7 @@ mod tests {
             "foo\\bar",
             "a/b/c",
         ] {
-            let err = load_session_data_movement_cmd(malicious.to_string())
+            let err = load_session_data_movement_impl(malicious.to_string())
                 .expect_err("path-traversal session id must be rejected");
             let message = match &err {
                 AppError::Unknown(message) => message.clone(),
@@ -13112,14 +13783,20 @@ mod tests {
             "Review transcript must derive from canonical revisions when the legacy file is absent"
         );
 
-        let notes = loaded.notes.expect("missing notes artifact should replay");
+        // Notes/graph moved off `load_session` (seed audio-graph-4fa5
+        // deliverable a) into their own lens-fetch commands.
+        let notes_artifacts = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect("Notes-lens fetch should replay missing materialized projections");
+        let notes = notes_artifacts
+            .notes
+            .expect("missing notes artifact should replay");
         assert_eq!(notes.last_sequence, 1);
         assert_eq!(notes.notes.len(), 1);
         assert_eq!(notes.notes[0].id, "note-report");
         assert_eq!(notes.notes[0].body, "Replayed note from event log.");
 
-        let graph = loaded
-            .materialized_graph
+        let graph = load_session_graph_artifact_impl(session_id.to_string())
+            .expect("Graph-lens fetch should replay missing materialized projections")
             .expect("missing graph artifact should replay");
         assert_eq!(graph.last_sequence, 1);
         assert_eq!(graph.nodes.len(), 1);
@@ -13163,7 +13840,11 @@ mod tests {
         let loaded = load_session_impl(session_id.to_string())
             .expect("load session should replay speaker-bearing projection state");
         assert_eq!(loaded.diarization_events, vec![speaker]);
-        let notes = loaded.notes.expect("speaker-bearing notes should replay");
+        let notes_artifacts = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect("Notes-lens fetch should replay speaker-bearing projection state");
+        let notes = notes_artifacts
+            .notes
+            .expect("speaker-bearing notes should replay");
         assert_eq!(notes.last_sequence, 1);
         assert_eq!(notes.notes.len(), 1);
         assert_eq!(notes.notes[0].body, "Speaker-aware replayed note.");
@@ -13247,8 +13928,12 @@ mod tests {
             .expect("mixed canonical streams should reconstruct projection state");
         assert_eq!(loaded.transcript_events.len(), 2);
         assert_eq!(loaded.diarization_events.len(), 2);
-        assert_eq!(loaded.projection_events.len(), 2);
-        let notes = loaded.notes.expect("mixed stream notes should replay");
+        let notes_artifacts = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect("Notes-lens fetch should reconstruct projection state");
+        assert_eq!(notes_artifacts.projection_events.len(), 2);
+        let notes = notes_artifacts
+            .notes
+            .expect("mixed stream notes should replay");
         assert_eq!(notes.last_sequence, 2);
         assert_eq!(notes.notes.len(), 1);
         assert_eq!(notes.notes[0].body, "Framed suffix note.");
@@ -13285,16 +13970,473 @@ mod tests {
             .open(&projection_path)
             .expect("model a crash-lost canonical projection log");
 
-        let loaded = load_session_impl(session_id.to_string())
+        load_session_impl(session_id.to_string())
             .expect("empty canonical stream should replay as explicit empty state");
-        let notes = loaded.notes.expect("canonical notes state is explicit");
-        let graph = loaded
-            .materialized_graph
+        let notes = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect("Notes-lens fetch should replay as explicit empty state")
+            .notes
+            .expect("canonical notes state is explicit");
+        let graph = load_session_graph_artifact_impl(session_id.to_string())
+            .expect("Graph-lens fetch should replay as explicit empty state")
             .expect("canonical graph state is explicit");
         assert_eq!(notes.last_sequence, 0);
         assert!(notes.notes.is_empty(), "orphan notes cache is ignored");
         assert_eq!(graph.last_sequence, 0);
         assert!(graph.nodes.is_empty(), "orphan graph cache is ignored");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// seed audio-graph-4fa5 deliverable a acceptance: `load_session`'s
+    /// response must no longer carry the heavy lenses — `notes`,
+    /// `materialized_graph`, and the raw `projection_events` log all had
+    /// their own fetch commands split out. Seeds a session that actually HAS
+    /// all three (so a field that was merely always-`None` couldn't fake a
+    /// pass) and asserts the serialized `LoadedSession` JSON has no such
+    /// keys, while the transcript-lens fields it must still carry survive.
+    #[test]
+    fn load_session_response_excludes_heavy_lens_artifacts() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-excludes-heavy-lenses");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-excludes-heavy-lenses";
+        seed_replayable_projection_session(session_id, "Notes lens body.");
+        // Confirm the artifacts this test is excluding actually exist and
+        // actually replay non-empty via their own lens commands — otherwise
+        // "response excludes notes" would be true merely because there was
+        // never anything to exclude.
+        assert!(
+            load_session_notes_artifacts_impl(session_id.to_string())
+                .expect("Notes-lens fetch should succeed")
+                .notes
+                .is_some(),
+            "the seeded session must actually carry replayable notes"
+        );
+
+        let loaded =
+            load_session_impl(session_id.to_string()).expect("load session should succeed");
+        let payload = serde_json::to_value(&loaded).expect("LoadedSession must serialize");
+        let fields = payload
+            .as_object()
+            .expect("LoadedSession serializes as a JSON object");
+
+        for heavy_field in ["notes", "materialized_graph", "projection_events"] {
+            assert!(
+                !fields.contains_key(heavy_field),
+                "load_session's response must not carry `{heavy_field}` — it is now a \
+                 separate lens-fetch command (seed audio-graph-4fa5)"
+            );
+        }
+        for light_field in [
+            "transcript",
+            "graph",
+            "transcript_events",
+            "diarization_events",
+            "live_assist_cards",
+        ] {
+            assert!(
+                fields.contains_key(light_field),
+                "load_session's response must still carry `{light_field}` (transcript lens)"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// seed audio-graph-4fa5 deliverable b: the byte-ceiling unit contract.
+    /// At the ceiling, a file passes; one byte over, it refuses with the
+    /// typed error carrying the observed size and configured ceiling; a
+    /// missing file is not a violation (the caller's "missing → None/empty"
+    /// fallback still applies).
+    #[test]
+    fn enforce_artifact_ceiling_boundary_behavior() {
+        let dir = unique_tempdir("artifact-ceiling-boundary");
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        let path = dir.join("artifact.bin");
+
+        std::fs::write(&path, vec![0u8; 1024]).expect("write at-ceiling file");
+        enforce_artifact_ceiling(&path, 1024, "test_artifact")
+            .expect("a file exactly at the ceiling must pass");
+
+        std::fs::write(&path, vec![0u8; 1025]).expect("write over-ceiling file");
+        let error = enforce_artifact_ceiling(&path, 1024, "test_artifact")
+            .expect_err("one byte over the ceiling must refuse");
+        match error {
+            AppError::ArtifactTooLarge {
+                artifact_class,
+                size_bytes,
+                ceiling_bytes,
+            } => {
+                assert_eq!(artifact_class, "test_artifact");
+                assert_eq!(size_bytes, 1025);
+                assert_eq!(ceiling_bytes, 1024);
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+
+        let missing = dir.join("does-not-exist.bin");
+        enforce_artifact_ceiling(&missing, 1024, "test_artifact")
+            .expect("a missing artifact is not a ceiling violation");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// seed audio-graph-4fa5 deliverable b acceptance: a synthetic
+    /// oversized `graphs/<id>.materialized.json` refuses with the typed
+    /// `ArtifactTooLarge` error rather than being parsed — the ceiling check
+    /// stats the file before ever reading its contents, so garbage bytes are
+    /// enough to prove the refusal; this test never needs to construct a
+    /// real 156MB graph (the field artifact this ceiling exists for).
+    #[test]
+    fn load_session_graph_artifact_cmd_refuses_an_oversized_materialized_graph() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("graph-artifact-ceiling-refuse");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "graph-artifact-ceiling-refuse";
+
+        let oversized = vec![b'x'; (MAX_MATERIALIZED_GRAPH_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::materialized_graph_path(session_id)
+                .expect("resolve materialized graph path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized materialized graph");
+
+        let error = load_session_graph_artifact_impl(session_id.to_string())
+            .expect_err("an oversized materialized graph must refuse, not attempt to parse");
+        match error {
+            AppError::ArtifactTooLarge {
+                artifact_class,
+                size_bytes,
+                ceiling_bytes,
+            } => {
+                assert_eq!(artifact_class, "materialized_graph");
+                assert_eq!(size_bytes, oversized.len() as u64);
+                assert_eq!(ceiling_bytes, MAX_MATERIALIZED_GRAPH_BYTES);
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion to the refusal test above: a small (well under the
+    /// ceiling), real materialized graph must still load and replay
+    /// normally through the same command.
+    #[test]
+    fn load_session_graph_artifact_cmd_loads_a_small_materialized_graph() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("graph-artifact-small-passes");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "graph-artifact-small-passes";
+        seed_replayable_projection_session(session_id, "Small graph companion note.");
+
+        let graph = load_session_graph_artifact_impl(session_id.to_string())
+            .expect("a small materialized graph must load")
+            .expect("replayed graph artifact must be present");
+        assert_eq!(graph.nodes[0].id, "node-report");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// seed audio-graph-4fa5 deliverable b: the same ceiling contract for
+    /// the materialized-notes artifact (Notes lens), synthesized the same
+    /// way as the graph case above.
+    #[test]
+    fn load_session_notes_artifacts_cmd_refuses_an_oversized_notes_artifact() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("notes-artifact-ceiling-refuse");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "notes-artifact-ceiling-refuse";
+
+        let oversized = vec![b'x'; (MAX_MATERIALIZED_NOTES_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::notes_path(session_id).expect("resolve notes path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized notes artifact");
+
+        let error = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect_err("an oversized notes artifact must refuse, not attempt to parse");
+        match error {
+            AppError::ArtifactTooLarge {
+                artifact_class,
+                size_bytes,
+                ceiling_bytes,
+            } => {
+                assert_eq!(artifact_class, "materialized_notes");
+                assert_eq!(size_bytes, oversized.len() as u64);
+                assert_eq!(ceiling_bytes, MAX_MATERIALIZED_NOTES_BYTES);
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix-round finding: the legacy (pre-event-log) transcript fallback
+    /// (`read_legacy_session_transcript`) had no ceiling at all — only the
+    /// canonical `transcripts/<id>.events.jsonl` read did. A session with no
+    /// canonical stream (this one never writes `.events.jsonl`) must refuse
+    /// an oversized `transcripts/<id>.jsonl` the same way the canonical path
+    /// does, stat-before-read, never attempting to parse the garbage bytes.
+    #[test]
+    fn load_session_transcript_impl_refuses_an_oversized_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("legacy-transcript-ceiling-refuse");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "legacy-transcript-ceiling-refuse";
+
+        let oversized = vec![b'x'; (MAX_TRANSCRIPT_EVENTS_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::transcript_path(session_id).expect("resolve legacy transcript path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized legacy transcript");
+
+        let error = load_session_transcript_impl(session_id.to_string())
+            .expect_err("an oversized legacy transcript must refuse, not attempt to parse");
+        let message = error.to_string();
+        assert!(
+            message.contains("transcript_events") && message.contains(&oversized.len().to_string()),
+            "expected the ceiling refusal in the collapsed error string, got {message:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix-round finding: `load_session` bundles the live graph, diarization
+    /// log, and live-assist cards behind `?` alongside the transcript — an
+    /// oversized SIDE artifact must not take the whole session open down
+    /// with it. Each degrades to its "missing" fallback instead of failing.
+    #[test]
+    fn load_session_impl_degrades_oversized_side_artifacts_instead_of_failing_the_open() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-degrade-side-artifacts");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-degrade-side-artifacts";
+
+        // A small, valid legacy transcript — the artifact this command is
+        // required to keep loading no matter what the side artifacts do.
+        seed_legacy_transcript(session_id, "the transcript lens must still work");
+
+        let oversized_graph = vec![b'x'; (MAX_LIVE_GRAPH_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::graph_path(session_id).expect("resolve live graph path"),
+            &oversized_graph,
+        )
+        .expect("write synthetic oversized live graph");
+
+        let oversized_diarization = vec![b'x'; (MAX_DIARIZATION_EVENTS_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::diarization_events_path(session_id)
+                .expect("resolve diarization path"),
+            &oversized_diarization,
+        )
+        .expect("write synthetic oversized diarization log");
+
+        let live_assist_path = crate::user_data::resolve_live_assist_current_path(session_id)
+            .expect("resolve live-assist path");
+        std::fs::create_dir_all(
+            live_assist_path
+                .parent()
+                .expect("live-assist path has a parent"),
+        )
+        .expect("create live_assist dir");
+        let oversized_live_assist = vec![b'x'; (MAX_LIVE_ASSIST_CARDS_BYTES + 1) as usize];
+        std::fs::write(&live_assist_path, &oversized_live_assist)
+            .expect("write synthetic oversized live-assist snapshot");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("oversized side artifacts must degrade, not fail the whole session open");
+        assert_eq!(
+            loaded.transcript.len(),
+            1,
+            "the transcript lens still works"
+        );
+        assert!(
+            loaded.graph.nodes.is_empty() && loaded.graph.links.is_empty(),
+            "the oversized live graph degrades to an empty snapshot"
+        );
+        assert!(
+            loaded.diarization_events.is_empty(),
+            "the oversized diarization log degrades to an empty vec"
+        );
+        assert!(
+            loaded.live_assist_cards.is_empty(),
+            "the oversized live-assist snapshot degrades to an empty vec"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix-round finding: the primary transcript-events artifact (unlike the
+    /// three side artifacts above) has no reasonable "degrade" fallback — an
+    /// oversized canonical stream really cannot be shown, so `load_session`
+    /// must still refuse, not silently truncate or crash.
+    #[test]
+    fn load_session_impl_refuses_an_oversized_transcript_events_log() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-oversized-transcript-events");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-oversized-transcript-events";
+
+        let oversized = vec![b'x'; (MAX_TRANSCRIPT_EVENTS_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve transcript events path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized transcript events log");
+
+        let error = load_session_impl(session_id.to_string())
+            .expect_err("an oversized transcript-events log must refuse the whole session open");
+        // `read_session_transcript_snapshot` collapses the typed
+        // `ArtifactTooLarge` into a `String` for this one artifact (see the
+        // comment there), so by the time it crosses `load_session_impl`'s
+        // `?` it has become `AppError::Unknown` — the refusal itself, not
+        // its typed shape, is what this test pins.
+        let message = error.to_string();
+        assert!(
+            message.contains("transcript_events") && message.contains(&oversized.len().to_string()),
+            "expected the ceiling refusal in the collapsed error string, got {message:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix-round finding: the Notes/Graph lens's shared canonical-replay
+    /// gather (`gather_projection_lens_state`) must refuse an oversized
+    /// projection-patch log rather than reading it into memory — the same
+    /// per-artifact stat-before-read guarantee the materialized-notes/graph
+    /// ceilings already have their own dedicated tests for.
+    #[test]
+    fn load_session_notes_artifacts_cmd_refuses_an_oversized_projection_events_log() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("notes-artifact-oversized-projection-log");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "notes-artifact-oversized-projection-log";
+
+        let oversized = vec![b'x'; (MAX_PROJECTION_EVENTS_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::projection_events_path(session_id)
+                .expect("resolve projection events path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized projection-patch log");
+
+        let error = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect_err("an oversized projection-patch log must refuse, not attempt to parse");
+        match error {
+            AppError::ArtifactTooLarge { artifact_class, .. } => {
+                assert_eq!(artifact_class, "projection_events");
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix-round finding: `load_session_data_movement_cmd` was the one
+    /// session-scoped historical read left with no byte ceiling.
+    #[test]
+    fn load_session_data_movement_impl_refuses_an_oversized_ledger() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("data-movement-ceiling-refuse");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "data-movement-ceiling-refuse";
+
+        let oversized = vec![b'x'; (MAX_DATA_MOVEMENT_EVENTS_BYTES + 1) as usize];
+        std::fs::write(
+            crate::user_data::data_movement_ledger_path(session_id)
+                .expect("resolve data movement ledger path"),
+            &oversized,
+        )
+        .expect("write synthetic oversized data-movement ledger");
+
+        let error = load_session_data_movement_impl(session_id.to_string())
+            .expect_err("an oversized data-movement ledger must refuse, not attempt to parse");
+        match error {
+            AppError::ArtifactTooLarge { artifact_class, .. } => {
+                assert_eq!(artifact_class, "data_movement_events");
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// seed audio-graph-4fa5 deliverable e: `limit` tail-caps the timeline
+    /// fold to the last N entries by media-clock order, matching
+    /// `SeekTimeline`'s own `slice(-MAX_BLOCKS)` — proving the backend now
+    /// does the slicing instead of shipping every span just to discard all
+    /// but the tail client-side. `None` still returns every entry (used by
+    /// the sibling retcon test above and any caller needing the full fold).
+    #[test]
+    fn session_timeline_limit_returns_only_the_media_clock_tail() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("session-timeline-limit-tail");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "session-timeline-limit-tail";
+        let repository = FileMemoryRepository::user_data();
+        for i in 0..5u64 {
+            let mut event = projection_status_test_event(&format!("span-{i}"));
+            event.start_time = i as f64;
+            event.end_time = i as f64 + 0.5;
+            event.received_at_ms = 1_700_000_000_000 + i;
+            repository
+                .append_transcript_event(session_id, &event)
+                .expect("append transcript event");
+        }
+
+        let full = session_timeline(session_id, None).expect("unbounded fold");
+        assert_eq!(full.entries.len(), 5, "an unbounded fold keeps every entry");
+        assert_eq!(
+            full.total_count, 5,
+            "an unbounded fold's total_count matches its own entry count"
+        );
+
+        let limited = session_timeline(session_id, Some(2)).expect("limited fold");
+        assert_eq!(
+            limited.entries.len(),
+            2,
+            "limit=2 must return exactly 2 entries"
+        );
+        assert_eq!(
+            limited.total_count, 5,
+            "total_count reports the pre-limit fold length (fix-round finding: this \
+             is what lets the frontend's truncation notice fire once `limit` equals \
+             its own render window)"
+        );
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .map(|e| e.span_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["span-3", "span-4"],
+            "limit must keep the media-clock TAIL, not the head"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13354,9 +14496,10 @@ mod tests {
 
         // Fold purely from disk — no in-memory diarization state, exactly the
         // reloaded-session path `build_session_timeline_cmd` exercises.
-        let timeline = session_timeline(session_id).expect("fold reloaded session timeline");
+        let timeline = session_timeline(session_id, None).expect("fold reloaded session timeline");
 
         let entry = timeline
+            .entries
             .iter()
             .find(|e| e.span_id == format!("{session_id}-span-1"))
             .expect("timeline must include the seeded utterance");
@@ -13503,10 +14646,13 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
 
-        let loaded = load_session_impl(session_id.to_string())
+        load_session_impl(session_id.to_string())
             .expect("load session should prefer replayed materialized projections");
 
-        let loaded_notes = loaded.notes.expect("stale notes artifact should replay");
+        let loaded_notes = load_session_notes_artifacts_impl(session_id.to_string())
+            .expect("Notes-lens fetch should prefer replayed materialized projections")
+            .notes
+            .expect("stale notes artifact should replay");
         assert_eq!(loaded_notes.last_sequence, 1);
         assert_eq!(
             loaded_notes
@@ -13524,8 +14670,8 @@ mod tests {
             "stale materialized note leaked into load result"
         );
 
-        let loaded_graph = loaded
-            .materialized_graph
+        let loaded_graph = load_session_graph_artifact_impl(session_id.to_string())
+            .expect("Graph-lens fetch should prefer replayed materialized projections")
             .expect("stale graph artifact should replay");
         assert_eq!(loaded_graph.last_sequence, 1);
         assert_eq!(
@@ -13709,16 +14855,18 @@ mod tests {
         seed_replayable_projection_session(session_a, "Session A note.");
         seed_replayable_projection_session(session_b, "Session B note.");
 
-        let loaded_a =
-            load_session_impl(session_a.to_string()).expect("load session A should succeed");
+        load_session_impl(session_a.to_string()).expect("load session A should succeed");
+        let notes_a = load_session_notes_artifacts_impl(session_a.to_string())
+            .expect("Notes-lens fetch for session A should succeed");
         assert_eq!(
-            loaded_a.notes.expect("A notes").notes[0].body,
+            notes_a.notes.expect("A notes").notes[0].body,
             "Session A note."
         );
 
-        let loaded_b =
-            load_session_impl(session_b.to_string()).expect("load session B should succeed");
-        let b_notes = loaded_b.notes.expect("B notes");
+        load_session_impl(session_b.to_string()).expect("load session B should succeed");
+        let notes_b = load_session_notes_artifacts_impl(session_b.to_string())
+            .expect("Notes-lens fetch for session B should succeed");
+        let b_notes = notes_b.notes.expect("B notes");
         assert_eq!(b_notes.notes[0].body, "Session B note.");
         assert!(
             b_notes

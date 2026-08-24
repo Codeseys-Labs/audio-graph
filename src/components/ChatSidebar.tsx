@@ -17,6 +17,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { useAudioGraphStore } from "../store";
 import type { ChatMessage } from "../types";
 import { scrollBehavior } from "../utils/motion";
@@ -29,7 +30,14 @@ function ChatSidebar() {
   const isChatLoading = useAudioGraphStore((s) => s.isChatLoading);
   const sendChatMessage = useAudioGraphStore((s) => s.sendChatMessage);
   const clearChatHistory = useAudioGraphStore((s) => s.clearChatHistory);
-  const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
+  // Merged snapshot (materialized graph when the Graph lens has loaded one,
+  // live graph otherwise) — the same seam `KnowledgeGraphViewer` /
+  // `NotesPanel` read, so this badge's entity count agrees with what the
+  // Graph lens actually shows for a historical session (fix-round finding:
+  // reading raw `graphSnapshot` here silently degraded to the live graph's
+  // capped, retraction-unaware view once the materialized-graph promotion
+  // moved out of `load_session`).
+  const { snapshot: graphSnapshot } = useActiveGraphSnapshot();
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const historicalReview = loadedSessionId !== null;
 

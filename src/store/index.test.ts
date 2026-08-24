@@ -806,19 +806,32 @@ describe("AudioGraphStore", () => {
         received_at_ms: 1_700_000_000_002,
       },
     ];
-    vi.mocked(invoke).mockResolvedValueOnce({
-      transcript,
-      graph: {
-        nodes: [],
-        links: [],
-        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
-      },
-      transcript_events: transcriptEvents,
-      diarization_events: diarizationEvents,
-      projection_events: projectionEvents,
-      notes,
-      materialized_graph: materializedGraph,
-      live_assist_cards: [pendingCard, approvedCard],
+    // Notes/materialized-graph/projection-events moved off `load_session`
+    // into their own lens-fetch commands (seed audio-graph-4fa5 deliverable
+    // a) — `load_session`'s own response no longer carries them.
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "load_session") {
+        return {
+          transcript,
+          graph: {
+            nodes: [],
+            links: [],
+            stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+          },
+          transcript_events: transcriptEvents,
+          diarization_events: diarizationEvents,
+          live_assist_cards: [pendingCard, approvedCard],
+        };
+      }
+      if (command === "load_session_notes_artifacts_cmd") {
+        return { notes, projection_events: projectionEvents };
+      }
+      if (command === "load_session_graph_artifact_cmd") {
+        return materializedGraph;
+      }
+      if (command === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
+      return undefined;
     });
 
     const loaded = await useAudioGraphStore.getState().loadSession("session-1");
@@ -834,17 +847,105 @@ describe("AudioGraphStore", () => {
     // joinSpeakerTimelineToTranscript selector resolves trusted attribution on
     // a loaded session (audio-graph-0b33).
     expect(state.diarizationSpanRevisions).toEqual(diarizationEvents);
-    expect(state.sessionProjectionEvents).toEqual(projectionEvents);
-    expect(state.materializedNotes).toEqual(notes);
-    expect(state.materializedProjectionGraph).toEqual(materializedGraph);
-    expect(state.graphSnapshot.nodes.map((node) => node.id)).toEqual([
-      "node-1",
-    ]);
+    // `load_session` alone must not carry the heavy lenses — they are idle
+    // until their own lens-fetch action runs.
+    expect(state.sessionProjectionEvents).toEqual([]);
+    expect(state.materializedNotes).toBeNull();
+    expect(state.materializedProjectionGraph).toBeNull();
+    expect(state.notesLensStatus).toEqual({ type: "idle" });
+    expect(state.graphLensStatus).toEqual({ type: "idle" });
+    expect(state.graphSnapshot.nodes).toEqual([]);
     expect(state.liveAssistCards).toEqual([pendingCard, approvedCard]);
     expect(state.agentProposals).toEqual([]);
     // Loading a historical session records its id so the data-route / privacy
     // report (seed audio-graph-51e0) can fetch its data-movement ledger.
     expect(state.loadedSessionId).toBe("session-1");
+
+    // The Notes lens (default-active) and Graph lens each fetch their own
+    // artifacts independently once activated.
+    await useAudioGraphStore.getState().loadSessionNotesArtifacts("session-1");
+    await useAudioGraphStore.getState().loadSessionGraphArtifact("session-1");
+    const afterLenses = useAudioGraphStore.getState();
+    expect(invoke).toHaveBeenCalledWith("load_session_notes_artifacts_cmd", {
+      sessionId: "session-1",
+    });
+    expect(invoke).toHaveBeenCalledWith("load_session_graph_artifact_cmd", {
+      sessionId: "session-1",
+    });
+    expect(afterLenses.sessionProjectionEvents).toEqual(projectionEvents);
+    expect(afterLenses.materializedNotes).toEqual(notes);
+    expect(afterLenses.materializedProjectionGraph).toEqual(materializedGraph);
+    expect(afterLenses.notesLensStatus).toEqual({ type: "ready" });
+    expect(afterLenses.graphLensStatus).toEqual({ type: "ready" });
+    // The Graph lens's materialized artifact now wins over the live snapshot
+    // via `useActiveGraphSnapshot`'s fallback rule — pinned separately in
+    // that hook's own tests; here we only confirm the store field landed.
+  });
+
+  // seed audio-graph-4fa5 deliverable b: a byte-ceiling refusal from
+  // `load_session_notes_artifacts_cmd` must set `notesLensStatus` to the
+  // typed `refused` shape (never throw to the caller, never fall back to
+  // the generic `error` string) so `SessionsBrowser` can render the
+  // dedicated refusal notice instead of a blank panel.
+  it("loadSessionNotesArtifacts sets notesLensStatus to refused on an artifact_too_large rejection", async () => {
+    useAudioGraphStore.setState({ loadedSessionId: "big-session" });
+    vi.mocked(invoke).mockRejectedValueOnce({
+      code: "artifact_too_large",
+      message: {
+        artifact_class: "materialized_notes",
+        size_bytes: 19_063_321,
+        ceiling_bytes: 8 * 1024 * 1024,
+      },
+    });
+
+    await useAudioGraphStore
+      .getState()
+      .loadSessionNotesArtifacts("big-session");
+
+    expect(useAudioGraphStore.getState().notesLensStatus).toEqual({
+      type: "refused",
+      artifactClass: "materialized_notes",
+      sizeBytes: 19_063_321,
+      ceilingBytes: 8 * 1024 * 1024,
+    });
+    // A refusal must not blank pre-existing notes/projection state.
+    expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
+  it("loadSessionGraphArtifact sets graphLensStatus to refused on an artifact_too_large rejection", async () => {
+    useAudioGraphStore.setState({ loadedSessionId: "big-session" });
+    vi.mocked(invoke).mockRejectedValueOnce({
+      code: "artifact_too_large",
+      message: {
+        artifact_class: "materialized_graph",
+        size_bytes: 156_579_416,
+        ceiling_bytes: 24 * 1024 * 1024,
+      },
+    });
+
+    await useAudioGraphStore.getState().loadSessionGraphArtifact("big-session");
+
+    expect(useAudioGraphStore.getState().graphLensStatus).toEqual({
+      type: "refused",
+      artifactClass: "materialized_graph",
+      sizeBytes: 156_579_416,
+      ceilingBytes: 24 * 1024 * 1024,
+    });
+  });
+
+  it("loadSessionNotesArtifacts falls back to an error status for a non-ceiling failure", async () => {
+    useAudioGraphStore.setState({ loadedSessionId: "broken-session" });
+    vi.mocked(invoke).mockRejectedValueOnce({
+      code: "session_invalid",
+      message: { reason: "Session files not found: broken-session" },
+    });
+
+    await useAudioGraphStore
+      .getState()
+      .loadSessionNotesArtifacts("broken-session");
+
+    const status = useAudioGraphStore.getState().notesLensStatus;
+    expect(status.type).toBe("error");
   });
 
   it("keeps historical Review isolated while live capture is active", async () => {
@@ -897,7 +998,8 @@ describe("AudioGraphStore", () => {
           ? pendingA
           : pendingB;
       }
-      if (command === "build_session_timeline_cmd") return [];
+      if (command === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
       return undefined;
     });
     const payload = (id: string) => ({
@@ -969,7 +1071,8 @@ describe("AudioGraphStore", () => {
           },
         };
       }
-      if (command === "build_session_timeline_cmd") return [];
+      if (command === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
       return undefined;
     });
 
@@ -1076,7 +1179,10 @@ describe("AudioGraphStore", () => {
         related_edge_ids: ["e1"],
       },
     ];
-    vi.mocked(invoke).mockResolvedValueOnce(timeline);
+    vi.mocked(invoke).mockResolvedValueOnce({
+      entries: timeline,
+      total_count: timeline.length,
+    });
 
     // In production loadSession sets loadedSessionId before firing the fold;
     // the stale-async guard checks the response against it.
@@ -1087,11 +1193,46 @@ describe("AudioGraphStore", () => {
 
     expect(invoke).toHaveBeenCalledWith("build_session_timeline_cmd", {
       sessionId: "session-t",
+      limit: 200,
     });
     expect(result).toEqual(timeline);
     const state = useAudioGraphStore.getState();
     expect(state.sessionTimeline).toEqual(timeline);
+    expect(state.sessionTimelineTotalCount).toBe(timeline.length);
     expect(state.sessionTimelineLoading).toBe(false);
+  });
+
+  it("loadSessionTimeline keeps the pre-cap total_count even when entries were tail-capped", async () => {
+    // Fix-round finding: the backend's `limit` equals the frontend's own
+    // render window, so `entries.length` alone can never again exceed what
+    // `SeekTimeline` shows — `total_count` is the only way its "showing the
+    // last N of TOTAL" notice can still fire.
+    const entries = [
+      {
+        span_id: "span-199",
+        start_ms: 0,
+        end_ms: 100,
+        received_at_ms: 1,
+        turn_id: null,
+        speaker_id: null,
+        speaker_label: null,
+        text: "tail entry",
+        related_edge_ids: [],
+      },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce({
+      entries,
+      total_count: 5_000,
+    });
+
+    useAudioGraphStore.setState({ loadedSessionId: "session-truncated" });
+    await useAudioGraphStore
+      .getState()
+      .loadSessionTimeline("session-truncated");
+
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionTimeline).toEqual(entries);
+    expect(state.sessionTimelineTotalCount).toBe(5_000);
   });
 
   it("loadSessionTimeline degrades to an empty timeline + error on failure", async () => {
@@ -1107,6 +1248,7 @@ describe("AudioGraphStore", () => {
     expect(result).toEqual([]);
     const state = useAudioGraphStore.getState();
     expect(state.sessionTimeline).toEqual([]);
+    expect(state.sessionTimelineTotalCount).toBe(0);
     expect(state.sessionTimelineLoading).toBe(false);
     expect(state.error).toMatch(/fold blew up/i);
   });
@@ -1148,7 +1290,7 @@ describe("AudioGraphStore", () => {
           resolveA = resolve;
         });
       }
-      return timelineB;
+      return { entries: timelineB, total_count: timelineB.length };
     });
 
     // Load A (fold hangs), then the user switches to B (fold resolves).
@@ -1161,7 +1303,7 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().sessionTimeline).toEqual(timelineB);
 
     // A's late response lands now — it must be ignored.
-    resolveA(timelineA);
+    resolveA({ entries: timelineA, total_count: timelineA.length });
     await pendingA;
     const state = useAudioGraphStore.getState();
     expect(state.sessionTimeline).toEqual(timelineB);
@@ -1190,7 +1332,7 @@ describe("AudioGraphStore", () => {
           rejectA = reject;
         });
       }
-      return timelineB;
+      return { entries: timelineB, total_count: timelineB.length };
     });
 
     useAudioGraphStore.setState({ loadedSessionId: "session-a" });
@@ -1281,7 +1423,7 @@ describe("AudioGraphStore", () => {
         };
       }
       if (cmd === "build_session_timeline_cmd") {
-        return timeline;
+        return { entries: timeline, total_count: timeline.length };
       }
       return undefined;
     });
@@ -1293,6 +1435,7 @@ describe("AudioGraphStore", () => {
 
     expect(invoke).toHaveBeenCalledWith("build_session_timeline_cmd", {
       sessionId: "session-fold",
+      limit: 200,
     });
     expect(useAudioGraphStore.getState().sessionTimeline).toEqual(timeline);
   });

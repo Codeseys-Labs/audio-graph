@@ -251,6 +251,18 @@ export interface TimelineEntry {
 }
 
 /**
+ * `build_session_timeline_cmd`'s response shape (fix-round finding for seed
+ * audio-graph-4fa5 deliverable e): `entries` is tail-capped to `limit`, but
+ * `total_count` is the fold's full length BEFORE that cap, so the frontend
+ * can still show "showing the last N of TOTAL utterances" even though
+ * `entries.length` can never itself exceed `limit`.
+ */
+export interface SessionTimelineFold {
+  entries: TimelineEntry[];
+  total_count: number;
+}
+
+/**
  * A request to scroll the transcript to a specific rendered segment, produced
  * when a user clicks/activates a block in the After seek-timeline
  * (audio-graph-3b3f). `segmentId` is the transcript segment id the transcript
@@ -2449,7 +2461,21 @@ export interface ProjectionReplayReport {
   latency: ProjectionReplayLatencyMetrics;
 }
 
-/** Transcript plus graph payload returned when loading a past session. */
+/**
+ * Transcript-lens payload returned when loading a past session. Notes,
+ * `materialized_graph`, and the raw `projection_events` log used to be
+ * bundled in here too — that bundle, materialized 3x on the synchronous main
+ * thread, is what field round 5 traced to a silent renderer-OOM/allocator-
+ * abort on a 208MB legacy session (seed audio-graph-4fa5). Those three
+ * artifacts now have their own commands (`load_session_notes_artifacts_cmd`
+ * → {@link SessionNotesArtifacts}, `load_session_graph_artifact_cmd`), each
+ * fetched only once its own lens activates — genuinely deferred for the
+ * Graph lens, but the Notes lens is `SessionsBrowser`'s default-active one,
+ * so in practice its fetch fires immediately after most session opens too.
+ * The byte ceiling (deliverable b), not lens-gating, is what actually
+ * protects the Notes-lens artifacts; only the materialized graph is
+ * genuinely deferred by lens activation.
+ */
 export interface LoadedSession {
   transcript: TranscriptSegment[];
   graph: GraphSnapshot;
@@ -2462,11 +2488,43 @@ export interface LoadedSession {
    * Missing log arrives as an empty array.
    */
   diarization_events?: DiarizationSpanRevisionEvent[];
-  projection_events: ProjectionPatch[];
   live_assist_cards?: LiveAssistCardRecord[];
-  notes?: MaterializedNotes | null;
-  materialized_graph?: MaterializedGraph | null;
 }
+
+/**
+ * Notes-lens artifacts for a past session (seed audio-graph-4fa5 deliverable
+ * a), returned by `load_session_notes_artifacts_cmd`: the materialized notes
+ * `NotesPanel` renders plus the raw projection-patch log it derives
+ * `noteRevisionCounts` from. Fetched only when the Notes lens activates.
+ */
+export interface SessionNotesArtifacts {
+  notes: MaterializedNotes | null;
+  projection_events: ProjectionPatch[];
+}
+
+/**
+ * Status of a lens-gated heavy-artifact fetch (seed audio-graph-4fa5
+ * deliverables a/b) — the Notes and Graph lenses in `SessionsBrowser` each
+ * carry one of these.
+ *
+ * `idle`: no session loaded, or this lens has never activated for the
+ * current session. `refused`: the backend's per-artifact byte ceiling
+ * rejected the artifact — `artifactClass`/`sizeBytes`/`ceilingBytes` mirror
+ * `AppErrorPayload`'s `artifact_too_large` variant verbatim (see
+ * `artifactTooLargeDetails` in `utils/errorToMessage`), rendered as a plain
+ * notice rather than a blank panel or a crash.
+ */
+export type SessionLensArtifactStatus =
+  | { type: "idle" }
+  | { type: "loading" }
+  | { type: "ready" }
+  | {
+      type: "refused";
+      artifactClass: string;
+      sizeBytes: number;
+      ceilingBytes: number;
+    }
+  | { type: "error"; message: string };
 
 /**
  * Self-contained version-1 snapshot of the portable core session artifacts,
@@ -2573,6 +2631,14 @@ export type AppErrorPayload =
     }
   | { code: "session_invalid"; message: { reason: string } }
   | { code: "network_timeout"; message: { service: string } }
+  | {
+      code: "artifact_too_large";
+      message: {
+        artifact_class: string;
+        size_bytes: number;
+        ceiling_bytes: number;
+      };
+    }
   | { code: "unknown"; message: string };
 
 /**
@@ -2827,6 +2893,18 @@ export interface AudioGraphStore {
    * untrusted inline ASR labels — the fold reads `SpeakerTimeline` directly).
    */
   sessionTimeline: TimelineEntry[] | null;
+  /**
+   * Total entries the backend fold produced BEFORE the `limit` tail-cap
+   * (fix-round finding for seed audio-graph-4fa5 deliverable e): `limit` is
+   * `TRANSCRIPT_WINDOW_SIZE`, the same constant `SeekTimeline`'s own
+   * `MAX_BLOCKS` renders, so `sessionTimeline.length` alone can never again
+   * exceed what's shown — this field is what lets the "showing the last N
+   * of TOTAL" notice fire for a session whose fold produced more than the
+   * cap. `null` when no session is loaded / not yet folded; matches
+   * `sessionTimeline.length` (not `total_count`) for the sample-preview's
+   * synthesized timeline, which is never truncated.
+   */
+  sessionTimelineTotalCount: number | null;
   /** True while `loadSessionTimeline` is in flight. */
   sessionTimelineLoading: boolean;
   /** Cross-component transcript-seek request from the After seek-timeline. */
@@ -2842,6 +2920,12 @@ export interface AudioGraphStore {
   sessionProjectionEvents: ProjectionPatch[];
   materializedNotes: MaterializedNotes | null;
   materializedProjectionGraph: MaterializedGraph | null;
+  /** Status of the Notes lens's own artifact fetch (seed audio-graph-4fa5
+   * deliverable a) — see {@link SessionLensArtifactStatus}. */
+  notesLensStatus: SessionLensArtifactStatus;
+  /** Status of the Graph lens's own artifact fetch (seed audio-graph-4fa5
+   * deliverable a) — see {@link SessionLensArtifactStatus}. */
+  graphLensStatus: SessionLensArtifactStatus;
   turnEvents: TurnLifecycleEvent[];
   agentStatus: AgentStatusEvent | null;
   agentProposals: AgentProposalEvent[];
@@ -2879,6 +2963,23 @@ export interface AudioGraphStore {
    * is dropped, so a slow fold can never clobber the newer session's timeline.
    */
   loadSessionTimeline: (sessionId: string) => Promise<TimelineEntry[]>;
+  /**
+   * Fetch the Notes lens's own artifacts (materialized notes + raw
+   * projection-patch log) for `sessionId` — deferred out of `loadSession`
+   * (seed audio-graph-4fa5 deliverable a). Sets `notesLensStatus` to
+   * `refused` (never throws to the caller) when the backend's byte ceiling
+   * rejects the artifact, so `SessionsBrowser` can render the refusal notice
+   * instead of leaving the lens blank or crashing. Stale-guarded like
+   * `loadSessionTimeline`: a response landing after `loadedSessionId` moved
+   * on is dropped.
+   */
+  loadSessionNotesArtifacts: (sessionId: string) => Promise<void>;
+  /**
+   * Fetch the Graph lens's own materialized-graph artifact for `sessionId` —
+   * deferred out of `loadSession` (seed audio-graph-4fa5 deliverable a).
+   * Same refusal/stale-guard behavior as {@link loadSessionNotesArtifacts}.
+   */
+  loadSessionGraphArtifact: (sessionId: string) => Promise<void>;
   /**
    * Request the transcript panel scroll to (and briefly highlight) the rendered
    * segment `segmentId`. Bumps `transcriptSeekTarget.nonce` so re-selecting the

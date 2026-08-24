@@ -21,6 +21,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useSessionView } from "../session/SessionViewProvider";
+import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { deferredProviderForLlmStart, useAudioGraphStore } from "../store";
 import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
@@ -65,8 +66,15 @@ export interface NotesSynthesisController {
 
 export function useNotesSynthesis(): NotesSynthesisController {
   const { t } = useTranslation();
-  const { transcriptSegments: segments, graphSnapshot: graph } =
-    useSessionView();
+  const { transcriptSegments: segments } = useSessionView();
+  // The merged snapshot (materialized graph when the Graph lens has loaded
+  // one, live graph otherwise) — the same seam `KnowledgeGraphViewer` reads,
+  // so the "is this synthesis stale" node-count comparison below agrees with
+  // what the Notes lens's own entity chips (`NotesPanel`'s main body, below)
+  // are actually showing (fix-round finding: reading raw `graphSnapshot`
+  // here silently degraded to the live graph's `MAX_NODES`/`MAX_EDGES`-capped,
+  // retraction-unaware view for any historical session).
+  const { snapshot: graph } = useActiveGraphSnapshot();
   const settings = useAudioGraphStore((s) => s.settings);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
 
@@ -149,10 +157,14 @@ export default function NotesPanel({
   const { t, i18n } = useTranslation();
   const {
     transcriptSegments: segments,
-    graphSnapshot: graph,
     materializedNotes,
     sessionProjectionEvents: projectionEvents,
   } = useSessionView();
+  // Merged snapshot, not raw `graphSnapshot` — see the comment in
+  // `useNotesSynthesis` above. Entity chips (Questions/Tasks/Decisions/
+  // Topics) and the Person-node participant fallback below must read the
+  // same graph the Graph lens shows, once it's loaded one.
+  const { snapshot: graph } = useActiveGraphSnapshot();
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,

@@ -17,10 +17,29 @@ import type { AppErrorPayload } from "../types";
  * Narrow an unknown value to an `AppErrorPayload` if it has the shape
  * serde emits (`{ code: string, message?: ... }`).
  */
-function isAppErrorPayload(e: unknown): e is AppErrorPayload {
+export function isAppErrorPayload(e: unknown): e is AppErrorPayload {
   if (typeof e !== "object" || e === null) return false;
   const obj = e as Record<string, unknown>;
   return typeof obj.code === "string";
+}
+
+/**
+ * Narrow a rejected `invoke(...)` error to the `artifact_too_large` variant's
+ * fields (seed audio-graph-4fa5 deliverable b), or `null` when it isn't one.
+ * The Notes/Graph lens fetch actions (`store/index.ts`) use this to set
+ * `notesLensStatus`/`graphLensStatus` to `refused` instead of the generic
+ * `error` state, so `SessionsBrowser` can render the typed refusal notice
+ * (artifact class + size + ceiling) rather than a plain error string.
+ */
+export function artifactTooLargeDetails(
+  e: unknown,
+): { artifactClass: string; sizeBytes: number; ceilingBytes: number } | null {
+  if (!isAppErrorPayload(e) || e.code !== "artifact_too_large") return null;
+  return {
+    artifactClass: e.message.artifact_class,
+    sizeBytes: e.message.size_bytes,
+    ceilingBytes: e.message.ceiling_bytes,
+  };
 }
 
 /**
@@ -55,6 +74,11 @@ function formatAppError(err: AppErrorPayload): string {
       return `Invalid session state: ${err.message.reason}`;
     case "network_timeout":
       return `Network timeout calling ${err.message.service}. Check your connection and retry.`;
+    case "artifact_too_large":
+      return i18n.t("errors.artifactTooLarge", {
+        sizeMb: (err.message.size_bytes / (1024 * 1024)).toFixed(1),
+        ceilingMb: (err.message.ceiling_bytes / (1024 * 1024)).toFixed(1),
+      });
     case "unknown":
       return err.message;
   }

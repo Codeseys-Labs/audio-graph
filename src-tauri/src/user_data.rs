@@ -188,9 +188,44 @@ pub fn materialized_graph_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(graphs_dir()?.join(format!("{session_id}.materialized.json")))
 }
 
+/// Resolve the materialized graph artifact path without creating its root or
+/// parent directory (mirrors `resolve_transcript_events_path` etc. below) —
+/// used by the byte-ceiling stat check (seed audio-graph-4fa5 deliverable b),
+/// which must never create `graphs/` as a side effect of merely checking
+/// whether an artifact is too large to read.
+pub(crate) fn resolve_materialized_graph_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("graphs")
+        .join(format!("{session_id}.materialized.json")))
+}
+
 pub fn notes_path(session_id: &str) -> Result<PathBuf, String> {
     guard_session_id(session_id)?;
     Ok(notes_dir()?.join(format!("{session_id}.json")))
+}
+
+/// Resolve the materialized notes artifact path without creating its root or
+/// parent directory. See [`resolve_materialized_graph_path`] for why this
+/// exists alongside the dir-creating `notes_path`.
+pub(crate) fn resolve_notes_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("notes")
+        .join(format!("{session_id}.json")))
+}
+
+/// Resolve the current live-assist-cards snapshot path
+/// (`live_assist/<id>.current.json`) without creating its root or parent
+/// directory. Mirrors [`resolve_notes_path`] / [`resolve_materialized_graph_path`]
+/// — this artifact has no other resolve-only accessor in this module because
+/// its dir-creating counterpart (`live_assist_current_path`) lives on
+/// `FileMemoryRepository` in `persistence/mod.rs`, not here.
+pub(crate) fn resolve_live_assist_current_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("live_assist")
+        .join(format!("{session_id}.current.json")))
 }
 
 /// Path to the scheduler queue state snapshot for a session.
@@ -377,6 +412,21 @@ mod tests {
             resolve_data_movement_ledger_path("session-1")
                 .unwrap()
                 .ends_with("session-1.movements.jsonl")
+        );
+        assert!(
+            resolve_materialized_graph_path("session-1")
+                .unwrap()
+                .ends_with("session-1.materialized.json")
+        );
+        assert!(
+            resolve_notes_path("session-1")
+                .unwrap()
+                .ends_with("session-1.json")
+        );
+        assert!(
+            resolve_live_assist_current_path("session-1")
+                .unwrap()
+                .ends_with("session-1.current.json")
         );
         assert!(!dir.exists(), "resolve-only paths must not create the root");
     }

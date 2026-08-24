@@ -180,6 +180,17 @@ describe("SessionsBrowser component", () => {
           },
         };
       }
+      // Notes/materialized-graph moved off `load_session` into their own
+      // lens-fetch commands (seed audio-graph-4fa5 deliverable a); the
+      // Notes lens is default-active, so every "select a row" test fires
+      // this too. Empty-but-well-shaped defaults keep unrelated tests from
+      // tripping the notes/graph lens into an "error" status.
+      if (cmd === "load_session_notes_artifacts_cmd") {
+        return { notes: null, projection_events: [] };
+      }
+      if (cmd === "load_session_graph_artifact_cmd") return null;
+      if (cmd === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
       if (cmd === "purge_expired_sessions") return [];
       if (cmd === "delete_session") return null;
       if (cmd === "restore_session") return null;
@@ -468,6 +479,141 @@ describe("SessionsBrowser component", () => {
     // SHELL-R2: selection routes through `nav.sessionId`, not the retired
     // `sessionsBrowserOpen`/`rightPanelTab` modal-close side effects.
     expect(useAudioGraphStore.getState().nav.sessionId).toBe("load-me");
+  });
+
+  // seed audio-graph-4fa5 deliverable a: opening a session must fetch the
+  // Notes lens's own artifacts (the default-active lens) once `load_session`
+  // resolves, and the Graph lens's artifact only once the user actually
+  // switches to that tab — proving the fetch is gated on lens activation,
+  // not bundled into the initial session open.
+  it("fetches the Notes lens's artifacts on session open and the Graph lens's only once that tab activates", async () => {
+    seed([makeSession({ id: "lens-gate", title: "Lens Gate" })]);
+    render(<SessionsBrowser />);
+
+    fireEvent.click(await screen.findByTestId("session-select-lens-gate"));
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_session_notes_artifacts_cmd",
+        { sessionId: "lens-gate" },
+      );
+    });
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      "load_session_graph_artifact_cmd",
+      expect.anything(),
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: /^graph$/i }));
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_session_graph_artifact_cmd",
+        { sessionId: "lens-gate" },
+      );
+    });
+  });
+
+  // seed audio-graph-4fa5 deliverables a/b: a real, store-driven render
+  // (the `App.test.tsx` degradation-notice pattern) proving the typed
+  // `artifact_too_large` refusal renders as a plain notice — never a blank
+  // panel — and that the transcript lens next to it is unaffected.
+  it("renders the artifact refusal notice when the Notes lens's fetch is refused by the byte ceiling", async () => {
+    seed([makeSession({ id: "too-big", title: "Too Big" })]);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_sessions")
+        return useAudioGraphStore.getState().sessions;
+      if (cmd === "load_session") {
+        return {
+          transcript: [],
+          graph: {
+            nodes: [],
+            links: [],
+            stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+          },
+        };
+      }
+      if (cmd === "load_session_notes_artifacts_cmd") {
+        return Promise.reject({
+          code: "artifact_too_large",
+          message: {
+            artifact_class: "materialized_notes",
+            size_bytes: 19_063_321,
+            ceiling_bytes: 8 * 1024 * 1024,
+          },
+        });
+      }
+      if (cmd === "load_session_graph_artifact_cmd") return null;
+      if (cmd === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
+      return null;
+    });
+    render(<SessionsBrowser />);
+
+    fireEvent.click(await screen.findByTestId("session-select-too-big"));
+
+    const notice = await screen.findByTestId("artifact-refusal-notice");
+    expect(notice).toBeInTheDocument();
+    // 19,063,321 bytes / 1024^2 ≈ 18.2 MiB; 8 * 1024 * 1024 bytes = 8.0 MiB
+    // exactly — the notice's `formatMb` divides by 1024^2, matching the
+    // Rust ceiling constants (defined in MiB, e.g. `8 * 1024 * 1024`).
+    expect(notice).toHaveTextContent("18.2 MB");
+    expect(notice).toHaveTextContent("8.0 MB");
+
+    // The transcript lens (a different, unrefused artifact) still works.
+    fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
+    expect(
+      screen.queryByTestId("artifact-refusal-notice"),
+    ).not.toBeInTheDocument();
+  });
+
+  // Fix-round finding: a non-ceiling lens-fetch failure (e.g. the canonical
+  // projection replay rejecting one or more patches, surfaced as a plain
+  // `SessionInvalid` string rather than the typed `artifact_too_large`
+  // shape) used to render as an ordinary empty Notes panel — indistinguishable
+  // from "this session has no notes". It must now render its own visible
+  // notice instead.
+  it("renders the lens fetch error notice when the Notes lens's fetch fails for a non-ceiling reason", async () => {
+    seed([makeSession({ id: "corrupt-replay", title: "Corrupt Replay" })]);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_sessions")
+        return useAudioGraphStore.getState().sessions;
+      if (cmd === "load_session") {
+        return {
+          transcript: [],
+          graph: {
+            nodes: [],
+            links: [],
+            stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+          },
+        };
+      }
+      if (cmd === "load_session_notes_artifacts_cmd") {
+        return Promise.reject(
+          "Canonical projection replay rejected 2 patch(es); derived caches were not loaded",
+        );
+      }
+      if (cmd === "load_session_graph_artifact_cmd") return null;
+      if (cmd === "build_session_timeline_cmd")
+        return { entries: [], total_count: 0 };
+      return null;
+    });
+    render(<SessionsBrowser />);
+
+    fireEvent.click(await screen.findByTestId("session-select-corrupt-replay"));
+
+    const notice = await screen.findByTestId("lens-fetch-error-notice");
+    expect(notice).toBeInTheDocument();
+    expect(notice).toHaveTextContent(/rejected 2 patch/i);
+    expect(
+      screen.queryByTestId("artifact-refusal-notice"),
+    ).not.toBeInTheDocument();
+
+    // The transcript lens (unaffected by the Notes lens's own fetch failure)
+    // still works.
+    fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
+    expect(
+      screen.queryByTestId("lens-fetch-error-notice"),
+    ).not.toBeInTheDocument();
   });
 
   it("does not call loadSession for the just-stopped session's own resident-live row (the 1d92 optimistic row)", async () => {

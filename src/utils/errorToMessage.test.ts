@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import i18n from "../i18n";
-import { errorToMessage } from "./errorToMessage";
+import { artifactTooLargeDetails, errorToMessage } from "./errorToMessage";
 
 describe("errorToMessage", () => {
   beforeEach(async () => {
@@ -92,6 +92,49 @@ describe("errorToMessage", () => {
         message: "Storage still unavailable",
       }),
     ).toBe("Storage still unavailable");
+  });
+
+  it("formats an artifact_too_large AppError with the size and ceiling in MB", () => {
+    // Matches the JSON shape from the Rust backend (seed audio-graph-4fa5):
+    //   { "code": "artifact_too_large", "message": { "artifact_class": ...,
+    //     "size_bytes": ..., "ceiling_bytes": ... } }
+    const msg = errorToMessage({
+      code: "artifact_too_large",
+      message: {
+        artifact_class: "materialized_graph",
+        size_bytes: 156_579_416,
+        ceiling_bytes: 24 * 1024 * 1024,
+      },
+    });
+    expect(msg).toContain("149.3");
+    expect(msg).toContain("24.0");
+  });
+
+  it("artifactTooLargeDetails narrows an artifact_too_large payload to its fields", () => {
+    const details = artifactTooLargeDetails({
+      code: "artifact_too_large",
+      message: {
+        artifact_class: "materialized_notes",
+        size_bytes: 19_063_321,
+        ceiling_bytes: 8 * 1024 * 1024,
+      },
+    });
+    expect(details).toEqual({
+      artifactClass: "materialized_notes",
+      sizeBytes: 19_063_321,
+      ceilingBytes: 8 * 1024 * 1024,
+    });
+  });
+
+  it("artifactTooLargeDetails returns null for any other error shape", () => {
+    expect(
+      artifactTooLargeDetails({
+        code: "session_invalid",
+        message: { reason: "not found" },
+      }),
+    ).toBeNull();
+    expect(artifactTooLargeDetails(new Error("boom"))).toBeNull();
+    expect(artifactTooLargeDetails("boom")).toBeNull();
   });
 
   it("falls back to String(e) for legacy bare-string rejections", () => {

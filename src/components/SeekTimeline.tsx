@@ -85,6 +85,16 @@ interface Lane {
 function SeekTimeline() {
   const { t } = useTranslation();
   const { sessionTimeline: timeline } = useSessionView();
+  // Fold total BEFORE the backend's `limit` tail-cap (fix-round finding for
+  // seed audio-graph-4fa5 deliverable e): `timeline.length` alone can never
+  // again exceed `MAX_BLOCKS` once the backend tail-caps to that exact
+  // limit, so the "showing the last N of TOTAL" notice below needs this
+  // separate field to ever fire again. Falls back to `timeline.length` for
+  // the sample-preview's synthesized timeline (never truncated, so the two
+  // always agree there anyway).
+  const sessionTimelineTotalCount = useAudioGraphStore(
+    (s) => s.sessionTimelineTotalCount,
+  );
   const loading = useAudioGraphStore((s) => s.sessionTimelineLoading);
   const sessionTranscriptEvents = useAudioGraphStore(
     (s) => s.sessionTranscriptEvents,
@@ -176,7 +186,8 @@ function SeekTimeline() {
     [focusGraphEdges],
   );
 
-  const total = timeline?.length ?? 0;
+  const shownCount = timeline?.length ?? 0;
+  const total = sessionTimelineTotalCount ?? shownCount;
 
   // Loading state: the fold is in flight and nothing to show yet.
   if (loading && !timeline) {
@@ -226,7 +237,7 @@ function SeekTimeline() {
     );
   }
 
-  const shown = Math.min(total, MAX_BLOCKS);
+  const shown = Math.min(shownCount, MAX_BLOCKS);
 
   return (
     <section

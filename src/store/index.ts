@@ -53,6 +53,7 @@ import { create } from "zustand";
 // action's existing catch → `errorToMessage` behavior is unchanged and every
 // failure is reported EXACTLY once at this single chokepoint (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import {
   isCerebrasEndpoint,
   isSambanovaEndpoint,
@@ -98,7 +99,9 @@ import type {
   ProviderDescriptor,
   SessionExportBundle,
   SessionMetadata,
+  SessionNotesArtifacts,
   SessionRecoveryReport,
+  SessionTimelineFold,
   StageStatus,
   TimelineEntry,
   TranscriptEvent,
@@ -106,11 +109,11 @@ import type {
   TurnLifecycleEvent,
 } from "../types";
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
-import { errorToMessage } from "../utils/errorToMessage";
 import {
-  fuzzyEntityNameMatch,
-  materializedGraphToSnapshot,
-} from "../utils/materializedGraph";
+  artifactTooLargeDetails,
+  errorToMessage,
+} from "../utils/errorToMessage";
+import { fuzzyEntityNameMatch } from "../utils/materializedGraph";
 import { createShellNavSlice } from "./shellNav";
 
 const idleStage: StageStatus = { type: "Idle" };
@@ -1035,6 +1038,7 @@ function clearSamplePreviewState() {
     asrSpanRevisions: [],
     diarizationSpanRevisions: [],
     sessionTimeline: null,
+    sessionTimelineTotalCount: null,
     sessionTimelineLoading: false,
     transcriptSeekTarget: null,
     graphEdgeFocus: null,
@@ -1042,6 +1046,8 @@ function clearSamplePreviewState() {
     sessionProjectionEvents: [],
     materializedNotes: null,
     materializedProjectionGraph: null,
+    notesLensStatus: { type: "idle" as const },
+    graphLensStatus: { type: "idle" as const },
     turnEvents: [],
     agentStatus: null,
     agentProposals: [],
@@ -1457,15 +1463,20 @@ function sampleSessionPreviewState(language?: string) {
     created_at_ms: SAMPLE_PREVIEW_BASE_MS + 5_000,
   };
 
+  const sampleTimeline = deriveTimelineFromTranscriptEvents(
+    sessionTranscriptEvents,
+  );
   return {
     samplePreviewActive: true,
     transcriptSegments,
     asrPartial: null,
     asrSpanRevisions,
     diarizationSpanRevisions: [],
-    sessionTimeline: deriveTimelineFromTranscriptEvents(
-      sessionTranscriptEvents,
-    ),
+    sessionTimeline: sampleTimeline,
+    // The sample preview's timeline is synthesized in full, never
+    // backend-tail-capped, so its total is just its own length — never
+    // truncated, so `SeekTimeline`'s notice never fires for it.
+    sessionTimelineTotalCount: sampleTimeline.length,
     sessionTimelineLoading: false,
     transcriptSeekTarget: null,
     graphEdgeFocus: null,
@@ -1473,6 +1484,10 @@ function sampleSessionPreviewState(language?: string) {
     sessionProjectionEvents,
     materializedNotes,
     materializedProjectionGraph,
+    // The sample preview bakes every artifact in directly (no lens fetch is
+    // ever needed), so both lenses start "ready" rather than "idle".
+    notesLensStatus: { type: "ready" as const },
+    graphLensStatus: { type: "ready" as const },
     turnEvents: [],
     agentStatus: null,
     agentProposals: [],
@@ -1622,6 +1637,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   asrSpanRevisions: [],
   diarizationSpanRevisions: [],
   sessionTimeline: null,
+  sessionTimelineTotalCount: null,
   sessionTimelineLoading: false,
   transcriptSeekTarget: null,
   graphEdgeFocus: null,
@@ -1629,6 +1645,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   sessionProjectionEvents: [],
   materializedNotes: null,
   materializedProjectionGraph: null,
+  notesLensStatus: { type: "idle" },
+  graphLensStatus: { type: "idle" },
   turnEvents: [],
   agentStatus: null,
   agentProposals: [],
@@ -1938,6 +1956,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             asrSpanRevisions: [],
             diarizationSpanRevisions: [],
             sessionTimeline: null,
+            sessionTimelineTotalCount: null,
             sessionTimelineLoading: false,
             transcriptSeekTarget: null,
             graphEdgeFocus: null,
@@ -1945,6 +1964,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             sessionProjectionEvents: [],
             materializedNotes: null,
             materializedProjectionGraph: null,
+            notesLensStatus: { type: "idle" as const },
+            graphLensStatus: { type: "idle" as const },
             turnEvents: [],
             agentStatus: null,
             agentProposals: [],
@@ -1961,6 +1982,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       asrSpanRevisions: [],
       diarizationSpanRevisions: [],
       sessionTimeline: null,
+      sessionTimelineTotalCount: null,
       sessionTimelineLoading: false,
       transcriptSeekTarget: null,
       graphEdgeFocus: null,
@@ -1968,6 +1990,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionProjectionEvents: [],
       materializedNotes: null,
       materializedProjectionGraph: null,
+      notesLensStatus: { type: "idle" as const },
+      graphLensStatus: { type: "idle" as const },
       turnEvents: [],
       agentStatus: null,
       agentProposals: [],
@@ -1995,17 +2019,25 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // the loaded session when the response lands, on success AND failure.
     const isStale = () => get().loadedSessionId !== sessionId;
     try {
-      const timeline = await invoke<TimelineEntry[]>(
+      // `limit` (seed audio-graph-4fa5 deliverable e): cap the fold to the
+      // same tail `SeekTimeline` renders (`entries.slice(-MAX_BLOCKS)`) so a
+      // long session's full span log is never serialized just to be sliced
+      // away client-side. `total_count` (fix-round finding) is the fold's
+      // full length BEFORE that cap — stored separately so the "showing the
+      // last N of TOTAL" notice can still fire even though `entries.length`
+      // itself can never again exceed `limit`.
+      const fold = await invoke<SessionTimelineFold>(
         "build_session_timeline_cmd",
-        { sessionId },
+        { sessionId, limit: TRANSCRIPT_WINDOW_SIZE },
       );
-      if (isStale()) return timeline;
+      if (isStale()) return fold.entries;
       set({
-        sessionTimeline: timeline,
+        sessionTimeline: fold.entries,
+        sessionTimelineTotalCount: fold.total_count,
         sessionTimelineLoading: false,
         error: null,
       });
-      return timeline;
+      return fold.entries;
     } catch (e) {
       if (isStale()) return [];
       // A failed fold must not blank the transcript view — surface the error
@@ -2013,10 +2045,61 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // empty state rather than staying in a perpetual loading spinner.
       set({
         sessionTimeline: [],
+        sessionTimelineTotalCount: 0,
         sessionTimelineLoading: false,
         error: errorToMessage(e),
       });
       return [];
+    }
+  },
+  loadSessionNotesArtifacts: async (sessionId: string) => {
+    set({ notesLensStatus: { type: "loading" } });
+    // Stale-async guard, matching `loadSessionTimeline`: a response landing
+    // after the store has moved on to a different (or no) session must not
+    // clobber that session's state.
+    const isStale = () => get().loadedSessionId !== sessionId;
+    try {
+      const artifacts = await invoke<SessionNotesArtifacts>(
+        "load_session_notes_artifacts_cmd",
+        { sessionId },
+      );
+      if (isStale()) return;
+      set({
+        materializedNotes: artifacts.notes ?? null,
+        sessionProjectionEvents: artifacts.projection_events ?? [],
+        notesLensStatus: { type: "ready" },
+      });
+    } catch (e) {
+      if (isStale()) return;
+      const refusal = artifactTooLargeDetails(e);
+      set({
+        notesLensStatus: refusal
+          ? { type: "refused", ...refusal }
+          : { type: "error", message: errorToMessage(e) },
+      });
+    }
+  },
+  loadSessionGraphArtifact: async (sessionId: string) => {
+    set({ graphLensStatus: { type: "loading" } });
+    const isStale = () => get().loadedSessionId !== sessionId;
+    try {
+      const graph = await invoke<MaterializedGraph | null>(
+        "load_session_graph_artifact_cmd",
+        { sessionId },
+      );
+      if (isStale()) return;
+      set({
+        materializedProjectionGraph: graph ?? null,
+        graphLensStatus: { type: "ready" },
+      });
+    } catch (e) {
+      if (isStale()) return;
+      const refusal = artifactTooLargeDetails(e);
+      set({
+        graphLensStatus: refusal
+          ? { type: "refused", ...refusal }
+          : { type: "error", message: errorToMessage(e) },
+      });
     }
   },
   seekTranscriptToSegment: (segmentId: string | null) =>
@@ -2318,6 +2401,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionProjectionEvents: [],
       materializedNotes: null,
       materializedProjectionGraph: null,
+      notesLensStatus: { type: "idle" as const },
+      graphLensStatus: { type: "idle" as const },
       liveAssistCards: [],
       agentProposals: [],
       approvingAgentProposalIds: [],
@@ -2325,6 +2410,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // The After seek-timeline is a loaded-session affordance; a fresh live
       // capture has no folded timeline yet, so clear the prior session's.
       sessionTimeline: null,
+      sessionTimelineTotalCount: null,
       sessionTimelineLoading: false,
       transcriptSeekTarget: null,
       graphEdgeFocus: null,
@@ -3272,6 +3358,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         asrPartial: null,
         asrSpanRevisions: [],
         sessionTimeline: null,
+        sessionTimelineTotalCount: null,
         sessionTimelineLoading: false,
         transcriptSeekTarget: null,
         graphEdgeFocus: null,
@@ -3279,6 +3366,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         sessionProjectionEvents: [],
         materializedNotes: null,
         materializedProjectionGraph: null,
+        notesLensStatus: { type: "idle" as const },
+        graphLensStatus: { type: "idle" as const },
         agentProposals: [],
         liveAssistCards: [],
         approvingAgentProposalIds: [],
@@ -3308,9 +3397,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set((state) => ({
         ...exitSamplePreviewState(state.samplePreviewActive),
         transcriptSegments: loaded.transcript,
-        graphSnapshot:
-          materializedGraphToSnapshot(loaded.materialized_graph) ??
-          loaded.graph,
+        // The live graph snapshot only — the richer materialized graph is a
+        // separate Graph-lens fetch (seed audio-graph-4fa5 deliverable a).
+        // `useActiveGraphSnapshot`'s `materializedGraphToSnapshot(materialized)
+        // ?? graphSnapshot` fallback picks this up automatically once
+        // `loadSessionGraphArtifact` populates `materializedProjectionGraph`.
+        graphSnapshot: loaded.graph,
         asrPartial: null,
         asrSpanRevisions: [],
         // Reset the seek-timeline for the incoming session; the backend fold
@@ -3319,6 +3411,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         // diarization ledger, so a frontend selector would fall back to
         // untrusted inline labels — ADR-0026 F3).
         sessionTimeline: null,
+        sessionTimelineTotalCount: null,
         sessionTimelineLoading: false,
         transcriptSeekTarget: null,
         graphEdgeFocus: null,
@@ -3327,9 +3420,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         // speakerAttributionIndex resolve trusted latest-wins attribution on a
         // loaded session instead of trusting inline ASR labels (audio-graph-0b33).
         diarizationSpanRevisions: loaded.diarization_events ?? [],
-        sessionProjectionEvents: loaded.projection_events ?? [],
-        materializedNotes: loaded.notes ?? null,
-        materializedProjectionGraph: loaded.materialized_graph ?? null,
+        // Notes / materialized graph / raw projection events are no longer
+        // part of `load_session`'s response (seed audio-graph-4fa5
+        // deliverable a) — idle until the Notes/Graph lens activates and
+        // calls `loadSessionNotesArtifacts` / `loadSessionGraphArtifact`.
+        sessionProjectionEvents: [],
+        materializedNotes: null,
+        materializedProjectionGraph: null,
+        notesLensStatus: { type: "idle" },
+        graphLensStatus: { type: "idle" },
         liveAssistCards: loaded.live_assist_cards ?? [],
         agentProposals: [],
         approvingAgentProposalIds: [],

@@ -111,6 +111,21 @@ pub enum AppError {
     SessionInvalid { reason: String },
     /// A network call to `service` exceeded its timeout.
     NetworkTimeout { service: String },
+    /// A per-artifact byte-size ceiling (seed audio-graph-4fa5) was exceeded
+    /// on disk. The historical-session read path stats the artifact and
+    /// refuses to materialize it into an IPC response rather than repeating
+    /// the ~208MB `load_session` payload that field round 5 traced to a
+    /// silent renderer-OOM/allocator-abort (seed audio-graph-cfa1: a
+    /// materialized-graph artifact whose per-fact basis grows unbounded).
+    /// `artifact_class` is a stable snake_case id (e.g. `"materialized_graph"`,
+    /// `"materialized_notes"`, `"projection_events"`) the frontend keys its
+    /// translated copy off of — never raw prose composed here, matching the
+    /// `DiarizationDegradationNotice` reason-code convention.
+    ArtifactTooLarge {
+        artifact_class: String,
+        size_bytes: u64,
+        ceiling_bytes: u64,
+    },
     /// Catch-all for errors not yet migrated to a typed variant.
     Unknown(String),
 }
@@ -168,6 +183,15 @@ impl fmt::Display for AppError {
             AppError::NetworkTimeout { service } => {
                 write!(f, "Network timeout calling {}", service)
             }
+            AppError::ArtifactTooLarge {
+                artifact_class,
+                size_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "{} artifact is {} bytes, exceeding the {}-byte ceiling; this session predates the artifact-size fix",
+                artifact_class, size_bytes, ceiling_bytes
+            ),
             AppError::Unknown(msg) => write!(f, "{}", msg),
         }
     }
@@ -410,6 +434,27 @@ mod tests {
                 "message": {
                     "provider_id": "asr.local_whisper",
                     "display_name": "Local Whisper",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_artifact_too_large_with_size_and_ceiling() {
+        let err = AppError::ArtifactTooLarge {
+            artifact_class: "materialized_graph".to_string(),
+            size_bytes: 156_579_416,
+            ceiling_bytes: 24 * 1024 * 1024,
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "artifact_too_large",
+                "message": {
+                    "artifact_class": "materialized_graph",
+                    "size_bytes": 156_579_416,
+                    "ceiling_bytes": 24 * 1024 * 1024,
                 },
             })
         );

@@ -851,6 +851,19 @@
       "graph": "Grafo",
       "route": "Rota"
     },
+    "artifactRefusal": {
+      "title": "Muito grande para carregar",
+      "body": "O {{artifactLabel}} desta sessão tem {{sizeMb}} MB, acima do limite de {{ceilingMb}} MB. Ele é anterior à correção de tamanho de artefato e não pode ser aberto aqui — a transcrição e as outras visualizações continuam disponíveis.",
+      "classLabel": {
+        "materialized_graph": "grafo de conhecimento",
+        "materialized_notes": "notas",
+        "projection_events": "registro de projeção"
+      }
+    },
+    "lensFetchError": {
+      "title": "Não foi possível carregar esta visualização",
+      "body": "{{message}} Isso é diferente da sessão ser grande demais para carregar — a transcrição e outras visualizações ainda podem funcionar."
+    },
     "ask": "Perguntar",
     "rowActionsLabel": "Ações para {{title}}",
     "detailActionsLabel": "Mais ações",
@@ -1501,6 +1514,7 @@
   "errors": {
     "providerDeferred": "{{provider}} não está disponível para novas sessões no MVP atual. Suas configurações salvas permanecem inalteradas.",
     "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",
+    "artifactTooLarge": "Este artefato tem {{sizeMb}} MB, acima do limite de {{ceilingMb}} MB.",
     "ipcUnavailable": {
       "title": "O backend do aplicativo não está acessível",
       "cause": "O aplicativo não conseguiu acessar seu backend local. Isso pode acontecer enquanto o aplicativo ainda está iniciando — tente novamente em instantes."

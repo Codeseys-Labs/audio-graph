@@ -851,6 +851,19 @@
       "graph": "Graph",
       "route": "Route"
     },
+    "artifactRefusal": {
+      "title": "Too large to load",
+      "body": "This session's {{artifactLabel}} is {{sizeMb}} MB, over the {{ceilingMb}} MB limit. It predates the artifact-size fix and can't be opened here — the transcript and other views are still available.",
+      "classLabel": {
+        "materialized_graph": "knowledge graph",
+        "materialized_notes": "notes",
+        "projection_events": "projection log"
+      }
+    },
+    "lensFetchError": {
+      "title": "Couldn't load this view",
+      "body": "{{message}} This is separate from the session being too large to load — the transcript and other views may still work."
+    },
     "ask": "Ask",
     "rowActionsLabel": "Actions for {{title}}",
     "detailActionsLabel": "More actions",
@@ -1501,6 +1514,7 @@
   "errors": {
     "providerDeferred": "{{provider}} is not available for new sessions in the current MVP. Your saved settings are unchanged.",
     "providerSettingsLoading": "Provider settings are still loading. Try again shortly.",
+    "artifactTooLarge": "This artifact is {{sizeMb}} MB, over the {{ceilingMb}} MB limit.",
     "ipcUnavailable": {
       "title": "The desktop backend isn’t reachable",
       "cause": "The app couldn’t reach its local backend. This can happen while the app is still starting up — try again in a moment."

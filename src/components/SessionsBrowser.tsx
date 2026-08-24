@@ -44,9 +44,11 @@ import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { formatDurationHoursAware, formatRelativeTime } from "../utils/format";
+import ArtifactRefusalNotice from "./ArtifactRefusalNotice";
 import ChatSidebar from "./ChatSidebar";
 import Icon, { type IconName } from "./Icon";
 import IconButton from "./IconButton";
+import LensFetchErrorNotice from "./LensFetchErrorNotice";
 import LiveTranscript from "./LiveTranscript";
 import NotesPanel, { useNotesSynthesis } from "./NotesPanel";
 import Popover, { PopoverItem } from "./Popover";
@@ -662,6 +664,45 @@ function SessionDetail({
   const [askOpen, setAskOpen] = useState(false);
   const synthesis = useNotesSynthesis();
 
+  // Per-lens lazy fetch (seed audio-graph-4fa5 deliverable a): the Notes and
+  // Graph lenses each own a heavy artifact `load_session` no longer bundles.
+  // Gated on `loadedSessionId === row.id` (not `row.id` alone) so the fetch
+  // fires only once `loadSession`'s own response has landed and actually
+  // matches this row — firing earlier would race `loadSessionNotesArtifacts`
+  // / `loadSessionGraphArtifact`'s own `loadedSessionId !== sessionId`
+  // stale-guard and get dropped as "stale" before it ever started. This also
+  // means the resident-just-stopped-live row (`row.optimistic`, which skips
+  // `loadSession` entirely — see `handleSelect`) never fires a redundant
+  // fetch: `loadedSessionId` stays whatever it was during capture, so it
+  // never matches that row's id, and the panel already renders correctly
+  // from the live-populated store fields regardless.
+  const notesLensStatus = useAudioGraphStore((s) => s.notesLensStatus);
+  const graphLensStatus = useAudioGraphStore((s) => s.graphLensStatus);
+  const loadSessionNotesArtifacts = useAudioGraphStore(
+    (s) => s.loadSessionNotesArtifacts,
+  );
+  const loadSessionGraphArtifact = useAudioGraphStore(
+    (s) => s.loadSessionGraphArtifact,
+  );
+  const activeSessionId = samplePreviewActive ? null : (row?.id ?? null);
+  useEffect(() => {
+    if (!activeSessionId || loadedSessionId !== activeSessionId) return;
+    if (lens === "notes" && notesLensStatus.type === "idle") {
+      void loadSessionNotesArtifacts(activeSessionId);
+    }
+    if (lens === "graph" && graphLensStatus.type === "idle") {
+      void loadSessionGraphArtifact(activeSessionId);
+    }
+  }, [
+    activeSessionId,
+    loadedSessionId,
+    lens,
+    notesLensStatus.type,
+    graphLensStatus.type,
+    loadSessionNotesArtifacts,
+    loadSessionGraphArtifact,
+  ]);
+
   // While live, concurrent Live+Review is not delivered (plan §R2, ADR-0046) —
   // reuses `sessions.reviewLockedWhileLive` verbatim (en.json:778), the same
   // copy `loadSession`'s own guard has always shown.
@@ -808,16 +849,26 @@ function SessionDetail({
           aria-labelledby={`sessions-lens-tab-${lens}`}
           className="flex-1 min-w-0 min-h-0 overflow-hidden flex flex-col"
         >
-          {lens === "notes" && (
-            <NotesPanel synthesis={synthesis} headerActions={false} />
-          )}
+          {lens === "notes" &&
+            (notesLensStatus.type === "refused" ? (
+              <ArtifactRefusalNotice status={notesLensStatus} />
+            ) : notesLensStatus.type === "error" ? (
+              <LensFetchErrorNotice status={notesLensStatus} />
+            ) : (
+              <NotesPanel synthesis={synthesis} headerActions={false} />
+            ))}
           {lens === "transcript" && <LiveTranscript />}
           {lens === "timeline" && <SeekTimeline />}
-          {lens === "graph" && (
-            <Suspense fallback={null}>
-              <KnowledgeGraphViewer />
-            </Suspense>
-          )}
+          {lens === "graph" &&
+            (graphLensStatus.type === "refused" ? (
+              <ArtifactRefusalNotice status={graphLensStatus} />
+            ) : graphLensStatus.type === "error" ? (
+              <LensFetchErrorNotice status={graphLensStatus} />
+            ) : (
+              <Suspense fallback={null}>
+                <KnowledgeGraphViewer />
+              </Suspense>
+            ))}
           {lens === "route" && (
             <SessionDataRoutePanel sessionId={sessionIdForRoute} />
           )}

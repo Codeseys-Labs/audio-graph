@@ -635,6 +635,8 @@ pub fn run() {
             commands::list_sessions,
             commands::load_session,
             commands::load_session_transcript,
+            commands::load_session_notes_artifacts_cmd,
+            commands::load_session_graph_artifact_cmd,
             commands::export_session_bundle,
             commands::build_session_timeline_cmd,
             commands::load_session_data_movement_cmd,
