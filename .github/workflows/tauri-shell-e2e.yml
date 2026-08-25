@@ -75,7 +75,12 @@ jobs:
       - name: Install Linux system dependencies
         if: matrix.os == 'linux'
         run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          # Vendored PPA key (fingerprint-pinned) instead of add-apt-repository:
+          # Launchpad's signing-key API outage (GPGKeyTemporarilyNotFoundError)
+          # held two landings on 2026-08-25 — seed audio-graph-6a8e.
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo install -m 0644 .github/keys/pipewire-upstream-ppa.gpg /etc/apt/keyrings/pipewire-upstream-ppa.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/pipewire-upstream-ppa.gpg] https://ppa.launchpadcontent.net/pipewire-debian/pipewire-upstream/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") main" | sudo tee /etc/apt/sources.list.d/pipewire-upstream.list >/dev/null
           sudo apt-get update
           sudo apt-get install -y \
             libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
