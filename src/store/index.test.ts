@@ -4,6 +4,7 @@ import i18n from "../i18n";
 import type {
   AppSettings,
   AsrSpanRevisionEvent,
+  AudioGraphStore,
   AudioSourceInfo,
   LiveAssistCardRecord,
   ProjectionPatch,
@@ -139,6 +140,18 @@ function liveAssistCard(
   };
 }
 
+/**
+ * Thin `setState` alias for tests that only need to layer a few fields on
+ * top of the baseline the outer `beforeEach` already reset — named so the
+ * answer-card action tests below read as "reset to this shape" rather than
+ * a bare `setState` call, matching this file's existing house style
+ * (`resetStore` in `AgentProposalsPanel.test.tsx` is the same idea, one
+ * level up at the component layer).
+ */
+function resetStoreForTest(overrides: Partial<AudioGraphStore> = {}) {
+  useAudioGraphStore.setState(overrides);
+}
+
 describe("AudioGraphStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -158,6 +171,11 @@ describe("AudioGraphStore", () => {
       agentProposals: [],
       liveAssistCards: [],
       approvingAgentProposalIds: [],
+      // audio-graph-83cc T4: reset between tests same as every other agent
+      // slice above it — otherwise a draft/composer error set by one test
+      // could leak into an unrelated later test in this file.
+      answerDrafts: {},
+      composerError: null,
       chatMessages: [],
       isChatLoading: false,
       streamingChatRequestId: null,
@@ -3538,6 +3556,458 @@ describe("AudioGraphStore", () => {
     expect(s.chatMessages[1]).toEqual({
       role: "assistant",
       content: "It is 3 o'clock.",
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Answer-card actions (audio-graph-83cc T4) — `askQuestion` (composer,
+  // mints a card via `ask_question_card`) and `answerQuestionCard` (manual
+  // "Ask AI"/Retry, `answer_question_card`, `auto: false`). Both commands are
+  // named in the design panel synthesis but NOT YET backed by a real Rust
+  // command in this tree (T3 unlanded) — the "rejecting invoke" tests below
+  // are exactly that real-world case today, not a hypothetical.
+  // -----------------------------------------------------------------------
+
+  type AnswerChannelLike = { onmessage: ((m: unknown) => void) | null };
+  /** Generalizes `captureStreamChannel` above to any command name and any
+   * resolved value shape — `answer_question_card`/`ask_question_card` return
+   * different payloads (`{request_id}` vs `{record, request_id}`) but both
+   * pass a `channel` arg the mock needs to capture identically. */
+  function captureAnswerChannel<T>(commandName: string) {
+    let channel: AnswerChannelLike | null = null;
+    let resolve: (value: T) => void = () => {};
+    let reject: (err: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === commandName) {
+        const argsRecord = args as { channel?: AnswerChannelLike } | undefined;
+        channel = argsRecord?.channel ?? null;
+        return new Promise<T>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+      }
+      return undefined;
+    });
+    return {
+      getChannel: (): AnswerChannelLike => {
+        if (channel === null) throw new Error("channel not captured yet");
+        return channel;
+      },
+      resolveDispatch: (value: T) => resolve(value),
+      rejectDispatch: (err: unknown) => reject(err),
+    };
+  }
+
+  describe("answerQuestionCard (manual Ask AI / Retry)", () => {
+    beforeEach(() => {
+      useAudioGraphStore.setState({ settings: selectableSettings() });
+    });
+
+    it("sets a streaming draft immediately, then coalesces deltas and clears the draft on a non-error terminal frame", async () => {
+      const { getChannel, resolveDispatch } = captureAnswerChannel<{
+        request_id: string;
+      }>("answer_question_card");
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("card-1", {
+            proposal: { kind: "question", body: "q body" },
+          }).proposal,
+        ],
+      });
+
+      const promise = useAudioGraphStore
+        .getState()
+        .answerQuestionCard("card-1");
+      expect(useAudioGraphStore.getState().answerDrafts["card-1"]).toEqual({
+        status: "streaming",
+        text: "",
+        requestId: null,
+      });
+
+      const channel = getChannel();
+      resolveDispatch({ request_id: "req-1" });
+      await promise;
+      expect(
+        useAudioGraphStore.getState().answerDrafts["card-1"]?.requestId,
+      ).toBe("req-1");
+
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: "req-1", delta: "Partial " },
+      });
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: "req-1", delta: "answer." },
+      });
+      await vi.waitFor(() => {
+        expect(useAudioGraphStore.getState().answerDrafts["card-1"]?.text).toBe(
+          "Partial answer.",
+        );
+      });
+
+      channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-1",
+          full_text: "Partial answer.",
+          finish_reason: "stop",
+        },
+      });
+      expect(
+        useAudioGraphStore.getState().answerDrafts["card-1"],
+      ).toBeUndefined();
+    });
+
+    it("sets a failed draft (never throwing) on a done frame carrying an error finish_reason", async () => {
+      const { getChannel, resolveDispatch } = captureAnswerChannel<{
+        request_id: string;
+      }>("answer_question_card");
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("card-err", {
+            proposal: { kind: "question", body: "q body" },
+          }).proposal,
+        ],
+      });
+
+      const promise = useAudioGraphStore
+        .getState()
+        .answerQuestionCard("card-err");
+      const channel = getChannel();
+      resolveDispatch({ request_id: "req-err" });
+      await promise;
+
+      channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-err",
+          full_text: "",
+          finish_reason: "error: rate limited",
+        },
+      });
+
+      expect(useAudioGraphStore.getState().answerDrafts["card-err"]).toEqual({
+        status: "failed",
+        text: "rate limited",
+        requestId: "req-err",
+      });
+    });
+
+    it("audio-graph-83cc T4 fix-round (minor): a STALE terminal frame from a superseded dispatch does not clobber a newer dispatch's draft for the same card (double-click on Ask AI before React re-renders)", async () => {
+      type PendingCall = {
+        channel: AnswerChannelLike;
+        resolve: (value: { request_id: string }) => void;
+      };
+      const calls: PendingCall[] = [];
+      vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+        if (cmd !== "answer_question_card") return undefined;
+        const argsRecord = args as { channel?: AnswerChannelLike } | undefined;
+        return new Promise<{ request_id: string }>((resolve) => {
+          calls.push({
+            channel: argsRecord?.channel ?? { onmessage: null },
+            resolve,
+          });
+        });
+      });
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("card-race", {
+            proposal: { kind: "question", body: "q body" },
+          }).proposal,
+        ],
+      });
+
+      const promiseA = useAudioGraphStore
+        .getState()
+        .answerQuestionCard("card-race");
+      const promiseB = useAudioGraphStore
+        .getState()
+        .answerQuestionCard("card-race");
+      expect(calls).toHaveLength(2);
+
+      calls[0].resolve({ request_id: "req-A" });
+      calls[1].resolve({ request_id: "req-B" });
+      await Promise.all([promiseA, promiseB]);
+      // The later dispatch's own arm won the race for the current draft.
+      expect(
+        useAudioGraphStore.getState().answerDrafts["card-race"]?.requestId,
+      ).toBe("req-B");
+
+      // req-A's STALE terminal frame must be a no-op — it must not clear or
+      // overwrite req-B's active streaming draft.
+      calls[0].channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-A",
+          full_text: "stale",
+          finish_reason: "stop",
+        },
+      });
+      expect(useAudioGraphStore.getState().answerDrafts["card-race"]).toEqual({
+        status: "streaming",
+        text: "",
+        requestId: "req-B",
+      });
+
+      // req-B's own terminal frame still applies normally.
+      calls[1].channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-B",
+          full_text: "final",
+          finish_reason: "stop",
+        },
+      });
+      expect(
+        useAudioGraphStore.getState().answerDrafts["card-race"],
+      ).toBeUndefined();
+    });
+
+    it("degrades gracefully on a REJECTING invoke: sets a failed draft, never throws, never silently drops the attempt", async () => {
+      vi.mocked(invoke).mockRejectedValueOnce(
+        new Error("Backend command not found: answer_question_card"),
+      );
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("card-rej", {
+            proposal: { kind: "question", body: "q body" },
+          }).proposal,
+        ],
+      });
+
+      await expect(
+        useAudioGraphStore.getState().answerQuestionCard("card-rej"),
+      ).resolves.toBeUndefined();
+
+      expect(useAudioGraphStore.getState().answerDrafts["card-rej"]).toEqual({
+        status: "failed",
+        text: "Backend command not found: answer_question_card",
+        requestId: null,
+      });
+    });
+
+    it("does nothing (no invoke call) when settings have not loaded yet", async () => {
+      useAudioGraphStore.setState({ settings: null });
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("card-nosettings", {
+            proposal: { kind: "question", body: "q body" },
+          }).proposal,
+        ],
+      });
+      await useAudioGraphStore.getState().answerQuestionCard("card-nosettings");
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+      expect(useAudioGraphStore.getState().error).not.toBeNull();
+    });
+  });
+
+  describe("askQuestion (composer)", () => {
+    beforeEach(() => {
+      useAudioGraphStore.setState({ settings: selectableSettings() });
+    });
+
+    it("mints a card via ask_question_card, upserts it, and arms the draft with the returned request id", async () => {
+      const { getChannel, resolveDispatch } = captureAnswerChannel<{
+        record: LiveAssistCardRecord;
+        request_id: string;
+      }>("ask_question_card");
+      resetStoreForTest();
+
+      const minted = liveAssistCard("minted-1", {
+        origin: "user",
+        proposal: { kind: "question" },
+      });
+      const promise = useAudioGraphStore
+        .getState()
+        .askQuestion("  what now?  ");
+      const channel = getChannel();
+      resolveDispatch({ record: minted, request_id: "req-mint-1" });
+      await promise;
+
+      expect(
+        useAudioGraphStore
+          .getState()
+          .liveAssistCards.some((c) => c.proposal.id === "minted-1"),
+      ).toBe(true);
+      expect(useAudioGraphStore.getState().answerDrafts["minted-1"]).toEqual({
+        status: "streaming",
+        text: "",
+        requestId: "req-mint-1",
+      });
+      expect(useAudioGraphStore.getState().composerError).toBeNull();
+
+      channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-mint-1",
+          full_text: "answer",
+          finish_reason: "stop",
+        },
+      });
+      expect(
+        useAudioGraphStore.getState().answerDrafts["minted-1"],
+      ).toBeUndefined();
+    });
+
+    it("audio-graph-83cc T4 fix-round (minor): a STALE terminal frame does not clobber a draft a LATER write armed for the same card", async () => {
+      const { getChannel, resolveDispatch } = captureAnswerChannel<{
+        record: LiveAssistCardRecord;
+        request_id: string;
+      }>("ask_question_card");
+      resetStoreForTest();
+
+      const minted = liveAssistCard("minted-race", {
+        origin: "user",
+        proposal: { kind: "question" },
+      });
+      const promise = useAudioGraphStore.getState().askQuestion("what now?");
+      const channel = getChannel();
+      resolveDispatch({ record: minted, request_id: "req-orig" });
+      await promise;
+      expect(
+        useAudioGraphStore.getState().answerDrafts["minted-race"]?.requestId,
+      ).toBe("req-orig");
+
+      // Simulate a later write superseding this draft for the same card id
+      // (e.g. a Retry re-arming it with a new request id).
+      useAudioGraphStore.getState().setAnswerDraft("minted-race", {
+        status: "streaming",
+        text: "",
+        requestId: "req-newer",
+      });
+
+      // req-orig's now-STALE terminal frame must be a no-op.
+      channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: "req-orig",
+          full_text: "stale",
+          finish_reason: "stop",
+        },
+      });
+      expect(useAudioGraphStore.getState().answerDrafts["minted-race"]).toEqual(
+        {
+          status: "streaming",
+          text: "",
+          requestId: "req-newer",
+        },
+      );
+    });
+
+    it("degrades gracefully on a REJECTING invoke: sets composerError, never throws, liveAssistCards unchanged", async () => {
+      vi.mocked(invoke).mockRejectedValueOnce(
+        new Error("Backend command not found: ask_question_card"),
+      );
+      resetStoreForTest();
+
+      await expect(
+        useAudioGraphStore.getState().askQuestion("what now?"),
+      ).resolves.toBeUndefined();
+
+      expect(useAudioGraphStore.getState().composerError).toBe(
+        "Backend command not found: ask_question_card",
+      );
+      expect(useAudioGraphStore.getState().liveAssistCards).toEqual([]);
+    });
+
+    it("never dispatches for an empty/whitespace-only question", async () => {
+      resetStoreForTest();
+      await useAudioGraphStore.getState().askQuestion("   ");
+      expect(invoke).not.toHaveBeenCalled();
+    });
+
+    it("clears any previous composerError at the start of a new attempt", async () => {
+      resetStoreForTest();
+      useAudioGraphStore.setState({ composerError: "stale error" });
+      vi.mocked(invoke).mockImplementation(
+        () => new Promise(() => {}), // never resolves — only the pre-dispatch clear matters here
+      );
+      void useAudioGraphStore.getState().askQuestion("hello");
+      expect(useAudioGraphStore.getState().composerError).toBeNull();
+    });
+  });
+
+  describe("answer drafts are cleaned up on dismiss/clear (audio-graph-83cc T4)", () => {
+    it("dismissAgentProposal clears only that card's draft", async () => {
+      resetStoreForTest({
+        agentProposals: [
+          liveAssistCard("keep-me").proposal,
+          liveAssistCard("drop-me").proposal,
+        ],
+      });
+      useAudioGraphStore.setState({
+        answerDrafts: {
+          "keep-me": { status: "streaming", text: "", requestId: "r1" },
+          "drop-me": { status: "failed", text: "oops", requestId: null },
+        },
+      });
+      vi.mocked(invoke).mockResolvedValue(null);
+
+      await useAudioGraphStore.getState().dismissAgentProposal("drop-me");
+
+      const drafts = useAudioGraphStore.getState().answerDrafts;
+      expect(drafts["drop-me"]).toBeUndefined();
+      expect(drafts["keep-me"]).toEqual({
+        status: "streaming",
+        text: "",
+        requestId: "r1",
+      });
+    });
+
+    it("clearAgentProposals clears drafts ONLY for the cards it actually dismissed — not every draft in the store", async () => {
+      // audio-graph-83cc T4 fix-round finding: a draft can outlive
+      // `"pending"` (`approveAgentProposal` never clears one), so a
+      // wholesale `{}` reset here would silently delete an unrelated
+      // approved card's failure text/Retry affordance. `card "b"` below
+      // stands in for exactly that — it is NOT among the cards this call
+      // dismisses (the mock only resolves with "a"'s record), so its draft
+      // must survive.
+      resetStoreForTest({
+        agentProposals: [liveAssistCard("a").proposal],
+      });
+      useAudioGraphStore.setState({
+        answerDrafts: {
+          a: { status: "streaming", text: "", requestId: "r1" },
+          b: { status: "failed", text: "oops", requestId: null },
+        },
+      });
+      vi.mocked(invoke).mockResolvedValue([
+        liveAssistCard("a", { status: "dismissed" }),
+      ]);
+
+      await useAudioGraphStore.getState().clearAgentProposals();
+
+      const drafts = useAudioGraphStore.getState().answerDrafts;
+      expect(drafts.a).toBeUndefined();
+      expect(drafts.b).toEqual({
+        status: "failed",
+        text: "oops",
+        requestId: null,
+      });
+    });
+  });
+
+  describe("resetSessionView clears the T4 answer-draft/composer-error state (audio-graph-83cc T4 fix-round finding, major)", () => {
+    it("clears answerDrafts and composerError alongside every other session-scoped projection", () => {
+      useAudioGraphStore.setState({
+        answerDrafts: {
+          "stale-card": {
+            status: "streaming",
+            text: "partial",
+            requestId: "r1",
+          },
+        },
+        composerError: "Backend command not found: ask_question_card",
+      });
+
+      useAudioGraphStore.getState().resetSessionView();
+
+      const s = useAudioGraphStore.getState();
+      expect(s.answerDrafts).toEqual({});
+      expect(s.composerError).toBeNull();
     });
   });
 

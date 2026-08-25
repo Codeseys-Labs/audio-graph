@@ -1278,7 +1278,16 @@
     "filterSignal": "Signal",
     "filterAll": "All",
     "lowSignal": "Low signal",
-    "duplicateCount": "×{{count}}"
+    "duplicateCount": "×{{count}}",
+    "answerFailedGeneric": "The answer failed.",
+    "answerRetry": "Retry",
+    "answerInterrupted": "Interrupted",
+    "answerTruncatedMarker": "…",
+    "answerTruncatedHint": "Answer truncated at the length limit",
+    "answerEvidenceSpans_one": "{{count}} span",
+    "answerEvidenceSpans_other": "{{count}} spans",
+    "answerEvidenceGraph_one": "{{count}} node",
+    "answerEvidenceGraph_other": "{{count}} nodes"
   },
   "projectionDiagnostics": {
     "title": "Projection diagnostics",

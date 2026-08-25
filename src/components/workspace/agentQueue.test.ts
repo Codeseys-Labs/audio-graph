@@ -80,6 +80,14 @@ describe("liveAssistCardFromProposal / mergeLiveAssistCards", () => {
     expect(synthesized.outcome).toBeNull();
   });
 
+  it("mirrors proposal.signal onto the synthesized record (T1 invariant: LiveAssistCardRecord.signal mirrors proposal.signal)", () => {
+    const withSignal = proposal({ id: "px-signal", signal: "weak" });
+    expect(liveAssistCardFromProposal(withSignal).signal).toBe("weak");
+
+    const withoutSignal = proposal({ id: "px-no-signal" });
+    expect(liveAssistCardFromProposal(withoutSignal).signal).toBeUndefined();
+  });
+
   it("prefers the persisted liveAssistCards record over a synthesized one for the same proposal id", () => {
     const persisted = card({
       proposal: { id: "shared" },
@@ -319,6 +327,35 @@ describe("classifyQueueEntry — the classification table (actionable / info / f
       },
     });
     expect(classifyQueueEntry(c, true)).toBe("actionable");
+  });
+
+  it("audio-graph-83cc T4 fix-round (major): a user-typed question (origin: 'user') is ALWAYS 'actionable' regardless of confidence/length/punctuation — W9's fragment rules exist for transcript-detection guesses, not text the user deliberately typed and submitted", () => {
+    const shortLowConfidence = card({
+      origin: "user",
+      proposal: {
+        kind: "question",
+        title: "Question",
+        body: "hi", // below AGENT_QUEUE_MIN_CHARS, below AGENT_QUEUE_MIN_TOKENS
+        confidence: 0, // below AGENT_QUEUE_CONFIDENCE_FLOOR
+      },
+    });
+    expect(classifyQueueEntry(shortLowConfidence, true)).toBe("actionable");
+
+    const danglingClause = card({
+      origin: "user",
+      proposal: {
+        kind: "question",
+        title: "Question",
+        body: "so what about the enterprise pricing tier we discussed,",
+        confidence: 0.9,
+      },
+    });
+    expect(classifyQueueEntry(danglingClause, true)).toBe("actionable");
+  });
+
+  it("a user-typed card stays 'info' when genuinely non-actionable — the origin exemption never overrides the structural isActionable check", () => {
+    const c = card({ origin: "user", status: "dismissed" });
+    expect(classifyQueueEntry(c, false)).toBe("info");
   });
 });
 
@@ -652,6 +689,76 @@ describe("selectAgentQueue — ticket W9's fragment filtering, default (Signal) 
   it("no duplicateCounts entry at all for a solo (non-duplicated) card", () => {
     const solo = proposal({ id: "solo-1", kind: "note" });
     const { duplicateCounts } = selectAgentQueue([], [solo]);
+    expect(duplicateCounts.size).toBe(0);
+  });
+
+  it("audio-graph-83cc T4 fix-round (major): two user-typed cards with IDENTICAL content are NOT duplicate-collapsed — asking the same question twice on purpose must not hide the second thread", () => {
+    const first = liveAssistCardFromProposal(
+      proposal({
+        id: "user-q-1",
+        kind: "question",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+        created_at_ms: 1,
+      }),
+    );
+    first.origin = "user";
+    const second = liveAssistCardFromProposal(
+      proposal({
+        id: "user-q-2",
+        kind: "question",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+        created_at_ms: 2,
+      }),
+    );
+    second.origin = "user";
+
+    const { queue, feed, fragmentSuspectIds, duplicateCounts } =
+      selectAgentQueue([first, second], [first.proposal, second.proposal]);
+
+    expect(queue.map((c) => c.proposal.id).sort()).toEqual([
+      "user-q-1",
+      "user-q-2",
+    ]);
+    expect(feed).toHaveLength(0);
+    expect(fragmentSuspectIds.size).toBe(0);
+    expect(duplicateCounts.size).toBe(0);
+  });
+
+  it("audio-graph-83cc T4 fix-round: a user-typed card never registers as a duplicate SURVIVOR either — it does not silently absorb a later transcript-derived card with the same content", () => {
+    const userCard = liveAssistCardFromProposal(
+      proposal({
+        id: "user-q",
+        kind: "question",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+        created_at_ms: 2,
+      }),
+    );
+    userCard.origin = "user";
+    const transcriptDuplicate = proposal({
+      id: "transcript-q",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+      created_at_ms: 1,
+    });
+
+    const { queue, feed, duplicateCounts } = selectAgentQueue(
+      [userCard],
+      [userCard.proposal, transcriptDuplicate],
+    );
+
+    // Neither is collapsed onto the other — the user card was never
+    // registered as a `seenContent` survivor, so the older transcript-derived
+    // card is classified on its own well-formed merits, not as a duplicate.
+    expect(queue.map((c) => c.proposal.id).sort()).toEqual([
+      "transcript-q",
+      "user-q",
+    ]);
+    expect(feed).toHaveLength(0);
     expect(duplicateCounts.size).toBe(0);
   });
 });

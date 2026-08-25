@@ -37,13 +37,31 @@
  * second internal `useState` copy in each would do exactly that). `filter`
  * defaults to `"signal"` so every pre-W9 render call site (and every
  * pre-W9 test) keeps compiling and behaving unchanged.
+ *
+ * Ticket T4 (audio-graph-83cc) is the one deliberate exception to the
+ * "approval semantics are UNCHANGED" claim above: the queue row's manual
+ * "Ask AI" button now dispatches `answerQuestionCard` (threads the answer
+ * under the card via `answerDrafts`/`CardAnswer`) instead of the pre-T4
+ * `askAgentProposal` (dismissed the card, dumped the reply into the
+ * unreachable `chatMessages` — the exact field failure this epic exists to
+ * kill). `approveAgentProposal`/`dismissAgentProposal`/`clearAgentProposals`
+ * are untouched. T4 also adds `<AgentComposer>` as a permanent sibling below
+ * the queue/feed scroll region, in every render branch including idle (see
+ * that component's module doc), and `<AnswerThread>` rendering inside both
+ * row types — see those two components' own doc comments.
  */
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import type { AgentProposalEvent, LiveAssistCardRecord } from "../types";
+import type {
+  AgentProposalEvent,
+  AnswerDraftState,
+  CardAnswer,
+  LiveAssistCardRecord,
+} from "../types";
 import Icon from "./Icon";
+import { AgentComposer } from "./workspace/AgentComposer";
 import { admitToQueue, selectAgentQueue } from "./workspace/agentQueue";
 import { agentOutcomeChipTone } from "./workspace/liveWorkspaceTone";
 
@@ -276,6 +294,9 @@ interface AgentQueueRowProps {
   isApproving: boolean;
   isFragmentSuspect: boolean;
   duplicateCount: number;
+  /** `answerDrafts[card.proposal.id]` (audio-graph-83cc T4) — `undefined`
+   * when no dispatch has ever been made for this card this session. */
+  draft: AnswerDraftState | undefined;
   onApprove: (proposalId: string) => void;
   onAsk: (proposalId: string) => void;
   onDismiss: (proposalId: string) => void;
@@ -315,6 +336,179 @@ function DuplicateCountBadge({ count }: { count: number }) {
   );
 }
 
+/** Compact, count-only evidence chips for a `CardAnswer` (audio-graph-83cc
+ * T4, deliverable c: "evidence ids render as compact chips (no content
+ * lookups in this unit)"). Deliberately renders COUNTS, not the raw
+ * `evidence_span_ids`/`evidence_graph_ids` themselves — a query-conditioned
+ * retrieval bundle can carry up to ~40 graph ids (design panel synthesis
+ * §4.3), and dumping that many opaque ids as individual chips would be
+ * exactly the "content dump" ticket W8 already rejected for the feed row.
+ * Neither chip performs a lookup into the transcript/graph store to resolve
+ * what an id refers to — resolving evidence content is explicitly out of
+ * this unit's scope. */
+function AnswerEvidenceChips({ answer }: { answer: CardAnswer }) {
+  const { t } = useTranslation();
+  const spanCount = answer.evidence_span_ids.length;
+  const graphCount = answer.evidence_graph_ids.length;
+  if (spanCount === 0 && graphCount === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-(--space-2)">
+      {spanCount > 0 ? (
+        <span className="ag-chip" data-tone="neutral">
+          {t("agent.answerEvidenceSpans", { count: spanCount })}
+        </span>
+      ) : null}
+      {graphCount > 0 ? (
+        <span className="ag-chip" data-tone="neutral">
+          {t("agent.answerEvidenceGraph", { count: graphCount })}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** The three-dot "thinking" indicator, migrated verbatim from
+ * `ChatSidebar.tsx`'s `isChatLoading` block (same CSS animation utility,
+ * `chat-dot-bounce`) — reused here rather than imported from that file
+ * since `ChatSidebar` is out of this unit's scope (T7 deletes it) and this
+ * is presentation-only markup, not shared behavior. */
+function AnswerStreamingDots() {
+  const { t } = useTranslation();
+  return (
+    <div
+      className="flex gap-(--space-2) py-(--space-3) px-(--space-4) bg-bg-tertiary border border-(--edge) rounded-lg w-fit"
+      role="status"
+    >
+      <span className="sr-only">{t("chat.thinking")}</span>
+      <span
+        className="w-[6px] h-[6px] rounded-full bg-text-secondary animate-[chat-dot-bounce_1.4s_infinite_ease-in-out_both] [animation-delay:-0.32s]"
+        aria-hidden="true"
+      />
+      <span
+        className="w-[6px] h-[6px] rounded-full bg-text-secondary animate-[chat-dot-bounce_1.4s_infinite_ease-in-out_both] [animation-delay:-0.16s]"
+        aria-hidden="true"
+      />
+      <span
+        className="w-[6px] h-[6px] rounded-full bg-text-secondary animate-[chat-dot-bounce_1.4s_infinite_ease-in-out_both] [animation-delay:0s]"
+        aria-hidden="true"
+      />
+    </div>
+  );
+}
+
+/**
+ * The threaded answer for one live-assist card (audio-graph-83cc T4,
+ * deliverable c). Reads TWO independent sources, in priority order:
+ *
+ * 1. `draft` (`answerDrafts[proposal.id]`, `store/answerDrafts.ts`) — the
+ *    transient in-flight state. `"streaming"` renders the thinking dots;
+ *    `"failed"` renders the typed failure text + a Retry affordance.
+ * 2. `card.answer` (the durable `CardAnswer`, absent for every legacy
+ *    pre-83cc record) — rendered only once there is no active draft, so a
+ *    fresh dispatch's progress always wins over a stale durable answer from
+ *    a previous turn.
+ *
+ * Returns `null` (renders nothing) when neither exists — the exact legacy
+ * shape: a card with no `answer`/`origin`/`signal` and no draft renders
+ * exactly as it did before this ticket (pinned by
+ * `AgentProposalsPanel.test.tsx`'s legacy-card regression test).
+ */
+function AnswerThread({
+  answer,
+  draft,
+  onRetry,
+  readOnly = false,
+}: {
+  answer: CardAnswer | null | undefined;
+  draft: AnswerDraftState | undefined;
+  /** `undefined` (not just omitted) when `readOnly` — the feed row never
+   * gains a capability the queue row doesn't already have (see this file's
+   * `AgentFeedRow` doc: "no approve/ask/dismiss anywhere in this file, for
+   * ANY card"). Required otherwise. */
+  onRetry?: () => void;
+  /** `true` for `AgentFeedRow` — suppresses the Retry button so a failed
+   * thread's ONLY reachable retry is via the queue (Signal/All toggle, same
+   * pre-existing "recoverable via All + marker" limitation
+   * `FragmentSuspectMarker` already accepts for this row). The failure text
+   * itself still renders — read-only means no NEW action, not no content. */
+  readOnly?: boolean;
+}) {
+  const { t } = useTranslation();
+
+  if (draft?.status === "streaming") {
+    return <AnswerStreamingDots />;
+  }
+  if (draft?.status === "failed") {
+    return (
+      <div className="flex flex-col gap-(--space-2)">
+        <p
+          className="m-0 text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm py-(--space-2) px-(--space-3) [overflow-wrap:anywhere]"
+          role="alert"
+        >
+          {draft.text || t("agent.answerFailedGeneric")}
+        </p>
+        {readOnly ? null : (
+          <button
+            type="button"
+            className="self-start border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-xs leading-[20px] py-0 px-(--space-3) hover:text-text-primary hover:border-accent-blue"
+            onClick={onRetry}
+          >
+            {t("agent.answerRetry")}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (!answer) return null;
+
+  if (answer.status === "failed") {
+    return (
+      <div className="flex flex-col gap-(--space-2)">
+        <p
+          className="m-0 text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm py-(--space-2) px-(--space-3) [overflow-wrap:anywhere]"
+          role="alert"
+        >
+          {answer.text || t("agent.answerFailedGeneric")}
+        </p>
+        {readOnly ? null : (
+          <button
+            type="button"
+            className="self-start border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-xs leading-[20px] py-0 px-(--space-3) hover:text-text-primary hover:border-accent-blue"
+            onClick={onRetry}
+          >
+            {t("agent.answerRetry")}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-(--space-2)">
+      {answer.status === "interrupted" ? (
+        <span className="ag-chip self-start" data-tone="neutral">
+          {t("agent.answerInterrupted")}
+        </span>
+      ) : null}
+      <p className="m-0 text-sm text-text-secondary leading-[1.4] [overflow-wrap:anywhere]">
+        {answer.text}
+        {answer.truncated ? (
+          <span
+            className="text-text-muted cursor-help"
+            title={t("agent.answerTruncatedHint")}
+          >
+            {" "}
+            {t("agent.answerTruncatedMarker")}
+            <span className="sr-only">{t("agent.answerTruncatedHint")}</span>
+          </span>
+        ) : null}
+      </p>
+      <AnswerEvidenceChips answer={answer} />
+    </div>
+  );
+}
+
 /** A queue row — the exact markup/handlers the pre-W8 panel rendered for an
  * actionable card, unchanged (approve/ask/dismiss per-kind actions). Only
  * ever rendered for `selectAgentQueue`'s `queue` list, i.e. `isActionable`
@@ -330,12 +524,23 @@ function AgentQueueRow({
   isApproving,
   isFragmentSuspect,
   duplicateCount,
+  draft,
   onApprove,
   onAsk,
   onDismiss,
 }: AgentQueueRowProps) {
   const { t } = useTranslation();
   const proposal = card.proposal;
+  // audio-graph-83cc T4: a question card that has ever had a dispatch (a
+  // draft) or already carries a durable answer shows the thread instead of
+  // the old static "✓ Added to graph" line + Ask AI button — graft G3's
+  // adopted-at-zero-cost item from the design panel synthesis ("the tile
+  // must stop presenting '✓ question added to graph' as the card's only
+  // feedback once a thread exists"). A card with NEITHER (every legacy
+  // pre-83cc record, and every question nobody has asked yet this session)
+  // renders exactly as it did before this ticket — pinned by
+  // `AgentProposalsPanel.test.tsx`'s legacy-card regression test.
+  const hasThread = draft !== undefined || card.answer != null;
   return (
     <li className="border border-(--edge) rounded-md p-(--space-4) bg-bg-tertiary">
       <div className="flex justify-between text-text-muted text-xs mb-(--space-2)">
@@ -357,17 +562,29 @@ function AgentQueueRow({
       </p>
       {proposal.kind === "question" ? (
         <>
-          <p className="text-accent-green text-xs m-0 mb-(--space-4)">
-            <Icon name="check" size={14} /> {t("agent.questionAdded")}
-          </p>
+          {hasThread ? (
+            <div className="mb-(--space-4)">
+              <AnswerThread
+                answer={card.answer}
+                draft={draft}
+                onRetry={() => onAsk(proposal.id)}
+              />
+            </div>
+          ) : (
+            <p className="text-accent-green text-xs m-0 mb-(--space-4)">
+              <Icon name="check" size={14} /> {t("agent.questionAdded")}
+            </p>
+          )}
           <div className="flex gap-(--space-3) justify-end">
-            <button
-              type="button"
-              className="border border-accent-green rounded-sm bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
-              onClick={() => void onAsk(proposal.id)}
-            >
-              {t("agent.askAi")}
-            </button>
+            {hasThread ? null : (
+              <button
+                type="button"
+                className="border border-accent-green rounded-sm bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
+                onClick={() => void onAsk(proposal.id)}
+              >
+                {t("agent.askAi")}
+              </button>
+            )}
             <button
               type="button"
               className="border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
@@ -438,14 +655,22 @@ function AgentFeedRow({
   card,
   isFragmentSuspect,
   duplicateCount,
+  draft,
 }: {
   card: LiveAssistCardRecord;
   isFragmentSuspect: boolean;
   duplicateCount: number;
+  /** `answerDrafts[card.proposal.id]` (audio-graph-83cc T4) — see
+   * `AgentQueueRowProps.draft`'s doc. Reaches this row today only via the
+   * Signal-mode fragment-suspect path (a still-actionable card `admitToQueue`
+   * filtered here) — see `AnswerThread`'s `readOnly` doc for why Retry does
+   * not render here. */
+  draft: AnswerDraftState | undefined;
 }) {
   const { t } = useTranslation();
   const [bodyExpanded, setBodyExpanded] = useState(false);
   const proposal = card.proposal;
+  const hasThread = draft !== undefined || card.answer != null;
   const approvedOutcome =
     card.status === "approved" ? formatApprovedOutcome(card) : null;
   const projectionPatchEvidence =
@@ -480,7 +705,7 @@ function AgentFeedRow({
           {projectionPatchEvidence}
         </p>
       ) : null}
-      {proposal.body ? (
+      {proposal.body || hasThread ? (
         <>
           <button
             type="button"
@@ -493,9 +718,16 @@ function AgentFeedRow({
               : t("notifications.details")}
           </button>
           {bodyExpanded ? (
-            <p className="m-0 text-xs text-text-secondary [overflow-wrap:anywhere]">
-              {proposal.body}
-            </p>
+            <>
+              {proposal.body ? (
+                <p className="m-0 text-xs text-text-secondary [overflow-wrap:anywhere]">
+                  {proposal.body}
+                </p>
+              ) : null}
+              {hasThread ? (
+                <AnswerThread answer={card.answer} draft={draft} readOnly />
+              ) : null}
+            </>
           ) : null}
         </>
       ) : null}
@@ -540,6 +772,18 @@ export function AgentTileHeaderActions() {
  * default) so every pre-W9 call site keeps compiling and behaving
  * identically. The real `App.tsx` call site always passes the lifted
  * `useAgentQueueFilter()` value explicitly.
+ *
+ * audio-graph-83cc T4, graft G3: the return below is now a stable outer
+ * `<div className="h-full flex flex-col">` with exactly ONE conditionally-
+ * rendered scroll region (idle empty state OR the queue/feed body — never
+ * both, `AGENT_QUEUE_PANEL_ID` lives on whichever one renders, never
+ * duplicated) plus `<AgentComposer />` as a SIBLING below it in every
+ * branch. This is the actual fix for the field bug this epic exists to
+ * kill: the pre-T4 idle branch returned a whole different JSX tree with no
+ * composer in it at all — see `AgentComposer.tsx`'s module doc for the exact
+ * synthesis quote. The composer sits outside `AGENT_QUEUE_PANEL_ID` on
+ * purpose (that id is the Signal/All tablist's `aria-controls` target, an
+ * unrelated contract this ticket must not touch).
  */
 function AgentProposalsPanel({
   filter = "signal",
@@ -551,10 +795,18 @@ function AgentProposalsPanel({
   const liveAssistCards = useAudioGraphStore((s) => s.liveAssistCards);
   const approvingIds = useAudioGraphStore((s) => s.approvingAgentProposalIds);
   const status = useAudioGraphStore((s) => s.agentStatus);
+  const answerDrafts = useAudioGraphStore((s) => s.answerDrafts);
   const approveAgentProposal = useAudioGraphStore(
     (s) => s.approveAgentProposal,
   );
-  const askAgentProposal = useAudioGraphStore((s) => s.askAgentProposal);
+  // audio-graph-83cc T4: the manual "Ask AI" action now dispatches through
+  // `answerQuestionCard` (threads the answer under the card) instead of the
+  // pre-T4 `askAgentProposal` (dismissed the card, dumped into the
+  // unreachable `chatMessages` — the exact field failure this epic exists
+  // to kill). `askAgentProposal` itself is left in the store, unchanged and
+  // still tested, for T7's later cleanup pass rather than deleted here —
+  // see this ticket's final report for the explicit scope note.
+  const answerQuestionCard = useAudioGraphStore((s) => s.answerQuestionCard);
   const dismissAgentProposal = useAudioGraphStore(
     (s) => s.dismissAgentProposal,
   );
@@ -573,76 +825,94 @@ function AgentProposalsPanel({
   );
   const approving = useMemo(() => new Set(approvingIds), [approvingIds]);
   const isRunning = status?.state === "running";
-
-  if (queue.length === 0 && feed.length === 0 && !isRunning) {
-    return (
-      <div
-        id={AGENT_QUEUE_PANEL_ID}
-        className="flex flex-col items-center justify-center h-full gap-(--space-3) py-(--space-6) px-(--space-4) text-center select-none"
-        data-testid="agent-empty"
-      >
-        <span className="text-text-muted opacity-40" aria-hidden="true">
-          <Icon name="agent" size={32} />
-        </span>
-        <div className="flex flex-col gap-(--space-2) max-w-[280px]">
-          <p className="m-0 text-text-secondary text-md font-medium">
-            {t("agent.idleTitle")}
-          </p>
-          <p className="m-0 text-text-muted text-sm leading-normal">
-            {t("agent.idleBody")}
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const isIdle = queue.length === 0 && feed.length === 0 && !isRunning;
 
   return (
-    <div
-      id={AGENT_QUEUE_PANEL_ID}
-      className="h-full overflow-y-auto py-[10px] px-(--space-5)"
-      data-testid="agent-body"
-    >
-      {isRunning ? (
-        <div className="text-accent-blue text-sm mb-(--space-4)">
-          {status?.message ?? t("agent.working")}
+    <div className="h-full flex flex-col">
+      {isIdle ? (
+        <div
+          id={AGENT_QUEUE_PANEL_ID}
+          // `overflow-y-auto` (audio-graph-83cc T4 fix-round finding, minor
+          // a11y gate: "200% zoom == compact tier"): the non-idle body below
+          // already scrolls instead of overflowing when its content
+          // outgrows the tile at a narrow/zoomed compact tier — this empty
+          // state had no such handling, so its content could bleed past the
+          // tile boundary into the pinned `<AgentComposer>` below it at 200%
+          // zoom on a compact tile. Scrolling on overflow rather than
+          // clipping or spilling matches the non-idle body's own contract.
+          className="flex flex-1 min-h-0 flex-col items-center justify-center gap-(--space-3) overflow-y-auto py-(--space-6) px-(--space-4) text-center select-none"
+          data-testid="agent-empty"
+        >
+          <span className="text-text-muted opacity-40" aria-hidden="true">
+            <Icon name="agent" size={32} />
+          </span>
+          <div className="flex flex-col gap-(--space-2) max-w-[280px]">
+            <p className="m-0 text-text-secondary text-md font-medium">
+              {t("agent.idleTitle")}
+            </p>
+            <p className="m-0 text-text-muted text-sm leading-normal">
+              {t("agent.idleBody")}
+            </p>
+          </div>
         </div>
-      ) : null}
-      {queue.length > 0 ? (
-        <div className="mb-(--space-5)">
-          <p className="ag-label m-0 mb-(--space-3)">{t("agent.queueTitle")}</p>
-          <ul className="flex flex-col gap-(--space-4) list-none m-0 p-0">
-            {queue.map((card) => (
-              <AgentQueueRow
-                key={card.proposal.id}
-                card={card}
-                isApproving={approving.has(card.proposal.id)}
-                isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
-                duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
-                onApprove={approveAgentProposal}
-                onAsk={askAgentProposal}
-                onDismiss={dismissAgentProposal}
-              />
-            ))}
-          </ul>
+      ) : (
+        <div
+          id={AGENT_QUEUE_PANEL_ID}
+          className="flex-1 min-h-0 overflow-y-auto py-[10px] px-(--space-5)"
+          data-testid="agent-body"
+        >
+          {isRunning ? (
+            <div className="text-accent-blue text-sm mb-(--space-4)">
+              {status?.message ?? t("agent.working")}
+            </div>
+          ) : null}
+          {queue.length > 0 ? (
+            <div className="mb-(--space-5)">
+              <p className="ag-label m-0 mb-(--space-3)">
+                {t("agent.queueTitle")}
+              </p>
+              <ul className="flex flex-col gap-(--space-4) list-none m-0 p-0">
+                {queue.map((card) => (
+                  <AgentQueueRow
+                    key={card.proposal.id}
+                    card={card}
+                    isApproving={approving.has(card.proposal.id)}
+                    isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
+                    duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
+                    draft={answerDrafts[card.proposal.id]}
+                    onApprove={approveAgentProposal}
+                    onAsk={answerQuestionCard}
+                    onDismiss={dismissAgentProposal}
+                  />
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <div>
+            <p className="ag-label m-0 mb-(--space-3)">
+              {t("agent.feedTitle")}
+            </p>
+            {feed.length === 0 ? (
+              <p className="text-text-muted text-sm m-0">
+                {t("agent.feedEmpty")}
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-(--space-2) list-none m-0 p-0">
+                {feed.map((card) => (
+                  <AgentFeedRow
+                    key={card.proposal.id}
+                    card={card}
+                    isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
+                    duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
+                    draft={answerDrafts[card.proposal.id]}
+                  />
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
-      ) : null}
-      <div>
-        <p className="ag-label m-0 mb-(--space-3)">{t("agent.feedTitle")}</p>
-        {feed.length === 0 ? (
-          <p className="text-text-muted text-sm m-0">{t("agent.feedEmpty")}</p>
-        ) : (
-          <ul className="flex flex-col gap-(--space-2) list-none m-0 p-0">
-            {feed.map((card) => (
-              <AgentFeedRow
-                key={card.proposal.id}
-                card={card}
-                isFragmentSuspect={fragmentSuspectIds.has(card.proposal.id)}
-                duplicateCount={duplicateCounts.get(card.proposal.id) ?? 1}
-              />
-            ))}
-          </ul>
-        )}
-      </div>
+      )}
+      <AgentComposer />
     </div>
   );
 }

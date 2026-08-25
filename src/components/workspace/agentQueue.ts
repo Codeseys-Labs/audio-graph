@@ -36,6 +36,14 @@ export function liveAssistCardFromProposal(
     projection_patch_sequence: null,
     created_at_ms: proposal.created_at_ms,
     updated_at_ms: proposal.created_at_ms,
+    // audio-graph-83cc T1's own invariant is that `LiveAssistCardRecord.signal`
+    // is mirrored from `proposal.signal` (events.rs) — a synthesized record
+    // (this function's whole reason for existing: a proposal that has not
+    // yet round-tripped through a real `live_assist_card` backend event) must
+    // not disagree with a backend-authored record for the identical proposal
+    // on this field once one does land (fix-round finding: T5's auto-answer
+    // admit is the next reader of this field).
+    signal: proposal.signal,
   };
 }
 
@@ -215,12 +223,27 @@ function hasDanglingClauseEnding(text: string): boolean {
  * actionable. Widening either rule to notes/graph suggestions would break
  * that fixture and would exceed what R6 ratified — it is a deliberately
  * conservative policy choice, not a fact about production provenance.
+ *
+ * audio-graph-83cc T4 fix-round finding (major): a card with
+ * `card.origin === "user"` (T1 schema — a free-form question the user typed
+ * into `AgentComposer`, never a transcript-detection guess) is EXEMPT from
+ * every rule below, unconditionally. These rules exist to catch seed 104f's
+ * transcript-fragment-detection bug ("so what about the") — a shape that
+ * cannot occur for text the user deliberately typed and submitted. Before
+ * this exemption, a short user question (or a low/default `confidence` a
+ * future backend mint assigns a typed question, since confidence is
+ * meaningless for non-detected text) would be demoted to the read-only feed
+ * row, where the composer's own flagship answer thread renders behind a
+ * collapsed `Details` disclosure with no reachable Retry — the exact
+ * regression an adversarial review caught against `askQuestion`'s minted
+ * cards.
  */
 export function classifyQueueEntry(
   card: LiveAssistCardRecord,
   isActionable: boolean,
 ): QueueEntryClassification {
   if (!isActionable) return "info";
+  if (card.origin === "user") return "actionable";
 
   const { proposal } = card;
   if (proposal.kind === "question") {
@@ -372,7 +395,15 @@ export function selectAgentQueue(
     if (!isActionable) {
       classification = "info";
     } else {
-      const duplicateKey = queueDuplicateKey(card.proposal);
+      // audio-graph-83cc T4 fix-round finding: a user-typed card (see
+      // `classifyQueueEntry`'s matching exemption doc above) never
+      // participates in duplicate-collapse either — asking the identical
+      // question twice on purpose (e.g. retrying with the same wording) must
+      // not silently hide the second thread behind a demoted feed row, and a
+      // user-origin card must never "burn" a content key that would then
+      // wrongly collapse an unrelated transcript-derived card onto it.
+      const duplicateKey =
+        card.origin === "user" ? null : queueDuplicateKey(card.proposal);
       const survivorId = duplicateKey
         ? seenContent.get(duplicateKey)
         : undefined;

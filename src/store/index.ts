@@ -26,6 +26,10 @@
  *                              persistence queue pressure.
  *   - Chat                   — `chatMessages`, `isChatLoading`,
  *                              `sendChatMessage`, `clearChatHistory`.
+ *   - Answer drafts (T4)     — `answerDrafts`, `composerError`,
+ *                              `askQuestion` / `answerQuestionCard` (thread
+ *                              an answer under a live-assist card instead of
+ *                              `chatMessages`; see `store/answerDrafts.ts`).
  *   - Settings / UI          — `settings`, `loadSettings`,
  *                              `settingsOpen` / `sessionsBrowserOpen`
  *                              modal flags + `rightPanelTab` tab state.
@@ -114,6 +118,11 @@ import {
   errorToMessage,
 } from "../utils/errorToMessage";
 import { fuzzyEntityNameMatch } from "../utils/materializedGraph";
+import { createAnswerDraftsSlice } from "./answerDrafts";
+import {
+  CHAT_STREAM_DELTA_THROTTLE_MS,
+  createChatStreamCoalescer,
+} from "./chatStream";
 import { createShellNavSlice } from "./shellNav";
 
 const idleStage: StageStatus = { type: "Idle" };
@@ -210,8 +219,75 @@ function providerDeferredMessage(provider: ProviderDescriptor): string {
  * the burst rate. (Was the `CHAT_DELTA_THROTTLE_MS` coalescer in
  * `useTauriEvents`; it moved here with the transport when the hot path went
  * from `chat-token-delta` events to the per-invocation channel.)
+ *
+ * audio-graph-83cc T4 fix-round finding (minor): single-sourced from
+ * `chatStream.ts`'s `CHAT_STREAM_DELTA_THROTTLE_MS` rather than a second,
+ * independently-declared `33` — `sendChatMessage` below is still its own
+ * inline implementation (not retrofitted onto `createChatStreamCoalescer`;
+ * see that module's doc for why), but there is no reason the two throttle
+ * WINDOWS should be free to drift from each other while the two mechanisms
+ * stay deliberately un-unified. `chatStream.ts` is a leaf helper this file
+ * already imports from — reusing its constant doesn't add a new dependency
+ * edge, just removes a duplicate literal.
  */
-const CHAT_DELTA_THROTTLE_MS = 33;
+const CHAT_DELTA_THROTTLE_MS = CHAT_STREAM_DELTA_THROTTLE_MS;
+
+// ── Answer-card commands (audio-graph-83cc T4) ────────────────────────────
+// T3 (the backend answer engine, `docs/agentic-runs/2026-08-24-83cc-design-
+// panel/synthesis-ticket-cut.md` §T3) is unlanded at the time these actions
+// were written. Command names + response shapes below are named in that
+// synthesis (angle-a §2.3's `answer_question_card`/`ask_question_card`) but
+// not yet backed by a real Rust command in this tree. Both are isolated to
+// this one block — command name as a standalone constant, response shape as
+// its own local interface — so a T3 rename/reshape is a one-line/one-type
+// fix here, never a call-site hunt. Every caller already degrades
+// gracefully on a rejected `invoke` (see `askQuestion`/`answerQuestionCard`
+// below), which is exactly the "T3 unlanded" case today.
+const ANSWER_QUESTION_CARD_COMMAND = "answer_question_card";
+const ASK_QUESTION_CARD_COMMAND = "ask_question_card";
+
+/** Response shape named in the synthesis for `answer_question_card`
+ * (angle-a §2.3: `AnswerDispatch { request_id }`). The card already exists;
+ * only a request id comes back synchronously. */
+interface AnswerQuestionCardDispatch {
+  request_id: string;
+}
+
+/** Response shape named in the synthesis for `ask_question_card` (angle-a
+ * §2.3: `AskDispatch { record, request_id }`). Mints the card and starts
+ * answering it in one round trip, so the newly-minted record comes back
+ * synchronously alongside the request id. */
+interface AskQuestionCardDispatch {
+  record: LiveAssistCardRecord;
+  request_id: string;
+}
+
+/** Strips the canned detection-prefix `run_agent_proposal_task` (speech/
+ * mod.rs) mints for a Question proposal's body, recovering the underlying
+ * utterance — the same extraction `askAgentProposal` already performs.
+ * Shared here so `answerQuestionCard` asks the same question a human reading
+ * the card would. */
+function questionTextForProposal(proposal: AgentProposalEvent): string {
+  return (
+    proposal.body?.replace(
+      /^Consider answering or linking this question:\s*/i,
+      "",
+    ) || proposal.title
+  );
+}
+
+/** `finish_reason` values of the shape `"error: <detail>"` are how
+ * `ChatTokenDoneEvent` (and, per the synthesis, the answer-card commands'
+ * shared `ChatStreamEvent` channel) carries a stream failure — mirrors
+ * `finalizeChatStream`'s own `startsWith("error:")` check below. Returns the
+ * detail text (or a generic fallback) when it matches, `null` otherwise. */
+function answerStreamErrorDetail(
+  finishReason: string | null | undefined,
+): string | null {
+  if (!finishReason?.startsWith("error:")) return null;
+  const detail = finishReason.slice("error:".length).trim();
+  return detail || i18n.t("agent.answerFailedGeneric");
+}
 
 function upsertLiveAssistCardRecord(
   cards: LiveAssistCardRecord[],
@@ -1567,6 +1643,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Shell navigation (SHELL-R1, ADR-0046) ───────────────────────────────
   ...createShellNavSlice(set, get),
 
+  // ── Answer drafts (audio-graph-83cc T4) ─────────────────────────────────
+  ...createAnswerDraftsSlice(set, get),
+
   // ── Audio sources ────────────────────────────────────────────────────
   audioSources: [],
   selectedSourceIds: [],
@@ -1840,6 +1919,160 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (!dismissed) return;
     await get().sendChatMessage(question);
   },
+  answerQuestionCard: async (proposalId: string) => {
+    const { settings } = get();
+    if (!settings) {
+      set({ error: i18n.t("errors.providerSettingsLoading") });
+      return;
+    }
+    const deferredProvider = deferredProviderForChatStart(settings);
+    if (deferredProvider) {
+      set({ error: providerDeferredMessage(deferredProvider) });
+      return;
+    }
+    const existing =
+      get().agentProposals.find((p) => p.id === proposalId) ??
+      get().liveAssistCards.find((c) => c.proposal.id === proposalId)?.proposal;
+    if (!existing) return;
+    const question = questionTextForProposal(existing);
+
+    // Optimistic: show "streaming" the instant the click fires, before the
+    // dispatch even resolves — same shape as `sendChatMessage`'s placeholder,
+    // just per-card instead of appended to a shared log.
+    get().setAnswerDraft(proposalId, {
+      status: "streaming",
+      text: "",
+      requestId: null,
+    });
+
+    let armedRequestId: string | null = null;
+    const coalescer = createChatStreamCoalescer({
+      onDelta: (delta) => {
+        if (armedRequestId === null) return;
+        get().appendAnswerDraftDelta(proposalId, armedRequestId, delta);
+      },
+      onDone: (doneEvent) => {
+        // audio-graph-83cc T4 fix-round finding (minor): a SUPERSEDED
+        // dispatch's terminal frame must never clobber a newer dispatch's
+        // draft for the same card (e.g. a double-click on Ask AI/Retry
+        // before React re-renders to hide the button, arming a second
+        // `armedRequestId` for `proposalId`). Mirrors the staleness guard
+        // `appendAnswerDraftDelta` already applies to delta frames, extended
+        // to the terminal write here.
+        if (get().answerDrafts[proposalId]?.requestId !== armedRequestId) {
+          return;
+        }
+        const errorDetail = answerStreamErrorDetail(doneEvent.finish_reason);
+        if (errorDetail !== null) {
+          get().setAnswerDraft(proposalId, {
+            status: "failed",
+            text: errorDetail,
+            requestId: armedRequestId,
+          });
+          return;
+        }
+        // Non-error terminal frame: the durable `CardAnswer` is expected to
+        // land on `liveAssistCards` via the backend's own event once T3
+        // lands (see `answerDrafts.ts`'s module doc) — clear the transient
+        // draft rather than leave a stale "streaming" ghost.
+        get().clearAnswerDraft(proposalId);
+      },
+    });
+
+    try {
+      const dispatch = await invoke<AnswerQuestionCardDispatch>(
+        ANSWER_QUESTION_CARD_COMMAND,
+        {
+          proposalId,
+          question,
+          auto: false,
+          channel: coalescer.channel,
+        },
+      );
+      armedRequestId = dispatch.request_id;
+      get().setAnswerDraft(proposalId, {
+        status: "streaming",
+        text: "",
+        requestId: armedRequestId,
+      });
+      coalescer.arm(armedRequestId);
+    } catch (err) {
+      coalescer.disarm();
+      get().setAnswerDraft(proposalId, {
+        status: "failed",
+        text: errorToMessage(err),
+        requestId: null,
+      });
+    }
+  },
+  askQuestion: async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const { settings } = get();
+    if (!settings) {
+      set({ error: i18n.t("errors.providerSettingsLoading") });
+      return;
+    }
+    const deferredProvider = deferredProviderForChatStart(settings);
+    if (deferredProvider) {
+      set({ error: providerDeferredMessage(deferredProvider) });
+      return;
+    }
+    get().setComposerError(null);
+
+    // Unlike `answerQuestionCard`, there is no card (and so no draft key)
+    // until the dispatch resolves — the mint-and-ask round trip is one call.
+    // A synchronous rejection has nowhere to thread onto a per-card draft,
+    // hence `composerError` instead (see `answerDrafts.ts`'s module doc).
+    let cardId: string | null = null;
+    let armedRequestId: string | null = null;
+    const coalescer = createChatStreamCoalescer({
+      onDelta: (delta) => {
+        if (cardId === null || armedRequestId === null) return;
+        get().appendAnswerDraftDelta(cardId, armedRequestId, delta);
+      },
+      onDone: (doneEvent) => {
+        if (cardId === null) return;
+        // audio-graph-83cc T4 fix-round finding (minor): same staleness
+        // guard as `answerQuestionCard`'s `onDone` — see that action's
+        // comment. Guards against a Retry (`answerQuestionCard`) re-arming
+        // this same freshly-minted card before this dispatch's own terminal
+        // frame lands.
+        if (get().answerDrafts[cardId]?.requestId !== armedRequestId) {
+          return;
+        }
+        const errorDetail = answerStreamErrorDetail(doneEvent.finish_reason);
+        if (errorDetail !== null) {
+          get().setAnswerDraft(cardId, {
+            status: "failed",
+            text: errorDetail,
+            requestId: armedRequestId,
+          });
+          return;
+        }
+        get().clearAnswerDraft(cardId);
+      },
+    });
+
+    try {
+      const dispatch = await invoke<AskQuestionCardDispatch>(
+        ASK_QUESTION_CARD_COMMAND,
+        { text: trimmed, channel: coalescer.channel },
+      );
+      cardId = dispatch.record.proposal.id;
+      armedRequestId = dispatch.request_id;
+      get().upsertLiveAssistCard(dispatch.record);
+      get().setAnswerDraft(cardId, {
+        status: "streaming",
+        text: "",
+        requestId: armedRequestId,
+      });
+      coalescer.arm(armedRequestId);
+    } catch (err) {
+      coalescer.disarm();
+      get().setComposerError(errorToMessage(err));
+    }
+  },
   approveAgentProposal: async (proposalId: string) => {
     const proposal = get().agentProposals.find(
       (item) => item.id === proposalId,
@@ -1904,17 +2137,25 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         "dismiss_agent_proposal",
         { proposalId },
       );
-      set((state) => ({
-        liveAssistCards: card
-          ? upsertLiveAssistCardRecord(state.liveAssistCards, card)
-          : state.liveAssistCards,
-        agentProposals: state.agentProposals.filter(
-          (item) => item.id !== proposalId,
-        ),
-        approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
-          (id) => id !== proposalId,
-        ),
-      }));
+      set((state) => {
+        // audio-graph-83cc T4: a dismissed card never keeps a stale
+        // "streaming"/"failed" answer-draft ghost around (answerDrafts.ts's
+        // module doc).
+        const answerDrafts = { ...state.answerDrafts };
+        delete answerDrafts[proposalId];
+        return {
+          liveAssistCards: card
+            ? upsertLiveAssistCardRecord(state.liveAssistCards, card)
+            : state.liveAssistCards,
+          agentProposals: state.agentProposals.filter(
+            (item) => item.id !== proposalId,
+          ),
+          approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+            (id) => id !== proposalId,
+          ),
+          answerDrafts,
+        };
+      });
       return card;
     } catch (err) {
       console.error("Failed to dismiss agent proposal:", err);
@@ -1930,14 +2171,28 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       const cards = await invoke<LiveAssistCardRecord[]>(
         "clear_agent_proposals",
       );
-      set((state) => ({
-        liveAssistCards: cards.reduce(
-          upsertLiveAssistCardRecord,
-          state.liveAssistCards,
-        ),
-        agentProposals: [],
-        approvingAgentProposalIds: [],
-      }));
+      set((state) => {
+        // audio-graph-83cc T4 fix-round finding: only the cards THIS call
+        // actually dismissed lose their draft — `answerDrafts` can outlive
+        // `"pending"` (an approved card's draft is never cleared, since
+        // `approveAgentProposal` doesn't touch it), so a wholesale `{}` reset
+        // here would silently delete an unrelated approved card's failure
+        // text and Retry affordance. Mirrors `dismissAgentProposal`'s
+        // per-card discipline exactly, one line up in this same file.
+        const answerDrafts = { ...state.answerDrafts };
+        for (const dismissedCard of cards) {
+          delete answerDrafts[dismissedCard.proposal.id];
+        }
+        return {
+          liveAssistCards: cards.reduce(
+            upsertLiveAssistCardRecord,
+            state.liveAssistCards,
+          ),
+          answerDrafts,
+          agentProposals: [],
+          approvingAgentProposalIds: [],
+        };
+      });
       return cards;
     } catch (err) {
       console.error("Failed to clear agent proposals:", err);
@@ -2007,6 +2262,18 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       isChatLoading: false,
       streamingChatRequestId: null,
       loadedSessionId: null,
+      // audio-graph-83cc T4 fix-round finding (major): every OTHER
+      // session-scoped transient projection above is reset here — these two
+      // (added by this ticket) were an oversight. Without this, a stale
+      // `composerError` banner survives a session switch until the next
+      // submit, and a stale `"streaming"`/`"failed"` draft can outrank a
+      // re-hydrated card's durable `answer` if the same card id reappears
+      // (same-session reload), permanently hiding that card's Ask AI button
+      // (see `answerDrafts.ts`'s module doc: "a dismissed card never keeps a
+      // stale ghost around" — session reset is the session-boundary
+      // equivalent of a dismiss for this state).
+      answerDrafts: {},
+      composerError: null,
     }));
   },
   loadSampleSessionPreview: (language?: string) =>

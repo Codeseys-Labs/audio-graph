@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type {
   AgentProposalEvent,
   AgentStatusEvent,
+  AnswerDraftState,
+  CardAnswer,
   LiveAssistCardRecord,
 } from "../types";
 import AgentProposalsPanel, {
@@ -97,6 +99,8 @@ function resetStore(
     liveAssistCards?: LiveAssistCardRecord[];
     approvingAgentProposalIds?: string[];
     agentStatus?: AgentStatusEvent | null;
+    answerDrafts?: Record<string, AnswerDraftState>;
+    composerError?: string | null;
   } = {},
 ) {
   useAudioGraphStore.setState({
@@ -104,10 +108,21 @@ function resetStore(
     liveAssistCards: overrides.liveAssistCards ?? [],
     approvingAgentProposalIds: overrides.approvingAgentProposalIds ?? [],
     agentStatus: overrides.agentStatus ?? null,
+    // audio-graph-83cc T4: defaults for the answer-draft slice so a test
+    // that doesn't care about it never sees a leftover draft from a
+    // previous test (Zustand state persists across tests unless reset).
+    answerDrafts: overrides.answerDrafts ?? {},
+    composerError: overrides.composerError ?? null,
     approveAgentProposal: vi.fn(async () => null),
     askAgentProposal: vi.fn(async () => {}),
     dismissAgentProposal: vi.fn(async () => null),
     clearAgentProposals: vi.fn(async () => []),
+    // T4: the manual "Ask AI" button now dispatches this action (see
+    // AgentProposalsPanel.tsx's module doc) — default it to a no-op so a
+    // test exercising an unrelated behavior never accidentally calls the
+    // REAL action (which invokes Tauri) just by rendering a question card.
+    answerQuestionCard: vi.fn(async () => {}),
+    askQuestion: vi.fn(async () => {}),
   });
 }
 
@@ -159,11 +174,12 @@ describe("AgentProposalsPanel", () => {
     expect(screen.getByText("Needs you")).toBeInTheDocument();
   });
 
-  it("fills its container's full height with no bottom-strip cap or border (ticket W4/W8: the panel lives inside a full-height bento tile body, not a bottom strip)", () => {
+  it("fills its container's full height with no bottom-strip cap or border (ticket W4/W8: the panel lives inside a full-height bento tile body, not a bottom strip; audio-graph-83cc T4: the scroll region now grows via flex-1 inside a full-height flex column rather than h-full directly, so the pinned composer sibling below it has room)", () => {
     resetStore({ agentProposals: [proposal()] });
     render(<AgentProposalsPanel />);
     const body = screen.getByTestId("agent-body");
-    expect(body).toHaveClass("h-full");
+    expect(body).toHaveClass("flex-1");
+    expect(body).toHaveClass("min-h-0");
     expect(body).not.toHaveClass("max-h-[240px]");
     expect(body).not.toHaveClass("border-t");
     expect(body).not.toHaveClass("shrink-0");
@@ -434,8 +450,8 @@ describe("AgentProposalsPanel", () => {
     expect(screen.getByRole("button", { name: /dismiss/i })).toBeDisabled();
   });
 
-  it("renders queued question proposals with Ask AI and the added-to-graph note", () => {
-    const askAgentProposal = vi.fn(async () => {});
+  it("renders queued question proposals with Ask AI and the added-to-graph note, and Ask AI dispatches answerQuestionCard (audio-graph-83cc T4 — NOT the old askAgentProposal dismiss-then-chat path)", () => {
+    const answerQuestionCard = vi.fn(async () => {});
     resetStore({
       // Ticket W9: the classifier reads the CONTENT recovered from `body`
       // for a question, not `title` (title is a formulaic backend
@@ -452,12 +468,12 @@ describe("AgentProposalsPanel", () => {
         }),
       ],
     });
-    useAudioGraphStore.setState({ askAgentProposal });
+    useAudioGraphStore.setState({ answerQuestionCard });
     render(<AgentProposalsPanel />);
     expect(screen.getByText("Question")).toBeInTheDocument();
     expect(screen.getByText(/added to graph/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /ask ai/i }));
-    expect(askAgentProposal).toHaveBeenCalledWith("pq");
+    expect(answerQuestionCard).toHaveBeenCalledWith("pq");
     expect(
       screen.queryByRole("button", { name: /add to graph/i }),
     ).not.toBeInTheDocument();
@@ -859,5 +875,445 @@ describe("Signal/All queue filter toggle (ticket W9, ratified R6)", () => {
 
     fireEvent.keyDown(allTab, { key: "Home" });
     expect(signalTab).toHaveAttribute("aria-selected", "true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AgentComposer + AnswerThread (audio-graph-83cc T4)
+// ---------------------------------------------------------------------------
+
+function answer(overrides: Partial<CardAnswer> = {}): CardAnswer {
+  return {
+    status: "answered",
+    text: "The team decided to hold pricing steady.",
+    truncated: false,
+    evidence_span_ids: [],
+    evidence_graph_ids: [],
+    notes_last_sequence: null,
+    route_id: "route.test",
+    requested_by: "transcript",
+    finish_reason: "stop",
+    total_tokens: 42,
+    answered_at_ms: 100,
+    ...overrides,
+  };
+}
+
+describe("AgentComposer renders in every panel state (audio-graph-83cc T4, graft G3)", () => {
+  beforeEach(() => {
+    seq = 0;
+    resetStore();
+  });
+
+  it("renders the composer alongside the idle empty state — the pre-T4 idle branch returned before any input could exist at all", () => {
+    render(<AgentProposalsPanel />);
+    expect(screen.getByTestId("agent-empty")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-composer")).toBeInTheDocument();
+    expect(
+      screen.getByRole("textbox", { name: "Ask about the conversation" }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the composer alongside a non-empty queue/feed body", () => {
+    resetStore({ agentProposals: [proposal()] });
+    render(<AgentProposalsPanel />);
+    expect(screen.getByTestId("agent-body")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-composer")).toBeInTheDocument();
+  });
+
+  it("renders the composer while the agent status is running (streaming state)", () => {
+    resetStore({
+      agentStatus: { state: "running", message: "Working", timestamp_ms: 1 },
+    });
+    render(<AgentProposalsPanel />);
+    expect(screen.getByTestId("agent-composer")).toBeInTheDocument();
+  });
+
+  it("keeps the composer OUTSIDE the Signal/All aria-controls target (AGENT_QUEUE_PANEL_ID) in every state", () => {
+    // Idle state.
+    const { rerender } = render(<AgentProposalsPanel />);
+    let panel = document.getElementById("agent-queue-filter-panel");
+    let composer = screen.getByTestId("agent-composer");
+    expect(panel).not.toBeNull();
+    expect(panel?.contains(composer)).toBe(false);
+
+    // Non-idle state — re-render after seeding a proposal.
+    act(() => {
+      resetStore({ agentProposals: [proposal()] });
+    });
+    rerender(<AgentProposalsPanel />);
+    panel = document.getElementById("agent-queue-filter-panel");
+    composer = screen.getByTestId("agent-composer");
+    expect(panel).not.toBeNull();
+    expect(panel?.contains(composer)).toBe(false);
+  });
+
+  it("submits the trimmed text via askQuestion and clears the input", async () => {
+    const askQuestion = vi.fn(async () => {});
+    useAudioGraphStore.setState({ askQuestion });
+    render(<AgentProposalsPanel />);
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    fireEvent.change(input, { target: { value: "  What changed?  " } });
+    // audio-graph-83cc T4 fix-round: the clear-on-submit now happens AFTER
+    // `await askQuestion(...)` resolves (so a failed submit can preserve the
+    // typed text instead — see the fix-round test right below this one), so
+    // the click + settle must be wrapped in `act()` for React to flush the
+    // resulting state update before the assertion runs.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    expect(askQuestion).toHaveBeenCalledWith("What changed?");
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  it("audio-graph-83cc T4 fix-round (minor): preserves the typed question on a failed submit instead of discarding it — composerError alone told the user WHAT failed, never WHAT they asked", async () => {
+    const askQuestion = vi.fn(async () => {
+      // Mirrors the real `askQuestion` store action's degrade-gracefully
+      // contract: never throws, sets `composerError` on failure.
+      useAudioGraphStore.setState({
+        composerError: "Backend command not found: ask_question_card",
+      });
+    });
+    useAudioGraphStore.setState({ askQuestion });
+    render(<AgentProposalsPanel />);
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    fireEvent.change(input, { target: { value: "What changed?" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    expect(askQuestion).toHaveBeenCalledWith("What changed?");
+    expect((input as HTMLInputElement).value).toBe("What changed?");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Backend command not found",
+    );
+  });
+
+  it("audio-graph-83cc T4 fix-round (minor): the input is never disabled mid-dispatch — only the send button is — so a keyboard user submitting via Enter is never blurred to <body>", async () => {
+    let resolveAsk: () => void = () => {};
+    const askQuestion = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveAsk = resolve;
+        }),
+    );
+    useAudioGraphStore.setState({ askQuestion });
+    render(<AgentProposalsPanel />);
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    fireEvent.change(input, { target: { value: "hello" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+    await act(async () => {
+      resolveAsk();
+      await Promise.resolve();
+    });
+  });
+
+  it("Enter submits, Shift+Enter does not", () => {
+    const askQuestion = vi.fn(async () => {});
+    useAudioGraphStore.setState({ askQuestion });
+    render(<AgentProposalsPanel />);
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    fireEvent.change(input, { target: { value: "hello" } });
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(askQuestion).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(askQuestion).toHaveBeenCalledWith("hello");
+  });
+
+  it("never submits an empty/whitespace-only question", () => {
+    const askQuestion = vi.fn(async () => {});
+    useAudioGraphStore.setState({ askQuestion });
+    render(<AgentProposalsPanel />);
+    const sendButton = screen.getByRole("button", { name: "Send message" });
+    expect(sendButton).toBeDisabled();
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(sendButton).toBeDisabled();
+    fireEvent.click(sendButton);
+    expect(askQuestion).not.toHaveBeenCalled();
+  });
+
+  it("renders a rejected askQuestion dispatch's error INLINE (role=alert) instead of crashing or silently dropping it — degrades gracefully while T3 is unlanded", () => {
+    resetStore({
+      composerError: "Backend command not found: ask_question_card",
+    });
+    render(<AgentProposalsPanel />);
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Backend command not found");
+    // Nothing thrown, nothing else in the tree replaced — the rest of the
+    // idle state still renders normally alongside the error.
+    expect(screen.getByTestId("agent-empty")).toBeInTheDocument();
+  });
+
+  it("does not steal focus from the composer input when a card updates elsewhere in the store", () => {
+    render(<AgentProposalsPanel />);
+    const input = screen.getByRole("textbox", {
+      name: "Ask about the conversation",
+    });
+    input.focus();
+    expect(input).toHaveFocus();
+
+    act(() => {
+      useAudioGraphStore.setState({
+        agentProposals: [proposal({ title: "New card" })],
+      });
+    });
+
+    expect(input).toHaveFocus();
+  });
+});
+
+describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
+  beforeEach(() => {
+    seq = 0;
+    resetStore();
+  });
+
+  it("a legacy card (no answer/origin/signal, no draft) renders EXACTLY as before this ticket — pinned regression", () => {
+    resetStore({
+      agentProposals: [
+        proposal({
+          id: "legacy-q",
+          kind: "question",
+          title: "Question from Speaker 1",
+          body: questionBody("What is the launch date?"),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(within(row).getByText(/added to graph/i)).toBeInTheDocument();
+    expect(
+      within(row).getByRole("button", { name: /ask ai/i }),
+    ).toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /retry/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("a streaming draft renders the thinking indicator instead of the added-to-graph note, and hides Ask AI", () => {
+    resetStore({
+      agentProposals: [
+        proposal({
+          id: "streaming-q",
+          kind: "question",
+          title: "Question from Speaker 1",
+          body: questionBody("What is the launch date?"),
+        }),
+      ],
+      answerDrafts: {
+        "streaming-q": { status: "streaming", text: "", requestId: "r1" },
+      },
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(within(row).getByRole("status")).toBeInTheDocument();
+    expect(within(row).queryByText(/added to graph/i)).not.toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /ask ai/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("a failed draft renders the typed error text and a Retry button that dispatches answerQuestionCard", () => {
+    const answerQuestionCard = vi.fn(async () => {});
+    resetStore({
+      agentProposals: [
+        proposal({
+          id: "failed-q",
+          kind: "question",
+          title: "Question from Speaker 1",
+          body: questionBody("What is the launch date?"),
+        }),
+      ],
+      answerDrafts: {
+        "failed-q": {
+          status: "failed",
+          text: "Rate limited by the provider.",
+          requestId: "r1",
+        },
+      },
+    });
+    useAudioGraphStore.setState({ answerQuestionCard });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(
+      within(row).getByText("Rate limited by the provider."),
+    ).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: "Retry" }));
+    expect(answerQuestionCard).toHaveBeenCalledWith("failed-q");
+  });
+
+  it("an answered card shows the answer text, no added-to-graph note, and no Ask AI button", () => {
+    // A card whose `answer` is already durable must ALSO appear in
+    // `agentProposals` (this session's live queue) for `isActionable` to
+    // stay `true` and land the row in the queue rather than the feed —
+    // `mergeLiveAssistCards` prefers the `liveAssistCards` entry's own
+    // `proposal` fields when both arrays name the same id, so this fixture
+    // keeps them IDENTICAL rather than letting title/body diverge between
+    // the two arrays.
+    const p = proposal({
+      id: "answered-q",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What is the launch date?"),
+    });
+    resetStore({
+      agentProposals: [p],
+      liveAssistCards: [
+        card({
+          proposal: p,
+          answer: answer({ text: "The launch date moved to March." }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(
+      within(row).getByText("The launch date moved to March."),
+    ).toBeInTheDocument();
+    expect(within(row).queryByText(/added to graph/i)).not.toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /ask ai/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("a truncated answer renders an ellipsis marker carrying a tooltip/i18n hint", () => {
+    const p = proposal({
+      id: "truncated-q",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What is the launch date?"),
+    });
+    resetStore({
+      agentProposals: [p],
+      liveAssistCards: [
+        card({
+          proposal: p,
+          answer: answer({ text: "Partial answer", truncated: true }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    const marker = within(row).getByTitle(
+      "Answer truncated at the length limit",
+    );
+    expect(marker).toBeInTheDocument();
+  });
+
+  it("evidence ids render as compact count chips, never the raw ids", () => {
+    const p = proposal({
+      id: "evidence-q",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What is the launch date?"),
+    });
+    resetStore({
+      agentProposals: [p],
+      liveAssistCards: [
+        card({
+          proposal: p,
+          answer: answer({
+            evidence_span_ids: ["span-1", "span-2"],
+            evidence_graph_ids: ["node-1"],
+          }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(within(row).getByText("2 spans")).toBeInTheDocument();
+    expect(within(row).getByText("1 node")).toBeInTheDocument();
+    expect(within(row).queryByText("span-1")).not.toBeInTheDocument();
+  });
+
+  it("a failed answer in the FEED row renders read-only — the failure text shows but Retry does not (feed stays a capability-free surface)", () => {
+    resetStore({
+      liveAssistCards: [
+        card({
+          status: "dismissed",
+          proposal: {
+            id: "feed-failed-q",
+            kind: "question",
+            title: "Question from Speaker 1",
+            body: questionBody("What is the launch date?"),
+          },
+          answer: answer({ status: "failed", text: "Provider timed out." }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
+    expect(within(row).getByText("Provider timed out.")).toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /retry/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("a dismissed card's answer is preserved and visible in the feed's details disclosure", () => {
+    resetStore({
+      liveAssistCards: [
+        card({
+          status: "dismissed",
+          proposal: {
+            id: "feed-answered-q",
+            kind: "question",
+            title: "Question from Speaker 1",
+            body: questionBody("What is the launch date?"),
+          },
+          answer: answer({ text: "The launch date moved to March." }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(
+      within(row).queryByText("The launch date moved to March."),
+    ).not.toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
+    expect(
+      within(row).getByText("The launch date moved to March."),
+    ).toBeInTheDocument();
+  });
+
+  it("audio-graph-83cc T4 fix-round (minor): a feed card with an EMPTY body still gets a Details disclosure when it has a thread — the thread must never be gated on body content", () => {
+    resetStore({
+      liveAssistCards: [
+        card({
+          status: "dismissed",
+          proposal: {
+            id: "feed-empty-body-q",
+            kind: "question",
+            title: "Question from Speaker 1",
+            body: "",
+          },
+          answer: answer({ text: "The launch date moved to March." }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    // Pre-fix, an empty `body` rendered NO disclosure button at all — the
+    // answer was permanently unreachable.
+    const toggle = within(row).getByRole("button", { name: "Details" });
+    fireEvent.click(toggle);
+    expect(
+      within(row).getByText("The launch date moved to March."),
+    ).toBeInTheDocument();
   });
 });

@@ -65,6 +65,35 @@ const NEW_W9_KEYS = [
   "agent.lowSignal",
 ] as const;
 
+/**
+ * New in audio-graph-83cc T4 (composer + threaded `AnswerThread` rendering).
+ * Fix-round finding: the ticket's own report claimed these were "key-parity
+ * enforced by locale-parity.test.ts", but that file (per this file's own
+ * doc above) structurally cannot catch a key absent from BOTH locales — and
+ * four of these nine keys (`answerFailedGeneric`, `answerTruncatedMarker`,
+ * pt's `answerRetry`, pt's `answerTruncatedHint`) had no OTHER incidental
+ * test coverage either. Listed here per this file's own stated discipline:
+ * cover every key a ticket introduces, not just the ones another file
+ * happens to also touch.
+ */
+const NEW_T4_KEYS = [
+  "agent.answerFailedGeneric",
+  "agent.answerInterrupted",
+  "agent.answerRetry",
+  "agent.answerTruncatedHint",
+  "agent.answerTruncatedMarker",
+] as const;
+
+/** Interpolated, plural-form T4 keys — need a `count` arg to resolve
+ * meaningfully, same reason `agent.duplicateCount` gets its own loop below
+ * rather than folding into `NEW_T4_KEYS`. Asserted at both `count: 1` (the
+ * `_one` form) and `count: 2` (the `_other` form) so a missing/deleted
+ * plural variant in EITHER locale fails here, not just the base key. */
+const NEW_T4_PLURAL_KEYS = [
+  "agent.answerEvidenceSpans",
+  "agent.answerEvidenceGraph",
+] as const;
+
 const LOCALES: Record<"en" | "pt", Record<string, unknown>> = {
   en: en as Record<string, unknown>,
   pt: pt as Record<string, unknown>,
@@ -136,6 +165,32 @@ describe("agent.* keys new in W9 (Signal/All queue-quality toggle)", () => {
   }
 });
 
+describe("agent.* keys new in audio-graph-83cc T4 (composer + AnswerThread)", () => {
+  for (const key of NEW_T4_KEYS) {
+    for (const lng of ["en", "pt"] as const) {
+      it(`${lng}.json resolves "${key}" to a real translation, not the raw key (mutation: delete the key -> this fails)`, () => {
+        const rendered = instance.t(key, { lng });
+        expect(typeof rendered).toBe("string");
+        expect(rendered).not.toBe(key);
+        expect(rendered.length).toBeGreaterThan(0);
+      });
+    }
+  }
+
+  for (const key of NEW_T4_PLURAL_KEYS) {
+    for (const lng of ["en", "pt"] as const) {
+      for (const count of [1, 2]) {
+        it(`${lng}.json resolves "${key}" to a real translation containing the count for count=${count}, not the raw key`, () => {
+          const rendered = instance.t(key, { lng, count });
+          expect(typeof rendered).toBe("string");
+          expect(rendered).not.toBe(key);
+          expect(rendered).toContain(String(count));
+        });
+      }
+    }
+  }
+});
+
 describe("regression guard for the test methodology itself", () => {
   it("demonstrates i18next's real missing-key behavior: a key absent from BOTH locales renders as the literal key string", () => {
     const rendered = instance.t("agent.thisKeyDoesNotExistAnywhere", {
@@ -151,11 +206,26 @@ describe("regression guard for the test methodology itself", () => {
       ...FORMERLY_DEFAULT_VALUE_KEYS,
       ...NEW_W8_KEYS,
       ...NEW_W9_KEYS,
+      ...NEW_T4_KEYS,
       "agent.duplicateCount",
     ]) {
       const leaf = dotted.split(".")[1];
       expect(agentEn, `en.json agent.${leaf}`).toHaveProperty(leaf);
       expect(agentPt, `pt.json agent.${leaf}`).toHaveProperty(leaf);
+    }
+    // Plural keys carry `_one`/`_other` suffixed leaves rather than a bare
+    // leaf (i18next's pluralization convention) — checked separately so the
+    // loop above stays a simple direct-property check for every other key.
+    for (const dotted of NEW_T4_PLURAL_KEYS) {
+      const base = dotted.split(".")[1];
+      for (const suffix of ["_one", "_other"]) {
+        expect(agentEn, `en.json agent.${base}${suffix}`).toHaveProperty(
+          `${base}${suffix}`,
+        );
+        expect(agentPt, `pt.json agent.${base}${suffix}`).toHaveProperty(
+          `${base}${suffix}`,
+        );
+      }
     }
   });
 });

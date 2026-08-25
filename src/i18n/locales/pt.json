@@ -1278,7 +1278,16 @@
     "filterSignal": "Sinal",
     "filterAll": "Todos",
     "lowSignal": "Sinal baixo",
-    "duplicateCount": "×{{count}}"
+    "duplicateCount": "×{{count}}",
+    "answerFailedGeneric": "A resposta falhou.",
+    "answerRetry": "Tentar novamente",
+    "answerInterrupted": "Interrompida",
+    "answerTruncatedMarker": "…",
+    "answerTruncatedHint": "Resposta truncada no limite de tamanho",
+    "answerEvidenceSpans_one": "{{count}} trecho",
+    "answerEvidenceSpans_other": "{{count}} trechos",
+    "answerEvidenceGraph_one": "{{count}} nó",
+    "answerEvidenceGraph_other": "{{count}} nós"
   },
   "projectionDiagnostics": {
     "title": "Diagnósticos de projeção",

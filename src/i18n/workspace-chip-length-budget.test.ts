@@ -81,6 +81,17 @@ const CHIP_CASES: readonly ChipCase[] = [
   // store's own `agentProposals` cap (`store/index.ts`'s `.slice(-49)`, 50
   // max entries), so a single duplicate-collapse group can never exceed 50.
   { key: "agent.duplicateCount", values: { count: 50 } },
+  // audio-graph-83cc T4: the answered-card evidence chips
+  // (`AnswerEvidenceChips`, `AgentProposalsPanel.tsx`) and the interrupted
+  // marker (`AnswerThread`). `TURNS_WORST_CASE` is reused as a generously
+  // oversized bound for the evidence counts too — the design panel
+  // synthesis's actual retrieval caps are far smaller (an anchored window of
+  // ±6/±2 spans, a query-conditioned top-40 graph context), but nothing in
+  // this unit enforces that bound at the type level, so the test should not
+  // assume it either.
+  { key: "agent.answerEvidenceSpans", values: { count: TURNS_WORST_CASE } },
+  { key: "agent.answerEvidenceGraph", values: { count: TURNS_WORST_CASE } },
+  { key: "agent.answerInterrupted", values: {} },
   // Ticket W10: the out-of-viewport change anchor (`DocChangeAnchor`,
   // `LiveDocument.tsx`) — styled as a small pill in `layout.css`
   // (`.ag-doc-anchor`), so it belongs in this file even though it's a

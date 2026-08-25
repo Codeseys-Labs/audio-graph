@@ -41,6 +41,12 @@ import type {
   AudioSourceInfo,
   SourceId,
 } from "../generated/audioSource";
+// AnswerDrafts (audio-graph-83cc T4): per-card transient answer-stream
+// progress state. Defined in `store/` (not here) for the same reason
+// `ShellNav` is — it ships with the slice creator `store/index.ts` spreads
+// in — re-exported below so store consumers can import the type from
+// `../types` like every other `AudioGraphStore` field type.
+import type { AnswerDraftState } from "../store/answerDrafts";
 // ShellNav (SHELL-R1, seed audio-graph-59fb, ADR-0046): the typed nav object
 // that replaces App-local `workspaceView`. Defined in `store/` (not here)
 // because it ships with pure derivation helpers (`deriveWorkspaceView` /
@@ -97,7 +103,7 @@ export type {
   PrivacyMode as LedgerPrivacyMode,
   RetentionClass,
 } from "../generated/sessionDataMovement";
-export type { SessionLens, ShellDest, ShellNav };
+export type { AnswerDraftState, SessionLens, ShellDest, ShellNav };
 
 export type SegmentId = string;
 
@@ -326,6 +332,17 @@ export interface AgentStatusEvent {
 
 export type AgentProposalKind = "note" | "question" | "graph_suggestion";
 
+/**
+ * Backend-computed quality grade for a mint-time `question` proposal
+ * (audio-graph-83cc, T2; mirrors Rust `crate::events::SignalGrade`,
+ * `src-tauri/src/events.rs`). `strong` is W9's `classifyQueueEntry`
+ * `"actionable"` outcome; `weak`/`fragment` both correspond to W9's single
+ * `"fragment_suspect"` outcome, split in Rust for observability only — see
+ * `events.rs`'s `SignalGrade` doc comment for the exact equivalence this
+ * mirror must preserve.
+ */
+export type SignalGrade = "strong" | "weak" | "fragment";
+
 export interface AgentProposalEvent {
   id: string;
   source_segment_id: string;
@@ -336,6 +353,13 @@ export interface AgentProposalEvent {
   body: string;
   confidence: number;
   created_at_ms: number;
+  /**
+   * Backend signal grade at mint (audio-graph-83cc, T2). Absent for every
+   * payload that predates this unit and for any payload that never went
+   * through `run_agent_proposal_task` (mirrors Rust
+   * `AgentProposalPayload.signal`, `src-tauri/src/events.rs`).
+   */
+  signal?: SignalGrade | null;
 }
 
 export interface AgentActionResult {
@@ -348,6 +372,53 @@ export interface AgentActionResult {
 
 export type LiveAssistCardStatus = "pending" | "approved" | "dismissed";
 
+/**
+ * Who authored a live-assist card's underlying question (audio-graph-83cc,
+ * T1; mirrors Rust `crate::events::CardOrigin`, `src-tauri/src/events.rs`).
+ * `"transcript"` is a question detected from the meeting itself — the only
+ * origin that has ever existed in production, and therefore the value every
+ * pre-83cc record is treated as when `origin` is absent. `"user"` is a
+ * free-form chatbox question the user typed.
+ */
+export type CardOrigin = "transcript" | "user";
+
+/**
+ * Terminal (or interrupted) state of a `CardAnswer` (audio-graph-83cc, T1;
+ * mirrors Rust `crate::events::CardAnswerStatus`, `src-tauri/src/events.rs`).
+ * `"interrupted"` is a user-preempted auto-answer whose partial text is still
+ * recorded, not discarded.
+ */
+export type CardAnswerStatus = "answered" | "failed" | "interrupted";
+
+/**
+ * The threaded answer to a live-assist card's question (audio-graph-83cc,
+ * T1; mirrors Rust `crate::events::CardAnswer`, `src-tauri/src/events.rs`).
+ * Written ONCE, on the answer stream's terminal frame. A Grounded Inference
+ * in CONTEXT.md terms: `evidence_span_ids` / `evidence_graph_ids` /
+ * `notes_last_sequence` are its Inference Chain, `route_id` is the
+ * trusted-code-resolved route that served it.
+ */
+export interface CardAnswer {
+  status: CardAnswerStatus;
+  /** Full answer text from the stream's terminal frame. */
+  text: string;
+  /** `true` when the backend truncated `text` at its length cap. */
+  truncated: boolean;
+  /** Transcript-window span ids that fed retrieval. */
+  evidence_span_ids: string[];
+  /** `build_graph_chat_context` node ids that fed retrieval. */
+  evidence_graph_ids: string[];
+  /** Notes basis sequence, when notes were used to answer. */
+  notes_last_sequence?: number | null;
+  /** ADR-0038: resolved by trusted code, never model- or config-echoed. */
+  route_id: string;
+  requested_by: CardOrigin;
+  finish_reason?: string | null;
+  /** `null` when the provider omitted usage — never a fabricated zero. */
+  total_tokens?: number | null;
+  answered_at_ms: number;
+}
+
 export interface LiveAssistCardRecord {
   session_id: string;
   proposal: AgentProposalEvent;
@@ -358,6 +429,23 @@ export interface LiveAssistCardRecord {
   projection_patch_sequence?: number | null;
   created_at_ms: number;
   updated_at_ms: number;
+  /**
+   * Who authored the underlying question. Absent ⇒ `"transcript"` (every
+   * pre-83cc record) — audio-graph-83cc T1 (mirrors Rust
+   * `LiveAssistCardRecord.origin`, `src-tauri/src/events.rs`).
+   */
+  origin?: CardOrigin | null;
+  /**
+   * The threaded answer, written once on terminal (T3). Absent for every
+   * unanswered card and for every pre-83cc record (mirrors Rust
+   * `LiveAssistCardRecord.answer`, `src-tauri/src/events.rs`).
+   */
+  answer?: CardAnswer | null;
+  /**
+   * Backend signal grade at mint (T2), mirrored from `proposal.signal`
+   * (mirrors Rust `LiveAssistCardRecord.signal`, `src-tauri/src/events.rs`).
+   */
+  signal?: SignalGrade | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2950,6 +3038,45 @@ export interface AudioGraphStore {
     proposalId: string,
   ) => Promise<LiveAssistCardRecord | null>;
   clearAgentProposals: () => Promise<LiveAssistCardRecord[]>;
+  /**
+   * Per-card transient answer-stream progress (audio-graph-83cc T4). See
+   * `store/answerDrafts.ts`'s module doc for the full lifecycle; keyed by
+   * `proposal.id`. Not durable — cleared on a successful terminal frame
+   * (the durable `CardAnswer` is expected to supersede it) or on dismiss.
+   */
+  answerDrafts: Record<string, AnswerDraftState>;
+  /** Set when the composer's `askQuestion` dispatch fails before any card
+   * exists to key a per-card draft against. Rendered inline in the composer;
+   * cleared at the start of the next submit attempt. */
+  composerError: string | null;
+  setAnswerDraft: (cardId: string, draft: AnswerDraftState) => void;
+  appendAnswerDraftDelta: (
+    cardId: string,
+    requestId: string,
+    delta: string,
+  ) => void;
+  clearAnswerDraft: (cardId: string) => void;
+  setComposerError: (message: string | null) => void;
+  /**
+   * Composer submit for a free-form, user-typed question (audio-graph-83cc
+   * T4, deliverable b). Invokes `ask_question_card` (T3's command name per
+   * the synthesis ticket cut) — mints a new `origin: "user"` card and starts
+   * its answer stream in one round trip. Degrades gracefully while T3 is
+   * unlanded: a rejected `invoke` sets `composerError`, never throws.
+   */
+  askQuestion: (text: string) => Promise<void>;
+  /**
+   * Manual "Ask AI" dispatch for an existing card (audio-graph-83cc T4).
+   * Invokes `answer_question_card` (T3's command name, `auto: false`) —
+   * replaces the old `askAgentProposal` dismiss-then-`sendChatMessage` path,
+   * which is exactly the field failure this epic exists to kill (the answer
+   * now threads under the card via `answerDrafts`/`CardAnswer` instead of
+   * landing in the unreachable `chatMessages`). Also the Retry affordance for
+   * a `CardAnswer.status === "failed"` thread. Degrades gracefully while T3
+   * is unlanded: a rejected `invoke` sets a failed `answerDraft` for this
+   * card, never throws.
+   */
+  answerQuestionCard: (proposalId: string) => Promise<void>;
   clearTranscript: () => void;
   /** Clear every frontend projection owned by the current session view. */
   resetSessionView: () => void;
