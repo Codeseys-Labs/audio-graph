@@ -7564,7 +7564,11 @@ describe("SettingsPage", () => {
       const llmTab = await screen.findByRole("tab", {
         name: /language model/i,
       });
-      expect(within(llmTab).getByText("Ready")).toBeInTheDocument();
+      // findByText, not getByText: the readiness fetch resolves async, and a
+      // loaded runner can render the tab before the Ready chip hydrates —
+      // this exact race failed twice on CI (run 32862213809 + rerun) while
+      // passing locally, with zero frontend diff since the last green run.
+      expect(await within(llmTab).findByText("Ready")).toBeInTheDocument();
     });
 
     it("never renders 'Ready' on the rail's engine line for a presence-only/never-probed active provider (ADR-0030 — presence alone never means Ready)", () => {
