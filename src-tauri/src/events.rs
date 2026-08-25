@@ -430,6 +430,52 @@ pub enum AgentProposalKind {
     GraphSuggestion,
 }
 
+/// Backend-computed quality grade for a mint-time [`AgentProposalKind::Question`]
+/// proposal (audio-graph-83cc, T2). Ports ticket W9's shipped
+/// `classifyQueueEntry` constants/logic
+/// (`src/components/workspace/agentQueue.ts`) into Rust so the auto-answer
+/// spend gate (T3) has a Rust-authoritative signal instead of trusting the
+/// renderer's own W9 classification alone — the exact shape the ratified
+/// agent-runtime verdict rejected in option D2 ("Rust validates what the
+/// renderer claims").
+///
+/// `Strong` is W9's `"actionable"` outcome — either a non-question kind
+/// (W9's quality rules never touch `note`/`graph_suggestion` at all) or a
+/// question that clears the confidence floor and the content-shape check.
+/// `Weak` and `Fragment` both correspond to W9's single, undifferentiated
+/// `"fragment_suspect"` outcome, split here for observability into WHY:
+/// `Weak` is the confidence-floor rule, `Fragment` is the content-shape rule
+/// (104f's actual fragment-minting bug — a truncated utterance
+/// misclassified as a question). This split does not exist on the
+/// frontend, so the one invariant the mirrored fixtures pin is:
+/// `grade == Strong` if and only if the frontend's `classifyQueueEntry(...,
+/// true)` returns `"actionable"` for the same proposal. See
+/// `agent_signal_grade` (`speech/mod.rs`) for the port and
+/// `speech::mod::tests` for the 1:1 mirrored fixtures.
+///
+/// **Named, deliberate gap (fix-round finding, scope-honesty review):** this
+/// grade mirrors `classifyQueueEntry` only, not the frontend's actual queue
+/// *admission* path. `selectAgentQueue` (`agentQueue.ts`) runs a kind-agnostic
+/// duplicate-collapse pass BEFORE `classifyQueueEntry` — a card whose
+/// normalized `queueContentText` matches a newer surviving card is rejected
+/// at admission regardless of what `classifyQueueEntry` would have said.
+/// That collapse is NOT ported here: a verbatim-repeated question grades
+/// `Strong` in Rust even though the frontend would refuse to admit it. This
+/// is harmless while ratified gate Q2 requires BOTH the Rust grade AND the
+/// frontend Signal admit (the frontend's rejection still wins), but it stops
+/// being harmless if Q2 is ever collapsed to "Rust-alone" — at that point
+/// each duplicate question would buy its own paid dispatch, bounded only by
+/// the per-session auto-answer cap. Whoever performs that collapse MUST
+/// either port duplicate-collapse into this grade first or add an equivalent
+/// check elsewhere in the Rust spend path.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalGrade {
+    Strong,
+    Weak,
+    Fragment,
+}
+
 /// Advisory proposal emitted by the agent/react loop.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AgentProposalPayload {
@@ -443,6 +489,12 @@ pub struct AgentProposalPayload {
     pub body: String,
     pub confidence: f32,
     pub created_at_ms: u64,
+    /// Backend signal grade at mint (audio-graph-83cc, T2). `None` for
+    /// every payload that predates this unit (nothing emitted one before
+    /// it) and for any hand-built payload that never went through the one
+    /// production mint site, `run_agent_proposal_task` (`speech/mod.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<SignalGrade>,
 }
 
 /// Result returned after the user approves an agent proposal.
@@ -463,6 +515,148 @@ pub enum LiveAssistCardStatus {
     Dismissed,
 }
 
+/// Who authored a live-assist card's underlying question (audio-graph-83cc,
+/// T1). `Transcript` is a question detected from the meeting itself — the
+/// only origin that has ever existed in production
+/// (`run_agent_proposal_task`, `speech/mod.rs`) — and is therefore the
+/// `#[serde(default)]` value every pre-83cc record deserializes to. `User`
+/// is a free-form chatbox question the user typed (`ask_question_card`,
+/// T3's command — not introduced by this unit; this enum and the
+/// validator's Q4 narrow widening below exist now so the schema is built
+/// and pinned ahead of it).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CardOrigin {
+    Transcript,
+    User,
+}
+
+/// Terminal (or interrupted) state of a [`CardAnswer`] (audio-graph-83cc,
+/// T1). `Answered` and `Failed` are self-explanatory; `Interrupted` is a
+/// user-preempted auto-answer (T3's single-flight gate cancels the
+/// in-progress stream of a *user* action, never the reverse) whose partial
+/// text is still recorded, not discarded.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CardAnswerStatus {
+    Answered,
+    Failed,
+    Interrupted,
+}
+
+/// Hard cap on [`CardAnswer::text`]'s length, enforced by
+/// `persistence::validate_live_assist_card` (audio-graph-83cc T1,
+/// size-margin gate — see `commands::tests` for the worst-case-card ×
+/// worst-case-count computation against `MAX_LIVE_ASSIST_CARDS_BYTES`).
+///
+/// Angle-a's design deliberately leaves `CardAnswer.text` uncapped (it is
+/// the FULL answer rendered under the card, not a preview — a rejected
+/// sibling design's separate `answer_preview` field, capped at 240 chars,
+/// is a different field for a different storage shape and does not apply
+/// here). Left fully uncapped, though, this field's worst case is bounded
+/// only by whatever `max_tokens` the active LLM provider config allows —
+/// which this crate's own settings permit configuring up to 262,144 for at
+/// least one provider (`llm/api_client.rs`'s Cerebras clamp test) — so a
+/// misconfigured or adversarial provider response could still make this
+/// field the dominant term in the live-assist ceiling math. 4,000 UTF-8
+/// characters is generous for a live-assist answer (several paragraphs)
+/// while keeping the worst-case card × worst-case count total a small,
+/// provable multiple of `MAX_LIVE_ASSIST_CARDS_BYTES`'s 8 MiB — see
+/// `commands::tests`' size-margin gate for the measured figure. (Fix-round
+/// correction: an earlier draft of this comment attributed "55 KB" to this
+/// field's own observed pathological size. That number is actually the
+/// *whole pre-answer-field* `live_assist` artifact's observed pathological
+/// size, per the ratified synthesis's deletion-test
+/// (`docs/agentic-runs/2026-08-24-83cc-design-panel/synthesis-ticket-cut.md`
+/// §1) — this field has never existed in production and so has no observed
+/// size of its own.)
+///
+/// A validator rejection at this cap (`persistence::validate_live_assist_card`)
+/// is a TERMINAL failure for whoever calls `upsert_live_assist_card` — it
+/// does not truncate, so a caller that lets a raw, uncapped answer hit the
+/// validator risks losing the whole answer, which is exactly the field
+/// failure this epic exists to kill (see the synthesis's "the field failure
+/// is answers being lost" framing, same section). `CardAnswer::cap_text`
+/// exists so a future writer (T3) can truncate BEFORE validation instead of
+/// discovering the cap as a write failure.
+pub const MAX_CARD_ANSWER_TEXT_CHARS: usize = 4_000;
+
+/// The threaded answer to a live-assist card's question (audio-graph-83cc,
+/// T1, angle-a §2.1). Written ONCE, on the answer stream's terminal frame
+/// (T3's job — this unit only defines the shape and its
+/// persistence/validation contract). A Grounded Inference in CONTEXT.md
+/// terms: `evidence_span_ids` / `evidence_graph_ids` / `notes_last_sequence`
+/// are its Inference Chain, `route_id` is the trusted-code-resolved route
+/// that served it, and it lives on this Session Artifact, never in the
+/// temporal graph — ADR-0013: no new graph write path is introduced by this
+/// type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CardAnswer {
+    pub status: CardAnswerStatus,
+    /// Full answer text from the stream's terminal frame. Non-empty unless
+    /// `status == Failed`, and capped at [`MAX_CARD_ANSWER_TEXT_CHARS`]
+    /// (both validator-enforced, `persistence::validate_live_assist_card`).
+    /// Prefer constructing via [`CardAnswer::cap_text`] over building this
+    /// field directly so an over-cap answer is truncated-and-marked instead
+    /// of rejected-and-lost at persistence time.
+    pub text: String,
+    /// `true` when [`CardAnswer::cap_text`] cut `text` down to
+    /// [`MAX_CARD_ANSWER_TEXT_CHARS`] characters. `#[serde(default)]` (not
+    /// `Option`) because "not truncated" is itself meaningful information,
+    /// not an absence — every pre-truncation-support answer defaults to
+    /// `false`, which is correct (nothing truncated it).
+    #[serde(default)]
+    pub truncated: bool,
+    /// Transcript-window span ids that fed retrieval.
+    #[serde(default)]
+    pub evidence_span_ids: Vec<String>,
+    /// `build_graph_chat_context` node ids that fed retrieval.
+    #[serde(default)]
+    pub evidence_graph_ids: Vec<String>,
+    /// Notes basis sequence, when notes were used to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_last_sequence: Option<u64>,
+    /// ADR-0038: resolved by trusted code (`resolve_route`), never model- or
+    /// config-echoed. Required non-empty (validator-enforced) regardless of
+    /// `status` — route resolution happens before dispatch, so even a
+    /// `Failed` answer carries the route that was attempted.
+    pub route_id: String,
+    pub requested_by: CardOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// `None` when the provider omitted usage (the existing
+    /// `persist_llm_usage_for_session` early-return, `commands.rs`) — never
+    /// a fabricated zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    pub answered_at_ms: u64,
+}
+
+impl CardAnswer {
+    /// Truncates `text` to [`MAX_CARD_ANSWER_TEXT_CHARS`] Unicode scalar
+    /// values (matching the validator's `chars().count()` measure exactly)
+    /// and sets `truncated = true` when truncation actually happened.
+    /// Returns whether it truncated.
+    ///
+    /// Fix-round addition (scope-honesty review, major): the validator
+    /// rejects any answer over the cap outright, with no truncation seam —
+    /// a caller that skips this method and writes a raw, uncapped answer
+    /// straight to `upsert_live_assist_card` loses the whole answer on a
+    /// validator error, not just the excess. Call this BEFORE persisting an
+    /// answer built from unbounded model output.
+    ///
+    /// Truncates at a `char` boundary (never splits a multi-byte UTF-8
+    /// sequence or a surrogate pair), so the result is always valid UTF-8.
+    pub fn cap_text(&mut self) -> bool {
+        if self.text.chars().count() <= MAX_CARD_ANSWER_TEXT_CHARS {
+            return false;
+        }
+        self.text = self.text.chars().take(MAX_CARD_ANSWER_TEXT_CHARS).collect();
+        self.truncated = true;
+        true
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LiveAssistCardRecord {
     pub session_id: String,
@@ -478,6 +672,17 @@ pub struct LiveAssistCardRecord {
     pub projection_patch_sequence: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Who authored the underlying question. Absent ⇒ `Transcript` (every
+    /// pre-83cc record) — audio-graph-83cc T1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CardOrigin>,
+    /// The threaded answer, written once on terminal (T3). Absent for
+    /// every unanswered card and for every pre-83cc record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<CardAnswer>,
+    /// Backend signal grade at mint (T2), mirrored from `proposal.signal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<SignalGrade>,
 }
 
 /// Payload for capture error events.
@@ -681,6 +886,7 @@ mod tests {
                 body: "Consider answering or linking this question: What changed?".to_string(),
                 confidence: 0.92,
                 created_at_ms: 1_700_000_000_000,
+                signal: None,
             },
             status: LiveAssistCardStatus::Approved,
             source_span_ids: vec!["span-1".to_string()],
@@ -695,6 +901,9 @@ mod tests {
             projection_patch_sequence: Some(7),
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_100,
+            origin: None,
+            answer: None,
+            signal: None,
         };
 
         let json = serde_json::to_value(card).expect("serialize live assist card");
@@ -703,6 +912,248 @@ mod tests {
         assert_eq!(json["source_span_ids"][0], "span-1");
         assert_eq!(json["outcome"]["action"], "graph_update");
         assert_eq!(json["projection_patch_sequence"], 7);
+        // A `None` origin/answer/signal/proposal.signal must not appear in
+        // the wire JSON at all (skip_serializing_if) — the exact shape
+        // every pre-83cc consumer already tolerates.
+        assert!(!json.as_object().unwrap().contains_key("origin"));
+        assert!(!json.as_object().unwrap().contains_key("answer"));
+        assert!(!json.as_object().unwrap().contains_key("signal"));
+        assert!(!json["proposal"].as_object().unwrap().contains_key("signal"));
+    }
+
+    /// audio-graph-83cc T1: additive-fields-only contract for
+    /// `LiveAssistCardRecord.origin`/`.answer`/`.signal` and
+    /// `AgentProposalPayload.signal`. A pre-83cc record (no `origin`,
+    /// `answer`, or `signal` key at all) must deserialize with every new
+    /// field defaulting to `None` — this is C12's whole point: additive
+    /// *fields* are safe for an older reader (serde ignores unknown keys),
+    /// additive *variants* are not, so this design adds fields only.
+    #[test]
+    fn live_assist_card_pre_83cc_json_deserializes_with_every_new_field_defaulting_to_none() {
+        let legacy_json = serde_json::json!({
+            "session_id": "session-legacy",
+            "proposal": {
+                "id": "card-legacy",
+                "source_segment_id": "segment-legacy",
+                "source_id": "default-mic",
+                "kind": "question",
+                "title": "Question from Speaker 1",
+                "body": "Consider answering or linking this question: What changed?",
+                "confidence": 0.9,
+                "created_at_ms": 1_700_000_000_000u64
+            },
+            "status": "pending",
+            "source_span_ids": ["segment-legacy"],
+            "graph_context_ids": [],
+            "created_at_ms": 1_700_000_000_000u64,
+            "updated_at_ms": 1_700_000_000_000u64
+        });
+
+        let card: LiveAssistCardRecord =
+            serde_json::from_value(legacy_json).expect("pre-83cc record must still deserialize");
+        assert_eq!(card.origin, None);
+        assert_eq!(card.answer, None);
+        assert_eq!(card.signal, None);
+        assert_eq!(card.proposal.signal, None);
+
+        // Re-serializing a defaulted legacy record must not corrupt it or
+        // introduce the new keys (skip_serializing_if) — byte-identical
+        // shape to what was read, modulo whitespace.
+        let round_tripped = serde_json::to_value(&card).expect("re-serialize legacy record");
+        assert!(!round_tripped.as_object().unwrap().contains_key("origin"));
+        assert!(!round_tripped.as_object().unwrap().contains_key("answer"));
+        assert!(!round_tripped.as_object().unwrap().contains_key("signal"));
+    }
+
+    /// The inverse of the test above (A1's other gate): a NEW-shape record
+    /// — written by this build, carrying real `origin`/`answer`/`signal`
+    /// values — must still deserialize in an OLDER reader that has never
+    /// heard of those fields. Modeled with a locally-defined struct that is
+    /// exactly the pre-83cc `LiveAssistCardRecord` shape (no
+    /// `deny_unknown_fields` anywhere on the real type, so this is the
+    /// real behavior, not an assumption about it).
+    #[test]
+    fn live_assist_card_new_shape_json_deserializes_in_a_pre_83cc_reader_that_ignores_unknown_fields()
+     {
+        #[derive(serde::Deserialize)]
+        struct PreCard83ccShape {
+            #[allow(dead_code)]
+            session_id: String,
+            status: LiveAssistCardStatus,
+            #[allow(dead_code)]
+            source_span_ids: Vec<String>,
+            #[allow(dead_code)]
+            graph_context_ids: Vec<String>,
+            #[allow(dead_code)]
+            created_at_ms: u64,
+            #[allow(dead_code)]
+            updated_at_ms: u64,
+            // Deliberately NO `origin`/`answer`/`signal` field, and no
+            // `proposal` field either (proposal.signal is nested) — this
+            // struct models a reader from before ANY of this unit's fields
+            // existed.
+        }
+
+        let new_shape = LiveAssistCardRecord {
+            session_id: "session-new".to_string(),
+            proposal: AgentProposalPayload {
+                id: "card-new".to_string(),
+                source_segment_id: "segment-new".to_string(),
+                source_id: "default-mic".to_string(),
+                speaker_label: None,
+                kind: AgentProposalKind::Question,
+                title: "Question from Speaker 1".to_string(),
+                body: "Consider answering or linking this question: What changed?".to_string(),
+                confidence: 0.9,
+                created_at_ms: 1_700_000_000_000,
+                signal: Some(SignalGrade::Strong),
+            },
+            status: LiveAssistCardStatus::Pending,
+            source_span_ids: vec!["segment-new".to_string()],
+            graph_context_ids: vec![],
+            outcome: None,
+            projection_patch_sequence: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            origin: Some(CardOrigin::User),
+            answer: Some(CardAnswer {
+                status: CardAnswerStatus::Answered,
+                text: "The deadline moved to Friday.".to_string(),
+                truncated: false,
+                evidence_span_ids: vec!["segment-new".to_string()],
+                evidence_graph_ids: vec![],
+                notes_last_sequence: None,
+                route_id: "route.openrouter".to_string(),
+                requested_by: CardOrigin::User,
+                finish_reason: Some("stop".to_string()),
+                total_tokens: Some(42),
+                answered_at_ms: 1_700_000_001_000,
+            }),
+            signal: Some(SignalGrade::Strong),
+        };
+
+        let json = serde_json::to_string(&new_shape).expect("serialize new-shape record");
+        let old_reader: PreCard83ccShape =
+            serde_json::from_str(&json).expect("an older reader must tolerate unknown fields");
+        assert_eq!(old_reader.status, LiveAssistCardStatus::Pending);
+    }
+
+    /// Pins `CardAnswer`'s own wire shape (field names, snake_case enum
+    /// values, which optionals are omitted vs `null` vs present) —
+    /// independent of the whole-record tests above, so a future field
+    /// rename or a dropped `skip_serializing_if` is caught at this type's
+    /// own boundary.
+    #[test]
+    fn card_answer_serializes_snake_case_contract_and_omits_absent_optionals() {
+        let minimal = CardAnswer {
+            status: CardAnswerStatus::Failed,
+            text: String::new(),
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: CardOrigin::Transcript,
+            finish_reason: None,
+            total_tokens: None,
+            answered_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_value(&minimal).expect("serialize minimal CardAnswer");
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["requested_by"], "transcript");
+        assert_eq!(json["route_id"], "route.openrouter");
+        assert_eq!(json["evidence_span_ids"], serde_json::json!([]));
+        // `truncated` is a plain bool (no `skip_serializing_if`) — `false`
+        // is meaningful information ("not truncated"), not absence, so it
+        // is always present on the wire, unlike the Option fields below.
+        assert_eq!(json["truncated"], false);
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("notes_last_sequence"));
+        assert!(!obj.contains_key("finish_reason"));
+        assert!(!obj.contains_key("total_tokens"));
+
+        let full = CardAnswer {
+            status: CardAnswerStatus::Answered,
+            text: "42".to_string(),
+            truncated: true,
+            evidence_span_ids: vec!["span-1".to_string()],
+            evidence_graph_ids: vec!["node-1".to_string()],
+            notes_last_sequence: Some(9),
+            route_id: "route.openrouter".to_string(),
+            requested_by: CardOrigin::User,
+            finish_reason: Some("stop".to_string()),
+            total_tokens: Some(128),
+            answered_at_ms: 1_700_000_001_000,
+        };
+        let json = serde_json::to_value(&full).expect("serialize full CardAnswer");
+        assert_eq!(json["status"], "answered");
+        assert_eq!(json["requested_by"], "user");
+        assert_eq!(json["notes_last_sequence"], 9);
+        assert_eq!(json["finish_reason"], "stop");
+        assert_eq!(json["total_tokens"], 128);
+        assert_eq!(json["truncated"], true);
+    }
+
+    /// `CardAnswer::cap_text` (fix-round addition): truncates to
+    /// `MAX_CARD_ANSWER_TEXT_CHARS` chars and marks `truncated = true` only
+    /// when the text actually exceeded the cap. Uses a multi-byte string so
+    /// truncation exercises the `chars()`-boundary path, not just ASCII
+    /// byte-slicing (which would panic or corrupt UTF-8 on a wrong boundary).
+    #[test]
+    fn card_answer_cap_text_truncates_and_marks_truncated_when_over_the_cap() {
+        let over = "é".repeat(MAX_CARD_ANSWER_TEXT_CHARS + 5);
+        let mut answer = CardAnswer {
+            status: CardAnswerStatus::Answered,
+            text: over,
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: CardOrigin::Transcript,
+            finish_reason: None,
+            total_tokens: None,
+            answered_at_ms: 1_700_000_000_000,
+        };
+        let did_truncate = answer.cap_text();
+        assert!(did_truncate);
+        assert!(answer.truncated);
+        assert_eq!(answer.text.chars().count(), MAX_CARD_ANSWER_TEXT_CHARS);
+        assert!(
+            answer.text.chars().all(|c| c == 'é'),
+            "truncation must land on a char boundary and not corrupt the text"
+        );
+    }
+
+    /// The inverse: text at or under the cap is untouched and `truncated`
+    /// stays `false` — `cap_text` must not be a no-op-that-lies (e.g.
+    /// flipping the flag when nothing was cut).
+    #[test]
+    fn card_answer_cap_text_is_a_no_op_at_or_under_the_cap() {
+        for len in [0, 1, MAX_CARD_ANSWER_TEXT_CHARS] {
+            let text = "a".repeat(len);
+            let mut answer = CardAnswer {
+                status: if len == 0 {
+                    CardAnswerStatus::Failed
+                } else {
+                    CardAnswerStatus::Answered
+                },
+                text: text.clone(),
+                truncated: false,
+                evidence_span_ids: vec![],
+                evidence_graph_ids: vec![],
+                notes_last_sequence: None,
+                route_id: "route.openrouter".to_string(),
+                requested_by: CardOrigin::Transcript,
+                finish_reason: None,
+                total_tokens: None,
+                answered_at_ms: 1_700_000_000_000,
+            };
+            let did_truncate = answer.cap_text();
+            assert!(!did_truncate, "length {len} must not be truncated");
+            assert!(!answer.truncated, "length {len} must not mark truncated");
+            assert_eq!(answer.text, text);
+        }
     }
 
     #[test]

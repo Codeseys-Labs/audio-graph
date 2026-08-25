@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::events::{
-    LiveAssistCardRecord, LiveAssistCardStatus, PersistenceQueueBackpressurePayload,
+    CardAnswerStatus, CardOrigin, LiveAssistCardRecord, LiveAssistCardStatus,
+    PersistenceQueueBackpressurePayload,
 };
 use crate::projections::{
     DiarizationSpanRevision, HistoricalProjectionReplay, MaterializedGraph, MaterializedNotes,
@@ -343,7 +344,17 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     if card.proposal.id.trim().is_empty() {
         return Err("Live assist card id is required".to_string());
     }
-    if card.proposal.source_segment_id.trim().is_empty() {
+    // Q4 (ratified, audio-graph-83cc T1): a user-typed question asked
+    // before any speech exists in the session has no real transcript
+    // segment to cite. `origin: User` narrowly relaxes the otherwise-
+    // unconditional non-empty `source_segment_id` requirement — every
+    // OTHER origin, including the default `Transcript` (every
+    // transcript-detected proposal AND every legacy pre-83cc record with no
+    // `origin` at all), keeps the full invariant unchanged. This is the
+    // ONLY widening this unit makes to this function; the citation
+    // invariant just below (spans OR graph context) is untouched.
+    let source_segment_id_required = !matches!(card.origin, Some(CardOrigin::User));
+    if source_segment_id_required && card.proposal.source_segment_id.trim().is_empty() {
         return Err(format!(
             "Live assist card {} source_segment_id is required",
             card.proposal.id
@@ -368,6 +379,37 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
             "Approved live assist card {} requires a projection patch sequence",
             card.proposal.id
         ));
+    }
+    // audio-graph-83cc T1: `CardAnswer` invariants, additive to the
+    // citation rule above — a card's answer (once T3 starts writing one) is
+    // still bound by ADR-0037 evidence validation.
+    if let Some(answer) = &card.answer {
+        if !matches!(answer.status, CardAnswerStatus::Failed) && answer.text.trim().is_empty() {
+            return Err(format!(
+                "Live assist card {} answer text is required unless the answer failed",
+                card.proposal.id
+            ));
+        }
+        // This rejection is a hard, terminal failure for the caller — it
+        // does NOT truncate. Whoever writes an answer built from unbounded
+        // model output (T3) should call `CardAnswer::cap_text` before
+        // reaching this validator, so the cap is enforced by truncation
+        // (with a `truncated` marker) rather than by losing the answer on a
+        // failed `upsert_live_assist_card`. See `MAX_CARD_ANSWER_TEXT_CHARS`'s
+        // doc comment (events.rs) for the fix-round rationale.
+        if answer.text.chars().count() > crate::events::MAX_CARD_ANSWER_TEXT_CHARS {
+            return Err(format!(
+                "Live assist card {} answer text exceeds {} characters",
+                card.proposal.id,
+                crate::events::MAX_CARD_ANSWER_TEXT_CHARS
+            ));
+        }
+        if answer.route_id.trim().is_empty() {
+            return Err(format!(
+                "Live assist card {} answer route_id is required",
+                card.proposal.id
+            ));
+        }
     }
     Ok(())
 }
@@ -3544,8 +3586,8 @@ mod local_memory_repository_tests {
     use serde_json::json;
 
     use crate::events::{
-        AgentActionResult, AgentProposalKind, AgentProposalPayload, LiveAssistCardRecord,
-        LiveAssistCardStatus,
+        AgentActionResult, AgentProposalKind, AgentProposalPayload, CardAnswer, CardAnswerStatus,
+        CardOrigin, LiveAssistCardRecord, LiveAssistCardStatus, SignalGrade,
     };
     use crate::projections::{
         HistoricalProjectionValidationError, ProjectionBasisStaleness, ProjectionKind,
@@ -3978,6 +4020,7 @@ mod local_memory_repository_tests {
             body: "Review this for an action item, decision, or relationship: launch risk".into(),
             confidence: 0.86,
             created_at_ms: 1_700_000_000_000,
+            signal: None,
         }
     }
 
@@ -4005,6 +4048,29 @@ mod local_memory_repository_tests {
             projection_patch_sequence,
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_100,
+            origin: None,
+            answer: None,
+            signal: None,
+        }
+    }
+
+    fn sample_card_answer(status: CardAnswerStatus, requested_by: CardOrigin) -> CardAnswer {
+        CardAnswer {
+            status,
+            text: if matches!(status, CardAnswerStatus::Failed) {
+                String::new()
+            } else {
+                "The migration deadline moved to Friday.".into()
+            },
+            truncated: false,
+            evidence_span_ids: vec!["span-live-1".into()],
+            evidence_graph_ids: Vec::new(),
+            notes_last_sequence: None,
+            route_id: "route.openrouter".into(),
+            requested_by,
+            finish_reason: Some("stop".into()),
+            total_tokens: Some(64),
+            answered_at_ms: 1_700_000_000_200,
         }
     }
 
@@ -4918,6 +4984,338 @@ mod local_memory_repository_tests {
                 .is_empty(),
             "invalid live assist cards must not enter audit log"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-83cc T1: Q4's narrow `validate_live_assist_card` widening —
+    // an empty `source_segment_id` is permitted ONLY when `origin ==
+    // CardOrigin::User`; every other origin (including the default
+    // `Transcript` a legacy `None` origin implies) keeps the full,
+    // pre-existing invariant. Pinned both ways per the ticket's own
+    // requirement.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_live_assist_card_q4_widening_accepts_empty_source_segment_id_only_for_user_origin()
+    {
+        let dir = unique_tempdir("live-assist-q4-user-origin");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-q4-user";
+
+        let mut card =
+            sample_live_assist_card(session_id, "card-user-typed", LiveAssistCardStatus::Pending);
+        card.origin = Some(CardOrigin::User);
+        card.proposal.source_segment_id = String::new();
+        // The OTHER half of the citation invariant (spans OR graph context)
+        // must still hold independently of this widening — keep a graph
+        // context id so this test isolates the `source_segment_id` rule.
+        card.source_span_ids = Vec::new();
+        card.graph_context_ids = vec!["node-1".into()];
+
+        repo.upsert_live_assist_card(session_id, &card)
+            .expect("origin: User with an empty source_segment_id must be accepted");
+
+        let loaded = repo
+            .load_live_assist_cards(session_id)
+            .expect("load q4-widened card");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].proposal.source_segment_id, "");
+        assert_eq!(loaded[0].origin, Some(CardOrigin::User));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_live_assist_card_q4_widening_still_rejects_empty_source_segment_id_for_every_other_origin()
+     {
+        let dir = unique_tempdir("live-assist-q4-transcript-origin");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-q4-transcript";
+
+        // Explicit `Transcript` origin.
+        let mut explicit_transcript = sample_live_assist_card(
+            session_id,
+            "card-explicit-transcript",
+            LiveAssistCardStatus::Pending,
+        );
+        explicit_transcript.origin = Some(CardOrigin::Transcript);
+        explicit_transcript.proposal.source_segment_id = String::new();
+        let error = repo
+            .upsert_live_assist_card(session_id, &explicit_transcript)
+            .expect_err("origin: Transcript must still require source_segment_id");
+        assert!(error.contains("source_segment_id is required"), "{error}");
+
+        // Legacy `None` origin (every pre-83cc record) must be treated the
+        // same as `Transcript`, not the same as `User`.
+        let mut legacy_none_origin = sample_live_assist_card(
+            session_id,
+            "card-legacy-none-origin",
+            LiveAssistCardStatus::Pending,
+        );
+        legacy_none_origin.origin = None;
+        legacy_none_origin.proposal.source_segment_id = String::new();
+        let error = repo
+            .upsert_live_assist_card(session_id, &legacy_none_origin)
+            .expect_err("a legacy None origin must default to the Transcript-strength invariant");
+        assert!(error.contains("source_segment_id is required"), "{error}");
+
+        assert!(
+            repo.load_live_assist_cards(session_id)
+                .expect("load current live assist cards")
+                .is_empty(),
+            "neither rejected card may have materialized"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-83cc T1: `CardAnswer` validator invariants, additive to
+    // the pre-existing citation rule.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_live_assist_card_rejects_a_non_failed_answer_with_empty_text() {
+        let dir = unique_tempdir("live-assist-answer-empty-text");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-answer-empty-text";
+
+        let mut card = sample_live_assist_card(
+            session_id,
+            "card-empty-answer",
+            LiveAssistCardStatus::Pending,
+        );
+        let mut answer = sample_card_answer(CardAnswerStatus::Answered, CardOrigin::Transcript);
+        answer.text = "   ".into();
+        card.answer = Some(answer);
+
+        let error = repo
+            .upsert_live_assist_card(session_id, &card)
+            .expect_err("a non-Failed answer with empty/whitespace text must be rejected");
+        assert!(
+            error.contains("answer text is required unless the answer failed"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_live_assist_card_permits_a_failed_answer_with_empty_text() {
+        let dir = unique_tempdir("live-assist-answer-failed-empty-text");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-answer-failed-empty-text";
+
+        let mut card = sample_live_assist_card(
+            session_id,
+            "card-failed-answer",
+            LiveAssistCardStatus::Pending,
+        );
+        card.answer = Some(sample_card_answer(
+            CardAnswerStatus::Failed,
+            CardOrigin::Transcript,
+        ));
+
+        repo.upsert_live_assist_card(session_id, &card)
+            .expect("a Failed answer may carry empty text");
+        let loaded = repo
+            .load_live_assist_cards(session_id)
+            .expect("load failed-answer card");
+        assert_eq!(
+            loaded[0].answer.as_ref().map(|a| a.status),
+            Some(CardAnswerStatus::Failed)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_live_assist_card_rejects_an_answer_with_empty_route_id_regardless_of_status() {
+        let dir = unique_tempdir("live-assist-answer-empty-route");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-answer-empty-route";
+
+        let mut card = sample_live_assist_card(
+            session_id,
+            "card-empty-route-failed",
+            LiveAssistCardStatus::Pending,
+        );
+        let mut failed_answer =
+            sample_card_answer(CardAnswerStatus::Failed, CardOrigin::Transcript);
+        failed_answer.route_id = String::new();
+        card.answer = Some(failed_answer);
+
+        let error = repo
+            .upsert_live_assist_card(session_id, &card)
+            .expect_err("route_id is required even for a Failed answer");
+        assert!(error.contains("answer route_id is required"), "{error}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_live_assist_card_rejects_and_accepts_answer_text_at_the_max_char_cap_boundary() {
+        let dir = unique_tempdir("live-assist-answer-text-cap");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-answer-text-cap";
+
+        let mut over_cap = sample_live_assist_card(
+            session_id,
+            "card-answer-over-cap",
+            LiveAssistCardStatus::Pending,
+        );
+        let mut over_cap_answer =
+            sample_card_answer(CardAnswerStatus::Answered, CardOrigin::Transcript);
+        over_cap_answer.text = "a".repeat(crate::events::MAX_CARD_ANSWER_TEXT_CHARS + 1);
+        over_cap.answer = Some(over_cap_answer);
+        let error = repo
+            .upsert_live_assist_card(session_id, &over_cap)
+            .expect_err("answer text over the cap must be rejected");
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(
+            error.contains(&crate::events::MAX_CARD_ANSWER_TEXT_CHARS.to_string()),
+            "{error}"
+        );
+
+        let mut at_cap = sample_live_assist_card(
+            session_id,
+            "card-answer-at-cap",
+            LiveAssistCardStatus::Pending,
+        );
+        let mut at_cap_answer =
+            sample_card_answer(CardAnswerStatus::Answered, CardOrigin::Transcript);
+        at_cap_answer.text = "a".repeat(crate::events::MAX_CARD_ANSWER_TEXT_CHARS);
+        at_cap.answer = Some(at_cap_answer);
+        repo.upsert_live_assist_card(session_id, &at_cap)
+            .expect("answer text exactly at the cap must be accepted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-83cc T1: upsert -> load round trip preserves the answer
+    // (and origin/signal), and a pre-83cc on-disk fixture (no
+    // origin/answer/signal keys at all) still loads with defaults and
+    // re-serializes without corruption.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_memory_repository_upsert_then_load_round_trip_preserves_the_answer() {
+        let dir = unique_tempdir("live-assist-answer-round-trip");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-answer-round-trip";
+
+        let mut card =
+            sample_live_assist_card(session_id, "card-round-trip", LiveAssistCardStatus::Pending);
+        card.origin = Some(CardOrigin::Transcript);
+        card.signal = Some(SignalGrade::Strong);
+        card.answer = Some(sample_card_answer(
+            CardAnswerStatus::Answered,
+            CardOrigin::Transcript,
+        ));
+
+        repo.upsert_live_assist_card(session_id, &card)
+            .expect("upsert answered card");
+
+        let restarted = FileMemoryRepository::with_data_root(&dir);
+        let loaded = restarted
+            .load_live_assist_cards(session_id)
+            .expect("load answered card after restart");
+        assert_eq!(loaded, vec![card.clone()]);
+        assert_eq!(loaded[0].answer, card.answer);
+        assert_eq!(loaded[0].origin, Some(CardOrigin::Transcript));
+        assert_eq!(loaded[0].signal, Some(SignalGrade::Strong));
+
+        let audit = restarted
+            .load_live_assist_card_audit(session_id)
+            .expect("load answered card audit");
+        assert_eq!(audit, vec![card]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_loads_a_pre_83cc_on_disk_fixture_with_defaults_and_resaves_it_intact()
+    {
+        let dir = unique_tempdir("live-assist-legacy-on-disk-83cc");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-legacy-on-disk-83cc";
+
+        // Hand-written OLD-SHAPE row: exactly what a pre-83cc
+        // `current.json`/audit `.jsonl` record looks like on disk today —
+        // no `origin`, `answer`, `signal`, or `proposal.signal` key at all.
+        let legacy_row = serde_json::json!({
+            "session_id": session_id,
+            "proposal": {
+                "id": "card-legacy-on-disk",
+                "source_segment_id": "seg-legacy-on-disk",
+                "source_id": "default-mic",
+                "speaker_label": "Speaker 1",
+                "kind": "question",
+                "title": "Question from Speaker 1",
+                "body": "Consider answering or linking this question: What changed?",
+                "confidence": 0.9,
+                "created_at_ms": 1_700_000_000_000u64
+            },
+            "status": "pending",
+            "source_span_ids": ["seg-legacy-on-disk"],
+            "graph_context_ids": [],
+            "created_at_ms": 1_700_000_000_000u64,
+            "updated_at_ms": 1_700_000_000_000u64
+        });
+
+        let current_path = repo
+            .live_assist_current_path(session_id)
+            .expect("current path");
+        fs::create_dir_all(current_path.parent().expect("current dir")).expect("mkdir");
+        fs::write(
+            &current_path,
+            serde_json::to_string(&vec![legacy_row.clone()]).expect("legacy current.json"),
+        )
+        .expect("write legacy current.json");
+
+        let audit_path = repo.live_assist_audit_path(session_id).expect("audit path");
+        fs::write(
+            &audit_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy_row).expect("legacy jsonl row")
+            ),
+        )
+        .expect("write legacy audit jsonl");
+
+        let loaded = repo
+            .load_live_assist_cards(session_id)
+            .expect("load pre-83cc on-disk fixture");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].origin, None);
+        assert_eq!(loaded[0].answer, None);
+        assert_eq!(loaded[0].signal, None);
+        assert_eq!(loaded[0].proposal.signal, None);
+
+        let audit = repo
+            .load_live_assist_card_audit(session_id)
+            .expect("load pre-83cc on-disk audit fixture");
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].origin, None);
+
+        // Re-upsert the defaulted record (simulating any lifecycle
+        // transition, e.g. dismiss) and confirm the file re-serializes and
+        // re-loads without corruption.
+        let mut resaved = loaded[0].clone();
+        resaved.status = LiveAssistCardStatus::Dismissed;
+        resaved.updated_at_ms = 1_700_000_000_500;
+        repo.upsert_live_assist_card(session_id, &resaved)
+            .expect("re-upsert a legacy-defaulted record");
+        let reloaded = repo
+            .load_live_assist_cards(session_id)
+            .expect("reload after re-upsert");
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].status, LiveAssistCardStatus::Dismissed);
+        assert_eq!(reloaded[0].updated_at_ms, 1_700_000_000_500);
+        assert_eq!(reloaded[0].origin, None);
 
         let _ = fs::remove_dir_all(&dir);
     }

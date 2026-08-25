@@ -3992,6 +3992,25 @@ fn live_assist_card_record(
     let graph_context_ids = existing
         .map(|card| card.graph_context_ids.clone())
         .unwrap_or_default();
+    // audio-graph-83cc T1: carry the new additive fields through every
+    // lifecycle transition this helper serves (approve/dismiss/clear). All
+    // three current call sites source `proposal` from
+    // `pending_agent_proposals`, which only ever holds transcript-detected
+    // proposals (the one production mint site, `run_agent_proposal_task`),
+    // so a brand-new card (no `existing` record yet) defaults to
+    // `CardOrigin::Transcript`, never `None` — `None` is reserved for
+    // records that predate this unit, not new ones created after it.
+    // `answer` is never originated here (T3's job); this helper only ever
+    // preserves whatever answer an existing record already carries so a
+    // dismiss/approve/clear on an already-answered card doesn't drop it.
+    // `signal` mirrors `proposal.signal` (the T2 grade stamped at mint,
+    // still present on the cloned pending-map entry every one of these
+    // call sites reads from) rather than an existing card's stale copy, so
+    // it never lags behind the mint-time computation.
+    let origin = existing
+        .and_then(|card| card.origin)
+        .or(Some(events::CardOrigin::Transcript));
+    let answer = existing.and_then(|card| card.answer.clone());
     events::LiveAssistCardRecord {
         session_id: session_id.to_string(),
         proposal: proposal.clone(),
@@ -4004,6 +4023,9 @@ fn live_assist_card_record(
             .map(|card| card.created_at_ms)
             .unwrap_or(proposal.created_at_ms),
         updated_at_ms,
+        origin,
+        answer,
+        signal: proposal.signal,
     }
 }
 
@@ -11981,6 +12003,101 @@ mod tests {
         );
     }
 
+    /// audio-graph-83cc T1: `live_assist_card_record` must carry the new
+    /// additive fields through every lifecycle transition it serves
+    /// (approve/dismiss/clear). A brand-new card (no `existing` record)
+    /// defaults `origin` to `Transcript` (every current call site only ever
+    /// sources `proposal` from `pending_agent_proposals`, which is 100%
+    /// transcript-detected), never originates an `answer`, and mirrors
+    /// `signal` straight from the proposal (the T2 mint-time grade).
+    #[test]
+    fn live_assist_card_record_defaults_a_brand_new_card_to_transcript_origin_and_mint_time_signal()
+    {
+        let proposal = events::AgentProposalPayload {
+            id: "card-fresh".to_string(),
+            source_segment_id: "segment-fresh".to_string(),
+            source_id: "default-mic".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "Question from Speaker 1".to_string(),
+            body: "Consider answering or linking this question: What changed?".to_string(),
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal: Some(events::SignalGrade::Fragment),
+        };
+        let record = live_assist_card_record(
+            "session-1",
+            &proposal,
+            events::LiveAssistCardStatus::Dismissed,
+            None,
+            None,
+            1_700_000_000_100,
+            None,
+        );
+        assert_eq!(record.origin, Some(events::CardOrigin::Transcript));
+        assert_eq!(record.answer, None);
+        assert_eq!(record.signal, Some(events::SignalGrade::Fragment));
+    }
+
+    /// The other half: when `existing` already carries an `origin`/
+    /// `answer`, a later lifecycle transition (e.g. dismissing an
+    /// already-answered card) must preserve them rather than reset them to
+    /// the brand-new defaults above.
+    #[test]
+    fn live_assist_card_record_preserves_an_existing_cards_origin_and_answer_across_a_transition() {
+        let proposal = events::AgentProposalPayload {
+            id: "card-existing".to_string(),
+            source_segment_id: "segment-existing".to_string(),
+            source_id: "default-mic".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "Question from Speaker 1".to_string(),
+            body: "Consider answering or linking this question: What changed?".to_string(),
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal: Some(events::SignalGrade::Strong),
+        };
+        let existing = events::LiveAssistCardRecord {
+            session_id: "session-1".to_string(),
+            proposal: proposal.clone(),
+            status: events::LiveAssistCardStatus::Pending,
+            source_span_ids: vec!["segment-existing".to_string()],
+            graph_context_ids: vec![],
+            outcome: None,
+            projection_patch_sequence: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_050,
+            origin: Some(events::CardOrigin::User),
+            answer: Some(events::CardAnswer {
+                status: events::CardAnswerStatus::Answered,
+                text: "The deadline moved to Friday.".to_string(),
+                truncated: false,
+                evidence_span_ids: vec!["segment-existing".to_string()],
+                evidence_graph_ids: vec![],
+                notes_last_sequence: None,
+                route_id: "route.openrouter".to_string(),
+                requested_by: events::CardOrigin::User,
+                finish_reason: Some("stop".to_string()),
+                total_tokens: Some(50),
+                answered_at_ms: 1_700_000_000_075,
+            }),
+            signal: Some(events::SignalGrade::Strong),
+        };
+
+        let record = live_assist_card_record(
+            "session-1",
+            &proposal,
+            events::LiveAssistCardStatus::Dismissed,
+            None,
+            None,
+            1_700_000_000_200,
+            Some(&existing),
+        );
+        assert_eq!(record.origin, Some(events::CardOrigin::User));
+        assert_eq!(record.answer, existing.answer);
+        assert_eq!(record.signal, Some(events::SignalGrade::Strong));
+    }
+
     /// audio-graph-cfa1 (post-scope-honesty-review fix):
     /// `projection_replay_latency_metrics` used to compute `missing_timestamp`
     /// by walking `patch.basis.span_revisions` directly — only ever the
@@ -12159,6 +12276,7 @@ mod tests {
             confidence: 0.8,
             // 2.5s of wall-clock time after the cited span was recorded.
             created_at_ms: 1_700_000_002_500,
+            signal: None,
         };
         state
             .pending_agent_proposals
@@ -14406,6 +14524,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-83cc T1 size-margin gate: a realistic worst-case card
+    /// set — 200 cards (the same count `MAX_PENDING_AGENT_PROPOSALS`
+    /// already caps in-memory PENDING proposals to, `speech/mod.rs:85` —
+    /// this is a plausible scenario size, NOT an enforced ceiling on the
+    /// persisted `current.json` array, which today has no count cap of its
+    /// own; `upsert_live_assist_card` appends/replaces without pruning), 12
+    /// of which carry a max-length answer (`events::MAX_CARD_ANSWER_TEXT_CHARS`,
+    /// T3's eventual per-session AUTO-answer cap — manual `Ask AI` answers
+    /// are not capped by this unit, so answered-card count is not bounded
+    /// by this "12" either) — must sit comfortably under
+    /// `MAX_LIVE_ASSIST_CARDS_BYTES` (8 MiB). This is the exact array shape
+    /// `current.json` persists
+    /// (`persistence::upsert_live_assist_card`'s `save_json(&current, ...)`).
+    ///
+    /// Fix-round correction: the answer text below is deliberately NOT
+    /// `"a".repeat(...)` (plain ASCII). `serde_json` escapes control
+    /// characters as `\u00XX` (6 ASCII bytes per 1 `char`), so an all-ASCII
+    /// fixture understates the true byte-worst-case by roughly 6x on the
+    /// answer-text term alone — a prior version of this test's own doc
+    /// comment (and the implementer's report) claimed a "50x" margin
+    /// measured only against the ASCII case. Using a repeated control
+    /// character makes this fixture reflect the actual worst-case
+    /// serialized size for a `MAX_CARD_ANSWER_TEXT_CHARS`-length answer.
+    #[test]
+    fn live_assist_cards_worst_case_count_and_max_length_answers_stay_comfortably_under_the_byte_ceiling()
+     {
+        const WORST_CASE_CARD_COUNT: usize = 200;
+        const WORST_CASE_ANSWERED_CARD_COUNT: usize = 12;
+        // The margin this test pins: the worst-case serialized set must be
+        // at least this many times SMALLER than the ceiling. A future field
+        // addition that erodes the margin below this is a visible test
+        // failure, not a silent creep toward 8 MiB.
+        const MIN_CEILING_MARGIN_MULTIPLE: u64 = 20;
+
+        let mut cards = Vec::with_capacity(WORST_CASE_CARD_COUNT);
+        for i in 0..WORST_CASE_CARD_COUNT {
+            let proposal = events::AgentProposalPayload {
+                id: format!("card-{i}"),
+                source_segment_id: format!("segment-{i}"),
+                source_id: "default-mic".to_string(),
+                speaker_label: Some("Speaker 1".to_string()),
+                kind: events::AgentProposalKind::Question,
+                title: "Question from Speaker 1".to_string(),
+                body: "Consider answering or linking this question: What changed in the \
+                       roadmap for next quarter's committed deliverables?"
+                    .to_string(),
+                confidence: 0.9,
+                created_at_ms: 1_700_000_000_000 + i as u64,
+                signal: Some(events::SignalGrade::Strong),
+            };
+            let answer = (i < WORST_CASE_ANSWERED_CARD_COUNT).then(|| events::CardAnswer {
+                status: events::CardAnswerStatus::Answered,
+                // Byte-worst-case, not char-count-worst-case: U+0001 (a
+                // control character) serializes as the 6-ASCII-byte escape
+                // sequence per 1 `char`, so this is ~6x heavier on the wire
+                // than the same number of plain ASCII letters while staying
+                // at exactly `MAX_CARD_ANSWER_TEXT_CHARS` `chars().count()`
+                // -- the validator's own measure.
+                text: "\u{1}".repeat(events::MAX_CARD_ANSWER_TEXT_CHARS),
+                truncated: false,
+                evidence_span_ids: (0..10).map(|n| format!("span-{i}-{n}")).collect(),
+                evidence_graph_ids: (0..10).map(|n| format!("node-{i}-{n}")).collect(),
+                notes_last_sequence: Some(42),
+                route_id: "route.openrouter".to_string(),
+                requested_by: events::CardOrigin::Transcript,
+                finish_reason: Some("stop".to_string()),
+                total_tokens: Some(1200),
+                answered_at_ms: 1_700_000_000_500 + i as u64,
+            });
+            cards.push(events::LiveAssistCardRecord {
+                session_id: "session-size-margin".to_string(),
+                proposal,
+                status: events::LiveAssistCardStatus::Pending,
+                source_span_ids: vec![format!("segment-{i}")],
+                graph_context_ids: vec![],
+                outcome: None,
+                projection_patch_sequence: None,
+                created_at_ms: 1_700_000_000_000 + i as u64,
+                updated_at_ms: 1_700_000_000_000 + i as u64,
+                origin: Some(events::CardOrigin::Transcript),
+                answer,
+                signal: Some(events::SignalGrade::Strong),
+            });
+        }
+
+        let json = serde_json::to_string(&cards).expect("serialize worst-case live-assist cards");
+        let size_bytes = json.len() as u64;
+        assert!(
+            size_bytes < MAX_LIVE_ASSIST_CARDS_BYTES,
+            "worst-case {WORST_CASE_CARD_COUNT} cards ({WORST_CASE_ANSWERED_CARD_COUNT} \
+             max-length answers) serialized to {size_bytes} bytes, at or over the \
+             {MAX_LIVE_ASSIST_CARDS_BYTES}-byte ceiling"
+        );
+        let margin = MAX_LIVE_ASSIST_CARDS_BYTES / size_bytes.max(1);
+        assert!(
+            margin >= MIN_CEILING_MARGIN_MULTIPLE,
+            "expected at least a {MIN_CEILING_MARGIN_MULTIPLE}x margin under the live-assist \
+             ceiling, got {margin}x ({size_bytes} bytes vs {MAX_LIVE_ASSIST_CARDS_BYTES})"
+        );
     }
 
     /// Fix-round finding: the primary transcript-events artifact (unlike the

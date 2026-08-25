@@ -1021,6 +1021,140 @@ fn agent_proposal_body(kind: &events::AgentProposalKind, text: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// audio-graph-83cc T2: backend signal grade at mint.
+//
+// Ports ticket W9's shipped `classifyQueueEntry` quality rules
+// (`src/components/workspace/agentQueue.ts`) into Rust, so the auto-answer
+// spend gate (T3) has a Rust-authoritative signal rather than trusting the
+// renderer's own classification alone. Same thresholds, same decision shape,
+// same outcome boundary — see `events::SignalGrade`'s doc comment for the
+// exact equivalence this ports (`grade == Strong` iff W9's
+// `classifyQueueEntry(..., true) == "actionable"`).
+//
+// This function computes grade at MINT time from the payload alone (no
+// structural "is this card still actionable" context — that's a card-head
+// fact the frontend has and this function deliberately does not need), so
+// it corresponds exactly to W9's quality rules run on an `isActionable:
+// true` card, never to the frontend's separate `"info"` outcome.
+// ---------------------------------------------------------------------------
+
+/// W9's shipped constants (`agentQueue.ts`'s `AGENT_QUEUE_CONFIDENCE_FLOOR`),
+/// kept verbatim so the two implementations never drift in value, even
+/// though — per that file's own module comment on
+/// `AGENT_PROPOSAL_BODY_PREFIXES` — this file deliberately does not import
+/// from the frontend (zero cross-language coupling; a Rust build must not
+/// depend on a TypeScript module existing).
+const AGENT_SIGNAL_CONFIDENCE_FLOOR: f32 = 0.5;
+/// W9's shipped constant (`AGENT_QUEUE_MIN_TOKENS`).
+const AGENT_SIGNAL_MIN_TOKENS: usize = 4;
+/// W9's shipped constant (`AGENT_QUEUE_MIN_CHARS`). Compared against a
+/// UTF-16-code-unit count (`str::encode_utf16().count()`), not Rust's
+/// native `chars().count()` (Unicode scalar values) — see
+/// `agent_signal_grade`'s `too_short` computation for why: the frontend
+/// compares against `String.prototype.length`, which counts UTF-16 code
+/// units, so an astral-plane character (outside the Basic Multilingual
+/// Plane, e.g. most emoji) counts as 2 there but only 1 Rust `char`. Fix-
+/// round correction: an earlier revision of this port compared against
+/// `chars().count()`, which is stricter than the frontend for astral text
+/// (fails closed under Q2's dual gate, but not an exact mirror — see
+/// `agent_signal_grade_min_chars_boundary_counts_utf16_code_units_like_the_frontend`
+/// in this module's `tests` for the differential-tested boundary this
+/// fixes).
+const AGENT_SIGNAL_MIN_CHARS: usize = 16;
+
+/// JS `String.prototype.trim()` strips Unicode whitespace AND U+FEFF
+/// (ZWNBSP) — an explicit quirk of the ECMAScript `WhiteSpace` production
+/// that Rust's `char::is_whitespace` (Unicode `White_Space` property) does
+/// not share. `agent_signal_content_text` and
+/// `agent_signal_has_dangling_clause_ending` need this JS-shaped trim, not
+/// Rust's native one, to recover the exact text W9's frontend rules would
+/// see. Fix-round addition: differential-tested against a trailing
+/// `",\u{FEFF}"` vector, which graded `Strong` here and `fragment_suspect`
+/// on the frontend before this helper existed (see
+/// `agent_signal_grade_a_trailing_bom_after_a_dangling_comma_is_still_fragment_shaped`
+/// in this module's `tests`).
+///
+/// Deliberately NOT a full port of JS's `\s` regex class (used by
+/// `queueContentText`'s tokenizer, not `trim()`) — that class additionally
+/// disagrees with Rust's `char::is_whitespace` on U+0085 (NEL: Unicode
+/// `White_Space`, but excluded from JS's `\s`). That divergence affects only
+/// token-count splitting, not trimming, is unreachable from real ASR
+/// output, and is intentionally left unclosed here — closing it exactly
+/// would mean hand-porting the ECMA-262 `WhiteSpace`/`LineTerminator`
+/// productions' full character set, an open-ended surface with no test
+/// coverage requirement for a fragment neither side's corpus can produce.
+fn js_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+}
+
+/// `trim_end` counterpart of [`js_trim`].
+fn js_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+}
+
+/// Mirrors `agentQueue.ts`'s `AGENT_PROPOSAL_BODY_PREFIXES` +
+/// `queueContentText`: recovers the transcript-derived text a proposal was
+/// minted from by stripping the known canned `agent_proposal_body` prefix
+/// for `kind`, falling back to the raw body when the prefix isn't present.
+/// Deliberately duplicated rather than shared with `agent_proposal_body`
+/// above (same reasoning as the frontend's own module comment on
+/// `AGENT_PROPOSAL_BODY_PREFIXES`: this keeps the two call sites — minting
+/// the body vs. grading its content — decoupled from each other's internal
+/// shape) and pinned against drift by
+/// `agent_signal_grade_content_text_recovers_what_agent_proposal_body_mints`
+/// below.
+fn agent_signal_content_text(payload: &events::AgentProposalPayload) -> String {
+    let body = js_trim(&payload.body);
+    let prefix = match &payload.kind {
+        events::AgentProposalKind::Question => "Consider answering or linking this question: ",
+        events::AgentProposalKind::GraphSuggestion => {
+            "Review this for an action item, decision, or relationship: "
+        }
+        events::AgentProposalKind::Note => "Keep this context available: ",
+    };
+    js_trim(body.strip_prefix(prefix).unwrap_or(body)).to_string()
+}
+
+/// Mirrors `agentQueue.ts`'s `hasDanglingClauseEnding`: a dangling clause —
+/// text that trails off in a comma/semicolon/colon, ignoring trailing
+/// whitespace (including a trailing BOM — see [`js_trim_end`]), is
+/// fragment-shaped. Punctuation-shape only, no word list, so this is
+/// identical behavior across locales (matches the frontend's own "no
+/// English word lists" constraint).
+fn agent_signal_has_dangling_clause_ending(text: &str) -> bool {
+    matches!(js_trim_end(text).chars().last(), Some(',' | ';' | ':'))
+}
+
+/// Backend port of W9's `classifyQueueEntry` quality rules
+/// (`agentQueue.ts:219-240`), scoped — exactly as the frontend is — to
+/// `kind == Question`. See `events::SignalGrade` for what each variant
+/// means and the one invariant (`Strong` iff the frontend's `"actionable"`)
+/// the mirrored fixtures in this module's `tests` pin.
+fn agent_signal_grade(payload: &events::AgentProposalPayload) -> events::SignalGrade {
+    if payload.kind != events::AgentProposalKind::Question {
+        return events::SignalGrade::Strong;
+    }
+    // JS `NaN < 0.5` is `false`, so a non-finite confidence (unreachable in
+    // production — `run_agent_proposal_task` always clamps to
+    // `0.0..=1.0` — but this function must still degrade rather than panic)
+    // falls through to the content-shape check below, exactly mirroring the
+    // frontend's own comparison semantics rather than special-casing it.
+    if payload.confidence < AGENT_SIGNAL_CONFIDENCE_FLOOR {
+        return events::SignalGrade::Weak;
+    }
+    let content = agent_signal_content_text(payload);
+    // `encode_utf16().count()`, not `chars().count()` — see
+    // `AGENT_SIGNAL_MIN_CHARS`'s doc comment for why this must match the
+    // frontend's `String.prototype.length` semantics exactly.
+    let too_short = content.split_whitespace().count() < AGENT_SIGNAL_MIN_TOKENS
+        || content.encode_utf16().count() < AGENT_SIGNAL_MIN_CHARS;
+    if too_short || agent_signal_has_dangling_clause_ending(&content) {
+        return events::SignalGrade::Fragment;
+    }
+    events::SignalGrade::Strong
+}
+
 fn prune_pending_agent_proposals(pending: &mut HashMap<String, events::AgentProposalPayload>) {
     if pending.len() <= MAX_PENDING_AGENT_PROPOSALS {
         return;
@@ -1123,7 +1257,7 @@ fn run_agent_proposal_task(
     } else {
         0.0
     };
-    let proposal = events::AgentProposalPayload {
+    let mut proposal = events::AgentProposalPayload {
         id: uuid::Uuid::new_v4().to_string(),
         source_segment_id: segment.id.clone(),
         source_id: segment.source_id.clone(),
@@ -1133,7 +1267,17 @@ fn run_agent_proposal_task(
         kind,
         confidence,
         created_at_ms: current_unix_millis(),
+        signal: None,
     };
+    // audio-graph-83cc T2: stamp the backend signal grade at mint, before
+    // the payload is cloned into the pending map / the card head below, so
+    // both copies carry the same grade this proposal will ever have (the
+    // grade is a deterministic function of fields already set above — it
+    // never changes after mint). This is additive telemetry-adjacent state
+    // only: it changes no existing mint behavior, no card lifecycle, and no
+    // log line (see this unit's own scope note on the 81a5 creation-log
+    // seam).
+    proposal.signal = Some(agent_signal_grade(&proposal));
 
     match pending_agent_proposals.lock() {
         Ok(mut pending) => {
@@ -1162,6 +1306,15 @@ fn run_agent_proposal_task(
         projection_patch_sequence: None,
         created_at_ms: proposal.created_at_ms,
         updated_at_ms: proposal.created_at_ms,
+        // audio-graph-83cc T1/T2: this is the one production mint site, so
+        // `origin` is always `Transcript` (never `None` — `None` is
+        // reserved for records that predate this unit) and `signal`
+        // mirrors the grade just stamped on `proposal` above. `answer` is
+        // never originated here — that's T3's job, on the answer stream's
+        // terminal frame.
+        origin: Some(events::CardOrigin::Transcript),
+        answer: None,
+        signal: proposal.signal,
     };
     if let Err(err) =
         FileMemoryRepository::user_data().upsert_live_assist_card(&expected_session_id, &live_card)
@@ -9142,13 +9295,14 @@ mod tests_provider_dispatch {
 #[cfg(test)]
 mod tests_status {
     use super::{
-        DiarizationDegradationReason, DiarizationDispatchContext, DiarizationEventSink,
-        ExtractionDeps, PipelineStatus, ProjectionDataMovementSink, ProjectionDispatchContext,
-        ProjectionPatchAttempt, ProjectionPatchGenerator, ProjectionRuntimeEventSink,
-        SpeechChannels, SpeechConfig, SpeechShared, StageStatus,
-        apply_extraction_result_if_current, aws_error_diagnostic, aws_error_for_diagnostic_event,
-        cloud_error_code, current_unix_millis, deregister_projection_job,
-        diarization_degradation_for_provider_labeled_session,
+        AGENT_SIGNAL_MIN_CHARS, AGENT_SIGNAL_MIN_TOKENS, DiarizationDegradationReason,
+        DiarizationDispatchContext, DiarizationEventSink, ExtractionDeps, PipelineStatus,
+        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchAttempt,
+        ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
+        SpeechShared, StageStatus, agent_proposal_body, agent_signal_content_text,
+        agent_signal_grade, apply_extraction_result_if_current, aws_error_diagnostic,
+        aws_error_for_diagnostic_event, cloud_error_code, current_unix_millis,
+        deregister_projection_job, diarization_degradation_for_provider_labeled_session,
         diarization_span_revision_for_transcript, dispatch_projection_decision,
         emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
@@ -10153,6 +10307,452 @@ mod tests_status {
         for listener in listeners {
             app_handle.unlisten(listener);
         }
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------
+    // audio-graph-83cc T2: backend signal grade at mint.
+    // -------------------------------------------------------------------
+
+    /// 1:1 mirrored fixtures, ported from
+    /// `src/components/workspace/agentQueue.test.ts`'s
+    /// `describe("classifyQueueEntry — the classification table
+    /// (actionable / info / fragment_suspect, ticket W9)")` block — the
+    /// `isActionable: true` cases only (the block's two other cases test a
+    /// STRUCTURAL fact — `isActionable: false` and a constant-sanity check
+    /// — that `agent_signal_grade` never sees, so they have no Rust
+    /// equivalent). Each fixture is named after its FE `it(...)` title
+    /// verbatim (truncated where the title itself documents the rule
+    /// twice) so a reviewer can `grep` the exact frontend test this Rust
+    /// vector mirrors. Cross-pointing in the OTHER direction (a comment in
+    /// `agentQueue.test.ts` naming this Rust test) is not possible without
+    /// touching a frontend file, which this unit does not do.
+    ///
+    /// `FIXTURE_COUNT` is a manual synchronization guard: if a future FE
+    /// change adds or removes a vector from that `describe` block without
+    /// a matching update here, the `assert_eq!` against `fixtures.len()`
+    /// below fails, forcing a deliberate decision instead of silent drift
+    /// (cross-language, so it cannot be a compiler-enforced check).
+    #[test]
+    fn agent_signal_grade_mirrors_w9_classify_queue_entry_fixtures_1_to_1() {
+        const FIXTURE_COUNT: usize = 12;
+
+        struct Fixture {
+            fe_test_name: &'static str,
+            kind: events::AgentProposalKind,
+            confidence: f32,
+            body: &'static str,
+            expected: events::SignalGrade,
+        }
+
+        let fixtures = [
+            Fixture {
+                // The FE vector this mirrors (`card({ proposal: { kind: "note" } })`)
+                // only overrides `kind`; `body` stays the test helper's
+                // default `` Body ${seq} `` literal — reproduced verbatim
+                // here (fix-round correction: an earlier revision used a
+                // prefixed body that happened to share the same outcome
+                // but was not the literal FE input) rather than a prefixed
+                // string, since a `Note`'s body content never affects its
+                // grade anyway (see the `if kind != Question` early return
+                // above).
+                fe_test_name: "classifies an actionable, well-formed non-question card as 'actionable'",
+                kind: events::AgentProposalKind::Note,
+                confidence: 0.8,
+                body: "Body 1",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "PRODUCTION-SHAPED (blocker fix): the real backend title \
+                    'Question from {speaker}' is 'actionable', not fragment_suspect, when the \
+                    underlying utterance is well-formed",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.87,
+                body: "Consider answering or linking this question: Is this the final budget \
+                    for the quarter?",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "PRODUCTION-SHAPED (blocker fix): 'Question from Unknown' (no \
+                    speaker label) is also 'actionable' for a well-formed underlying question",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: What did the team decide \
+                    about pricing?",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "W9: a low-confidence QUESTION proposal is 'fragment_suspect' \
+                    (confidence floor) — literal boundary, not derived from the imported \
+                    constant",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.49,
+                body: "Consider answering or linking this question: Is this the final budget \
+                    for the quarter?",
+                expected: events::SignalGrade::Weak,
+            },
+            Fixture {
+                fe_test_name: "W9: confidence exactly AT the floor (0.5, literal) is NOT caught \
+                    by the floor rule — only strictly-below is",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.5,
+                body: "Consider answering or linking this question: Is this the final budget \
+                    for the quarter?",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "W9: a low-confidence NOTE/graph_suggestion proposal is NOT \
+                    reclassified — the confidence rule is question-scoped",
+                kind: events::AgentProposalKind::Note,
+                confidence: 0.1,
+                body: "Keep this context available: Ok",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "W9: a short QUESTION underlying utterance below the token/char \
+                    thresholds is 'fragment_suspect' (the 104f fragment shape, e.g. 'what \
+                    about')",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: what about",
+                expected: events::SignalGrade::Fragment,
+            },
+            Fixture {
+                fe_test_name: "MIN_CHARS clause (mutation guard): 4+ tokens, terminal \
+                    punctuation, but under 16 chars is still 'fragment_suspect'",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: Is it ok now?",
+                expected: events::SignalGrade::Fragment,
+            },
+            Fixture {
+                fe_test_name: "W9 (design-a §3.2's ACTUAL rule): a long-enough QUESTION with no \
+                    terminal punctuation at all is 'actionable'",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: so what about the \
+                    enterprise pricing tier we discussed",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "W9 (design-a §3.2's ACTUAL rule): a long-enough QUESTION that \
+                    trails off in a comma/semicolon/colon IS 'fragment_suspect'",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: so what about the \
+                    enterprise pricing tier we discussed,",
+                expected: events::SignalGrade::Fragment,
+            },
+            Fixture {
+                fe_test_name: "W9: a well-formed QUESTION (long enough, confident, no dangling \
+                    clause) is 'actionable'",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: What did the team decide \
+                    about pricing?",
+                expected: events::SignalGrade::Strong,
+            },
+            Fixture {
+                fe_test_name: "LOCALE SAFETY (pt fixture): a short but well-formed Portuguese \
+                    question is NOT misclassified by English-specific rules",
+                kind: events::AgentProposalKind::Question,
+                confidence: 0.9,
+                body: "Consider answering or linking this question: Você acha isso bom?",
+                expected: events::SignalGrade::Strong,
+            },
+        ];
+
+        assert_eq!(
+            fixtures.len(),
+            FIXTURE_COUNT,
+            "fixture count drifted from the documented FIXTURE_COUNT — update it \
+             deliberately if a vector was intentionally added or removed"
+        );
+
+        for fixture in &fixtures {
+            let payload = events::AgentProposalPayload {
+                id: "fixture".to_string(),
+                source_segment_id: "segment-fixture".to_string(),
+                source_id: "default-mic".to_string(),
+                speaker_label: Some("Speaker 1".to_string()),
+                kind: fixture.kind.clone(),
+                title: "fixture title (unused by agent_signal_grade)".to_string(),
+                body: fixture.body.to_string(),
+                confidence: fixture.confidence,
+                created_at_ms: 1_700_000_000_000,
+                signal: None,
+            };
+            assert_eq!(
+                agent_signal_grade(&payload),
+                fixture.expected,
+                "mismatched grade for FE fixture {:?}",
+                fixture.fe_test_name
+            );
+        }
+    }
+
+    /// Fix-round addition: the drift guard `agent_signal_content_text`'s own
+    /// doc comment has promised since this unit's first commit — a prior
+    /// revision named this exact test without ever writing it. Asserts
+    /// `agent_signal_content_text` recovers the RAW text for all three
+    /// `AgentProposalKind`s from a body built by the real
+    /// `agent_proposal_body` mint helper, so a future change to either
+    /// function's canned prefix strings fails this test instead of silently
+    /// mis-grading every short fragment of that kind as `Strong` (an
+    /// unstripped prefix adds ~30-60 chars / 5-9 tokens, enough to clear
+    /// both the `AGENT_SIGNAL_MIN_CHARS` and `AGENT_SIGNAL_MIN_TOKENS`
+    /// floors on its own).
+    #[test]
+    fn agent_signal_grade_content_text_recovers_what_agent_proposal_body_mints() {
+        for kind in [
+            events::AgentProposalKind::Question,
+            events::AgentProposalKind::GraphSuggestion,
+            events::AgentProposalKind::Note,
+        ] {
+            let raw = "what about";
+            let body = agent_proposal_body(&kind, raw);
+            let payload = events::AgentProposalPayload {
+                id: "drift-guard".to_string(),
+                source_segment_id: "segment-drift-guard".to_string(),
+                source_id: "default-mic".to_string(),
+                speaker_label: Some("Speaker 1".to_string()),
+                kind: kind.clone(),
+                title: "fixture title (unused by agent_signal_content_text)".to_string(),
+                body,
+                confidence: 0.9,
+                created_at_ms: 1_700_000_000_000,
+                signal: None,
+            };
+            assert_eq!(
+                agent_signal_content_text(&payload),
+                raw,
+                "agent_signal_content_text must recover the raw mint-time text for {kind:?} — \
+                 if this fails, agent_proposal_body's canned prefix for {kind:?} drifted from \
+                 the prefix agent_signal_content_text strips"
+            );
+        }
+    }
+
+    /// Fix-round addition (mutation-probe gap, review finding): the FE-
+    /// mirrored table above pins only a trailing comma for the dangling-
+    /// clause rule (the one vector the real FE `describe` block happens to
+    /// use). A mutation that narrowed the dangling-clause set to comma-only
+    /// survived the full existing suite. Not part of `FIXTURE_COUNT` — these
+    /// vectors have no corresponding FE `it()` block, they exist purely to
+    /// close a Rust-side coverage gap.
+    #[test]
+    fn agent_signal_has_dangling_clause_ending_recognizes_semicolon_and_colon_not_just_comma() {
+        for ending in [';', ':'] {
+            let body = format!(
+                "Consider answering or linking this question: so what about the enterprise \
+                 pricing tier we discussed{ending}"
+            );
+            let payload = events::AgentProposalPayload {
+                id: "dangling-gap".to_string(),
+                source_segment_id: "segment-dangling-gap".to_string(),
+                source_id: "default-mic".to_string(),
+                speaker_label: Some("Speaker 1".to_string()),
+                kind: events::AgentProposalKind::Question,
+                title: "fixture title".to_string(),
+                body,
+                confidence: 0.9,
+                created_at_ms: 1_700_000_000_000,
+                signal: None,
+            };
+            assert_eq!(
+                agent_signal_grade(&payload),
+                events::SignalGrade::Fragment,
+                "a question dangling on {ending:?} must grade Fragment"
+            );
+        }
+    }
+
+    /// Fix-round addition (mutation-probe gap, review finding): no existing
+    /// fixture has exactly `AGENT_SIGNAL_MIN_TOKENS - 1` tokens while also
+    /// clearing `AGENT_SIGNAL_MIN_CHARS`, so a mutation lowering
+    /// `AGENT_SIGNAL_MIN_TOKENS` from 4 to 3 survived the full existing
+    /// suite (the one short fixture is caught by the chars rule too). This
+    /// content is exactly 3 tokens and 28 chars (`>= 16`), isolating the
+    /// token-count rule.
+    #[test]
+    fn agent_signal_grade_min_tokens_boundary_is_pinned_independent_of_min_chars() {
+        let body =
+            "Consider answering or linking this question: Wonderfully expansive topic".to_string();
+        let content = "Wonderfully expansive topic";
+        assert_eq!(content.split_whitespace().count(), 3, "sanity: 3 tokens");
+        assert!(
+            content.chars().count() >= AGENT_SIGNAL_MIN_CHARS,
+            "sanity: clears the chars floor on its own"
+        );
+        let payload = events::AgentProposalPayload {
+            id: "min-tokens-boundary".to_string(),
+            source_segment_id: "segment-min-tokens-boundary".to_string(),
+            source_id: "default-mic".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "fixture title".to_string(),
+            body,
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal: None,
+        };
+        assert_eq!(
+            agent_signal_grade(&payload),
+            events::SignalGrade::Fragment,
+            "3 tokens (below AGENT_SIGNAL_MIN_TOKENS=4) must grade Fragment even though the \
+             char floor is cleared"
+        );
+    }
+
+    /// Fix-round regression pin (review finding): before `AGENT_SIGNAL_MIN_CHARS`
+    /// was compared via `encode_utf16().count()`, this exact content (8
+    /// astral-plane emoji + 7 separating spaces: 15 Unicode scalar values
+    /// but 23 UTF-16 code units) graded `Fragment` here while the frontend's
+    /// `classifyQueueEntry` (comparing `String.prototype.length`, which
+    /// counts UTF-16 code units) graded it `actionable` — a real,
+    /// differential-tested divergence, in the conservative (Rust-denies)
+    /// direction. Pins the fix.
+    #[test]
+    fn agent_signal_grade_min_chars_boundary_counts_utf16_code_units_like_the_frontend() {
+        let content =
+            "\u{1F600} \u{1F600} \u{1F600} \u{1F600} \u{1F600} \u{1F600} \u{1F600} \u{1F600}";
+        assert_eq!(
+            content.chars().count(),
+            15,
+            "sanity: 15 Unicode scalar values"
+        );
+        assert_eq!(
+            content.encode_utf16().count(),
+            23,
+            "sanity: 23 UTF-16 code units"
+        );
+        assert!(
+            content.split_whitespace().count() >= AGENT_SIGNAL_MIN_TOKENS,
+            "sanity: clears the token floor on its own"
+        );
+        let body = format!("Consider answering or linking this question: {content}");
+        let payload = events::AgentProposalPayload {
+            id: "min-chars-utf16-boundary".to_string(),
+            source_segment_id: "segment-min-chars-utf16-boundary".to_string(),
+            source_id: "default-mic".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "fixture title".to_string(),
+            body,
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal: None,
+        };
+        assert_eq!(
+            agent_signal_grade(&payload),
+            events::SignalGrade::Strong,
+            "content clearing AGENT_SIGNAL_MIN_CHARS in UTF-16 code units (like the frontend) \
+             must not be graded Fragment just because it is short in Unicode scalar values"
+        );
+    }
+
+    /// Fix-round regression pin (review finding): before `js_trim`/
+    /// `js_trim_end` existed, a trailing U+FEFF after a dangling comma hid
+    /// the comma from `agent_signal_has_dangling_clause_ending` (Rust's
+    /// native `trim_end` does not strip U+FEFF, but JS's `trim()` does),
+    /// grading `Strong` here while the frontend graded `fragment_suspect`
+    /// for the same content. Pins the fix.
+    #[test]
+    fn agent_signal_grade_a_trailing_bom_after_a_dangling_comma_is_still_fragment_shaped() {
+        let body = "Consider answering or linking this question: so what about the enterprise \
+                     pricing tier we discussed,\u{FEFF}"
+            .to_string();
+        let payload = events::AgentProposalPayload {
+            id: "trailing-bom".to_string(),
+            source_segment_id: "segment-trailing-bom".to_string(),
+            source_id: "default-mic".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: events::AgentProposalKind::Question,
+            title: "fixture title".to_string(),
+            body,
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal: None,
+        };
+        assert_eq!(
+            agent_signal_grade(&payload),
+            events::SignalGrade::Fragment,
+            "a dangling comma hidden behind a trailing BOM must still grade Fragment"
+        );
+    }
+
+    /// The one production mint site, `run_agent_proposal_task`, must stamp
+    /// the backend signal grade onto BOTH the emitted `AGENT_PROPOSAL`
+    /// payload (what T3's spend gate will read from the pending map) and
+    /// the persisted `LiveAssistCardRecord.signal` (the durable mirror). A
+    /// well-formed question minted here must grade `Strong`, and the card
+    /// must default to `origin: Transcript` (T1's contract for this site).
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn run_agent_proposal_task_stamps_the_backend_signal_grade_on_the_emitted_payload_and_the_persisted_card()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = unique_tempdir("agent-signal-grade-mint");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let app_handle = super::shared_test_app_handle();
+        let expected_session_id = app.current_session_id();
+
+        let segment = TranscriptSegment {
+            id: "signal-grade-segment".to_string(),
+            source_id: "system".to_string(),
+            speaker_id: None,
+            speaker_label: Some("Speaker 1".to_string()),
+            text: "What did the team decide about pricing?".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+
+        let (proposal_tx, proposal_rx) = std::sync::mpsc::channel();
+        let listener = app_handle.listen_any(events::AGENT_PROPOSAL, move |event| {
+            if let Ok(payload) =
+                serde_json::from_str::<events::AgentProposalPayload>(event.payload())
+            {
+                let _ = proposal_tx.send(payload);
+            }
+        });
+
+        let handled = run_agent_proposal_task(
+            segment.clone(),
+            segment.text.clone(),
+            expected_session_id.clone(),
+            "signal-grade-span".to_string(),
+            app_handle.clone(),
+            app.pending_agent_proposals.clone(),
+            app.session_id.clone(),
+            app.transcript_ledger.clone(),
+        );
+        assert!(
+            handled,
+            "a well-formed question must be handled, not discarded as stale"
+        );
+
+        let payload = proposal_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("AGENT_PROPOSAL must have been emitted");
+        assert_eq!(payload.signal, Some(events::SignalGrade::Strong));
+
+        let cards = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&expected_session_id)
+            .expect("load persisted live-assist cards");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].signal, Some(events::SignalGrade::Strong));
+        assert_eq!(cards[0].origin, Some(events::CardOrigin::Transcript));
+        assert_eq!(cards[0].answer, None);
+
+        app_handle.unlisten(listener);
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
     }
