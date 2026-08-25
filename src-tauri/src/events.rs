@@ -579,11 +579,30 @@ pub enum CardAnswerStatus {
 
 /// Typed reason [`crate::commands::evaluate_answer_spend_gate`] refused to
 /// dispatch an answer (audio-graph-83cc, T3). Every variant is renderable —
-/// closed, content-free, and returned to the caller inside
-/// `AnswerDispatch::Refused` (a normal `Ok(...)` outcome, not an `AppError`:
-/// a refusal is an expected, common result of the spend gate, not a
-/// failure) — so the frontend can localize/display exactly why a dispatch
-/// did not happen without ever seeing raw question/answer content.
+/// closed and content-free — and, up to `answer_question_card_impl`'s own
+/// return value, still carried as `AnswerDispatch::Refused` (a normal
+/// `Ok(...)` outcome, not an `AppError`: a refusal is an expected, common
+/// result of the spend gate, not a failure).
+///
+/// Fix-round correction (T3G, scope-honesty review, minor): the above is
+/// true only up to that internal boundary. At the two `#[tauri::command]`
+/// boundaries the landed frontend contract actually crosses
+/// (`answer_question_card`/`ask_question_card`, via
+/// `commands::answer_refusal_message`), `Refused` is flattened into
+/// `Err(AppError::Unknown(<static English string>))` before it ever reaches
+/// the wire — T4's `store/index.ts` has no branch for a "refused but still
+/// `Ok`" response, only a `catch`, so a typed `Ok` here would never render
+/// at all. The localization this doc originally promised does NOT happen at
+/// that boundary: this typed reason survives only as far as
+/// `card_telemetry::log_answer_event`; a renderer only ever sees one of
+/// eight fixed English strings (no frontend code anywhere mirrors this
+/// enum — verified). This is the correct adaptation given the frontend's
+/// closed `AppErrorPayload` union has no arm for a bespoke code, not a
+/// defect this unit is scoped to reverse (doing so would mean adding a new
+/// `AppError` variant AND a matching frontend case, i.e. an FE change,
+/// which is outside this ticket's allowed surface) — recorded here so a
+/// future reader does not rely on this doc's original, now-inaccurate
+/// localization claim.
 ///
 /// Order mirrors the gate's own evaluation order for the auto path
 /// (`enabled → NotQuestion → WeakSignal → Converse → Duplicate → Busy →

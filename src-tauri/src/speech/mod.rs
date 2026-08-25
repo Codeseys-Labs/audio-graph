@@ -1131,7 +1131,17 @@ fn agent_signal_has_dangling_clause_ending(text: &str) -> bool {
 /// `kind == Question`. See `events::SignalGrade` for what each variant
 /// means and the one invariant (`Strong` iff the frontend's `"actionable"`)
 /// the mirrored fixtures in this module's `tests` pin.
-fn agent_signal_grade(payload: &events::AgentProposalPayload) -> events::SignalGrade {
+///
+/// `pub(crate)` (audio-graph-83cc T3G): this function's ONE other production
+/// caller, `commands::mint_user_question_card` (the `ask_question_card` mint
+/// path), stamps the SAME Rust-authoritative grade on a free-form chatbox
+/// question that this module's own `run_agent_proposal_task` stamps on a
+/// transcript-detected one — reusing this exact function rather than a
+/// second Rust copy, which is precisely the drift this function's own
+/// "implemented twice" doc note (on `SignalGrade`, above) already warns is a
+/// cost worth naming, not multiplying. Zero behavior change: the visibility
+/// bump is the entire diff.
+pub(crate) fn agent_signal_grade(payload: &events::AgentProposalPayload) -> events::SignalGrade {
     if payload.kind != events::AgentProposalKind::Question {
         return events::SignalGrade::Strong;
     }

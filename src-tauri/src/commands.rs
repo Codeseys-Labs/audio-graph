@@ -4648,13 +4648,27 @@ pub fn clear_agent_proposals(
 // ---------------------------------------------------------------------------
 // audio-graph-83cc T3: the answer engine.
 //
-// Two commands, `answer_question_card` (auto path) and `ask_question_card`
-// (manual path), both thin `#[tauri::command]` wrappers over one shared
-// `answer_question_card_impl`. Both operate on an EXISTING card id: neither
-// mints a new `LiveAssistCardRecord` — the free-form-question-mints-a-card
-// affordance angle-a describes is explicitly deferred past this unit (zero
-// frontend files, and this unit's whole surface is "answer a card that
-// already exists").
+// Two commands, `answer_question_card` (manual Ask-AI/Retry on an EXISTING
+// card, `auto` caller-supplied — T5's future auto trigger passes `true`) and
+// `ask_question_card` (mint-and-ask: mints a NEW `CardOrigin::User` card
+// from typed text, then answers it via the manual gate, one round trip),
+// both thin `#[tauri::command]` wrappers over one shared
+// `answer_question_card_impl`.
+//
+// audio-graph-83cc-b63a (T3G, this unit): T3 (above) and T4 (the frontend,
+// `store/index.ts`) were landed and individually reviewed against the SAME
+// design synthesis but resolved its command shapes differently — T3 kept
+// both commands scoped to an existing card id with a hardcoded `auto`
+// literal per command, matching the design-panel synthesis's OLDER §2.3
+// sketch; T4 was written against the synthesis's ticket-cut FE contract
+// (`askQuestion`/`answerQuestionCard`, `store/index.ts`), which mints on
+// `ask_question_card` and threads `auto` through `answer_question_card`.
+// This unit conforms the two `#[tauri::command]` signatures below to T4's
+// landed contract — the frontend files are the source of truth and are
+// UNCHANGED by this unit. `answer_question_card_impl` itself (the shared
+// gate/counter/registry/retrieval/ledger/telemetry body immediately below
+// this comment) is untouched: this is a contract-adaptation unit, not an
+// engine rewrite.
 //
 // SECURITY posture (this is a new automatic LLM spend path): question/answer
 // CONTENT may flow into the sanctioned LLM route and into the persisted
@@ -4663,16 +4677,29 @@ pub fn clear_agent_proposals(
 // touches question content is annotated with where that content stops.
 // ---------------------------------------------------------------------------
 
-/// Result of a successful (non-erroring) call to `answer_question_card` /
-/// `ask_question_card`. A REFUSAL is `Ok(Refused { reason })`, not `Err(_)`:
-/// the ordered spend gate refusing to dispatch is an expected, common
-/// outcome (busy / capped / weak signal / …), not a command failure — see
+/// Result of a successful (non-erroring) call to `answer_question_card_impl`.
+/// A REFUSAL is `Ok(Refused { reason })`, not `Err(_)`, at THIS internal
+/// layer: the ordered spend gate refusing to dispatch is an expected, common
+/// outcome (busy / capped / weak signal / …), not an engine failure — see
 /// `events::AnswerRefusalReason`'s doc comment. Genuine failures (bad
 /// `proposal_id`, provider unavailable, privacy-blocked, lock errors) still
 /// return `Err(AppError)` via the existing typed variants.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum AnswerDispatch {
+///
+/// **Not the wire type.** `answer_question_card`/`ask_question_card` (the
+/// two `#[tauri::command]`s below) convert this into their own landed
+/// response shapes (`AnswerQuestionCardDispatch`/`AskQuestionCardDispatch`,
+/// which carry no discriminant — a bare `request_id` on success) and turn
+/// `Refused` into an `Err(AppError::Unknown(..))` at the command boundary
+/// (`answer_refusal_message`) — the frontend (`store/index.ts`'s
+/// `askQuestion`/`answerQuestionCard`) has no branch for a "refused but
+/// still `Ok`" response; it only ever reads `dispatch.request_id` on success
+/// and falls into its existing `catch` (`errorToMessage`) otherwise. This is
+/// audio-graph-83cc-b63a's actual integration gap: T3 modeled a refusal as a
+/// typed `Ok` variant nothing downstream of it could render; T4 never grew a
+/// case for it because the ticket-cut contract it was built against never
+/// surfaced one.
+#[derive(Debug, Clone)]
+enum AnswerDispatch {
     /// The gate passed and a provider call was started. `request_id`
     /// correlates the `channel`'s `Delta`/`Done` frames back to this call,
     /// same contract as `start_streaming_chat`.
@@ -4680,6 +4707,59 @@ pub enum AnswerDispatch {
     /// The gate declined to dispatch. No provider call was made, no
     /// `CardAnswer` was written, and the card is unchanged.
     Refused { reason: events::AnswerRefusalReason },
+}
+
+/// Wire response for `answer_question_card` (manual Ask-AI/Retry on an
+/// EXISTING card). Mirrors the frontend's `AnswerQuestionCardDispatch`
+/// (`store/index.ts`) field-for-field: the card already exists, so only a
+/// `request_id` needs to come back synchronously — the FE keys its transient
+/// `answerDrafts` entry on the proposal id it already has.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnswerQuestionCardDispatch {
+    pub request_id: String,
+}
+
+/// Wire response for `ask_question_card` (mint-and-ask). Mirrors the
+/// frontend's `AskQuestionCardDispatch` (`store/index.ts`) field-for-field:
+/// the newly minted `record` comes back alongside `request_id` so the FE can
+/// `upsertLiveAssistCard(dispatch.record)` and key its streaming draft on
+/// `record.proposal.id` in the SAME round trip, before the first delta frame
+/// arrives (deliverable b: the card is persisted and returned BEFORE
+/// streaming begins).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AskQuestionCardDispatch {
+    pub record: events::LiveAssistCardRecord,
+    pub request_id: String,
+}
+
+/// Render an [`events::AnswerRefusalReason`] as a plain, content-free error
+/// message for a rejected `invoke(...)` (audio-graph-83cc-b63a, T3G). The
+/// frontend's `errorToMessage` (`utils/errorToMessage.ts`) has a generic
+/// fallback for `AppError::Unknown` — `case "unknown": return err.message;`
+/// — and no case at all for a bespoke refusal code, so this reuses that
+/// existing, already-rendered variant rather than adding a new `AppError`
+/// variant the frontend's closed `AppErrorPayload` union has no arm for
+/// (which would render as `undefined` in the UI, not a helpful message).
+/// Every branch is a static string: `AnswerRefusalReason` itself carries no
+/// field, so there is no content-leak surface here to begin with.
+fn answer_refusal_message(reason: events::AnswerRefusalReason) -> String {
+    use events::AnswerRefusalReason as Reason;
+    match reason {
+        Reason::Disabled => "The auto-answer engine is disabled.".to_string(),
+        Reason::NotQuestion => "This card is not a question and cannot be answered.".to_string(),
+        Reason::WeakSignal => {
+            "This question's signal is too weak for an automatic answer.".to_string()
+        }
+        Reason::Duplicate => "This question has already been answered.".to_string(),
+        Reason::Converse => "Converse mode is active; automatic answers are paused.".to_string(),
+        Reason::Busy => {
+            "Another answer is already streaming; please try again shortly.".to_string()
+        }
+        Reason::Interval => {
+            "Please wait a moment before requesting another automatic answer.".to_string()
+        }
+        Reason::Capped => "This session's automatic-answer limit has been reached.".to_string(),
+    }
 }
 
 /// Auto-only content-dedupe check (deliverable c's "not-duplicate" gate
@@ -5874,33 +5954,318 @@ async fn answer_question_card_impl(
     Ok(AnswerDispatch::Dispatched { request_id })
 }
 
-/// Auto path (deliverable a): answer an existing question card automatically.
-/// The FE trigger (`autoAnswerAdmits`, T5) is the *initiator*; this command's
-/// own ordered spend gate is the durable, self-sufficient spend authority
-/// (Q2) — it must refuse on its own even if the caller claims eligibility it
-/// does not have.
+/// Mint-time cap for user-typed question text (fix-round finding,
+/// adversarial review, minor). Before this, `mint_user_question_card` only
+/// rejected EMPTY text — `proposal.body` was otherwise unbounded, unlike
+/// `CardAnswer::cap_text`'s existing cap on the answer side, so a giant
+/// composer paste would persist a multi-megabyte card body (re-read/
+/// re-written on every subsequent card upsert/load) and send an
+/// over-context prompt the provider would typically reject anyway. Refuses
+/// rather than truncates: unlike an answer, silently truncating a QUESTION
+/// would invisibly change what the user asked, which is worse than a clear
+/// refusal before anything is persisted. Reuses
+/// `events::MAX_CARD_ANSWER_TEXT_CHARS`'s value for symmetry with the
+/// answer-side cap rather than inventing an unrelated number.
+const MAX_USER_QUESTION_TEXT_CHARS: usize = events::MAX_CARD_ANSWER_TEXT_CHARS;
+
+/// Build + persist a `CardOrigin::User` live-assist card for a free-form
+/// chatbox question (audio-graph-83cc-b63a, T3G — `ask_question_card`'s mint
+/// half). Mirrors `speech::run_agent_proposal_task`'s production mint site
+/// for everything the design panel synthesis (angle-a §2.1, ratified Q4/Q5)
+/// asks for a user-typed question:
+///
+/// - `kind: Question`, `confidence: 1.0` (a typed question is never a
+///   partial-ASR guess).
+/// - The T2 Rust-authoritative grade, via the SAME `agent_signal_grade`
+///   function the transcript mint site stamps — this is that function's
+///   second production call site, never a duplicated copy of its rules.
+/// - The Q4 narrow validator widening (`persistence::validate_live_assist_card`):
+///   `source_segment_id` anchors to the transcript ledger's newest span
+///   ("asked at this point in the conversation"). `source_span_ids` mirrors
+///   the same single-span anchor, matching the transcript mint site's own
+///   `vec![source_span_id]` shape.
+/// - `graph_context_ids: Vec::new()` at mint, matching the transcript mint
+///   site's own `Vec::new()` — a card's citation is its `source_span_ids`;
+///   the ANSWER's own retrieval (graph top-k, computed later by
+///   `prepare_card_answer_request`) is a separate concern
+///   (`CardAnswer::evidence_graph_ids`), not the card's mint-time citation.
+///
+/// Fix-round correction (blocker, scope-honesty review): this doc used to
+/// claim the empty-ledger case is "left empty, permitted by Q4" — that is
+/// NOT actually reachable. `persistence::validate_live_assist_card` has a
+/// SECOND, untouched citation invariant (`source_span_ids` OR
+/// `graph_context_ids` non-empty) that still rejects a card citing neither;
+/// Q4 only relaxed `source_segment_id`'s own non-emptiness, never that joint
+/// check, and `graph_context_ids` is unconditionally empty at mint (above).
+/// So a question typed before the session's first transcript span always
+/// failed validation — surfacing the validator's raw internal prose
+/// ("...must cite transcript spans or graph context") verbatim in the
+/// composer. WIDENING the joint invariant (or deciding what a
+/// pre-transcript question legitimately cites) is a `persistence/mod.rs`
+/// change plus a product decision, outside this ticket's allowed file set —
+/// filed as a follow-up rather than silently patched around. What THIS fix
+/// round closes, in scope: fail fast, below, with a clear static message
+/// before ever calling `upsert_live_assist_card`, instead of leaking the
+/// validator's prose through `AppError::Unknown`.
+/// - Q5 (ratified: a query about the meeting is not meeting content): no
+///   graph write happens here — that is `add_question_to_graph`'s job for
+///   transcript-detected questions only, and this function never calls it.
+/// - `card_telemetry::log_card_event(.., CardLifecycleEvent::Created { .. })`
+///   fires exactly once, content-free, same as the one production
+///   transcript-mint site — a User-origin card is observable the same way a
+///   transcript-minted one is (deliverable b).
+///
+/// Named, accepted race (documented rather than fixed — fixing it would mean
+/// widening `state.session_lifecycle`'s critical section to cover this mint,
+/// which is `answer_question_card_impl`'s own lock and is not reentrant): if
+/// a session rotation lands between this call returning and
+/// `answer_question_card_impl` re-reading `state.current_session_id()`, the
+/// freshly-minted card is durably persisted under the OLD session but looked
+/// up under the NEW one, so the round trip errors out with "does not exist"
+/// rather than silently double-minting or double-spending — no gate,
+/// counter, or registry state is touched by this function, so this race has
+/// no spend-boundary consequence, only a rare, narrow UX one (session
+/// rotation racing a chatbox send).
+fn mint_user_question_card(
+    state: &AppState,
+    text: &str,
+) -> AppResult<events::LiveAssistCardRecord> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Unknown("Question text is required".to_string()));
+    }
+    if trimmed.chars().count() > MAX_USER_QUESTION_TEXT_CHARS {
+        return Err(AppError::Unknown(format!(
+            "Question text is too long (max {MAX_USER_QUESTION_TEXT_CHARS} characters)."
+        )));
+    }
+
+    let session_id = state.current_session_id();
+    let ledger = state
+        .projection_runtime_handle()
+        .transcript_ledger_snapshot();
+    // Fix-round fix (blocker, scope-honesty review): fail fast, with a
+    // clear static message, when there is no span to cite — see this
+    // function's doc comment above for why the alternative (minting anyway)
+    // always failed validation downstream with leaked internal prose.
+    let Some(newest_span_id) = ledger
+        .latest_spans
+        .last()
+        .map(|event| event.span_id.clone())
+    else {
+        return Err(AppError::Unknown(
+            "Ask a question once the conversation has started — there's no \
+             transcript yet for this question to reference."
+                .to_string(),
+        ));
+    };
+
+    let now_ms = unix_millis();
+    let mut proposal = events::AgentProposalPayload {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_segment_id: newest_span_id.clone(),
+        source_id: "user".to_string(),
+        speaker_label: None,
+        kind: events::AgentProposalKind::Question,
+        title: "Question from you".to_string(),
+        body: trimmed.to_string(),
+        confidence: 1.0,
+        created_at_ms: now_ms,
+        signal: None,
+    };
+    proposal.signal = Some(crate::speech::agent_signal_grade(&proposal));
+
+    let card = events::LiveAssistCardRecord {
+        session_id: session_id.clone(),
+        proposal: proposal.clone(),
+        status: events::LiveAssistCardStatus::Pending,
+        source_span_ids: vec![newest_span_id],
+        graph_context_ids: Vec::new(),
+        outcome: None,
+        projection_patch_sequence: None,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        origin: Some(events::CardOrigin::User),
+        answer: None,
+        signal: proposal.signal,
+    };
+
+    FileMemoryRepository::user_data().upsert_live_assist_card(&session_id, &card)?;
+
+    // audio-graph-81a5-style card creation telemetry (deliverable b): same
+    // best-effort re-read-for-count pattern as `run_agent_proposal_task`'s
+    // one production transcript-mint site.
+    let session_running_count = FileMemoryRepository::user_data()
+        .load_live_assist_cards(&session_id)
+        .map(|cards| cards.len() as u64)
+        .unwrap_or(0);
+    crate::card_telemetry::log_card_event(
+        &session_id,
+        &proposal.id,
+        &proposal.kind,
+        proposal.confidence,
+        proposal.signal,
+        crate::card_telemetry::CardLifecycleEvent::Created {
+            session_running_count,
+        },
+    );
+
+    Ok(card)
+}
+
+/// Best-effort compensating delete for a card `mint_user_question_card` just
+/// persisted, when the SAME round trip's dispatch attempt (the gate, a
+/// provider/privacy check, or retrieval) subsequently refuses or errors
+/// (fix-round finding, adversarial review, major: "every post-mint refusal
+/// or error orphans a persisted User card"). Before this, a mint-and-ask
+/// that failed AFTER minting — Disabled, Busy, a privacy-policy block, a
+/// provider-availability error, anything `dispatch_ask_question_card` below
+/// can return `Err` for — left a durable, `Pending`, answer-less card in the
+/// session's CURRENT live-assist store that the frontend never learned about
+/// in this round trip; it would only resurface on the NEXT `load_session`
+/// (`loaded.live_assist_cards`), rendered as an orphaned read-only row. A
+/// retry while the same condition holds (e.g. busy) would mint another,
+/// growing unboundedly.
+///
+/// Removes the card from the CURRENT store ONLY — the append-only audit log
+/// (`live_assist_audit_path`) is deliberately left untouched, same posture
+/// as this codebase's other audit/ledger trails: a "created, then abandoned"
+/// pair of rows is an honest record, not a defect, and audit logs in this
+/// crate are never rehydrated into live UI state the way the current store
+/// is (`load_session` reads `load_live_assist_cards`, never the audit log).
+///
+/// Uses ONLY pre-existing, already-`pub`/`pub(crate)` primitives
+/// (`user_data::resolve_live_assist_current_path`, `persistence::save_json`,
+/// the trait's own `load_live_assist_cards`) — no new persistence surface,
+/// zero edits to `persistence/mod.rs`. Best-effort: a failure to read/write
+/// here is swallowed (`let _ =` / early `return`) rather than shadowing the
+/// REAL error this round trip is already returning to the caller; only ids
+/// cross this function, nothing content-bearing.
+fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
+    let Ok(path) = crate::user_data::resolve_live_assist_current_path(session_id) else {
+        return;
+    };
+    let Ok(mut cards) = FileMemoryRepository::user_data().load_live_assist_cards(session_id) else {
+        return;
+    };
+    let before = cards.len();
+    cards.retain(|card| card.proposal.id != proposal_id);
+    if cards.len() != before {
+        let _ = crate::persistence::save_json(&cards, &path);
+    }
+}
+
+/// Manual path (deliverable a, T4's landed contract): a user-initiated
+/// "Ask AI" or "Retry" on an EXISTING question card (including a fragment
+/// the auto path refused — P4). `auto` is caller-supplied — the frontend
+/// sends `false` for every call site that exists today (T4's manual Ask-AI/
+/// Retry); `true` is T5's future auto-answer trigger, reusing this same
+/// command rather than a separate one. Passing `auto` straight through to
+/// `answer_question_card_impl` unchanged is exactly what keeps the gate
+/// self-sufficient (Q2): a caller claiming `auto: true` gets the FULL
+/// ordered auto gate (Rust-stamped `Strong` signal, converse exclusion,
+/// duplicate check, interval, session cap) with no way to short-circuit it
+/// by construction — there is no other code path into the engine.
+///
+/// `question` is renderer-supplied and never used for anything: the engine
+/// derives its own question text from the durable card's `proposal.body`
+/// (`question_text_from_body`, inside `answer_question_card_impl`) — the
+/// only trustworthy source. Accepted purely for wire-contract parity with
+/// the frontend (`answerQuestionCard`, `store/index.ts`, which always sends
+/// the question it already derived from the same proposal); never read,
+/// never logged, and therefore never a spend-widening input.
+///
+/// Fix-round extraction (adversarial review, minor: "neither
+/// `#[tauri::command]` wrapper is ever executed by a test"). `tauri::State`
+/// has no public constructor outside the framework's own IPC/invoke
+/// plumbing (verified against the vendored `tauri-2.11.5` source: its tuple
+/// field is private and the crate exposes no `From<&T>`/`new`), so a unit
+/// test cannot call the `#[tauri::command]`-annotated function below
+/// directly without standing up a full mock webview + IPC round trip
+/// (disproportionate for this ticket's scope, and fragile for a
+/// `Channel<ChatStreamEvent>` argument's wire encoding). Pulling the actual
+/// logic out into this plain `&AppState`-taking function means a test CAN
+/// call it directly — the annotated wrapper below is then a one-line
+/// delegation, correct by inspection.
+async fn dispatch_answer_question_card(
+    proposal_id: String,
+    question: String,
+    auto: bool,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<AnswerQuestionCardDispatch> {
+    let _ = &question;
+    match answer_question_card_impl(proposal_id, auto, channel, app, state).await? {
+        AnswerDispatch::Dispatched { request_id } => Ok(AnswerQuestionCardDispatch { request_id }),
+        AnswerDispatch::Refused { reason } => {
+            Err(AppError::Unknown(answer_refusal_message(reason)))
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn answer_question_card(
     proposal_id: String,
+    question: String,
+    auto: bool,
     channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> AppResult<AnswerDispatch> {
-    answer_question_card_impl(proposal_id, true, channel, app, state.inner()).await
+) -> AppResult<AnswerQuestionCardDispatch> {
+    dispatch_answer_question_card(proposal_id, question, auto, channel, app, state.inner()).await
 }
 
-/// Manual path (deliverable a): a user-initiated "Ask AI" on an existing
-/// question card (including a fragment the auto path refused — P4). Skips
-/// the grade/duplicate/interval/cap steps of the spend gate but keeps the
-/// enabled/kind/stream checks (deliverable c).
+/// Mint-and-ask (deliverable a/b, T4's landed contract): mint a
+/// `CardOrigin::User` question card from free-form chatbox text
+/// (`mint_user_question_card`), then answer it in the SAME round trip via
+/// the manual gate — `auto` is hardcoded `false` here, never caller-
+/// supplied, because a mint-and-ask is definitionally a manual ask (the
+/// ledger action id this buys, `assist_manual_answer`, is deliverable c's
+/// "mint-and-ask + manual retry = assist_manual_answer" rule). The minted
+/// `record` is returned alongside `request_id` so the frontend can render
+/// the card immediately, before the first streamed delta arrives.
+///
+/// Fix-round addition (major, adversarial review): on EITHER failure arm —
+/// a gate `Refused` or any other `Err` from `answer_question_card_impl`
+/// (privacy policy, provider availability, retrieval) — the just-minted
+/// card is removed from the current store via `delete_orphaned_mint` before
+/// the error is returned, so a failed mint-and-ask never leaves a durable
+/// orphan behind. See `dispatch_answer_question_card`'s doc comment above
+/// for why this logic lives in a plain function rather than in the
+/// `#[tauri::command]`-annotated wrapper itself.
+async fn dispatch_ask_question_card(
+    text: String,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<AskQuestionCardDispatch> {
+    let record = mint_user_question_card(state, &text)?;
+    let proposal_id = record.proposal.id.clone();
+    let session_id = record.session_id.clone();
+    match answer_question_card_impl(proposal_id, false, channel, app, state).await {
+        Ok(AnswerDispatch::Dispatched { request_id }) => {
+            Ok(AskQuestionCardDispatch { record, request_id })
+        }
+        Ok(AnswerDispatch::Refused { reason }) => {
+            delete_orphaned_mint(&session_id, &record.proposal.id);
+            Err(AppError::Unknown(answer_refusal_message(reason)))
+        }
+        Err(err) => {
+            delete_orphaned_mint(&session_id, &record.proposal.id);
+            Err(err)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn ask_question_card(
-    proposal_id: String,
+    text: String,
     channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> AppResult<AnswerDispatch> {
-    answer_question_card_impl(proposal_id, false, channel, app, state.inner()).await
+) -> AppResult<AskQuestionCardDispatch> {
+    dispatch_ask_question_card(text, channel, app, state.inner()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -23284,9 +23649,9 @@ mod tests {
             .find("async fn answer_question_card_impl(")
             .expect("answer_question_card_impl must exist");
         let end = source[start..]
-            .find("/// Auto path (deliverable a)")
+            .find("fn mint_user_question_card(")
             .map(|rel| start + rel)
-            .expect("answer_question_card must follow answer_question_card_impl");
+            .expect("mint_user_question_card must follow answer_question_card_impl");
         let body = &source[start..end];
 
         let policy_pos = body
@@ -23318,9 +23683,9 @@ mod tests {
             .find("async fn answer_question_card_impl(")
             .expect("answer_question_card_impl must exist");
         let end = source[start..]
-            .find("/// Auto path (deliverable a)")
+            .find("fn mint_user_question_card(")
             .map(|rel| start + rel)
-            .expect("answer_question_card must follow answer_question_card_impl");
+            .expect("mint_user_question_card must follow answer_question_card_impl");
         let body = &source[start..end];
 
         let gate_return_pos = body
@@ -23361,9 +23726,9 @@ mod tests {
             .find("async fn answer_question_card_impl(")
             .expect("answer_question_card_impl must exist");
         let end = source[start..]
-            .find("/// Auto path (deliverable a)")
+            .find("fn mint_user_question_card(")
             .map(|rel| start + rel)
-            .expect("answer_question_card must follow answer_question_card_impl");
+            .expect("mint_user_question_card must follow answer_question_card_impl");
         let body = &source[start..end];
         assert!(
             body.contains("effective_speak_aloud_for_dispatch(auto, settings.speak_aloud)"),
@@ -23374,47 +23739,991 @@ mod tests {
     }
 
     #[test]
-    fn answer_question_card_and_ask_question_card_pass_the_correct_auto_boolean() {
-        // Fix-round finding (scope-honesty review, major): the ONLY thing
-        // distinguishing the auto path from the manual path at the very top
-        // of the call chain is a single boolean literal at each of these
-        // two `#[tauri::command]` wrappers — nothing previously pinned
-        // which literal goes where. A single-character mutation swapping
-        // either wrapper's boolean (e.g. `answer_question_card` delegating
-        // with `false`) silently drops WeakSignal/Converse/Duplicate/
-        // Interval/Capped for what the frontend believes is the auto path
-        // — uncapping automatic spend — and the full suite still passed:
-        // the gate tests call `evaluate_answer_spend_gate` with an explicit
-        // `auto` argument of their own choosing, and every source-order pin
-        // above scans only `answer_question_card_impl`'s body, never the
-        // two thin wrapper bodies.
+    fn answer_question_card_passes_the_callers_auto_flag_through_unchanged() {
+        // audio-graph-83cc-b63a (T3G) rewrite of the pre-T3G pin (which
+        // asserted a HARDCODED `true` literal here — that was T3's
+        // pre-integration shape; the landed frontend contract instead sends
+        // `auto` as a real argument, `false` for every call site that exists
+        // today (T4's manual Ask-AI/Retry) and reserving `true` for T5's
+        // future auto-answer trigger). The security invariant this pin
+        // exists to hold is unchanged from the pre-T3G version: nothing in
+        // this wrapper may override, coerce, or ignore the caller's `auto`
+        // value — a plant-and-revert probe hardcoding either literal here
+        // would silently drop the full ordered auto gate (WeakSignal/
+        // Converse/Duplicate/Interval/Capped) for what the frontend believes
+        // is the auto path, uncapping automatic spend.
         let source = include_str!("commands.rs");
 
-        let auto_start = source
+        // Fix-round rewrite (adversarial review, minor: "neither wrapper is
+        // ever executed by a test"): the actual dispatch logic now lives in
+        // `dispatch_answer_question_card` (a plain `&AppState`-taking
+        // function other new tests below call directly), with
+        // `answer_question_card` reduced to a one-line delegation — this pin
+        // follows the logic to where it actually lives.
+        let start = source
+            .find("async fn dispatch_answer_question_card(")
+            .expect("dispatch_answer_question_card must exist");
+        let end = source[start..]
+            .find("pub async fn answer_question_card(")
+            .map(|rel| start + rel)
+            .expect("answer_question_card must follow dispatch_answer_question_card");
+        let body = &source[start..end];
+        assert!(
+            body.contains(
+                "answer_question_card_impl(proposal_id, auto, channel, app, state).await?"
+            ),
+            "dispatch_answer_question_card must pass the caller-supplied `auto` \
+             straight through, never a hardcoded literal"
+        );
+        assert!(
+            !body.contains("answer_question_card_impl(proposal_id, true"),
+            "dispatch_answer_question_card must not hardcode auto=true"
+        );
+        assert!(
+            !body.contains("answer_question_card_impl(proposal_id, false"),
+            "dispatch_answer_question_card must not hardcode auto=false"
+        );
+    }
+
+    #[test]
+    fn ask_question_card_mints_then_dispatches_with_auto_hardcoded_false() {
+        // A mint-and-ask is definitionally a manual ask (deliverable c: the
+        // ledger action id it buys is `assist_manual_answer`, never
+        // `assist_auto_answer`) — `ask_question_card` must mint via
+        // `mint_user_question_card` and then delegate to
+        // `answer_question_card_impl` with a HARDCODED `false`, never the
+        // caller's own input (there is no caller-supplied `auto` in this
+        // command's signature at all — `text` only). Fix-round rewrite: the
+        // actual logic now lives in `dispatch_ask_question_card` — see
+        // `answer_question_card_passes_the_callers_auto_flag_through_unchanged`'s
+        // comment for why.
+        let source = include_str!("commands.rs");
+
+        let start = source
+            .find("async fn dispatch_ask_question_card(")
+            .expect("dispatch_ask_question_card must exist");
+        let end = source[start..]
+            .find("pub async fn ask_question_card(")
+            .map(|rel| start + rel)
+            .expect("ask_question_card must follow dispatch_ask_question_card");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("mint_user_question_card(state, &text)?"),
+            "dispatch_ask_question_card must mint the User-origin card via mint_user_question_card"
+        );
+        assert!(
+            body.contains(
+                "answer_question_card_impl(proposal_id, false, channel, app, state).await"
+            ),
+            "dispatch_ask_question_card must delegate to the shared engine with auto hardcoded false"
+        );
+        assert!(
+            !body.contains("answer_question_card_impl(proposal_id, true"),
+            "dispatch_ask_question_card must not hardcode auto=true"
+        );
+        // Fix-round finding (major, adversarial review): a failed mint-and-
+        // ask must not orphan the just-minted card — both failure arms
+        // (Refused and any other Err) must clean it up.
+        assert_eq!(
+            body.matches("delete_orphaned_mint(").count(),
+            2,
+            "dispatch_ask_question_card must clean up the mint on BOTH the \
+             Refused arm and the Err arm, not just one"
+        );
+    }
+
+    #[test]
+    fn answer_question_card_never_uses_the_callers_question_argument_as_the_dispatch_text() {
+        // Deliverable (a)'s "validate it is consistent with the card if you
+        // use it, or ignore it — never trust it as a spend-widening input
+        // and never log it" — this unit chose "ignore it" outright. Source
+        // pin: the ONLY reference to the `question` parameter inside
+        // `dispatch_answer_question_card`'s body is the explicit
+        // unused-but-accepted marker; it is never threaded into
+        // `question_text_from_body`, `prepare_card_answer_request`, or any
+        // `log::`/telemetry call.
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("async fn dispatch_answer_question_card(")
+            .expect("dispatch_answer_question_card must exist");
+        let end = source[start..]
+            .find("pub async fn answer_question_card(")
+            .map(|rel| start + rel)
+            .expect("answer_question_card must follow dispatch_answer_question_card");
+        let body = &source[start..end];
+
+        // Word-boundary match (not a plain substring search): the function
+        // name/return type embed "question"/"Question" inside longer
+        // identifiers (`answer_question_card_impl`, `AnswerQuestionCardDispatch`)
+        // with no boundary around the lowercase substring, so those don't
+        // count here — only the standalone `question` IDENTIFIER can match.
+        let standalone = regex::Regex::new(r"\bquestion\b").expect("valid regex");
+        let occurrences = standalone.find_iter(body).count();
+        assert_eq!(
+            occurrences, 2,
+            "the standalone `question` identifier must appear exactly twice in \
+             this command's body — its own parameter declaration and the \
+             explicit `let _ = &question;` marker — and nowhere else; got body: {body}"
+        );
+        assert!(body.contains("let _ = &question;"));
+    }
+
+    /// Mirrors `tauri-macros`' own default argument-renaming rule verbatim
+    /// (verified against that crate's source, `tauri-macros-2.6.3/src/
+    /// command/wrapper.rs`: `WrapperAttributes::argument_case` defaults to
+    /// `ArgumentCase::Camel`, applied via `key.to_lower_camel_case()`, and
+    /// neither command below overrides it with a `#[tauri::command(rename_all
+    /// = "snake_case")]`) — a minimal, dependency-free re-implementation
+    /// (this crate does not depend on `heck` directly) of the SAME
+    /// ASCII-snake-case-to-lowerCamelCase algorithm, so this test does not
+    /// need that crate to pin the wire shape.
+    fn ascii_snake_to_lower_camel(s: &str) -> String {
+        let mut out = String::new();
+        for (i, part) in s.split('_').filter(|p| !p.is_empty()).enumerate() {
+            if i == 0 {
+                out.push_str(part);
+                continue;
+            }
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+            }
+            out.push_str(chars.as_str());
+        }
+        out
+    }
+
+    /// Deliverable (d), the argument-shape half: proves the Rust parameter
+    /// NAMES on both commands camelCase to the EXACT keys the landed
+    /// frontend sends (`store/index.ts`: `invoke(ASK_QUESTION_CARD_COMMAND,
+    /// { text, channel })` / `invoke(ANSWER_QUESTION_CARD_COMMAND, {
+    /// proposalId, question, auto, channel })`), given Tauri's own default
+    /// camelCase argument-renaming rule (pinned by
+    /// `ascii_snake_to_lower_camel`'s doc comment above). A rename of any
+    /// parameter here (e.g. `proposal_id` -> `card_id`) changes the wire key
+    /// Tauri looks for and desyncs from the frontend's literal object keys —
+    /// this test fails the moment that happens, without needing a full
+    /// webview/IPC round trip.
+    #[test]
+    fn command_argument_names_camel_case_to_the_exact_keys_the_frontend_sends() {
+        for (rust_name, frontend_key) in [
+            ("proposal_id", "proposalId"),
+            ("question", "question"),
+            ("auto", "auto"),
+            ("channel", "channel"),
+            ("text", "text"),
+        ] {
+            assert_eq!(
+                ascii_snake_to_lower_camel(rust_name),
+                frontend_key,
+                "Rust parameter `{rust_name}` must camelCase to the frontend's \
+                 literal object key `{frontend_key}`"
+            );
+        }
+
+        // Presence pin: the exact parameter names above must be the actual
+        // parameter list of each command (not merely believed to be).
+        //
+        // Fix-round fix (minor, scope-honesty review): the old version
+        // sliced a FIXED byte window (`start..start + 300/400`) rather than
+        // the actual parameter list, so the negative assertion below
+        // (`!ask_params.contains("proposal_id")`) passed only because the
+        // window happened to cut off six bytes before `ask_question_card`'s
+        // own `let proposal_id = ...` local binding — any reformatting or a
+        // longer identifier would have flipped it. Slicing to the `) ->`
+        // that actually closes each parameter list removes the magic
+        // number.
+        let source = include_str!("commands.rs");
+        let answer_start = source
             .find("pub async fn answer_question_card(")
             .expect("answer_question_card must exist");
-        let auto_end = source[auto_start..]
-            .find("/// Manual path (deliverable a)")
-            .map(|rel| auto_start + rel)
-            .expect("ask_question_card must follow answer_question_card");
-        let auto_body = &source[auto_start..auto_end];
+        let answer_header_end = source[answer_start..]
+            .find(") -> AppResult<AnswerQuestionCardDispatch>")
+            .map(|rel| answer_start + rel)
+            .expect("answer_question_card must return AppResult<AnswerQuestionCardDispatch>");
+        let answer_params = &source[answer_start..answer_header_end];
+        for name in ["proposal_id: String", "question: String", "auto: bool"] {
+            assert!(
+                answer_params.contains(name),
+                "answer_question_card must declare parameter `{name}`"
+            );
+        }
+
+        let ask_start = source
+            .find("pub async fn ask_question_card(")
+            .expect("ask_question_card must exist");
+        let ask_header_end = source[ask_start..]
+            .find(") -> AppResult<AskQuestionCardDispatch>")
+            .map(|rel| ask_start + rel)
+            .expect("ask_question_card must return AppResult<AskQuestionCardDispatch>");
+        let ask_params = &source[ask_start..ask_header_end];
         assert!(
-            auto_body.contains(
-                "answer_question_card_impl(proposal_id, true, channel, app, state.inner()).await"
-            ),
-            "answer_question_card (the auto command) must delegate with auto=true"
+            ask_params.contains("text: String"),
+            "ask_question_card must declare parameter `text: String`"
+        );
+        assert!(
+            !ask_params.contains("proposal_id"),
+            "ask_question_card must NOT take a proposal_id — it mints a new card from `text`"
         );
 
-        let manual_end = source[auto_end..]
-            .find("// Model management commands")
-            .map(|rel| auto_end + rel)
-            .expect("the model-management section must follow ask_question_card");
-        let manual_body = &source[auto_end..manual_end];
+        // Fix-round addition (minor, scope-honesty review): the camelCase
+        // re-implementation above only holds if neither command overrides
+        // Tauri's default `ArgumentCase::Camel` — assert the bare
+        // `#[tauri::command]` attribute (no `rename_all`) actually precedes
+        // each signature, rather than merely asserting it in a doc comment.
+        for (name, marker) in [
+            ("answer_question_card", "pub async fn answer_question_card("),
+            ("ask_question_card", "pub async fn ask_question_card("),
+        ] {
+            let idx = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let preceding = source[..idx].trim_end();
+            assert!(
+                preceding.ends_with("#[tauri::command]"),
+                "{name} must carry a bare `#[tauri::command]` with no \
+                 `rename_all` override immediately before its signature — \
+                 a rename_all=\"snake_case\" override would silently break \
+                 the camelCase wire mapping this test otherwise pins; got \
+                 tail: {:?}",
+                &preceding[preceding.len().saturating_sub(60)..]
+            );
+        }
+    }
+
+    /// Deliverable (d), the response-shape half: serializes each landed
+    /// response type and asserts the EXACT field-name set the TS types
+    /// declare (`AnswerQuestionCardDispatch { request_id }` /
+    /// `AskQuestionCardDispatch { record, request_id }`, `src/types/
+    /// index.ts` mirror in `store/index.ts`'s local interfaces) — not a
+    /// source-text scan, an actual `serde_json` round trip, so a `#[serde]`
+    /// attribute added later (e.g. a stray `rename_all = "camelCase"`) would
+    /// fail this test even though the Rust field names never changed.
+    #[test]
+    fn response_shapes_serialize_with_the_exact_field_names_the_frontend_expects() {
+        let answer_dispatch = AnswerQuestionCardDispatch {
+            request_id: "req-1".to_string(),
+        };
+        let value = serde_json::to_value(&answer_dispatch).expect("serialize");
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["request_id"]),
+            "AnswerQuestionCardDispatch must serialize with exactly {{ request_id }}"
+        );
+        assert_eq!(value["request_id"], serde_json::json!("req-1"));
+
+        let card = answer_engine_test_card(
+            "card-shape-probe",
+            "session-shape-probe",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        let ask_dispatch = AskQuestionCardDispatch {
+            record: card,
+            request_id: "req-2".to_string(),
+        };
+        let value = serde_json::to_value(&ask_dispatch).expect("serialize");
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["record", "request_id"]),
+            "AskQuestionCardDispatch must serialize with exactly {{ record, request_id }}"
+        );
+        assert_eq!(value["request_id"], serde_json::json!("req-2"));
         assert!(
-            manual_body.contains(
-                "answer_question_card_impl(proposal_id, false, channel, app, state.inner()).await"
-            ),
-            "ask_question_card (the manual command) must delegate with auto=false"
+            value["record"].is_object(),
+            "record must serialize as an object"
+        );
+        assert_eq!(
+            value["record"]["proposal"]["id"],
+            serde_json::json!("card-shape-probe")
+        );
+    }
+
+    /// Fix-round addition (minor, scope-honesty review): `answer_refusal_message`
+    /// is the ONE place a refusal reason turns into user-facing text, and
+    /// nothing pinned it before this — a mutation widening it to interpolate
+    /// card/question content (`format!("... {}", card.proposal.body)`) would
+    /// pass the whole suite plus clippy. A source-text scan for `format!`
+    /// closes that: every arm today is a static `&str` literal + `.to_string()`,
+    /// so introducing ANY interpolation trips this test regardless of what
+    /// gets interpolated. Paired with an executable half proving every
+    /// variant renders a non-empty string today.
+    #[test]
+    fn answer_refusal_message_uses_only_static_literals_never_format_interpolation() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn answer_refusal_message(")
+            .expect("answer_refusal_message must exist");
+        let end = source[start..]
+            .find("fn is_duplicate_answered_question(")
+            .map(|rel| start + rel)
+            .expect("is_duplicate_answered_question must follow answer_refusal_message");
+        let body = &source[start..end];
+        assert!(
+            !body.contains("format!"),
+            "answer_refusal_message must return only static string literals — \
+             a `format!` call here is exactly the shape that could interpolate \
+             card/question content into a user-facing error string; got body: {body}"
+        );
+
+        use events::AnswerRefusalReason as Reason;
+        for reason in [
+            Reason::Disabled,
+            Reason::NotQuestion,
+            Reason::WeakSignal,
+            Reason::Duplicate,
+            Reason::Converse,
+            Reason::Busy,
+            Reason::Interval,
+            Reason::Capped,
+        ] {
+            assert!(
+                !answer_refusal_message(reason).trim().is_empty(),
+                "{reason:?} must render a non-empty message"
+            );
+        }
+    }
+
+    /// Fix-round addition (minor, scope-honesty review): deliverable (b)'s
+    /// "card_telemetry creation line fires" was verified only structurally
+    /// (the e2e test below exercises the code path but never asserted the
+    /// telemetry call site itself), so deleting it outright would leave the
+    /// whole suite green. Source-text presence pin, same idiom this module
+    /// already uses elsewhere for a content-free log call with no capture
+    /// harness (`log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`).
+    #[test]
+    fn mint_user_question_card_emits_the_created_telemetry_line() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn mint_user_question_card(")
+            .expect("mint_user_question_card must exist");
+        let end = source[start..]
+            .find("/// Best-effort compensating delete")
+            .map(|rel| start + rel)
+            .expect("delete_orphaned_mint's doc must follow mint_user_question_card");
+        let body = &source[start..end];
+        assert!(
+            body.contains("crate::card_telemetry::log_card_event("),
+            "mint_user_question_card must fire a card_telemetry line"
+        );
+        assert!(
+            body.contains("CardLifecycleEvent::Created {"),
+            "mint_user_question_card's telemetry line must be Created — a \
+             User-origin card must be observable the same way a \
+             transcript-minted one is"
+        );
+    }
+
+    // =======================================================================
+    // audio-graph-83cc-b63a (T3G): end-to-end impl coverage. Everything
+    // above this point pins the ordered gate and source-shape via unit tests
+    // and source-order scans (the pre-existing "Channel-construction gap"
+    // this module's own comments name). `tauri::ipc::Channel::new` takes a
+    // plain closure — no real `AppHandle`/webview needed — so a REAL round
+    // trip through `mint_user_question_card` +
+    // `answer_question_card_impl` (mock HTTP server standing in for the LLM
+    // provider, same pattern `llm::streaming::tests::spawn_sse_mock` already
+    // uses) is possible after all; these two tests exercise it.
+    // =======================================================================
+
+    /// A no-op sink for a `ChatStreamEvent` channel — the test only needs
+    /// the CALL to succeed and the background task to run; frame content is
+    /// asserted by re-reading the persisted card instead of by inspecting
+    /// what this channel receives.
+    fn noop_answer_channel() -> tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent> {
+        tauri::ipc::Channel::new(|_body| Ok(()))
+    }
+
+    /// Tiny single-shot SSE mock, local to this module's tests (mirrors
+    /// `llm::streaming::tests::spawn_sse_mock`, which is private to that
+    /// module and therefore not reusable here). Reads and discards the
+    /// request, then streams back `body` as `text/event-stream`.
+    async fn spawn_answer_engine_sse_mock(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if total.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Points `state.app_settings.llm_provider` at a loopback mock endpoint
+    /// (so `requires_cloud_content_transfer()` is `false` and no privacy
+    /// gate is even in play) and leaves everything else at its default
+    /// (`speak_aloud: false`, `agent_auto_answer` ON with the ratified
+    /// defaults).
+    fn point_state_at_mock_llm_provider(state: &AppState, endpoint: String) {
+        let mut settings = state
+            .app_settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        settings.llm_provider = crate::settings::LlmProvider::Api {
+            endpoint,
+            api_key: "sk-test".to_string(),
+            model: "test-model".to_string(),
+        };
+    }
+
+    /// Pre-warm `state.api_client` on a PLAIN std thread, before any async
+    /// dispatch runs. `reqwest::blocking::Client` (which `ApiClient` wraps)
+    /// asserts, in debug builds, that it is never constructed from within an
+    /// active tokio context (`reqwest::blocking::wait::enter`'s debug-only
+    /// shell-runtime probe) — exactly the context `answer_question_card_impl`
+    /// runs in here, inside `rt.block_on(async { .. })` (this crate's callers
+    /// are plain `#[test]` functions, not `#[tokio::test]`, specifically so
+    /// `TEST_HOME_LOCK`'s guard can be held across the whole call without
+    /// tripping `clippy::await_holding_lock` — see the two call sites'
+    /// comments — but `block_on` itself still counts as "an active tokio
+    /// context" for this hazard). `prepare_card_answer_request`
+    /// unconditionally calls `sync_llm_api_client_from_settings_cache`
+    /// (pre-existing T3 code, unchanged here), but that function only
+    /// constructs a NEW `ApiClient` when the cached one's config/policy is
+    /// stale (`already_current`, `commands.rs`) — so constructing the
+    /// identical config+policy here, off-thread, first, makes the later
+    /// in-flight call a same-config no-op. This is a TEST-ONLY workaround
+    /// for a pre-existing reqwest/tokio interaction; it changes no
+    /// production code path.
+    fn prewarm_api_client_off_the_async_context(state: &AppState) {
+        let settings = state
+            .app_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(config) = api_config_from_runtime_settings(&settings) else {
+            return;
+        };
+        let policy = provider_content_egress_policy_from_settings(
+            &settings,
+            settings.llm_provider.requires_cloud_content_transfer(),
+        );
+        let client =
+            std::thread::spawn(move || ApiClient::new(config).with_content_egress_policy(policy))
+                .join()
+                .expect("construct ApiClient on a plain thread");
+        *state.api_client.lock().unwrap_or_else(|e| e.into_inner()) = Some(client);
+    }
+
+    /// Poll the durable card store until `proposal_id`'s card carries an
+    /// `answer` (the background `spawn_card_answer_stream_task` task
+    /// finalizes asynchronously — `answer_question_card_impl` itself returns
+    /// as soon as the stream is DISPATCHED, not once it completes).
+    async fn wait_for_answered_card(
+        session_id: &str,
+        proposal_id: &str,
+    ) -> events::LiveAssistCardRecord {
+        for _ in 0..500 {
+            let cards = FileMemoryRepository::user_data()
+                .load_live_assist_cards(session_id)
+                .expect("load cards");
+            if let Some(card) = cards.into_iter().find(|c| c.proposal.id == proposal_id)
+                && card.answer.is_some()
+            {
+                return card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("card {proposal_id} did not receive an answer within the test timeout");
+    }
+
+    /// `ApiClient` (`llm::api_client`) wraps a `reqwest::blocking::Client`,
+    /// which owns its own internal tokio `Runtime` — dropping it from within
+    /// an ALREADY-running tokio runtime (e.g. from inside `rt.block_on(async
+    /// { .. })`) panics ("Cannot drop a runtime in a context where blocking
+    /// is not allowed"). This helper is called from the PLAIN, non-async
+    /// call frame that surrounds `block_on` at each of its two call sites
+    /// (after `block_on` has already returned), where no such context is
+    /// active — belt-and-suspenders with its own off-thread drop below, in
+    /// case a future edit moves the call. `prepare_card_answer_request`
+    /// unconditionally calls `sync_llm_api_client_from_settings_cache`, which
+    /// populates `state.api_client` whenever `settings.llm_provider` is the
+    /// `Api` variant — exactly what these end-to-end tests point at the mock
+    /// server, and exactly the ONLY thing `AppState::new()` in this test file
+    /// constructs that owns a nested runtime. Taking the client out and
+    /// dropping it on a plain OS thread (the same idiom
+    /// `llm::api_client::tests::run_blocking` uses for the SAME hazard class,
+    /// on the call side rather than the drop side) sidesteps the panic
+    /// without touching any production code path.
+    fn drop_cached_api_client_off_the_async_context(state: &AppState) {
+        let leftover = state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if leftover.is_some() {
+            std::thread::spawn(move || drop(leftover))
+                .join()
+                .expect("drop api client on a plain thread");
+        }
+    }
+
+    // Plain `#[test]` + a manually-driven `Runtime::block_on` (NOT
+    // `#[tokio::test]`): `TEST_HOME_LOCK` is a plain `std::sync::Mutex`, and
+    // holding its guard across an `.await` point trips
+    // `clippy::await_holding_lock` — the guard must be held for this test's
+    // ENTIRE body (it serializes against every other test in this binary
+    // that mutates the process-wide home/data-dir env vars), so the fix is
+    // to keep the guard in a non-async function and drive the async body
+    // through `block_on` instead of `async fn` + `#[tokio::test]`. This also
+    // sidesteps `ApiClient::new`'s nested-runtime-construction hazard the
+    // SAME way `prewarm_api_client_off_the_async_context` does elsewhere:
+    // `reqwest::blocking::Client` asserts, in debug builds, that it is never
+    // built from within an active tokio context, and `block_on` itself
+    // establishes exactly that context for everything inside it — which is
+    // why `prewarm_api_client_off_the_async_context` still runs its
+    // construction on a SEPARATE plain thread rather than relying on this
+    // function's own (non-async) call frame.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn ask_question_card_mint_and_ask_round_trip_persists_a_graded_user_origin_answer_exactly_once()
+    {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("ask-question-card-mint-and-ask");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+
+        // "on a session with spans": seed one live transcript span so the
+        // mint anchors `source_segment_id`/`source_span_ids` to it instead
+        // of falling back to the Q4 empty-ledger case.
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(transcript_event_fixture("span-1", "segment-1"))
+                .expect("seed ledger span");
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"The \"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"deadline moved to Friday.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4,\"total_tokens\":9}}\n\n\
+                            data: [DONE]\n\n";
+            let base = spawn_answer_engine_sse_mock(sse_body).await;
+            point_state_at_mock_llm_provider(&state, base);
+            prewarm_api_client_off_the_async_context(&state);
+
+            // --- Mint-and-ask, through the REAL wrapper assembly (fix-round:
+            // this now calls `dispatch_ask_question_card` itself rather than
+            // its two halves (`mint_user_question_card` +
+            // `answer_question_card_impl`) separately — closing the
+            // adversarial-review finding that "neither wrapper is ever
+            // executed by a test"; `dispatch_ask_question_card` is the plain
+            // `&AppState`-taking function the `#[tauri::command]`-annotated
+            // `ask_question_card` delegates to). ---
+            let dispatch = dispatch_ask_question_card(
+                "What changed in the roadmap for next quarter?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the mint-and-ask round trip must not error");
+            assert!(!dispatch.request_id.is_empty());
+
+            let record = dispatch.record;
+            assert_eq!(record.origin, Some(events::CardOrigin::User));
+            assert_eq!(record.proposal.kind, events::AgentProposalKind::Question);
+            assert_eq!(
+                record.signal,
+                Some(events::SignalGrade::Strong),
+                "a well-formed, high-confidence typed question must grade Strong"
+            );
+            assert!(
+                record.answer.is_none(),
+                "the record returned alongside request_id is the MINT-time \
+                 snapshot — no answer yet"
+            );
+            assert_eq!(
+                record.source_span_ids,
+                vec!["span-1".to_string()],
+                "mint must anchor to the ledger's newest span, per angle-a"
+            );
+            assert_eq!(record.proposal.source_segment_id, "span-1");
+
+            // Content-hygiene proof: the persisted card carries the question
+            // text (it is allowed to — CardAnswer/proposal.body are the
+            // sanctioned content-carrying fields), but nothing about the MINT
+            // path itself logs it (log lines only ever carry ids/enums, per
+            // `card_telemetry`'s content-free contract, unit-tested elsewhere).
+            assert_eq!(
+                record.proposal.body,
+                "What changed in the roadmap for next quarter?"
+            );
+
+            let proposal_id = record.proposal.id.clone();
+
+            let answered = wait_for_answered_card(&session_id, &proposal_id).await;
+            let answer = answered.answer.expect("answer persisted");
+            assert_eq!(answer.status, events::CardAnswerStatus::Answered);
+            assert_eq!(answer.text, "The deadline moved to Friday.");
+            assert_eq!(
+                answer.requested_by,
+                events::CardOrigin::User,
+                "a manual ask on a User-origin card carries requested_by == User \
+                 (answer_question_card_impl falls back to `card.origin` for the \
+                 manual path)"
+            );
+            assert!(!answer.route_id.is_empty());
+
+            // Persisted exactly once: the audit log has the mint's own upsert
+            // plus exactly one finalize upsert, never a per-delta write.
+            let audit = FileMemoryRepository::user_data()
+                .load_live_assist_card_audit(&session_id)
+                .expect("load audit log");
+            assert_eq!(
+                audit
+                    .iter()
+                    .filter(|c| c.proposal.id == proposal_id)
+                    .count(),
+                2,
+                "exactly two audit rows for this card: the mint upsert and the \
+                 one finalize-on-terminal upsert"
+            );
+
+            // Ledger: one started row, one succeeded terminal row, both tagged
+            // with the MANUAL action id (mint-and-ask is never `assist_auto_answer`).
+            let ledger_rows = FileMemoryRepository::user_data()
+                .load_data_movement_events(&session_id)
+                .expect("load movement ledger");
+            assert_eq!(ledger_rows.len(), 2, "one started + one terminal row");
+            assert_eq!(
+                ledger_rows[0].event_type,
+                crate::persistence::DataMovementEventType::ProviderCallStarted
+            );
+            assert_eq!(
+                ledger_rows[1].event_type,
+                crate::persistence::DataMovementEventType::ProviderCallSucceeded
+            );
+            for row in &ledger_rows {
+                assert_eq!(
+                    row.source.as_ref().map(|s| s.kind.as_str()),
+                    Some("assist_manual_answer")
+                );
+                let serialized = serde_json::to_string(row).expect("serialize ledger row");
+                assert!(!serialized.contains("deadline moved"));
+            }
+        });
+
+        drop_cached_api_client_off_the_async_context(&state);
+    }
+
+    // Plain `#[test]` + a manually-driven `Runtime::block_on` — see the
+    // previous test's comment for why (holding `TEST_HOME_LOCK`'s guard
+    // across `.await` trips `clippy::await_holding_lock`, and `ApiClient::new`
+    // cannot run inside an active tokio context either way).
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn manual_retry_succeeds_on_a_weak_signal_card_while_auto_refuses_the_same_card() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("manual-retry-weak-signal-vs-auto-refuses");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "weak-signal-card";
+
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Weak),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the weak-signal card");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            // auto=true REFUSES with WeakSignal — checked BEFORE the gate
+            // ever touches provider/network setup, so this needs no mock
+            // server.
+            let auto_dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                true,
+                noop_answer_channel(),
+                app_handle.clone(),
+                &state,
+            )
+            .await
+            .expect("the auto dispatch call itself must not error");
+            assert!(
+                matches!(
+                    auto_dispatch,
+                    AnswerDispatch::Refused {
+                        reason: events::AnswerRefusalReason::WeakSignal
+                    }
+                ),
+                "auto must refuse a Weak-signal card with WeakSignal, got {auto_dispatch:?}"
+            );
+
+            // manual (auto=false) SUCCEEDS on the exact same card — proving
+            // manual skips the Strong-signal gate step entirely (P4:
+            // fragments/weak cards keep manual Ask AI).
+            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Manual retry answer.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n\
+                            data: [DONE]\n\n";
+            let base = spawn_answer_engine_sse_mock(sse_body).await;
+            point_state_at_mock_llm_provider(&state, base);
+            prewarm_api_client_off_the_async_context(&state);
+
+            let manual_dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the manual dispatch call itself must not error");
+            assert!(
+                matches!(manual_dispatch, AnswerDispatch::Dispatched { .. }),
+                "manual must dispatch a Weak-signal card, got {manual_dispatch:?}"
+            );
+
+            let answered = wait_for_answered_card(&session_id, card_id).await;
+            let answer = answered.answer.expect("answer persisted");
+            assert_eq!(answer.status, events::CardAnswerStatus::Answered);
+            assert_eq!(answer.text, "Manual retry answer.");
+        });
+
+        drop_cached_api_client_off_the_async_context(&state);
+    }
+
+    /// Fix-round addition (blocker, scope-honesty review). Before this fix,
+    /// `mint_user_question_card` would build and attempt to persist a card
+    /// in a spanless session, and `persistence::validate_live_assist_card`'s
+    /// citation invariant would reject it — surfacing that validator's raw
+    /// internal prose verbatim in the caller's `AppError::Unknown`. This is
+    /// a pure in-memory precondition check (no disk touched either way —
+    /// `current_session_id`/`transcript_ledger_snapshot` are both in-memory
+    /// reads), so, like the gate-only tests above, needs no
+    /// `TEST_HOME_LOCK`/`HomeGuard`.
+    #[test]
+    fn mint_user_question_card_refuses_cleanly_in_a_spanless_session_instead_of_leaking_validator_prose()
+     {
+        let state = AppState::new();
+        let err = mint_user_question_card(&state, "What's next on the roadmap?")
+            .expect_err("mint must refuse when the session has no transcript spans yet");
+        let message = err.to_string();
+        assert!(
+            message.contains("no transcript yet"),
+            "expected mint's own clear, static message, got: {message}"
+        );
+        assert!(
+            !message.contains("must cite transcript spans or graph context"),
+            "the persistence validator's raw internal prose must never reach \
+             the caller: {message}"
+        );
+    }
+
+    /// Fix-round addition (minor, scope-honesty review): before this fix,
+    /// `proposal.body` had no cap at all — only an empty-text check.
+    #[test]
+    fn mint_user_question_card_refuses_text_over_the_character_cap() {
+        let state = AppState::new();
+        let too_long = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS + 1);
+        let err = mint_user_question_card(&state, &too_long)
+            .expect_err("mint must refuse text over the cap");
+        assert!(
+            err.to_string().contains("too long"),
+            "expected the length-cap message, got: {}",
+            err
+        );
+
+        // Boundary: exactly at the cap still fails ONLY on the (unrelated,
+        // pre-existing) spanless-session check, never on length.
+        let at_cap = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS);
+        let err = mint_user_question_card(&state, &at_cap)
+            .expect_err("spanless session still refuses, but not for length");
+        assert!(
+            !err.to_string().contains("too long"),
+            "text at exactly the cap must not be rejected for length: {}",
+            err
+        );
+    }
+
+    /// Fix-round addition (major, adversarial review): `Disabled` is the
+    /// first check the manual gate runs, purely off `AppSettings` — no
+    /// mock LLM provider needed since dispatch never reaches provider setup.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn ask_question_card_deletes_the_orphaned_mint_when_the_manual_gate_is_disabled() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("ask-question-card-orphan-disabled");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(transcript_event_fixture("span-1", "segment-1"))
+                .expect("seed ledger span");
+        }
+        state
+            .app_settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .agent_auto_answer
+            .enabled = false;
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            let err = dispatch_ask_question_card(
+                "Anyone still there?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect_err("a disabled engine must refuse, not dispatch");
+            assert!(
+                err.to_string().contains("disabled"),
+                "expected the Disabled refusal message, got: {err}"
+            );
+        });
+
+        let current = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .expect("load current cards");
+        assert!(
+            current.is_empty(),
+            "the minted card must NOT survive in the current store after a \
+             Disabled refusal — got {} card(s)",
+            current.len()
+        );
+
+        // The append-only audit log is deliberately left untouched: exactly
+        // the mint's own upsert, no second row (nothing else was persisted).
+        let audit = FileMemoryRepository::user_data()
+            .load_live_assist_card_audit(&session_id)
+            .expect("load audit log");
+        assert_eq!(audit.len(), 1, "only the mint's own audit row should exist");
+    }
+
+    /// Fix-round addition (major, adversarial review): the finding's own
+    /// motivating scenario — "user is mid-chat... asks a composer question".
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn ask_question_card_deletes_the_orphaned_mint_when_the_manual_gate_is_busy() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("ask-question-card-orphan-busy");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        {
+            let mut ledger = state
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .apply_event(transcript_event_fixture("span-1", "segment-1"))
+                .expect("seed ledger span");
+        }
+        let token = CancellationToken::new();
+        state
+            .stream_registry
+            .register("some-other-in-flight-request".to_string(), token.clone());
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            let err = dispatch_ask_question_card(
+                "Can you catch me up?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect_err("a busy registry must refuse, not dispatch");
+            assert!(
+                err.to_string().contains("already streaming"),
+                "expected the Busy refusal message, got: {err}"
+            );
+        });
+
+        // The pre-existing in-flight stream was never touched by the refusal
+        // (Busy is refuse-not-cancel, same invariant the gate-level pin
+        // above holds).
+        assert!(!state.stream_registry.is_empty());
+        assert!(!token.is_cancelled());
+
+        let current = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .expect("load current cards");
+        assert!(
+            current.is_empty(),
+            "the minted card must NOT survive in the current store after a \
+             Busy refusal — got {} card(s)",
+            current.len()
         );
     }
 }
