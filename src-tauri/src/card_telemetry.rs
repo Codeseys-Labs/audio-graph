@@ -70,7 +70,7 @@
 //!   already emitted; it is enumerated here rather than separately
 //!   instrumented.
 
-use crate::events::AgentProposalKind;
+use crate::events::{AgentProposalKind, AnswerRefusalReason, SignalGrade};
 
 /// Bucketed confidence/quality class — the only signal this module emits
 /// about how good a proposal is. Never the raw float: a fixed 3-word
@@ -236,17 +236,36 @@ impl CardLifecycleEvent {
     }
 }
 
+/// Stable lowercase wire string for [`SignalGrade`]. Duplicated rather than
+/// reusing the type's own `serde(rename_all = "snake_case")` serialization —
+/// same zero-coupling-to-the-wire-format reasoning as [`kind_str`] above.
+fn signal_str(signal: SignalGrade) -> &'static str {
+    match signal {
+        SignalGrade::Strong => "strong",
+        SignalGrade::Weak => "weak",
+        SignalGrade::Fragment => "fragment",
+    }
+}
+
 /// Build the line [`log_card_event`] emits, without emitting it. Pure and
 /// side-effect-free so tests can assert on the EXACT string production code
 /// sends to `log::info!` (not a hand-duplicated stand-in) — see
 /// `log_card_event`'s call to this function below. `confidence` is bucketed
 /// via [`ConfidenceClass::from_confidence`] before it ever reaches the
 /// returned line — the raw float never appears in output.
+///
+/// `signal` (audio-graph-83cc T3, picking up T2's deferred "grade in the
+/// creation line" note) is the card's T2-stamped [`SignalGrade`] — `None`
+/// for every record that predates T2 (never for a production mint after it;
+/// `run_agent_proposal_task` always stamps one). Omitted from the line
+/// entirely when absent, matching this module's existing "absent field ⇒ no
+/// key" convention (e.g. `session_running_count` on non-`Created` events).
 fn card_event_line(
     session_id: &str,
     card_id: &str,
     kind: &AgentProposalKind,
     confidence: f32,
+    signal: Option<SignalGrade>,
     event: CardLifecycleEvent,
 ) -> String {
     let class = ConfidenceClass::from_confidence(confidence);
@@ -256,6 +275,9 @@ fn card_event_line(
     } = event
     {
         extra.push(("session_running_count", session_running_count.to_string()));
+    }
+    if let Some(signal) = signal {
+        extra.push(("signal", signal_str(signal).to_string()));
     }
     format_line(
         event.name(),
@@ -273,9 +295,10 @@ pub fn log_card_event(
     card_id: &str,
     kind: &AgentProposalKind,
     confidence: f32,
+    signal: Option<SignalGrade>,
     event: CardLifecycleEvent,
 ) {
-    let line = card_event_line(session_id, card_id, kind, confidence, event);
+    let line = card_event_line(session_id, card_id, kind, confidence, signal, event);
     log::info!("{line}");
 }
 
@@ -290,6 +313,97 @@ pub fn log_card_event(
 /// same-seam correlation signal instead of two differently-shaped log lines.
 pub fn log_chat_invoked(session_id: &str) {
     let line = format_line("chat.invoked", session_id, None, None, None, &[]);
+    log::info!("{line}");
+}
+
+// ---------------------------------------------------------------------------
+// audio-graph-83cc T3: answer-engine telemetry.
+//
+// Four lifecycle events for a card-answer dispatch attempt: `Requested`
+// (the gate passed and a provider call is about to start),
+// `Completed`/`Failed` (the terminal frame resolved, successfully or not —
+// `CardAnswerStatus::Interrupted` also logs as `Failed`; see that status's
+// own doc comment), and `Refused` (the gate declined to dispatch at all,
+// carrying the closed, content-free `AnswerRefusalReason` class). Same
+// privacy invariant as the rest of this module: `session_id`/`card_id` are
+// validated ids, `kind`/`auto`/`reason` are closed enums/bools — there is no
+// parameter shape here that could carry question or answer text.
+// ---------------------------------------------------------------------------
+
+/// A per-dispatch-attempt telemetry event for the answer engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerLifecycleEvent {
+    Requested,
+    Completed,
+    /// The spend gate declined to dispatch. Carries the typed reason class
+    /// (never the compared question content — see
+    /// `crate::commands::is_duplicate_answered_question`'s doc comment for
+    /// the content-never-escapes proof for the `Duplicate` reason
+    /// specifically).
+    Refused(AnswerRefusalReason),
+    Failed,
+}
+
+impl AnswerLifecycleEvent {
+    fn name(self) -> &'static str {
+        match self {
+            AnswerLifecycleEvent::Requested => "answer.requested",
+            AnswerLifecycleEvent::Completed => "answer.completed",
+            AnswerLifecycleEvent::Refused(_) => "answer.refused",
+            AnswerLifecycleEvent::Failed => "answer.failed",
+        }
+    }
+}
+
+/// Stable lowercase wire string for [`AnswerRefusalReason`]. Duplicated
+/// rather than reusing the type's own serde rename — same zero-coupling
+/// reasoning as [`kind_str`]/[`signal_str`] above.
+fn answer_refusal_reason_str(reason: AnswerRefusalReason) -> &'static str {
+    match reason {
+        AnswerRefusalReason::Disabled => "disabled",
+        AnswerRefusalReason::NotQuestion => "not_question",
+        AnswerRefusalReason::WeakSignal => "weak_signal",
+        AnswerRefusalReason::Converse => "converse",
+        AnswerRefusalReason::Duplicate => "duplicate",
+        AnswerRefusalReason::Busy => "busy",
+        AnswerRefusalReason::Interval => "interval",
+        AnswerRefusalReason::Capped => "capped",
+    }
+}
+
+/// Build the line [`log_answer_event`] emits, without emitting it. Pure and
+/// side-effect-free for the same reason [`card_event_line`] is.
+fn answer_event_line(
+    session_id: &str,
+    card_id: &str,
+    kind: &AgentProposalKind,
+    auto: bool,
+    event: AnswerLifecycleEvent,
+) -> String {
+    let mut extra: Vec<(&str, String)> = vec![("auto", auto.to_string())];
+    if let AnswerLifecycleEvent::Refused(reason) = event {
+        extra.push(("reason", answer_refusal_reason_str(reason).to_string()));
+    }
+    format_line(
+        event.name(),
+        session_id,
+        Some(card_id),
+        Some(kind),
+        None,
+        &extra,
+    )
+}
+
+/// Log one answer-engine lifecycle event (requested / completed / refused /
+/// failed) for one card-answer dispatch attempt.
+pub fn log_answer_event(
+    session_id: &str,
+    card_id: &str,
+    kind: &AgentProposalKind,
+    auto: bool,
+    event: AnswerLifecycleEvent,
+) {
+    let line = answer_event_line(session_id, card_id, kind, auto, event);
     log::info!("{line}");
 }
 
@@ -420,6 +534,7 @@ mod tests {
             "card-def-456",
             &AgentProposalKind::Question,
             0.6,
+            Some(SignalGrade::Strong),
             CardLifecycleEvent::Created {
                 session_running_count: 3,
             },
@@ -430,6 +545,23 @@ mod tests {
         assert!(line.contains("kind=question"), "{line}");
         assert!(line.contains("confidence_class=medium"), "{line}");
         assert!(line.contains("session_running_count=3"), "{line}");
+        assert!(line.contains("signal=strong"), "{line}");
+    }
+
+    #[test]
+    fn card_event_line_omits_signal_entirely_when_none() {
+        // audio-graph-83cc T3: a pre-T2 record (or any record with no
+        // stamped grade) must not emit a `signal=` key at all — distinct
+        // from emitting an empty/placeholder value.
+        let line = card_event_line(
+            "sess-nosig",
+            "card-nosig",
+            &AgentProposalKind::Note,
+            0.9,
+            None,
+            CardLifecycleEvent::Approved,
+        );
+        assert!(!line.contains("signal="), "{line}");
     }
 
     #[test]
@@ -439,6 +571,7 @@ mod tests {
             "card-1",
             &AgentProposalKind::Note,
             0.9,
+            None,
             CardLifecycleEvent::Approved,
         );
         assert!(approved.contains("event=card.approved"), "{approved}");
@@ -452,11 +585,13 @@ mod tests {
             "card-2",
             &AgentProposalKind::GraphSuggestion,
             0.2,
+            Some(SignalGrade::Fragment),
             CardLifecycleEvent::Dismissed,
         );
         assert!(dismissed.contains("event=card.dismissed"), "{dismissed}");
         assert!(dismissed.contains("kind=graph_suggestion"), "{dismissed}");
         assert!(dismissed.contains("confidence_class=low"), "{dismissed}");
+        assert!(dismissed.contains("signal=fragment"), "{dismissed}");
     }
 
     #[test]
@@ -471,6 +606,7 @@ mod tests {
             "card-float",
             &AgentProposalKind::Note,
             0.8734567,
+            None,
             CardLifecycleEvent::Approved,
         );
         assert!(line.contains("confidence_class=high"), "{line}");
@@ -494,6 +630,7 @@ mod tests {
             "card-def-456",
             &AgentProposalKind::Question,
             0.6,
+            None,
             CardLifecycleEvent::Approved,
         );
         assert!(
@@ -510,6 +647,7 @@ mod tests {
             "what time is it and who told you that",
             &AgentProposalKind::Question,
             0.6,
+            None,
             CardLifecycleEvent::Approved,
         );
         assert!(
@@ -560,6 +698,101 @@ mod tests {
         assert!(line.contains("session_id=sess-chat"), "{line}");
         assert!(!line.contains("card_id="), "{line}");
         assert!(!line.contains(" kind="), "{line}");
+    }
+
+    // ---------------------------------------------------------------------
+    // audio-graph-83cc T3: answer-engine telemetry pins.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn answer_requested_completed_and_failed_lines_carry_auto_and_event_name() {
+        let requested = answer_event_line(
+            "sess-a",
+            "card-a",
+            &AgentProposalKind::Question,
+            true,
+            AnswerLifecycleEvent::Requested,
+        );
+        assert!(requested.contains("event=answer.requested"), "{requested}");
+        assert!(requested.contains("kind=question"), "{requested}");
+        assert!(requested.contains("auto=true"), "{requested}");
+        assert!(!requested.contains("reason="), "{requested}");
+
+        let completed = answer_event_line(
+            "sess-a",
+            "card-a",
+            &AgentProposalKind::Question,
+            false,
+            AnswerLifecycleEvent::Completed,
+        );
+        assert!(completed.contains("event=answer.completed"), "{completed}");
+        assert!(completed.contains("auto=false"), "{completed}");
+
+        let failed = answer_event_line(
+            "sess-a",
+            "card-a",
+            &AgentProposalKind::Question,
+            true,
+            AnswerLifecycleEvent::Failed,
+        );
+        assert!(failed.contains("event=answer.failed"), "{failed}");
+    }
+
+    #[test]
+    fn answer_refused_line_carries_the_reason_class_and_never_a_confidence_class() {
+        let line = answer_event_line(
+            "sess-a",
+            "card-a",
+            &AgentProposalKind::Question,
+            true,
+            AnswerLifecycleEvent::Refused(AnswerRefusalReason::Duplicate),
+        );
+        assert!(line.contains("event=answer.refused"), "{line}");
+        assert!(line.contains("reason=duplicate"), "{line}");
+        // The answer telemetry line is not a card-lifecycle line: it never
+        // carries a bucketed confidence class (only `log_card_event`'s lines
+        // do), which this asserts by construction — `answer_event_line`
+        // passes `None` for `confidence_class` to `format_line`.
+        assert!(!line.contains("confidence_class="), "{line}");
+
+        for (reason, expected) in [
+            (AnswerRefusalReason::Disabled, "disabled"),
+            (AnswerRefusalReason::NotQuestion, "not_question"),
+            (AnswerRefusalReason::WeakSignal, "weak_signal"),
+            (AnswerRefusalReason::Converse, "converse"),
+            (AnswerRefusalReason::Duplicate, "duplicate"),
+            (AnswerRefusalReason::Busy, "busy"),
+            (AnswerRefusalReason::Interval, "interval"),
+            (AnswerRefusalReason::Capped, "capped"),
+        ] {
+            let line = answer_event_line(
+                "sess-a",
+                "card-a",
+                &AgentProposalKind::Question,
+                true,
+                AnswerLifecycleEvent::Refused(reason),
+            );
+            assert!(
+                line.contains(&format!("reason={expected}")),
+                "{reason:?} -> {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_event_line_redacts_prose_passed_through_either_id_slot() {
+        let line = answer_event_line(
+            "please answer this: what is my social security number",
+            "card-a",
+            &AgentProposalKind::Question,
+            true,
+            AnswerLifecycleEvent::Requested,
+        );
+        assert!(
+            line.contains(&format!("session_id={ID_REDACTED}")),
+            "{line}"
+        );
+        assert!(!line.contains("social security"), "{line}");
     }
 
     // ---------------------------------------------------------------------
@@ -752,6 +985,10 @@ mod tests {
         assert!(
             count(commands_src, "card_telemetry::log_chat_invoked(") >= 2,
             "start_streaming_chat and send_chat_message must each still call log_chat_invoked"
+        );
+        assert!(
+            count(commands_src, "card_telemetry::log_answer_event(") >= 3,
+            "the answer engine's refused/requested/terminal sites must each still call log_answer_event (audio-graph-83cc T3)"
         );
         assert!(
             lib_src.contains("fn log_session_card_summary_best_effort(")

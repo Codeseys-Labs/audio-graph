@@ -1211,6 +1211,56 @@ impl PrivacyMode {
     }
 }
 
+/// Auto-answer engine settings (audio-graph-83cc, T3; ratified maintainer
+/// gate Q1). Governs BOTH the automatic and the manual live-assist-card
+/// answer path — `enabled` is the whole engine's off switch (see
+/// `events::AnswerRefusalReason::Disabled`'s doc comment for why manual Ask
+/// AI is also gated by it) — while `max_per_session`/`min_interval_secs`
+/// bound only the AUTO path's spend.
+///
+/// Every field carries its own `#[serde(default = "...")]` so a hand-edited
+/// `config.yaml` missing one field still gets Q1's ratified default for it,
+/// and the struct as a whole is `#[serde(default)]` on `AppSettings` (house
+/// pattern shared with `DiarizationSettings`/etc.) so an OLDER settings file
+/// with no `agent_auto_answer` key at all round-trips to these same
+/// defaults rather than failing to parse.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct AgentAutoAnswerSettings {
+    /// Q1 ratified default: `true` (ON by default). Off-by-default would
+    /// make the ratified auto-answer feature invisible in the field — the
+    /// exact round-5 failure mode this epic exists to fix.
+    #[serde(default = "default_agent_auto_answer_enabled")]
+    pub enabled: bool,
+    /// Q1 ratified default: 12 auto-dispatches per session.
+    #[serde(default = "default_agent_auto_answer_max_per_session")]
+    pub max_per_session: u32,
+    /// Q1 ratified default: 45 seconds minimum between auto-dispatches.
+    #[serde(default = "default_agent_auto_answer_min_interval_secs")]
+    pub min_interval_secs: u32,
+}
+
+fn default_agent_auto_answer_enabled() -> bool {
+    true
+}
+
+fn default_agent_auto_answer_max_per_session() -> u32 {
+    12
+}
+
+fn default_agent_auto_answer_min_interval_secs() -> u32 {
+    45
+}
+
+impl Default for AgentAutoAnswerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_auto_answer_enabled(),
+            max_per_session: default_agent_auto_answer_max_per_session(),
+            min_interval_secs: default_agent_auto_answer_min_interval_secs(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level settings
 // ---------------------------------------------------------------------------
@@ -1319,6 +1369,10 @@ pub struct AppSettings {
     /// credentials, or IPs are ever sent (see `crate::analytics` privacy gate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analytics_enabled: Option<bool>,
+    /// Auto-answer engine settings (audio-graph-83cc T3, Q1). See
+    /// [`AgentAutoAnswerSettings`].
+    #[serde(default)]
+    pub agent_auto_answer: AgentAutoAnswerSettings,
 }
 
 fn default_whisper_model() -> String {
@@ -1346,6 +1400,7 @@ impl Default for AppSettings {
             log_file_mode: Some("archive".to_string()),
             demo_mode: None,
             analytics_enabled: Some(false),
+            agent_auto_answer: AgentAutoAnswerSettings::default(),
         }
     }
 }
@@ -2844,6 +2899,52 @@ mod tests {
 
         let legacy: AppSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.diarization, DiarizationSettings::default());
+    }
+
+    /// audio-graph-83cc T3: `AgentAutoAnswerSettings` round-trips through
+    /// YAML with its Q1-ratified defaults (enabled=true, cap=12,
+    /// interval=45s), AND an older settings file with no
+    /// `agent_auto_answer` key at all still parses to those same defaults —
+    /// the house pattern this mirrors from
+    /// `diarization_settings_default_and_round_trip_without_secrets` above.
+    #[test]
+    fn agent_auto_answer_settings_default_and_round_trip() {
+        assert_eq!(
+            AgentAutoAnswerSettings::default(),
+            AgentAutoAnswerSettings {
+                enabled: true,
+                max_per_session: 12,
+                min_interval_secs: 45,
+            }
+        );
+
+        let settings = AppSettings {
+            agent_auto_answer: AgentAutoAnswerSettings {
+                enabled: false,
+                max_per_session: 3,
+                min_interval_secs: 90,
+            },
+            ..AppSettings::default()
+        };
+
+        let yaml = config_codec().serialize_config_yaml(&settings).unwrap();
+        assert!(yaml.contains("agent_auto_answer:"));
+        assert!(yaml.contains("enabled: false"));
+        assert!(yaml.contains("max_per_session: 3"));
+        assert!(yaml.contains("min_interval_secs: 90"));
+
+        let back = config_codec().parse_config_yaml(&yaml).unwrap();
+        assert!(!back.agent_auto_answer.enabled);
+        assert_eq!(back.agent_auto_answer.max_per_session, 3);
+        assert_eq!(back.agent_auto_answer.min_interval_secs, 90);
+
+        // An old settings file with no `agent_auto_answer` key at all (the
+        // shape every pre-83cc settings file has) must still parse, and must
+        // default to Q1's ratified ON-with-caps posture rather than failing
+        // or silently defaulting to off.
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.agent_auto_answer, AgentAutoAnswerSettings::default());
+        assert!(legacy.agent_auto_answer.enabled);
     }
 
     #[test]

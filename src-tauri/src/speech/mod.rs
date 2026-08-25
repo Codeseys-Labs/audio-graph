@@ -1104,7 +1104,7 @@ fn js_trim_end(text: &str) -> &str {
 /// shape) and pinned against drift by
 /// `agent_signal_grade_content_text_recovers_what_agent_proposal_body_mints`
 /// below.
-fn agent_signal_content_text(payload: &events::AgentProposalPayload) -> String {
+pub(crate) fn agent_signal_content_text(payload: &events::AgentProposalPayload) -> String {
     let body = js_trim(&payload.body);
     let prefix = match &payload.kind {
         events::AgentProposalKind::Question => "Consider answering or linking this question: ",
@@ -1338,6 +1338,7 @@ fn run_agent_proposal_task(
     let telemetry_card_id = proposal.id.clone();
     let telemetry_kind = proposal.kind.clone();
     let telemetry_confidence = proposal.confidence;
+    let telemetry_signal = proposal.signal;
 
     events::emit_or_log(&app_handle, events::AGENT_PROPOSAL, proposal);
     emit_stage_latency(
@@ -1383,6 +1384,7 @@ fn run_agent_proposal_task(
         &telemetry_card_id,
         &telemetry_kind,
         telemetry_confidence,
+        telemetry_signal,
         crate::card_telemetry::CardLifecycleEvent::Created {
             session_running_count,
         },

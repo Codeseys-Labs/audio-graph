@@ -4375,6 +4375,7 @@ fn approve_agent_proposal_impl(
         &proposal.id,
         &proposal.kind,
         proposal.confidence,
+        proposal.signal,
         crate::card_telemetry::CardLifecycleEvent::Approved,
     );
     Ok(record)
@@ -4586,6 +4587,7 @@ pub fn dismiss_agent_proposal(
             &proposal.id,
             &proposal.kind,
             proposal.confidence,
+            proposal.signal,
             crate::card_telemetry::CardLifecycleEvent::Dismissed,
         );
         return Ok(Some(record));
@@ -4635,11 +4637,1270 @@ pub fn clear_agent_proposals(
             &proposal.id,
             &proposal.kind,
             proposal.confidence,
+            proposal.signal,
             crate::card_telemetry::CardLifecycleEvent::Dismissed,
         );
         records.push(record);
     }
     Ok(records)
+}
+
+// ---------------------------------------------------------------------------
+// audio-graph-83cc T3: the answer engine.
+//
+// Two commands, `answer_question_card` (auto path) and `ask_question_card`
+// (manual path), both thin `#[tauri::command]` wrappers over one shared
+// `answer_question_card_impl`. Both operate on an EXISTING card id: neither
+// mints a new `LiveAssistCardRecord` — the free-form-question-mints-a-card
+// affordance angle-a describes is explicitly deferred past this unit (zero
+// frontend files, and this unit's whole surface is "answer a card that
+// already exists").
+//
+// SECURITY posture (this is a new automatic LLM spend path): question/answer
+// CONTENT may flow into the sanctioned LLM route and into the persisted
+// `CardAnswer`, but NEVER into a log line, an error string, a telemetry
+// field, a movement-ledger field, or a test fixture. Every helper below that
+// touches question content is annotated with where that content stops.
+// ---------------------------------------------------------------------------
+
+/// Result of a successful (non-erroring) call to `answer_question_card` /
+/// `ask_question_card`. A REFUSAL is `Ok(Refused { reason })`, not `Err(_)`:
+/// the ordered spend gate refusing to dispatch is an expected, common
+/// outcome (busy / capped / weak signal / …), not a command failure — see
+/// `events::AnswerRefusalReason`'s doc comment. Genuine failures (bad
+/// `proposal_id`, provider unavailable, privacy-blocked, lock errors) still
+/// return `Err(AppError)` via the existing typed variants.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AnswerDispatch {
+    /// The gate passed and a provider call was started. `request_id`
+    /// correlates the `channel`'s `Delta`/`Done` frames back to this call,
+    /// same contract as `start_streaming_chat`.
+    Dispatched { request_id: String },
+    /// The gate declined to dispatch. No provider call was made, no
+    /// `CardAnswer` was written, and the card is unchanged.
+    Refused { reason: events::AnswerRefusalReason },
+}
+
+/// Auto-only content-dedupe check (deliverable c's "not-duplicate" gate
+/// step): refuses to auto-answer a question whose normalized content
+/// EXACTLY matches another card in this session that already carries an
+/// answer, so a verbatim-repeated question (asked twice, or detected twice
+/// from two overlapping transcript spans) cannot buy a second paid
+/// dispatch. This ports, narrowly, the ONE piece of the frontend's
+/// `selectAgentQueue` duplicate-collapse admission filter that is
+/// load-bearing for spend — the fuller admission-time collapse stays
+/// frontend-only (see `events::AnswerRefusalReason::Duplicate`'s doc
+/// comment for the exact gap this leaves and why it's harmless under Q2).
+///
+/// CONTENT-NEVER-ESCAPES proof: this function's only inputs are a session
+/// id (a validated id, never logged directly here) and two
+/// `AgentProposalPayload`s already held in memory by the caller; its only
+/// output is a `bool`. The normalized content strings
+/// (`crate::speech::agent_signal_content_text` + `normalize_queue_content`)
+/// are local to this function's stack frame and are never passed to
+/// `log::*`, never stored on `AppState`, and never returned — the caller
+/// (`evaluate_answer_spend_gate`) receives only `AnswerRefusalReason::Duplicate`
+/// (a unit-like enum variant with no content field), which is the ONLY
+/// thing that can reach a log line (via `card_telemetry::log_answer_event`,
+/// itself structurally content-free).
+fn is_duplicate_answered_question(
+    session_id: &str,
+    proposal: &events::AgentProposalPayload,
+) -> bool {
+    let content = normalize_queue_content(&crate::speech::agent_signal_content_text(proposal));
+    if content.is_empty() {
+        return false;
+    }
+    FileMemoryRepository::user_data()
+        .load_live_assist_cards(session_id)
+        .unwrap_or_default()
+        .iter()
+        .any(|card| {
+            card.proposal.id != proposal.id
+                && card.answer.is_some()
+                && normalize_queue_content(&crate::speech::agent_signal_content_text(
+                    &card.proposal,
+                )) == content
+        })
+}
+
+/// Mirrors the frontend's `normalizeQueueContent` (`agentQueue.ts`): trim,
+/// lowercase (Unicode-aware — `str::to_lowercase` handles accented pt text
+/// the same way `String.prototype.toLowerCase()` does), collapse internal
+/// whitespace runs to a single space. `split_whitespace()` already trims
+/// and collapses runs in one pass.
+///
+/// Accepted bound (fix-round finding, adversarial review, minor, declined):
+/// punctuation is NOT stripped, so "What changed?" and "What changed" don't
+/// normalize equal and can each buy their own auto dispatch. This is
+/// deliberate FE parity — `normalizeQueueContent` itself doesn't strip
+/// punctuation either — and any abuse is hard-bounded by the 45s interval
+/// and 12/session cap regardless (worst case is the ratified session
+/// budget, not unbounded spend). Stripping punctuation here without also
+/// changing the frontend's copy would silently desync the two "duplicate"
+/// definitions, which is a worse outcome than the bound itself.
+fn normalize_queue_content(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The ordered spend gate (deliverable c). Returns `None` when dispatch is
+/// permitted, or the first `AnswerRefusalReason` that fires otherwise.
+///
+/// **Auto order** (cheapest/cheapest-to-verify first):
+/// `enabled → NotQuestion → WeakSignal → Converse → Duplicate → Busy →
+/// Interval → Capped`. Two deltas against the literal ticket-cut order,
+/// both load-bearing:
+/// - `NotQuestion` is NOT in the ticket-cut bullet's literal list, but IS in
+///   the design-panel synthesis's (`kind == Question`), and is load-bearing
+///   either way: `agent_signal_grade` (`speech/mod.rs`) grades every
+///   NON-question kind `Strong` by construction (see that function's doc
+///   comment), so without this check a caller naming a `note`/
+///   `graph_suggestion` card would clear `WeakSignal` trivially and this
+///   Rust gate would NOT "hold alone" per Q2 — it would depend on the
+///   frontend never sending a non-question id, exactly the
+///   untrusted-renderer shape Q2 exists to close.
+/// - `Converse` is in the design-panel synthesis's order ("not converse
+///   mode") but not the ticket-cut bullet; see
+///   `events::AnswerRefusalReason::Converse`'s doc comment for what this
+///   checks (native S2S only — the pipelined half has no backend flag) and
+///   why it is included anyway.
+///
+/// `Duplicate` is the ticket-cut bullet's own addition (closing the
+/// unported frontend duplicate-collapse gap) and is NOT in the synthesis's
+/// order; both additions are unioned here rather than picking one source
+/// over the other, since neither contradicts the other — both close a real
+/// gap. `Duplicate` fires in TWO cases: (1) `card.answer.is_some()` — this
+/// exact card already carries a terminal answer, so a repeated dispatch
+/// against it is refused before ever calling
+/// `is_duplicate_answered_question` (fix-round finding, scope-honesty
+/// review: `is_duplicate_answered_question` deliberately excludes the
+/// proposal's own id, so it alone cannot catch self-re-dispatch); (2)
+/// another card in the session already carries an answer with matching
+/// normalized content, per `is_duplicate_answered_question`.
+///
+/// **Manual order**: `enabled → NotQuestion → Busy`. Grade/converse/duplicate/
+/// interval/cap are skipped — fragments keep manual Ask AI (P4), and a user
+/// click is not the repeated-content/contention risk those steps guard
+/// against.
+///
+/// Neither path ever calls `stream_registry.cancel`/`cancel_all` — `Busy` is
+/// refuse-not-cancel in both directions (see
+/// `events::CardAnswerStatus::Interrupted`'s doc comment for the two
+/// pre-existing, unrelated paths `Interrupted` IS reachable from, neither of
+/// which is this gate).
+fn evaluate_answer_spend_gate(
+    state: &AppState,
+    settings: &crate::settings::AgentAutoAnswerSettings,
+    session_id: &str,
+    card: &events::LiveAssistCardRecord,
+    auto: bool,
+) -> Option<events::AnswerRefusalReason> {
+    use events::AnswerRefusalReason as Reason;
+
+    if !settings.enabled {
+        return Some(Reason::Disabled);
+    }
+    if card.proposal.kind != events::AgentProposalKind::Question {
+        return Some(Reason::NotQuestion);
+    }
+    if auto {
+        if card.signal != Some(events::SignalGrade::Strong) {
+            return Some(Reason::WeakSignal);
+        }
+        let is_converse_active = state
+            .is_converse_active
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(false);
+        if is_converse_active {
+            return Some(Reason::Converse);
+        }
+        // Fix-round finding (scope-honesty review, major): a card that
+        // ALREADY carries a terminal answer must itself refuse as
+        // `Duplicate` before ever reaching `is_duplicate_answered_question`
+        // (which deliberately excludes the proposal's own id — see that
+        // function's doc comment — so it alone cannot catch a card being
+        // re-dispatched against itself). Without this, a repeated
+        // `answer_question_card` call on the SAME already-answered card
+        // (a re-triggered FE admit, an upserted-proposal replay, or a
+        // hostile renderer) would clear every remaining auto check and buy
+        // a fresh paid dispatch each time, up to burning the entire
+        // 12/session cap on one card — leaving Q2's "the Rust gate must
+        // hold alone" resting on the FE trigger firing at most once per
+        // card, which is exactly the untrusted-renderer assumption Q2
+        // exists to close. Manual (`auto == false`) intentionally does NOT
+        // get this check: re-asking an already-answered card manually is
+        // T4's retry affordance.
+        if card.answer.is_some() || is_duplicate_answered_question(session_id, &card.proposal) {
+            return Some(Reason::Duplicate);
+        }
+    }
+    if !state.stream_registry.is_empty() {
+        return Some(Reason::Busy);
+    }
+    if auto {
+        let last_dispatch_ms = state
+            .agent_auto_answer_last_dispatch_ms
+            .load(Ordering::SeqCst);
+        if last_dispatch_ms != 0 {
+            let min_interval_ms = u64::from(settings.min_interval_secs).saturating_mul(1000);
+            if unix_millis().saturating_sub(last_dispatch_ms) < min_interval_ms {
+                return Some(Reason::Interval);
+            }
+        }
+        let dispatched_this_session = state.agent_auto_answer_session_count.load(Ordering::SeqCst);
+        if dispatched_this_session >= u64::from(settings.max_per_session) {
+            return Some(Reason::Capped);
+        }
+    }
+    None
+}
+
+/// Default backward window (chronological span count before the earliest
+/// resolved anchor) for the anchored transcript window (deliverable b).
+const CARD_ANSWER_ANCHOR_SPANS_BEFORE: usize = 6;
+/// Default forward window (span count after the latest resolved anchor).
+const CARD_ANSWER_ANCHOR_SPANS_AFTER: usize = 2;
+/// Tail-fallback window size when no anchor resolves (matches
+/// `prepare_chat_request`'s existing tail-10 constant, kept independently
+/// per this module's "no cross-module coupling for a tunable constant"
+/// convention — see `AGENT_SIGNAL_MIN_CHARS`'s doc comment in `speech/mod.rs`
+/// for the precedent).
+const CARD_ANSWER_TAIL_FALLBACK_SPANS: usize = 10;
+
+/// Resolve the transcript window that feeds an answer's retrieval context
+/// (deliverable b): when `source_span_ids` resolves against `ledger`'s
+/// chronologically-sorted `latest_spans` (matching either `span_id` OR
+/// `transcript_segment_id`, the same OR-match `live_assist_evidence_anchor`
+/// already uses), the window is
+/// `[CARD_ANSWER_ANCHOR_SPANS_BEFORE before the earliest anchor,
+/// CARD_ANSWER_ANCHOR_SPANS_AFTER after the latest anchor]`; otherwise it
+/// falls back to the last `CARD_ANSWER_TAIL_FALLBACK_SPANS` spans (a
+/// user-typed question with no transcript anchor, or a card whose anchor
+/// spans have since scrolled out of the ledger).
+///
+/// Returns the window's own span ids (for `CardAnswer.evidence_span_ids`)
+/// alongside the resolved segments.
+fn anchored_or_tail_transcript_window(
+    ledger: &crate::projections::TranscriptLedger,
+    source_span_ids: &[String],
+) -> (Vec<crate::projections::TranscriptEvent>, Vec<String>) {
+    let spans = &ledger.latest_spans;
+    if spans.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let anchor_indices: Vec<usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            source_span_ids.iter().any(|id| {
+                event.span_id == *id || event.transcript_segment_id.as_deref() == Some(id.as_str())
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    let window: Vec<crate::projections::TranscriptEvent> = if anchor_indices.is_empty() {
+        let take = CARD_ANSWER_TAIL_FALLBACK_SPANS.min(spans.len());
+        spans[spans.len() - take..].to_vec()
+    } else {
+        let min_index = *anchor_indices.iter().min().expect("non-empty");
+        let max_index = *anchor_indices.iter().max().expect("non-empty");
+        let start = min_index.saturating_sub(CARD_ANSWER_ANCHOR_SPANS_BEFORE);
+        let end = (max_index + CARD_ANSWER_ANCHOR_SPANS_AFTER).min(spans.len() - 1);
+        spans[start..=end].to_vec()
+    };
+    let ids = window.iter().map(|event| event.span_id.clone()).collect();
+    (window, ids)
+}
+
+/// Max chars the notes-outline block may add to the answer's graph context
+/// (deliverable b's "notes headings (≤ ~1,500 chars)"). Only note TITLES
+/// (with `heading_level`-based indentation) are rendered — never note
+/// bodies — so this stays a cheap outline, not a second copy of the notes
+/// artifact.
+const CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS: usize = 1_500;
+
+/// Render a cheap "Notes Outline" block from a session's materialized notes
+/// (deliverable b), capped at [`CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS`].
+/// Returns `(block, notes_last_sequence)`; `notes_last_sequence` is `Some`
+/// only when the block actually carries content — matching
+/// `CardAnswer.notes_last_sequence`'s doc comment ("when notes were used to
+/// answer"), an empty session with zero notes did not use notes.
+fn notes_outline_block(
+    notes: Option<&crate::projections::MaterializedNotes>,
+) -> (String, Option<u64>) {
+    let Some(notes) = notes else {
+        return (String::new(), None);
+    };
+    if notes.notes.is_empty() {
+        return (String::new(), None);
+    }
+    let mut block = String::from("\nNotes Outline:\n");
+    for note in &notes.notes {
+        let indent = "  ".repeat(usize::from(note.heading_level.unwrap_or(0)));
+        let line = format!("{indent}- {}\n", note.title);
+        if block.len() + line.len() > CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS {
+            break;
+        }
+        block.push_str(&line);
+    }
+    if block == "\nNotes Outline:\n" {
+        return (String::new(), None);
+    }
+    (block, Some(notes.last_sequence))
+}
+
+/// Replica of `graph::entities::build_graph_chat_context`'s top-k relevance
+/// scoring (SAME formula: query-term overlap ×100 + `ln_1p(mention_count)`
+/// centrality tiebreak), kept independent rather than exposing node ids from
+/// that function — this crate's existing precedent for a scoring-formula
+/// duplication local to its own call site is `speech::agent_signal_content_text`
+/// (see that function's doc comment). Returns the SAME node ids
+/// `build_graph_chat_context` selects into its context string, for
+/// `CardAnswer.evidence_graph_ids`.
+fn top_k_graph_node_ids_for_query(
+    snapshot: &crate::graph::entities::GraphSnapshot,
+    query: &str,
+    max_nodes: usize,
+) -> Vec<String> {
+    fn tokens(s: &str) -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    let q_tokens = tokens(query);
+    let mut scored: Vec<(f64, &str)> = snapshot
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut text = n.name.clone();
+            if let Some(d) = &n.description {
+                text.push(' ');
+                text.push_str(d);
+            }
+            let overlap = tokens(&text)
+                .iter()
+                .filter(|t| q_tokens.contains(*t))
+                .count();
+            let score = (overlap as f64) * 100.0 + (f64::from(n.mention_count)).ln_1p();
+            (score, n.id.as_str())
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(max_nodes)
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+/// Graph top-k node count for card-answer retrieval (deliverable b's "graph
+/// top-40"), independent of `prepare_chat_request`'s own `MAX_CONTEXT_NODES`
+/// constant for the same "no cross-module coupling for a tunable constant"
+/// reason `CARD_ANSWER_TAIL_FALLBACK_SPANS` is.
+const CARD_ANSWER_MAX_GRAPH_NODES: usize = 40;
+
+/// Retrieval + prompt materials `answer_question_card_impl` feeds into the
+/// answer stream. Everything here is content — never logged, never stored
+/// outside a `CardAnswer` (`evidence_span_ids`/`evidence_graph_ids`/
+/// `notes_last_sequence` are the ONLY fields that survive past dispatch;
+/// `messages`/`graph_context` are consumed once by `spawn_card_answer_stream_task`
+/// and then dropped).
+struct CardAnswerMaterials {
+    messages: Vec<ChatMessage>,
+    graph_context: String,
+    evidence_span_ids: Vec<String>,
+    evidence_graph_ids: Vec<String>,
+    notes_last_sequence: Option<u64>,
+}
+
+/// Stateless sibling of `prepare_chat_request` (deliverable b): builds one
+/// system context block (graph top-40 + anchored/tail transcript window +
+/// notes outline headings) plus the ONE question message — NEVER touches
+/// `state.chat_history` (no read, no write), so an answer's prompt carries
+/// no cross-contamination from prior chat turns and no auto-answer is ever
+/// pushed into the shared 200-message buffer converse mode also reads (C4).
+/// "No retrieval state, no caching" — every call rebuilds its context fresh
+/// from the current graph/ledger/notes snapshots; nothing here is stored on
+/// `AppState`.
+fn prepare_card_answer_request(
+    state: &AppState,
+    source_span_ids: &[String],
+    question_text: &str,
+) -> Result<CardAnswerMaterials, String> {
+    sync_llm_api_client_from_settings_cache(state)?;
+    sync_openrouter_client_from_settings_cache(state)?;
+
+    let snapshot = {
+        let kg = state
+            .knowledge_graph
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        kg.snapshot()
+    };
+
+    let runtime = state.projection_runtime_handle();
+    let ledger = runtime.transcript_ledger_snapshot();
+    let (window, evidence_span_ids) = anchored_or_tail_transcript_window(&ledger, source_span_ids);
+
+    let evidence_graph_ids =
+        top_k_graph_node_ids_for_query(&snapshot, question_text, CARD_ANSWER_MAX_GRAPH_NODES);
+    let mut graph_context = crate::graph::entities::build_graph_chat_context(
+        &snapshot,
+        question_text,
+        CARD_ANSWER_MAX_GRAPH_NODES,
+    );
+
+    if !window.is_empty() {
+        graph_context.push_str("\nRelevant Transcript:\n");
+        for seg in &window {
+            let speaker = seg.speaker_label.as_deref().unwrap_or("Unknown");
+            graph_context.push_str(&format!("[{}]: {}\n", speaker, seg.text));
+        }
+    }
+
+    let notes_session_id = runtime.current_session_id();
+    let notes_snapshot = runtime.materialized_notes_snapshot_for_session(&notes_session_id);
+    let (notes_block, notes_last_sequence) = notes_outline_block(notes_snapshot.as_ref());
+    if !notes_block.is_empty() {
+        graph_context.push_str(&notes_block);
+    }
+
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: question_text.to_string(),
+    }];
+
+    Ok(CardAnswerMaterials {
+        messages,
+        graph_context,
+        evidence_span_ids,
+        evidence_graph_ids,
+        notes_last_sequence,
+    })
+}
+
+/// Deliverable e: whether THIS dispatch may speak its answer aloud.
+/// `auto` dispatches NEVER speak aloud, unconditionally — the user's
+/// `speak_aloud` setting is not even consulted for `auto == true`. Manual/
+/// typed asks follow the user's setting exactly, same as
+/// `start_streaming_chat`. Extracted to its own pure function (rather than
+/// left as an inline expression) so it is directly unit-testable: combined
+/// with `SpeakAloudPipe::maybe_new`'s own unconditional `!speak_aloud ⇒
+/// Ok(None)` short-circuit (`speak_aloud.rs`, pre-existing/unchanged), this
+/// is the exact proof that an auto dispatch can never construct a
+/// `SpeakAloudPipe`.
+fn effective_speak_aloud_for_dispatch(auto: bool, settings_speak_aloud: bool) -> bool {
+    !auto && settings_speak_aloud
+}
+
+/// `AppSettings.agent_auto_answer.enabled == false` also gates manual asks
+/// (deliverable c) — an LLM start-gate check specific to the answer engine,
+/// paralleling `enforce_chat_provider_start`. Skips the TTS provider-start
+/// check entirely when `effective_speak_aloud` is `false` (always true for
+/// the auto path — deliverable e), so an auto-answer with speak-aloud forced
+/// off never requires a TTS provider to be enabled.
+fn enforce_card_answer_provider_start(
+    settings: &crate::settings::AppSettings,
+    effective_speak_aloud: bool,
+) -> AppResult<()> {
+    crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
+    if effective_speak_aloud {
+        crate::provider_registry::ensure_tts_provider_start_enabled(&settings.tts_provider)?;
+    }
+    Ok(())
+}
+
+/// ADR-0034 egress action id (deliverable d), distinct per dispatch kind so
+/// the answer engine is distinguishable from a click in both the privacy
+/// policy surface (`enforce_session_content_policy`'s `action` parameter)
+/// and the movement ledger (`DataMovementSource.kind`, below).
+fn assist_answer_action_id(auto: bool) -> &'static str {
+    if auto {
+        "assist_auto_answer"
+    } else {
+        "assist_manual_answer"
+    }
+}
+
+fn assist_answer_actor(auto: bool) -> crate::persistence::DataMovementActor {
+    if auto {
+        crate::persistence::DataMovementActor::System
+    } else {
+        crate::persistence::DataMovementActor::User
+    }
+}
+
+/// Destination + policy for an assist-answer ledger row. Mirrors
+/// `projection_data_movement::resolved_destination`'s shape exactly (same
+/// remote-iff-`requires_cloud_transfer && cloud_transfer_allowed` rule), kept
+/// independent because that module is scoped to the projection LLM path, not
+/// the answer engine (out of this unit's touched-file list).
+fn assist_answer_destination_and_policy(
+    provider_id: &str,
+    requires_cloud_transfer: bool,
+    cloud_transfer_allowed: bool,
+) -> (
+    crate::persistence::DataMovementDestination,
+    crate::persistence::MovementPolicy,
+) {
+    let remote = requires_cloud_transfer && cloud_transfer_allowed;
+    if remote {
+        (
+            crate::persistence::DataMovementDestination::provider(
+                provider_id.to_string(),
+                "chat_completions",
+            ),
+            crate::persistence::MovementPolicy {
+                privacy_mode: crate::persistence::PrivacyMode::ByokCloud,
+                user_visible: true,
+                retention_class: crate::persistence::RetentionClass::Transient,
+            },
+        )
+    } else {
+        (
+            crate::persistence::DataMovementDestination::local(),
+            crate::persistence::MovementPolicy {
+                privacy_mode: if cloud_transfer_allowed {
+                    crate::persistence::PrivacyMode::ByokCloud
+                } else {
+                    crate::persistence::PrivacyMode::LocalOnly
+                },
+                user_visible: true,
+                retention_class: crate::persistence::RetentionClass::Transient,
+            },
+        )
+    }
+}
+
+/// Data classes moved by an assist-answer call. Base classes always present
+/// (the question is a `Prompts`-class payload; the transcript window is
+/// `TranscriptText`); `GraphContext`/`Notes` are added only for a REMOTE
+/// call, mirroring `projection_data_movement::data_classes`'s "local calls
+/// stay minimal" convention exactly.
+fn assist_answer_data_classes(remote: bool, has_notes: bool) -> Vec<crate::persistence::DataClass> {
+    let mut classes = vec![
+        crate::persistence::DataClass::Prompts,
+        crate::persistence::DataClass::TranscriptText,
+    ];
+    if remote {
+        classes.push(crate::persistence::DataClass::GraphContext);
+        if has_notes {
+            classes.push(crate::persistence::DataClass::Notes);
+        }
+    }
+    classes
+}
+
+/// Build the pre-dispatch `ProviderCallStarted` ledger row (deliverable d).
+fn build_assist_answer_started_event(
+    session_id: &str,
+    auto: bool,
+    card_id: &str,
+    provider_id: &str,
+    requires_cloud_transfer: bool,
+    cloud_transfer_allowed: bool,
+    has_notes: bool,
+) -> crate::persistence::DataMovementEvent {
+    let remote = requires_cloud_transfer && cloud_transfer_allowed;
+    let (destination, policy) = assist_answer_destination_and_policy(
+        provider_id,
+        requires_cloud_transfer,
+        cloud_transfer_allowed,
+    );
+    crate::persistence::DataMovementLedgerBuilder::new(
+        session_id,
+        assist_answer_actor(auto),
+        crate::persistence::DataMovementEventType::ProviderCallStarted,
+        policy,
+        destination,
+    )
+    .data_classes(assist_answer_data_classes(remote, has_notes))
+    .model(crate::persistence::MovementModel {
+        provider_id: Some(provider_id.to_string()),
+        model_id: None,
+    })
+    .source(crate::persistence::DataMovementSource {
+        kind: assist_answer_action_id(auto).to_string(),
+        source_id: Some(card_id.to_string()),
+        source_label: None,
+    })
+    .result(crate::persistence::DataMovementResult::started())
+    .build()
+}
+
+/// Build the terminal ledger row (`ProviderCallSucceeded`/`Failed`/
+/// `Cancelled`, deliverable d) for one assist-answer dispatch.
+#[allow(clippy::too_many_arguments)]
+fn build_assist_answer_terminal_event(
+    session_id: &str,
+    auto: bool,
+    card_id: &str,
+    provider_id: &str,
+    requires_cloud_transfer: bool,
+    cloud_transfer_allowed: bool,
+    has_notes: bool,
+    status: events::CardAnswerStatus,
+) -> crate::persistence::DataMovementEvent {
+    let remote = requires_cloud_transfer && cloud_transfer_allowed;
+    let (destination, policy) = assist_answer_destination_and_policy(
+        provider_id,
+        requires_cloud_transfer,
+        cloud_transfer_allowed,
+    );
+    let event_type = match status {
+        events::CardAnswerStatus::Answered => {
+            crate::persistence::DataMovementEventType::ProviderCallSucceeded
+        }
+        events::CardAnswerStatus::Failed => {
+            crate::persistence::DataMovementEventType::ProviderCallFailed
+        }
+        events::CardAnswerStatus::Interrupted => {
+            crate::persistence::DataMovementEventType::ProviderCallCancelled
+        }
+    };
+    let mut builder = crate::persistence::DataMovementLedgerBuilder::new(
+        session_id,
+        assist_answer_actor(auto),
+        event_type,
+        policy,
+        destination,
+    )
+    .data_classes(assist_answer_data_classes(remote, has_notes))
+    .model(crate::persistence::MovementModel {
+        provider_id: Some(provider_id.to_string()),
+        model_id: None,
+    })
+    .source(crate::persistence::DataMovementSource {
+        kind: assist_answer_action_id(auto).to_string(),
+        source_id: Some(card_id.to_string()),
+        source_label: None,
+    });
+    builder = match status {
+        events::CardAnswerStatus::Answered => builder,
+        events::CardAnswerStatus::Failed => {
+            builder.result(crate::persistence::DataMovementResult::failed(
+                "assist_answer_failed",
+                "assist answer call failed",
+            ))
+        }
+        events::CardAnswerStatus::Interrupted => {
+            builder.result(crate::persistence::DataMovementResult {
+                status: crate::persistence::MovementStatus::Cancelled,
+                error_code: None,
+                error_message_redacted: None,
+            })
+        }
+    };
+    builder.build()
+}
+
+/// Best-effort ledger append: a movement-ledger write failure must never
+/// abort or unwind the answer path (the answer itself, and its telemetry,
+/// still matter even if the audit row didn't persist) — same posture as
+/// `append_capture_lifecycle_movement_for`'s callers, which log and continue.
+fn append_assist_answer_ledger_event(
+    session_id: &str,
+    event: &crate::persistence::DataMovementEvent,
+) {
+    if let Err(err) =
+        FileMemoryRepository::user_data().append_data_movement_event(session_id, event)
+    {
+        log::warn!(
+            "Failed to append assist-answer movement ledger row: {}",
+            err
+        );
+    }
+}
+
+/// Everything `spawn_card_answer_stream_task` needs that isn't already a
+/// parameter of `spawn_stream_task` (which this function otherwise mirrors).
+/// Bundled into one struct rather than growing the parameter list further —
+/// `spawn_stream_task` itself already carries an
+/// `#[allow(clippy::too_many_arguments)]`; this avoids needing a second one
+/// with even more parameters.
+struct CardAnswerContext {
+    session_id: String,
+    card_id: String,
+    card_kind: events::AgentProposalKind,
+    auto: bool,
+    route_id: String,
+    requested_by: events::CardOrigin,
+    evidence_span_ids: Vec<String>,
+    evidence_graph_ids: Vec<String>,
+    notes_last_sequence: Option<u64>,
+    provider_id_for_ledger: String,
+    requires_cloud_transfer: bool,
+    cloud_transfer_allowed: bool,
+}
+
+/// Build, cap, and persist the `CardAnswer` on the stream's terminal frame
+/// (deliverable a: "persist ONCE on the terminal frame — never per-delta"),
+/// append the terminal ledger row, emit `AGENT_CARD_UPDATE`, and log the
+/// `Completed`/`Failed` telemetry event (`Interrupted` also logs `Failed` —
+/// deliverable f names exactly four telemetry events, not five).
+///
+/// Re-fetches the card fresh from disk rather than reusing a copy captured
+/// at dispatch time, so a concurrent approve/dismiss that landed while the
+/// stream was in flight is not clobbered by a stale `existing` snapshot.
+#[allow(clippy::too_many_arguments)]
+fn finalize_card_answer(
+    app: &tauri::AppHandle,
+    ctx: &CardAnswerContext,
+    status: events::CardAnswerStatus,
+    full_text: String,
+    finish_reason: Option<String>,
+    total_tokens: Option<u64>,
+) {
+    let mut answer = events::CardAnswer {
+        status,
+        text: full_text,
+        truncated: false,
+        evidence_span_ids: ctx.evidence_span_ids.clone(),
+        evidence_graph_ids: ctx.evidence_graph_ids.clone(),
+        notes_last_sequence: ctx.notes_last_sequence,
+        route_id: ctx.route_id.clone(),
+        requested_by: ctx.requested_by,
+        finish_reason,
+        total_tokens,
+        answered_at_ms: unix_millis(),
+    };
+    // T1's validator rejects an over-cap answer OUTRIGHT (no truncation
+    // seam of its own) — cap BEFORE persisting so an unbounded model
+    // response truncates-and-marks instead of losing the whole answer to a
+    // validator error, exactly the seam `CardAnswer::cap_text`'s own doc
+    // comment describes.
+    answer.cap_text();
+
+    match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
+        Some(mut card) => {
+            card.answer = Some(answer);
+            card.updated_at_ms = unix_millis();
+            if let Err(err) =
+                FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
+            {
+                log::warn!(
+                    "Failed to persist card answer for card_id={}: {}",
+                    ctx.card_id,
+                    err
+                );
+            }
+            events::emit_or_log(app, events::AGENT_CARD_UPDATE, card);
+        }
+        None => {
+            log::warn!(
+                "Card answer terminal frame arrived but card_id={} no longer exists; answer not persisted",
+                ctx.card_id
+            );
+        }
+    }
+
+    let has_notes = ctx.notes_last_sequence.is_some();
+    let terminal_event = build_assist_answer_terminal_event(
+        &ctx.session_id,
+        ctx.auto,
+        &ctx.card_id,
+        &ctx.provider_id_for_ledger,
+        ctx.requires_cloud_transfer,
+        ctx.cloud_transfer_allowed,
+        has_notes,
+        status,
+    );
+    append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
+
+    let telemetry_event = match status {
+        events::CardAnswerStatus::Answered => {
+            crate::card_telemetry::AnswerLifecycleEvent::Completed
+        }
+        events::CardAnswerStatus::Failed | events::CardAnswerStatus::Interrupted => {
+            crate::card_telemetry::AnswerLifecycleEvent::Failed
+        }
+    };
+    crate::card_telemetry::log_answer_event(
+        &ctx.session_id,
+        &ctx.card_id,
+        &ctx.card_kind,
+        ctx.auto,
+        telemetry_event,
+    );
+}
+
+/// Spawn the answer stream task. Deliberately NOT a call to
+/// `spawn_stream_task`: that function unconditionally calls
+/// `state.stream_registry.cancel_all()` before registering (AUD-STR1 P1),
+/// which is exactly the hazard the ordered spend gate's `Busy` check exists
+/// to avoid — this function never cancels a prior stream; the gate's
+/// `stream_registry.is_empty()` check (evaluated by the caller before this
+/// function is reached) is the ENTIRE protection. Also never touches
+/// `state.chat_history` (stateless, per `prepare_card_answer_request`'s doc
+/// comment) and forces `speak_aloud` off whenever `ctx.auto` is `true`
+/// (deliverable e) by simply never constructing a `SpeakAloudPipe` for the
+/// auto path.
+#[allow(clippy::too_many_arguments)]
+fn spawn_card_answer_stream_task(
+    app: tauri::AppHandle,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    state: &AppState,
+    request_id: String,
+    provider: crate::settings::LlmProvider,
+    materials: CardAnswerMaterials,
+    settings: crate::settings::AppSettings,
+    effective_speak_aloud: bool,
+    ctx: CardAnswerContext,
+) {
+    use crate::llm::streaming::{
+        ChatStreamEvent, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
+    };
+
+    let params = stream_params_from_settings(&settings);
+    let content_egress_policy = provider_content_egress_policy_from_settings(
+        &settings,
+        provider.requires_cloud_content_transfer(),
+    );
+    let request = crate::llm::streaming::StreamChatRequest::new(
+        provider,
+        materials.messages,
+        materials.graph_context,
+        params,
+    )
+    .with_content_egress_policy(content_egress_policy)
+    .with_backend_handles(stream_backend_handles_from_state(state))
+    .with_source_metadata(StreamSourceMetadata {
+        session_id: Some(ctx.session_id.clone()),
+        source_id: None,
+        request_id: Some(request_id.clone()),
+    });
+    let (mut rx, cancel) = stream_chat_with_request(request);
+    state.stream_registry.register(request_id.clone(), cancel);
+
+    let registry = state.stream_registry.clone();
+    let request_id_for_task = request_id.clone();
+
+    let settings_snapshot = (
+        // Deliverable e: auto-answers never speak aloud. Manual/typed asks
+        // follow the user's setting, same as `start_streaming_chat`.
+        effective_speak_aloud,
+        settings.tts_provider.clone(),
+        provider_content_egress_policy_from_settings(
+            &settings,
+            settings.tts_provider.requires_cloud_content_transfer(),
+        ),
+    );
+    let credentials_snapshot = crate::credentials::load_credentials();
+    let player_for_pipe = state.audio_player.clone();
+    let request_id_for_pipe_log = request_id.clone();
+
+    tokio::spawn(async move {
+        let mut pipe: Option<crate::speak_aloud::SpeakAloudPipe> =
+            match crate::speak_aloud::SpeakAloudPipe::maybe_new(
+                settings_snapshot.0,
+                &settings_snapshot.1,
+                &credentials_snapshot,
+                settings_snapshot.2,
+                player_for_pipe,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!(
+                        "speak-aloud setup failed for card answer request {}: {}; falling back to text-only",
+                        request_id_for_pipe_log,
+                        e
+                    );
+                    None
+                }
+            };
+
+        // Fix-round finding (adversarial review, minor): once the frontend
+        // channel is gone (window closed/navigated mid-stream), further
+        // `channel.send` attempts are guaranteed to keep failing — this
+        // flag stops us from re-attempting (and re-logging) on every
+        // remaining frame, WITHOUT aborting the loop early. The stream
+        // keeps draining to its own terminal frame either way, so the paid
+        // dispatch this answer represents is always finalized (persisted
+        // answer + terminal ledger row), even when nobody is left to watch
+        // it stream — this is the ADR-0034 "1:1 started/terminal" honesty
+        // property the previous shape (an early `return` on the Delta arm's
+        // send failure) broke.
+        let mut channel_alive = true;
+
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta {
+                    content,
+                    finish_reason,
+                } => {
+                    if let Some(p) = pipe.as_mut()
+                        && let Err(e) = p.append_delta(&content)
+                    {
+                        log::warn!("speak-aloud append_delta failed: {}", e);
+                    }
+                    if channel_alive
+                        && let Err(e) = channel.send(ChatStreamEvent::Delta {
+                            request_id: request_id_for_task.clone(),
+                            delta: content,
+                            finish_reason,
+                        })
+                    {
+                        log::warn!(
+                            "card answer stream {}: delta channel send failed ({}); the frontend can no longer see this answer, but it will still be finalized and persisted when the terminal frame arrives",
+                            request_id_for_task,
+                            e
+                        );
+                        if let Some(p) = pipe.take() {
+                            let _ = p.cancel();
+                        }
+                        channel_alive = false;
+                    }
+                }
+                TokenDelta::Done {
+                    full_text,
+                    usage,
+                    finish_reason,
+                } => {
+                    if let Some(p) = pipe.take()
+                        && let Err(e) = p.finish()
+                    {
+                        log::warn!("speak-aloud finish failed: {}", e);
+                    }
+                    let tokens_used = tokens_used_from_stream_usage(usage.clone());
+                    persist_llm_usage_for_session(&app, &ctx.session_id, tokens_used);
+                    let total_tokens = (tokens_used > 0).then(|| u64::from(tokens_used));
+                    if channel_alive
+                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                            request_id: request_id_for_task.clone(),
+                            full_text: full_text.clone(),
+                            finish_reason: finish_reason.clone(),
+                            usage,
+                        })
+                    {
+                        log::warn!(
+                            "card answer stream {}: done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
+                    registry.finish(&request_id_for_task);
+                    finalize_card_answer(
+                        &app,
+                        &ctx,
+                        events::CardAnswerStatus::Answered,
+                        full_text,
+                        Some(finish_reason).filter(|s| !s.is_empty()),
+                        total_tokens,
+                    );
+                    return;
+                }
+                TokenDelta::Error { message, full_text } => {
+                    // Fix-round finding (scope-honesty review, minor,
+                    // declined as a functional change): `message` here is
+                    // already `crate::error::redacted_error_excerpt`'d at
+                    // its source in `llm/streaming.rs` (secrets stripped,
+                    // bounded to 200 chars) before it ever reaches this
+                    // channel — the SAME redaction convention
+                    // `redacted_provider_diagnostic` wraps (it is that
+                    // function plus a wider bound, not a distinct
+                    // "class"-reduction step; error.rs has no separate
+                    // class-only reducer to call into here). This line is a
+                    // byte-for-byte mirror of the pre-existing
+                    // `start_streaming_chat` error line just above it in
+                    // this file. Declined further reduction: doing so only
+                    // for this new call site while leaving the identical,
+                    // pre-existing chat line as-is would create an
+                    // inconsistency with no clear security win, and
+                    // widening the redaction convention itself is out of
+                    // this ticket's scope.
+                    log::warn!("Card answer streaming error: {}", message);
+                    if let Some(p) = pipe.take() {
+                        let _ = p.cancel();
+                    }
+                    let finish_reason = format!("error: {}", message);
+                    if channel_alive
+                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                            request_id: request_id_for_task.clone(),
+                            full_text: full_text.clone(),
+                            finish_reason: finish_reason.clone(),
+                            usage: None,
+                        })
+                    {
+                        log::warn!(
+                            "card answer stream {}: error-done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
+                    registry.finish(&request_id_for_task);
+                    finalize_card_answer(
+                        &app,
+                        &ctx,
+                        events::CardAnswerStatus::Failed,
+                        full_text,
+                        Some(finish_reason),
+                        None,
+                    );
+                    return;
+                }
+                TokenDelta::Cancelled { full_text } => {
+                    if let Some(p) = pipe.take() {
+                        let _ = p.cancel();
+                    }
+                    if channel_alive
+                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                            request_id: request_id_for_task.clone(),
+                            full_text: full_text.clone(),
+                            finish_reason: "cancelled".to_string(),
+                            usage: None,
+                        })
+                    {
+                        log::warn!(
+                            "card answer stream {}: cancelled-done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
+                    registry.finish(&request_id_for_task);
+                    finalize_card_answer(
+                        &app,
+                        &ctx,
+                        events::CardAnswerStatus::Interrupted,
+                        full_text,
+                        Some("cancelled".to_string()),
+                        None,
+                    );
+                    return;
+                }
+            }
+        }
+        // Fix-round finding (adversarial review, minor): if the producer
+        // ends (adapter task panic, sender dropped) WITHOUT ever sending a
+        // terminal frame, every arm's own `registry.finish` above is
+        // unreached, and — because this path is deliberately
+        // refuse-not-cancel — the leaked entry would wedge the `Busy` gate
+        // for the rest of the session (neither `answer_question_card` nor
+        // `ask_question_card` can ever cancel it themselves). This is a
+        // no-op on every normal path: each reachable match arm above
+        // already calls `return` immediately after its own
+        // `registry.finish`, so this line only executes on the abnormal
+        // no-terminal-frame path.
+        registry.finish(&request_id_for_task);
+    });
+}
+
+/// Shared body of `answer_question_card` (auto) and `ask_question_card`
+/// (manual). See the module-level comment above for the shape decisions.
+async fn answer_question_card_impl(
+    proposal_id: String,
+    auto: bool,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> AppResult<AnswerDispatch> {
+    // Same session-lifecycle serialization `start_streaming_chat` uses:
+    // holds for this whole function body, so the gate-check-then-dispatch
+    // critical section (including the counter increment below) cannot
+    // interleave with another answer dispatch, a chat dispatch, or a
+    // session rotation.
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+
+    let session_id = state.current_session_id();
+    let card = existing_live_assist_card(&session_id, &proposal_id)
+        .ok_or_else(|| AppError::from(format!("Live assist card {proposal_id} does not exist")))?;
+
+    let settings = read_settings_for_session_content(state, assist_answer_action_id(auto))?;
+
+    if let Some(reason) =
+        evaluate_answer_spend_gate(state, &settings.agent_auto_answer, &session_id, &card, auto)
+    {
+        crate::card_telemetry::log_answer_event(
+            &session_id,
+            &proposal_id,
+            &card.proposal.kind,
+            auto,
+            crate::card_telemetry::AnswerLifecycleEvent::Refused(reason),
+        );
+        return Ok(AnswerDispatch::Refused { reason });
+    }
+
+    // Deliverable e: auto NEVER speaks aloud; manual/typed follows the
+    // user's setting, same posture as `start_streaming_chat`.
+    let effective_speak_aloud = effective_speak_aloud_for_dispatch(auto, settings.speak_aloud);
+    enforce_card_answer_provider_start(&settings, effective_speak_aloud)?;
+
+    let llm_provider = settings.llm_provider.clone();
+    let action_id = assist_answer_action_id(auto);
+    enforce_session_content_policy(
+        &app,
+        state,
+        &settings,
+        action_id,
+        llm_provider.runtime_provider_id(),
+        &[
+            "user_message",
+            "transcript",
+            "graph_context",
+            "notes",
+            "prompt",
+        ],
+        llm_provider.requires_cloud_content_transfer(),
+    )?;
+    if effective_speak_aloud {
+        enforce_session_content_policy(
+            &app,
+            state,
+            &settings,
+            "tts_speak_aloud",
+            settings.tts_provider.runtime_provider_id(),
+            &["generated_text"],
+            settings.tts_provider.requires_cloud_content_transfer(),
+        )?;
+    }
+
+    if let Some(err) = local_llm_provider_availability_error(&llm_provider) {
+        return Err(err);
+    }
+    if !provider_supports_streaming(&llm_provider) {
+        return Err(AppError::Unknown(format!(
+            "Streaming is not yet supported for the active LLM provider ({:?}); the answer engine \
+             requires a streaming-capable provider.",
+            llm_provider
+        )));
+    }
+
+    // ADR-0038 route seam, documented honestly (deliverable g): this stamps
+    // the RESOLVED route id (`resolve_route`, the same resolver
+    // `authorize_route_dispatch` itself uses to pick a `RouteDescriptor`),
+    // by trusted code, never model- or config-echoed — regardless of the
+    // eventual outcome (even a `Failed` answer carries the attempted
+    // route). It does NOT obtain an `AuthorizedRoute` seal: no chat path in
+    // this crate is sealed today (`llm/streaming.rs` has zero `route::`
+    // references — verified, not assumed), and retrofitting the seal onto
+    // the streaming path is its own Rust lane across five provider skins,
+    // out of this unit's scope (assigned to the agent-runtime lane per the
+    // design-panel synthesis). The seam this unit leaves for that lane: the
+    // moment `llm/streaming.rs` gains an `AuthorizedRoute` parameter, this
+    // one call becomes `authorize_route_dispatch(&llm_provider)?.descriptor()`
+    // (`llm/route.rs:568`) in place of `resolve_route(&llm_provider)` — same
+    // downstream `route_id` usage, no other line in this function needs to
+    // change. Not inventing a new
+    // `route.assist_answer` table row now, on the same honesty basis: a row
+    // nothing resolves through is provenance theater.
+    let route = crate::llm::route::resolve_route(&llm_provider);
+    let route_id = route.id.to_string();
+
+    let question_text = question_text_from_body(&card.proposal.body);
+    let materials = prepare_card_answer_request(state, &card.source_span_ids, &question_text)?;
+
+    let requested_by = if auto {
+        events::CardOrigin::Transcript
+    } else {
+        card.origin.unwrap_or(events::CardOrigin::Transcript)
+    };
+
+    let has_notes = materials.notes_last_sequence.is_some();
+    let requires_cloud_transfer = llm_provider.requires_cloud_content_transfer();
+    let cloud_transfer_allowed = settings
+        .privacy_mode
+        .allows_session_cloud_content_transfer();
+    let provider_id_for_ledger = llm_provider.runtime_provider_id().to_string();
+
+    // Count DISPATCHES, at dispatch time, before the stream starts — a
+    // refused or never-attempted call must never count against the cap
+    // (deliverable c / state.rs's own doc comment on this counter).
+    if auto {
+        state
+            .agent_auto_answer_session_count
+            .fetch_add(1, Ordering::SeqCst);
+        state
+            .agent_auto_answer_last_dispatch_ms
+            .store(unix_millis(), Ordering::SeqCst);
+    }
+
+    let started_event = build_assist_answer_started_event(
+        &session_id,
+        auto,
+        &proposal_id,
+        &provider_id_for_ledger,
+        requires_cloud_transfer,
+        cloud_transfer_allowed,
+        has_notes,
+    );
+    append_assist_answer_ledger_event(&session_id, &started_event);
+
+    crate::card_telemetry::log_answer_event(
+        &session_id,
+        &proposal_id,
+        &card.proposal.kind,
+        auto,
+        crate::card_telemetry::AnswerLifecycleEvent::Requested,
+    );
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let ctx = CardAnswerContext {
+        session_id,
+        card_id: proposal_id,
+        card_kind: card.proposal.kind.clone(),
+        auto,
+        route_id,
+        requested_by,
+        evidence_span_ids: materials.evidence_span_ids.clone(),
+        evidence_graph_ids: materials.evidence_graph_ids.clone(),
+        notes_last_sequence: materials.notes_last_sequence,
+        provider_id_for_ledger,
+        requires_cloud_transfer,
+        cloud_transfer_allowed,
+    };
+    spawn_card_answer_stream_task(
+        app,
+        channel,
+        state,
+        request_id.clone(),
+        llm_provider,
+        materials,
+        settings,
+        effective_speak_aloud,
+        ctx,
+    );
+
+    Ok(AnswerDispatch::Dispatched { request_id })
+}
+
+/// Auto path (deliverable a): answer an existing question card automatically.
+/// The FE trigger (`autoAnswerAdmits`, T5) is the *initiator*; this command's
+/// own ordered spend gate is the durable, self-sufficient spend authority
+/// (Q2) — it must refuse on its own even if the caller claims eligibility it
+/// does not have.
+#[tauri::command]
+pub async fn answer_question_card(
+    proposal_id: String,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<AnswerDispatch> {
+    answer_question_card_impl(proposal_id, true, channel, app, state.inner()).await
+}
+
+/// Manual path (deliverable a): a user-initiated "Ask AI" on an existing
+/// question card (including a fragment the auto path refused — P4). Skips
+/// the grade/duplicate/interval/cap steps of the spend gate but keeps the
+/// enabled/kind/stream checks (deliverable c).
+#[tauri::command]
+pub async fn ask_question_card(
+    proposal_id: String,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<AnswerDispatch> {
+    answer_question_card_impl(proposal_id, false, channel, app, state.inner()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -20975,6 +22236,1185 @@ mod tests {
             cached_deepgram_api_key(&state),
             "fresh-deepgram-secret",
             "after save re-hydrate the cache must serve the freshly-saved key"
+        );
+    }
+
+    // =======================================================================
+    // audio-graph-83cc T3: the answer engine.
+    // =======================================================================
+
+    fn answer_engine_test_card(
+        card_id: &str,
+        session_id: &str,
+        kind: events::AgentProposalKind,
+        signal: Option<events::SignalGrade>,
+        source_span_ids: Vec<String>,
+    ) -> events::LiveAssistCardRecord {
+        let body_prefix = match kind {
+            events::AgentProposalKind::Question => "Consider answering or linking this question: ",
+            events::AgentProposalKind::GraphSuggestion => {
+                "Review this for an action item, decision, or relationship: "
+            }
+            events::AgentProposalKind::Note => "Keep this context available: ",
+        };
+        let proposal = events::AgentProposalPayload {
+            id: card_id.to_string(),
+            source_segment_id: format!("segment-{card_id}"),
+            source_id: "source-1".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            kind: kind.clone(),
+            title: "Question from Speaker 1".to_string(),
+            body: format!("{body_prefix}What changed in the roadmap for next quarter?"),
+            confidence: 0.9,
+            created_at_ms: 1_700_000_000_000,
+            signal,
+        };
+        events::LiveAssistCardRecord {
+            session_id: session_id.to_string(),
+            proposal,
+            status: events::LiveAssistCardStatus::Pending,
+            source_span_ids,
+            graph_context_ids: Vec::new(),
+            outcome: None,
+            projection_patch_sequence: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            origin: Some(events::CardOrigin::Transcript),
+            answer: None,
+            signal,
+        }
+    }
+
+    fn answer_engine_answered_card(
+        card_id: &str,
+        session_id: &str,
+        answer_text: &str,
+    ) -> events::LiveAssistCardRecord {
+        let mut card = answer_engine_test_card(
+            card_id,
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![format!("segment-{card_id}")],
+        );
+        card.answer = Some(events::CardAnswer {
+            status: events::CardAnswerStatus::Answered,
+            text: answer_text.to_string(),
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: events::CardOrigin::Transcript,
+            finish_reason: Some("stop".to_string()),
+            total_tokens: Some(42),
+            answered_at_ms: 1_700_000_000_500,
+        });
+        card
+    }
+
+    // -----------------------------------------------------------------
+    // evaluate_answer_spend_gate: ordered gate, deliverable c.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn spend_gate_disabled_refuses_first_for_both_auto_and_manual() {
+        let state = AppState::new();
+        let disabled = crate::settings::AgentAutoAnswerSettings {
+            enabled: false,
+            ..crate::settings::AgentAutoAnswerSettings::default()
+        };
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &disabled, "sess-gate", &card, true),
+            Some(events::AnswerRefusalReason::Disabled)
+        );
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &disabled, "sess-gate", &card, false),
+            Some(events::AnswerRefusalReason::Disabled)
+        );
+    }
+
+    #[test]
+    fn spend_gate_refuses_non_question_kinds_even_though_grade_defaults_strong() {
+        // The renderer-untrusted case: `agent_signal_grade` (speech/mod.rs)
+        // grades every non-question kind `Strong` by construction, so this
+        // pins that the Rust gate does NOT trust `signal == Strong` alone —
+        // it independently re-derives `kind == Question` from the card it
+        // loaded itself, never from anything a caller "claims".
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        for kind in [
+            events::AgentProposalKind::Note,
+            events::AgentProposalKind::GraphSuggestion,
+        ] {
+            let card = answer_engine_test_card(
+                "card-1",
+                "sess-gate",
+                kind.clone(),
+                Some(events::SignalGrade::Strong),
+                vec![],
+            );
+            assert_eq!(
+                evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+                Some(events::AnswerRefusalReason::NotQuestion),
+                "{kind:?} (auto)"
+            );
+            assert_eq!(
+                evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
+                Some(events::AnswerRefusalReason::NotQuestion),
+                "{kind:?} (manual)"
+            );
+        }
+    }
+
+    #[test]
+    fn spend_gate_auto_refuses_weak_or_fragment_signal_but_manual_does_not() {
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        for signal in [
+            None,
+            Some(events::SignalGrade::Weak),
+            Some(events::SignalGrade::Fragment),
+        ] {
+            let card = answer_engine_test_card(
+                "card-1",
+                "sess-gate",
+                events::AgentProposalKind::Question,
+                signal,
+                vec![],
+            );
+            assert_eq!(
+                evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+                Some(events::AnswerRefusalReason::WeakSignal),
+                "{signal:?} (auto)"
+            );
+            // Manual path skips the grade check entirely (P4: fragments
+            // keep manual Ask AI) — the gate passes (registry empty, no
+            // interval/cap checks on this path).
+            assert_eq!(
+                evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
+                None,
+                "{signal:?} (manual)"
+            );
+        }
+    }
+
+    #[test]
+    fn spend_gate_auto_refuses_while_native_converse_is_active() {
+        let state = AppState::new();
+        *state.is_converse_active.write().expect("lock") = true;
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            Some(events::AnswerRefusalReason::Converse)
+        );
+        // Manual is not subject to the converse exclusion at all.
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
+            None
+        );
+    }
+
+    #[test]
+    fn spend_gate_busy_refuses_both_paths_without_cancelling_the_registered_stream() {
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        let token = CancellationToken::new();
+        state
+            .stream_registry
+            .register("in-flight-request".to_string(), token.clone());
+
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            Some(events::AnswerRefusalReason::Busy)
+        );
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
+            Some(events::AnswerRefusalReason::Busy)
+        );
+        // The registered stream must still be live and uncancelled — the
+        // gate REFUSES, it never reaches for `cancel`/`cancel_all`.
+        assert!(!state.stream_registry.is_empty());
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn spend_gate_auto_refuses_within_the_minimum_interval_and_permits_after_a_reset() {
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings {
+            min_interval_secs: 45,
+            ..crate::settings::AgentAutoAnswerSettings::default()
+        };
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        state
+            .agent_auto_answer_last_dispatch_ms
+            .store(unix_millis(), Ordering::SeqCst);
+
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            Some(events::AnswerRefusalReason::Interval)
+        );
+
+        // A rotation (or the elapsed real interval) resets the clock to 0,
+        // which this gate treats as "no auto-dispatch yet this session".
+        state
+            .agent_auto_answer_last_dispatch_ms
+            .store(0, Ordering::SeqCst);
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            None
+        );
+    }
+
+    #[test]
+    fn spend_gate_auto_refuses_at_the_per_session_cap() {
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings {
+            max_per_session: 12,
+            ..crate::settings::AgentAutoAnswerSettings::default()
+        };
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+
+        state
+            .agent_auto_answer_session_count
+            .store(11, Ordering::SeqCst);
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            None,
+            "11 dispatched, cap 12: still permitted"
+        );
+
+        state
+            .agent_auto_answer_session_count
+            .store(12, Ordering::SeqCst);
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            Some(events::AnswerRefusalReason::Capped)
+        );
+    }
+
+    #[test]
+    fn spend_gate_permits_dispatch_when_every_auto_check_clears() {
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        let card = answer_engine_test_card(
+            "card-1",
+            "sess-gate",
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, true),
+            None
+        );
+    }
+
+    #[test]
+    fn spend_gate_auto_refuses_when_the_card_itself_already_has_an_answer() {
+        // Fix-round finding (scope-honesty review, major): re-dispatching
+        // the SAME already-answered card must refuse as `Duplicate` on the
+        // auto path. `is_duplicate_answered_question` alone cannot catch
+        // this — it deliberately excludes the proposal's own id (see
+        // `is_duplicate_answered_question_true_only_for_...`'s "the
+        // answered card itself is never its own duplicate" assertion above)
+        // — so this gate must check `card.answer.is_some()` itself, BEFORE
+        // that function is ever reached. No card is persisted to disk in
+        // this test, so a call into that function's disk read would find
+        // nothing to compare against either way: this test only passes if
+        // the short-circuiting self-check fires first, not as a side effect
+        // of the cross-card check somehow also matching.
+        let state = AppState::new();
+        let settings = crate::settings::AgentAutoAnswerSettings::default();
+        let answered =
+            answer_engine_answered_card("card-1", "sess-self-answered", "The Q3 roadmap.");
+
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-self-answered", &answered, true),
+            Some(events::AnswerRefusalReason::Duplicate),
+            "auto must refuse to re-dispatch a card that already carries a terminal answer"
+        );
+        // Manual retry on an already-answered card is explicitly allowed
+        // (T4's retry affordance) — the self-check is auto-only.
+        assert_eq!(
+            evaluate_answer_spend_gate(&state, &settings, "sess-self-answered", &answered, false),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // is_duplicate_answered_question / normalize_queue_content
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn normalize_queue_content_trims_lowercases_and_collapses_whitespace() {
+        assert_eq!(
+            normalize_queue_content("  What   Changed\tIN the\n\nroadmap?  "),
+            "what changed in the roadmap?"
+        );
+        assert_eq!(normalize_queue_content(""), "");
+        // Unicode-aware lowercasing (accented pt text), matching the
+        // frontend's `normalizeQueueContent`.
+        assert_eq!(normalize_queue_content("Você"), "você");
+    }
+
+    #[test]
+    fn is_duplicate_answered_question_true_only_for_another_card_with_an_answer_and_matching_content()
+     {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("answer-engine-duplicate");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "sess-duplicate";
+
+        let answered = answer_engine_answered_card("card-answered", session_id, "The Q3 roadmap.");
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &answered)
+            .expect("seed the answered card");
+
+        // Same normalized content, different id, no answer of its own yet.
+        let candidate = answer_engine_test_card(
+            "card-candidate",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        assert!(
+            is_duplicate_answered_question(session_id, &candidate.proposal),
+            "a verbatim-repeated, already-answered question must be detected as a duplicate"
+        );
+
+        // The answered card itself is never its own duplicate.
+        assert!(!is_duplicate_answered_question(
+            session_id,
+            &answered.proposal
+        ));
+
+        // An unrelated question is not a duplicate.
+        let mut unrelated = answer_engine_test_card(
+            "card-unrelated",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        unrelated.proposal.body =
+            "Consider answering or linking this question: Who owns the migration?".to_string();
+        assert!(!is_duplicate_answered_question(
+            session_id,
+            &unrelated.proposal
+        ));
+    }
+
+    #[test]
+    fn is_duplicate_answered_question_false_when_the_matching_card_has_no_answer_yet() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("answer-engine-duplicate-unanswered");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "sess-duplicate-unanswered";
+
+        let unanswered = answer_engine_test_card(
+            "card-unanswered",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-unanswered".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &unanswered)
+            .expect("seed the unanswered card");
+
+        let candidate = answer_engine_test_card(
+            "card-candidate",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec![],
+        );
+        assert!(
+            !is_duplicate_answered_question(session_id, &candidate.proposal),
+            "a matching-content card with NO answer yet must not count as a duplicate — \
+             only one of the two should ever end up dispatching (single-flight), and \
+             refusing the very first attempt as its own 'duplicate' would starve both"
+        );
+    }
+
+    #[test]
+    fn is_duplicate_answered_question_body_never_calls_log() {
+        // Fix-round finding (adversarial review, minor): this is the ONE
+        // gate function whose stack frame holds raw normalized question
+        // content (see its own doc comment's CONTENT-NEVER-ESCAPES proof).
+        // A planted `log::info!("dedupe comparing content: {content}")`
+        // inside its body previously passed the entire suite — this
+        // source-text pin closes that gap the same way this file's other
+        // `include_str!` pins do (`prepare_card_answer_request_never_touches_chat_history`
+        // et al.): a future edit that adds ANY `log::*` call inside this
+        // function's body now fails here directly, without needing a
+        // log-capture harness this crate doesn't have.
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn is_duplicate_answered_question(")
+            .expect("is_duplicate_answered_question must exist");
+        let end = source[start..]
+            .find("/// Mirrors the frontend's `normalizeQueueContent`")
+            .map(|rel| start + rel)
+            .expect("normalize_queue_content must follow is_duplicate_answered_question");
+        let body = &source[start..end];
+        assert!(
+            !body.contains("log::"),
+            "is_duplicate_answered_question must never call log::* — the normalized \
+             question content it holds must never reach a log line"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // anchored_or_tail_transcript_window / notes_outline_block
+    // -----------------------------------------------------------------
+
+    fn answer_engine_span(span_id: &str, start_time: f64) -> crate::projections::TranscriptEvent {
+        crate::projections::TranscriptEvent {
+            start_time,
+            end_time: start_time + 1.0,
+            ..transcript_event_fixture(span_id, span_id)
+        }
+    }
+
+    #[test]
+    fn anchored_window_resolves_every_recorded_span_id_and_widens_by_the_configured_margins() {
+        let mut ledger = crate::projections::TranscriptLedger::new("sess-window");
+        for i in 0..20 {
+            ledger
+                .apply_event(answer_engine_span(&format!("span-{i:02}"), i as f64))
+                .expect("seed span");
+        }
+
+        // Anchor at span-10 only: window should be [10-6, 10+2] = [4, 12].
+        let (window, ids) = anchored_or_tail_transcript_window(&ledger, &["span-10".to_string()]);
+        assert_eq!(window.len(), 9, "spans 4..=12 inclusive");
+        assert_eq!(window.first().unwrap().span_id, "span-04");
+        assert_eq!(window.last().unwrap().span_id, "span-12");
+        for id in ["span-04", "span-08", "span-10", "span-12"] {
+            assert!(ids.contains(&id.to_string()), "missing {id} in {ids:?}");
+        }
+        // Every id the window claims must actually resolve in the ledger.
+        for id in &ids {
+            assert!(
+                ledger.latest_spans.iter().any(|span| &span.span_id == id),
+                "window claimed span_id {id} that isn't in the ledger"
+            );
+        }
+
+        // Two anchors (span-2 and span-15): window is [2-6 clamped to 0, 15+2] = [0, 17].
+        let (wide_window, _) = anchored_or_tail_transcript_window(
+            &ledger,
+            &["span-02".to_string(), "span-15".to_string()],
+        );
+        assert_eq!(wide_window.first().unwrap().span_id, "span-00");
+        assert_eq!(wide_window.last().unwrap().span_id, "span-17");
+    }
+
+    #[test]
+    fn anchored_window_falls_back_to_the_tail_when_unanchored_or_empty() {
+        let mut ledger = crate::projections::TranscriptLedger::new("sess-window-tail");
+        for i in 0..20 {
+            ledger
+                .apply_event(answer_engine_span(&format!("span-{i:02}"), i as f64))
+                .expect("seed span");
+        }
+
+        // No matching source_span_ids at all: tail-10 fallback.
+        let (window, ids) =
+            anchored_or_tail_transcript_window(&ledger, &["not-a-real-span".to_string()]);
+        assert_eq!(window.len(), CARD_ANSWER_TAIL_FALLBACK_SPANS);
+        assert_eq!(window.last().unwrap().span_id, "span-19");
+        assert_eq!(ids.len(), CARD_ANSWER_TAIL_FALLBACK_SPANS);
+
+        // Empty source_span_ids (a user-typed question with no anchor):
+        // same tail-10 fallback.
+        let (window_no_ids, _) = anchored_or_tail_transcript_window(&ledger, &[]);
+        assert_eq!(window_no_ids.len(), CARD_ANSWER_TAIL_FALLBACK_SPANS);
+
+        // Empty ledger: no spans to fall back to.
+        let empty_ledger = crate::projections::TranscriptLedger::new("sess-window-empty");
+        let (empty_window, empty_ids) =
+            anchored_or_tail_transcript_window(&empty_ledger, &["span-00".to_string()]);
+        assert!(empty_window.is_empty());
+        assert!(empty_ids.is_empty());
+    }
+
+    fn notes_fixture(
+        titles_and_levels: &[(&str, Option<u8>)],
+    ) -> crate::projections::MaterializedNotes {
+        let mut notes = crate::projections::MaterializedNotes::new("sess-notes");
+        notes.last_sequence = 7;
+        for (i, (title, heading_level)) in titles_and_levels.iter().enumerate() {
+            notes.notes.push(crate::projections::MaterializedNote {
+                id: format!("note-{i}"),
+                title: title.to_string(),
+                body: "irrelevant body text".to_string(),
+                tags: vec![],
+                heading_level: *heading_level,
+                updated_by_sequence: 1,
+                updated_at_ms: 1_700_000_000_000,
+                basis: std::sync::Arc::new(
+                    crate::projections::ProjectionBasis::from_transcript_events(&[]),
+                ),
+                provenance: crate::projections::ProjectionProvenance {
+                    provider: "test".to_string(),
+                    model: "test".to_string(),
+                    prompt_id: "test".to_string(),
+                    route_id: None,
+                    model_source: crate::llm::route::ModelIdentitySource::Requested,
+                },
+                evidence: None,
+            });
+        }
+        notes
+    }
+
+    #[test]
+    fn notes_outline_block_renders_titles_only_never_bodies() {
+        let notes = notes_fixture(&[("Roadmap decisions", Some(0)), ("Open questions", Some(1))]);
+        let (block, last_sequence) = notes_outline_block(Some(&notes));
+        assert!(block.contains("Roadmap decisions"));
+        assert!(block.contains("Open questions"));
+        assert!(
+            !block.contains("irrelevant body text"),
+            "the outline must never carry note bodies, only titles: {block}"
+        );
+        assert_eq!(last_sequence, Some(7));
+    }
+
+    #[test]
+    fn notes_outline_block_is_empty_with_no_last_sequence_when_there_are_no_notes() {
+        let empty_notes = crate::projections::MaterializedNotes::new("sess-notes-empty");
+        let (block, last_sequence) = notes_outline_block(Some(&empty_notes));
+        assert_eq!(block, "");
+        assert_eq!(last_sequence, None);
+
+        let (block_none, last_sequence_none) = notes_outline_block(None);
+        assert_eq!(block_none, "");
+        assert_eq!(last_sequence_none, None);
+    }
+
+    #[test]
+    fn notes_outline_block_stays_under_the_configured_char_cap() {
+        let many_titles: Vec<(&str, Option<u8>)> = (0..500)
+            .map(|_| ("A reasonably long note title about the roadmap", Some(0)))
+            .collect();
+        let notes = notes_fixture(&many_titles);
+        let (block, _) = notes_outline_block(Some(&notes));
+        assert!(
+            block.len() <= CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS + 200,
+            "outline block grew to {} chars, expected to stay near the {} cap",
+            block.len(),
+            CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // top_k_graph_node_ids_for_query
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn top_k_graph_node_ids_ranks_query_term_overlap_over_centrality() {
+        let snapshot = crate::graph::entities::GraphSnapshot {
+            nodes: vec![
+                crate::graph::entities::GraphNode {
+                    id: "n-roadmap".to_string(),
+                    name: "Roadmap".to_string(),
+                    entity_type: "Topic".to_string(),
+                    val: 1.0,
+                    color: "#fff".to_string(),
+                    first_seen: 0.0,
+                    last_seen: 1.0,
+                    mention_count: 1,
+                    description: None,
+                },
+                crate::graph::entities::GraphNode {
+                    id: "n-popular".to_string(),
+                    name: "Unrelated Topic".to_string(),
+                    entity_type: "Topic".to_string(),
+                    val: 1.0,
+                    color: "#fff".to_string(),
+                    first_seen: 0.0,
+                    last_seen: 1.0,
+                    mention_count: 1000,
+                    description: None,
+                },
+            ],
+            links: vec![],
+            stats: Default::default(),
+        };
+        let ids = top_k_graph_node_ids_for_query(&snapshot, "What changed in the roadmap?", 40);
+        assert_eq!(
+            ids.first().map(String::as_str),
+            Some("n-roadmap"),
+            "query-term overlap must outrank raw mention-count centrality: {ids:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // finalize_card_answer: persist-once, ledger, telemetry mapping.
+    // -----------------------------------------------------------------
+
+    fn answer_engine_context(session_id: &str, card_id: &str, auto: bool) -> CardAnswerContext {
+        CardAnswerContext {
+            session_id: session_id.to_string(),
+            card_id: card_id.to_string(),
+            card_kind: events::AgentProposalKind::Question,
+            auto,
+            route_id: "route.openrouter".to_string(),
+            requested_by: events::CardOrigin::Transcript,
+            evidence_span_ids: vec!["span-1".to_string()],
+            evidence_graph_ids: vec!["node-1".to_string()],
+            notes_last_sequence: Some(3),
+            provider_id_for_ledger: "llm.openrouter".to_string(),
+            requires_cloud_transfer: true,
+            cloud_transfer_allowed: true,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn finalize_card_answer_persists_exactly_once_and_appends_exactly_one_terminal_ledger_row() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("answer-engine-finalize-once");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "sess-finalize";
+        let card_id = "card-finalize";
+
+        let seed = answer_engine_test_card(
+            card_id,
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &seed)
+            .expect("seed the pending card");
+
+        let app_handle = crate::speech::shared_test_app_handle();
+        let ctx = answer_engine_context(session_id, card_id, true);
+        finalize_card_answer(
+            &app_handle,
+            &ctx,
+            events::CardAnswerStatus::Answered,
+            "The roadmap moved the launch to Q3.".to_string(),
+            Some("stop".to_string()),
+            Some(42),
+        );
+
+        let audit = FileMemoryRepository::user_data()
+            .load_live_assist_card_audit(session_id)
+            .expect("load audit log");
+        assert_eq!(
+            audit.iter().filter(|c| c.proposal.id == card_id).count(),
+            2,
+            "exactly one NEW audit entry beyond the seed upsert (seed + this one finalize call)"
+        );
+
+        let current = FileMemoryRepository::user_data()
+            .load_live_assist_cards(session_id)
+            .expect("load current cards");
+        let persisted = current
+            .iter()
+            .find(|c| c.proposal.id == card_id)
+            .expect("card still present");
+        let answer = persisted.answer.as_ref().expect("answer persisted");
+        assert_eq!(answer.status, events::CardAnswerStatus::Answered);
+        assert_eq!(answer.text, "The roadmap moved the launch to Q3.");
+        assert_eq!(answer.route_id, "route.openrouter");
+        assert_eq!(answer.evidence_span_ids, vec!["span-1".to_string()]);
+        assert_eq!(answer.evidence_graph_ids, vec!["node-1".to_string()]);
+        assert_eq!(answer.notes_last_sequence, Some(3));
+
+        let ledger_rows = FileMemoryRepository::user_data()
+            .load_data_movement_events(session_id)
+            .expect("load movement ledger");
+        assert_eq!(
+            ledger_rows.len(),
+            1,
+            "finalize_card_answer appends exactly one terminal ledger row"
+        );
+        assert_eq!(
+            ledger_rows[0].event_type,
+            crate::persistence::DataMovementEventType::ProviderCallSucceeded
+        );
+        assert_eq!(
+            ledger_rows[0].source.as_ref().map(|s| s.kind.as_str()),
+            Some("assist_auto_answer")
+        );
+        assert_eq!(
+            ledger_rows[0].actor,
+            crate::persistence::DataMovementActor::System
+        );
+
+        // Content-free: the ledger row never carries the answer text.
+        let serialized = serde_json::to_string(&ledger_rows[0]).expect("serialize ledger row");
+        assert!(!serialized.contains("roadmap moved the launch"));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn finalize_card_answer_caps_an_over_limit_answer_instead_of_losing_it_to_the_validator() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("answer-engine-finalize-cap");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "sess-finalize-cap";
+        let card_id = "card-finalize-cap";
+
+        let seed = answer_engine_test_card(
+            card_id,
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &seed)
+            .expect("seed the pending card");
+
+        let app_handle = crate::speech::shared_test_app_handle();
+        let ctx = answer_engine_context(session_id, card_id, false);
+        let oversized = "a".repeat(events::MAX_CARD_ANSWER_TEXT_CHARS + 500);
+        finalize_card_answer(
+            &app_handle,
+            &ctx,
+            events::CardAnswerStatus::Answered,
+            oversized,
+            Some("length".to_string()),
+            Some(9000),
+        );
+
+        let current = FileMemoryRepository::user_data()
+            .load_live_assist_cards(session_id)
+            .expect("load current cards");
+        let persisted = current
+            .iter()
+            .find(|c| c.proposal.id == card_id)
+            .expect("card still present — a caps-then-persists path must not lose the card");
+        let answer = persisted.answer.as_ref().expect("answer persisted");
+        assert!(
+            answer.truncated,
+            "an over-cap answer must be marked truncated"
+        );
+        assert_eq!(
+            answer.text.chars().count(),
+            events::MAX_CARD_ANSWER_TEXT_CHARS
+        );
+    }
+
+    #[test]
+    fn finalize_card_answer_terminal_ledger_event_type_matches_card_answer_status() {
+        for (status, expected) in [
+            (
+                events::CardAnswerStatus::Answered,
+                crate::persistence::DataMovementEventType::ProviderCallSucceeded,
+            ),
+            (
+                events::CardAnswerStatus::Failed,
+                crate::persistence::DataMovementEventType::ProviderCallFailed,
+            ),
+            (
+                events::CardAnswerStatus::Interrupted,
+                crate::persistence::DataMovementEventType::ProviderCallCancelled,
+            ),
+        ] {
+            let event = build_assist_answer_terminal_event(
+                "sess-x",
+                true,
+                "card-x",
+                "llm.openrouter",
+                true,
+                true,
+                false,
+                status,
+            );
+            assert_eq!(event.event_type, expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn assist_answer_action_id_and_actor_are_distinct_for_auto_vs_manual() {
+        assert_eq!(assist_answer_action_id(true), "assist_auto_answer");
+        assert_eq!(assist_answer_action_id(false), "assist_manual_answer");
+        assert_eq!(
+            assist_answer_actor(true),
+            crate::persistence::DataMovementActor::System
+        );
+        assert_eq!(
+            assist_answer_actor(false),
+            crate::persistence::DataMovementActor::User
+        );
+    }
+
+    #[test]
+    fn assist_answer_data_classes_stay_minimal_locally_and_widen_only_for_remote() {
+        let local = assist_answer_data_classes(false, true);
+        assert!(local.contains(&crate::persistence::DataClass::Prompts));
+        assert!(local.contains(&crate::persistence::DataClass::TranscriptText));
+        assert!(!local.contains(&crate::persistence::DataClass::GraphContext));
+        assert!(!local.contains(&crate::persistence::DataClass::Notes));
+
+        let remote_no_notes = assist_answer_data_classes(true, false);
+        assert!(remote_no_notes.contains(&crate::persistence::DataClass::GraphContext));
+        assert!(!remote_no_notes.contains(&crate::persistence::DataClass::Notes));
+
+        let remote_with_notes = assist_answer_data_classes(true, true);
+        assert!(remote_with_notes.contains(&crate::persistence::DataClass::Notes));
+    }
+
+    // -----------------------------------------------------------------
+    // deliverable e: speak-aloud forced off for auto.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn effective_speak_aloud_forces_off_for_auto_regardless_of_the_setting() {
+        assert!(!effective_speak_aloud_for_dispatch(true, true));
+        assert!(!effective_speak_aloud_for_dispatch(true, false));
+        assert!(effective_speak_aloud_for_dispatch(false, true));
+        assert!(!effective_speak_aloud_for_dispatch(false, false));
+    }
+
+    // -----------------------------------------------------------------
+    // Source-order / no-cross-contamination pins, for the properties that
+    // are structural rather than behaviorally observable without a live
+    // `tauri::ipc::Channel` (this crate has no test harness for
+    // constructing one — see e.g. `start_streaming_chat`, which for the
+    // same reason has no direct test coverage of its own either).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn prepare_card_answer_request_never_touches_chat_history() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn prepare_card_answer_request(")
+            .expect("prepare_card_answer_request must exist");
+        let end = source[start..]
+            .find("/// Deliverable e: whether THIS dispatch may speak")
+            .map(|rel| start + rel)
+            .expect("effective_speak_aloud_for_dispatch must follow prepare_card_answer_request");
+        assert!(
+            !source[start..end].contains("chat_history"),
+            "prepare_card_answer_request must never read or write chat_history (C4)"
+        );
+    }
+
+    #[test]
+    fn spawn_card_answer_stream_task_never_touches_chat_history_or_cancels_a_prior_stream() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn spawn_card_answer_stream_task(")
+            .expect("spawn_card_answer_stream_task must exist");
+        let end = source[start..]
+            .find("/// Shared body of `answer_question_card`")
+            .map(|rel| start + rel)
+            .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
+        let body = &source[start..end];
+        assert!(
+            !body.contains("chat_history"),
+            "the answer stream task must never touch chat_history (C4)"
+        );
+        assert!(
+            !body.contains("cancel_all"),
+            "the answer stream task must never cancel a prior stream (refuse-not-cancel)"
+        );
+        assert!(
+            !body.contains("registry.cancel("),
+            "the answer stream task must never cancel another registered stream by id either"
+        );
+    }
+
+    #[test]
+    fn spawn_card_answer_stream_task_finishes_the_registry_after_the_loop_as_a_leak_backstop() {
+        // Fix-round finding (adversarial review, minor): if the stream ends
+        // without ever sending a terminal frame (producer panic, sender
+        // dropped), every match arm's own `registry.finish` is unreached,
+        // and — because this path is refuse-not-cancel — the leaked entry
+        // would wedge the `Busy` gate for the rest of the session. Pins
+        // that a `registry.finish(&request_id_for_task)` call exists
+        // OUTSIDE (after) the `while` loop as a backstop, in addition to
+        // the 4 per-arm calls inside it (Delta no longer calls it at all
+        // post the channel-drop durability fix below; Done/Error/Cancelled
+        // each still call it once).
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn spawn_card_answer_stream_task(")
+            .expect("spawn_card_answer_stream_task must exist");
+        let end = source[start..]
+            .find("/// Shared body of `answer_question_card`")
+            .map(|rel| start + rel)
+            .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
+        let body = &source[start..end];
+
+        let loop_end = body
+            .rfind("\n        }\n")
+            .expect("the while loop's closing brace must exist");
+        let after_loop = &body[loop_end..];
+        assert!(
+            after_loop.contains("registry.finish(&request_id_for_task);"),
+            "a backstop registry.finish must run after the while loop exits, \
+             for the no-terminal-frame case none of the match arms cover"
+        );
+
+        let finish_count = body
+            .matches("registry.finish(&request_id_for_task);")
+            .count();
+        assert_eq!(
+            finish_count, 4,
+            "expected exactly 4 registry.finish calls: Done + Error + Cancelled \
+             (one each) + the post-loop backstop — Delta intentionally does not \
+             call it (see the channel-drop durability test below)"
+        );
+    }
+
+    #[test]
+    fn spawn_card_answer_stream_task_keeps_draining_after_a_dropped_delta_channel() {
+        // Fix-round finding (adversarial review, minor): the Delta arm used
+        // to `return` immediately when `channel.send` failed (frontend
+        // window closed/navigated mid-stream) — WITHOUT ever calling
+        // `finalize_card_answer`. That silently abandoned an
+        // already-charged auto dispatch: no persisted answer, no terminal
+        // ledger row, breaking the claimed 1:1 started/terminal ledger
+        // pairing this same test module pins elsewhere
+        // (`finalize_card_answer_persists_exactly_once_and_appends_exactly_one_terminal_ledger_row`).
+        // The fix marks the channel dead and keeps draining to the actual
+        // terminal frame instead of bailing out early. Source-text pin:
+        // the `TokenDelta::Delta` arm must set a "channel is gone" flag on
+        // send failure but must NOT `return` — only the terminal arms
+        // (Done/Error/Cancelled) may return.
+        let source = include_str!("commands.rs");
+        let fn_start = source
+            .find("fn spawn_card_answer_stream_task(")
+            .expect("spawn_card_answer_stream_task must exist");
+        let fn_end = source[fn_start..]
+            .find("/// Shared body of `answer_question_card`")
+            .map(|rel| fn_start + rel)
+            .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
+        let fn_body = &source[fn_start..fn_end];
+
+        // Scoped to THIS function's body — `TokenDelta::Delta {` also
+        // appears in the pre-existing, unrelated chat path
+        // (`spawn_stream_task`) earlier in the file; an unscoped `find`
+        // would silently pin the wrong function.
+        let delta_start = fn_body
+            .find("TokenDelta::Delta {")
+            .expect("the Delta arm must exist");
+        let delta_end = fn_body[delta_start..]
+            .find("TokenDelta::Done {")
+            .map(|rel| delta_start + rel)
+            .expect("the Done arm must follow the Delta arm");
+        let delta_body = &fn_body[delta_start..delta_end];
+
+        assert!(
+            delta_body.contains("channel_alive = false;"),
+            "the Delta arm must mark the channel dead on a send failure, not \
+             abandon the dispatch"
+        );
+        assert!(
+            !delta_body.contains("return;"),
+            "the Delta arm must never `return` early — doing so on a channel \
+             send failure skips finalize_card_answer entirely, orphaning an \
+             already-charged dispatch with no persisted answer and no \
+             terminal ledger row"
+        );
+    }
+
+    #[test]
+    fn answer_question_card_impl_enforces_privacy_policy_before_any_retrieval_or_dispatch() {
+        // Source-order pin (the `Channel`-construction gap noted above means
+        // this can't be proven by actually invoking the command and
+        // observing "no HTTP request happened"): `enforce_session_content_policy`
+        // must appear, textually, before `prepare_card_answer_request` and
+        // before `spawn_card_answer_stream_task` inside
+        // `answer_question_card_impl`'s body — so a `PrivacyPolicyBlocked`
+        // `Err` returned by the former (via `?`) makes the latter two
+        // provably unreachable for that call.
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("async fn answer_question_card_impl(")
+            .expect("answer_question_card_impl must exist");
+        let end = source[start..]
+            .find("/// Auto path (deliverable a)")
+            .map(|rel| start + rel)
+            .expect("answer_question_card must follow answer_question_card_impl");
+        let body = &source[start..end];
+
+        let policy_pos = body
+            .find("enforce_session_content_policy(")
+            .expect("the privacy policy gate must be called");
+        let prepare_pos = body
+            .find("prepare_card_answer_request(")
+            .expect("prepare_card_answer_request must be called");
+        let spawn_pos = body
+            .find("spawn_card_answer_stream_task(")
+            .expect("spawn_card_answer_stream_task must be called");
+
+        assert!(
+            policy_pos < prepare_pos,
+            "policy gate must precede retrieval"
+        );
+        assert!(policy_pos < spawn_pos, "policy gate must precede dispatch");
+    }
+
+    #[test]
+    fn answer_question_card_impl_increments_the_auto_counter_only_after_the_gate_and_only_for_auto()
+    {
+        // Source-order + presence pin, same `Channel`-construction
+        // limitation as above: the counter increment must appear AFTER the
+        // spend-gate's early return and must be conditioned on `auto`, so a
+        // refused or manual dispatch never counts against the cap.
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("async fn answer_question_card_impl(")
+            .expect("answer_question_card_impl must exist");
+        let end = source[start..]
+            .find("/// Auto path (deliverable a)")
+            .map(|rel| start + rel)
+            .expect("answer_question_card must follow answer_question_card_impl");
+        let body = &source[start..end];
+
+        let gate_return_pos = body
+            .find("return Ok(AnswerDispatch::Refused { reason });")
+            .expect("the gate's early-return must exist");
+        let counter_pos = body
+            .find("agent_auto_answer_session_count\n            .fetch_add(1, Ordering::SeqCst);")
+            .expect("the dispatch-time counter increment must exist");
+        assert!(
+            gate_return_pos < counter_pos,
+            "the counter increment must be reachable only after the gate's early return"
+        );
+        // The increment sits inside `if auto { ... }` — pinned by presence
+        // of the guard immediately before it in the body's byte range.
+        let if_auto_pos = body
+            .rfind("if auto {")
+            .expect("the counter increment must be guarded by `if auto`");
+        assert!(if_auto_pos < counter_pos && counter_pos - if_auto_pos < 200);
+    }
+
+    #[test]
+    fn answer_question_card_impl_computes_effective_speak_aloud_via_the_auto_flag() {
+        // Fix-round finding (adversarial review, major): the pure helper
+        // `effective_speak_aloud_for_dispatch` is fully unit-tested (see
+        // `effective_speak_aloud_forces_off_for_auto_regardless_of_the_setting`),
+        // but nothing previously pinned that `answer_question_card_impl`
+        // actually calls it WITH the real `auto` flag. A plant-and-revert
+        // probe changing the call site to
+        // `effective_speak_aloud_for_dispatch(false, settings.speak_aloud)`
+        // — which makes every AUTO answer speak aloud whenever the user's
+        // `speak_aloud` setting is on, violating Q6 — passed the entire
+        // `commands::tests` suite AND `cargo clippy -D warnings` before this
+        // pin existed. Source-text presence pin: the literal call must
+        // appear inside this function's body with `auto` (not a hardcoded
+        // `true`/`false`) as its first argument.
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("async fn answer_question_card_impl(")
+            .expect("answer_question_card_impl must exist");
+        let end = source[start..]
+            .find("/// Auto path (deliverable a)")
+            .map(|rel| start + rel)
+            .expect("answer_question_card must follow answer_question_card_impl");
+        let body = &source[start..end];
+        assert!(
+            body.contains("effective_speak_aloud_for_dispatch(auto, settings.speak_aloud)"),
+            "answer_question_card_impl must compute effective_speak_aloud via the \
+             real `auto` flag, not a hardcoded boolean (Q6: auto answers must \
+             never speak aloud)"
+        );
+    }
+
+    #[test]
+    fn answer_question_card_and_ask_question_card_pass_the_correct_auto_boolean() {
+        // Fix-round finding (scope-honesty review, major): the ONLY thing
+        // distinguishing the auto path from the manual path at the very top
+        // of the call chain is a single boolean literal at each of these
+        // two `#[tauri::command]` wrappers — nothing previously pinned
+        // which literal goes where. A single-character mutation swapping
+        // either wrapper's boolean (e.g. `answer_question_card` delegating
+        // with `false`) silently drops WeakSignal/Converse/Duplicate/
+        // Interval/Capped for what the frontend believes is the auto path
+        // — uncapping automatic spend — and the full suite still passed:
+        // the gate tests call `evaluate_answer_spend_gate` with an explicit
+        // `auto` argument of their own choosing, and every source-order pin
+        // above scans only `answer_question_card_impl`'s body, never the
+        // two thin wrapper bodies.
+        let source = include_str!("commands.rs");
+
+        let auto_start = source
+            .find("pub async fn answer_question_card(")
+            .expect("answer_question_card must exist");
+        let auto_end = source[auto_start..]
+            .find("/// Manual path (deliverable a)")
+            .map(|rel| auto_start + rel)
+            .expect("ask_question_card must follow answer_question_card");
+        let auto_body = &source[auto_start..auto_end];
+        assert!(
+            auto_body.contains(
+                "answer_question_card_impl(proposal_id, true, channel, app, state.inner()).await"
+            ),
+            "answer_question_card (the auto command) must delegate with auto=true"
+        );
+
+        let manual_end = source[auto_end..]
+            .find("// Model management commands")
+            .map(|rel| auto_end + rel)
+            .expect("the model-management section must follow ask_question_card");
+        let manual_body = &source[auto_end..manual_end];
+        assert!(
+            manual_body.contains(
+                "answer_question_card_impl(proposal_id, false, channel, app, state.inner()).await"
+            ),
+            "ask_question_card (the manual command) must delegate with auto=false"
         );
     }
 }

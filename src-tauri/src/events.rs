@@ -80,6 +80,14 @@ pub const AGENT_STATUS: &str = "agent-status";
 /// the user to inspect. Proposals stay advisory until the user approves them.
 pub const AGENT_PROPOSAL: &str = "agent-proposal";
 
+/// Event emitted after a live-assist card's [`CardAnswer`] is written
+/// (audio-graph-83cc, T3), once on the answer stream's terminal frame —
+/// never per-delta (see `commands::finalize_card_answer`). Payload is the
+/// full, just-upserted [`LiveAssistCardRecord`]; the frontend's existing
+/// `upsertLiveAssistCard` store action (unused in production before this
+/// unit) consumes exactly this shape.
+pub const AGENT_CARD_UPDATE: &str = "agent-card-update";
+
 /// Event emitted when a new speaker is first identified.
 pub const SPEAKER_DETECTED: &str = "speaker-detected";
 
@@ -532,16 +540,112 @@ pub enum CardOrigin {
 }
 
 /// Terminal (or interrupted) state of a [`CardAnswer`] (audio-graph-83cc,
-/// T1). `Answered` and `Failed` are self-explanatory; `Interrupted` is a
-/// user-preempted auto-answer (T3's single-flight gate cancels the
-/// in-progress stream of a *user* action, never the reverse) whose partial
-/// text is still recorded, not discarded.
+/// T1). `Answered` and `Failed` are self-explanatory.
+///
+/// **T3 correction to this doc comment's original framing (and to a second,
+/// too-narrow correction attempt caught in fix-round review):**
+/// `Interrupted` is NOT produced by T3's own spend gate actively cancelling
+/// anything — the gate's `stream_registry.is_empty()` check is
+/// refuse-not-cancel in BOTH directions (auto AND manual never call
+/// `cancel_all`/`cancel` on each other; see
+/// `commands::evaluate_answer_spend_gate`'s `Busy` reason and the regression
+/// test pinning "registry non-empty ⇒ refused, no cancel_all"). But an
+/// answer stream registers its `request_id` in the SAME
+/// `state.stream_registry` a chat stream does (`commands::
+/// spawn_card_answer_stream_task`), so `Interrupted` IS reachable from a
+/// PRE-EXISTING, unrelated action while an answer is in flight, via either
+/// of two paths: (1) `cancel_streaming_chat(request_id)` invoked against the
+/// answer stream's own `request_id`, or (2) — the case the doc's previous
+/// revision missed — the user sending an ordinary chat message while an
+/// auto/manual answer is streaming: `start_streaming_chat` →
+/// `spawn_stream_task` unconditionally calls `stream_registry.cancel_all()`
+/// before registering its own stream, which also cancels any in-flight
+/// answer stream. Either way, the cancelled stream's terminal frame becomes
+/// `TokenDelta::Cancelled`, which `commands::finalize_card_answer` maps to
+/// this status, preserving whatever partial text had streamed so far rather
+/// than discarding it. This is a genuine cross-path interaction introduced
+/// by sharing the registry, not a defect T3 needs to close — a user's
+/// explicit chat action legitimately pre-empting a background auto-answer
+/// is the correct behavior — but it is a real reachability path and is
+/// documented here so a future reader does not assume (as this doc's first
+/// T3 revision did) that only `cancel_streaming_chat` can produce it.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CardAnswerStatus {
     Answered,
     Failed,
     Interrupted,
+}
+
+/// Typed reason [`crate::commands::evaluate_answer_spend_gate`] refused to
+/// dispatch an answer (audio-graph-83cc, T3). Every variant is renderable —
+/// closed, content-free, and returned to the caller inside
+/// `AnswerDispatch::Refused` (a normal `Ok(...)` outcome, not an `AppError`:
+/// a refusal is an expected, common result of the spend gate, not a
+/// failure) — so the frontend can localize/display exactly why a dispatch
+/// did not happen without ever seeing raw question/answer content.
+///
+/// Order mirrors the gate's own evaluation order for the auto path
+/// (`enabled → NotQuestion → WeakSignal → Converse → Duplicate → Busy →
+/// Interval → Capped`); the manual path evaluates only
+/// `Disabled`/`NotQuestion`/`Busy`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerRefusalReason {
+    /// `AgentAutoAnswerSettings.enabled` is `false`. Gates BOTH the auto and
+    /// the manual path — a maintainer/user who turns the whole answer
+    /// engine off stops all card-answer LLM spend, not only the automatic
+    /// half.
+    Disabled,
+    /// The card's `proposal.kind != Question`. Checked independently of the
+    /// Rust signal grade (T2's `agent_signal_grade` grades every non-question
+    /// kind `Strong` by construction — see that function's doc comment — so
+    /// this check is what keeps the gate self-sufficient against a caller
+    /// that names a note/graph-suggestion card; Q2 requires the Rust gate to
+    /// "hold alone").
+    NotQuestion,
+    /// Auto path only: the card's Rust-stamped `signal != Some(Strong)`.
+    /// Never evaluated for a manual ask — fragments keep manual Ask AI by
+    /// design (P4).
+    WeakSignal,
+    /// Auto path only. Fires in two cases: (1) THIS card already carries a
+    /// terminal answer (`card.answer.is_some()`) — refuses a repeated
+    /// dispatch against the same already-answered card, closing a spend
+    /// gap a re-triggered FE admit or an upserted-proposal replay could
+    /// otherwise exploit up to the full session cap (fix-round finding,
+    /// scope-honesty review); or (2) another card in this session already
+    /// carries an `Answered`/`Failed`/`Interrupted` answer for the same
+    /// normalized question content (see
+    /// `crate::commands::is_duplicate_answered_question` — content is
+    /// compared in-process and never logged; only this reason class is).
+    /// Case (2) ports the frontend's unported duplicate-collapse admission
+    /// filter into the one place it is load-bearing for spend. Neither case
+    /// applies to a manual ask — re-asking an already-answered card
+    /// manually is T4's retry affordance.
+    Duplicate,
+    /// Auto path only: `AppState::is_converse_active` (native S2S converse)
+    /// is true. The design-panel synthesis's mode exclusion is broader —
+    /// "no auto-answer while `conversationMode === 'converse'`", covering
+    /// BOTH the native and the pipelined engine — but the pipelined half is
+    /// tracked ONLY in the frontend store (`useConverseFrontLeg`'s busy
+    /// guard), with no backend-observable flag, and this unit adds zero
+    /// frontend files. This variant closes the half Rust CAN see; the
+    /// pipelined half stays the FE trigger's (`autoAnswerAdmits`, T5)
+    /// responsibility, same posture as Q2's "FE admit additionally
+    /// required for one release" — named, bounded, not smuggled.
+    Converse,
+    /// `!state.stream_registry.is_empty()`. Refuse, never cancel — see this
+    /// enum's module-level note and `CardAnswerStatus::Interrupted`'s doc
+    /// comment for why neither dispatch path ever calls `cancel_all`/`cancel`.
+    Busy,
+    /// Auto path only: fewer than `min_interval_secs` have elapsed since the
+    /// session's last auto-dispatch.
+    Interval,
+    /// Auto path only: `max_per_session` auto-dispatches already counted
+    /// this session. Counts DISPATCHES (attempts), not completions or
+    /// tokens — see `AppState::agent_auto_answer_session_count`'s doc
+    /// comment.
+    Capped,
 }
 
 /// Hard cap on [`CardAnswer::text`]'s length, enforced by

@@ -241,6 +241,23 @@ pub struct AppState {
     /// Agent/react proposals that are awaiting user approval.
     pub pending_agent_proposals: Arc<Mutex<HashMap<String, crate::events::AgentProposalPayload>>>,
 
+    /// Per-session running count of AUTO-answer dispatches (audio-graph-83cc,
+    /// T3's spend gate). Counts DISPATCHES (attempts), never tokens or
+    /// completions — `persist_llm_usage_for_session` early-returns when a
+    /// provider omits usage, so a token budget is unenforceable against
+    /// exactly the providers most likely to blow it, while a dispatch count
+    /// is exact and honest. Incremented once per AUTO dispatch, at dispatch
+    /// time (before the stream starts), never at the terminal frame — a
+    /// refused or never-attempted call must not count against the cap.
+    /// Reset to 0 on session rotation (`rotate_session`, next to the other
+    /// per-session aggregate resets) so the cap is per-session, matching Q1's
+    /// ratified `max_per_session` semantics.
+    pub agent_auto_answer_session_count: Arc<AtomicU64>,
+    /// Unix-ms timestamp of the most recent AUTO-answer dispatch; `0` means
+    /// "no auto-dispatch yet this session". Backs the `min_interval_secs`
+    /// gate. Reset to 0 on session rotation.
+    pub agent_auto_answer_last_dispatch_ms: Arc<AtomicU64>,
+
     // ── Audio capture infrastructure ────────────────────────────────────
     /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
     pub capture_manager: Arc<Mutex<AudioCaptureManager>>,
@@ -872,6 +889,8 @@ impl AppState {
             audio_player: crate::playback::AudioPlayer::new(),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+            agent_auto_answer_session_count: Arc::new(AtomicU64::new(0)),
+            agent_auto_answer_last_dispatch_ms: Arc::new(AtomicU64::new(0)),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
             pipeline_rx,
@@ -1131,6 +1150,14 @@ impl AppState {
             };
             proposals.clear();
         }
+        // audio-graph-83cc T3: the auto-answer spend gate's counters are
+        // per-SESSION (Q1's `max_per_session` / `min_interval_secs`), so a
+        // rotation must reset both to their session-start values, same as
+        // every other per-session aggregate in this block.
+        self.agent_auto_answer_session_count
+            .store(0, Ordering::SeqCst);
+        self.agent_auto_answer_last_dispatch_ms
+            .store(0, Ordering::SeqCst);
         {
             let mut status = match self.pipeline_status.write() {
                 Ok(guard) => guard,

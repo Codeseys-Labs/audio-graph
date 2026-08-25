@@ -636,6 +636,8 @@ pub fn run() {
             commands::dismiss_agent_proposal,
             commands::clear_agent_proposals,
             commands::add_question_to_graph,
+            commands::answer_question_card,
+            commands::ask_question_card,
             commands::merge_graph_entities,
             commands::list_available_models,
             commands::download_model_cmd,
