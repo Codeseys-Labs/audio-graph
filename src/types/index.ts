@@ -1643,6 +1643,39 @@ export interface AppSettings {
    * field (default `Some(false)`).
    */
   analytics_enabled?: boolean;
+  /**
+   * Auto-answer engine settings (audio-graph-83cc, T3 backend; mirrored
+   * read-only here for T5 — deliverable f). Mirrors Rust
+   * `crate::settings::AgentAutoAnswerSettings`
+   * (`src-tauri/src/settings/mod.rs`); `#[serde(default)]` there means an
+   * older settings file with no `agent_auto_answer` key still round-trips,
+   * so this stays optional here too rather than assuming presence.
+   * `enabled` is the WHOLE answer engine's off switch (both the auto and
+   * the manual live-assist-card answer path — see that Rust struct's own
+   * doc comment) — T5's auto-answer TRIGGER reads it as its belt check
+   * (never even attempt the dispatch when disabled) alongside Rust's own
+   * suspenders (`evaluate_answer_spend_gate`'s `Disabled` refusal, which
+   * holds even if this mirror is stale or a caller skips reading it). This
+   * type has no settings-panel writer in this unit (T6's scope) — read-only
+   * by design, for now.
+   */
+  agent_auto_answer?: AgentAutoAnswerSettings;
+}
+
+/**
+ * Auto-answer engine settings (audio-graph-83cc, T3 backend; mirrors Rust
+ * `crate::settings::AgentAutoAnswerSettings`, `src-tauri/src/settings/mod.rs`).
+ * See {@link AppSettings.agent_auto_answer}'s doc for why this mirror exists
+ * and why it is read-only as of T5.
+ */
+export interface AgentAutoAnswerSettings {
+  /** Q1 ratified default: `true`. The whole engine's off switch — governs
+   * both the auto path AND the manual Ask AI / typed-question path. */
+  enabled: boolean;
+  /** Q1 ratified default: `12`. Bounds only the AUTO path's spend. */
+  max_per_session: number;
+  /** Q1 ratified default: `45`. Bounds only the AUTO path's spend. */
+  min_interval_secs: number;
 }
 
 /**
@@ -3019,6 +3052,21 @@ export interface AudioGraphStore {
   agentProposals: AgentProposalEvent[];
   liveAssistCards: LiveAssistCardRecord[];
   approvingAgentProposalIds: string[];
+  /**
+   * Proposal ids the auto-answer trigger has ATTEMPTED a dispatch for, this
+   * session (audio-graph-83cc T5, deliverable b) — recorded synchronously
+   * in `addAgentProposal`, before the async `answerQuestionCard(id, true)`
+   * call even starts, the first time `autoAnswerAdmits` admits a proposal.
+   * Never removed and never re-checked-then-retried, regardless of the
+   * dispatch's outcome (accepted, refused, or a later stream failure): this
+   * is what makes a DUPLICATE `addAgentProposal` call for the exact same id
+   * (upsert semantics — a replayed/re-emitted backend event, a
+   * double-mount) dispatch AT MOST once, and it is deliberately NOT a retry
+   * mechanism (the ticket's own stop condition) — the only way back in for
+   * a specific card, ever, is the manual Ask AI / Retry button. Reset in
+   * `resetSessionView` alongside the other session-scoped answer state.
+   */
+  autoAnswerAttemptedProposalIds: Set<string>;
   addTranscriptSegment: (segment: TranscriptSegment) => void;
   setAsrPartial: (partial: AsrPartialEvent | null) => void;
   addAsrSpanRevision: (revision: AsrSpanRevisionEvent) => void;
@@ -3049,6 +3097,22 @@ export interface AudioGraphStore {
    * exists to key a per-card draft against. Rendered inline in the composer;
    * cleared at the start of the next submit attempt. */
   composerError: string | null;
+  /**
+   * Count of SUCCESSFULLY dispatched auto-answers this session
+   * (audio-graph-83cc T5, deliverable e) — incremented only when
+   * `answerQuestionCard(proposalId, true)`'s `invoke` resolves (i.e. Rust's
+   * own spend gate accepted the dispatch), never on a refusal, so a burst of
+   * refused auto-triggers never inflates the counter chip. NOT derived from
+   * `liveAssistCards`/`CardAnswer.requested_by`: that field is `"transcript"`
+   * for BOTH an auto dispatch and a manual "Ask AI" click on a
+   * transcript-detected question (see `commands.rs`'s `requested_by`
+   * assignment), so counting answered cards by that field would conflate
+   * the two. Reset to `0` in `resetSessionView` — the same single
+   * session-boundary reset point `answerDrafts`/`composerError` use (T4
+   * fix-round finding), not duplicated across every other `liveAssistCards`
+   * reset site.
+   */
+  autoAnswerDispatchCount: number;
   setAnswerDraft: (cardId: string, draft: AnswerDraftState) => void;
   appendAnswerDraftDelta: (
     cardId: string,
@@ -3057,6 +3121,9 @@ export interface AudioGraphStore {
   ) => void;
   clearAnswerDraft: (cardId: string) => void;
   setComposerError: (message: string | null) => void;
+  /** Increments `autoAnswerDispatchCount` by 1. Called ONLY from
+   * `answerQuestionCard`'s success branch when `auto === true`. */
+  recordAutoAnswerDispatch: () => void;
   /**
    * Composer submit for a free-form, user-typed question (audio-graph-83cc
    * T4, deliverable b). Invokes `ask_question_card` (T3's command name per
@@ -3075,8 +3142,19 @@ export interface AudioGraphStore {
    * a `CardAnswer.status === "failed"` thread. Degrades gracefully while T3
    * is unlanded: a rejected `invoke` sets a failed `answerDraft` for this
    * card, never throws.
+   *
+   * `auto` (audio-graph-83cc T5, deliverable b): defaults to `false` so
+   * every existing manual call site (the queue row's Ask AI button, the
+   * feed row's read-only Retry-via-queue, and this file's own Retry
+   * affordance) is unaffected. `true` is passed ONLY by the auto-answer
+   * trigger in `addAgentProposal` — sharing this SAME action rather than a
+   * duplicated dispatch keeps the coalescer/draft logic single-sourced (per
+   * the ticket's "do NOT duplicate the coalescer/draft logic"). See this
+   * action's implementation for the `auto`-specific behavior differences:
+   * no optimistic pre-invoke draft, and drop-not-queue on refusal (never an
+   * error banner, never a "failed" draft) — deliverable c.
    */
-  answerQuestionCard: (proposalId: string) => Promise<void>;
+  answerQuestionCard: (proposalId: string, auto?: boolean) => Promise<void>;
   clearTranscript: () => void;
   /** Clear every frontend projection owned by the current session view. */
   resetSessionView: () => void;

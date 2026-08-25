@@ -1287,7 +1287,9 @@
     "answerEvidenceSpans_one": "{{count}} trecho",
     "answerEvidenceSpans_other": "{{count}} trechos",
     "answerEvidenceGraph_one": "{{count}} nó",
-    "answerEvidenceGraph_other": "{{count}} nós"
+    "answerEvidenceGraph_other": "{{count}} nós",
+    "autoAnswerCount": "{{count}}/{{cap}}",
+    "autoAnswerCountAria": "{{count}} de {{cap}} respostas automáticas usadas nesta sessão"
   },
   "projectionDiagnostics": {
     "title": "Diagnósticos de projeção",

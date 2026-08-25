@@ -10,6 +10,15 @@
  * `liveAssistCards` store fields. `selectAgentQueue` is the one call site
  * `AgentProposalsPanel` uses; it does not read the store itself, so it stays
  * trivially unit-testable without a Zustand harness.
+ *
+ * audio-graph-83cc T5 adds two more pure exports on top of the same
+ * foundation: `classifyQueueEntry`'s "answered ⇒ feed" branch (an answered
+ * card resolves out of the actionable queue with its thread attached), and
+ * `autoAnswerAdmits` (the FE half of the auto-answer trigger's admission
+ * gate — see that function's own doc for why it calls `selectAgentQueue`
+ * itself rather than re-deriving the Signal bar). Both stay pure/DOM-free
+ * for the same reason the rest of this module is; the actual dispatch side
+ * effect lives in `store/index.ts`'s `addAgentProposal`.
  */
 import type { AgentProposalEvent, LiveAssistCardRecord } from "../../types";
 
@@ -237,12 +246,28 @@ function hasDanglingClauseEnding(text: string): boolean {
  * collapsed `Details` disclosure with no reachable Retry — the exact
  * regression an adversarial review caught against `askQuestion`'s minted
  * cards.
+ *
+ * audio-graph-83cc T5 (deliverable d, design panel synthesis §4 item 6 /
+ * angle-a §2.6's lifecycle diagram): a card carrying a TERMINAL,
+ * non-`"failed"` `answer` (`"answered"` or `"interrupted"`) resolves to
+ * `"info"` unconditionally — the answer, not the detection-quality signal,
+ * is the point once a thread exists, and this must apply to a `origin ===
+ * "user"` card exactly the same as a transcript-detected one (checked
+ * BEFORE the origin exemption below, not after). A `"failed"` answer
+ * deliberately does NOT take this branch — it falls through to the normal
+ * rules below (which resolve to `"actionable"` for anything that isn't
+ * independently fragment-suspect) so Retry stays reachable from the queue,
+ * per the lifecycle diagram's own "Failed stays actionable" line. A card
+ * with no `answer` at all (every legacy pre-83cc record, and every
+ * question nobody has dispatched yet) is completely unaffected — this is
+ * an additive branch, not a rewrite of the existing table.
  */
 export function classifyQueueEntry(
   card: LiveAssistCardRecord,
   isActionable: boolean,
 ): QueueEntryClassification {
   if (!isActionable) return "info";
+  if (card.answer && card.answer.status !== "failed") return "info";
   if (card.origin === "user") return "actionable";
 
   const { proposal } = card;
@@ -424,11 +449,75 @@ export function selectAgentQueue(
     if (classification === "fragment_suspect") {
       fragmentSuspectIds.add(card.proposal.id);
     }
-    if (isActionable && admit(card, classification)) {
+    // audio-graph-83cc T5: `classification === "info"` can now be TRUE even
+    // when `isActionable` is true (an answered card — see
+    // `classifyQueueEntry`'s new branch above). Pre-T5, `"info"` only ever
+    // co-occurred with `!isActionable` (the branch above returns "info"
+    // before this point is ever reached with `isActionable === true`), so
+    // `isActionable && admit(...)` alone correctly kept every `"info"` card
+    // out of the queue. That invariant no longer holds, so the decision
+    // below checks the classification explicitly rather than relying on
+    // `isActionable` to imply it: an `"info"` card always goes to the feed,
+    // regardless of `isActionable` or what `admit` says — `admit` only ever
+    // answers a FRAGMENT-suspect quality question (and its own doc's "the
+    // All-mode toggle can always bring a filtered fragment back" promise
+    // deliberately does not extend to `"info"`: an answered card is
+    // resolved, not quality-filtered, and no toggle should resurrect it
+    // into the actionable queue).
+    if (
+      isActionable &&
+      classification !== "info" &&
+      admit(card, classification)
+    ) {
       queue.push(card);
     } else {
       feed.push(card);
     }
   }
   return { queue, feed, fragmentSuspectIds, duplicateCounts };
+}
+
+/**
+ * The auto-answer trigger's admission gate (audio-graph-83cc T5, deliverable
+ * a). Calls the REAL `selectAgentQueue` (Signal mode, i.e. the default
+ * `admitToQueue` predicate — auto-answer never runs under the All-mode
+ * override) itself rather than re-deriving any threshold: "gate == Signal
+ * bar by construction" (design panel synthesis, angle-a §2.4 item 1) — the
+ * exact fixture that puts a card in the feed is the one that proves this
+ * function refuses it too, because both checks run through the SAME call.
+ *
+ * Two checks beyond "is this proposal in the Signal queue":
+ *
+ * 1. `proposal.kind !== "question"` — short-circuits before touching
+ *    `selectAgentQueue` at all. Fragments and non-questions keep manual Ask
+ *    AI only (ratified P4); `selectAgentQueue`'s queue can legitimately
+ *    contain non-question cards (notes, graph suggestions), and those must
+ *    never reach the auto-answer trigger.
+ * 2. `card.answer != null` — an already-answered card (any terminal status,
+ *    including `"failed"`) is never RE-dispatched by this trigger; the only
+ *    path back in for a failed answer is the manual Retry affordance.
+ *    Mirrors (independently — this function never reads `card.signal` or
+ *    any Rust-owned field) the backend's own `Duplicate` refusal reason in
+ *    `commands::evaluate_answer_spend_gate`, so both sides arrive at "never
+ *    auto-re-answer an answered card" without either copying the other's
+ *    check.
+ *
+ * Ratified maintainer gate Q2 ("both gates for one release"): this function
+ * is the FE half — Signal-queue admission. The backend's OWN Rust-stamped
+ * `signal == Strong` check (`evaluate_answer_spend_gate`) is the second,
+ * independent lock. This function deliberately does NOT read `card.signal`
+ * itself — doing so would be exactly the second copy of W9's thresholds Q2
+ * exists to avoid; the Signal-bar admission via `selectAgentQueue` IS the FE
+ * gate, full stop, and it is checked by calling the real selector, never by
+ * re-implementing any of its rules.
+ */
+export function autoAnswerAdmits(
+  proposal: AgentProposalEvent,
+  liveAssistCards: LiveAssistCardRecord[],
+  agentProposals: AgentProposalEvent[],
+): boolean {
+  if (proposal.kind !== "question") return false;
+  const { queue } = selectAgentQueue(liveAssistCards, agentProposals);
+  const admitted = queue.find((c) => c.proposal.id === proposal.id);
+  return admitted !== undefined && admitted.answer == null;
 }

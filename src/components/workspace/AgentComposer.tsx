@@ -42,6 +42,13 @@
  * already prevented at the `handleSend` guard (`if (!trimmed ||
  * isSubmitting) return`), so disabling the input bought nothing;  only the
  * send `IconButton` is disabled during submit.
+ *
+ * `AutoAnswerCountChip` (audio-graph-83cc T5, deliverable e) renders above
+ * the input row, in this composer, not the tile's `headerSlot` (already
+ * double-occupied by `AgentQueueFilterToggle`/`AgentTileHeaderActions`, and
+ * each `WorkspaceTile` gets exactly one, per `WorkspaceTile.tsx`'s frozen
+ * contract) — matching the design panel synthesis's own placement ("the
+ * chip in the composer row").
  */
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useState } from "react";
@@ -49,6 +56,42 @@ import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../../store";
 import Icon from "../Icon";
 import IconButton from "../IconButton";
+
+/**
+ * The auto-answer session budget chip: `"{{count}}/{{cap}}"` (e.g. `"3/12"`),
+ * fed from `autoAnswerDispatchCount` — a count of SUCCESSFULLY dispatched
+ * auto-answers this session, incremented only on acceptance, never on a
+ * refusal (see that store field's own doc, `types/index.ts`, for why it
+ * isn't derived from `liveAssistCards`/`CardAnswer.requested_by`). Hidden
+ * entirely while auto-answer is disabled (deliverable f's off switch):
+ * showing a budget for a feature that will never spend it is more
+ * confusing than showing nothing. `max_per_session` falls back to the same
+ * `12` Rust defaults to (`AgentAutoAnswerSettings::default`,
+ * `settings/mod.rs`) for the brief window before settings load — this chip
+ * itself is unreachable in that window anyway, since `enabled` is
+ * `undefined` (not `=== true`) until settings load.
+ */
+function AutoAnswerCountChip() {
+  const { t } = useTranslation();
+  const enabled = useAudioGraphStore(
+    (s) => s.settings?.agent_auto_answer?.enabled === true,
+  );
+  const count = useAudioGraphStore((s) => s.autoAnswerDispatchCount);
+  const cap = useAudioGraphStore(
+    (s) => s.settings?.agent_auto_answer?.max_per_session ?? 12,
+  );
+  if (!enabled) return null;
+  return (
+    <span className="ag-chip self-start" data-tone="neutral">
+      <span aria-hidden="true">
+        {t("agent.autoAnswerCount", { count, cap })}
+      </span>
+      <span className="sr-only">
+        {t("agent.autoAnswerCountAria", { count, cap })}
+      </span>
+    </span>
+  );
+}
 
 export function AgentComposer() {
   const { t } = useTranslation();
@@ -90,6 +133,7 @@ export function AgentComposer() {
       className="flex flex-col gap-(--space-2) py-[10px] px-(--space-5) border-t border-(--edge) bg-bg-secondary shrink-0"
       data-testid="agent-composer"
     >
+      <AutoAnswerCountChip />
       {composerError ? (
         <p
           className="m-0 rounded-sm border border-(--tint-border-danger) bg-(--tint-danger) px-(--space-4) py-(--space-3) text-xs leading-[1.4] text-(--text-on-tint-danger)"

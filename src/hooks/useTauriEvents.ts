@@ -13,6 +13,12 @@
  *   - `TURN_EVENT`              → `addTurnEvent`
  *   - `AGENT_STATUS`            → `setAgentStatus`
  *   - `AGENT_PROPOSAL`          → `addAgentProposal` + toast
+ *   - `AGENT_CARD_UPDATE`       → `upsertLiveAssistCard` (fix round,
+ *                                 audio-graph-83cc T5: wires the listener
+ *                                 the backend's `CardAnswer` terminal-frame
+ *                                 emission has always assumed exists — see
+ *                                 `src-tauri/src/events.rs`'s doc on
+ *                                 `AGENT_CARD_UPDATE`)
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
  *   - `PROJECTION_PATCH`        → `addProjectionPatch`
@@ -68,6 +74,7 @@ import type {
   GeminiTranscriptionEvent,
   GraphDelta,
   GraphSnapshot,
+  LiveAssistCardRecord,
   MaterializedGraph,
   MaterializedNotes,
   NotificationSeverity,
@@ -139,6 +146,7 @@ const DIARIZATION_SPAN_REVISION = "diarization-span-revision";
 const TURN_EVENT = "turn-event";
 const AGENT_STATUS = "agent-status";
 const AGENT_PROPOSAL = "agent-proposal";
+const AGENT_CARD_UPDATE = "agent-card-update";
 const GRAPH_UPDATE = "graph-update";
 const GRAPH_DELTA = "graph-delta";
 const PROJECTION_PATCH = "projection-patch";
@@ -215,6 +223,9 @@ export function useTauriEvents(): void {
   const addTurnEvent = useAudioGraphStore((s) => s.addTurnEvent);
   const setAgentStatus = useAudioGraphStore((s) => s.setAgentStatus);
   const addAgentProposal = useAudioGraphStore((s) => s.addAgentProposal);
+  const upsertLiveAssistCard = useAudioGraphStore(
+    (s) => s.upsertLiveAssistCard,
+  );
   const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
   const applyGraphDelta = useAudioGraphStore((s) => s.applyGraphDelta);
   const addProjectionPatch = useAudioGraphStore((s) => s.addProjectionPatch);
@@ -332,6 +343,13 @@ export function useTauriEvents(): void {
             severity: event.payload.kind === "question" ? "info" : "success",
             message: event.payload.title,
           });
+        }),
+        // audio-graph-83cc T5 (fix round): the backend has emitted this
+        // since T3/T3G's `finalize_card_answer`, but nothing consumed it —
+        // deliverable (d)'s "answered ⇒ feed" classification rule was
+        // unreachable in production without this listener.
+        safeListen<LiveAssistCardRecord>(AGENT_CARD_UPDATE, (event) => {
+          upsertLiveAssistCard(event.payload);
         }),
         safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
           setGraphSnapshot(event.payload);
@@ -556,6 +574,7 @@ export function useTauriEvents(): void {
     addTurnEvent,
     setAgentStatus,
     addAgentProposal,
+    upsertLiveAssistCard,
     setGraphSnapshot,
     applyGraphDelta,
     addProjectionPatch,

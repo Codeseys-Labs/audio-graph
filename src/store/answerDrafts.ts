@@ -38,6 +38,14 @@
  * draft against (the mint-and-ask round trip is one call), so its error has
  * nowhere to thread onto a per-card draft — it renders inline in the
  * composer itself instead. Cleared at the start of the next submit attempt.
+ *
+ * `autoAnswerDispatchCount` (audio-graph-83cc T5, deliverable e) lives here
+ * too — not a draft, but the same session-scoped lifecycle: reset in
+ * `resetSessionView` alongside `answerDrafts`/`composerError` (see that
+ * action's own comment), mutated only from the same `answerQuestionCard`
+ * action that owns every other piece of state in this file. See
+ * `types/index.ts`'s doc on the field for why it's a counter incremented on
+ * successful dispatch rather than something derived from `liveAssistCards`.
  */
 
 /** One card's transient answer-stream progress. `requestId` is `null` only
@@ -56,6 +64,7 @@ export interface AnswerDraftState {
 export interface AnswerDraftsSlice {
   answerDrafts: Record<string, AnswerDraftState>;
   composerError: string | null;
+  autoAnswerDispatchCount: number;
   setAnswerDraft: (cardId: string, draft: AnswerDraftState) => void;
   /** No-ops (returns the same object reference behind the scenes via a `{}`
    * partial) unless `requestId` matches the draft's currently-armed id —
@@ -69,6 +78,7 @@ export interface AnswerDraftsSlice {
   ) => void;
   clearAnswerDraft: (cardId: string) => void;
   setComposerError: (message: string | null) => void;
+  recordAutoAnswerDispatch: () => void;
 }
 
 type AnswerDraftsSet = (
@@ -85,6 +95,7 @@ export function createAnswerDraftsSlice(
   return {
     answerDrafts: {},
     composerError: null,
+    autoAnswerDispatchCount: 0,
     setAnswerDraft: (cardId, draft) =>
       set((state) => ({
         answerDrafts: { ...state.answerDrafts, [cardId]: draft },
@@ -108,5 +119,9 @@ export function createAnswerDraftsSlice(
         return { answerDrafts: next };
       }),
     setComposerError: (message) => set({ composerError: message }),
+    recordAutoAnswerDispatch: () =>
+      set((state) => ({
+        autoAnswerDispatchCount: state.autoAnswerDispatchCount + 1,
+      })),
   };
 }

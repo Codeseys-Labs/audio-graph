@@ -92,6 +92,18 @@ const CHIP_CASES: readonly ChipCase[] = [
   { key: "agent.answerEvidenceSpans", values: { count: TURNS_WORST_CASE } },
   { key: "agent.answerEvidenceGraph", values: { count: TURNS_WORST_CASE } },
   { key: "agent.answerInterrupted", values: {} },
+  // audio-graph-83cc T5: the auto-answer session budget chip
+  // (`AutoAnswerCountChip`, `AgentComposer.tsx`) — interpolates BOTH
+  // `{{count}}` and `{{cap}}`. `max_per_session` has no type-level upper
+  // bound (a `u32` on the Rust side, `settings/mod.rs`), so this reuses
+  // `TURNS_WORST_CASE` as the same generously oversized bound the evidence
+  // chips above use, for both interpolation slots at once (the pathological
+  // case where a session somehow both dispatches and is capped at a huge
+  // number).
+  {
+    key: "agent.autoAnswerCount",
+    values: { count: TURNS_WORST_CASE, cap: TURNS_WORST_CASE },
+  },
   // Ticket W10: the out-of-viewport change anchor (`DocChangeAnchor`,
   // `LiveDocument.tsx`) — styled as a small pill in `layout.css`
   // (`.ag-doc-anchor`), so it belongs in this file even though it's a

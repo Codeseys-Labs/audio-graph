@@ -46,6 +46,7 @@ function resetStore() {
     turnEvents: [],
     agentStatus: null,
     agentProposals: [],
+    liveAssistCards: [],
     speakers: [],
     backpressuredSources: [],
     persistenceQueueBackpressure: {},
@@ -86,7 +87,7 @@ describe("useTauriEvents", () => {
   // `expected` list in the "subscribes to all expected events on mount"
   // test. The count is also exercised by the unlisten-cleanup test and
   // the partial-failure test (which drops exactly one).
-  const TOTAL_LISTENERS = 27;
+  const TOTAL_LISTENERS = 28;
   async function waitForAllHandlers() {
     await waitFor(() => {
       expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -105,6 +106,7 @@ describe("useTauriEvents", () => {
       "turn-event",
       "agent-status",
       "agent-proposal",
+      "agent-card-update",
       "graph-update",
       "graph-delta",
       "projection-patch",
@@ -332,6 +334,58 @@ describe("useTauriEvents", () => {
         message: "Question from Speaker 1",
       }),
     );
+  });
+
+  // audio-graph-83cc T5 (fix round, scope-honesty major): the backend has
+  // emitted `agent-card-update` since T3/T3G's `finalize_card_answer` — this
+  // pins that the frontend actually consumes it via `upsertLiveAssistCard`,
+  // which is what makes deliverable (d)'s "answered ⇒ feed" classification
+  // rule reachable outside of a loaded (not live) session.
+  it("routes agent-card-update payloads into liveAssistCards via upsertLiveAssistCard", async () => {
+    useAudioGraphStore.setState({ liveAssistCards: [] });
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    const card = {
+      session_id: "session-live",
+      proposal: {
+        id: "card-1",
+        source_segment_id: "seg-1",
+        source_id: "system-default",
+        speaker_label: "Speaker 1",
+        kind: "question" as const,
+        title: "Question from Speaker 1",
+        body: "Consider answering or linking this question: What changed?",
+        confidence: 0.9,
+        created_at_ms: 1_700_000_000_000,
+      },
+      status: "pending" as const,
+      source_span_ids: ["seg-1"],
+      graph_context_ids: [],
+      outcome: null,
+      projection_patch_sequence: null,
+      created_at_ms: 1_700_000_000_000,
+      updated_at_ms: 1_700_000_000_500,
+      answer: {
+        status: "answered" as const,
+        text: "It shipped last Tuesday.",
+        truncated: false,
+        evidence_span_ids: [],
+        evidence_graph_ids: [],
+        route_id: "route-1",
+        requested_by: "transcript" as const,
+        answered_at_ms: 1_700_000_000_500,
+      },
+    };
+
+    handlers.get("agent-card-update")?.(makeEvent("agent-card-update", card));
+
+    const cards = useAudioGraphStore.getState().liveAssistCards;
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      session_id: "session-live",
+      answer: expect.objectContaining({ status: "answered" }),
+    });
   });
 
   it("applies graph-delta payloads to the graph snapshot", async () => {

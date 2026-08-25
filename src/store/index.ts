@@ -57,6 +57,7 @@ import { create } from "zustand";
 // action's existing catch → `errorToMessage` behavior is unchanged and every
 // failure is reported EXACTLY once at this single chokepoint (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { autoAnswerAdmits } from "../components/workspace/agentQueue";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import {
   isCerebrasEndpoint,
@@ -1731,6 +1732,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   agentProposals: [],
   liveAssistCards: [],
   approvingAgentProposalIds: [],
+  autoAnswerAttemptedProposalIds: new Set<string>(),
   addTranscriptSegment: (segment) =>
     set((state) => {
       const transcriptSegments = state.samplePreviewActive
@@ -1886,7 +1888,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }));
     // Questions default to the graph: auto-record a Question node (local,
     // no LLM, never rate-limits). The card then only offers the OPTIONAL
-    // "Ask AI" action to fetch a possible answer.
+    // "Ask AI" action to fetch a possible answer — audio-graph-83cc T5 adds
+    // a SECOND, independent question-kind side effect below (the
+    // auto-answer trigger), which now makes that "OPTIONAL" fetch also
+    // happen automatically for Signal-admitted cards; a fragment or
+    // otherwise non-admitted question still only ever gets this local,
+    // free graph write plus the manual "Ask AI" button.
     if (proposal.kind === "question") {
       const text =
         proposal.body?.replace(
@@ -1902,6 +1909,80 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       ).catch((err) =>
         console.error("auto add_question_to_graph failed:", err),
       );
+
+      // audio-graph-83cc T5 (deliverable b): the auto-answer trigger.
+      // Hooked into THIS ONE funnel every card passes through exactly
+      // once — never a render path, never a `useEffect` over the queue
+      // (a remount/StrictMode double-invoke of an effect would double-
+      // spend; a plain function call inside a store action cannot
+      // double-fire the way an effect can). Fire-and-forget: never awaited,
+      // never blocks `addAgentProposal` itself, and `answerQuestionCard`
+      // (below) never throws regardless of outcome.
+      //
+      // Belt (deliverable f): read the mirrored, read-only
+      // `agent_auto_answer.enabled` off switch BEFORE even checking
+      // admission — an absent/not-yet-loaded `settings` or an explicit
+      // `false` both skip the dispatch entirely (never `=== true` by
+      // omission). Rust's own `evaluate_answer_spend_gate` re-checks the
+      // SAME setting server-side (its `Disabled` refusal) — the suspenders
+      // that hold even if this mirror goes stale or a future caller skips
+      // this check.
+      //
+      // Gate (Q2, "both gates for one release"): `autoAnswerAdmits` is the
+      // FE half (Signal-queue admission, by construction — see that
+      // function's own doc). It is read AFTER the state update above via a
+      // fresh `get()` call, so it sees THIS proposal already merged into
+      // `agentProposals` — matching exactly what a render immediately after
+      // this action would compute.
+      //
+      // Idempotency: `autoAnswerAttemptedProposalIds` (recorded
+      // SYNCHRONOUSLY, before the async `answerQuestionCard` call below even
+      // starts) is what makes a DUPLICATE `addAgentProposal` call for the
+      // exact same id (upsert semantics — a replayed/re-emitted backend
+      // event, a double-mount) dispatch AT MOST once. Nothing else in this
+      // window would catch it: the card carries no `answer` yet (that only
+      // lands once the stream's terminal frame does, via `AGENT_CARD_UPDATE`
+      // — see T1/T3, and `useTauriEvents.ts`'s listener, wired in this fix
+      // round: it emitted since T3/T3G but nothing consumed it before now),
+      // so a second synchronous call would otherwise see the
+      // identical "admitted, unanswered" state and re-dispatch. Marked
+      // regardless of outcome (accepted, refused, or a later stream
+      // failure) — deliberately NOT a retry mechanism (the ticket's own
+      // stop condition): the only way back in for a specific card, ever, is
+      // the manual Ask AI / Retry button.
+      // Converse exclusion (fix round, scope-honesty finding): Rust's own
+      // `evaluate_answer_spend_gate` `Converse` refusal only observes
+      // `AppState::is_converse_active`, which `start_converse` sets — i.e.
+      // the NATIVE S2S engine only (see `src-tauri/src/events.rs`'s doc on
+      // `AnswerRefusalReason::Converse`). The DEFAULT `converseEngine`
+      // ("pipelined") never calls `start_converse`; it runs
+      // `sendChatMessage`/`useConverseFrontLeg` instead, so Rust cannot see
+      // it at all. `conversationMode` is FE-only session state Rust has no
+      // access to either way (not a re-derived W9 threshold), so checking it
+      // here is the only place this half of the exclusion can live — this
+      // covers BOTH engines directly rather than relying on Rust's
+      // native-only half.
+      if (
+        get().settings?.agent_auto_answer?.enabled === true &&
+        get().conversationMode !== "converse"
+      ) {
+        const {
+          liveAssistCards,
+          agentProposals,
+          autoAnswerAttemptedProposalIds,
+        } = get();
+        if (
+          !autoAnswerAttemptedProposalIds.has(proposal.id) &&
+          autoAnswerAdmits(proposal, liveAssistCards, agentProposals)
+        ) {
+          set((state) => ({
+            autoAnswerAttemptedProposalIds: new Set(
+              state.autoAnswerAttemptedProposalIds,
+            ).add(proposal.id),
+          }));
+          void get().answerQuestionCard(proposal.id, true);
+        }
+      }
     }
   },
   askAgentProposal: async (proposalId: string) => {
@@ -1919,15 +2000,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (!dismissed) return;
     await get().sendChatMessage(question);
   },
-  answerQuestionCard: async (proposalId: string) => {
+  answerQuestionCard: async (proposalId: string, auto = false) => {
     const { settings } = get();
     if (!settings) {
-      set({ error: i18n.t("errors.providerSettingsLoading") });
+      // audio-graph-83cc T5: an `auto` dispatch reaching this function at
+      // all already implies the trigger's own belt check
+      // (`addAgentProposal`) saw a loaded, enabled `settings.agent_auto_answer`
+      // — this branch is unreachable for `auto` in practice. Still guarded
+      // defensively here (never a visible banner for a background
+      // auto-fire the user never asked for — deliverable c's drop-not-queue
+      // spirit) rather than assumed unreachable.
+      if (!auto) set({ error: i18n.t("errors.providerSettingsLoading") });
       return;
     }
     const deferredProvider = deferredProviderForChatStart(settings);
     if (deferredProvider) {
-      set({ error: providerDeferredMessage(deferredProvider) });
+      if (!auto) set({ error: providerDeferredMessage(deferredProvider) });
       return;
     }
     const existing =
@@ -1936,14 +2024,21 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (!existing) return;
     const question = questionTextForProposal(existing);
 
-    // Optimistic: show "streaming" the instant the click fires, before the
-    // dispatch even resolves — same shape as `sendChatMessage`'s placeholder,
-    // just per-card instead of appended to a shared log.
-    get().setAnswerDraft(proposalId, {
-      status: "streaming",
-      text: "",
-      requestId: null,
-    });
+    if (!auto) {
+      // Optimistic: show "streaming" the instant the click fires, before the
+      // dispatch even resolves — same shape as `sendChatMessage`'s
+      // placeholder, just per-card instead of appended to a shared log.
+      // Skipped for `auto` (audio-graph-83cc T5, deliverable c,
+      // drop-not-queue): a refused auto dispatch must leave NO visible
+      // trace, and setting-then-clearing this draft on a fast refusal would
+      // flash a "thinking" ghost for a dispatch nobody clicked and that
+      // never actually started streaming.
+      get().setAnswerDraft(proposalId, {
+        status: "streaming",
+        text: "",
+        requestId: null,
+      });
+    }
 
     let armedRequestId: string | null = null;
     const coalescer = createChatStreamCoalescer({
@@ -1962,6 +2057,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         if (get().answerDrafts[proposalId]?.requestId !== armedRequestId) {
           return;
         }
+        // T5: this handler runs IDENTICALLY for `auto` and manual — a
+        // dispatch that WAS accepted (past this point, the gate already let
+        // it through) and later fails mid-stream is a genuine
+        // `CardAnswerStatus.Failed`, not a gate refusal, and `Failed stays
+        // actionable so Retry is reachable` (deliverable d's lifecycle rule)
+        // only makes sense if this failure state is visible for auto
+        // dispatches too. Drop-not-queue (deliverable c) is scoped to the
+        // dispatch-START refusal in the `catch` below, not to a
+        // post-acceptance stream error.
         const errorDetail = answerStreamErrorDetail(doneEvent.finish_reason);
         if (errorDetail !== null) {
           get().setAnswerDraft(proposalId, {
@@ -1985,7 +2089,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         {
           proposalId,
           question,
-          auto: false,
+          auto,
           channel: coalescer.channel,
         },
       );
@@ -1996,8 +2100,28 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         requestId: armedRequestId,
       });
       coalescer.arm(armedRequestId);
+      // audio-graph-83cc T5, deliverable e: count only a dispatch Rust's own
+      // spend gate actually ACCEPTED (this line only runs once `invoke` has
+      // resolved) — a refused auto-trigger never reaches here, so a burst
+      // of refusals can never inflate the counter chip.
+      if (auto) {
+        get().recordAutoAnswerDispatch();
+      }
     } catch (err) {
       coalescer.disarm();
+      if (auto) {
+        // audio-graph-83cc T5, deliverable c (drop-not-queue): ANY
+        // refusal — busy, capped, interval, disabled, converse,
+        // weak-signal, duplicate (every `AnswerRefusalReason`) — or any
+        // other dispatch-start failure is DROPPED here: no error banner,
+        // no "failed" draft carrying a Retry affordance nobody asked for.
+        // At most, clean up a draft for this card (a no-op today, since
+        // the optimistic pre-invoke set above is skipped for `auto` — see
+        // that comment — but kept here so a future change to that skip
+        // can't silently leave a stale draft behind either).
+        get().clearAnswerDraft(proposalId);
+        return;
+      }
       get().setAnswerDraft(proposalId, {
         status: "failed",
         text: errorToMessage(err),
@@ -2274,6 +2398,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // equivalent of a dismiss for this state).
       answerDrafts: {},
       composerError: null,
+      // audio-graph-83cc T5: the auto-answer counter chip's data source is
+      // session-scoped for the same reason `answerDrafts`/`composerError`
+      // are (see the fix-round comment immediately above) — a stale count
+      // from a PREVIOUS session must not survive into a new one's chip.
+      autoAnswerDispatchCount: 0,
+      // T5: the idempotency guard is ALSO session-scoped — a proposal id
+      // from a previous session should never suppress a genuinely new
+      // proposal that happens to reuse the same id space (defensive; ids
+      // are expected to be unique regardless, but this keeps the field's
+      // lifecycle honest and matches every other field reset in this block).
+      autoAnswerAttemptedProposalIds: new Set<string>(),
     }));
   },
   loadSampleSessionPreview: (language?: string) =>

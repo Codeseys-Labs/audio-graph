@@ -1287,7 +1287,9 @@
     "answerEvidenceSpans_one": "{{count}} span",
     "answerEvidenceSpans_other": "{{count}} spans",
     "answerEvidenceGraph_one": "{{count}} node",
-    "answerEvidenceGraph_other": "{{count}} nodes"
+    "answerEvidenceGraph_other": "{{count}} nodes",
+    "autoAnswerCount": "{{count}}/{{cap}}",
+    "autoAnswerCountAria": "{{count}} of {{cap}} auto-answers used this session"
   },
   "projectionDiagnostics": {
     "title": "Projection diagnostics",

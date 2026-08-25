@@ -1157,14 +1157,17 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     expect(answerQuestionCard).toHaveBeenCalledWith("failed-q");
   });
 
-  it("an answered card shows the answer text, no added-to-graph note, and no Ask AI button", () => {
-    // A card whose `answer` is already durable must ALSO appear in
-    // `agentProposals` (this session's live queue) for `isActionable` to
-    // stay `true` and land the row in the queue rather than the feed —
-    // `mergeLiveAssistCards` prefers the `liveAssistCards` entry's own
-    // `proposal` fields when both arrays name the same id, so this fixture
-    // keeps them IDENTICAL rather than letting title/body diverge between
-    // the two arrays.
+  it("an answered card shows the answer text (in the feed's details disclosure), no added-to-graph note, and no Ask AI button", () => {
+    // audio-graph-83cc T5 (deliverable d) update: an answered, terminal
+    // (non-Failed) card now resolves to the FEED regardless of whether it
+    // also still appears in `agentProposals` — `classifyQueueEntry`'s
+    // "answered ⇒ feed" rule runs BEFORE the actionable/queue split (see
+    // `agentQueue.ts`). Pre-T5 this fixture (deliberately kept in
+    // `agentProposals` too) landed in the QUEUE, where `AnswerThread`
+    // renders inline with no disclosure to open; post-T5 it is a FEED row,
+    // so the thread sits behind the same "Details" toggle every other feed
+    // thread uses (see the dismissed-card feed tests below) — this test
+    // clicks it open rather than asserting inline visibility.
     const p = proposal({
       id: "answered-q",
       kind: "question",
@@ -1182,6 +1185,7 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     });
     render(<AgentProposalsPanel />);
     const row = itemForText("Question from Speaker 1");
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
     expect(
       within(row).getByText("The launch date moved to March."),
     ).toBeInTheDocument();
@@ -1209,6 +1213,9 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     });
     render(<AgentProposalsPanel />);
     const row = itemForText("Question from Speaker 1");
+    // T5: an answered card is a FEED row now — open its details disclosure
+    // before looking for the marker (see the previous test's comment).
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
     const marker = within(row).getByTitle(
       "Answer truncated at the length limit",
     );
@@ -1236,6 +1243,9 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     });
     render(<AgentProposalsPanel />);
     const row = itemForText("Question from Speaker 1");
+    // T5: an answered card is a FEED row now — open its details disclosure
+    // before looking for the evidence chips (see the first test's comment).
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
     expect(within(row).getByText("2 spans")).toBeInTheDocument();
     expect(within(row).getByText("1 node")).toBeInTheDocument();
     expect(within(row).queryByText("span-1")).not.toBeInTheDocument();

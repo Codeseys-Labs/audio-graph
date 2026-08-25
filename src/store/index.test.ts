@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
 import type {
+  AgentProposalEvent,
   AppSettings,
   AsrSpanRevisionEvent,
   AudioGraphStore,
@@ -176,6 +177,10 @@ describe("AudioGraphStore", () => {
       // could leak into an unrelated later test in this file.
       answerDrafts: {},
       composerError: null,
+      // audio-graph-83cc T5: same reasoning — a dispatch count or an
+      // attempted-id from one test must never leak into another.
+      autoAnswerDispatchCount: 0,
+      autoAnswerAttemptedProposalIds: new Set(),
       chatMessages: [],
       isChatLoading: false,
       streamingChatRequestId: null,
@@ -3927,6 +3932,231 @@ describe("AudioGraphStore", () => {
       );
       void useAudioGraphStore.getState().askQuestion("hello");
       expect(useAudioGraphStore.getState().composerError).toBeNull();
+    });
+  });
+
+  describe("the auto-answer trigger, hooked into addAgentProposal (audio-graph-83cc T5)", () => {
+    beforeEach(() => {
+      useAudioGraphStore.setState({
+        settings: selectableSettings({
+          agent_auto_answer: {
+            enabled: true,
+            max_per_session: 12,
+            min_interval_secs: 45,
+          },
+        }),
+      });
+    });
+
+    function wellFormedQuestionProposal(
+      overrides: Partial<AgentProposalEvent> = {},
+    ): AgentProposalEvent {
+      return {
+        id: "trigger-q",
+        source_segment_id: "segment-trigger-q",
+        source_id: "system",
+        speaker_label: "Speaker 1",
+        kind: "question",
+        title: "Question from Speaker 1",
+        body: "Consider answering or linking this question: What did the team decide about the launch date?",
+        confidence: 0.9,
+        created_at_ms: 100,
+        ...overrides,
+      };
+    }
+
+    it("dispatches answer_question_card with auto:true for a well-formed, Signal-admitted question proposal", () => {
+      captureAnswerChannel<{ request_id: string }>("answer_question_card");
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).toHaveBeenCalledWith("answer_question_card", {
+        proposalId: "trigger-q",
+        question: "What did the team decide about the launch date?",
+        auto: true,
+        channel: expect.any(Channel),
+      });
+    });
+
+    it("does NOT dispatch when agent_auto_answer.enabled is false — the belt check (deliverable f)", () => {
+      useAudioGraphStore.setState({
+        settings: selectableSettings({
+          agent_auto_answer: {
+            enabled: false,
+            max_per_session: 12,
+            min_interval_secs: 45,
+          },
+        }),
+      });
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+    });
+
+    it("does NOT dispatch when settings/agent_auto_answer are absent (never enabled by omission)", () => {
+      useAudioGraphStore.setState({ settings: selectableSettings() }); // no agent_auto_answer field at all
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+    });
+
+    it("does NOT dispatch a fragment-suspect question (below the Signal bar) — the FE half of the ratified 'both gates' rule", () => {
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore.getState().addAgentProposal(
+        wellFormedQuestionProposal({
+          id: "trigger-fragment",
+          body: "Consider answering or linking this question: what about",
+        }),
+      );
+
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+    });
+
+    it("does NOT dispatch while conversationMode is 'converse' with the DEFAULT (pipelined) engine — Rust's own Converse refusal only covers native S2S, so this exclusion must be FE-side (fix round, scope-honesty blocker)", () => {
+      useAudioGraphStore.setState({
+        conversationMode: "converse",
+        converseEngine: "pipelined",
+      });
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+    });
+
+    it("does NOT dispatch while conversationMode is 'converse' with the native engine either", () => {
+      useAudioGraphStore.setState({
+        conversationMode: "converse",
+        converseEngine: "native",
+      });
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).not.toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.anything(),
+      );
+    });
+
+    it("dispatches normally once conversationMode returns to 'notes'", () => {
+      captureAnswerChannel<{ request_id: string }>("answer_question_card");
+      useAudioGraphStore.setState({ conversationMode: "notes" });
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+
+      expect(invoke).toHaveBeenCalledWith(
+        "answer_question_card",
+        expect.objectContaining({ auto: true }),
+      );
+    });
+
+    it("dispatches EXACTLY ONCE for a duplicate addAgentProposal call with the same id (upsert semantics)", () => {
+      captureAnswerChannel<{ request_id: string }>("answer_question_card");
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      const p = wellFormedQuestionProposal();
+      useAudioGraphStore.getState().addAgentProposal(p);
+      useAudioGraphStore.getState().addAgentProposal(p);
+
+      const dispatchCalls = vi
+        .mocked(invoke)
+        .mock.calls.filter(([cmd]) => cmd === "answer_question_card");
+      expect(dispatchCalls).toHaveLength(1);
+    });
+
+    it("drop-not-queue (deliverable c): a REFUSED auto dispatch sets no error banner and no failed draft, and repeated refusals across DIFFERENT cards never accumulate any of that state", async () => {
+      vi.mocked(invoke).mockImplementation(async (cmd) => {
+        if (cmd === "answer_question_card") {
+          throw new Error("Rejected: 12/session cap reached");
+        }
+        return undefined;
+      });
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal({ id: "refused-1" }));
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(
+          wellFormedQuestionProposal({ id: "refused-2", created_at_ms: 200 }),
+        );
+      // Let the fire-and-forget `answerQuestionCard` promises settle.
+      //
+      // Waiting only for the invoke call COUNT (a prior version of this
+      // test did) is vacuous: `mock.calls` is populated synchronously the
+      // instant `invoke` is called, which happens before the rejection has
+      // unwound through `safeInvoke`'s own `try/await/catch` wrapper AND
+      // `answerQuestionCard`'s `catch` — two more awaited hops. A `vi.waitFor`
+      // whose predicate is already true resolves without ever yielding to a
+      // macrotask, so it would pass unconditionally even with the entire
+      // drop-not-queue branch deleted. A real macrotask boundary
+      // (`setTimeout`) is timing-independent: by spec every pending
+      // microtask, however many hops deep, drains before the next macrotask
+      // runs, so this guarantees both refusals have fully settled before the
+      // assertions below run.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const dispatchCalls = vi
+        .mocked(invoke)
+        .mock.calls.filter(([cmd]) => cmd === "answer_question_card");
+      expect(dispatchCalls).toHaveLength(2);
+
+      expect(useAudioGraphStore.getState().error).toBeNull();
+      expect(useAudioGraphStore.getState().answerDrafts).toEqual({});
+      expect(useAudioGraphStore.getState().autoAnswerDispatchCount).toBe(0);
+    });
+
+    it("increments autoAnswerDispatchCount only once the dispatch is ACCEPTED, never on a refusal", async () => {
+      const { getChannel, resolveDispatch } = captureAnswerChannel<{
+        request_id: string;
+      }>("answer_question_card");
+      resetStoreForTest({ agentProposals: [], liveAssistCards: [] });
+
+      useAudioGraphStore
+        .getState()
+        .addAgentProposal(wellFormedQuestionProposal());
+      expect(useAudioGraphStore.getState().autoAnswerDispatchCount).toBe(0);
+
+      getChannel();
+      resolveDispatch({ request_id: "auto-req-1" });
+      await vi.waitFor(() => {
+        expect(useAudioGraphStore.getState().autoAnswerDispatchCount).toBe(1);
+      });
+      // No error, no draft ghost, from an ACCEPTED auto dispatch either —
+      // the streaming draft carries the real request id, not a failure.
+      expect(useAudioGraphStore.getState().error).toBeNull();
     });
   });
 

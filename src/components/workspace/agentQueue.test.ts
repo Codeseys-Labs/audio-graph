@@ -1,11 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import type { AgentProposalEvent, LiveAssistCardRecord } from "../../types";
+import type {
+  AgentProposalEvent,
+  CardAnswer,
+  LiveAssistCardRecord,
+} from "../../types";
 import {
   AGENT_QUEUE_CONFIDENCE_FLOOR,
   AGENT_QUEUE_MIN_CHARS,
   AGENT_QUEUE_MIN_TOKENS,
   admitToQueue,
+  autoAnswerAdmits,
   classifyQueueEntry,
   liveAssistCardFromProposal,
   mergeLiveAssistCards,
@@ -68,6 +73,23 @@ function card(
     updated_at_ms: baseProposal.created_at_ms,
     ...recordOverrides,
     proposal: { ...baseProposal, ...(proposalOverrides ?? {}) },
+  };
+}
+
+/** Minimal `CardAnswer` fixture for T5's "answered ⇒ feed" tests — only the
+ * one field (`status`) those tests actually vary matters; everything else is
+ * a plausible, otherwise-inert filler value. */
+function cardAnswer(overrides: Partial<CardAnswer> = {}): CardAnswer {
+  return {
+    status: "answered",
+    text: "An answer.",
+    truncated: false,
+    evidence_span_ids: [],
+    evidence_graph_ids: [],
+    route_id: "route.test",
+    requested_by: "transcript",
+    answered_at_ms: 1000,
+    ...overrides,
   };
 }
 
@@ -793,5 +815,240 @@ describe("selectAgentQueue — the Signal/All toggle's real override (ticket W9)
     // Still flagged even though it is now admitted — this is exactly the
     // bit a renderer checks to draw the marker in All mode.
     expect(all.fragmentSuspectIds.has("fragment-1")).toBe(true);
+  });
+});
+
+describe("classifyQueueEntry — audio-graph-83cc T5 (deliverable d): the 'answered ⇒ feed, Failed stays actionable' rule", () => {
+  it("a terminal 'answered' card is 'info' even though it is structurally actionable", () => {
+    const c = card({ answer: cardAnswer({ status: "answered" }) });
+    expect(classifyQueueEntry(c, true)).toBe("info");
+  });
+
+  it("a terminal 'interrupted' card is also 'info' (terminal-and-not-failed, per the lifecycle rule)", () => {
+    const c = card({ answer: cardAnswer({ status: "interrupted" }) });
+    expect(classifyQueueEntry(c, true)).toBe("info");
+  });
+
+  it("a 'failed' answer does NOT take the 'info' branch — it falls through to the normal rules, so a well-formed card stays 'actionable' (Retry reachable from the queue)", () => {
+    const c = card({
+      proposal: {
+        kind: "question",
+        title: "Question from Speaker 1",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+      },
+      answer: cardAnswer({ status: "failed" }),
+    });
+    expect(classifyQueueEntry(c, true)).toBe("actionable");
+  });
+
+  it("a 'failed' answer on an otherwise fragment-shaped question still falls through to 'fragment_suspect' — the answer-status check does not blanket-exempt failed cards from the quality rules", () => {
+    const c = card({
+      proposal: {
+        kind: "question",
+        title: "Question from Speaker 1",
+        body: questionBody("what about"),
+        confidence: 0.9,
+      },
+      answer: cardAnswer({ status: "failed" }),
+    });
+    expect(classifyQueueEntry(c, true)).toBe("fragment_suspect");
+  });
+
+  it("the answered-card check runs BEFORE the origin:'user' exemption — a user-typed card that has been answered is 'info' exactly like a transcript-detected one", () => {
+    const c = card({
+      origin: "user",
+      proposal: { kind: "question", body: "hi" }, // would be 'actionable' via the exemption alone
+      answer: cardAnswer({ status: "answered" }),
+    });
+    expect(classifyQueueEntry(c, true)).toBe("info");
+  });
+
+  it("a card with NO answer at all is completely unaffected by this rule (legacy/unanswered behavior pinned unchanged)", () => {
+    const wellFormed = card({
+      proposal: {
+        kind: "question",
+        title: "Question from Speaker 1",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+      },
+    });
+    expect(wellFormed.answer).toBeUndefined();
+    expect(classifyQueueEntry(wellFormed, true)).toBe("actionable");
+  });
+
+  it("a non-actionable answered card is still 'info' — the same outcome as the pre-existing !isActionable branch, not a new special case", () => {
+    const c = card({ status: "dismissed", answer: cardAnswer() });
+    expect(classifyQueueEntry(c, false)).toBe("info");
+  });
+});
+
+describe("selectAgentQueue — audio-graph-83cc T5: an answered card resolves out of the queue in BOTH Signal and All mode", () => {
+  it("an answered card lands in the feed under the default (Signal) admit, with its content intact", () => {
+    const answered = card({
+      proposal: { id: "answered-1", kind: "question" },
+      answer: cardAnswer({
+        status: "answered",
+        text: "The deadline is Friday.",
+      }),
+    });
+    const { queue, feed } = selectAgentQueue([answered], [answered.proposal]);
+    expect(queue).toHaveLength(0);
+    expect(feed.map((c) => c.proposal.id)).toEqual(["answered-1"]);
+    expect(feed[0].answer?.text).toBe("The deadline is Friday.");
+  });
+
+  it("an answered card ALSO lands in the feed under the All-mode override (() => true) — 'info' is a resolution, not a quality filter the toggle can override", () => {
+    const answered = card({
+      proposal: { id: "answered-2", kind: "question" },
+      answer: cardAnswer({ status: "answered" }),
+    });
+    const { queue, feed } = selectAgentQueue(
+      [answered],
+      [answered.proposal],
+      () => true,
+    );
+    expect(queue).toHaveLength(0);
+    expect(feed.map((c) => c.proposal.id)).toEqual(["answered-2"]);
+  });
+
+  it("a card with a FAILED answer stays in the queue (Signal mode) so Retry is reachable", () => {
+    const failed = card({
+      proposal: {
+        id: "failed-1",
+        kind: "question",
+        title: "Question from Speaker 1",
+        body: questionBody("What did the team decide about pricing?"),
+        confidence: 0.9,
+      },
+      answer: cardAnswer({ status: "failed" }),
+    });
+    const { queue, feed } = selectAgentQueue([failed], [failed.proposal]);
+    expect(queue.map((c) => c.proposal.id)).toEqual(["failed-1"]);
+    expect(feed).toHaveLength(0);
+  });
+});
+
+describe("autoAnswerAdmits — audio-graph-83cc T5 (deliverable a): the auto-answer trigger's FE admission gate", () => {
+  it("admits a well-formed, Signal-admitted question proposal with no existing answer", () => {
+    const wellFormed = proposal({
+      id: "auto-1",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+    });
+    expect(autoAnswerAdmits(wellFormed, [], [wellFormed])).toBe(true);
+  });
+
+  it("refuses a non-question proposal (note / graph_suggestion), even though notes/suggestions can sit in the Signal queue", () => {
+    const note = proposal({ id: "auto-note", kind: "note", confidence: 0.9 });
+    // Sanity: this fixture really is in `selectAgentQueue`'s queue — proves
+    // the refusal below is the kind check, not an incidental non-admission.
+    expect(
+      selectAgentQueue([], [note]).queue.map((c) => c.proposal.id),
+    ).toEqual(["auto-note"]);
+    expect(autoAnswerAdmits(note, [], [note])).toBe(false);
+  });
+
+  it("refuses a fragment-suspect question (below the Signal bar) — the SAME fixture that lands in the feed, not the queue", () => {
+    const fragment = proposal({
+      id: "auto-fragment",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("what about"),
+      confidence: 0.9,
+    });
+    const { queue, feed } = selectAgentQueue([], [fragment]);
+    expect(queue).toHaveLength(0);
+    expect(feed.map((c) => c.proposal.id)).toEqual(["auto-fragment"]);
+    expect(autoAnswerAdmits(fragment, [], [fragment])).toBe(false);
+  });
+
+  it("refuses a low-confidence question (below the confidence floor)", () => {
+    const lowConfidence = proposal({
+      id: "auto-low-conf",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.2,
+    });
+    expect(autoAnswerAdmits(lowConfidence, [], [lowConfidence])).toBe(false);
+  });
+
+  it("refuses a proposal whose card already carries an answer (any terminal status) — never re-dispatches an answered card", () => {
+    const wellFormed = proposal({
+      id: "auto-answered",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+    });
+    const answeredCard = card({
+      proposal: wellFormed,
+      answer: cardAnswer({ status: "answered" }),
+    });
+    expect(autoAnswerAdmits(wellFormed, [answeredCard], [wellFormed])).toBe(
+      false,
+    );
+
+    const failedCard = card({
+      proposal: wellFormed,
+      answer: cardAnswer({ status: "failed" }),
+    });
+    expect(autoAnswerAdmits(wellFormed, [failedCard], [wellFormed])).toBe(
+      false,
+    );
+  });
+
+  it("refuses the demoted victim of duplicate-collapse — it lands in the feed, not the queue, exactly like a fragment", () => {
+    const survivor = proposal({
+      id: "auto-dup-survivor",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+      created_at_ms: 20,
+    });
+    const duplicate = proposal({
+      id: "auto-dup-victim",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+      created_at_ms: 10,
+    });
+    // `selectAgentQueue` sorts newest-first; the survivor (newer) claims the
+    // content key, so the older duplicate is the one refused.
+    expect(autoAnswerAdmits(duplicate, [], [survivor, duplicate])).toBe(false);
+    expect(autoAnswerAdmits(survivor, [], [survivor, duplicate])).toBe(true);
+  });
+
+  it("refuses a historical/non-actionable card (present only in liveAssistCards, not in the live agentProposals array)", () => {
+    const wellFormed = proposal({
+      id: "auto-historical",
+      kind: "question",
+      title: "Question from Speaker 1",
+      body: questionBody("What did the team decide about pricing?"),
+      confidence: 0.9,
+    });
+    const historical = card({ status: "pending", proposal: wellFormed });
+    expect(autoAnswerAdmits(wellFormed, [historical], [])).toBe(false);
+  });
+
+  it("GREP-PIN: autoAnswerAdmits calls the real selectAgentQueue, not a re-derived copy of the Signal thresholds", () => {
+    const source = readFileSync(
+      "src/components/workspace/agentQueue.ts",
+      "utf8",
+    );
+    const fnSource = source.slice(
+      source.indexOf("export function autoAnswerAdmits"),
+    );
+    expect(fnSource).toMatch(/selectAgentQueue\(/);
+    // And it must not read `card.signal` — that would be Q2's exact
+    // "second copy of the rules" the ratified gate exists to avoid.
+    expect(fnSource.slice(0, fnSource.indexOf("\n}"))).not.toMatch(
+      /\.signal\b/,
+    );
   });
 });
