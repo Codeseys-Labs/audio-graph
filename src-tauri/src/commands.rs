@@ -3594,6 +3594,10 @@ pub async fn start_streaming_chat(
     state: State<'_, AppState>,
 ) -> AppResult<String> {
     log::info!("start_streaming_chat called ({} chars)", message.len());
+    // audio-graph-81a5: content-free, session-scoped chat-invocation counter
+    // (correlation proxy for Ask-AI on a question card; see card_telemetry's
+    // module doc for why this is not attribution).
+    crate::card_telemetry::log_chat_invoked(&state.current_session_id());
     let _session_lifecycle = state.session_lifecycle.lock().await;
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
@@ -3695,6 +3699,10 @@ pub async fn send_chat_message(
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
     log::info!("send_chat_message called ({} chars)", message.len());
+    // audio-graph-81a5: content-free, session-scoped chat-invocation counter
+    // (correlation proxy for Ask-AI on a question card; see card_telemetry's
+    // module doc for why this is not attribution).
+    crate::card_telemetry::log_chat_invoked(&state.current_session_id());
     let _session_lifecycle = state.session_lifecycle.lock().await;
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
@@ -4339,6 +4347,14 @@ fn approve_agent_proposal_impl(
         existing_card.as_ref(),
     );
     FileMemoryRepository::user_data().upsert_live_assist_card(&session_id, &record)?;
+    // audio-graph-81a5: card approval telemetry.
+    crate::card_telemetry::log_card_event(
+        &session_id,
+        &proposal.id,
+        &proposal.kind,
+        proposal.confidence,
+        crate::card_telemetry::CardLifecycleEvent::Approved,
+    );
     Ok(record)
 }
 
@@ -4542,6 +4558,14 @@ pub fn dismiss_agent_proposal(
             existing_card.as_ref(),
         );
         FileMemoryRepository::user_data().upsert_live_assist_card(&session_id, &record)?;
+        // audio-graph-81a5: card dismissal telemetry.
+        crate::card_telemetry::log_card_event(
+            &session_id,
+            &proposal.id,
+            &proposal.kind,
+            proposal.confidence,
+            crate::card_telemetry::CardLifecycleEvent::Dismissed,
+        );
         return Ok(Some(record));
     }
     Ok(None)
@@ -4581,6 +4605,16 @@ pub fn clear_agent_proposals(
             existing_card,
         );
         repository.upsert_live_assist_card(&session_id, &record)?;
+        // audio-graph-81a5: card dismissal telemetry. `clear_agent_proposals`
+        // is a bulk-dismiss of every still-pending card, so each one gets its
+        // own dismissal line (same event as the single-card `dismiss_agent_proposal`).
+        crate::card_telemetry::log_card_event(
+            &session_id,
+            &proposal.id,
+            &proposal.kind,
+            proposal.confidence,
+            crate::card_telemetry::CardLifecycleEvent::Dismissed,
+        );
         records.push(record);
     }
     Ok(records)
@@ -8790,6 +8824,7 @@ pub async fn new_session_cmd(
     if let Err(e) = crate::sessions::finalize_session(&previous_id) {
         log::warn!("new_session_cmd: finalize previous failed: {}", e);
     }
+    crate::log_session_card_summary_best_effort(&previous_id);
 
     // 5. Register new session in the index so it shows up in list_sessions
     //    (status "active"). Best-effort: failure just means the UI won't

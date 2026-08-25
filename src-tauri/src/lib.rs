@@ -37,6 +37,7 @@ pub mod analytics;
 pub mod asr;
 pub mod audio;
 pub mod aws_util;
+pub mod card_telemetry;
 pub mod claim_evidence;
 pub mod commands;
 pub mod config;
@@ -268,6 +269,43 @@ fn graceful_shutdown(h: &ShutdownHandles) {
     log::info!("Graceful shutdown: sentry flushed={}", sentry_flushed);
 
     log::info!("Graceful shutdown: complete");
+}
+
+/// Log the [`card_telemetry`] per-session card summary (deliverable c) for
+/// `session_id` at its natural stop/finalize hooks: the `RunEvent::Exit`
+/// handler above, and `commands::new_session_cmd`'s rotation path (audio-graph-81a5).
+///
+/// Best-effort and side-effect-free on the session/card lifecycle itself:
+/// reads the session's persisted live-assist cards (never writes), folds each
+/// card's `(kind, confidence)` into a [`card_telemetry::SessionCardCounts`],
+/// and logs one summary line — but only when at least one card was recorded.
+/// A session that never produced a card is the COMMON case (most sessions
+/// have zero live-assist cards), and `load_live_assist_cards` already
+/// returns `Ok(vec![])` for a missing file (its normal representation), not
+/// an error — so skipping the summary line when `counts.total() == 0` avoids
+/// an all-zero noise row on every idle session/rotation without changing
+/// behavior for any session that actually created a card. A genuine
+/// read/parse error (rare: a corrupt or truncated cards file) also degrades
+/// to the same all-zero, skip-the-line outcome rather than erroring — this
+/// runs on the shutdown/rotation path, where nothing should ever be allowed
+/// to fail louder than a debug log, and that debug log intentionally carries
+/// no interpolated data (not the session id, not the error) so it stays
+/// outside the `card_telemetry` seam without needing to route through it.
+pub(crate) fn log_session_card_summary_best_effort(session_id: &str) {
+    use crate::persistence::LocalMemoryRepository;
+    let cards = crate::persistence::FileMemoryRepository::user_data()
+        .load_live_assist_cards(session_id)
+        .unwrap_or_else(|_| {
+            log::debug!("card_telemetry: live-assist card summary read failed; degrading to empty");
+            Vec::new()
+        });
+    let mut counts = crate::card_telemetry::SessionCardCounts::default();
+    for card in &cards {
+        counts.record(&card.proposal.kind, card.proposal.confidence);
+    }
+    if counts.total() > 0 {
+        crate::card_telemetry::log_session_summary(session_id, &counts);
+    }
 }
 
 /// Take the owned writer out of a `Arc<Mutex<Option<W>>>` slot, recovering from
@@ -721,6 +759,7 @@ pub fn run() {
                     } else {
                         log::info!("Session {} finalized on exit", current_sid);
                     }
+                    log_session_card_summary_best_effort(&current_sid);
                 }
                 _ => {}
             }
@@ -831,5 +870,38 @@ mod shutdown_tests {
             assert_ne!(writer, Some(false));
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_card_summary_helper_gates_summary_and_keeps_the_debug_line_content_free() {
+        // Source-text pins (this crate has no log-capture harness by
+        // design — see `card_telemetry`'s module doc, which uses the same
+        // technique): (1) the summary line only fires when at least one
+        // card was recorded, so idle sessions/rotations don't emit an
+        // all-zero noise row on every exit/rotation; (2) the load-error
+        // fallback's debug line carries no interpolated data (a fixed
+        // string only), so it can't bypass the `card_telemetry` seam's
+        // hygiene guarantee by echoing an unsanitized session_id or a
+        // persistence error string that may itself embed a corrupted
+        // field's value.
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn log_session_card_summary_best_effort(")
+            .expect("log_session_card_summary_best_effort must exist");
+        let end = source[start..]
+            .find("fn take_writer")
+            .map(|rel| start + rel)
+            .expect("take_writer must follow the summary helper");
+        let body = &source[start..end];
+        assert!(
+            body.contains("if counts.total() > 0 {"),
+            "the summary line must be gated on a nonzero total:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "card_telemetry: live-assist card summary read failed; degrading to empty"
+            ),
+            "the load-error debug line must be the fixed, content-free string:\n{body}"
+        );
     }
 }

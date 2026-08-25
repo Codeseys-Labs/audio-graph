@@ -1173,6 +1173,19 @@ fn run_agent_proposal_task(
         );
     }
 
+    // audio-graph-81a5: capture what card-creation telemetry needs before
+    // `proposal` is moved into `emit_or_log` below. The telemetry call
+    // itself is deliberately issued AFTER the UI emit, the latency
+    // measurement, and the generation-guard drop (see below) rather than
+    // inline here — fix-round finding: the original placement ran the extra
+    // `load_live_assist_cards` re-read before the UI emit and inside the
+    // `start.elapsed()` window that feeds the existing "agent" stage-latency
+    // metric, so the observability addition silently delayed the card
+    // reaching the UI and inflated a pre-existing measurement.
+    let telemetry_card_id = proposal.id.clone();
+    let telemetry_kind = proposal.kind.clone();
+    let telemetry_confidence = proposal.confidence;
+
     events::emit_or_log(&app_handle, events::AGENT_PROPOSAL, proposal);
     emit_stage_latency(
         &app_handle,
@@ -1187,6 +1200,41 @@ fn run_agent_proposal_task(
         Some(&segment.id),
         None,
     );
+
+    // Release the session-generation guard before the best-effort telemetry
+    // read below. The guard's documented job — spanning proposal insertion,
+    // durable persistence, and UI/status emission so the whole commit is
+    // atomic w.r.t. session rotation — is done as of the statements above;
+    // telemetry does not need that atomicity. Re-reading the live-assist
+    // cards file for the running count while still holding this mutex would
+    // extend a critical section also taken by the live ASR ingest path
+    // (`record_asr_span_revision_event`) and projection scheduling, which
+    // this ticket's "observation only" constraint forbids.
+    drop(_generation_guard);
+
+    // audio-graph-81a5: card creation telemetry. Best-effort re-read of the
+    // just-persisted per-session card list for the running count — this is
+    // the ONE card-creation site (`run_agent_proposal_task`); see
+    // `card_telemetry` for the content-non-representable helper contract.
+    // This read is unbounded (no `enforce_artifact_ceiling` check), matching
+    // every other pre-existing reader of this same artifact in the crate
+    // (`clear_agent_proposals`, the session-summary hook) other than
+    // `load_session`; bounding all of them behind the ceiling `load_session`
+    // already uses is tracked as a follow-up, not introduced by this read.
+    let session_running_count = FileMemoryRepository::user_data()
+        .load_live_assist_cards(&expected_session_id)
+        .map(|cards| cards.len() as u64)
+        .unwrap_or(0);
+    crate::card_telemetry::log_card_event(
+        &expected_session_id,
+        &telemetry_card_id,
+        &telemetry_kind,
+        telemetry_confidence,
+        crate::card_telemetry::CardLifecycleEvent::Created {
+            session_running_count,
+        },
+    );
+
     true
 }
 
