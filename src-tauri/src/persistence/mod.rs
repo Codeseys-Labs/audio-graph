@@ -350,9 +350,11 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     // unconditional non-empty `source_segment_id` requirement — every
     // OTHER origin, including the default `Transcript` (every
     // transcript-detected proposal AND every legacy pre-83cc record with no
-    // `origin` at all), keeps the full invariant unchanged. This is the
-    // ONLY widening this unit makes to this function; the citation
-    // invariant just below (spans OR graph context) is untouched.
+    // `origin` at all), keeps the full invariant unchanged. T1 stopped here;
+    // T3G2 (audio-graph-83cc-ba04, immediately below) finishes the same
+    // widening for the joint citation invariant this function also
+    // enforces, because that second, untouched invariant was still
+    // rejecting the exact spanless mint T1 was meant to unblock.
     let source_segment_id_required = !matches!(card.origin, Some(CardOrigin::User));
     if source_segment_id_required && card.proposal.source_segment_id.trim().is_empty() {
         return Err(format!(
@@ -360,7 +362,30 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
             card.proposal.id
         ));
     }
-    if card.source_span_ids.is_empty() && card.graph_context_ids.is_empty() {
+    // T3G2 (audio-graph-83cc-ba04, completing ratified Q4): permit BOTH
+    // citation fields empty ONLY when `origin == CardOrigin::User`. This
+    // does NOT touch ADR-0037's evidence-for-claims semantics. The joint
+    // check below (source_span_ids OR graph_context_ids non-empty) is this
+    // module's own pre-existing live-assist admission rule, which predates
+    // ADR-0037; ADR-0037 does not impose it — it cites this exact rule as
+    // its own *layering precedent* for a different surface (claims the
+    // agent asserts about the meeting), and explicitly contemplates claim
+    // classes with no citation at all. So "ADR-0037 semantics unchanged"
+    // means: this widening does not touch the claim-evidence rule ADR-0037
+    // actually governs. A `CardOrigin::User` card's `proposal.body` is the
+    // user's OWN typed text, not a claim about the meeting; there is
+    // nothing for it to cite when it is asked before any speech exists in
+    // the session (an idle-composer question). Every other origin —
+    // `Transcript` and the legacy `None` origin every pre-83cc record
+    // implies — is unconditionally still bound by the full citation
+    // requirement below, unchanged. NOTE: this widening means ADR-0037's
+    // own descriptive sentence about live-assist cards ("admitted if it
+    // cites transcript spans or graph context") is no longer universally
+    // true, and its `mod.rs` line reference is now stale — filed as a
+    // follow-up to update the ADR, not fixed here (out of this ticket's
+    // scope).
+    let citation_required = !matches!(card.origin, Some(CardOrigin::User));
+    if citation_required && card.source_span_ids.is_empty() && card.graph_context_ids.is_empty() {
         return Err(format!(
             "Live assist card {} must cite transcript spans or graph context",
             card.proposal.id
@@ -650,6 +675,30 @@ pub trait LocalMemoryRepository: Send + Sync {
         session_id: &str,
     ) -> Result<Option<MaterializedGraph>, String>;
 
+    /// Read-modify-write on the session's live-assist "current" JSON array
+    /// (audio-graph-83cc T3G review finding, filed then, documented — not
+    /// fixed — here by T3G2 while this file was already open for the
+    /// citation-invariant widening above): this call has no lock of its
+    /// own, and neither does `load_live_assist_cards`. Ticket deliverable
+    /// (d) named three `commands.rs` call sites that read-modify-write a
+    /// session's live-assist current array — `mint_user_question_card`'s
+    /// mint, `finalize_card_answer`'s (called from
+    /// `answer_question_card_impl`) finalize-on-terminal upsert, and
+    /// `delete_orphaned_mint`'s compensating delete — but this is NOT an
+    /// exhaustive list of every such call site: `approve_agent_proposal_impl`,
+    /// `dismiss_agent_proposal`, and `clear_agent_proposals` (all in
+    /// `commands.rs`) and the transcript-mint path in `speech/mod.rs` do
+    /// the same unlocked read-modify-write against the same array. None of
+    /// the three named sites runs inside `state.session_lifecycle`'s
+    /// critical section: they are plain sync `fn`s (not `async fn`), so
+    /// none of them can `.await` the `tokio::sync::Mutex<()>` guard without
+    /// first being restructured into async — that restructuring, not lock
+    /// reentrancy, is why the lock is absent here. Two concurrent upserts
+    /// against the same session can each read the same on-disk snapshot,
+    /// then each write back their own modification, silently losing
+    /// whichever write lands first. Pre-existing risk profile, unchanged by
+    /// T3G2's scope (a validator + mint-path widening only) — named here
+    /// rather than fixed.
     fn upsert_live_assist_card(
         &self,
         session_id: &str,
@@ -5060,6 +5109,102 @@ mod local_memory_repository_tests {
             .upsert_live_assist_card(session_id, &legacy_none_origin)
             .expect_err("a legacy None origin must default to the Transcript-strength invariant");
         assert!(error.contains("source_segment_id is required"), "{error}");
+
+        assert!(
+            repo.load_live_assist_cards(session_id)
+                .expect("load current live assist cards")
+                .is_empty(),
+            "neither rejected card may have materialized"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // audio-graph-83cc T3G2 (ba04): completes Q4 by widening the SECOND,
+    // joint citation invariant (source_span_ids OR graph_context_ids
+    // non-empty) the same way T1 widened `source_segment_id` — ONLY for
+    // `origin: User`, and ONLY when BOTH citation fields are empty. Pinned
+    // both ways, same idiom as T1's own pair of tests above.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_live_assist_card_t3g2_widening_accepts_fully_empty_citations_only_for_user_origin()
+    {
+        let dir = unique_tempdir("live-assist-t3g2-user-origin-spanless");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-t3g2-user-spanless";
+
+        let mut card = sample_live_assist_card(
+            session_id,
+            "card-user-typed-spanless",
+            LiveAssistCardStatus::Pending,
+        );
+        card.origin = Some(CardOrigin::User);
+        // The idle-composer case this ticket exists to unblock: a question
+        // typed before any speech exists in the session has neither a
+        // transcript span nor graph context to cite.
+        card.proposal.source_segment_id = String::new();
+        card.source_span_ids = Vec::new();
+        card.graph_context_ids = Vec::new();
+
+        repo.upsert_live_assist_card(session_id, &card)
+            .expect("origin: User with fully empty citations must be accepted");
+
+        let loaded = repo
+            .load_live_assist_cards(session_id)
+            .expect("load t3g2-widened card");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].source_span_ids.is_empty());
+        assert!(loaded[0].graph_context_ids.is_empty());
+        assert_eq!(loaded[0].origin, Some(CardOrigin::User));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_live_assist_card_t3g2_widening_still_rejects_fully_empty_citations_for_every_other_origin()
+     {
+        let dir = unique_tempdir("live-assist-t3g2-transcript-origin-spanless");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-t3g2-transcript-spanless";
+
+        // Explicit `Transcript` origin: the ADR-0037 evidence-for-claims
+        // invariant is UNCHANGED — a transcript-detected proposal must
+        // still cite a span or graph context.
+        let mut explicit_transcript = sample_live_assist_card(
+            session_id,
+            "card-explicit-transcript-spanless",
+            LiveAssistCardStatus::Pending,
+        );
+        explicit_transcript.origin = Some(CardOrigin::Transcript);
+        explicit_transcript.source_span_ids = Vec::new();
+        explicit_transcript.graph_context_ids = Vec::new();
+        let error = repo
+            .upsert_live_assist_card(session_id, &explicit_transcript)
+            .expect_err("origin: Transcript must still require a citation");
+        assert!(
+            error.contains("must cite transcript spans or graph context"),
+            "{error}"
+        );
+
+        // Legacy `None` origin (every pre-83cc record) must be treated the
+        // same as `Transcript`, not the same as `User`.
+        let mut legacy_none_origin = sample_live_assist_card(
+            session_id,
+            "card-legacy-none-origin-spanless",
+            LiveAssistCardStatus::Pending,
+        );
+        legacy_none_origin.origin = None;
+        legacy_none_origin.source_span_ids = Vec::new();
+        legacy_none_origin.graph_context_ids = Vec::new();
+        let error = repo
+            .upsert_live_assist_card(session_id, &legacy_none_origin)
+            .expect_err("a legacy None origin must default to the Transcript-strength invariant");
+        assert!(
+            error.contains("must cite transcript spans or graph context"),
+            "{error}"
+        );
 
         assert!(
             repo.load_live_assist_cards(session_id)

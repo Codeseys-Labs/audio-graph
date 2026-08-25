@@ -5979,34 +5979,33 @@ const MAX_USER_QUESTION_TEXT_CHARS: usize = events::MAX_CARD_ANSWER_TEXT_CHARS;
 /// - The T2 Rust-authoritative grade, via the SAME `agent_signal_grade`
 ///   function the transcript mint site stamps — this is that function's
 ///   second production call site, never a duplicated copy of its rules.
-/// - The Q4 narrow validator widening (`persistence::validate_live_assist_card`):
-///   `source_segment_id` anchors to the transcript ledger's newest span
-///   ("asked at this point in the conversation"). `source_span_ids` mirrors
-///   the same single-span anchor, matching the transcript mint site's own
-///   `vec![source_span_id]` shape.
+/// - The Q4/T3G2 validator widening (`persistence::validate_live_assist_card`):
+///   when the session already has a transcript span, `source_segment_id`
+///   anchors to the ledger's newest one ("asked at this point in the
+///   conversation") and `source_span_ids` mirrors that same single-span
+///   anchor, matching the transcript mint site's own `vec![source_span_id]`
+///   shape — this half is unchanged from T1. When the session has NO
+///   transcript span yet (the idle-composer case), both fields are left
+///   empty: `persistence::validate_live_assist_card`'s joint citation
+///   invariant (source_span_ids OR graph_context_ids non-empty) now permits
+///   that, but ONLY for `origin: User` (audio-graph-83cc-ba04, T3G2 —
+///   completing the widening T1 started; see that validator's doc comment).
 /// - `graph_context_ids: Vec::new()` at mint, matching the transcript mint
 ///   site's own `Vec::new()` — a card's citation is its `source_span_ids`;
 ///   the ANSWER's own retrieval (graph top-k, computed later by
 ///   `prepare_card_answer_request`) is a separate concern
 ///   (`CardAnswer::evidence_graph_ids`), not the card's mint-time citation.
 ///
-/// Fix-round correction (blocker, scope-honesty review): this doc used to
-/// claim the empty-ledger case is "left empty, permitted by Q4" — that is
-/// NOT actually reachable. `persistence::validate_live_assist_card` has a
-/// SECOND, untouched citation invariant (`source_span_ids` OR
-/// `graph_context_ids` non-empty) that still rejects a card citing neither;
-/// Q4 only relaxed `source_segment_id`'s own non-emptiness, never that joint
-/// check, and `graph_context_ids` is unconditionally empty at mint (above).
-/// So a question typed before the session's first transcript span always
-/// failed validation — surfacing the validator's raw internal prose
-/// ("...must cite transcript spans or graph context") verbatim in the
-/// composer. WIDENING the joint invariant (or deciding what a
-/// pre-transcript question legitimately cites) is a `persistence/mod.rs`
-/// change plus a product decision, outside this ticket's allowed file set —
-/// filed as a follow-up rather than silently patched around. What THIS fix
-/// round closes, in scope: fail fast, below, with a clear static message
-/// before ever calling `upsert_live_assist_card`, instead of leaking the
-/// validator's prose through `AppError::Unknown`.
+/// History (T3G fix-round, superseded by T3G2 above): T3G's own fix-round
+/// found that a question typed before the session's first transcript span
+/// always failed `persistence::validate_live_assist_card`'s joint citation
+/// invariant, and closed that — IN SCOPE for T3G, which could not touch
+/// `persistence/mod.rs` — by failing fast here with a clear static message
+/// instead of leaking the validator's raw internal prose through
+/// `AppError::Unknown`. T3G2 is the follow-up T3G filed: with the validator
+/// itself now widened for `origin: User` (this ticket touches
+/// `persistence/mod.rs` directly), that fail-fast guard is no longer needed
+/// and has been removed below — the mint proceeds instead.
 /// - Q5 (ratified: a query about the meeting is not meeting content): no
 ///   graph write happens here — that is `add_question_to_graph`'s job for
 ///   transcript-detected questions only, and this function never calls it.
@@ -6044,26 +6043,24 @@ fn mint_user_question_card(
     let ledger = state
         .projection_runtime_handle()
         .transcript_ledger_snapshot();
-    // Fix-round fix (blocker, scope-honesty review): fail fast, with a
-    // clear static message, when there is no span to cite — see this
-    // function's doc comment above for why the alternative (minting anyway)
-    // always failed validation downstream with leaked internal prose.
-    let Some(newest_span_id) = ledger
+    // T3G2 (audio-graph-83cc-ba04): anchor to the ledger's newest span when
+    // one exists (unchanged from T1/T3G). When the session is spanless —
+    // the idle-composer case — there is nothing to anchor to, so both
+    // `source_segment_id` and `source_span_ids` stay empty below; this is
+    // now permitted for `origin: User` by
+    // `persistence::validate_live_assist_card`'s own T3G2 widening (see
+    // this function's doc comment above), so the mint proceeds instead of
+    // the fail-fast guard T3G had to add before that validator was
+    // widened.
+    let newest_span_id = ledger
         .latest_spans
         .last()
-        .map(|event| event.span_id.clone())
-    else {
-        return Err(AppError::Unknown(
-            "Ask a question once the conversation has started — there's no \
-             transcript yet for this question to reference."
-                .to_string(),
-        ));
-    };
+        .map(|event| event.span_id.clone());
 
     let now_ms = unix_millis();
     let mut proposal = events::AgentProposalPayload {
         id: uuid::Uuid::new_v4().to_string(),
-        source_segment_id: newest_span_id.clone(),
+        source_segment_id: newest_span_id.clone().unwrap_or_default(),
         source_id: "user".to_string(),
         speaker_label: None,
         kind: events::AgentProposalKind::Question,
@@ -6079,7 +6076,7 @@ fn mint_user_question_card(
         session_id: session_id.clone(),
         proposal: proposal.clone(),
         status: events::LiveAssistCardStatus::Pending,
-        source_span_ids: vec![newest_span_id],
+        source_span_ids: newest_span_id.map(|id| vec![id]).unwrap_or_default(),
         graph_context_ids: Vec::new(),
         outcome: None,
         projection_patch_sequence: None,
@@ -24454,6 +24451,133 @@ mod tests {
         drop_cached_api_client_off_the_async_context(&state);
     }
 
+    /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4): the same
+    /// mint-and-ask round trip as the test above, but on an IDLE session —
+    /// zero transcript spans, the exact case the design panel's
+    /// idle-composer affordance exists for ("a question typed before any
+    /// speech works"). Before this ticket, `mint_user_question_card` failed
+    /// fast here; now the mint proceeds with a fully empty citation
+    /// (`origin: User`, both `source_span_ids` and `graph_context_ids`
+    /// empty) and the round trip completes exactly like the with-span case.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn ask_question_card_mint_and_ask_round_trip_succeeds_on_an_idle_spanless_session() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("ask-question-card-mint-and-ask-spanless");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+
+        // Deliberately NO ledger seed — an idle session, zero transcript
+        // spans, is the point of this test.
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Nothing has been discussed yet.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n\
+                            data: [DONE]\n\n";
+            let base = spawn_answer_engine_sse_mock(sse_body).await;
+            point_state_at_mock_llm_provider(&state, base);
+            prewarm_api_client_off_the_async_context(&state);
+
+            let dispatch = dispatch_ask_question_card(
+                "What's on the agenda today?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the mint-and-ask round trip must succeed on an idle session too");
+            assert!(!dispatch.request_id.is_empty());
+
+            let record = dispatch.record;
+            assert_eq!(record.origin, Some(events::CardOrigin::User));
+            assert_eq!(record.proposal.kind, events::AgentProposalKind::Question);
+            assert_eq!(
+                record.signal,
+                Some(events::SignalGrade::Strong),
+                "signal grading depends on confidence/content only, not on \
+                 whether a span exists to anchor to"
+            );
+            assert_eq!(
+                record.source_span_ids,
+                Vec::<String>::new(),
+                "a spanless mint must cite no spans — it is the user's own \
+                 text, not a claim, so ADR-0037 evidence-for-claims never \
+                 applied to it"
+            );
+            assert!(record.graph_context_ids.is_empty());
+            assert_eq!(record.proposal.source_segment_id, "");
+
+            let proposal_id = record.proposal.id.clone();
+
+            let answered = wait_for_answered_card(&session_id, &proposal_id).await;
+            let answer = answered.answer.expect("answer persisted");
+            assert_eq!(answer.status, events::CardAnswerStatus::Answered);
+            assert_eq!(answer.text, "Nothing has been discussed yet.");
+            assert_eq!(answer.requested_by, events::CardOrigin::User);
+            assert!(!answer.route_id.is_empty());
+
+            // Persisted exactly once, same shape as the with-span round trip:
+            // the mint's own upsert plus exactly one finalize-on-terminal
+            // upsert, never a per-delta write.
+            let audit = FileMemoryRepository::user_data()
+                .load_live_assist_card_audit(&session_id)
+                .expect("load audit log");
+            assert_eq!(
+                audit
+                    .iter()
+                    .filter(|c| c.proposal.id == proposal_id)
+                    .count(),
+                2,
+                "exactly two audit rows for this card: the mint upsert and the \
+                 one finalize-on-terminal upsert"
+            );
+
+            // Ledger fires the same way it does for the with-span round trip.
+            // No dynamic telemetry assertion here: this crate has no
+            // log-capture harness by design (see `card_telemetry.rs`'s
+            // `public_log_functions_still_call_log_info` test comment), so
+            // telemetry is pinned via source-text inspection, not execution.
+            // `mint_user_question_card`'s `card_telemetry::log_card_event(..,
+            // Created { .. })` call (commands.rs, just above the upsert) is
+            // unconditional — the spanless branch this test exercises only
+            // changes `source_segment_id`'s `Option`, never that call — so
+            // the existing structural pin,
+            // `mint_user_question_card_emits_the_created_telemetry_line`
+            // above, already covers this call path; no spanless-specific
+            // variant is needed.
+            let ledger_rows = FileMemoryRepository::user_data()
+                .load_data_movement_events(&session_id)
+                .expect("load movement ledger");
+            assert_eq!(ledger_rows.len(), 2, "one started + one terminal row");
+            assert_eq!(
+                ledger_rows[0].event_type,
+                crate::persistence::DataMovementEventType::ProviderCallStarted
+            );
+            assert_eq!(
+                ledger_rows[1].event_type,
+                crate::persistence::DataMovementEventType::ProviderCallSucceeded
+            );
+            for row in &ledger_rows {
+                assert_eq!(
+                    row.source.as_ref().map(|s| s.kind.as_str()),
+                    Some("assist_manual_answer")
+                );
+                let serialized = serde_json::to_string(row).expect("serialize ledger row");
+                assert!(!serialized.contains("Nothing has been discussed"));
+            }
+        });
+
+        drop_cached_api_client_off_the_async_context(&state);
+    }
+
     // Plain `#[test]` + a manually-driven `Runtime::block_on` — see the
     // previous test's comment for why (holding `TEST_HOME_LOCK`'s guard
     // across `.await` trips `clippy::await_holding_lock`, and `ApiClient::new`
@@ -24542,37 +24666,65 @@ mod tests {
         drop_cached_api_client_off_the_async_context(&state);
     }
 
-    /// Fix-round addition (blocker, scope-honesty review). Before this fix,
-    /// `mint_user_question_card` would build and attempt to persist a card
-    /// in a spanless session, and `persistence::validate_live_assist_card`'s
-    /// citation invariant would reject it — surfacing that validator's raw
-    /// internal prose verbatim in the caller's `AppError::Unknown`. This is
-    /// a pure in-memory precondition check (no disk touched either way —
-    /// `current_session_id`/`transcript_ledger_snapshot` are both in-memory
-    /// reads), so, like the gate-only tests above, needs no
-    /// `TEST_HOME_LOCK`/`HomeGuard`.
+    /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4). FLIPPED,
+    /// explicitly, from T3G's `..._refuses_cleanly_in_a_spanless_session_
+    /// instead_of_leaking_validator_prose` — that test pinned
+    /// `mint_user_question_card`'s OWN fail-fast refusal, which existed only
+    /// because `persistence::validate_live_assist_card`'s joint citation
+    /// invariant unconditionally rejected an empty-citation card (see that
+    /// function's doc comment, and this one's, for the full history). Now
+    /// that the validator itself widens the joint invariant for `origin:
+    /// User` (this ticket's deliverable (a)), the fail-fast guard is gone
+    /// and the mint SUCCEEDS instead — this is the idle-composer affordance
+    /// ratified Q4 exists for. Unlike the old test (a pure in-memory
+    /// precondition check that never touched disk), this one actually
+    /// persists, so it needs the same `TEST_HOME_LOCK`/`HomeGuard` isolation
+    /// every other disk-touching test in this module uses.
     #[test]
-    fn mint_user_question_card_refuses_cleanly_in_a_spanless_session_instead_of_leaking_validator_prose()
-     {
+    fn mint_user_question_card_succeeds_in_a_spanless_session_with_empty_citations() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("mint-user-question-card-spanless-success");
+        let _guard = HomeGuard::set(&dir);
+
         let state = AppState::new();
-        let err = mint_user_question_card(&state, "What's next on the roadmap?")
-            .expect_err("mint must refuse when the session has no transcript spans yet");
-        let message = err.to_string();
+        let session_id = state.current_session_id();
+
+        let record = mint_user_question_card(&state, "What's next on the roadmap?")
+            .expect("mint must succeed in a spanless session for a User-origin question");
+
+        assert_eq!(record.origin, Some(events::CardOrigin::User));
         assert!(
-            message.contains("no transcript yet"),
-            "expected mint's own clear, static message, got: {message}"
+            record.source_span_ids.is_empty(),
+            "a spanless mint must not fabricate a span id"
         );
-        assert!(
-            !message.contains("must cite transcript spans or graph context"),
-            "the persistence validator's raw internal prose must never reach \
-             the caller: {message}"
-        );
+        assert!(record.graph_context_ids.is_empty());
+        assert_eq!(record.proposal.source_segment_id, "");
+
+        let loaded = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .expect("load persisted card");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].proposal.id, record.proposal.id);
     }
 
     /// Fix-round addition (minor, scope-honesty review): before this fix,
-    /// `proposal.body` had no cap at all — only an empty-text check.
+    /// `proposal.body` had no cap at all — only an empty-text check. The
+    /// at-cap boundary used to rely on the spanless-session fail-fast (now
+    /// removed by T3G2, audio-graph-83cc-ba04) to prove "rejected for an
+    /// unrelated reason, never length" without needing disk isolation —
+    /// with that guard gone the at-cap case now SUCCEEDS, so this asserts
+    /// success directly and needs the same `TEST_HOME_LOCK`/`HomeGuard`
+    /// every other persisting test in this module uses.
     #[test]
     fn mint_user_question_card_refuses_text_over_the_character_cap() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("mint-user-question-card-length-cap");
+        let _guard = HomeGuard::set(&dir);
+
         let state = AppState::new();
         let too_long = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS + 1);
         let err = mint_user_question_card(&state, &too_long)
@@ -24583,15 +24735,14 @@ mod tests {
             err
         );
 
-        // Boundary: exactly at the cap still fails ONLY on the (unrelated,
-        // pre-existing) spanless-session check, never on length.
+        // Boundary: exactly at the cap succeeds (T3G2: a spanless session no
+        // longer refuses) — proving the cap check itself is `>`, not `>=`.
         let at_cap = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS);
-        let err = mint_user_question_card(&state, &at_cap)
-            .expect_err("spanless session still refuses, but not for length");
-        assert!(
-            !err.to_string().contains("too long"),
-            "text at exactly the cap must not be rejected for length: {}",
-            err
+        let record = mint_user_question_card(&state, &at_cap)
+            .expect("text at exactly the cap must be accepted, not rejected for length");
+        assert_eq!(
+            record.proposal.body.chars().count(),
+            MAX_USER_QUESTION_TEXT_CHARS
         );
     }
 
