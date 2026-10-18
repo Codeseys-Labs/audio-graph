@@ -310,6 +310,14 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
 
 - Vulkan-only GPUs get CPU speed (`audio-graph-26b4`); llama.cpp stays a fallback design if that matters
   more than exactness.
+- Tokenizer regex engine: `candle-core` 0.10.2 depends on `tokenizers` with the `onig` feature on every
+  non-wasm target, and `tokenizers` 0.22 uses Oniguruma whenever `onig` is on, even with `fancy-regex`
+  also enabled. Every build with `decision-d3` therefore tokenizes with Oniguruma, the engine the HF
+  Python reference uses, and the parity runs measured exactly that. Side effects: enabling `decision-d3`
+  also moves Laya from fancy-regex to Oniguruma in builds that did not already have it (the default
+  `local-ml` build already gets `onig` through mistralrs), and cross-compiling needs a C compiler for
+  the target (`onig_sys`); a Windows-to-macOS `cargo check` fails there, so the Metal code path has not
+  even been compiled yet (`audio-graph-377a`).
 - Metal is unverified until the MSL kernel lands and macOS CI runs it (`audio-graph-377a`).
 - BF16 on GPU moves probabilities by up to 1.9e-2 against the default BF16 reference and 3.4e-2 against
   its batch-size-1 run, the same spread as the reference's own batch-size variance; one near-tie pick
