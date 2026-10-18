@@ -1,9 +1,13 @@
+#[cfg(feature = "decision-clef")]
+pub mod clef;
 pub mod contract;
 #[cfg(feature = "decision-d3")]
 pub mod d3;
 #[cfg(feature = "decision-laya")]
 pub mod laya;
-#[cfg(feature = "decision-d3")]
+#[cfg(any(feature = "decision-d3", feature = "decision-clef"))]
+pub mod pyjson;
+#[cfg(any(feature = "decision-d3", feature = "decision-clef"))]
 pub mod qwen35;
 
 pub use contract::*;

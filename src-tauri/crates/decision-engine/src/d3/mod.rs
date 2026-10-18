@@ -114,6 +114,7 @@ impl Loaded {
             prefix: "language_model",
             attention: internal(decision.attention())?,
             dtype: precision.dtype(),
+            weights: precision.dtype(),
         };
         let encoder = internal(Encoder::load(directory, &text, &options, device))?;
         let readout = internal(candle_core::safetensors::load(
@@ -146,29 +147,6 @@ impl Loaded {
             .squeeze(1)?;
         let probs = candle_nn::ops::softmax_last_dim(&(logits / self.temperature)?.unsqueeze(0)?)?;
         probs.squeeze(0)?.to_device(&Device::Cpu)?.to_vec1::<f32>()
-    }
-}
-
-/// The candle device for an execution provider. candle has CUDA and Metal backends only; DirectML
-/// requests are refused (Vulkan-only GPUs: audio-graph-26b4).
-fn device_for(provider: ExecutionProvider) -> Result<Device, DecisionError> {
-    match provider {
-        ExecutionProvider::Cpu => Ok(Device::Cpu),
-        #[cfg(all(feature = "cuda", any(target_os = "windows", target_os = "linux")))]
-        ExecutionProvider::Cuda => {
-            let device = Device::new_cuda(0)
-                .map_err(|_| DecisionError::EngineUnavailable { feature: "cuda" })?;
-            // One stream and no cross-stream sharing: candle's per-tensor event tracking is pure overhead.
-            // SAFETY: every tensor of this engine lives on this device's single stream.
-            unsafe { internal(device.as_cuda_device())?.disable_event_tracking() };
-            Ok(device)
-        }
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        ExecutionProvider::CoreMl => {
-            Device::new_metal(0).map_err(|_| DecisionError::EngineUnavailable { feature: "metal" })
-        }
-        #[allow(unreachable_patterns)]
-        _ => Err(DecisionError::EngineUnavailable { feature: "cuda" }),
     }
 }
 
@@ -270,7 +248,7 @@ impl DecisionEngine for D3Engine {
         tokio::task::spawn_blocking(move || {
             let mut slot = model.lock().map_err(|_| DecisionError::Internal)?;
             if slot.is_none() {
-                let device = device_for(provider)?;
+                let device = qwen35::device_for(provider)?;
                 *slot = Some(Loaded::load(&directory, &device, precision)?);
             }
             let loaded = slot.as_ref().ok_or(DecisionError::Internal)?;

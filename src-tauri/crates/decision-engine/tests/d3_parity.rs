@@ -238,6 +238,7 @@ fn encoder_causal_mode_matches_the_reference_causal_run() {
         prefix: "language_model",
         attention: Attention::Causal,
         dtype: DType::F32,
+        weights: DType::F32,
     };
     let encoder = Encoder::load(&root, &text, &options, &device).unwrap();
     let readout = candle_core::safetensors::load(root.join("readout.safetensors"), &device)

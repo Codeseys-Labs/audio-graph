@@ -227,6 +227,22 @@ const D3_NANO_URL: &str =
 const D3_MINI_URL: &str =
     "https://huggingface.co/vllm-sr/d3-mini/resolve/bd0090dd758d32ba59ef5c749910a8e87fc4391f";
 
+// Clef-flash (Cloudflare/clef-flash, Apache-2.0), pinned to the revision of fixtures/clef-flash.json. The
+// vision tower lives in the same shards, so all four are needed even for text-only use.
+const CLEF_FLASH_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    "joint_head_config.json",
+    "joint_head.safetensors",
+    "model.safetensors.index.json",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+];
+const CLEF_FLASH_URL: &str =
+    "https://huggingface.co/Cloudflare/clef-flash/resolve/8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3";
+
 // --- Clustering diarization models (ADR-0017 / B16, `diarization-clustering`) -
 // Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
 // embedding model (URLs verified 200 on 2026-05-30, see
@@ -432,6 +448,15 @@ const MODELS: &[ModelDef] = &[
         archive_required_files: None,
         component_required_files: Some(D3_MINI_FILES),
     },
+    ModelDef {
+        name: "Clef-flash (9B)",
+        filename: "clef-flash",
+        url: CLEF_FLASH_URL,
+        expected_size: None,
+        description: "Local typed decisions with the Clef-flash Qwen3.5-9B backbone and joint schema head (about 19 GB)",
+        archive_required_files: None,
+        component_required_files: Some(CLEF_FLASH_FILES),
+    },
     // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
     ModelDef {
         name: "Pyannote Segmentation 3.0 (Clustering Diarization)",
@@ -544,10 +569,15 @@ pub fn create_decision_engine(
     let mut config = audio_graph_decision_engine::EngineConfig::new(get_models_dir(app));
     config.execution_provider = execution_provider;
     config.allow_large_choice_sets = allow_large_choice_sets;
-    #[cfg_attr(not(feature = "decision-d3"), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(feature = "decision-d3", feature = "decision-clef")),
+        allow(unused_mut)
+    )]
     let mut registry = audio_graph_decision_engine::EngineRegistry::default();
     #[cfg(feature = "decision-d3")]
     audio_graph_decision_engine::d3::register(&mut registry);
+    #[cfg(feature = "decision-clef")]
+    audio_graph_decision_engine::clef::register(&mut registry);
     registry.create(id, &config)
 }
 
@@ -1873,6 +1903,35 @@ mod tests {
                 sharded || files.contains(&"model.safetensors"),
                 "{id} has no weights"
             );
+        }
+    }
+
+    #[test]
+    fn clef_flash_is_registered_with_every_weight_shard() {
+        #[cfg(feature = "decision-clef")]
+        assert_eq!(audio_graph_decision_engine::clef::CLEF_FLASH, "clef-flash");
+        let model = MODELS
+            .iter()
+            .find(|m| m.filename == "clef-flash")
+            .expect("clef-flash registered");
+        assert!(
+            model
+                .url
+                .contains("/resolve/8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3")
+        );
+        let files = model.component_required_files.expect("component directory");
+        // The loader opens every shard named by model.safetensors.index.json; a missing one fails at load.
+        for shard in 1..=4 {
+            let name = format!("model-{shard:05}-of-00004.safetensors");
+            assert!(files.contains(&name.as_str()), "missing {name}");
+        }
+        for required in [
+            "config.json",
+            "tokenizer.json",
+            "joint_head_config.json",
+            "joint_head.safetensors",
+        ] {
+            assert!(files.contains(&required), "missing {required}");
         }
     }
 

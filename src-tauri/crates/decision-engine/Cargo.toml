@@ -10,7 +10,8 @@ decision-laya = ["dep:ort", "dep:tokenizers", "dep:unicode-script"]
 # Decision 3.0 on candle (docs/designs/d3-native-runtime-2026-10-18.md). candle-core/candle-nn are the
 # versions mistralrs already pins in Cargo.lock.
 decision-d3 = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:rayon", "dep:tokenizers"]
-decision-clef = []
+# Clef-flash on the same candle Qwen3.5 encoder (docs/designs/clef-flash-native-2026-10-18.md).
+decision-clef = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:rayon", "dep:tokenizers"]
 cuda = ["ort?/cuda", "candle-core?/cuda", "candle-nn?/cuda"]
 vulkan = ["ort?/directml"]
 metal = ["ort?/coreml", "candle-core?/metal", "candle-nn?/metal"]
