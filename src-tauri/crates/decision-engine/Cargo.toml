@@ -16,6 +16,7 @@ vulkan = ["ort?/directml"]
 metal = ["ort?/coreml", "candle-core?/metal", "candle-nn?/metal"]
 
 [dependencies]
+audio-graph-decision-contract = { path = "../decision-contract" }
 async-trait = "0.1"
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }

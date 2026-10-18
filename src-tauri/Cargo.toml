@@ -6,7 +6,7 @@ authors = ["rsac contributors"]
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ipc-contract", "crates/provider-registry", "crates/decision-engine"]
+members = [".", "crates/ipc-contract", "crates/provider-registry", "crates/decision-contract", "crates/decision-engine"]
 default-members = ["."]
 resolver = "3"
 

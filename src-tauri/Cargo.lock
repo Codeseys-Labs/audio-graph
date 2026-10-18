@@ -642,10 +642,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-graph-decision-contract"
+version = "0.1.0-rc.1"
+dependencies = [
+ "async-trait",
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "audio-graph-decision-engine"
 version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
+ "audio-graph-decision-contract",
  "candle-core",
  "candle-nn",
  "half",
