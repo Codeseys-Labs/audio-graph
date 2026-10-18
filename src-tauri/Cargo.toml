@@ -6,7 +6,7 @@ authors = ["rsac contributors"]
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ipc-contract", "crates/provider-registry"]
+members = [".", "crates/ipc-contract", "crates/provider-registry", "crates/decision-contract"]
 default-members = ["."]
 resolver = "3"
 
@@ -129,6 +129,7 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 [dependencies]
 audio-graph-provider-registry = { path = "crates/provider-registry" }
 audio-graph-ipc-contract = { path = "crates/ipc-contract" }
+audio-graph-decision-contract = { path = "crates/decision-contract" }
 
 # Tauri framework.
 # NOTE: `devtools` is intentionally NOT in this feature list. Enabling it here

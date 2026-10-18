@@ -574,6 +574,7 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
+ "audio-graph-decision-contract",
  "audio-graph-ipc-contract",
  "audio-graph-provider-registry",
  "audioadapter-buffers",
@@ -638,6 +639,17 @@ dependencies = [
  "whisper-rs",
  "windows 0.62.2",
  "zeroize",
+]
+
+[[package]]
+name = "audio-graph-decision-contract"
+version = "0.1.0-rc.1"
+dependencies = [
+ "async-trait",
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
