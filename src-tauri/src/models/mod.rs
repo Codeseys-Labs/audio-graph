@@ -5,6 +5,7 @@
 //! based model setup with a cross-platform Rust implementation.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,10 +52,10 @@ fn build_download_client() -> reqwest::blocking::Client {
 // ---------------------------------------------------------------------------
 
 /// Internal model definition with expected sizes for verification.
-struct ModelDef {
+struct ModelDef<'a> {
     name: &'static str,
     filename: &'static str,
-    url: &'static str,
+    url: &'a str,
     expected_size: Option<u64>, // bytes, with 1% tolerance
     description: &'static str,
     /// When `Some`, this model ships as a `.tar.bz2` archive that extracts into a
@@ -159,6 +160,31 @@ pub const LAYA_MULTILINGUAL: &str = audio_graph_decision_engine::LAYA_MULTILINGU
 const LAYA_BUNDLE_FILES: &[&str] = audio_graph_decision_engine::LAYA_BUNDLE_FILES;
 const LAYA_ENGLISH_URL: &str =
     "https://huggingface.co/receptron/laya-onnx/resolve/d42786bdff8a7550316339c5fbf8f46caa83ea1b";
+const LAYA_MULTILINGUAL_URL: &str = "https://huggingface.co/soyelmismo/laya-multilingual-onnx/resolve/0966c4fa58da6878b39e7e14cb5e93313b82d828";
+const LAYA_MULTILINGUAL_FILES: &[&str] = &[
+    "model-fp32.onnx",
+    "rl_agent_config.json",
+    "tokenizer/tokenizer.json",
+    "tokenizer/tokenizer_config.json",
+];
+const LAYA_MULTILINGUAL_HASHES: &[(&str, &str)] = &[
+    (
+        "model-fp32.onnx",
+        "7147e7651132da5ee2c1791c52ea25d4b9f7d9d187b15b60b1373467a436d626",
+    ),
+    (
+        "rl_agent_config.json",
+        "9a669a70961064c3c6cc76d2afb8bc5fb10dcd8349bb66e5f7b9b1afb74440d5",
+    ),
+    (
+        "tokenizer/tokenizer.json",
+        "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+    ),
+    (
+        "tokenizer/tokenizer_config.json",
+        "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1",
+    ),
+];
 
 // Decision 3.0 (vllm-sr/d3-*): component directories named after the d3 engine ids, pinned to the
 // revisions the d3 parity fixtures were generated from.
@@ -360,6 +386,15 @@ const MODELS: &[ModelDef] = &[
         description: "Local typed decisions with the ModernBERT-large encoder and decision head",
         archive_required_files: None,
         component_required_files: Some(LAYA_BUNDLE_FILES),
+    },
+    ModelDef {
+        name: "Laya Multilingual",
+        filename: LAYA_MULTILINGUAL,
+        url: LAYA_MULTILINGUAL_URL,
+        expected_size: None,
+        description: "Local multilingual typed decisions using the hosted FP32 mmBERT checkpoint",
+        archive_required_files: None,
+        component_required_files: Some(LAYA_MULTILINGUAL_FILES),
     },
     ModelDef {
         name: "Decision 3.0 edge (0.6B)",
@@ -595,6 +630,26 @@ fn verify_archive_dir(path: &Path, required_files: &[&str]) -> bool {
                 .map(|m| m.is_file() && m.len() > 0)
                 .unwrap_or(false)
         })
+}
+
+fn component_digest_matches(path: &Path, expected: &str) -> bool {
+    let mut expected_bytes = [0_u8; 32];
+    if hex::decode_to_slice(expected, &mut expected_bytes).is_err() {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => digest.update(&buffer[..count]),
+            Err(_) => return false,
+        }
+    }
+    digest.finalize()[..] == expected_bytes
 }
 
 fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
@@ -1013,8 +1068,44 @@ fn download_component_directory_model(
     target_path: &Path,
 ) -> Result<String, String> {
     use tauri::Emitter;
+    let hashes = if def.filename == LAYA_MULTILINGUAL {
+        LAYA_MULTILINGUAL_HASHES
+    } else {
+        &[]
+    };
+    download_component_directory(
+        def,
+        required_files,
+        hashes,
+        models_dir,
+        target_path,
+        |progress| {
+            let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, progress);
+        },
+    )
+}
 
-    if verify_archive_dir(target_path, required_files) {
+fn download_component_directory(
+    def: &ModelDef,
+    required_files: &[&str],
+    expected_hashes: &[(&str, &str)],
+    models_dir: &Path,
+    target_path: &Path,
+    mut emit_progress: impl FnMut(&DownloadProgress),
+) -> Result<String, String> {
+    if !expected_hashes.is_empty()
+        && !required_files
+            .iter()
+            .all(|name| expected_hashes.iter().any(|(file, _)| file == name))
+    {
+        return Err("Model component SHA-256 metadata is incomplete".into());
+    }
+
+    if verify_archive_dir(target_path, required_files)
+        && expected_hashes
+            .iter()
+            .all(|(name, digest)| component_digest_matches(&target_path.join(name), digest))
+    {
         return Ok(target_path.to_string_lossy().to_string());
     }
 
@@ -1037,6 +1128,17 @@ fn download_component_directory_model(
     let base_url = def.url.trim_end_matches('/');
 
     for component in required_files {
+        let expected_digest = expected_hashes
+            .iter()
+            .find(|(name, _)| name == component)
+            .map(|(_, expected)| {
+                let mut bytes = [0_u8; 32];
+                hex::decode_to_slice(expected, &mut bytes)
+                    .map_err(|_| "Invalid model component SHA-256 metadata".to_string())?;
+                Ok::<_, String>(bytes)
+            })
+            .transpose()?;
+        let mut digest = expected_digest.as_ref().map(|_| Sha256::new());
         let component_url = format!("{}/{}", base_url, component);
         let component_path = install_dir.join(component);
         let component_tmp_path = install_dir.join(format!("{}.download", component));
@@ -1063,7 +1165,7 @@ fn download_component_directory_model(
                     start.elapsed(),
                     "error",
                 );
-                let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+                emit_progress(&progress);
                 return Err(format!(
                     "Download failed for model component '{}': {}",
                     component, error
@@ -1090,7 +1192,7 @@ fn download_component_directory_model(
                         start.elapsed(),
                         "error",
                     );
-                    let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+                    emit_progress(&progress);
                     return Err(format!(
                         "Read error for model component '{}': {}",
                         component, error
@@ -1103,6 +1205,9 @@ fn download_component_directory_model(
 
             file.write_all(&buffer[..bytes_read])
                 .map_err(|e| format!("Write error for component '{}': {}", component, e))?;
+            if let Some(digest) = &mut digest {
+                digest.update(&buffer[..bytes_read]);
+            }
             downloaded_total = downloaded_total.saturating_add(bytes_read as u64);
 
             if throttle.should_emit(Instant::now()) {
@@ -1113,12 +1218,17 @@ fn download_component_directory_model(
                     start.elapsed(),
                     "downloading",
                 );
-                let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+                emit_progress(&progress);
             }
         }
         drop(file);
+        let digest_valid = match (digest, expected_digest) {
+            (Some(actual), Some(expected)) => actual.finalize()[..] == expected,
+            (None, None) => true,
+            _ => false,
+        };
 
-        if !verify_model_file(&component_tmp_path, None) {
+        if !verify_model_file(&component_tmp_path, None) || !digest_valid {
             let _ = remove_path(&install_dir);
             let progress = build_progress(
                 def,
@@ -1127,9 +1237,9 @@ fn download_component_directory_model(
                 start.elapsed(),
                 "error",
             );
-            let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+            emit_progress(&progress);
             return Err(format!(
-                "Download verification failed for model component '{}'",
+                "Download size/SHA-256 verification failed for model component '{}'",
                 component
             ));
         }
@@ -1149,7 +1259,7 @@ fn download_component_directory_model(
             start.elapsed(),
             "error",
         );
-        let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+        emit_progress(&progress);
         return Err(format!(
             "Component download did not produce required files: {}",
             required_files.join(", ")
@@ -1169,7 +1279,7 @@ fn download_component_directory_model(
             "complete",
         )
     };
-    let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+    emit_progress(&progress);
 
     Ok(target_path.to_string_lossy().to_string())
 }
@@ -1521,6 +1631,77 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    fn hashed_component_fixture(url: &str) -> ModelDef<'_> {
+        ModelDef {
+            name: "Hashed component fixture",
+            filename: "hashed-component",
+            url,
+            expected_size: None,
+            description: "Integrity test fixture",
+            archive_required_files: None,
+            component_required_files: Some(&["tokenizer/tokenizer.json"]),
+        }
+    }
+
+    #[test]
+    fn component_hash_failure_never_installs_or_reports_complete() {
+        let url = spawn_oneshot_http(200, "OK", "application/octet-stream", "corrupt");
+        let def = hashed_component_fixture(&url);
+        let root = std::env::temp_dir().join(format!(
+            "audiograph-component-hash-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let target = root.join(def.filename);
+        let expected = hex::encode(Sha256::digest(b"model-bytes"));
+        let hashes = [("tokenizer/tokenizer.json", expected.as_str())];
+        let mut statuses = Vec::new();
+        let error = download_component_directory(
+            &def,
+            def.component_required_files.unwrap(),
+            &hashes,
+            &root,
+            &target,
+            |progress| statuses.push(progress.status.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("SHA-256"));
+        assert!(!target.exists());
+        assert!(!root.join("hashed-component.downloading").exists());
+        assert_eq!(statuses.last().map(String::as_str), Some("error"));
+        assert!(!statuses.iter().any(|status| status == "complete"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn component_cache_hash_mismatch_forces_verified_redownload() {
+        let url = spawn_oneshot_http(200, "OK", "application/octet-stream", "model-bytes");
+        let def = hashed_component_fixture(&url);
+        let root = std::env::temp_dir().join(format!(
+            "audiograph-component-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let target = root.join(def.filename);
+        let component = target.join("tokenizer/tokenizer.json");
+        fs::create_dir_all(component.parent().unwrap()).unwrap();
+        fs::write(&component, b"tampered-but-nonempty").unwrap();
+        let expected = hex::encode(Sha256::digest(b"model-bytes"));
+        let hashes = [("tokenizer/tokenizer.json", expected.as_str())];
+        let mut statuses = Vec::new();
+        download_component_directory(
+            &def,
+            def.component_required_files.unwrap(),
+            &hashes,
+            &root,
+            &target,
+            |progress| statuses.push(progress.status.clone()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(component).unwrap(), b"model-bytes");
+        assert_eq!(statuses.last().map(String::as_str), Some("complete"));
+        assert!(!root.join("hashed-component.downloading").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
