@@ -1,4 +1,4 @@
-# Clef-flash native runtime (Phase A, audio-graph-4bc6)
+# Clef-flash native runtime (audio-graph-4bc6)
 
 Date: 2026-10-18. Seed: `audio-graph-4bc6` (S1-T5), epic `audio-graph-6dfb`.
 Code: `src-tauri/crates/decision-engine/src/clef/` (feature `decision-clef`), on the shared Qwen3.5 encoder
@@ -123,9 +123,7 @@ French and Japanese text, a JSON list state with quotes and a newline, a single-
 | CUDA, FP32 compute, BF16 weights | `fp32` | 5.96e-7 | 23/23 |
 | CUDA, BF16 | `official` | 6.44e-3 | 23/23 |
 
-Wall time per request in the parity run (first request includes kernel compilation): BF16 0.04 to
-0.06 s for 200 to 400 tokens and 0.28 s for 1,930 tokens; FP32 compute 0.13 to 0.24 s and 0.76 s.
-Proper warm p50 / p95 per mode is Phase B.
+Warm latency through the engine is in the Phase B section below.
 
 ## Memory and quantization
 
@@ -144,18 +142,35 @@ weights. Community recipes serve Clef-flash in FP8 on 16 and 24 GB GPUs (`turloc
 `cryguy/clef-flash-vllm-fp8`). The candle path would be its quantized matmul (Q8_0 about 7.4 GB, Q4K about
 4 GB for the layers) with parity measured against `official`; that is follow-up seed `audio-graph-5678`.
 
-## Phase B plan
+## Phase B (as built)
 
-- `ClefEngine` implementing `DecisionEngine`, registered through `clef::register(&mut EngineRegistry)`
-  like d3; `create_decision_engine` calls it under the app's `decision-clef` feature.
-- Limits: 64 questions (vLLM's limit), options bounded by the 16k budget; schema over budget maps to
-  `CardinalityLimit`; state truncation reported in `usage.input_tokens` only, as vLLM does.
-- Model-manager entry `clef-flash` pinned to revision `8b2e5fd1`. The vision tower shares the four weight
-  shards with the text layers, so the download is the full 19 GB even though only the text layers load.
-- GPU smoke and warm p50 / p95 per precision on this machine, recorded in `docs/research`.
+- `ClefEngine` (`clef/mod.rs`) implements `DecisionEngine`; `clef::register(&mut EngineRegistry)` adds it
+  through the registry API, and `create_decision_engine` in `src-tauri/src/models/mod.rs` calls it under
+  the app's `decision-clef` feature. Without the feature the skeleton registry answers `clef-flash` with
+  `EngineUnavailable { feature: "decision-clef" }`.
+- `egress()` is `Local`. Limits: 64 questions (vLLM's limit), 255 options per choice or score, state
+  budget 16,384 tokens. `EngineLimits::validate` runs before any model file is read. A schema that alone
+  exceeds the budget returns `CardinalityLimit`; a long state is truncated as in the reference and vLLM,
+  and `usage.input_tokens` counts the prompt actually read.
+- Precision: BF16 on GPU by default; `ClefEngine::with_precision(Precision::F32)` selects FP32 compute
+  on the BF16 weights. CPU always runs FP32 compute (candle's CPU matmul has no BF16 kernel). DirectML is
+  refused with `EngineUnavailable { feature: "cuda" }`, as for d3; device selection is shared
+  (`qwen35::device_for`).
+- Model files: `ModelDef` `clef-flash` in the existing model manager, `resolve/8b2e5fd1...` with the
+  config, tokenizer, joint head and all four weight shards (the vision tower shares the shards, so the
+  download is the full 19 GB even though only the text layers load).
+- GPU smoke and latency (`examples/clef_bench.rs`, details in
+  `docs/research/clef-flash-native-latency-2026-10-18.md`), warm p50 / p95 on the RTX 5090:
+
+  | Path | 3 questions, 335 tokens | 4 questions, 1,930 tokens | Device memory |
+  | --- | --- | --- | ---: |
+  | BF16 | 57.6 / 60.0 ms | 279 / 284 ms | 14.2 GB |
+  | FP32 compute | 176 / 179 ms | 769 / 785 ms | 15.1 GB |
+  | Reference `systemone()`, BF16 | 160 / 183 ms | 385 / 423 ms | 18.5 GB peak |
 
 ## Risks
 
 - Same platform limits as d3: no Vulkan backend (`audio-graph-26b4`), Metal untested (`audio-graph-377a`).
-- CPU: FP32 compute on BF16 weights needs about 18 GB of RAM and will be slow; not measured yet.
+- CPU: FP32 compute on the BF16 weights needs about 18 GB of RAM; not measured (this machine had 14 to
+  20 GB free during the session). Tracked with the CPU work in `audio-graph-1f5c`.
 - Images and video are out of scope (text only), as for d3.
