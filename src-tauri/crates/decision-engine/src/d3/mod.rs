@@ -1,12 +1,12 @@
-//! Decision 3.0 (`vllm-sr/d3-*`) on candle: a Qwen3.5 prompt encoder with bidirectional full attention,
-//! causal Gated DeltaNet, and the 255-code readout. One forward pass per question; answers match
-//! `model.system_one()` of the checkpoint's Python package (see `docs/designs/d3-native-runtime-2026-10-18.md`).
+//! Decision 3.0 (`vllm-sr/d3-*`) on candle: the shared Qwen3.5 encoder (`crate::qwen35`) with
+//! bidirectional full attention, plus the d3 prompt and 255-code readout. One forward pass per question;
+//! answers match `model.system_one()` of the checkpoint's Python package (see
+//! `docs/designs/d3-native-runtime-2026-10-18.md`).
 
 mod config;
 pub mod format;
-mod gdn;
-mod model;
 
+use crate::qwen35::{self, Encoder, LoadOptions};
 use crate::{
     DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress, EngineConfig,
     EngineConstructor, EngineLimits, EngineRegistry, ExecutionProvider, OrderedMap, Usage,
@@ -83,7 +83,7 @@ impl Precision {
 
 struct Loaded {
     tokenizer: Tokenizer,
-    encoder: model::Encoder,
+    encoder: Encoder,
     readout: Tensor, // (255, hidden) FP32 on the device
     codes: Vec<String>,
     temperature: f64,
@@ -100,7 +100,8 @@ impl Loaded {
         device: &Device,
         precision: Precision,
     ) -> Result<Self, DecisionError> {
-        let (text, decision) = internal(config::load(directory))?;
+        let text = internal(qwen35::config::load(directory))?;
+        let decision = internal(config::load(directory))?;
         let tokenizer = internal(Tokenizer::from_file(directory.join("tokenizer.json")))?;
         for (code, id) in decision.codes.iter().zip(&decision.token_ids) {
             let encoding = internal(tokenizer.encode(code.as_str(), false))?;
@@ -108,12 +109,12 @@ impl Loaded {
                 return Err(DecisionError::Internal);
             }
         }
-        let encoder = internal(model::Encoder::load(
-            directory,
-            &text,
-            precision.dtype(),
-            device,
-        ))?;
+        let options = LoadOptions {
+            prefix: "language_model",
+            attention: internal(decision.attention())?,
+            dtype: precision.dtype(),
+        };
+        let encoder = internal(Encoder::load(directory, &text, &options, device))?;
         let readout = internal(candle_core::safetensors::load(
             directory.join("readout.safetensors"),
             device,

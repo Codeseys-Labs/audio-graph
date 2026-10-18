@@ -3,6 +3,8 @@ pub mod contract;
 pub mod d3;
 #[cfg(feature = "decision-laya")]
 pub mod laya;
+#[cfg(feature = "decision-d3")]
+pub mod qwen35;
 
 pub use contract::*;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};

@@ -1,9 +1,11 @@
-//! Qwen3.5 text backbone as a d3 prompt encoder: one forward pass over one prompt, no cache, no LM head.
+//! Qwen3.5 text backbone as a prompt encoder: one forward pass over one prompt, no cache, no LM head.
+//! Heads (the d3 code readout, a future Clef-flash schema head) live with their engines and read the
+//! final-norm hidden states this module returns.
 //!
-//! Matches `d3_runtime.PromptEncoder` with `attention_mode = noncausal_full_attention`: the softmax
-//! (full) attention layers read every prompt position (no causal mask, batch of one so no padding mask);
-//! the Gated DeltaNet layers stay causal. RoPE positions are `0..L-1` on all three mRoPE sections, which
-//! for text reduces to standard rotate-half RoPE on the first `head_dim * partial_rotary_factor` dims.
+//! The Gated DeltaNet layers are always causal. The softmax (full) attention layers are bidirectional or
+//! causal per [`Attention`]; d3 checkpoints declare `noncausal_full_attention`, and the stock Qwen3.5
+//! forward is causal. RoPE positions are `0..L-1` on all three mRoPE sections, which for text reduces to
+//! standard rotate-half RoPE on the first `head_dim * partial_rotary_factor` dims.
 
 use super::config::TextConfig;
 use super::gdn;
@@ -11,6 +13,25 @@ use candle_core::{D, DType, Device, Module, Tensor};
 use candle_core::{Result, bail};
 use candle_nn::{Linear, VarBuilder};
 use std::path::{Path, PathBuf};
+
+/// How the full-attention layers read the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// Every position reads every prompt position (d3 `noncausal_full_attention`).
+    Bidirectional,
+    /// Each position reads itself and earlier positions (the stock Qwen3.5 forward).
+    Causal,
+}
+
+/// Where and how to load the backbone.
+#[derive(Debug, Clone)]
+pub struct LoadOptions<'a> {
+    /// Tensor name prefix of the text model, e.g. `language_model` for `Qwen3_5Model` checkpoints.
+    pub prefix: &'a str,
+    pub attention: Attention,
+    /// Compute dtype of the layers (F32 or BF16). The embedding table stays in its stored dtype on the host.
+    pub dtype: DType,
+}
 
 fn linear(vb: &VarBuilder, out_dim: usize, in_dim: usize, name: &str) -> Result<Linear> {
     Ok(Linear::new(
@@ -75,7 +96,14 @@ impl FullAttention {
         Tensor::cat(&[rot, pass], D::Minus1)
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    /// `mask`: additive (L, L) causal mask in the compute dtype, or None for bidirectional attention.
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let len = x.dim(0)?;
         let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
         let qg = self.q_proj.forward(x)?.reshape((len, h, 2 * hd))?;
@@ -94,7 +122,14 @@ impl FullAttention {
         let k = k.reshape((kvh, len, hd))?;
         let scale = (hd as f64).powf(-0.5);
         let scores = (q.matmul(&k.t()?)? * scale)?;
-        // Bidirectional: no mask at all (one prompt, no padding).
+        let scores = match mask {
+            // One prompt and no padding: bidirectional attention needs no mask at all.
+            None => scores,
+            Some(mask) => scores
+                .reshape((kvh, rep, len, len))?
+                .broadcast_add(mask)?
+                .reshape((kvh, rep * len, len))?,
+        };
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs.matmul(&v)?; // (kvh, rep*L, hd)
         let out = out
@@ -166,6 +201,7 @@ pub struct Encoder {
     layers: Vec<Layer>,
     norm: RmsNorm,
     inv_freq: Vec<f32>,
+    attention: Attention,
     dtype: DType,
     device: Device,
 }
@@ -192,16 +228,21 @@ fn weight_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl Encoder {
-    pub fn load(root: &Path, cfg: &TextConfig, dtype: DType, device: &Device) -> Result<Self> {
+    pub fn load(
+        root: &Path,
+        cfg: &TextConfig,
+        options: &LoadOptions,
+        device: &Device,
+    ) -> Result<Self> {
+        let (prefix, dtype) = (options.prefix, options.dtype);
         let files = weight_files(root)?;
         // SAFETY: the checkpoint files are not modified while mapped.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? }
-            .pp("language_model");
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? }.pp(prefix);
         let cpu =
             unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &Device::Cpu)? };
         let embed = cpu.get(
             (cfg.vocab_size, cfg.hidden_size),
-            "language_model.embed_tokens.weight",
+            &format!("{prefix}.embed_tokens.weight"),
         )?;
         let (hs, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -287,14 +328,32 @@ impl Encoder {
             layers,
             norm: RmsNorm::load(&vb.pp("norm"), hs, eps)?,
             inv_freq,
+            attention: options.attention,
             dtype,
             device: device.clone(),
         })
     }
 
-    /// Final-norm hidden state at the last prompt position, FP32, shape (hidden,).
+    /// Final-norm hidden states of every prompt position, FP32, shape (L, hidden).
+    pub fn hidden_states(&self, ids: &[u32]) -> Result<Tensor> {
+        self.norm
+            .forward(&self.layers_forward(ids)?)?
+            .to_dtype(DType::F32)
+    }
+
+    /// Final-norm hidden state at the last prompt position, FP32, shape (hidden,). Normalizes that row only.
     pub fn last_hidden(&self, ids: &[u32]) -> Result<Tensor> {
+        let x = self.layers_forward(ids)?;
+        let last = x.narrow(0, ids.len() - 1, 1)?;
+        self.norm.forward(&last)?.squeeze(0)?.to_dtype(DType::F32)
+    }
+
+    /// The decoder layers over one prompt, before the final norm: (L, hidden) in the compute dtype.
+    fn layers_forward(&self, ids: &[u32]) -> Result<Tensor> {
         let len = ids.len();
+        if len == 0 {
+            bail!("empty prompt");
+        }
         let idx = Tensor::new(ids, &Device::Cpu)?;
         let mut x = self
             .embed
@@ -308,18 +367,28 @@ impl Encoder {
         let freqs = Tensor::from_vec(freqs, (len, self.inv_freq.len()), &Device::Cpu)?;
         let cos = freqs.cos()?.to_dtype(self.dtype)?.to_device(&self.device)?;
         let sin = freqs.sin()?.to_dtype(self.dtype)?.to_device(&self.device)?;
+        let mask = match self.attention {
+            Attention::Bidirectional => None,
+            Attention::Causal => {
+                let values: Vec<f32> = (0..len)
+                    .flat_map(|i| {
+                        (0..len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })
+                    })
+                    .collect();
+                let mask = Tensor::from_vec(values, (len, len), &Device::Cpu)?;
+                Some(mask.to_dtype(self.dtype)?.to_device(&self.device)?)
+            }
+        };
         for layer in &self.layers {
             let h = layer.input_norm.forward(&x)?;
             let h = match &layer.mixer {
-                Mixer::Full(a) => a.forward(&h, &cos, &sin)?,
+                Mixer::Full(a) => a.forward(&h, &cos, &sin, mask.as_ref())?,
                 Mixer::Linear(g) => g.forward(&h)?,
             };
             x = (x + h)?;
             let h = layer.mlp.forward(&layer.post_norm.forward(&x)?)?;
             x = (x + h)?;
         }
-        // Only the last position is read: normalize that row alone.
-        let last = x.narrow(0, len - 1, 1)?;
-        self.norm.forward(&last)?.squeeze(0)?.to_dtype(DType::F32)
+        Ok(x)
     }
 }

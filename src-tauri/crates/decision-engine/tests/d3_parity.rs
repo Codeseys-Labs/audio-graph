@@ -213,3 +213,80 @@ async fn d3_mini_matches_the_reference() {
     )
     .await;
 }
+
+/// The shared Qwen3.5 encoder in causal mode (the stock forward, as a Clef-flash style backbone would
+/// run it) with the d3 readout on top reproduces the reference's `fp32_causal` run, using the
+/// all-positions `hidden_states` API. Covers every fixture question, including ones the typed contract
+/// cannot express.
+#[test]
+#[ignore = "requires AUDIOGRAPH_MODELS_DIR with d3-edge/"]
+fn encoder_causal_mode_matches_the_reference_causal_run() {
+    use audio_graph_decision_engine::qwen35::{self, Attention, Encoder, LoadOptions};
+    use candle_core::{D, DType, Device, IndexOp};
+
+    let root = std::path::PathBuf::from(
+        std::env::var_os("AUDIOGRAPH_MODELS_DIR").expect("set AUDIOGRAPH_MODELS_DIR"),
+    )
+    .join("d3-edge");
+    let device = match provider() {
+        #[cfg(feature = "cuda")]
+        ExecutionProvider::Cuda => Device::new_cuda(0).unwrap(),
+        _ => Device::Cpu,
+    };
+    let text = qwen35::config::load(&root).unwrap();
+    let options = LoadOptions {
+        prefix: "language_model",
+        attention: Attention::Causal,
+        dtype: DType::F32,
+    };
+    let encoder = Encoder::load(&root, &text, &options, &device).unwrap();
+    let readout = candle_core::safetensors::load(root.join("readout.safetensors"), &device)
+        .unwrap()
+        .remove("weight")
+        .unwrap();
+    let fixture: Value = serde_json::from_str(include_str!("../fixtures/d3-edge.json")).unwrap();
+    let (mut questions, mut worst) = (0, 0f64);
+    for case in fixture["cases"].as_array().unwrap() {
+        for q in case["questions"].as_array().unwrap() {
+            let ids: Vec<u32> = q["input_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let expected = floats(&q["fp32_causal"]);
+            let hidden = encoder.hidden_states(&ids).unwrap();
+            assert_eq!(hidden.dims(), [ids.len(), text.hidden_size]);
+            let last = hidden.i(ids.len() - 1).unwrap();
+            let logits = readout
+                .narrow(0, 0, expected.len())
+                .unwrap()
+                .matmul(&last.unsqueeze(1).unwrap())
+                .unwrap()
+                .squeeze(1)
+                .unwrap();
+            // decision_config.json temperature is 1.0 for every released size.
+            let got: Vec<f32> = candle_nn::ops::softmax(&logits, D::Minus1)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let diff = got
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (f64::from(*a) - b).abs())
+                .fold(0.0, f64::max);
+            worst = worst.max(diff);
+            questions += 1;
+            assert!(
+                diff <= FP32_TOLERANCE,
+                "{}: |p - p_causal| = {diff:e}",
+                q["id"]
+            );
+        }
+    }
+    println!(
+        "causal encoder on {device:?}: {questions} questions, max |p - p_fp32_causal| = {worst:.3e}"
+    );
+}

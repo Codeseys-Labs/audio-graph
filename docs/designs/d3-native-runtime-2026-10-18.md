@@ -140,14 +140,16 @@ benefit. It does have Vulkan, which candle lacks (see risks).
 
 ## Implementation
 
-`src-tauri/crates/decision-engine/src/d3/`:
+`src-tauri/crates/decision-engine/src/qwen35/` is the backbone, with no d3 readout in it, so Clef-flash
+(S1-T5) can reuse it:
 
-- `format.rs`: port of `d3_format.py` and the question handling of `d3_runtime.py`, including a
-  Python-compatible `json.dumps` writer (separators, escapes, float repr).
-- `config.rs`: `config.json` text config and `decision_config.json`, rejecting unsupported variants.
-- `model.rs`: the encoder. Embedding rows are gathered on the CPU from the BF16 table (the 248,320-row
-  table never goes to the GPU; d3-nano saves 0.95 GiB of VRAM). Full attention has no mask. GQA reshapes
-  queries per KV head instead of copying K/V.
+- `config.rs`: the `text_config` of `config.json`, rejecting unsupported variants.
+- `model.rs`: `Encoder::load(root, cfg, LoadOptions { prefix, attention, dtype }, device)`, then
+  `hidden_states(ids)` (final-norm states of every position) or `last_hidden(ids)` (the last row only).
+  `Attention::Bidirectional` leaves full attention unmasked (d3); `Attention::Causal` is the stock
+  Qwen3.5 forward and matches the reference's `fp32_causal` run to 2.6e-6 on the d3-edge fixtures.
+  Embedding rows are gathered on the CPU from the BF16 table (the 248,320-row table never goes to the
+  GPU; d3-nano saves 0.95 GiB of VRAM). GQA reshapes queries per KV head instead of copying K/V.
 - `gdn.rs`: the Gated DeltaNet pieces outside matmuls, as three fused kernels per layer: `prepare`
   (conv1d + SiLU, q/k L2 norm and scale, k-head repeat, `g`, `beta`), `recurrence` (the delta rule),
   and `gated_norm`. CPU: plain Rust on rayon. CUDA: NVRTC kernels compiled at first use through
@@ -156,8 +158,15 @@ benefit. It does have Vulkan, which candle lacks (see risks).
   per column split the 128 state rows and combine with warp shuffles, and the next token's q/k row is
   prefetched into a double buffer. A `generic` candle-op version is the oracle in unit tests and the
   path for devices without a fused kernel.
+
+`src-tauri/crates/decision-engine/src/d3/`:
+
+- `format.rs`: port of `d3_format.py` and the question handling of `d3_runtime.py`, including a
+  Python-compatible `json.dumps` writer (separators, escapes, float repr).
+- `config.rs`: `decision_config.json` (codes, temperature, `attention_mode` mapped to `Attention`).
 - `mod.rs`: `D3Engine` (`DecisionEngine`): validation before any model file is read, lazy load from
-  `<models_dir>/<id>/`, device and precision selection, one forward pass and readout per question.
+  `<models_dir>/<id>/`, device and precision selection, one forward pass and the 255-code readout per
+  question; `register` for the engine registry.
 
 ### Fixtures
 
