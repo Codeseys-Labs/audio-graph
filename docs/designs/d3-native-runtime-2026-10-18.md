@@ -317,8 +317,10 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
   also moves Laya from fancy-regex to Oniguruma in builds that did not already have it (the default
   `local-ml` build already gets `onig` through mistralrs). Checked 2026-10-18 in a
   `decision-laya,decision-d3` build with `tests/laya_parity.rs` (ONNX Runtime 1.24.4, app-data
-  English and multilingual bundles): max error 5.03e-5 / 4.63e-5 on CPU and 5.00e-5 / 4.64e-5 on CUDA,
-  against the fixtures' 1e-3 tolerance, so Laya is unaffected. Cross-compiling needs a C compiler for
+  English and multilingual bundles): max error 5.03e-5 / 4.63e-5 on CPU and 5.00e-5 / 4.64e-5 on CUDA
+  (the CUDA execution provider is registered with `error_on_failure`, so it really ran), against the
+  fixtures' 1e-3 tolerance. The fancy-regex side is audio-graph-6's own `decision-laya`-only run
+  (within 5.1e-5, commit `3c34cda`), so Laya passes on both engines. Cross-compiling needs a C compiler for
   the target (`onig_sys`); a Windows-to-macOS `cargo check` fails there, so the Metal code path has not
   even been compiled yet (`audio-graph-377a`).
 - Metal is unverified until the MSL kernel lands and macOS CI runs it (`audio-graph-377a`).
