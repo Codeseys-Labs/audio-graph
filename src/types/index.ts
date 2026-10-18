@@ -2781,6 +2781,8 @@ export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
   "groq_api_key",
   "together_api_key",
   "fireworks_api_key",
+  "typesafe_api_key",
+  "cloudflare_workers_ai_token",
   "deepgram_api_key",
   "assemblyai_api_key",
   "soniox_api_key",

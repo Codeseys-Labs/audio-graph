@@ -113,6 +113,8 @@ pub const ALLOWED_CREDENTIAL_KEYS: &[&str] = &[
     "groq_api_key",
     "together_api_key",
     "fireworks_api_key",
+    "typesafe_api_key",
+    "cloudflare_workers_ai_token",
     "deepgram_api_key",
     "assemblyai_api_key",
     "soniox_api_key",
@@ -169,6 +171,10 @@ pub struct CredentialStore {
     pub together_api_key: Option<String>,
     #[serde(default)]
     pub fireworks_api_key: Option<String>,
+    #[serde(default)]
+    pub typesafe_api_key: Option<String>,
+    #[serde(default)]
+    pub cloudflare_workers_ai_token: Option<String>,
 
     // --- Streaming ASR provider keys ---
     #[serde(default)]
@@ -277,6 +283,14 @@ impl std::fmt::Debug for CredentialStore {
                 &redacted_presence(&self.fireworks_api_key),
             )
             .field(
+                "typesafe_api_key",
+                &redacted_presence(&self.typesafe_api_key),
+            )
+            .field(
+                "cloudflare_workers_ai_token",
+                &redacted_presence(&self.cloudflare_workers_ai_token),
+            )
+            .field(
                 "deepgram_api_key",
                 &redacted_presence(&self.deepgram_api_key),
             )
@@ -326,6 +340,8 @@ impl CredentialStore {
             "groq_api_key" => self.groq_api_key.as_deref(),
             "together_api_key" => self.together_api_key.as_deref(),
             "fireworks_api_key" => self.fireworks_api_key.as_deref(),
+            "typesafe_api_key" => self.typesafe_api_key.as_deref(),
+            "cloudflare_workers_ai_token" => self.cloudflare_workers_ai_token.as_deref(),
             "deepgram_api_key" => self.deepgram_api_key.as_deref(),
             "assemblyai_api_key" => self.assemblyai_api_key.as_deref(),
             "soniox_api_key" => self.soniox_api_key.as_deref(),
@@ -1588,6 +1604,8 @@ fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> R
         "groq_api_key" => store.groq_api_key = value,
         "together_api_key" => store.together_api_key = value,
         "fireworks_api_key" => store.fireworks_api_key = value,
+        "typesafe_api_key" => store.typesafe_api_key = value,
+        "cloudflare_workers_ai_token" => store.cloudflare_workers_ai_token = value,
         "deepgram_api_key" => store.deepgram_api_key = value,
         "assemblyai_api_key" => store.assemblyai_api_key = value,
         "soniox_api_key" => store.soniox_api_key = value,
@@ -1874,6 +1892,48 @@ mod tests {
         for value in plaintext_values {
             assert!(!payload.contains(value));
         }
+    }
+
+    #[test]
+    fn decision_credentials_survive_keychain_save_and_delete_without_plaintext_presence() {
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-decision-credentials-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let yaml_path = dir.join("credentials.yaml");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state: CredentialMigrationStateBackend::with_path(dir.join("credentials-state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        for (key, sentinel) in [
+            ("typesafe_api_key", "fixture-typesafe-secret"),
+            ("cloudflare_workers_ai_token", "fixture-cloudflare-secret"),
+        ] {
+            assert!(
+                !backend
+                    .load_with_source()
+                    .unwrap()
+                    .store
+                    .is_present(key)
+                    .unwrap()
+            );
+            backend.set(key, sentinel).unwrap();
+            let snapshot = backend.load_with_source().unwrap();
+            assert_eq!(snapshot.store.get(key).unwrap(), Some(sentinel));
+            assert_eq!(snapshot.source_for(key), "os_keychain");
+            let presence = serialize_smoke_presence(&snapshot);
+            assert_payload_omits_plaintext(&presence, &[sentinel]);
+            assert_payload_omits_plaintext(&format!("{:?}", snapshot.store), &[sentinel]);
+            assert!(!yaml_path.exists());
+            backend.delete(key).unwrap();
+            let snapshot = backend.load_with_source().unwrap();
+            assert!(!snapshot.store.is_present(key).unwrap());
+            assert_eq!(snapshot.source_for(key), "missing");
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

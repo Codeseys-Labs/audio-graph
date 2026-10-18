@@ -1,0 +1,210 @@
+{
+  "session_id": "system-one-public-replay",
+  "steps": [
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-1",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Is this the final budget for the quarter?",
+        "start_time": 0,
+        "end_time": 0.5,
+        "confidence": 0.87,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 1000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-2",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "What did the team decide about pricing?",
+        "start_time": 1,
+        "end_time": 1.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 2000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-3",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Is this the final budget for the quarter?",
+        "start_time": 2,
+        "end_time": 2.5,
+        "confidence": 0.49,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 3000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-4",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "what about",
+        "start_time": 3,
+        "end_time": 3.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 4000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-5",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Is it ok now?",
+        "start_time": 4,
+        "end_time": 4.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 5000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-6",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "What about the enterprise pricing tier we discussed,",
+        "start_time": 5,
+        "end_time": 5.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 6000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-7",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Você acha isso bom?",
+        "start_time": 6,
+        "end_time": 6.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 7000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-8",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Remember the important context for the launch.",
+        "start_time": 7,
+        "end_time": 7.5,
+        "confidence": 0.9,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 8000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-9",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Action item: follow up with the team tomorrow.",
+        "start_time": 8,
+        "end_time": 8.5,
+        "confidence": 0.95,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 9000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-10",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "We should decide on the deployment date.",
+        "start_time": 9,
+        "end_time": 9.5,
+        "confidence": 0.95,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 10000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-11",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "Okay, see you tomorrow.",
+        "start_time": 10,
+        "end_time": 10.5,
+        "confidence": 0.92,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 11000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-12",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "first span",
+        "start_time": 11,
+        "end_time": 11.5,
+        "confidence": 0.91,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 12000
+      }
+    }
+  ],
+  "generated_patches": []
+}
