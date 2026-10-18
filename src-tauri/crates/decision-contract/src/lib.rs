@@ -115,6 +115,7 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// Answer confidence semantics and thresholds are per decision route, not global.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionResponse {
     pub answers: OrderedMap<QuestionId, Answer>,

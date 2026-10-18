@@ -375,6 +375,8 @@ fn validate_answers(req: &DecisionRequest, response: &DecisionResponse) -> Resul
     Ok(())
 }
 
+/// Passes vendor confidence through unchanged; thresholds are per decision route.
+/// [`WireResponse`] retains vendor-native values without recalibration.
 #[async_trait]
 impl DecisionEngine for SystemOneHttpEngine {
     fn id(&self) -> &str {
