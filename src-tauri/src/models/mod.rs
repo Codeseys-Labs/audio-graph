@@ -160,6 +160,10 @@ const LAYA_BUNDLE_FILES: &[&str] = audio_graph_decision_engine::LAYA_BUNDLE_FILE
 const LAYA_ENGLISH_URL: &str =
     "https://huggingface.co/receptron/laya-onnx/resolve/d42786bdff8a7550316339c5fbf8f46caa83ea1b";
 
+// Decision 3.0 (vllm-sr/d3-*): component directories pinned to the revisions of the d3 parity fixtures.
+const D3_CHECKPOINTS: &[audio_graph_decision_engine::D3Checkpoint] =
+    audio_graph_decision_engine::D3_CHECKPOINTS;
+
 // --- Clustering diarization models (ADR-0017 / B16, `diarization-clustering`) -
 // Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
 // embedding model (URLs verified 200 on 2026-05-30, see
@@ -319,6 +323,42 @@ const MODELS: &[ModelDef] = &[
         description: "Local typed decisions with the ModernBERT-large encoder and decision head",
         archive_required_files: None,
         component_required_files: Some(LAYA_BUNDLE_FILES),
+    },
+    ModelDef {
+        name: "Decision 3.0 edge (0.6B)",
+        filename: D3_CHECKPOINTS[0].id,
+        url: D3_CHECKPOINTS[0].url,
+        expected_size: None,
+        description: "Local typed decisions with the d3-edge Qwen3.5 encoder and answer-code readout",
+        archive_required_files: None,
+        component_required_files: Some(D3_CHECKPOINTS[0].files),
+    },
+    ModelDef {
+        name: "Decision 3.0 lite (0.8B)",
+        filename: D3_CHECKPOINTS[1].id,
+        url: D3_CHECKPOINTS[1].url,
+        expected_size: None,
+        description: "Local typed decisions with the d3-lite Qwen3.5 encoder and answer-code readout",
+        archive_required_files: None,
+        component_required_files: Some(D3_CHECKPOINTS[1].files),
+    },
+    ModelDef {
+        name: "Decision 3.0 nano (2B)",
+        filename: D3_CHECKPOINTS[2].id,
+        url: D3_CHECKPOINTS[2].url,
+        expected_size: None,
+        description: "Local typed decisions with the d3-nano Qwen3.5 encoder and answer-code readout",
+        archive_required_files: None,
+        component_required_files: Some(D3_CHECKPOINTS[2].files),
+    },
+    ModelDef {
+        name: "Decision 3.0 mini (4B)",
+        filename: D3_CHECKPOINTS[3].id,
+        url: D3_CHECKPOINTS[3].url,
+        expected_size: None,
+        description: "Local typed decisions with the d3-mini Qwen3.5 encoder and answer-code readout",
+        archive_required_files: None,
+        component_required_files: Some(D3_CHECKPOINTS[3].files),
     },
     // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
     ModelDef {
@@ -1547,6 +1587,44 @@ mod tests {
                 Some(MOONSHINE_STREAMING_REQUIRED_FILES)
             );
             assert_eq!(model.expected_size, None);
+        }
+    }
+
+    #[test]
+    fn d3_models_are_registered_as_pinned_component_directories() {
+        for checkpoint in D3_CHECKPOINTS {
+            let model = MODELS
+                .iter()
+                .find(|m| m.filename == checkpoint.id)
+                .unwrap_or_else(|| panic!("{} registered", checkpoint.id));
+            // The parity fixtures pin these revisions; `main` could change the weights under them.
+            assert!(
+                model.url.contains("/resolve/") && !model.url.ends_with("/main"),
+                "{} must download a pinned revision",
+                checkpoint.id
+            );
+            let files = model.component_required_files.expect("component directory");
+            for required in [
+                "config.json",
+                "decision_config.json",
+                "readout.safetensors",
+                "tokenizer.json",
+            ] {
+                assert!(
+                    files.contains(&required),
+                    "{} lacks {required}",
+                    checkpoint.id
+                );
+            }
+            let sharded = files.contains(&"model.safetensors.index.json")
+                && files
+                    .iter()
+                    .any(|f| f.starts_with("model-") && f.ends_with(".safetensors"));
+            assert!(
+                sharded || files.contains(&"model.safetensors"),
+                "{} has no weights",
+                checkpoint.id
+            );
         }
     }
 }

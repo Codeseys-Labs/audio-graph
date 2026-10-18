@@ -1,7 +1,9 @@
-# Decision 3.0 native runtime (Phase A, audio-graph-60c7)
+# Decision 3.0 native runtime (audio-graph-60c7)
 
 Date: 2026-10-18. Seed: `audio-graph-60c7` (S1-T4), epic `audio-graph-6dfb`.
-Prototype: `prototypes/d3-probe` (standalone crate, not in the `src-tauri` workspace, never shipped).
+Code: `src-tauri/crates/decision-engine/src/d3/` (feature `decision-d3`). Phase A ran as a standalone
+probe crate outside the workspace (commits `158545f`, `97bc66b`); Phase B moved it into the engine and
+deleted the probe.
 
 ## Decision
 
@@ -136,9 +138,9 @@ A stock conversion of d3-edge would therefore place full attention on layers 3, 
 hosted derivative weights, and F16 attention accumulation on GPU, llama.cpp adds risk with no accuracy
 benefit. It does have Vulkan, which candle lacks (see risks).
 
-## Prototype
+## Implementation
 
-`prototypes/d3-probe/src`:
+`src-tauri/crates/decision-engine/src/d3/`:
 
 - `format.rs`: port of `d3_format.py` and the question handling of `d3_runtime.py`, including a
   Python-compatible `json.dumps` writer (separators, escapes, float repr).
@@ -154,11 +156,12 @@ benefit. It does have Vulkan, which candle lacks (see risks).
   per column split the 128 state rows and combine with warp shuffles, and the next token's q/k row is
   prefetched into a double buffer. A `generic` candle-op version is the oracle in unit tests and the
   path for devices without a fused kernel.
-- `runtime.rs`, `main.rs`: load, prompt, tokenize, forward, readout; `parity` and `bench` commands.
+- `mod.rs`: `D3Engine` (`DecisionEngine`): validation before any model file is read, lazy load from
+  `<models_dir>/<id>/`, device and precision selection, one forward pass and readout per question.
 
 ### Fixtures
 
-`prototypes/d3-probe/fixtures/gen_fixtures.py` ran once with Python 3.11, torch 2.11.0+cu128,
+`src-tauri/crates/decision-engine/tools/generate_d3_reference.py` ran once with Python 3.11, torch 2.11.0+cu128,
 transformers 5.17.0, no flash-linear-attention (so transformers' PyTorch Gated DeltaNet ran), on the
 RTX 5090. Python is used for fixtures only. Each of the 24 questions per model (10 cases: support ticket,
 code request, JSON state, empty state, default instructions, a 725 to 751 token meeting transcript,
@@ -181,7 +184,9 @@ reference, and the BF16 comparison checks picks wherever the FP32 reference's to
 
 ### Parity results
 
-Command: `d3-probe parity <snapshot> fixtures/<model>.json --device <cpu|cuda> --dtype <f32|bf16>`.
+Phase A command (the probe, now deleted): `d3-probe parity <snapshot> fixtures/<model>.json --device
+<cpu|cuda> --dtype <f32|bf16>`. Phase B reran the same fixtures through `D3Engine` (`tests/d3_parity.rs`,
+`docs/research/d3-native-latency-2026-10-18.md`) with identical maxima.
 
 | Model | Device | DType | max abs diff vs `fp32` | vs `official` | vs `official_b1` | Picks vs `official` |
 | --- | --- | --- | ---: | ---: | ---: | --- |
@@ -234,7 +239,7 @@ elementwise launches per linear-attention layer. Fusing them into the three kern
 128-token p50 from 10.6 to 7.05 ms (d3-edge FP32), 28.8 to 10.9 ms (d3-lite FP32) and 30.2 to 12.9 ms
 (d3-nano BF16).
 
-CPU is about 2x slower than torch on the same CPU. Torch runs the BF16 backbone; the prototype runs FP32
+CPU is about 2x slower than torch on the same CPU. Torch runs the BF16 backbone; this code runs FP32
 through candle's `gemm` crate (candle's CPU matmul has no BF16 kernel). CPU tuning is Seed
 `audio-graph-1f5c`.
 
@@ -258,24 +263,32 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
   for `sm_120` (Blackwell), the MSVC developer environment, and `NVCC_APPEND_FLAGS=-Xcompiler
   /Zc:preprocessor` because CUDA 13 CCCL rejects MSVC's traditional preprocessor. At run time cuBLAS,
   cuRAND and NVRTC DLLs load dynamically from `%CUDA_PATH%\bin\x64` (CUDA 13 layout).
-- Metal (macOS): `candle-core/metal` + `candle-nn/metal` cover every op except the delta rule, which needs
-  an MSL port of the recurrence kernel (mistral.rs 0.8.1 has one under MIT,
-  `mistralrs-core/src/metal/kernels/gdn.metal`) and macOS CI to verify it: Seed `audio-graph-377a`.
+- Metal (macOS, `metal` feature): candle's Metal backend runs every op; the two fused Gated DeltaNet
+  elementwise steps use the candle-op `generic` path and the delta rule runs on the host (copy out, scan,
+  copy back) until an MSL port of the recurrence lands (mistral.rs 0.8.1 has one under MIT,
+  `mistralrs-core/src/metal/kernels/gdn.metal`). None of this is verified on a Mac yet: Seed
+  `audio-graph-377a`.
 - CPU: always available; the fallback when no GPU feature is compiled.
-- Vulkan: candle has no Vulkan backend. AMD and Intel GPUs on Windows and Linux run the CPU path
-  (Seed `audio-graph-26b4`).
+- Vulkan / DirectML: candle has no such backend; `D3Engine` refuses `ExecutionProvider::DirectMl` with
+  `EngineUnavailable { feature: "cuda" }`, and AMD and Intel GPUs run the CPU path (Seed
+  `audio-graph-26b4`).
 
-## Phase B plan
+## Phase B (as built)
 
-- Backend `d3` in `src-tauri/crates/decision-engine` behind feature `decision-d3` (CUDA and Metal as
-  sub-features that forward to candle). Without the feature the engine returns
-  `DecisionError::EngineUnavailable { feature: "decision-d3" }`, and the cloud build stays free of candle.
-- Implements `DecisionEngine` from `decision-contract`: `egress()` is `Local`, limits are 255 choice
-  options, 10 score levels, no state-token limit (`max_length` is null).
-- Model files come from the decision-engine skeleton's download manager (S1-T2); no second manager.
-- Parity tests for d3-edge and d3-nano read the committed fixtures, run when the model directory is
-  present, and skip with a message otherwise.
-- GPU smoke on this machine, then p50 / p95 per size on CPU and GPU into `docs/research`.
+- `D3Engine` in `src-tauri/crates/decision-engine/src/d3/` behind feature `decision-d3`; the crate's
+  `cuda` and `metal` features forward to `candle-core` / `candle-nn`. Without `decision-d3` the registry
+  returns `DecisionError::EngineUnavailable { feature: "decision-d3" }` for the four ids, and the
+  cloud build has no candle in its dependency tree.
+- `egress()` is `Local`; limits are 255 choice options, 10 score levels, no state-token limit
+  (`max_length` is null in every checkpoint). Invalid questions fail before any model file is read.
+  Noul answers carry only `noul`, like the reference.
+- Model files: four `ModelDef` component directories in `src-tauri/src/models/mod.rs` (the existing
+  model manager), `resolve/<revision>` URLs pinned to the fixture revisions, listed in
+  `D3_CHECKPOINTS`.
+- Parity: `tests/d3_parity.rs` (ignored by default; `AUDIOGRAPH_MODELS_DIR`, `AUDIOGRAPH_D3_EP`) for all
+  four sizes; prompt rendering is pinned without model files by a unit test against the same fixtures.
+- Latency per size on CPU and CUDA: `examples/d3_bench.rs`, results in
+  `docs/research/d3-native-latency-2026-10-18.md`.
 
 ## Risks
 
@@ -285,7 +298,7 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
 - BF16 on GPU moves probabilities by up to 1.9e-2 against the default BF16 reference and 3.4e-2 against
   its batch-size-1 run, the same spread as the reference's own batch-size variance; one near-tie pick
   flips on d3-edge. FP32 matches the FP32 reference exactly but costs memory and long-prompt time (d3-nano
-  751 tokens: 65.7 ms FP32, 31.5 ms BF16). Phase B makes the dtype a setting, defaults to FP32 for edge
-  and lite and BF16 for nano and mini, and runs parity in FP32. CPU runs FP32 only.
+  751 tokens: 65.7 ms FP32, 31.5 ms BF16). `D3Engine` defaults to FP32 everywhere except BF16 for nano
+  and mini on CUDA; `D3Engine::with_precision` overrides it on GPU, and CPU always runs FP32.
 - Clef-flash (9B) reuses the encoder but needs about 18 GiB in BF16. Consumer GPUs need candle's
   quantized matmul (Q8_0 / Q4K); S1-T5 should measure accuracy against its reference before choosing.

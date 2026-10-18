@@ -5,15 +5,18 @@
 //! the Gated DeltaNet layers stay causal. RoPE positions are `0..L-1` on all three mRoPE sections, which
 //! for text reduces to standard rotate-half RoPE on the first `head_dim * partial_rotary_factor` dims.
 
-use crate::config::TextConfig;
-use crate::gdn;
-use anyhow::{Context, Result};
-use candle_core::{DType, Device, Module, Tensor, D};
+use super::config::TextConfig;
+use super::gdn;
+use candle_core::{D, DType, Device, Module, Tensor};
+use candle_core::{Result, bail};
 use candle_nn::{Linear, VarBuilder};
 use std::path::{Path, PathBuf};
 
 fn linear(vb: &VarBuilder, out_dim: usize, in_dim: usize, name: &str) -> Result<Linear> {
-    Ok(Linear::new(vb.get((out_dim, in_dim), &format!("{name}.weight"))?, None))
+    Ok(Linear::new(
+        vb.get((out_dim, in_dim), &format!("{name}.weight"))?,
+        None,
+    ))
 }
 
 /// Zero-centered RMSNorm (`x * rsqrt(mean(x^2) + eps) * (1 + w)`), as `Qwen3_5RMSNorm`.
@@ -26,11 +29,14 @@ impl RmsNorm {
     fn load(vb: &VarBuilder, size: usize, eps: f64) -> Result<Self> {
         let w = vb.get(size, "weight")?;
         let alpha = (w.to_dtype(DType::F32)? + 1.0)?.to_dtype(w.dtype())?;
-        Ok(Self { alpha, eps: eps as f32 })
+        Ok(Self {
+            alpha,
+            eps: eps as f32,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(candle_nn::ops::rms_norm(&x.contiguous()?, &self.alpha, self.eps)?)
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.alpha, self.eps)
     }
 }
 
@@ -43,7 +49,7 @@ struct Mlp {
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = (self.gate.forward(x)?.silu()? * self.up.forward(x)?)?;
-        Ok(self.down.forward(&h)?)
+        self.down.forward(&h)
     }
 }
 
@@ -66,7 +72,7 @@ impl FullAttention {
         let rot = x.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
         let rot = candle_nn::rotary_emb::rope(&rot, cos, sin)?;
         let pass = x.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
-        Ok(Tensor::cat(&[rot, pass], D::Minus1)?)
+        Tensor::cat(&[rot, pass], D::Minus1)
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -75,7 +81,9 @@ impl FullAttention {
         let qg = self.q_proj.forward(x)?.reshape((len, h, 2 * hd))?;
         let q = self.q_norm.forward(&qg.narrow(2, 0, hd)?)?;
         let gate = qg.narrow(2, hd, hd)?.reshape((len, h * hd))?;
-        let k = self.k_norm.forward(&self.k_proj.forward(x)?.reshape((len, kvh, hd))?)?;
+        let k = self
+            .k_norm
+            .forward(&self.k_proj.forward(x)?.reshape((len, kvh, hd))?)?;
         let v = self.v_proj.forward(x)?.reshape((len, kvh, hd))?;
         let q = self.rope(&q.transpose(0, 1)?.unsqueeze(0)?, cos, sin)?;
         let k = self.rope(&k.transpose(0, 1)?.unsqueeze(0)?, cos, sin)?;
@@ -89,9 +97,12 @@ impl FullAttention {
         // Bidirectional: no mask at all (one prompt, no padding).
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs.matmul(&v)?; // (kvh, rep*L, hd)
-        let out = out.reshape((h, len, hd))?.transpose(0, 1)?.reshape((len, h * hd))?;
+        let out = out
+            .reshape((h, len, hd))?
+            .transpose(0, 1)?
+            .reshape((len, h * hd))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
-        Ok(self.o_proj.forward(&out)?)
+        self.o_proj.forward(&out)
     }
 }
 
@@ -115,17 +126,26 @@ struct GatedDeltaNet {
 impl GatedDeltaNet {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let len = x.dim(0)?;
-        let dims = gdn::Dims { k_heads: self.k_heads, v_heads: self.v_heads, dk: self.dk, dv: self.dv };
+        let dims = gdn::Dims {
+            k_heads: self.k_heads,
+            v_heads: self.v_heads,
+            dk: self.dk,
+            dv: self.dv,
+        };
         let qkv = self.in_proj_qkv.forward(x)?; // (L, conv_dim)
         let a = self.in_proj_a.forward(x)?;
         let b = self.in_proj_b.forward(x)?;
-        let weights = gdn::PrepWeights { conv: &self.conv_weight, dt_bias: &self.dt_bias, neg_a: &self.neg_a };
+        let weights = gdn::PrepWeights {
+            conv: &self.conv_weight,
+            dt_bias: &self.dt_bias,
+            neg_a: &self.neg_a,
+        };
         let prepared = gdn::prepare(&qkv, &a, &b, &weights, dims)?;
         let core = gdn::recurrence(&prepared)?;
         let z = self.in_proj_z.forward(x)?; // (L, nv*dv)
         let gated = gdn::gated_norm(&core, &z, &self.norm_weight, self.eps)?;
         debug_assert_eq!(gated.dims(), [len, self.v_heads * self.dv]);
-        Ok(self.out_proj.forward(&gated)?)
+        self.out_proj.forward(&gated)
     }
 }
 
@@ -150,13 +170,16 @@ pub struct Encoder {
     device: Device,
 }
 
-pub fn weight_files(root: &Path) -> Result<Vec<PathBuf>> {
+fn weight_files(root: &Path) -> Result<Vec<PathBuf>> {
     let index = root.join("model.safetensors.index.json");
     if index.is_file() {
-        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?)?;
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?)
+            .map_err(|e| candle_core::Error::Msg(format!("{}: {e}", index.display())))?;
         let mut files: Vec<String> = doc["weight_map"]
             .as_object()
-            .context("weight_map")?
+            .ok_or_else(|| {
+                candle_core::Error::Msg("model.safetensors.index.json has no weight_map".into())
+            })?
             .values()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect();
@@ -172,9 +195,14 @@ impl Encoder {
     pub fn load(root: &Path, cfg: &TextConfig, dtype: DType, device: &Device) -> Result<Self> {
         let files = weight_files(root)?;
         // SAFETY: the checkpoint files are not modified while mapped.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? }.pp("language_model");
-        let cpu = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &Device::Cpu)? };
-        let embed = cpu.get((cfg.vocab_size, cfg.hidden_size), "language_model.embed_tokens.weight")?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? }
+            .pp("language_model");
+        let cpu =
+            unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &Device::Cpu)? };
+        let embed = cpu.get(
+            (cfg.vocab_size, cfg.hidden_size),
+            "language_model.embed_tokens.weight",
+        )?;
         let (hs, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -182,7 +210,11 @@ impl Encoder {
             let mixer = match cfg.layer_types[i].as_str() {
                 "full_attention" => {
                     let ab = lb.pp("self_attn");
-                    let (h, kvh, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+                    let (h, kvh, hd) = (
+                        cfg.num_attention_heads,
+                        cfg.num_key_value_heads,
+                        cfg.head_dim,
+                    );
                     Mixer::Full(FullAttention {
                         q_proj: linear(&ab, h * hd * 2, hs, "q_proj")?,
                         k_proj: linear(&ab, kvh * hd, hs, "k_proj")?,
@@ -207,7 +239,8 @@ impl Encoder {
                     let conv_dim = 2 * nk * dk + nv * dv;
                     let kernel = cfg.linear_conv_kernel_dim;
                     let conv = gb.get((conv_dim, 1, kernel), "conv1d.weight")?;
-                    let a_log = gb.get_with_hints_dtype(nv, "A_log", Default::default(), DType::F32)?;
+                    let a_log =
+                        gb.get_with_hints_dtype(nv, "A_log", Default::default(), DType::F32)?;
                     Mixer::Linear(GatedDeltaNet {
                         in_proj_qkv: linear(&gb, conv_dim, hs, "in_proj_qkv")?,
                         in_proj_z: linear(&gb, nv * dv, hs, "in_proj_z")?,
@@ -215,7 +248,12 @@ impl Encoder {
                         in_proj_a: linear(&gb, nv, hs, "in_proj_a")?,
                         conv_weight: conv.squeeze(1)?.t()?.contiguous()?,
                         neg_a: a_log.exp()?.neg()?,
-                        dt_bias: gb.get_with_hints_dtype(nv, "dt_bias", Default::default(), DType::F32)?,
+                        dt_bias: gb.get_with_hints_dtype(
+                            nv,
+                            "dt_bias",
+                            Default::default(),
+                            DType::F32,
+                        )?,
                         norm_weight: gb.get(dv, "norm.weight")?,
                         out_proj: linear(&gb, hs, nv * dv, "out_proj")?,
                         k_heads: nk,
@@ -225,7 +263,7 @@ impl Encoder {
                         eps,
                     })
                 }
-                other => anyhow::bail!("layer {i}: unsupported layer type {other:?}"),
+                other => bail!("layer {i}: unsupported layer type {other:?}"),
             };
             let mb = lb.pp("mlp");
             layers.push(Layer {
@@ -241,7 +279,9 @@ impl Encoder {
         }
         let rd = cfg.rotary_dim();
         let theta = cfg.rope_parameters.rope_theta;
-        let inv_freq = (0..rd / 2).map(|i| (1.0 / theta.powf((2 * i) as f64 / rd as f64)) as f32).collect();
+        let inv_freq = (0..rd / 2)
+            .map(|i| (1.0 / theta.powf((2 * i) as f64 / rd as f64)) as f32)
+            .collect();
         Ok(Self {
             embed,
             layers,
@@ -256,7 +296,11 @@ impl Encoder {
     pub fn last_hidden(&self, ids: &[u32]) -> Result<Tensor> {
         let len = ids.len();
         let idx = Tensor::new(ids, &Device::Cpu)?;
-        let mut x = self.embed.index_select(&idx, 0)?.to_dtype(self.dtype)?.to_device(&self.device)?;
+        let mut x = self
+            .embed
+            .index_select(&idx, 0)?
+            .to_dtype(self.dtype)?
+            .to_device(&self.device)?;
         // RoPE tables in FP32, cast to the compute dtype like the reference.
         let freqs: Vec<f32> = (0..len)
             .flat_map(|p| self.inv_freq.iter().map(move |f| p as f32 * f))
@@ -264,35 +308,18 @@ impl Encoder {
         let freqs = Tensor::from_vec(freqs, (len, self.inv_freq.len()), &Device::Cpu)?;
         let cos = freqs.cos()?.to_dtype(self.dtype)?.to_device(&self.device)?;
         let sin = freqs.sin()?.to_dtype(self.dtype)?.to_device(&self.device)?;
-        let profile = std::env::var_os("D3_PROFILE").is_some();
-        let mut mark = std::time::Instant::now();
-        if profile {
-            self.device.synchronize()?;
-            eprintln!("  embed+rope {:.3} ms", mark.elapsed().as_secs_f64() * 1e3);
-            mark = std::time::Instant::now();
-        }
-        for (i, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             let h = layer.input_norm.forward(&x)?;
             let h = match &layer.mixer {
                 Mixer::Full(a) => a.forward(&h, &cos, &sin)?,
                 Mixer::Linear(g) => g.forward(&h)?,
             };
             x = (x + h)?;
-            if profile {
-                self.device.synchronize()?;
-                eprintln!("  layer {i:>2} mixer {:.3} ms", mark.elapsed().as_secs_f64() * 1e3);
-                mark = std::time::Instant::now();
-            }
             let h = layer.mlp.forward(&layer.post_norm.forward(&x)?)?;
             x = (x + h)?;
-            if profile {
-                self.device.synchronize()?;
-                eprintln!("  layer {i:>2} mlp   {:.3} ms", mark.elapsed().as_secs_f64() * 1e3);
-                mark = std::time::Instant::now();
-            }
         }
         // Only the last position is read: normalize that row alone.
         let last = x.narrow(0, len - 1, 1)?;
-        Ok(self.norm.forward(&last)?.squeeze(0)?.to_dtype(DType::F32)?)
+        self.norm.forward(&last)?.squeeze(0)?.to_dtype(DType::F32)
     }
 }

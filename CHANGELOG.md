@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing app-data model cache. Includes calibrated probabilities, state
   windowing, Unicode-script routing, Python-reference fixtures, and a native
   parity/latency runner. CUDA disables TF32 for probability parity.
+- Opt-in (`decision-d3`) native Decision 3.0 backend (`d3-edge`, `d3-lite`,
+  `d3-nano`, `d3-mini`) on candle: Qwen3.5 encoder with bidirectional full
+  attention, fused Gated DeltaNet kernels (CPU, CUDA via NVRTC), 255-code
+  readout, model-manager entries pinned to the parity-fixture revisions. FP32
+  answers match the Hugging Face reference to within 5e-6 per probability.
 
 ### Changed
 

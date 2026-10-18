@@ -1,6 +1,6 @@
 """Generate the d3 parity fixture once from the Hugging Face reference (fixtures only, never at runtime).
 
-    python gen_fixtures.py <snapshot-dir> <out.json> [--model-name d3-edge] [--device cuda]
+    python tools/generate_d3_reference.py <hf-snapshot-dir> fixtures/d3-edge.json [--model-name d3-edge] [--device cuda:0]
 
 Environment used for the committed fixtures: Python 3.11, torch 2.11.0+cu128, transformers==5.17.0, no
 flash-linear-attention (so transformers' PyTorch Gated DeltaNet reference runs), RTX 5090.

@@ -15,8 +15,8 @@
 //! CPU and CUDA use fused kernels (one pass, one launch each); other devices use `generic`, the same
 //! math in candle ops, which is also the oracle in the tests.
 
-use anyhow::Result;
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::Result;
+use candle_core::{D, DType, Device, Tensor};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +51,13 @@ pub struct PrepWeights<'a> {
     pub neg_a: &'a Tensor,
 }
 
-pub fn prepare(qkv: &Tensor, a: &Tensor, b: &Tensor, w: &PrepWeights, dims: Dims) -> Result<Prepared> {
+pub fn prepare(
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    w: &PrepWeights,
+    dims: Dims,
+) -> Result<Prepared> {
     match qkv.device() {
         Device::Cpu => cpu::prepare(qkv, a, b, w, dims),
         #[cfg(feature = "cuda")]
@@ -67,7 +73,16 @@ pub fn recurrence(p: &Prepared) -> Result<Tensor> {
         Device::Cpu => cpu::recurrence(p),
         #[cfg(feature = "cuda")]
         Device::Cuda(_) => cuda::recurrence(p),
-        other => anyhow::bail!("no gated delta rule kernel for {other:?}"),
+        // No native kernel yet (Metal: audio-graph-377a): run the scan on the host and copy back.
+        #[allow(unreachable_patterns)]
+        device => {
+            let host = Prepared {
+                qk: p.qk.to_device(&Device::Cpu)?,
+                v: p.v.to_device(&Device::Cpu)?,
+                gb: p.gb.to_device(&Device::Cpu)?,
+            };
+            cpu::recurrence(&host)?.to_device(device)
+        }
     }
 }
 
@@ -108,12 +123,29 @@ fn silu(x: f32) -> f32 {
 pub mod generic {
     use super::*;
 
-    pub fn prepare(qkv: &Tensor, a: &Tensor, b: &Tensor, w: &PrepWeights, dims: Dims) -> Result<Prepared> {
+    pub fn prepare(
+        qkv: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        w: &PrepWeights,
+        dims: Dims,
+    ) -> Result<Prepared> {
         let len = qkv.dim(0)?;
         let dtype = qkv.dtype();
-        let Dims { k_heads: nk, v_heads: nv, dk, dv } = dims;
+        let Dims {
+            k_heads: nk,
+            v_heads: nv,
+            dk,
+            dv,
+        } = dims;
         let kernel = w.conv.dim(0)?;
-        let padded = Tensor::cat(&[Tensor::zeros((kernel - 1, dims.conv_dim()), dtype, qkv.device())?, qkv.clone()], 0)?;
+        let padded = Tensor::cat(
+            &[
+                Tensor::zeros((kernel - 1, dims.conv_dim()), dtype, qkv.device())?,
+                qkv.clone(),
+            ],
+            0,
+        )?;
         let mut mixed = padded.narrow(0, 0, len)?.broadcast_mul(&w.conv.get(0)?)?;
         for j in 1..kernel {
             mixed = (mixed + padded.narrow(0, j, len)?.broadcast_mul(&w.conv.get(j)?)?)?;
@@ -131,11 +163,13 @@ pub mod generic {
             if nv == nk {
                 return Ok(t);
             }
-            Ok(t.unsqueeze(2)?.broadcast_as((len, nk, nv / nk, dk))?.reshape((len, nv, dk))?)
+            t.unsqueeze(2)?
+                .broadcast_as((len, nk, nv / nk, dk))?
+                .reshape((len, nv, dk))
         };
         let l2 = |x: Tensor| -> Result<Tensor> {
             let inv = (x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?.recip()?;
-            Ok(x.broadcast_mul(&inv)?)
+            x.broadcast_mul(&inv)
         };
         let q = (l2(expand(q)?.to_dtype(DType::F32)?)? * (dk as f64).powf(-0.5))?;
         let k = l2(expand(k)?.to_dtype(DType::F32)?)?;
@@ -154,7 +188,9 @@ pub mod generic {
         let normed = x.broadcast_div(&(var + eps)?.sqrt()?)?.to_dtype(dtype)?;
         let normed = normed.broadcast_mul(weight)?.to_dtype(DType::F32)?;
         let z = z.reshape((len, heads, dv))?.to_dtype(DType::F32)?;
-        Ok((normed * z.silu()?)?.to_dtype(dtype)?.reshape((len, heads * dv))?)
+        (normed * z.silu()?)?
+            .to_dtype(dtype)?
+            .reshape((len, heads * dv))
     }
 }
 
@@ -162,13 +198,24 @@ mod cpu {
     use super::*;
 
     fn host(t: &Tensor) -> Result<Vec<f32>> {
-        Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
+        t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
     }
 
-    pub fn prepare(qkv: &Tensor, a: &Tensor, b: &Tensor, w: &PrepWeights, dims: Dims) -> Result<Prepared> {
+    pub fn prepare(
+        qkv: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        w: &PrepWeights,
+        dims: Dims,
+    ) -> Result<Prepared> {
         let len = qkv.dim(0)?;
         let dtype = qkv.dtype();
-        let Dims { k_heads: nk, v_heads: nv, dk, dv } = dims;
+        let Dims {
+            k_heads: nk,
+            v_heads: nv,
+            dk,
+            dv,
+        } = dims;
         let (cd, kd) = (dims.conv_dim(), dims.key_dim());
         let kernel = w.conv.dim(0)?;
         let (x, conv) = (host(qkv)?, host(w.conv)?);
@@ -268,7 +315,7 @@ mod cpu {
                 out[(t * heads + h) * dv..][..dv].copy_from_slice(&slab[t * dv..][..dv]);
             }
         }
-        Ok(Tensor::from_vec(out, (len, heads, dv), &Device::Cpu)?)
+        Tensor::from_vec(out, (len, heads, dv), &Device::Cpu)
     }
 
     pub fn gated_norm(core: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -277,7 +324,10 @@ mod cpu {
         let (x, zv, w) = (host(core)?, host(z)?, host(weight)?);
         let mut out = vec![0f32; len * heads * dv];
         out.par_chunks_mut(dv).enumerate().for_each(|(row, o)| {
-            let xs: Vec<f32> = x[row * dv..][..dv].iter().map(|v| round_to(dtype, *v)).collect();
+            let xs: Vec<f32> = x[row * dv..][..dv]
+                .iter()
+                .map(|v| round_to(dtype, *v))
+                .collect();
             let var = xs.iter().map(|v| v * v).sum::<f32>() / dv as f32;
             let inv = 1.0 / (var + eps as f32).sqrt();
             for j in 0..dv {
@@ -285,18 +335,18 @@ mod cpu {
                 o[j] = round_to(dtype, n * silu(zv[row * dv + j]));
             }
         });
-        Ok(Tensor::from_vec(out, (len, heads * dv), &Device::Cpu)?.to_dtype(dtype)?)
+        Tensor::from_vec(out, (len, heads * dv), &Device::Cpu)?.to_dtype(dtype)
     }
 }
 
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::{Dims, PrepWeights, Prepared};
-    use anyhow::Result;
     use candle_core::cuda::cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
-    use candle_core::cuda::cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use candle_core::cuda::cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use candle_core::cuda::{CudaDevice, WrapErr};
     use candle_core::{CudaStorage, DType, Layout, Shape, Storage, Tensor};
+    use candle_core::{Result, bail};
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
@@ -435,26 +485,39 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
 
     /// PTX and module name for a (DK, compute dtype) variant, compiled once per process with NVRTC.
     fn ptx_for(dk: usize, dtype: DType) -> Result<(String, String)> {
-        static PTX: LazyLock<Mutex<HashMap<(usize, bool), String>>> = LazyLock::new(Default::default);
+        static PTX: LazyLock<Mutex<HashMap<(usize, bool), String>>> =
+            LazyLock::new(Default::default);
         let bf16 = match dtype {
             DType::F32 => false,
             DType::BF16 => true,
-            other => anyhow::bail!("gated deltanet kernels support f32 and bf16, not {other:?}"),
+            other => bail!("gated deltanet kernels support f32 and bf16, not {other:?}"),
         };
         let mut cache = PTX.lock().expect("ptx cache");
         let ptx = match cache.get(&(dk, bf16)) {
             Some(p) => p.clone(),
             None => {
                 let opts = CompileOptions {
-                    options: vec![format!("-DDK={dk}"), format!("-DIS_BF16={}", u8::from(bf16))],
+                    options: vec![
+                        format!("-DDK={dk}"),
+                        format!("-DIS_BF16={}", u8::from(bf16)),
+                    ],
                     ..Default::default()
                 };
-                let ptx = compile_ptx_with_opts(SOURCE, opts)?.to_src();
+                let ptx = compile_ptx_with_opts(SOURCE, opts)
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "NVRTC failed to compile the d3 kernels: {e:?}"
+                        ))
+                    })?
+                    .to_src();
                 cache.insert((dk, bf16), ptx.clone());
                 ptx
             }
         };
-        Ok((ptx, format!("d3_gdn_dk{dk}_{}", if bf16 { "bf16" } else { "f32" })))
+        Ok((
+            ptx,
+            format!("d3_gdn_dk{dk}_{}", if bf16 { "bf16" } else { "f32" }),
+        ))
     }
 
     /// candle's `CudaFunc` is not nameable outside candle, so the lookup is a macro.
@@ -474,29 +537,58 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
         t: &Tensor,
         f: impl FnOnce(CudaView<'_, T>) -> Result<R>,
     ) -> Result<R> {
-        let (storage, layout): (std::sync::RwLockReadGuard<'_, Storage>, &Layout) = t.storage_and_layout();
-        let Storage::Cuda(cs) = &*storage else { anyhow::bail!("expected a cuda tensor") };
-        let (start, end) = layout.contiguous_offsets().ok_or_else(|| anyhow::anyhow!("tensor not contiguous"))?;
+        let (storage, layout): (std::sync::RwLockReadGuard<'_, Storage>, &Layout) =
+            t.storage_and_layout();
+        let Storage::Cuda(cs) = &*storage else {
+            bail!("expected a cuda tensor")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            bail!("tensor not contiguous")
+        };
         f(cs.as_cuda_slice::<T>()?.slice(start..end))
     }
 
-    fn wrap<T: candle_core::cuda_backend::CudaDType>(slice: CudaSlice<T>, dev: &CudaDevice, shape: impl Into<Shape>) -> Tensor {
+    fn wrap<T: candle_core::cuda_backend::CudaDType>(
+        slice: CudaSlice<T>,
+        dev: &CudaDevice,
+        shape: impl Into<Shape>,
+    ) -> Tensor {
         let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(slice, dev.clone()));
         Tensor::from_storage(storage, shape, candle_core::op::BackpropOp::none(), false)
     }
 
     fn launch_1d(n: usize, block: u32) -> LaunchConfig {
-        LaunchConfig { grid_dim: ((n as u32).div_ceil(block), 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 }
+        LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        }
     }
 
-    pub fn prepare(qkv: &Tensor, a: &Tensor, b: &Tensor, w: &PrepWeights, dims: Dims) -> Result<Prepared> {
+    pub fn prepare(
+        qkv: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        w: &PrepWeights,
+        dims: Dims,
+    ) -> Result<Prepared> {
         let dev = cuda_dev(qkv)?;
         let dtype = qkv.dtype();
         let len = qkv.dim(0)?;
-        let Dims { k_heads: nk, v_heads: nv, dk, dv } = dims;
+        let Dims {
+            k_heads: nk,
+            v_heads: nv,
+            dk,
+            dv,
+        } = dims;
         let cd = dims.conv_dim();
         let kernel = w.conv.dim(0)?;
-        let (qkv, conv, a, b) = (qkv.contiguous()?, w.conv.contiguous()?, a.contiguous()?, b.contiguous()?);
+        let (qkv, conv, a, b) = (
+            qkv.contiguous()?,
+            w.conv.contiguous()?,
+            a.contiguous()?,
+            b.contiguous()?,
+        );
         let (dt_bias, neg_a) = (w.dt_bias.contiguous()?, w.neg_a.contiguous()?);
         macro_rules! run {
             ($t:ty) => {{
@@ -519,10 +611,17 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
                     with_view::<$t, _>(&b, |bv| {
                         with_view::<f32, _>(&dt_bias, |dtb| {
                             with_view::<f32, _>(&neg_a, |na| {
-                                let (nk_, nv_, dk_, dv_) = (nk as i32, nv as i32, dk as i32, dv as i32);
+                                let (nk_, nv_, dk_, dv_) =
+                                    (nk as i32, nv as i32, dk as i32, dv as i32);
                                 let mut bld = gate_fn.builder();
                                 bld.arg(&mixed).arg(&av).arg(&bv).arg(&dtb).arg(&na);
-                                bld.arg(&qk).arg(&v).arg(&gb).arg(&nk_).arg(&nv_).arg(&dk_).arg(&dv_);
+                                bld.arg(&qk)
+                                    .arg(&v)
+                                    .arg(&gb)
+                                    .arg(&nk_)
+                                    .arg(&nv_)
+                                    .arg(&dk_)
+                                    .arg(&dv_);
                                 let cfg = LaunchConfig {
                                     grid_dim: (len as u32, nv as u32, 1),
                                     block_dim: (dk as u32, 1, 1),
@@ -544,7 +643,7 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
         Ok(match dtype {
             DType::F32 => run!(f32),
             DType::BF16 => run!(half::bf16),
-            other => anyhow::bail!("unsupported compute dtype {other:?}"),
+            other => bail!("unsupported compute dtype {other:?}"),
         })
     }
 
@@ -560,7 +659,13 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
                 with_view::<f32, _>(&p.gb, |gb| {
                     let (l, h, d) = (len as i32, heads as i32, dv as i32);
                     let mut bld = func.builder();
-                    bld.arg(&qk).arg(&v).arg(&gb).arg(&out).arg(&l).arg(&h).arg(&d);
+                    bld.arg(&qk)
+                        .arg(&v)
+                        .arg(&gb)
+                        .arg(&out)
+                        .arg(&l)
+                        .arg(&h)
+                        .arg(&d);
                     let cfg = LaunchConfig {
                         grid_dim: ((dv as u32).div_ceil(COLUMNS_PER_BLOCK), heads as u32, 1),
                         block_dim: (RECURRENCE_BLOCK, 1, 1),
@@ -605,7 +710,7 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
         Ok(match dtype {
             DType::F32 => run!(f32),
             DType::BF16 => run!(half::bf16),
-            other => anyhow::bail!("unsupported compute dtype {other:?}"),
+            other => bail!("unsupported compute dtype {other:?}"),
         })
     }
 }
@@ -615,10 +720,19 @@ mod tests {
     use super::*;
 
     fn max_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
-        Ok((a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?)
+        (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()
     }
 
-    fn random_prep(dev: &Device, dtype: DType, dims: Dims, len: usize) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    fn random_prep(
+        dev: &Device,
+        dtype: DType,
+        dims: Dims,
+        len: usize,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let qkv = Tensor::randn(0f32, 1., (len, dims.conv_dim()), dev)?.to_dtype(dtype)?;
         let a = Tensor::randn(0f32, 1., (len, dims.v_heads), dev)?.to_dtype(dtype)?;
         let b = Tensor::randn(0f32, 1., (len, dims.v_heads), dev)?.to_dtype(dtype)?;
@@ -631,11 +745,20 @@ mod tests {
     /// The fused CPU kernels against the candle-op oracle, with k heads repeated (mini's 16/32 layout).
     #[test]
     fn cpu_fused_matches_generic() -> Result<()> {
-        let dims = Dims { k_heads: 2, v_heads: 4, dk: 16, dv: 8 };
+        let dims = Dims {
+            k_heads: 2,
+            v_heads: 4,
+            dk: 16,
+            dv: 8,
+        };
         let dev = Device::Cpu;
         for dtype in [DType::F32, DType::BF16] {
             let (qkv, a, b, conv, dt_bias, neg_a) = random_prep(&dev, dtype, dims, 11)?;
-            let w = PrepWeights { conv: &conv, dt_bias: &dt_bias, neg_a: &neg_a };
+            let w = PrepWeights {
+                conv: &conv,
+                dt_bias: &dt_bias,
+                neg_a: &neg_a,
+            };
             let fused = cpu::prepare(&qkv, &a, &b, &w, dims)?;
             let oracle = generic::prepare(&qkv, &a, &b, &w, dims)?;
             // The generic path rounds every BF16 conv product and sum; the fused path accumulates the conv
@@ -648,7 +771,12 @@ mod tests {
             let z = Tensor::randn(0f32, 1., (11, 32), &dev)?.to_dtype(dtype)?;
             let weight = Tensor::randn(0f32, 1., 8, &dev)?.to_dtype(dtype)?;
             let tol = if dtype == DType::F32 { 1e-5 } else { 2e-2 };
-            assert!(max_diff(&cpu::gated_norm(&core, &z, &weight, 1e-6)?, &generic::gated_norm(&core, &z, &weight, 1e-6)?)? < tol);
+            assert!(
+                max_diff(
+                    &cpu::gated_norm(&core, &z, &weight, 1e-6)?,
+                    &generic::gated_norm(&core, &z, &weight, 1e-6)?
+                )? < tol
+            );
         }
         Ok(())
     }
@@ -663,9 +791,17 @@ mod tests {
         let v = Tensor::randn(0f32, 1., (len, heads, dv), &dev)?;
         let g = (Tensor::rand(0f32, 1., (len, heads), &dev)? * -1.0)?;
         let beta = Tensor::rand(0f32, 1., (len, heads), &dev)?;
-        let p = Prepared { qk: Tensor::cat(&[&q, &k], 2)?, v: v.clone(), gb: Tensor::stack(&[&g, &beta], 2)? };
+        let p = Prepared {
+            qk: Tensor::cat(&[&q, &k], 2)?,
+            v: v.clone(),
+            gb: Tensor::stack(&[&g, &beta], 2)?,
+        };
         let got = cpu::recurrence(&p)?.to_vec3::<f32>()?;
-        let (qv, kv, vv) = (q.to_vec3::<f32>()?, k.to_vec3::<f32>()?, v.to_vec3::<f32>()?);
+        let (qv, kv, vv) = (
+            q.to_vec3::<f32>()?,
+            k.to_vec3::<f32>()?,
+            v.to_vec3::<f32>()?,
+        );
         let (gv, bv) = (g.to_vec2::<f32>()?, beta.to_vec2::<f32>()?);
         for h in 0..heads {
             let mut s = vec![vec![0f32; dv]; dk];
@@ -675,7 +811,9 @@ mod tests {
                         *x *= gv[t][h].exp();
                     }
                 }
-                let mem: Vec<f32> = (0..dv).map(|j| (0..dk).map(|i| s[i][j] * kv[t][h][i]).sum()).collect();
+                let mem: Vec<f32> = (0..dv)
+                    .map(|j| (0..dk).map(|i| s[i][j] * kv[t][h][i]).sum())
+                    .collect();
                 let delta: Vec<f32> = (0..dv).map(|j| (vv[t][h][j] - mem[j]) * bv[t][h]).collect();
                 for i in 0..dk {
                     for j in 0..dv {
@@ -684,7 +822,11 @@ mod tests {
                 }
                 for j in 0..dv {
                     let o: f32 = (0..dk).map(|i| s[i][j] * qv[t][h][i]).sum();
-                    assert!((o - got[t][h][j]).abs() < 1e-4, "t{t} h{h} j{j}: {o} vs {}", got[t][h][j]);
+                    assert!(
+                        (o - got[t][h][j]).abs() < 1e-4,
+                        "t{t} h{h} j{j}: {o} vs {}",
+                        got[t][h][j]
+                    );
                 }
             }
         }
@@ -695,26 +837,66 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_kernels_match_cpu() -> Result<()> {
-        let dims = Dims { k_heads: 2, v_heads: 4, dk: 128, dv: 128 };
+        let dims = Dims {
+            k_heads: 2,
+            v_heads: 4,
+            dk: 128,
+            dv: 128,
+        };
         let gpu = Device::new_cuda(0)?;
         for dtype in [DType::F32, DType::BF16] {
             let (qkv, a, b, conv, dt_bias, neg_a) = random_prep(&Device::Cpu, dtype, dims, 70)?;
-            let w = PrepWeights { conv: &conv, dt_bias: &dt_bias, neg_a: &neg_a };
+            let w = PrepWeights {
+                conv: &conv,
+                dt_bias: &dt_bias,
+                neg_a: &neg_a,
+            };
             let host = cpu::prepare(&qkv, &a, &b, &w, dims)?;
-            let (cg, dg, ng) = (conv.to_device(&gpu)?, dt_bias.to_device(&gpu)?, neg_a.to_device(&gpu)?);
-            let wg = PrepWeights { conv: &cg, dt_bias: &dg, neg_a: &ng };
-            let dev_p = cuda::prepare(&qkv.to_device(&gpu)?, &a.to_device(&gpu)?, &b.to_device(&gpu)?, &wg, dims)?;
-            assert!(max_diff(&host.qk, &dev_p.qk.to_device(&Device::Cpu)?)? < 1e-5, "{dtype:?} qk");
-            assert!(max_diff(&host.gb, &dev_p.gb.to_device(&Device::Cpu)?)? < 1e-5, "{dtype:?} gb");
+            let (cg, dg, ng) = (
+                conv.to_device(&gpu)?,
+                dt_bias.to_device(&gpu)?,
+                neg_a.to_device(&gpu)?,
+            );
+            let wg = PrepWeights {
+                conv: &cg,
+                dt_bias: &dg,
+                neg_a: &ng,
+            };
+            let dev_p = cuda::prepare(
+                &qkv.to_device(&gpu)?,
+                &a.to_device(&gpu)?,
+                &b.to_device(&gpu)?,
+                &wg,
+                dims,
+            )?;
+            assert!(
+                max_diff(&host.qk, &dev_p.qk.to_device(&Device::Cpu)?)? < 1e-5,
+                "{dtype:?} qk"
+            );
+            assert!(
+                max_diff(&host.gb, &dev_p.gb.to_device(&Device::Cpu)?)? < 1e-5,
+                "{dtype:?} gb"
+            );
             let core_h = cpu::recurrence(&host)?;
             let core_d = cuda::recurrence(&dev_p)?;
-            assert!(max_diff(&core_h, &core_d.to_device(&Device::Cpu)?)? < 1e-3, "{dtype:?} recurrence");
+            assert!(
+                max_diff(&core_h, &core_d.to_device(&Device::Cpu)?)? < 1e-3,
+                "{dtype:?} recurrence"
+            );
             let z = Tensor::randn(0f32, 1., (70, 4 * 128), &Device::Cpu)?.to_dtype(dtype)?;
             let weight = Tensor::randn(0f32, 1., 128, &Device::Cpu)?.to_dtype(dtype)?;
             let nh = cpu::gated_norm(&core_h, &z, &weight, 1e-6)?;
-            let nd = cuda::gated_norm(&core_h.to_device(&gpu)?, &z.to_device(&gpu)?, &weight.to_device(&gpu)?, 1e-6)?;
+            let nd = cuda::gated_norm(
+                &core_h.to_device(&gpu)?,
+                &z.to_device(&gpu)?,
+                &weight.to_device(&gpu)?,
+                1e-6,
+            )?;
             let tol = if dtype == DType::F32 { 1e-4 } else { 2e-2 };
-            assert!(max_diff(&nh, &nd.to_device(&Device::Cpu)?)? < tol, "{dtype:?} gated norm");
+            assert!(
+                max_diff(&nh, &nd.to_device(&Device::Cpu)?)? < tol,
+                "{dtype:?} gated norm"
+            );
         }
         Ok(())
     }
