@@ -154,6 +154,12 @@ const MOONSHINE_SMALL_STREAMING_EN_URL: &str =
 const MOONSHINE_MEDIUM_STREAMING_EN_URL: &str =
     "https://download.moonshine.ai/model/medium-streaming-en/quantized";
 
+pub const LAYA_ENGLISH: &str = audio_graph_decision_engine::LAYA_ENGLISH;
+pub const LAYA_MULTILINGUAL: &str = audio_graph_decision_engine::LAYA_MULTILINGUAL;
+const LAYA_BUNDLE_FILES: &[&str] = audio_graph_decision_engine::LAYA_BUNDLE_FILES;
+const LAYA_ENGLISH_URL: &str =
+    "https://huggingface.co/receptron/laya-onnx/resolve/d42786bdff8a7550316339c5fbf8f46caa83ea1b";
+
 // --- Clustering diarization models (ADR-0017 / B16, `diarization-clustering`) -
 // Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
 // embedding model (URLs verified 200 on 2026-05-30, see
@@ -305,6 +311,15 @@ const MODELS: &[ModelDef] = &[
         archive_required_files: None,
         component_required_files: Some(MOONSHINE_STREAMING_REQUIRED_FILES),
     },
+    ModelDef {
+        name: "Laya English",
+        filename: LAYA_ENGLISH,
+        url: LAYA_ENGLISH_URL,
+        expected_size: None,
+        description: "Local typed decisions with the ModernBERT-large encoder and decision head",
+        archive_required_files: None,
+        component_required_files: Some(LAYA_BUNDLE_FILES),
+    },
     // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
     ModelDef {
         name: "Pyannote Segmentation 3.0 (Clustering Diarization)",
@@ -402,6 +417,62 @@ pub fn get_models_dir(app: &AppHandle) -> PathBuf {
         let _ = fs::create_dir_all(&dir);
     }
     dir
+}
+
+/// Construct a backend using the same app-data model root as ASR and LLMs.
+pub fn create_decision_engine(
+    app: &AppHandle,
+    id: &str,
+    execution_provider: audio_graph_decision_engine::ExecutionProvider,
+    allow_large_choice_sets: bool,
+) -> Result<
+    std::sync::Arc<dyn audio_graph_decision_engine::DecisionEngine>,
+    audio_graph_decision_engine::DecisionError,
+> {
+    let mut config = audio_graph_decision_engine::EngineConfig::new(get_models_dir(app));
+    config.execution_provider = execution_provider;
+    config.allow_large_choice_sets = allow_large_choice_sets;
+    audio_graph_decision_engine::EngineRegistry::default().create(id, &config)
+}
+
+/// Install a one-off exported checkpoint without introducing another cache.
+pub fn install_laya_bundle(
+    app: &AppHandle,
+    checkpoint: &str,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    if !matches!(checkpoint, LAYA_ENGLISH | LAYA_MULTILINGUAL) {
+        return Err("Unknown Laya checkpoint".into());
+    }
+    if !verify_archive_dir(source, LAYA_BUNDLE_FILES) {
+        return Err("Laya export is missing required non-empty bundle files".into());
+    }
+    let root = get_models_dir(app);
+    let target = root.join(checkpoint);
+    if target.exists() {
+        return Err(
+            "Model already exists; delete it explicitly before importing a replacement".into(),
+        );
+    }
+    let staging = root.join(format!("{checkpoint}.importing"));
+    fs::create_dir(&staging).map_err(|e| format!("Failed to create import directory: {e}"))?;
+    let result = (|| {
+        for component in LAYA_BUNDLE_FILES {
+            let destination = staging.join(component);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create bundle directory: {e}"))?;
+            }
+            fs::copy(source.join(component), destination)
+                .map_err(|e| format!("Failed to copy bundle component: {e}"))?;
+        }
+        fs::rename(&staging, &target).map_err(|e| format!("Failed to install Laya bundle: {e}"))?;
+        Ok(target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +959,10 @@ fn download_component_directory_model(
         let component_url = format!("{}/{}", base_url, component);
         let component_path = install_dir.join(component);
         let component_tmp_path = install_dir.join(format!("{}.download", component));
+        if let Some(parent) = component_tmp_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create model component directory: {}", e))?;
+        }
         if component_tmp_path.exists() {
             let _ = fs::remove_file(&component_tmp_path);
         }
@@ -909,7 +984,7 @@ fn download_component_directory_model(
                 );
                 let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
                 return Err(format!(
-                    "Download failed for Moonshine component '{}': {}",
+                    "Download failed for model component '{}': {}",
                     component, error
                 ));
             }
@@ -936,7 +1011,7 @@ fn download_component_directory_model(
                     );
                     let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
                     return Err(format!(
-                        "Read error for Moonshine component '{}': {}",
+                        "Read error for model component '{}': {}",
                         component, error
                     ));
                 }
@@ -973,17 +1048,14 @@ fn download_component_directory_model(
             );
             let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
             return Err(format!(
-                "Download verification failed for Moonshine component '{}'",
+                "Download verification failed for model component '{}'",
                 component
             ));
         }
 
         fs::rename(&component_tmp_path, &component_path).map_err(|e| {
             let _ = remove_path(&install_dir);
-            format!(
-                "Failed to install Moonshine component '{}': {}",
-                component, e
-            )
+            format!("Failed to install model component '{}': {}", component, e)
         })?;
     }
 
@@ -998,13 +1070,13 @@ fn download_component_directory_model(
         );
         let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
         return Err(format!(
-            "Moonshine component download did not produce required files: {}",
+            "Component download did not produce required files: {}",
             required_files.join(", ")
         ));
     }
 
     fs::rename(&install_dir, target_path)
-        .map_err(|e| format!("Failed to install Moonshine model directory: {}", e))?;
+        .map_err(|e| format!("Failed to install model directory: {}", e))?;
 
     let progress = DownloadProgress {
         percent: 100.0,
