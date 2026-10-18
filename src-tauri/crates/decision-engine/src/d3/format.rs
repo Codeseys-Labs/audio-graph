@@ -2,6 +2,7 @@
 //! handling of `d3_runtime.py`. Every byte of the rendered prompt must match the Python reference; the
 //! committed fixtures pin it (`fixtures/d3-*.json`, field `prompt`).
 
+use crate::pyjson::{self, Style};
 use audio_graph_decision_contract::{Answer, DecisionError, DecisionState, OrderedMap, Question};
 use serde_json::Value;
 
@@ -119,7 +120,7 @@ pub fn state_text(state: &DecisionState) -> String {
         DecisionState::Json(Value::Null) => EMPTY_STATE.into(),
         DecisionState::Json(Value::String(text)) if text.is_empty() => EMPTY_STATE.into(),
         DecisionState::Json(Value::String(text)) => text.clone(),
-        DecisionState::Json(value) => py_json(value),
+        DecisionState::Json(value) => pyjson::dumps(value, Style::Default),
     }
 }
 
@@ -208,111 +209,12 @@ fn argmax(values: &[f64]) -> usize {
     best
 }
 
-/// Python's `json.dumps(value, ensure_ascii=False)`: separators `", "` and `": "`, Python float repr.
-pub fn py_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_py_json(value, &mut out);
-    out
-}
-
-fn write_py_json(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                out.push_str(&i.to_string());
-            } else if let Some(u) = n.as_u64() {
-                out.push_str(&u.to_string());
-            } else {
-                out.push_str(&py_float_repr(n.as_f64().unwrap_or(f64::NAN)));
-            }
-        }
-        Value::String(s) => write_py_str(s, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_py_json(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (k, v)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_py_str(k, out);
-                out.push_str(": ");
-                write_py_json(v, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-fn write_py_str(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-/// Python `repr(float)`: shortest round-trip digits, scientific below 1e-4 or from 1e16.
-fn py_float_repr(x: f64) -> String {
-    if x.is_nan() {
-        return "NaN".into();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
-    }
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.into();
-    }
-    let sci = format!("{x:e}");
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    if (-4..16).contains(&exp) {
-        let plain = format!("{x}");
-        if plain.contains('.') {
-            plain
-        } else {
-            format!("{plain}.0")
-        }
-    } else {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn json_state_uses_python_json_text() {
-        let v: Value = serde_json::from_str(
-            r#"{"a": [1, 2.5, "x\ny"], "b": {"c": null, "d": true}, "é": 1e-7, "big": 1e16, "ctl": "\u0001"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            state_text(&DecisionState::Json(v)),
-            r#"{"a": [1, 2.5, "x\ny"], "b": {"c": null, "d": true}, "é": 1e-07, "big": 1e+16, "ctl": "\u0001"}"#
-        );
+    fn empty_states_render_as_empty() {
         assert_eq!(state_text(&DecisionState::Json(Value::Null)), "(empty)");
         assert_eq!(state_text(&DecisionState::Text(String::new())), "(empty)");
     }

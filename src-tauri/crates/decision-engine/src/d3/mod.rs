@@ -114,6 +114,7 @@ impl Loaded {
             prefix: "language_model",
             attention: internal(decision.attention())?,
             dtype: precision.dtype(),
+            weights: precision.dtype(),
         };
         let encoder = internal(Encoder::load(directory, &text, &options, device))?;
         let readout = internal(candle_core::safetensors::load(
