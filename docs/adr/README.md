@@ -55,6 +55,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0046] | Collapse the Shell to Capture and Sessions with a Persistent Active-Session Strip | accepted | Amends ADR-0030's workspace structure; preserves ADR-0028/0033/0034; ratified 2026-08-20 via the design panel; seed `audio-graph-19c7` | 2026-08-20 |
 | [0047] | A Tier-3 `.ag-*` Recipe Layer in `@layer components`, and `--edge`/`--edge-subtle` Non-Text Contrast Tokens | accepted | Amends ADR-0016's 2026-06-29 "two channels only" convention clause; extends ADR-0009's surface/border tokens; seed `audio-graph-b9dc` | 2026-08-20 |
 | [0048] | Compact the Projection-Basis Summarized Prefix Behind a Content-Hash Digest | accepted | Amends ADR-0031's ordered-identity requirement for the summarized prefix only; depends on ADR-0025 §2c; relates to ADR-0042 and ADR-0037; seed `audio-graph-cfa1` | 2026-08-24 |
+| [0049] | Route System-One Decisions Through a Named Decision Route Table | proposed | Sits beside ADR-0038 (mirrors its no-walker discipline); extends ADR-0033/0034 to `decision.*` producers; feeds ADR-0037's judge; gate before S1-T7 `audio-graph-0ac0`; seed `audio-graph-8b3e` | 2026-10-18 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -104,6 +105,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0046]: 0046-collapse-shell-to-capture-and-sessions.md
 [0047]: 0047-tier-3-recipe-layer-and-non-text-contrast-edge-tokens.md
 [0048]: 0048-compact-the-projection-basis-summarized-prefix-behind-a-content-hash-digest.md
+[0049]: 0049-decision-route-layer.md
 
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
