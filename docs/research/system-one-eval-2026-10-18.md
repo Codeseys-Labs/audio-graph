@@ -108,11 +108,44 @@ A replay regression was reproduced before the fix and passed afterward. A speech
 
 The initial parallel cloud run failed the Deepgram speaker-ledger test at `speech/tests_integration.rs:2505`, observing zero rows instead of two. The latest parallel run also failed analytics hub, sessions artifact path, usage seed/migration, shutdown lifecycle, and projection fold-counter tests. Running the full suite serially passed all 2,160 tests and the doctest, including all seven previously failing tests. This is evidence of parallel test-isolation sensitivity, not a verified production regression or a repaired parallel suite. No code in those modules was changed for this work.
 
-All-target clippy reports unused/dead platform-specific test fixtures in `persistence/canonical_durability.rs`, `canonical_crash_harness.rs`, `session_artifact_manifest.rs`, and `session_semantics.rs`, plus `explicit_auto_deref` in the crash fixture. Those files remain unchanged. The parallel failures and lint diagnostics are recorded as orchestration follow-ups rather than folded into this decision-layer change.
+The persistence lint baseline is tracked separately as `audio-graph-9f65`. Per the orchestrator's decision, ad35 clippy acceptance requires zero new diagnostics against `origin/master` and zero diagnostics in files added or changed by this task. The measured comparison below passes that criterion. Persistence modules were not edited.
 
 The stdin example's actual empty, command-argument, and oversized-input probes each printed only `missing`, exited 1, and emitted no stderr. A console/PTY refusal probe could not execute because the host PTY tool failed; no console-refusal execution result is claimed. Actual Jev and local Ollama private-session probes, without `--allow-private-session`, both exited 1 before loading content. Only the committed public corpus was used for the real Jev attempt, which still stopped on the missing credential.
 
-This Seed remains open until a real endpoint evaluation produces model metrics and the full-suite/clippy acceptance blockers are resolved. Exact provider token preflight also needs the provider tokenizer and prompt accounting; this implementation does not claim that byte length is a token count.
+Live evaluation remains `live eval pending credential` until the human saves the key through the stdin-only command. The clippy baseline-delta criterion and serial full-cloud verification now pass. The raw parallel-suite and baseline lint findings remain separately recorded. Exact provider token preflight still needs the provider tokenizer and prompt accounting; this implementation does not claim that byte length is a token count.
+
+### Clippy baseline acceptance comparison
+
+A detached, stash-free scratch checkout pinned `origin/master` at `a6ea3f8e51a6e93c0ebcc6812c60eb335595046c`. The implementation head was `c68b3ba1462493d1499541985c5791a074aca55c`. Both runs used the package's Rust 1.95.0, Cargo 1.95.0, and Clippy 0.1.95 with default features on Windows. No persistence source was changed. The scratch checkout was removed after comparison.
+
+The requested all-target lint command was executed on both revisions. The only added option selected machine-readable output, not different lint or feature behavior:
+
+```sh
+cargo clippy --locked --all-targets --message-format=json -- -D warnings
+```
+
+| Metric | Baseline | Implementation |
+| --- | ---: | ---: |
+| Compiler diagnostics | 41 | 41 |
+| Raw clippy exit status | 101 | 101 |
+
+| Persistence file | Baseline | Implementation |
+| --- | ---: | ---: |
+| `canonical_crash_harness.rs` | 16 | 16 |
+| `session_semantics.rs` | 11 | 11 |
+| `canonical_durability.rs` | 8 | 8 |
+| `session_artifact_manifest.rs` | 6 | 6 |
+| Total | 41 | 41 |
+
+The comparison used diagnostic code, severity, message, and primary source span, with paths normalized relative to each repository root. This was a set comparison, not just a comparison of totals:
+
+- New diagnostics: **0**.
+- Removed diagnostics: **0**.
+- Clippy diagnostics in any of the 17 added/changed files from `git diff --name-only` between those revisions: **0**.
+- The separate Windows debug local-ML CRT build-script advisory was identical on both revisions.
+
+Both raw clippy commands still fail on the same baseline. The result is acceptance under the approved zero-delta rule, not a claim that all-target clippy is globally clean. The subsequent cloud-suite rerun with the Windows manifest and `--test-threads=1` passed 2,160 tests and one doctest, with 11 ignored.
+
 
 ## Reproduction
 
