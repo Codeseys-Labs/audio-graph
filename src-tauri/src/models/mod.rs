@@ -551,23 +551,37 @@ pub fn create_decision_engine(
     registry.create(id, &config)
 }
 
+/// Directory layouts `Model::load` reads for a Laya checkpoint: the `export/` bundle (`laya.onnx` with
+/// external data and `laya_config.json`, what `multilingual.py` writes) and, for multilingual, the hosted
+/// repository layout its model-manager entry downloads.
+fn laya_layouts(checkpoint: &str) -> Option<&'static [&'static [&'static str]]> {
+    match checkpoint {
+        LAYA_ENGLISH => Some(&[LAYA_BUNDLE_FILES]),
+        LAYA_MULTILINGUAL => Some(&[LAYA_MULTILINGUAL_FILES, LAYA_BUNDLE_FILES]),
+        _ => None,
+    }
+}
+
 /// Install a one-off exported checkpoint without introducing another cache.
 pub fn install_laya_bundle(
     app: &AppHandle,
     checkpoint: &str,
     source: &Path,
 ) -> Result<PathBuf, String> {
-    // Each checkpoint is installed in the layout its model-manager entry checks: the legacy export bundle
-    // for English, the hosted repository layout for multilingual.
-    let files: &[&str] = match checkpoint {
-        LAYA_ENGLISH => LAYA_BUNDLE_FILES,
-        LAYA_MULTILINGUAL => LAYA_MULTILINGUAL_FILES,
-        _ => return Err("Unknown Laya checkpoint".into()),
-    };
-    if !verify_archive_dir(source, files) {
-        return Err("Laya export is missing required non-empty bundle files".into());
-    }
-    let root = get_models_dir(app);
+    install_laya_bundle_into(&get_models_dir(app), checkpoint, source)
+}
+
+fn install_laya_bundle_into(
+    root: &Path,
+    checkpoint: &str,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    let layouts = laya_layouts(checkpoint).ok_or("Unknown Laya checkpoint")?;
+    let files = layouts
+        .iter()
+        .copied()
+        .find(|files| verify_archive_dir(source, files))
+        .ok_or("Laya export is missing required non-empty bundle files")?;
     let target = root.join(checkpoint);
     if target.exists() {
         return Err(
@@ -667,7 +681,12 @@ fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
     }
     if let Some(required) = def.component_required_files {
         let exists = path.exists();
-        return (exists, exists && verify_archive_dir(path, required));
+        // An imported Laya export is installed even though it is not the downloaded layout.
+        let valid = match laya_layouts(def.filename) {
+            Some(layouts) => layouts.iter().any(|files| verify_archive_dir(path, files)),
+            None => verify_archive_dir(path, required),
+        };
+        return (exists, exists && valid);
     }
 
     let exists = path.exists();
@@ -1855,5 +1874,49 @@ mod tests {
                 "{id} has no weights"
             );
         }
+    }
+
+    #[test]
+    fn laya_import_accepts_the_export_layout_and_the_hosted_multilingual_layout() {
+        let base =
+            std::env::temp_dir().join(format!("audiograph-laya-import-{}", uuid::Uuid::new_v4()));
+        let bundle = |name: &str, files: &[&str]| {
+            let dir = base.join(name);
+            for file in files {
+                let path = dir.join(file);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"x").unwrap();
+            }
+            dir
+        };
+        let export = bundle("export", LAYA_BUNDLE_FILES);
+        let hosted = bundle("hosted", LAYA_MULTILINGUAL_FILES);
+        let multilingual = MODELS
+            .iter()
+            .find(|m| m.filename == LAYA_MULTILINGUAL)
+            .unwrap();
+
+        // `multilingual.py` output, after a killed import left its staging directory behind.
+        let root = base.join("models-a");
+        fs::create_dir_all(root.join(format!("{LAYA_MULTILINGUAL}.importing"))).unwrap();
+        let installed = install_laya_bundle_into(&root, LAYA_MULTILINGUAL, &export).unwrap();
+        assert!(verify_archive_dir(&installed, LAYA_BUNDLE_FILES));
+        assert_eq!(
+            model_exists_and_is_valid(&installed, multilingual),
+            (true, true)
+        );
+
+        let root = base.join("models-b");
+        fs::create_dir_all(&root).unwrap();
+        let installed = install_laya_bundle_into(&root, LAYA_MULTILINGUAL, &hosted).unwrap();
+        assert!(verify_archive_dir(&installed, LAYA_MULTILINGUAL_FILES));
+        assert_eq!(
+            model_exists_and_is_valid(&installed, multilingual),
+            (true, true)
+        );
+
+        // English has only the export layout.
+        assert!(install_laya_bundle_into(&base.join("models-c"), LAYA_ENGLISH, &hosted).is_err());
+        fs::remove_dir_all(base).unwrap();
     }
 }
