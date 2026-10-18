@@ -194,8 +194,9 @@ reference, and the BF16 comparison checks picks wherever the FP32 reference's to
 ### Parity results
 
 Phase A command (the probe, now deleted): `d3-probe parity <snapshot> fixtures/<model>.json --device
-<cpu|cuda> --dtype <f32|bf16>`. Phase B reran the same fixtures through `D3Engine` (`tests/d3_parity.rs`,
-`docs/research/d3-native-latency-2026-10-18.md`) with identical maxima.
+<cpu|cuda> --dtype <f32|bf16>`. The table is Phase A. Phase B reran the same fixtures through `D3Engine`
+(`tests/d3_parity.rs`, `docs/research/d3-native-latency-2026-10-18.md`): the maxima vs `fp32` match this
+table except d3-nano, which came out lower (CPU F32 1.03e-6, CUDA BF16 8.01e-3); picks are unchanged.
 
 | Model | Device | DType | max abs diff vs `fp32` | vs `official` | vs `official_b1` | Picks vs `official` |
 | --- | --- | --- | ---: | ---: | ---: | --- |

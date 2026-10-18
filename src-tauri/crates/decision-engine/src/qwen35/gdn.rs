@@ -565,6 +565,17 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
         }
     }
 
+    /// `block_sum` reduces over full warps and the recurrence splits `dk` into 4 groups, so the head
+    /// dimensions that size a block must be whole warps within CUDA's 1,024-thread block limit.
+    fn check_block(name: &str, n: usize) -> Result<()> {
+        if n == 0 || !n.is_multiple_of(32) || n > 1024 {
+            bail!(
+                "gated deltanet CUDA kernels need {name} as a multiple of 32 up to 1024, got {n}"
+            );
+        }
+        Ok(())
+    }
+
     pub fn prepare(
         qkv: &Tensor,
         a: &Tensor,
@@ -581,6 +592,8 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
             dk,
             dv,
         } = dims;
+        check_block("linear_key_head_dim", dk)?;
+        check_block("linear_value_head_dim", dv)?;
         let cd = dims.conv_dim();
         let kernel = w.conv.dim(0)?;
         let (qkv, conv, a, b) = (
@@ -682,6 +695,7 @@ extern "C" __global__ void gdn_recurrence(const float* __restrict__ qk, const fl
     pub fn gated_norm(core: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
         let dev = cuda_dev(core)?;
         let (len, heads, dv) = core.dims3()?;
+        check_block("linear_value_head_dim", dv)?;
         let dtype = z.dtype();
         let (core, z, weight) = (core.contiguous()?, z.contiguous()?, weight.contiguous()?);
         let func = module!(dev, 128, dtype, "gdn_gated_norm");

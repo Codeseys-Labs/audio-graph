@@ -320,16 +320,18 @@ impl Model {
     }
 }
 
+/// One lock per checkpoint: loading one model must not stall requests routed to the other.
+#[derive(Default)]
 struct LoadedModels {
-    english: Option<Model>,
-    multilingual: Option<Model>,
+    english: Mutex<Option<Model>>,
+    multilingual: Mutex<Option<Model>>,
 }
 
 pub struct LayaEngine {
     directory: PathBuf,
     provider: ExecutionProvider,
     allow_large: bool,
-    models: Arc<Mutex<LoadedModels>>,
+    models: Arc<LoadedModels>,
 }
 
 impl LayaEngine {
@@ -346,10 +348,7 @@ impl LayaEngine {
             directory: config.models_dir.clone(),
             provider: config.execution_provider,
             allow_large: config.allow_large_choice_sets,
-            models: Arc::new(Mutex::new(LoadedModels {
-                english: None,
-                multilingual: None,
-            })),
+            models: Arc::default(),
         })
     }
 }
@@ -405,11 +404,11 @@ impl DecisionEngine for LayaEngine {
         let allow_large = self.allow_large;
         tokio::task::spawn_blocking(move || {
             let state = sequence::state_text(&request.state);
-            let mut models = models.lock().map_err(|_| DecisionError::Internal)?;
             let (slot, folder) = match checkpoint {
-                Checkpoint::English => (&mut models.english, LAYA_ENGLISH),
-                Checkpoint::Multilingual => (&mut models.multilingual, LAYA_MULTILINGUAL),
+                Checkpoint::English => (&models.english, LAYA_ENGLISH),
+                Checkpoint::Multilingual => (&models.multilingual, LAYA_MULTILINGUAL),
             };
+            let mut slot = slot.lock().map_err(|_| DecisionError::Internal)?;
             if slot.is_none() {
                 *slot = Some(Model::load(&directory.join(folder), provider)?);
             }

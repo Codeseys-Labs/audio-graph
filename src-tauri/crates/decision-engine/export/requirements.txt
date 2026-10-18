@@ -1,3 +1,7 @@
+# Development-time environment of multilingual.py only; the Rust runtime never installs or loads it.
+# The exporter verifies every input file against multilingual-manifest.json before building the model and
+# does not use Trainer, LightGlue or save_pretrained (the paths of the advisories against transformers
+# 4.57.6). The pins reproduce the recorded output hashes; upgrading them invalidates those hashes.
 certifi==2026.7.22
 charset-normalizer==3.5.2
 colorama==0.4.6

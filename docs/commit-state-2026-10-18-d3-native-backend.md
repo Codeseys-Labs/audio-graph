@@ -1,8 +1,21 @@
 # Decision 3.0 native backend commit state — 2026-10-18
 
-## Repository state
+Sections below "Current state" are a snapshot taken at `ad3b925`, before the branch was published.
 
-- Worktree: `C:\Users\bbala_n314ugx\.ao\data\worktrees\audio-graph\audio-graph-3`, branch `ao/audio-graph-3/root`.
+## Current state
+
+- Branch `ao/audio-graph-3/root`, HEAD `9cefa1a` (cherry-pick of the hosted multilingual Laya commit,
+  `audio-graph-4022`), pushed and open as PR #109 against `master`.
+- Since the snapshot: the registry rework (`e6cebc4`), the shared `decision-contract` crate (`7f60567` to
+  `0fd43c3`), the shared `qwen35` module (`9639ee2`), and merges of `cafeeae` (audio-graph-6) and
+  `ao/audio-graph/root` `3603002` (audio-graph-5).
+- Verification at HEAD: `cargo test -p audio-graph-decision-engine --features decision-laya,decision-d3`
+  16 passed; `models::` lib tests 17 passed for `cloud` and `cloud,decision-d3`; cloud `check --locked`
+  and cloud clippy clean. The PR description holds the full matrix.
+
+## Repository state (snapshot at `ad3b925`)
+
+- Worktree: this AO session's linked worktree, branch `ao/audio-graph-3/root`.
 - Base: `origin/master` `a6ea3f8`, plus the cherry-picked orchestrator Seeds commit `122fcd1` (as `f1d4910`).
 - Merged `ao/audio-graph-2/root` `3c34cda` (decision-engine skeleton and Laya backend, still unmerged on master)
   as `f41abf6`, because the d3 backend plugs into that skeleton. The merge deduplicated eight Seed rows that
@@ -12,9 +25,8 @@
   then the registry rework requested by the decision-engine owner: `lib.rs` is back to the skeleton except
   the feature-gated `pub mod d3`; `d3::register` adds the engines through `EngineRegistry::register`, called
   from `create_decision_engine`; the download table (URLs, files) moved into `src-tauri/src/models/mod.rs`.
-- The tree is clean after these commits. Nothing is pushed and no PR is open: publishing is not authorized,
-  and the orchestrator integrates this branch with the skeleton branch and the `decision-contract` crate
-  (`ao/audio-graph/root`).
+- The tree was clean after these commits. At the snapshot nothing was pushed and no PR was open
+  (publishing was not yet authorized); the branch is now PR #109, see "Current state".
 - The global `sd` 0.5.5 reads `E:\CS\github\audio-graph\.seeds`; every Seed mutation here mirrored this
   worktree's `issues.jsonl` to that checkout, ran `sd`, copied the result back, and restored the checkout.
 
@@ -25,7 +37,7 @@
   macOS parity), `audio-graph-26b4` (Vulkan-only GPUs).
 - Documents: `docs/designs/d3-native-runtime-2026-10-18.md`, `docs/research/d3-native-latency-2026-10-18.md`.
 
-## Verification
+## Verification (snapshot at `ad3b925`)
 
 Run in `src-tauri` with Rust 1.95.0 (CUDA runs inside an MSVC developer shell with CUDA 13.2 on PATH and
 `NVCC_APPEND_FLAGS=-Xcompiler /Zc:preprocessor`):
