@@ -74,7 +74,50 @@ The actual `system_one_eval` executable completed a transport-only smoke using t
 
 The rebuilt final executable also replayed the 12-span public corpus through the temporary server. It exited 0 after 12 requests. Heuristic row counts were question 7, graph suggestion 2, note 1, none 2. With the fixed synthetic none answer, kind agreement was 2/12 and ECE was 0.6833333; grade count was zero. Transport p50/p95 were 0.5114/4.3477 ms and synthetic usage was 1,200 input/24 output tokens. This verifies the diagnostic corpus path, not model inference.
 
-The real Jev invocation against `fixtures/decision/public_replay.json` exited 1 with `decision credential missing or rejected`, before sending content. No model inference numbers are available from that attempt. Endpoint evaluation remains required before this Seed can close.
+An earlier real Jev invocation exited 1 with `decision credential missing or rejected`, before sending content. The authorized keychain import and completed live run below remove that credential blocker.
+
+### Live TypeSafe Jev on the public fixture
+
+The live invocation completed at `2026-10-18T15:36:04.921Z` from implementation head `3603002`. It used only the 12-span committed public fixture, with no session loaded and zero persisted cards. The requested alias was `jev-latest`; the provider returned `jev-1.13.0`.
+
+```sh
+cargo +1.95.0 run --quiet --locked --no-default-features --features cloud --example system_one_eval -- --endpoint jev --allow-cloud --fixture fixtures/decision/public_replay.json
+```
+
+The harness environment-key override and credential-backend override were removed for this process. Authentication came from the saved OS keychain slot, not an environment key. Cargo and the executable exited 0 with no stderr.
+
+| Live metric | Observed |
+| --- | ---: |
+| Requests / final spans | 12 / 12 |
+| Questions per request | 2 |
+| Kind agreement | 12/12, 100% |
+| Kind ECE, 10 bins | 0.0366666667 |
+| Heuristic questions / model questions | 7 / 7 |
+| Grade comparison subset | 7 |
+| Grade agreement | 6/7, 85.7142857% |
+| Grade ECE, 10 bins | 0.1085714286 |
+| Request latency p50 / p95 | 87.8152 / 428.0188 ms |
+| Provider input / output tokens | 6,920 / 824 |
+| Estimated API cost at $0.042/M input tokens | $0.00029064 |
+
+Confusion rows are the heuristic label; columns are the model label.
+
+| Kind | question | graph_suggestion | note | none |
+| --- | ---: | ---: | ---: | ---: |
+| question | 7 | 0 | 0 | 0 |
+| graph_suggestion | 0 | 2 | 0 | 0 |
+| note | 0 | 0 | 1 | 0 |
+| none | 0 | 0 | 0 | 2 |
+
+| Grade, conditional question subset | fragment | weak | strong |
+| --- | ---: | ---: | ---: |
+| fragment | 2 | 0 | 1 |
+| weak | 0 | 1 | 0 |
+| strong | 0 | 0 | 3 |
+
+The only grade disagreement was heuristic `fragment` to model `strong`. ECE was recomputed from the printed bin counts and probability sums; confusion totals, agreement denominators, and the token-price calculation also matched. No raw response or credential was written to a report or fixture.
+
+These are agreement diagnostics on 12 synthetic spans, not independently labeled accuracy or evidence that Jev can replace the heuristics. Grade ECE uses the seven-question intersection. Confidence semantics and thresholds remain per decision route; HTTP vendor confidence is unchanged. With 12 requests, nearest-rank p95 is the maximum observed latency, not a stable tail estimate. Latency excludes Cargo build time. Cost is an estimate from reported tokens and published pricing, not a billing receipt.
 
 Ollama was not found on PATH or in the current-user and machine-wide 32/64-bit uninstall registries. The local API on port 11434 refused a connection. A `winget list` inventory attempt timed out. No Ollama installation or model download was performed.
 
@@ -99,6 +142,7 @@ Commands ran from `src-tauri` unless stated otherwise.
 | `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud decision_credentials_survive_keychain_save_and_delete_without_plaintext_presence` | Passed, 1 test on final code |
 | `cargo +1.95.0 build --locked --no-default-features --features cloud --example save_typesafe_credential --example system_one_eval` | Passed; both actual executables exercised |
 | `cargo +1.95.0 run --locked --no-default-features --features cloud --example system_one_eval -- --help` | Passed; actual executable printed usage |
+| Public Jev command in the live-results section | Passed, exit 0; 12 requests, model `jev-1.13.0`, aggregate metrics above |
 | `bun run typecheck`, repository root | Could not execute `tsc`; frontend dependencies are absent |
 | `bun scripts/check-docs-secret-hygiene.mjs`, repository root | Passed, 0 findings |
 
@@ -110,9 +154,11 @@ The initial parallel cloud run failed the Deepgram speaker-ledger test at `speec
 
 The persistence lint baseline is tracked separately as `audio-graph-9f65`. Per the orchestrator's decision, ad35 clippy acceptance requires zero new diagnostics against `origin/master` and zero diagnostics in files added or changed by this task. The measured comparison below passes that criterion. Persistence modules were not edited.
 
-The stdin example's actual empty, command-argument, and oversized-input probes each printed only `missing`, exited 1, and emitted no stderr. A console/PTY refusal probe could not execute because the host PTY tool failed; no console-refusal execution result is claimed. Actual Jev and local Ollama private-session probes, without `--allow-private-session`, both exited 1 before loading content. Only the committed public corpus was used for the real Jev attempt, which still stopped on the missing credential.
+The stdin example's actual empty, command-argument, and oversized-input probes each printed only `missing`, exited 1, and emitted no stderr. A console/PTY refusal probe could not execute because the host PTY tool failed; no console-refusal execution result is claimed. Actual Jev and local Ollama private-session probes, without `--allow-private-session`, both exited 1 before loading content. The subsequent authorized import printed `saved`, and public-fixture Jev evaluation completed. No private session was read or exported.
 
-Live evaluation remains `live eval pending credential` until the human saves the key through the stdin-only command. The clippy baseline-delta criterion and serial full-cloud verification now pass. The raw parallel-suite and baseline lint findings remain separately recorded. Exact provider token preflight still needs the provider tokenizer and prompt accounting; this implementation does not claim that byte length is a token count.
+The public Jev evaluation and credential import are complete. The approved clippy baseline-delta criterion and serial full-cloud verification pass. Raw parallel-suite failures and baseline lint findings remain separately recorded; no globally green parallel-suite or raw all-target lint result is claimed. Exact provider token preflight still needs the provider tokenizer and prompt accounting; this implementation does not claim that byte length is a token count.
+
+Follow-up ownership is explicit. Exact provider-tokenizer/prompt preflight is `audio-graph-f069` under epic `audio-graph-6dfb`. Existing parallel test-hermeticity work remains under `audio-graph-39a4` and `audio-graph-1b91`; the ad35 serial/parallel and isolated-test observations are attached to `audio-graph-39a4`. The unrelated lint baseline remains `audio-graph-9f65`. Closing the evaluation task does not close these issues or claim a repaired parallel test suite.
 
 ### Clippy baseline acceptance comparison
 
@@ -161,13 +207,22 @@ AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-defaul
 | Implementation | 3 | 1 | 0 | 0 | 0 | 0.35 s |
 | `origin/master` | 1 | 1 | 0 | 0 | 0 | 0.34 s |
 
-The failure was not reproduced in isolation on either revision. These four runs establish neither a pre-existing failure nor a branch-specific regression. The earlier parallel-suite failure remains an observed, unresolved failure; passing isolated and serial runs do not erase it or prove its cause. No speech, persistence, credential, or module-wiring source was changed for this check. The scratch checkout and temporary runner/logs were removed afterward. ad35 remains open with `live eval pending credential`.
+The failure was not reproduced in isolation on either revision. These four runs establish neither a pre-existing failure nor a branch-specific regression. The earlier parallel-suite failure remains an observed, unresolved failure; passing isolated and serial runs do not erase it or prove its cause. No speech, persistence, credential, or module-wiring source was changed for this check. The scratch checkout and temporary runner/logs were removed afterward. At that checkpoint ad35 remained open with `live eval pending credential`; the later public Jev run removed that blocker.
 
 
 
 ## Reproduction
 
 Run in `src-tauri` after setting credentials through the existing backend or the harness-only environment variable. Never pass a secret on the command line.
+
+### Authorized existing OMP credential import
+
+For the measured run, the human authorized reuse of the existing OMP TypeSafe credential instead of manual entry. A temporary Rust bridge opened the SQLite source with `SQLITE_OPEN_READONLY` and verified `sqlite3_db_readonly(main) == 1`. It selected only `provider = typesafe` and `credential_type = api_key`, inspected JSON key names only, and required exactly one selected row. No database copy was needed or created.
+
+The bridge extracted the key in process, copied it to an owned buffer, and wrote it directly to the existing `save_typesafe_credential` executable's stdin. No shell interpolation, key argument, environment key, or secret file was used. Child stdout was accepted only if it was exactly `saved`; unexpected output and stderr were not forwarded. Owned secret buffers were zeroized with volatile writes and a compiler fence. The child also used its existing zeroizing stdin reader and forced OS-only keychain backend with no plaintext fallback. The operation printed `saved`. The temporary bridge source and executable were deleted afterward; the source database was not modified.
+
+SQLite internals, the OS pipe, and the credential backend may hold transient copies outside the bridge's owned buffer. This operation assumes the same trusted host and OS account as the credential CLI; it does not claim process-memory isolation from a compromised host.
+
 
 ### Human-only stdin credential entry
 
@@ -204,6 +259,8 @@ The API key is restricted data. Private session text is confidential. Scope is t
 
 ```text
 [Human hidden prompt] -- stdin --|process boundary|--> [credential CLI]
+[Authorized OMP SQLite row] -- read-only --|process boundary|--> [temporary bridge]
+[temporary bridge] -- stdin --> [credential CLI]
 [credential CLI] --|OS credential boundary|--> [keychain]
 [Explicit private consent] --> [replay CLI] <-- [local session store]
 [replay CLI] -- TLS --|provider boundary|--> [Jev]
@@ -212,6 +269,7 @@ The API key is restricted data. Private session text is confidential. Scope is t
 | Component | STRIDE | Threat | Risk | Mitigation and status |
 | --- | --- | --- | --- | --- |
 | Human terminal and CLI | Information disclosure, spoofing | Key appears in chat, history, argv, or terminal echo | High | Hidden terminal prompt, piped stdin only, no accepted arguments, fixed saved/missing output. Mitigated. |
+| OMP SQLite and temporary bridge | Information disclosure, tampering | Wrong provider row is imported, source is modified, or a secret is exposed through diagnostics | High | Read-only connection verified, fixed provider/type filter, exactly one row, key-name-only inspection, in-process stdin, suppressed sensitive diagnostics, volatile-zeroized owned buffer, temporary bridge deleted. Mitigated. |
 | Stdin reader | Tampering, denial of service | Malformed or oversized input overwrites a saved value or allocates unbounded memory | Medium | Bounded zeroizing buffer; validation completes before a write. Mitigated. |
 | Credential facade | Information disclosure, elevation of privilege | Key silently lands in plaintext fallback or a stale entry masks the saved value | High | Explicit OS-only mode, existing migration/tombstone cleanup, saved-value verification. Mitigated. |
 | Replay CLI | Spoofing, elevation of privilege | Private content is read or exported without an explicit approval step | High | `--allow-private-session` before loading a session; `--allow-cloud` for cloud transport. Private runs are not authorized in this evaluation. Mitigated at the CLI boundary. |
