@@ -204,12 +204,31 @@ pub struct Wire<T> {
 pub type WireRequest = Wire<DecisionRequest>;
 pub type WireResponse = Wire<DecisionResponse>;
 
+/// Opaque vendor bytes carried alongside a typed value for exact reconstruction.
+#[derive(Debug, Clone)]
+pub struct WireFormat {
+    raw: Box<RawValue>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WireConversionError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("typed value changed; use from_typed for new canonical output")]
+    TypedValueChanged,
+}
+
 impl<T> Wire<T> {
     pub fn typed(&self) -> &T {
         &self.typed
     }
+    /// Discard vendor formatting and extensions for engine-neutral processing.
+    /// Use `into_parts` when the original wire representation must survive.
     pub fn into_typed(self) -> T {
         self.typed
+    }
+    pub fn into_parts(self) -> (T, WireFormat) {
+        (self.typed, WireFormat { raw: self.raw })
     }
     pub fn json(&self) -> &str {
         self.raw.get()
@@ -222,6 +241,52 @@ impl<T: for<'de> Deserialize<'de>> Wire<T> {
         Ok(Self { typed, raw })
     }
 }
+impl<T: Serialize> Wire<T> {
+    /// Encode a native typed value without vendor-specific provenance.
+    pub fn from_typed(typed: T) -> Result<Self, serde_json::Error> {
+        let raw = serde_json::value::to_raw_value(&typed)?;
+        Ok(Self { typed, raw })
+    }
+}
+
+impl<T: Serialize + for<'de> Deserialize<'de>> Wire<T> {
+    /// Restore vendor bytes after read-only typed processing. Reject changes,
+    /// including map reordering, rather than silently emitting stale data.
+    pub fn from_parts(typed: T, format: WireFormat) -> Result<Self, WireConversionError> {
+        let original: T = serde_json::from_str(format.raw.get())?;
+        let expected = serde_json::to_vec(&typed)?;
+        let mut comparison = JsonComparison {
+            remaining: &expected,
+            equal: true,
+        };
+        serde_json::to_writer(&mut comparison, &original)?;
+        if !comparison.equal || !comparison.remaining.is_empty() {
+            return Err(WireConversionError::TypedValueChanged);
+        }
+        Ok(Self {
+            typed,
+            raw: format.raw,
+        })
+    }
+}
+
+struct JsonComparison<'a> {
+    remaining: &'a [u8],
+    equal: bool,
+}
+
+impl std::io::Write for JsonComparison<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.equal &= self.remaining.starts_with(bytes);
+        self.remaining = self.remaining.get(bytes.len()..).unwrap_or_default();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<T> Serialize for Wire<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.raw.serialize(serializer)
