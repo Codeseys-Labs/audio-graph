@@ -115,58 +115,18 @@ struct GatedDeltaNet {
 impl GatedDeltaNet {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let len = x.dim(0)?;
-        let dtype = x.dtype();
-        let (nk, nv, dk, dv) = (self.k_heads, self.v_heads, self.dk, self.dv);
-        let key_dim = nk * dk;
+        let dims = gdn::Dims { k_heads: self.k_heads, v_heads: self.v_heads, dk: self.dk, dv: self.dv };
         let qkv = self.in_proj_qkv.forward(x)?; // (L, conv_dim)
-        // Depthwise causal conv1d (kernel K, left zero padding) followed by SiLU.
-        let kernel = self.conv_weight.dim(0)?;
-        let conv_dim = qkv.dim(1)?;
-        let padded = Tensor::cat(&[Tensor::zeros((kernel - 1, conv_dim), dtype, x.device())?, qkv], 0)?;
-        let mut mixed = padded.narrow(0, 0, len)?.broadcast_mul(&self.conv_weight.get(0)?)?;
-        for j in 1..kernel {
-            mixed = (mixed + padded.narrow(0, j, len)?.broadcast_mul(&self.conv_weight.get(j)?)?)?;
-        }
-        let mixed = mixed.silu()?;
-        let q = mixed.narrow(1, 0, key_dim)?.reshape((len, nk, dk))?;
-        let k = mixed.narrow(1, key_dim, key_dim)?.reshape((len, nk, dk))?;
-        let v = mixed.narrow(1, 2 * key_dim, nv * dv)?.reshape((len, nv, dv))?;
-        let z = self.in_proj_z.forward(x)?.reshape((len, nv, dv))?;
-        let beta = candle_nn::ops::sigmoid(&self.in_proj_b.forward(x)?)?.to_dtype(DType::F32)?;
-        let a = self.in_proj_a.forward(x)?.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias)?;
-        let g = softplus(&a)?.broadcast_mul(&self.neg_a)?;
-        let (q, k) = if nv > nk {
-            let rep = nv / nk;
-            let expand = |t: Tensor| -> Result<Tensor> {
-                Ok(t.unsqueeze(2)?.broadcast_as((len, nk, rep, dk))?.reshape((len, nv, dk))?)
-            };
-            (expand(q)?, expand(k)?)
-        } else {
-            (q, k)
-        };
-        let q = (l2norm(&q.to_dtype(DType::F32)?)? * (dk as f64).powf(-0.5))?;
-        let k = l2norm(&k.to_dtype(DType::F32)?)?;
-        let v = v.to_dtype(DType::F32)?;
-        let core = gdn::gated_delta_rule(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, &g.contiguous()?, &beta.contiguous()?)?;
-        let core = core.to_dtype(dtype)?;
-        // Gated RMSNorm over each head's value dim: weight * norm(x) * silu(z) (weight not zero-centered).
-        let core32 = core.to_dtype(DType::F32)?;
-        let var = core32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = core32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(dtype)?;
-        let normed = normed.broadcast_mul(&self.norm_weight)?.to_dtype(DType::F32)?;
-        let gated = (normed * z.to_dtype(DType::F32)?.silu()?)?.to_dtype(dtype)?;
-        Ok(self.out_proj.forward(&gated.reshape((len, nv * dv))?)?)
+        let a = self.in_proj_a.forward(x)?;
+        let b = self.in_proj_b.forward(x)?;
+        let weights = gdn::PrepWeights { conv: &self.conv_weight, dt_bias: &self.dt_bias, neg_a: &self.neg_a };
+        let prepared = gdn::prepare(&qkv, &a, &b, &weights, dims)?;
+        let core = gdn::recurrence(&prepared)?;
+        let z = self.in_proj_z.forward(x)?; // (L, nv*dv)
+        let gated = gdn::gated_norm(&core, &z, &self.norm_weight, self.eps)?;
+        debug_assert_eq!(gated.dims(), [len, self.v_heads * self.dv]);
+        Ok(self.out_proj.forward(&gated)?)
     }
-}
-
-fn softplus(x: &Tensor) -> Result<Tensor> {
-    // max(x, 0) + log(1 + exp(-|x|)): no overflow for large |x|.
-    Ok((x.relu()? + ((x.abs()?.neg()?.exp()? + 1.0)?.log()?))?)
-}
-
-fn l2norm(x: &Tensor) -> Result<Tensor> {
-    let inv = (x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?.recip()?;
-    Ok(x.broadcast_mul(&inv)?)
 }
 
 enum Mixer {

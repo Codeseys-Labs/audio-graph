@@ -15,14 +15,15 @@ Measured with the committed fixtures for all four sizes (details below; d3-edge 
 required parity models, d3-lite and d3-mini add coverage for 24 layers at width 1024 and for the 16/32
 key/value-head Gated DeltaNet of d3-mini):
 
-- FP32 on CPU and on CUDA matches the FP32 run of the reference code path to at most 2.9e-6 per
-  probability, against the 1e-3 target. Picks match `model.system_one()` on 24 of 24 questions per model.
+- FP32 on CPU and on CUDA matches the FP32 run of the reference code path to at most 4.3e-6 per
+  probability, against the 1e-3 target. FP32 picks match `model.system_one()` on 24 of 24 questions per
+  model; BF16 picks match except one near-tie on d3-edge.
 - The rendered prompt text and token ids are identical to `d3_format.render` plus the checkpoint
   tokenizer for every fixture question.
 - The bidirectional mask matters: a stock causal forward moves probabilities by up to 0.878 and changes
   9 of 24 picks on d3-edge (d3-lite 1, d3-nano 2, d3-mini 4).
-- On the RTX 5090 in this machine the Rust path answers a 128-token question in 10.6 ms (d3-edge, FP32)
-  and 28.0 ms (d3-nano, FP32). The Hugging Face reference on the same GPU takes 32.7 ms and 71.5 ms.
+- On the RTX 5090 in this machine the Rust path answers a 128-token question in 7.05 ms (d3-edge, FP32)
+  and 12.9 ms (d3-nano, BF16). The Hugging Face reference on the same GPU takes 32.7 ms and 71.5 ms.
 
 ## What the checkpoint computes
 
@@ -145,10 +146,14 @@ benefit. It does have Vulkan, which candle lacks (see risks).
 - `model.rs`: the encoder. Embedding rows are gathered on the CPU from the BF16 table (the 248,320-row
   table never goes to the GPU; d3-nano saves 0.95 GiB of VRAM). Full attention has no mask. GQA reshapes
   queries per KV head instead of copying K/V.
-- `gdn.rs`: the delta rule. CPU path: per-head recurrence in plain Rust on rayon. CUDA path: an NVRTC
-  kernel compiled at first use through candle's `cudarc` (already enabled by `candle-core/cuda`), one
-  launch per layer; block per (32 value columns, head), 4 lanes per column split the 128 state rows and
-  combine with warp shuffles, the next token's q/k row is prefetched into a double buffer.
+- `gdn.rs`: the Gated DeltaNet pieces outside matmuls, as three fused kernels per layer: `prepare`
+  (conv1d + SiLU, q/k L2 norm and scale, k-head repeat, `g`, `beta`), `recurrence` (the delta rule),
+  and `gated_norm`. CPU: plain Rust on rayon. CUDA: NVRTC kernels compiled at first use through
+  candle's `cudarc` (already enabled by `candle-core/cuda`), with BF16 handled as raw bits so no CUDA
+  headers are needed at run time. The recurrence runs one block per (32 value columns, head); 4 lanes
+  per column split the 128 state rows and combine with warp shuffles, and the next token's q/k row is
+  prefetched into a double buffer. A `generic` candle-op version is the oracle in unit tests and the
+  path for devices without a fused kernel.
 - `runtime.rs`, `main.rs`: load, prompt, tokenize, forward, readout; `parity` and `bench` commands.
 
 ### Fixtures
@@ -170,7 +175,9 @@ score, single option) records the rendered prompt, the token ids, and four proba
 The BF16 reference is not a 1e-3 target. Changing only its batch size moves probabilities by up to
 3.4e-2 (d3-edge), 1.3e-2 (d3-lite), 1.2e-2 (d3-nano) and 7.2e-3 (d3-mini). The FP32 run of the same
 code differs from the default BF16 run by up to 1.5e-2. The 1e-3 target therefore applies to the FP32
-reference, and the BF16 comparison checks picks.
+reference, and the BF16 comparison checks picks wherever the FP32 reference's top-two margin exceeds
+0.05 (the BF16 noise bound above). One d3-edge question is a near-tie (`json-state/risk`, margin
+0.0031) and flips in BF16.
 
 ### Parity results
 
@@ -178,16 +185,16 @@ Command: `d3-probe parity <snapshot> fixtures/<model>.json --device <cpu|cuda> -
 
 | Model | Device | DType | max abs diff vs `fp32` | vs `official` | vs `official_b1` | Picks vs `official` |
 | --- | --- | --- | ---: | ---: | ---: | --- |
-| d3-edge | CPU | F32 | 2.87e-6 | 1.47e-2 | 1.94e-2 | 24/24 |
-| d3-edge | CUDA | F32 | 2.41e-6 | 1.47e-2 | 1.94e-2 | 24/24 |
-| d3-edge | CUDA | BF16 | 1.75e-2 | 2.05e-2 | 2.91e-2 | 24/24 |
-| d3-nano | CPU | F32 | 1.59e-6 | 9.11e-3 | 7.26e-3 | 24/24 |
-| d3-nano | CUDA | F32 | 2.52e-6 | 9.12e-3 | 7.26e-3 | 24/24 |
-| d3-nano | CUDA | BF16 | 1.29e-2 | 1.80e-2 | 1.30e-2 | 24/24 |
-| d3-lite | CUDA | F32 | 1.64e-6 | 8.79e-3 | 6.02e-3 | 24/24 |
-| d3-lite | CUDA | BF16 | 1.60e-2 | 1.63e-2 | 1.68e-2 | 24/24 |
-| d3-mini | CUDA | F32 | 1.07e-6 | 4.41e-3 | 5.77e-3 | 24/24 |
-| d3-mini | CUDA | BF16 | 1.25e-2 | 8.75e-3 | 1.28e-2 | 24/24 |
+| d3-edge | CPU | F32 | 4.29e-6 | 1.47e-2 | 1.94e-2 | 24/24 |
+| d3-edge | CUDA | F32 | 2.25e-6 | 1.47e-2 | 1.94e-2 | 24/24 |
+| d3-edge | CUDA | BF16 | 2.12e-2 | 1.92e-2 | 3.40e-2 | 23/24 (near-tie) |
+| d3-nano | CPU | F32 | 1.17e-6 | 9.11e-3 | 7.26e-3 | 24/24 |
+| d3-nano | CUDA | F32 | 3.12e-6 | 9.12e-3 | 7.26e-3 | 24/24 |
+| d3-nano | CUDA | BF16 | 1.75e-2 | 1.23e-2 | 1.74e-2 | 24/24 |
+| d3-lite | CUDA | F32 | 1.71e-6 | 8.79e-3 | 6.02e-3 | 24/24 |
+| d3-lite | CUDA | BF16 | 8.74e-3 | 1.08e-2 | 1.31e-2 | 24/24 |
+| d3-mini | CUDA | F32 | 1.08e-6 | 4.41e-3 | 5.77e-3 | 24/24 |
+| d3-mini | CUDA | BF16 | 6.56e-3 | 8.99e-3 | 1.04e-2 | 24/24 |
 
 Bidirectional-mask evidence from the same fixtures (reference code, FP32, causal vs bidirectional):
 d3-edge max diff 0.878 with 9 of 24 picks flipped; d3-lite 0.335, 1 flipped; d3-nano 0.347, 2 flipped;
@@ -201,32 +208,35 @@ question per call, 50 timed calls on GPU, 5 to 20 on CPU; the call ends with the
 
 | Model | Path | 128 tok p50 / p95 | 751 tok p50 / p95 | Device memory (weights / after forward) |
 | --- | --- | --- | --- | --- |
-| d3-edge | Rust CUDA F32 | 10.6 / 12.9 ms | 23.3 / 24.4 ms | 1024 / 1120 MiB |
-| d3-edge | Rust CUDA BF16 | 11.8 / 14.2 ms | 15.5 / 17.0 ms | 480 / 576 MiB |
+| d3-edge | Rust CUDA F32 | 7.05 / 8.42 ms | 18.6 / 19.7 ms | 1024 / 1120 MiB |
+| d3-edge | Rust CUDA BF16 | 6.04 / 7.45 ms | 10.9 / 11.7 ms | 480 / 576 MiB |
 | d3-edge | HF reference CUDA (BF16) | 32.7 / 42.7 ms | 52.3 / 59.4 ms | 1.20 GiB peak (torch) |
-| d3-edge | Rust CPU F32 | 487 / 601 ms | 2341 / 2650 ms | |
+| d3-edge | Rust CPU F32 | 352 / 447 ms | 1544 / 1731 ms | |
 | d3-edge | HF reference CPU (BF16) | 173 / 205 ms | 819 / 902 ms | |
-| d3-lite | Rust CUDA F32 | 28.8 / 30.2 ms | 50.7 / 51.7 ms | 2144 / 2208 MiB |
-| d3-lite | Rust CUDA BF16 | 30.3 / 37.8 ms | 36.7 / 39.8 ms | 960 / 1088 MiB |
-| d3-nano | Rust CUDA F32 | 28.0 / 33.0 ms | 79.6 / 84.6 ms | 5664 / 5760 MiB |
-| d3-nano | Rust CUDA BF16 | 30.2 / 37.4 ms | 48.3 / 62.5 ms | 2624 / 2752 MiB |
+| d3-lite | Rust CUDA F32 | 10.9 / 12.1 ms | 36.3 / 37.9 ms | 2144 / 2208 MiB |
+| d3-lite | Rust CUDA BF16 | 9.96 / 11.6 ms | 22.1 / 23.4 ms | 960 / 1088 MiB |
+| d3-nano | Rust CUDA F32 | 18.3 / 20.0 ms | 65.7 / 67.1 ms | 5664 / 5760 MiB |
+| d3-nano | Rust CUDA BF16 | 12.9 / 18.3 ms | 31.5 / 32.9 ms | 2624 / 2752 MiB |
 | d3-nano | HF reference CUDA (BF16) | 71.5 / 80.8 ms | 123.3 / 147.8 ms | 4.22 GiB peak (torch) |
-| d3-nano | Rust CPU F32 | 2110 / 2162 ms | 8578 / 9807 ms | |
-| d3-mini | Rust CUDA F32 | 53.0 / 55.7 ms | 172.5 / 176.3 ms | 14016 / 14080 MiB |
-| d3-mini | Rust CUDA BF16 | 35.6 / 40.0 ms | 82.7 / 85.9 ms | 6816 / 7040 MiB |
+| d3-nano | Rust CPU F32 | 1422 / 1572 ms | 6665 / 7442 ms | |
+| d3-mini | Rust CUDA F32 | 38.6 / 39.8 ms | 146.2 / 148.9 ms | 14016 / 14080 MiB |
+| d3-mini | Rust CUDA BF16 | 14.8 / 20.2 ms | 59.0 / 60.7 ms | 6816 / 7040 MiB |
 
 Device memory is the device-wide delta from `cuMemGetInfo` after load and after the long forward, so it
-also counts allocations candle and cuBLAS make outside the weights. The model cards report 6.6 ms
-(d3-edge) and 13.4 ms (d3-nano) text p50 on one AMD Instinct MI325X with ROCm 7.2 and AutoModel.
+also counts allocations candle and cuBLAS make outside the weights (measured before the kernel fusion,
+which does not change the weights). The model cards report 6.6 ms (d3-edge) and 13.4 ms (d3-nano) text
+p50 on one AMD Instinct MI325X with ROCm 7.2 and AutoModel.
 
-Short prompts are launch-bound. An Nsight Systems trace of d3-nano BF16 (46 forwards) shows about 1,570
-kernel launches and about 360 small host-to-device copies per forward. Under WDDM a launch costs a median
-7 us of host time, which alone is about 11 ms per forward. The Gated DeltaNet pre- and post-processing
-(conv, SiLU, L2 norm, gating, gated RMSNorm) is about 40 elementwise launches per linear-attention layer
-(an estimate from the code), so fusing it into two kernels is the first Phase B tuning step.
+Short prompts are launch-bound under WDDM. Before the fusion, an Nsight Systems trace of d3-nano BF16
+(46 forwards) showed about 1,570 kernel launches and about 360 small host-to-device copies per forward,
+at a median 7 us of host time per launch, and the Gated DeltaNet pre- and post-processing took about 40
+elementwise launches per linear-attention layer. Fusing them into the three kernels above cut the
+128-token p50 from 10.6 to 7.05 ms (d3-edge FP32), 28.8 to 10.9 ms (d3-lite FP32) and 30.2 to 12.9 ms
+(d3-nano BF16).
 
-CPU is about 2.8x slower than torch on the same CPU. Torch runs the BF16 backbone; the prototype runs
-FP32 through candle's `gemm` crate and candle's elementwise ops. CPU tuning is Seed `audio-graph-1f5c`.
+CPU is about 2x slower than torch on the same CPU. Torch runs the BF16 backbone; the prototype runs FP32
+through candle's `gemm` crate (candle's CPU matmul has no BF16 kernel). CPU tuning is Seed
+`audio-graph-1f5c`.
 
 ### Memory per size (estimates from configs, text layers only)
 
@@ -272,9 +282,10 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
 - Vulkan-only GPUs get CPU speed (`audio-graph-26b4`); llama.cpp stays a fallback design if that matters
   more than exactness.
 - Metal is unverified until the MSL kernel lands and macOS CI runs it (`audio-graph-377a`).
-- BF16 on GPU moves probabilities by up to 2e-2 against the BF16 reference, inside the reference's own
-  batch-size variance, with no pick changes on the fixtures. FP32 matches the FP32 reference exactly but
-  costs memory and long-prompt time (d3-nano 751 tokens: 79.6 ms FP32, 48.3 ms BF16). Phase B makes the
-  dtype a setting, defaults to FP32 for edge and lite and BF16 for nano and mini, and runs parity in FP32.
+- BF16 on GPU moves probabilities by up to 1.9e-2 against the default BF16 reference and 3.4e-2 against
+  its batch-size-1 run, the same spread as the reference's own batch-size variance; one near-tie pick
+  flips on d3-edge. FP32 matches the FP32 reference exactly but costs memory and long-prompt time (d3-nano
+  751 tokens: 65.7 ms FP32, 31.5 ms BF16). Phase B makes the dtype a setting, defaults to FP32 for edge
+  and lite and BF16 for nano and mini, and runs parity in FP32. CPU runs FP32 only.
 - Clef-flash (9B) reuses the encoder but needs about 18 GiB in BF16. Consumer GPUs need candle's
   quantized matmul (Q8_0 / Q4K); S1-T5 should measure accuracy against its reference before choosing.

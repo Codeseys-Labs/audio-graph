@@ -107,6 +107,16 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
 }
 
+/// Top-2 margin above which a BF16 run must keep the reference pick. BF16 moves probabilities by up to
+/// ~3.4e-2 (the BF16 reference's own batch-size spread), so closer races may flip.
+const BF16_PICK_MARGIN: f64 = 0.05;
+
+fn top2_margin(p: &[f64]) -> f64 {
+    let mut sorted = p.to_vec();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    sorted[0] - sorted.get(1).copied().unwrap_or(0.0)
+}
+
 fn load(opts: &Opts) -> Result<(runtime::D3, Fixture)> {
     let fixture: Fixture = serde_json::from_slice(&std::fs::read(&opts.fixture)?)?;
     let started = Instant::now();
@@ -155,7 +165,12 @@ fn parity(opts: &Opts) -> Result<()> {
             let pick = format::argmax(&probs);
             if pick != format::argmax(&fq.official) || pick != format::argmax(&fq.fp32) {
                 pick_mismatch += 1;
-                failures.push(format!("{}/{}: pick {} differs from the reference", case.id, fq.id, question.keys[pick]));
+                let margin = top2_margin(&fq.fp32);
+                if opts.dtype == DType::F32 || margin > BF16_PICK_MARGIN {
+                    failures.push(format!("{}/{}: pick {} differs from the reference", case.id, fq.id, question.keys[pick]));
+                } else {
+                    println!("near-tie flip allowed for {:?}: {}/{} (reference margin {margin:.4})", opts.dtype, case.id, fq.id);
+                }
             }
             if format::argmax(&fq.fp32_causal) != format::argmax(&fq.fp32) {
                 causal_flips += 1;

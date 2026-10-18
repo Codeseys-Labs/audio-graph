@@ -16,11 +16,12 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 anyhow = "1"
 candle-core = "=0.10.2"
 candle-nn = "=0.10.2"
+half = "2"
 indexmap = { version = "2", features = ["serde"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 debug = 1
