@@ -1,4 +1,9 @@
-use audio_graph_decision_contract::{Answer, DecisionState, WireRequest, WireResponse};
+use audio_graph_decision_contract::{
+    Answer, DecisionEngine, DecisionResponse, DecisionState, OrderedMap, Usage,
+    WireConversionError, WireRequest, WireResponse,
+};
+
+const _: Option<std::sync::Arc<dyn DecisionEngine + Send + Sync>> = None;
 
 // https://docs.typesafe.ai/introduction/quickstart.md (2026-10-18), Bash request.
 const TYPESAFE: &str = r#"{
@@ -69,6 +74,62 @@ fn vendor_bytes_and_extensions_survive_replay() {
             confidence: None,
             ..
         }
+    ));
+}
+
+#[test]
+fn vendor_json_survives_conversion_through_owned_typed_values() {
+    let (request, format) = WireRequest::from_json(TYPESAFE).unwrap().into_parts();
+    assert!(matches!(request.state, DecisionState::Text(_)));
+    let request = WireRequest::from_parts(request, format).unwrap();
+    assert_eq!(serde_json::to_string(&request).unwrap(), TYPESAFE);
+
+    for json in [VLLM, OLLAMA] {
+        let wire = WireResponse::from_json(json).unwrap();
+        let (response, format) = wire.into_parts();
+        assert_eq!(response.engine_id, "");
+        let restored = WireResponse::from_parts(response, format).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), json);
+    }
+}
+
+#[test]
+fn native_score_values_encode_probabilities_by_level_index() {
+    let response = DecisionResponse {
+        answers: OrderedMap::from([(
+            "grade".to_owned(),
+            Answer::Score {
+                score: 0.75,
+                probabilities: vec![0.25, 0.75],
+                confidence: 0.75,
+            },
+        )]),
+        usage: Usage {
+            input_tokens: 12,
+            output_tokens: 0,
+        },
+        engine_id: "native".to_owned(),
+        model: "fixture".to_owned(),
+    };
+    let wire = WireResponse::from_typed(response).unwrap();
+    let json: serde_json::Value = serde_json::from_str(wire.json()).unwrap();
+    assert_eq!(
+        json["answers"]["grade"]["probabilities"],
+        serde_json::json!({"0": 0.25, "1": 0.75})
+    );
+    assert_eq!(
+        WireResponse::from_json(wire.json()).unwrap().typed(),
+        wire.typed()
+    );
+}
+
+#[test]
+fn reconstruction_rejects_changes_instead_of_emitting_stale_vendor_bytes() {
+    let (mut response, format) = WireResponse::from_json(VLLM).unwrap().into_parts();
+    response.usage.input_tokens += 1;
+    assert!(matches!(
+        WireResponse::from_parts(response, format),
+        Err(WireConversionError::TypedValueChanged)
     ));
 }
 
