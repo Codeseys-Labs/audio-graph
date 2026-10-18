@@ -315,7 +315,10 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
   also enabled. Every build with `decision-d3` therefore tokenizes with Oniguruma, the engine the HF
   Python reference uses, and the parity runs measured exactly that. Side effects: enabling `decision-d3`
   also moves Laya from fancy-regex to Oniguruma in builds that did not already have it (the default
-  `local-ml` build already gets `onig` through mistralrs), and cross-compiling needs a C compiler for
+  `local-ml` build already gets `onig` through mistralrs). Checked 2026-10-18 in a
+  `decision-laya,decision-d3` build with `tests/laya_parity.rs` (ONNX Runtime 1.24.4, app-data
+  English and multilingual bundles): max error 5.03e-5 / 4.63e-5 on CPU and 5.00e-5 / 4.64e-5 on CUDA,
+  against the fixtures' 1e-3 tolerance, so Laya is unaffected. Cross-compiling needs a C compiler for
   the target (`onig_sys`); a Windows-to-macOS `cargo check` fails there, so the Metal code path has not
   even been compiled yet (`audio-graph-377a`).
 - Metal is unverified until the MSL kernel lands and macOS CI runs it (`audio-graph-377a`).
