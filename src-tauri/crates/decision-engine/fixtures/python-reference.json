@@ -1,0 +1,254 @@
+{
+  "source": "laya.Agent.system_one",
+  "laya_version": "0.3.20",
+  "checkpoint": "convaiinnovations/laya@7b928d828b7b0e022f929d9bd2e44165aa270148",
+  "device": "cpu",
+  "dtype": "float32",
+  "tolerance": 0.001,
+  "cases": [
+    {
+      "request": {
+        "state": "The parcel never arrived. Please refund my payment.",
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "refund",
+            "probabilities": {
+              "refund": 0.9534,
+              "shipping": 0.0327,
+              "support": 0.0139
+            },
+            "confidence": 0.8027,
+            "answer_confidence": 0.9534,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 40,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": "The parcel never arrived. Please refund my payment.",
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is the request?",
+            "criteria": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "The customer explicitly requests a refund.",
+            "criteria": null
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "refund",
+            "probabilities": {
+              "refund": 0.9534,
+              "shipping": 0.0327,
+              "support": 0.0139
+            },
+            "confidence": 0.8027,
+            "answer_confidence": 0.9534,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "score": 1.0297,
+            "legend": {
+              "0": "low",
+              "1": "medium",
+              "2": "high"
+            },
+            "probabilities": {
+              "0": 0.2933,
+              "1": 0.3836,
+              "2": 0.3231
+            },
+            "confidence": 0.0057,
+            "answer_confidence": 0.3836,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "refund_requested": {
+            "type": "noul",
+            "noul": 0.8948,
+            "confidence": 0.8948,
+            "answer_confidence": 0.8948,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 121,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": {
+          "customer": "My app keeps crashing, but I can wait until next week."
+        },
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "support",
+            "probabilities": {
+              "refund": 0.0798,
+              "shipping": 0.0959,
+              "support": 0.8243
+            },
+            "confidence": 0.4668,
+            "answer_confidence": 0.8243,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 48,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": {
+          "customer": "My app keeps crashing, but I can wait until next week."
+        },
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is the request?",
+            "criteria": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "The customer explicitly requests a refund.",
+            "criteria": null
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "support",
+            "probabilities": {
+              "refund": 0.0798,
+              "shipping": 0.0959,
+              "support": 0.8243
+            },
+            "confidence": 0.4668,
+            "answer_confidence": 0.8243,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "score": 0.7696,
+            "legend": {
+              "0": "low",
+              "1": "medium",
+              "2": "high"
+            },
+            "probabilities": {
+              "0": 0.2387,
+              "1": 0.753,
+              "2": 0.0083
+            },
+            "confidence": 0.4582,
+            "answer_confidence": 0.753,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "refund_requested": {
+            "type": "noul",
+            "noul": 0.0406,
+            "confidence": 0.9594,
+            "answer_confidence": 0.9594,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 145,
+          "output_tokens": 0
+        }
+      }
+    }
+  ]
+}

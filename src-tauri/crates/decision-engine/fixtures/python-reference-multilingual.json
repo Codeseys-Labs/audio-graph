@@ -1,0 +1,254 @@
+{
+  "source": "laya.Agent.system_one",
+  "laya_version": "0.3.20",
+  "checkpoint": "convaiinnovations/laya@7b928d828b7b0e022f929d9bd2e44165aa270148/multilingual",
+  "device": "cpu",
+  "dtype": "float32",
+  "tolerance": 0.001,
+  "cases": [
+    {
+      "request": {
+        "state": "包裹一直没有送达，请退还我的付款。",
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "refund",
+            "probabilities": {
+              "refund": 0.9878,
+              "shipping": 0.0112,
+              "support": 0.001
+            },
+            "confidence": 0.937,
+            "answer_confidence": 0.9878,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 44,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": "包裹一直没有送达，请退还我的付款。",
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is the request?",
+            "criteria": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "The customer explicitly requests a refund.",
+            "criteria": null
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "refund",
+            "probabilities": {
+              "refund": 0.9878,
+              "shipping": 0.0112,
+              "support": 0.001
+            },
+            "confidence": 0.937,
+            "answer_confidence": 0.9878,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "score": 1.3704,
+            "legend": {
+              "0": "low",
+              "1": "medium",
+              "2": "high"
+            },
+            "probabilities": {
+              "0": 0.083,
+              "1": 0.4636,
+              "2": 0.4534
+            },
+            "confidence": 0.1612,
+            "answer_confidence": 0.4636,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "refund_requested": {
+            "type": "noul",
+            "noul": 0.9763,
+            "confidence": 0.9763,
+            "answer_confidence": 0.9763,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 134,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": {
+          "customer": "Приложение постоянно вылетает, но я могу подождать до следующей недели."
+        },
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "shipping",
+            "probabilities": {
+              "refund": 0.2652,
+              "shipping": 0.6569,
+              "support": 0.0779
+            },
+            "confidence": 0.2473,
+            "answer_confidence": 0.6569,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 52,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "request": {
+        "state": {
+          "customer": "Приложение постоянно вылетает, но я могу подождать до следующей недели."
+        },
+        "questions": {
+          "intent": {
+            "type": "choice",
+            "instructions": "Classify the customer's request.",
+            "criteria": {
+              "refund": "Return money",
+              "shipping": "Track a delivery",
+              "support": "Technical assistance"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is the request?",
+            "criteria": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "refund_requested": {
+            "type": "noul",
+            "instructions": "The customer explicitly requests a refund.",
+            "criteria": null
+          }
+        }
+      },
+      "reference": {
+        "model": "laya-rl-agent",
+        "answers": {
+          "intent": {
+            "type": "choice",
+            "choice": "shipping",
+            "probabilities": {
+              "refund": 0.2652,
+              "shipping": 0.6569,
+              "support": 0.0779
+            },
+            "confidence": 0.2473,
+            "answer_confidence": 0.6569,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "score": 1.2861,
+            "legend": {
+              "0": "low",
+              "1": "medium",
+              "2": "high"
+            },
+            "probabilities": {
+              "0": 0.0443,
+              "1": 0.6252,
+              "2": 0.3304
+            },
+            "confidence": 0.2739,
+            "answer_confidence": 0.6252,
+            "action": {
+              "act_probability": 1.0
+            }
+          },
+          "refund_requested": {
+            "type": "noul",
+            "noul": 0.0024,
+            "confidence": 0.9976,
+            "answer_confidence": 0.9976,
+            "action": {
+              "act_probability": 1.0
+            }
+          }
+        },
+        "usage": {
+          "input_tokens": 158,
+          "output_tokens": 0
+        }
+      }
+    }
+  ]
+}
