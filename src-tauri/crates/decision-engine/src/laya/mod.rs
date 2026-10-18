@@ -154,9 +154,13 @@ fn provider_builder(provider: ExecutionProvider) -> Result<SessionBuilder, Decis
 
 impl Model {
     fn load(directory: &Path, provider: ExecutionProvider) -> Result<Self, DecisionError> {
+        let (graph_file, config_file) = if directory.join("model-fp32.onnx").is_file() {
+            ("model-fp32.onnx", "rl_agent_config.json")
+        } else {
+            ("laya.onnx", "laya_config.json")
+        };
         let config: Config = serde_json::from_slice(
-            &std::fs::read(directory.join("laya_config.json"))
-                .map_err(|_| DecisionError::Internal)?,
+            &std::fs::read(directory.join(config_file)).map_err(|_| DecisionError::Internal)?,
         )
         .map_err(|_| DecisionError::Internal)?;
         if config.max_len < 16 || config.max_len > 1024 || config.head_max_len < 16 {
@@ -194,7 +198,25 @@ impl Model {
             mask_text,
         };
         let session =
-            internal(provider_builder(provider)?.commit_from_file(directory.join("laya.onnx")))?;
+            internal(provider_builder(provider)?.commit_from_file(directory.join(graph_file)))?;
+        let required_inputs = [
+            "input_ids",
+            "attention_mask",
+            "marker_pos",
+            "marker_mask",
+            "qtype",
+        ];
+        if session.inputs().len() != required_inputs.len()
+            || !required_inputs
+                .iter()
+                .all(|name| session.inputs().iter().any(|input| input.name() == *name))
+            || !session
+                .outputs()
+                .iter()
+                .any(|output| output.name() == "logits")
+        {
+            return Err(DecisionError::Internal);
+        }
         Ok(Self {
             session,
             tok,
