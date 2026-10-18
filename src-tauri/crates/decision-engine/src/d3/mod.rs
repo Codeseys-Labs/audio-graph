@@ -7,11 +7,12 @@ mod config;
 pub mod format;
 
 use crate::qwen35::{self, Encoder, LoadOptions};
-use crate::{
-    DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress, EngineConfig,
-    EngineConstructor, EngineLimits, EngineRegistry, ExecutionProvider, OrderedMap, Usage,
-};
+use crate::{EngineConfig, EngineConstructor, EngineRegistry, ExecutionProvider};
 use async_trait::async_trait;
+use audio_graph_decision_contract::{
+    DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress, EngineLimits,
+    OrderedMap, Usage,
+};
 use candle_core::{DType, Device, Tensor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -304,7 +305,7 @@ impl DecisionEngine for D3Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DecisionState, Question};
+    use audio_graph_decision_contract::{DecisionState, Question};
 
     #[tokio::test]
     async fn invalid_questions_fail_before_loading_model_files() {

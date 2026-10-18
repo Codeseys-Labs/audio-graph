@@ -2,7 +2,7 @@
 //! handling of `d3_runtime.py`. Every byte of the rendered prompt must match the Python reference; the
 //! committed fixtures pin it (`fixtures/d3-*.json`, field `prompt`).
 
-use crate::{Answer, DecisionError, DecisionState, OrderedMap, Question};
+use audio_graph_decision_contract::{Answer, DecisionError, DecisionState, OrderedMap, Question};
 use serde_json::Value;
 
 pub const MAX_OPTIONS: usize = 255;
@@ -390,9 +390,9 @@ mod tests {
             let fixture: Value = serde_json::from_str(source).unwrap();
             let codes: Vec<String> = serde_json::from_value(fixture["codes"].clone()).unwrap();
             for case in fixture["cases"].as_array().unwrap() {
-                let Ok(request) =
-                    serde_json::from_value::<crate::DecisionRequest>(case["request"].clone())
-                else {
+                let Ok(request) = serde_json::from_value::<
+                    audio_graph_decision_contract::DecisionRequest,
+                >(case["request"].clone()) else {
                     continue; // JSON instructions/descriptions or missing instructions: not expressible in the contract
                 };
                 let state = state_text(&request.state);
