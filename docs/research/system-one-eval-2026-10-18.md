@@ -44,7 +44,7 @@ Local endpoints require loopback IP literals, disable proxies and redirects, and
 
 `cargo example system_one_eval` reads either:
 
-- `--session ID`: final canonical transcript spans, falling back to legacy transcript JSONL only when the canonical stream is absent. LiveAssistCardRecord heads are loaded and counted. Reference labels are recomputed with the shipped Rust heuristics, not copied from potentially stale cards.
+- `--session ID --allow-private-session`: final canonical transcript spans, falling back to legacy transcript JSONL only when the canonical stream is absent. The consent flag is required before reading private session content, including local replay. Cloud replay additionally requires `--allow-cloud`. LiveAssistCardRecord heads are loaded and counted. Reference labels are recomputed with the shipped Rust heuristics, not copied from potentially stale cards.
 - `--fixture PATH`: the existing `OfflineProjectionReplayFixture` format. Transcript events replay through `TranscriptLedger`; superseded partials do not become extra samples. The default is the existing `fixtures/projection_eval/two_span_repair.json`.
 
 The additional public corpus, `fixtures/decision/public_replay.json`, contains 12 synthetic spans. Seven question examples reuse the existing `speech/mod.rs` signal-grade fixture sentences and confidence values. Added graph, note, and none examples exercise the other intent labels. This is a small diagnostic corpus, not a representative meeting benchmark or independently human-labeled accuracy set.
@@ -86,15 +86,18 @@ Commands ran from `src-tauri` unless stated otherwise.
 | --- | --- |
 | `cargo +1.95.0 test --locked -p audio-graph-decision-contract` | Passed, 5 integration tests, including vLLM/Ollama owned typed round trips and canonical native score encoding |
 | `cargo +1.95.0 test --locked --no-default-features --features cloud` | Compiled; Windows loader aborted before tests with `0xc0000139` |
-| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud` | 2,154 passed, 1 failed, 11 ignored; all 7 new decision/credential tests passed |
+| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud` | Latest parallel run: 2,153 passed, 7 failed, 11 ignored, all failures in untouched modules |
+| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud -- --test-threads=1` | Passed, 2,160 tests plus 1 doctest, 0 failures, 11 ignored |
 | `cargo +1.95.0 check --locked` | Passed with the existing Windows debug local-ML CRT advisory |
-| `cargo +1.95.0 check --locked --no-default-features --features cloud` | Passed after wire reconstruction changes |
+| `cargo +1.95.0 check --locked --no-default-features --features cloud` | Passed after wire, stdin credential, and consent changes |
 | `cargo clippy --locked --all-targets -- -D warnings` | Failed with 41 diagnostics in untouched persistence test code |
-| `cargo +1.95.0 clippy --locked --no-default-features --features cloud --lib --example system_one_eval -- -D warnings` | Passed |
+| `cargo +1.95.0 clippy --locked --no-default-features --features cloud --lib --example save_typesafe_credential --example system_one_eval -- -D warnings` | Passed |
+| `cargo +1.95.0 clippy --locked --no-default-features --features cloud --all-targets -- -D warnings` | Failed with the same 41 diagnostics in untouched persistence tests |
 | `cargo +1.95.0 clippy --locked -p audio-graph-decision-contract --all-targets -- -D warnings` | Passed |
-| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud decision::` | Passed, 6 tests on final code |
+| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud decision::` | Passed, 9 tests including Cloudflare envelope/auth, typed HTTP failures, and cardinality maxima |
+| `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud stdin_credential` | Passed, 2 tests; invalid input preserves the saved value and keychain failure creates no plaintext fallback |
 | `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud decision_credentials_survive_keychain_save_and_delete_without_plaintext_presence` | Passed, 1 test on final code |
-| `cargo +1.95.0 build --locked --no-default-features --features cloud --example system_one_eval` | Passed; rebuilt executable used in the 12-request smoke |
+| `cargo +1.95.0 build --locked --no-default-features --features cloud --example save_typesafe_credential --example system_one_eval` | Passed; both actual executables exercised |
 | `cargo +1.95.0 run --locked --no-default-features --features cloud --example system_one_eval -- --help` | Passed; actual executable printed usage |
 | `bun run typecheck`, repository root | Could not execute `tsc`; frontend dependencies are absent |
 | `bun scripts/check-docs-secret-hygiene.mjs`, repository root | Passed, 0 findings |
@@ -103,15 +106,70 @@ The Windows test environment variable is the existing repository-prescribed laun
 
 A replay regression was reproduced before the fix and passed afterward. A speech span that naturally starts with a canned proposal prefix was being stripped one extra time when computing the reference grade. Replay now calls the existing proposal-body formatter before the existing grade function, exactly matching production minting. Only crate visibility changed in those speech helpers; their behavior is unchanged.
 
-The full cloud suite's failure is `speech::tests_integration::deepgram_final_after_writer_cleared_reaches_ledger_but_is_counted_as_display_miss` at `speech/tests_integration.rs:2505`. It observed zero speaker-ledger rows instead of two. The decision module is not called by that path. No Deepgram integration code or persistence implementation was changed for this task.
+The initial parallel cloud run failed the Deepgram speaker-ledger test at `speech/tests_integration.rs:2505`, observing zero rows instead of two. The latest parallel run also failed analytics hub, sessions artifact path, usage seed/migration, shutdown lifecycle, and projection fold-counter tests. Running the full suite serially passed all 2,160 tests and the doctest, including all seven previously failing tests. This is evidence of parallel test-isolation sensitivity, not a verified production regression or a repaired parallel suite. No code in those modules was changed for this work.
 
-All-target clippy reports unused/dead platform-specific test fixtures in `persistence/canonical_durability.rs`, `canonical_crash_harness.rs`, `session_artifact_manifest.rs`, and `session_semantics.rs`, plus `explicit_auto_deref` in the crash fixture. Those files remain unchanged. Their cleanup and the Deepgram test failure were reported to the orchestrator rather than folded into this decision-layer change.
+All-target clippy reports unused/dead platform-specific test fixtures in `persistence/canonical_durability.rs`, `canonical_crash_harness.rs`, `session_artifact_manifest.rs`, and `session_semantics.rs`, plus `explicit_auto_deref` in the crash fixture. Those files remain unchanged. The parallel failures and lint diagnostics are recorded as orchestration follow-ups rather than folded into this decision-layer change.
+
+The stdin example's actual empty, command-argument, and oversized-input probes each printed only `missing`, exited 1, and emitted no stderr. A console/PTY refusal probe could not execute because the host PTY tool failed; no console-refusal execution result is claimed. Actual Jev and local Ollama private-session probes, without `--allow-private-session`, both exited 1 before loading content. Only the committed public corpus was used for the real Jev attempt, which still stopped on the missing credential.
 
 This Seed remains open until a real endpoint evaluation produces model metrics and the full-suite/clippy acceptance blockers are resolved. Exact provider token preflight also needs the provider tokenizer and prompt accounting; this implementation does not claim that byte length is a token count.
 
 ## Reproduction
 
 Run in `src-tauri` after setting credentials through the existing backend or the harness-only environment variable. Never pass a secret on the command line.
+
+### Human-only stdin credential entry
+
+Do not send the key through chat, command-line arguments, files, or logs. Run this in the human's own PowerShell terminal. `Read-Host -AsSecureString` hides the input, and the value is piped only to the child process's stdin:
+
+```powershell
+$credential = Read-Host 'TypeSafe API key' -AsSecureString
+$buffer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($credential)
+try {
+  [Runtime.InteropServices.Marshal]::PtrToStringBSTR($buffer) |
+    cargo +1.95.0 run --quiet --locked --no-default-features --features cloud --example save_typesafe_credential
+} finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($buffer)
+  $credential.Dispose()
+  Remove-Variable credential, buffer
+}
+```
+
+The example prints only `saved` or `missing`. It rejects command-line values and terminal stdin so the key cannot accidentally be typed into an echoing stdin prompt. The reader accepts at most 16 KiB, rejects malformed or multiline input, and zeroizes its fixed buffer. The existing credential facade is forced to OS keychain with file fallback disabled, even if a development environment override selects a file backend. It preserves migration/tombstone handling, clears a stale legacy entry through the existing facade, and verifies the saved value without displaying it. `missing` exits 1 and does not mean an existing saved key was deleted.
+
+On Bash, a hidden shell prompt can feed the same stdin-only example without putting the value into history or an environment variable:
+
+```bash
+IFS= read -r -s -p 'TypeSafe API key: ' credential
+printf '\n'
+printf '%s\n' "$credential" |
+  cargo +1.95.0 run --quiet --locked --no-default-features --features cloud --example save_typesafe_credential
+unset credential
+```
+
+### Credential and consent threat boundary
+
+The API key is restricted data. Private session text is confidential. Scope is this evaluation CLI and its existing credential facade, not product routing or protection against a compromised OS user account.
+
+```text
+[Human hidden prompt] -- stdin --|process boundary|--> [credential CLI]
+[credential CLI] --|OS credential boundary|--> [keychain]
+[Explicit private consent] --> [replay CLI] <-- [local session store]
+[replay CLI] -- TLS --|provider boundary|--> [Jev]
+```
+
+| Component | STRIDE | Threat | Risk | Mitigation and status |
+| --- | --- | --- | --- | --- |
+| Human terminal and CLI | Information disclosure, spoofing | Key appears in chat, history, argv, or terminal echo | High | Hidden terminal prompt, piped stdin only, no accepted arguments, fixed saved/missing output. Mitigated. |
+| Stdin reader | Tampering, denial of service | Malformed or oversized input overwrites a saved value or allocates unbounded memory | Medium | Bounded zeroizing buffer; validation completes before a write. Mitigated. |
+| Credential facade | Information disclosure, elevation of privilege | Key silently lands in plaintext fallback or a stale entry masks the saved value | High | Explicit OS-only mode, existing migration/tombstone cleanup, saved-value verification. Mitigated. |
+| Replay CLI | Spoofing, elevation of privilege | Private content is read or exported without an explicit approval step | High | `--allow-private-session` before loading a session; `--allow-cloud` for cloud transport. Private runs are not authorized in this evaluation. Mitigated at the CLI boundary. |
+| Local credential changes | Repudiation | No detailed audit identifies which local process supplied a key | Low | OS-user identity and presence-only output. Accepted; secret-bearing audit logs are out of scope. |
+| Terminal/OS process memory | Information disclosure | A same-user attacker reads temporary plaintext while the key is passed to stdin | High | Rust buffer and unmanaged BSTR are zeroized. Remaining runtime/OS copies are accepted under the trusted-host assumption. |
+
+Assumptions: the human's terminal and OS account are trusted, the existing platform keychain enforces its access controls, TLS verification stays enabled, and the selected evaluation fixtures contain reviewed public text. Arbitrary fixture files must not be assumed public. Revisit these boundaries if the CLI input, storage backend, or session-export workflow changes.
+
+### Public fixture evaluation
 
 ```sh
 cargo +1.95.0 run --locked --no-default-features --features cloud --example system_one_eval -- --help
@@ -120,7 +178,7 @@ cargo +1.95.0 run --locked --no-default-features --features cloud --example syst
 cargo +1.95.0 run --locked --no-default-features --features cloud --example system_one_eval -- --endpoint ollama --model clef-flash --fixture fixtures/decision/public_replay.json
 ```
 
-A real session's text leaves the device only if the caller explicitly selects that session and allows cloud evaluation. Initial evaluation uses public fixtures only.
+A real session's text is not loaded unless the caller supplies `--allow-private-session` after explicit user approval. Sending it to a cloud provider also requires `--allow-cloud`. No private-session evaluation is authorized or run here. Initial evaluation uses the committed public fixtures only.
 
 ## Sources
 

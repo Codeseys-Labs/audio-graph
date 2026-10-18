@@ -1630,6 +1630,58 @@ pub fn set_credential(key: &str, value: &str) -> Result<(), String> {
     default_backend().set(key, value)
 }
 
+/// Store the stdin-only Jev credential in the OS backend, never file fallback.
+/// Returns presence confirmation only; errors and input are never formatted.
+pub fn save_typesafe_credential_from_reader(reader: impl std::io::Read) -> bool {
+    let backend = DefaultCredentialBackend {
+        keychain: KeychainCredentialBackend::default(),
+        yaml: YamlCredentialBackend::default(),
+        state: CredentialMigrationStateBackend::default(),
+        file_backend: false,
+        fallback_to_yaml: false,
+    };
+    save_typesafe_from_reader(&backend, reader)
+}
+
+fn save_typesafe_from_reader(
+    backend: &impl CredentialBackend,
+    mut reader: impl std::io::Read,
+) -> bool {
+    const MAX_INPUT_BYTES: usize = 16 * 1024;
+    const KEY: &str = "typesafe_api_key";
+    let mut input = zeroize::Zeroizing::new([0_u8; MAX_INPUT_BYTES + 1]);
+    let mut used = 0;
+    loop {
+        match reader.read(&mut input[used..]) {
+            Ok(0) => break,
+            Ok(count) => {
+                used += count;
+                if used > MAX_INPUT_BYTES {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    let Ok(value) = std::str::from_utf8(&input[..used]) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return false;
+    }
+    if backend.set(KEY, value).is_err() {
+        return false;
+    }
+    backend
+        .get(KEY)
+        .ok()
+        .flatten()
+        .map(zeroize::Zeroizing::new)
+        .is_some_and(|saved| saved.as_str() == value)
+}
+
 pub fn delete_credential(key: &str) -> Result<(), String> {
     default_backend().delete(key)
 }
@@ -1934,6 +1986,83 @@ mod tests {
             assert_eq!(snapshot.source_for(key), "missing");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stdin_credential_save_uses_keychain_and_invalid_input_preserves_saved_value() {
+        use std::io::Read as _;
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-stdin-credential-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let yaml_path = dir.join("credentials.yaml");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state: CredentialMigrationStateBackend::with_path(dir.join("credentials-state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        assert!(save_typesafe_from_reader(
+            &backend,
+            &b"  fixture-stdin-value \r\n"[..]
+        ));
+        assert_eq!(
+            backend.get("typesafe_api_key").unwrap().as_deref(),
+            Some("fixture-stdin-value")
+        );
+        assert_eq!(
+            backend
+                .load_with_source()
+                .unwrap()
+                .source_for("typesafe_api_key"),
+            "os_keychain"
+        );
+        for invalid in [
+            &b""[..],
+            &b" \r\n"[..],
+            &b"first\nsecond"[..],
+            &b"bad\0value"[..],
+            &[0xff][..],
+        ] {
+            assert!(!save_typesafe_from_reader(&backend, invalid));
+            assert_eq!(
+                backend.get("typesafe_api_key").unwrap().as_deref(),
+                Some("fixture-stdin-value")
+            );
+        }
+        assert!(!save_typesafe_from_reader(
+            &backend,
+            std::io::repeat(b'x').take(16 * 1024 + 1)
+        ));
+        assert_eq!(
+            backend.get("typesafe_api_key").unwrap().as_deref(),
+            Some("fixture-stdin-value")
+        );
+        assert!(!yaml_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stdin_credential_failure_never_creates_plaintext_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-stdin-unavailable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let yaml_path = dir.join("credentials.yaml");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state: CredentialMigrationStateBackend::with_path(dir.join("credentials-state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        assert!(!save_typesafe_from_reader(
+            &backend,
+            &b"fixture-stdin-value"[..]
+        ));
+        assert!(!yaml_path.exists());
+        assert!(!dir.exists());
     }
 
     #[test]

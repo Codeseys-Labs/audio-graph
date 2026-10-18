@@ -26,14 +26,14 @@ async fn execute() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help") {
         println!(
-            "system_one_eval --endpoint jev|cf-jev|cf-clef|ollama|vllm [--allow-cloud] [--fixture PATH | --session ID] [--model NAME] [--url LOOPBACK_SYSTEMONE_URL] [--account-id ID] [--limit N] [--input-price USD_PER_MTOK]\nDefault input: fixtures/projection_eval/two_span_repair.json. Credentials: saved keychain slot; harness-only TYPESAFE_API_KEY/CLOUDFLARE_API_TOKEN overrides. Only aggregate metrics are printed. --session sends that session's final speech spans; --allow-cloud explicitly authorizes cloud evaluation."
+            "system_one_eval --endpoint jev|cf-jev|cf-clef|ollama|vllm [--allow-cloud] [--allow-private-session] [--fixture PATH | --session ID] [--model NAME] [--url LOOPBACK_SYSTEMONE_URL] [--account-id ID] [--limit N] [--input-price USD_PER_MTOK]\nDefault input: fixtures/projection_eval/two_span_repair.json. Credentials: saved keychain slot; harness-only TYPESAFE_API_KEY/CLOUDFLARE_API_TOKEN overrides. Only aggregate metrics are printed. --session requires --allow-private-session after the user's explicit approval, even for local replay. Cloud requests additionally require --allow-cloud. No private session is loaded without its consent flag."
         );
         return Ok(());
     }
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--allow-cloud" => index += 1,
+            "--allow-cloud" | "--allow-private-session" => index += 1,
             "--endpoint" | "--fixture" | "--session" | "--model" | "--url" | "--account-id"
             | "--limit" | "--input-price" => {
                 value(&args, &args[index])?;
@@ -74,6 +74,12 @@ async fn execute() -> Result<(), String> {
     let fixture = value(&args, "--fixture")?;
     if session.is_some() && fixture.is_some() {
         return Err("Choose --session or --fixture, not both".to_owned());
+    }
+    if session.is_some() && !args.iter().any(|s| s == "--allow-private-session") {
+        return Err(
+            "Private session replay requires explicit user approval and --allow-private-session; no session content was loaded or sent"
+                .to_owned(),
+        );
     }
     let mut corpus = match session {
         Some(id) => eval::load_session(&id)?,

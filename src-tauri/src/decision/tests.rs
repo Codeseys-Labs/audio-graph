@@ -209,3 +209,137 @@ async fn replay_reports_conditional_grade_and_heuristic_disagreement() {
     assert_eq!(report.grade_calibration.ece, None);
     served.await.unwrap();
 }
+
+#[tokio::test]
+async fn cloudflare_envelope_preserves_vendor_extensions_and_uses_unified_jev_input() {
+    let answer = r#"{"model":"jev-1.13.0","answers":{"team":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"shipping":0.1},"confidence":0.8}},"usage":{"input_tokens":20,"output_tokens":1},"diagnostics":{"team":{"label_mass":0.95}}}"#;
+    let (url, served) = server(
+        200,
+        format!(r#"{{"result":{answer},"success":true,"errors":[],"messages":[]}}"#),
+    )
+    .await;
+    let mut engine = SystemOneHttpEngine::new(
+        EndpointKind::Cloudflare {
+            account_id: "fixture".to_owned(),
+            model: CloudflareModel::Jev,
+        },
+        Some("fixture-bearer-token".to_owned()),
+    )
+    .unwrap();
+    engine.url = Url::parse(&url).unwrap();
+    engine.client = Client::builder().no_proxy().build().unwrap();
+    let wire = engine.evaluate_wire(&request()).await.unwrap();
+    assert_eq!(wire.json(), answer);
+    assert!(
+        matches!(&wire.typed().answers["team"], Answer::Choice { choice, .. } if choice == "billing")
+    );
+    let transmitted = served.await.unwrap();
+    let (headers, body) = transmitted.split_once("\r\n\r\n").unwrap();
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-bearer-token")
+    );
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["model"], "typesafe/jev");
+    assert_eq!(body["input"]["state"], "A public fixture");
+    assert!(body.get("state").is_none());
+}
+
+#[tokio::test]
+async fn failed_cloudflare_envelope_and_http_errors_do_not_become_answers() {
+    let (url, served) = server(200, r#"{"success":false,"result":null,"errors":[{"message":"fixture-private-token and private content"}]}"#.to_owned()).await;
+    let mut engine = SystemOneHttpEngine::new(
+        EndpointKind::Cloudflare {
+            account_id: "fixture".to_owned(),
+            model: CloudflareModel::ClefFlash,
+        },
+        Some("fixture-private-token".to_owned()),
+    )
+    .unwrap();
+    engine.url = Url::parse(&url).unwrap();
+    engine.client = Client::builder().no_proxy().build().unwrap();
+    let error = engine.system_one(&request()).await.unwrap_err();
+    assert!(matches!(error, DecisionError::Transport(_)));
+    assert!(!error.to_string().contains("fixture-private-token"));
+    assert!(!error.to_string().contains("private content"));
+    served.await.unwrap();
+
+    for (status, body) in [
+        (401, r#"{"error":"fixture-private-token"}"#),
+        (
+            400,
+            r#"{"error":{"code":"max_tokens_exceeded","message":"private content"}}"#,
+        ),
+    ] {
+        let (url, served) = server(status, body.to_owned()).await;
+        let engine = SystemOneHttpEngine::new(
+            EndpointKind::Vllm {
+                url,
+                model: "fixture".to_owned(),
+            },
+            None,
+        )
+        .unwrap();
+        let error = engine.system_one(&request()).await.unwrap_err();
+        match status {
+            401 => assert!(matches!(error, DecisionError::Credential)),
+            400 => assert!(matches!(error, DecisionError::StateTooLong)),
+            _ => unreachable!(),
+        }
+        served.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn endpoint_maxima_are_rejected_before_transport() {
+    let mut engine = SystemOneHttpEngine::new(
+        EndpointKind::TypeSafe,
+        Some("fixture-bearer-token".to_owned()),
+    )
+    .unwrap();
+    engine.url = Url::parse("http://127.0.0.1:9/v1/systemone").unwrap();
+    let mut req = request();
+    if let Question::Choice { criteria, .. } = req.questions.get_mut("team").unwrap() {
+        *criteria = (0..256).map(|i| (i.to_string(), None)).collect();
+    }
+    assert!(matches!(
+        engine.system_one(&req).await,
+        Err(DecisionError::CardinalityLimit { limit: 255, .. })
+    ));
+
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Vllm {
+            url: "http://127.0.0.1:9/v1/systemone".to_owned(),
+            model: "fixture".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    req.questions = (0..65)
+        .map(|i| {
+            (
+                i.to_string(),
+                Question::Noul {
+                    instructions: "predicate".to_owned(),
+                    criteria: None,
+                },
+            )
+        })
+        .collect();
+    assert!(matches!(
+        engine.system_one(&req).await,
+        Err(DecisionError::CardinalityLimit { limit: 64, .. })
+    ));
+    req.questions = OrderedMap::from([(
+        "grade".to_owned(),
+        Question::Score {
+            instructions: "rate".to_owned(),
+            criteria: (0..11).map(|i| i.to_string()).collect(),
+        },
+    )]);
+    assert!(matches!(
+        engine.system_one(&req).await,
+        Err(DecisionError::CardinalityLimit { limit: 10, .. })
+    ));
+}
