@@ -27,11 +27,44 @@ fn provider() -> ExecutionProvider {
     }
 }
 
+/// The option probabilities of an answer, after checking the native confidence semantics: `confidence`
+/// is the probability of the reported answer, and noul's map agrees with `noul`.
 fn vector(answer: &Answer) -> Vec<f64> {
+    let max = |p: &[f64]| p.iter().copied().fold(0.0, f64::max);
     match answer {
-        Answer::Choice { probabilities, .. } => probabilities.values().copied().collect(),
-        Answer::Noul { noul, .. } => vec![1.0 - noul, *noul],
-        Answer::Score { probabilities, .. } => probabilities.clone(),
+        Answer::Choice {
+            choice,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(*confidence, probabilities[choice]);
+            assert_eq!(
+                *confidence,
+                max(&probabilities.values().copied().collect::<Vec<_>>())
+            );
+            probabilities.values().copied().collect()
+        }
+        Answer::Noul {
+            noul,
+            probabilities,
+            confidence,
+        } => {
+            let probabilities = probabilities.as_ref().expect("noul probabilities");
+            assert_eq!(*noul, probabilities["true"]);
+            assert_eq!(
+                confidence.expect("noul confidence"),
+                noul.max(probabilities["false"])
+            );
+            vec![probabilities["false"], *noul]
+        }
+        Answer::Score {
+            probabilities,
+            confidence,
+            ..
+        } => {
+            assert_eq!(*confidence, max(probabilities));
+            probabilities.clone()
+        }
     }
 }
 

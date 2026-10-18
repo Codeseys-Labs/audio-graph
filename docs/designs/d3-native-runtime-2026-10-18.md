@@ -107,9 +107,9 @@ d3-edge has an irregular layer pattern (`LLFLLFLLFFFF`: 6 linear, 6 full) that d
 The final RMSNorm runs on the last position only. `readout.safetensors` holds `weight` `[255, hidden]`
 in float32. Logits are `hidden_f32 @ weight[:n].T` for a question with `n` options (the other codes are
 masked to -inf), divided by `temperature`, then softmaxed in FP32. The answer renormalizes in float64:
-choice picks the first maximum, noul reports `p[true]`, score reports `sum(i * p_i)`. Choice and score
-confidence is `1 - H(p) / ln(n)`, clamped to [0, 1]. One forward pass per question; nothing is cached
-across questions.
+choice picks the first maximum, noul reports `p[true]`, score reports `sum(i * p_i)`. The Python
+package's choice and score confidence is `1 - H(p) / ln(n)`, clamped to [0, 1]; `D3Engine` reports a
+different `confidence` (see Phase B). One forward pass per question; nothing is cached across questions.
 
 ### Backbone details that a port must reproduce
 
@@ -284,7 +284,11 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
   dependency tree.
 - `egress()` is `Local`; limits are 255 choice options, 10 score levels, no state-token limit
   (`max_length` is null in every checkpoint). Invalid questions fail before any model file is read.
-  Noul answers carry only `noul`, like the reference.
+- `confidence` follows the orchestrator's native-engine decision (shared with Laya, contract frozen at
+  `3348507`): the calibrated probability of the reported answer, i.e. the top option's probability for
+  choice and score and `max(p, 1 - p)` for noul. Noul answers also carry `probabilities` keyed
+  `false` / `true`. Probabilities, picks, noul and score values still match `model.system_one()`;
+  thresholds on `confidence` are per decision route (ADR seed `audio-graph-8b3e`).
 - Model files: four `ModelDef` component directories in `src-tauri/src/models/mod.rs` (the existing
   model manager), named after `d3::CHECKPOINTS` ids, with `resolve/<revision>` URLs pinned to the fixture
   revisions.

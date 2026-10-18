@@ -146,7 +146,10 @@ pub fn render(state: &str, question: &Prompted, codes: &[String]) -> String {
     )
 }
 
-/// The answer object `d3_runtime.product_answer` builds from the option probabilities (prompt order).
+/// The answer for one question from its option probabilities (prompt order). Choice, noul and score
+/// values match `d3_runtime.product_answer`. `confidence` follows the native-engine contract decision
+/// instead of the Python package's entropy measure: it is the calibrated probability of the reported
+/// answer (the top option for choice and score, `max(p, 1 - p)` for noul).
 pub fn answer(question: &Prompted, probabilities: &[f32]) -> Result<Answer, DecisionError> {
     let values: Vec<f64> = probabilities.iter().map(|p| f64::from(*p)).collect();
     if values.len() != question.keys.len() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
@@ -157,11 +160,20 @@ pub fn answer(question: &Prompted, probabilities: &[f32]) -> Result<Answer, Deci
         return Err(DecisionError::Internal);
     }
     let shares: Vec<f64> = values.iter().map(|v| v / total).collect();
+    let best = argmax(&shares);
+    let confidence = shares[best];
     Ok(match question.kind {
         Kind::Noul => Answer::Noul {
             noul: shares[1],
-            probabilities: None,
-            confidence: None,
+            probabilities: Some(
+                [
+                    ("false".to_owned(), shares[0]),
+                    ("true".to_owned(), shares[1]),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            confidence: Some(confidence),
         },
         Kind::Score => Answer::Score {
             score: shares
@@ -169,37 +181,20 @@ pub fn answer(question: &Prompted, probabilities: &[f32]) -> Result<Answer, Deci
                 .enumerate()
                 .map(|(level, p)| level as f64 * p)
                 .sum(),
-            confidence: confidence(&shares),
+            confidence,
             probabilities: shares,
         },
-        Kind::Choice => {
-            let best = argmax(&shares);
-            Answer::Choice {
-                choice: question.keys[best].clone(),
-                confidence: confidence(&shares),
-                probabilities: question
-                    .keys
-                    .iter()
-                    .cloned()
-                    .zip(shares)
-                    .collect::<OrderedMap<_, _>>(),
-            }
-        }
+        Kind::Choice => Answer::Choice {
+            choice: question.keys[best].clone(),
+            confidence,
+            probabilities: question
+                .keys
+                .iter()
+                .cloned()
+                .zip(shares)
+                .collect::<OrderedMap<_, _>>(),
+        },
     })
-}
-
-/// One minus the normalized Shannon entropy, clamped to [0, 1].
-fn confidence(values: &[f64]) -> f64 {
-    let n = values.len();
-    if n < 2 {
-        return 1.0;
-    }
-    let entropy: f64 = -values
-        .iter()
-        .filter(|p| **p > 0.0)
-        .map(|p| p * p.ln())
-        .sum::<f64>();
-    (1.0 - entropy / (n as f64).ln()).clamp(0.0, 1.0)
 }
 
 /// Index of the first maximum (ties keep the earlier option, like the reference).
@@ -320,6 +315,33 @@ mod tests {
         );
         assert_eq!(state_text(&DecisionState::Json(Value::Null)), "(empty)");
         assert_eq!(state_text(&DecisionState::Text(String::new())), "(empty)");
+    }
+
+    #[test]
+    fn confidence_is_the_probability_of_the_reported_answer() {
+        let prompted = |kind, n: usize| Prompted {
+            kind,
+            instructions: String::new(),
+            keys: (0..n).map(|i| i.to_string()).collect(),
+            texts: (0..n).map(|i| i.to_string()).collect(),
+        };
+        let Answer::Noul {
+            noul,
+            probabilities,
+            confidence,
+        } = answer(&prompted(Kind::Noul, 2), &[0.7, 0.3]).unwrap()
+        else {
+            panic!("noul")
+        };
+        assert!((noul - 0.3).abs() < 1e-7);
+        assert_eq!(confidence, Some(probabilities.unwrap()["false"]));
+        let Answer::Score {
+            score, confidence, ..
+        } = answer(&prompted(Kind::Score, 3), &[0.2, 0.5, 0.3]).unwrap()
+        else {
+            panic!("score")
+        };
+        assert!((score - 1.1).abs() < 1e-6 && (confidence - 0.5).abs() < 1e-7);
     }
 
     #[test]

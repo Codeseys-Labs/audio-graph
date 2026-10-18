@@ -224,6 +224,11 @@ impl D3Engine {
     }
 }
 
+/// System One over a d3 checkpoint. Option probabilities, picks, noul and score values match the
+/// checkpoint's `model.system_one()`. `confidence` is the native-engine meaning shared with Laya: the
+/// calibrated probability of the reported answer (the top option's probability for choice and score,
+/// `max(p, 1 - p)` for noul), not the Python package's entropy-based confidence. Noul answers also carry
+/// `probabilities` keyed `false` / `true`. Thresholds on `confidence` are per decision route.
 #[async_trait]
 impl DecisionEngine for D3Engine {
     fn id(&self) -> &str {
