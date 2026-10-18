@@ -7,8 +7,8 @@
 //! AUDIOGRAPH_D3_EP selects `cpu` (default), `cuda` or `metal`.
 
 use audio_graph_decision_engine::{
-    Answer, D3_CHECKPOINTS, DecisionEngine, DecisionRequest, EngineConfig, ExecutionProvider,
-    d3::{D3Engine, Precision},
+    Answer, DecisionEngine, DecisionRequest, EngineConfig, ExecutionProvider,
+    d3::{CHECKPOINTS, D3Engine, Precision},
 };
 use serde_json::Value;
 
@@ -58,7 +58,7 @@ async fn check(id: &str, fixture: &str, precision: Precision) {
         .expect("set AUDIOGRAPH_MODELS_DIR to the app-data models directory");
     let mut config = EngineConfig::new(root.into());
     config.execution_provider = provider();
-    let checkpoint = D3_CHECKPOINTS.iter().find(|c| c.id == id).unwrap();
+    let checkpoint = CHECKPOINTS.iter().find(|c| c.id == id).unwrap();
     let engine = D3Engine::load(&config, checkpoint)
         .unwrap()
         .with_precision(precision);

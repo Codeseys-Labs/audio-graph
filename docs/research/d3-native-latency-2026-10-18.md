@@ -7,7 +7,7 @@ Code: `src-tauri/crates/decision-engine/src/d3/` (feature `decision-d3`).
 
 - AMD Ryzen 7 7700X (8 cores, 16 threads), 64-bit Windows 11 23H2 (WDDM), NVIDIA RTX 5090 32 GB,
   driver 610.88, CUDA 13.2, Rust 1.95.0, candle 0.10.2.
-- Checkpoints at the revisions pinned in `D3_CHECKPOINTS` (`src-tauri/crates/decision-engine/src/lib.rs`).
+- Checkpoints at the revisions pinned in the d3 `ModelDef` URLs (`src-tauri/src/models/mod.rs`).
 - Requests go through `DecisionEngine::system_one`, so the time includes prompt rendering, tokenization,
   `spawn_blocking`, the forward pass, the readout and copying the probabilities to the host. One question
   per request, warm (3 untimed calls first).

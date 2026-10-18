@@ -276,15 +276,18 @@ vision tower in the d3-nano and d3-mini files is never read (mmap, lazy tensor l
 ## Phase B (as built)
 
 - `D3Engine` in `src-tauri/crates/decision-engine/src/d3/` behind feature `decision-d3`; the crate's
-  `cuda` and `metal` features forward to `candle-core` / `candle-nn`. Without `decision-d3` the registry
-  returns `DecisionError::EngineUnavailable { feature: "decision-d3" }` for the four ids, and the
-  cloud build has no candle in its dependency tree.
+  `cuda` and `metal` features forward to `candle-core` / `candle-nn`. The only `lib.rs` change is the
+  feature-gated `pub mod d3`. `d3::register(&mut EngineRegistry)` adds the four ids through
+  `EngineRegistry::register`; `create_decision_engine` in `src-tauri/src/models/mod.rs` calls it when the
+  app's `decision-d3` feature is on. Otherwise the skeleton's default registry answers the four ids with
+  `DecisionError::EngineUnavailable { feature: "decision-d3" }`, and the cloud build has no candle in its
+  dependency tree.
 - `egress()` is `Local`; limits are 255 choice options, 10 score levels, no state-token limit
   (`max_length` is null in every checkpoint). Invalid questions fail before any model file is read.
   Noul answers carry only `noul`, like the reference.
 - Model files: four `ModelDef` component directories in `src-tauri/src/models/mod.rs` (the existing
-  model manager), `resolve/<revision>` URLs pinned to the fixture revisions, listed in
-  `D3_CHECKPOINTS`.
+  model manager), named after `d3::CHECKPOINTS` ids, with `resolve/<revision>` URLs pinned to the fixture
+  revisions.
 - Parity: `tests/d3_parity.rs` (ignored by default; `AUDIOGRAPH_MODELS_DIR`, `AUDIOGRAPH_D3_EP`) for all
   four sizes; prompt rendering is pinned without model files by a unit test against the same fixtures.
 - Latency per size on CPU and CUDA: `examples/d3_bench.rs`, results in

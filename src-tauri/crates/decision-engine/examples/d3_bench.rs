@@ -9,8 +9,8 @@
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use audio_graph_decision_engine::{
-        D3_CHECKPOINTS, DecisionEngine, DecisionRequest, EngineConfig, ExecutionProvider,
-        d3::{D3Engine, Precision},
+        DecisionEngine, DecisionRequest, EngineConfig, ExecutionProvider,
+        d3::{CHECKPOINTS, D3Engine, Precision},
     };
     use std::{path::PathBuf, time::Instant};
 
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().ok_or(USAGE)?);
     let id = args.next().ok_or(USAGE)?;
-    let checkpoint = D3_CHECKPOINTS
+    let checkpoint = CHECKPOINTS
         .iter()
         .find(|c| c.id == id)
         .ok_or("unknown d3 checkpoint")?;

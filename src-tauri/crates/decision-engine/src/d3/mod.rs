@@ -8,14 +8,60 @@ mod gdn;
 mod model;
 
 use crate::{
-    D3Checkpoint, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress,
-    EngineConfig, EngineLimits, ExecutionProvider, OrderedMap, Usage,
+    DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress, EngineConfig,
+    EngineConstructor, EngineLimits, EngineRegistry, ExecutionProvider, OrderedMap, Usage,
 };
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
+
+/// One Decision 3.0 size: the engine id, which is also its directory under `models_dir`, and the
+/// Hugging Face repository reported as the response `model`.
+#[derive(Debug)]
+pub struct Checkpoint {
+    pub id: &'static str,
+    pub repo: &'static str,
+}
+
+pub const CHECKPOINTS: &[Checkpoint] = &[
+    Checkpoint {
+        id: "d3-edge",
+        repo: "vllm-sr/d3-edge",
+    },
+    Checkpoint {
+        id: "d3-lite",
+        repo: "vllm-sr/d3-lite",
+    },
+    Checkpoint {
+        id: "d3-nano",
+        repo: "vllm-sr/d3-nano",
+    },
+    Checkpoint {
+        id: "d3-mini",
+        repo: "vllm-sr/d3-mini",
+    },
+];
+
+/// Add the four d3 engines to `registry` through its constructor API.
+pub fn register(registry: &mut EngineRegistry) {
+    let constructors: [EngineConstructor; 4] = [
+        construct::<0>,
+        construct::<1>,
+        construct::<2>,
+        construct::<3>,
+    ];
+    for (checkpoint, constructor) in CHECKPOINTS.iter().zip(constructors) {
+        registry.register(checkpoint.id.into(), constructor);
+    }
+}
+
+fn construct<const INDEX: usize>(
+    config: &EngineConfig,
+) -> Result<Arc<dyn DecisionEngine>, DecisionError> {
+    Ok(Arc::new(D3Engine::load(config, &CHECKPOINTS[INDEX])?))
+}
 
 /// Backbone compute dtype. The readout and softmax always run in FP32, as in the reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,15 +172,15 @@ fn device_for(provider: ExecutionProvider) -> Result<Device, DecisionError> {
 
 /// FP32 wherever it is cheap; BF16 for the two larger sizes on CUDA (halves memory, about half the
 /// long-prompt time). candle's CPU matmul has no BF16 kernel, so CPU is always FP32.
-fn default_precision(checkpoint: &D3Checkpoint, provider: ExecutionProvider) -> Precision {
+fn default_precision(checkpoint: &Checkpoint, provider: ExecutionProvider) -> Precision {
     match (provider, checkpoint.id) {
-        (ExecutionProvider::Cuda, crate::D3_NANO | crate::D3_MINI) => Precision::Bf16,
+        (ExecutionProvider::Cuda, "d3-nano" | "d3-mini") => Precision::Bf16,
         _ => Precision::F32,
     }
 }
 
 pub struct D3Engine {
-    checkpoint: &'static D3Checkpoint,
+    checkpoint: &'static Checkpoint,
     directory: PathBuf,
     provider: ExecutionProvider,
     precision: Precision,
@@ -145,7 +191,7 @@ impl D3Engine {
     /// Checks the provider; the model files load on the first request.
     pub fn load(
         config: &EngineConfig,
-        checkpoint: &'static D3Checkpoint,
+        checkpoint: &'static Checkpoint,
     ) -> Result<Self, DecisionError> {
         // candle has no DirectML/Vulkan backend: point at the GPU path that exists.
         if matches!(config.execution_provider, ExecutionProvider::DirectMl) {
@@ -257,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_questions_fail_before_loading_model_files() {
         let config = EngineConfig::new(PathBuf::from("absent-models"));
-        let engine = D3Engine::load(&config, &crate::D3_CHECKPOINTS[0]).unwrap();
+        let engine = D3Engine::load(&config, &CHECKPOINTS[0]).unwrap();
         let mut request = DecisionRequest {
             state: DecisionState::Text("s".into()),
             questions: OrderedMap::new(),
@@ -284,17 +330,27 @@ mod tests {
         let mut config = EngineConfig::new(PathBuf::from("absent-models"));
         config.execution_provider = ExecutionProvider::DirectMl;
         assert!(matches!(
-            D3Engine::load(&config, &crate::D3_CHECKPOINTS[0]),
+            D3Engine::load(&config, &CHECKPOINTS[0]),
             Err(DecisionError::EngineUnavailable { .. })
         ));
         config.execution_provider = ExecutionProvider::Cpu;
-        let nano = crate::D3_CHECKPOINTS
-            .iter()
-            .find(|c| c.id == crate::D3_NANO)
-            .unwrap();
+        let nano = CHECKPOINTS.iter().find(|c| c.id == "d3-nano").unwrap();
         let engine = D3Engine::load(&config, nano)
             .unwrap()
             .with_precision(Precision::Bf16);
         assert_eq!(engine.precision(), Precision::F32);
+    }
+
+    #[test]
+    fn register_adds_the_four_sizes_without_loading_models() {
+        let config = EngineConfig::new(PathBuf::from("absent-models"));
+        let mut registry = EngineRegistry::default();
+        register(&mut registry);
+        for checkpoint in CHECKPOINTS {
+            assert_eq!(
+                registry.create(checkpoint.id, &config).unwrap().id(),
+                checkpoint.id
+            );
+        }
     }
 }

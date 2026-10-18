@@ -160,9 +160,46 @@ const LAYA_BUNDLE_FILES: &[&str] = audio_graph_decision_engine::LAYA_BUNDLE_FILE
 const LAYA_ENGLISH_URL: &str =
     "https://huggingface.co/receptron/laya-onnx/resolve/d42786bdff8a7550316339c5fbf8f46caa83ea1b";
 
-// Decision 3.0 (vllm-sr/d3-*): component directories pinned to the revisions of the d3 parity fixtures.
-const D3_CHECKPOINTS: &[audio_graph_decision_engine::D3Checkpoint] =
-    audio_graph_decision_engine::D3_CHECKPOINTS;
+// Decision 3.0 (vllm-sr/d3-*): component directories named after the d3 engine ids, pinned to the
+// revisions the d3 parity fixtures were generated from.
+const D3_COMMON_FILES: [&str; 4] = [
+    "config.json",
+    "decision_config.json",
+    "readout.safetensors",
+    "tokenizer.json",
+];
+const D3_INDEXED_FILES: &[&str] = &[
+    D3_COMMON_FILES[0],
+    D3_COMMON_FILES[1],
+    D3_COMMON_FILES[2],
+    D3_COMMON_FILES[3],
+    "model.safetensors.index.json",
+    "model-00001-of-00001.safetensors",
+];
+const D3_NANO_FILES: &[&str] = &[
+    D3_COMMON_FILES[0],
+    D3_COMMON_FILES[1],
+    D3_COMMON_FILES[2],
+    D3_COMMON_FILES[3],
+    "model.safetensors",
+];
+const D3_MINI_FILES: &[&str] = &[
+    D3_COMMON_FILES[0],
+    D3_COMMON_FILES[1],
+    D3_COMMON_FILES[2],
+    D3_COMMON_FILES[3],
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+];
+const D3_EDGE_URL: &str =
+    "https://huggingface.co/vllm-sr/d3-edge/resolve/c454ee39b862248d70abd7f84195d2f54ffe6d43";
+const D3_LITE_URL: &str =
+    "https://huggingface.co/vllm-sr/d3-lite/resolve/03560c26f5199c3c04129a2ccb38960c913635e0";
+const D3_NANO_URL: &str =
+    "https://huggingface.co/vllm-sr/d3-nano/resolve/462efc366229ea268cf4eed3738b3fc4415e4817";
+const D3_MINI_URL: &str =
+    "https://huggingface.co/vllm-sr/d3-mini/resolve/bd0090dd758d32ba59ef5c749910a8e87fc4391f";
 
 // --- Clustering diarization models (ADR-0017 / B16, `diarization-clustering`) -
 // Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
@@ -326,39 +363,39 @@ const MODELS: &[ModelDef] = &[
     },
     ModelDef {
         name: "Decision 3.0 edge (0.6B)",
-        filename: D3_CHECKPOINTS[0].id,
-        url: D3_CHECKPOINTS[0].url,
+        filename: "d3-edge",
+        url: D3_EDGE_URL,
         expected_size: None,
         description: "Local typed decisions with the d3-edge Qwen3.5 encoder and answer-code readout",
         archive_required_files: None,
-        component_required_files: Some(D3_CHECKPOINTS[0].files),
+        component_required_files: Some(D3_INDEXED_FILES),
     },
     ModelDef {
         name: "Decision 3.0 lite (0.8B)",
-        filename: D3_CHECKPOINTS[1].id,
-        url: D3_CHECKPOINTS[1].url,
+        filename: "d3-lite",
+        url: D3_LITE_URL,
         expected_size: None,
         description: "Local typed decisions with the d3-lite Qwen3.5 encoder and answer-code readout",
         archive_required_files: None,
-        component_required_files: Some(D3_CHECKPOINTS[1].files),
+        component_required_files: Some(D3_INDEXED_FILES),
     },
     ModelDef {
         name: "Decision 3.0 nano (2B)",
-        filename: D3_CHECKPOINTS[2].id,
-        url: D3_CHECKPOINTS[2].url,
+        filename: "d3-nano",
+        url: D3_NANO_URL,
         expected_size: None,
         description: "Local typed decisions with the d3-nano Qwen3.5 encoder and answer-code readout",
         archive_required_files: None,
-        component_required_files: Some(D3_CHECKPOINTS[2].files),
+        component_required_files: Some(D3_NANO_FILES),
     },
     ModelDef {
         name: "Decision 3.0 mini (4B)",
-        filename: D3_CHECKPOINTS[3].id,
-        url: D3_CHECKPOINTS[3].url,
+        filename: "d3-mini",
+        url: D3_MINI_URL,
         expected_size: None,
         description: "Local typed decisions with the d3-mini Qwen3.5 encoder and answer-code readout",
         archive_required_files: None,
-        component_required_files: Some(D3_CHECKPOINTS[3].files),
+        component_required_files: Some(D3_MINI_FILES),
     },
     // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
     ModelDef {
@@ -472,7 +509,11 @@ pub fn create_decision_engine(
     let mut config = audio_graph_decision_engine::EngineConfig::new(get_models_dir(app));
     config.execution_provider = execution_provider;
     config.allow_large_choice_sets = allow_large_choice_sets;
-    audio_graph_decision_engine::EngineRegistry::default().create(id, &config)
+    #[cfg_attr(not(feature = "decision-d3"), allow(unused_mut))]
+    let mut registry = audio_graph_decision_engine::EngineRegistry::default();
+    #[cfg(feature = "decision-d3")]
+    audio_graph_decision_engine::d3::register(&mut registry);
+    registry.create(id, &config)
 }
 
 /// Install a one-off exported checkpoint without introducing another cache.
@@ -1592,29 +1633,29 @@ mod tests {
 
     #[test]
     fn d3_models_are_registered_as_pinned_component_directories() {
-        for checkpoint in D3_CHECKPOINTS {
+        const D3_IDS: [&str; 4] = ["d3-edge", "d3-lite", "d3-nano", "d3-mini"];
+        // The engine opens `<models_dir>/<engine id>/`, so the download directories must use its ids.
+        #[cfg(feature = "decision-d3")]
+        assert_eq!(
+            audio_graph_decision_engine::d3::CHECKPOINTS
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            D3_IDS
+        );
+        for id in D3_IDS {
             let model = MODELS
                 .iter()
-                .find(|m| m.filename == checkpoint.id)
-                .unwrap_or_else(|| panic!("{} registered", checkpoint.id));
+                .find(|m| m.filename == id)
+                .unwrap_or_else(|| panic!("{id} registered"));
             // The parity fixtures pin these revisions; `main` could change the weights under them.
             assert!(
                 model.url.contains("/resolve/") && !model.url.ends_with("/main"),
-                "{} must download a pinned revision",
-                checkpoint.id
+                "{id} must download a pinned revision"
             );
             let files = model.component_required_files.expect("component directory");
-            for required in [
-                "config.json",
-                "decision_config.json",
-                "readout.safetensors",
-                "tokenizer.json",
-            ] {
-                assert!(
-                    files.contains(&required),
-                    "{} lacks {required}",
-                    checkpoint.id
-                );
+            for required in D3_COMMON_FILES {
+                assert!(files.contains(&required), "{id} lacks {required}");
             }
             let sharded = files.contains(&"model.safetensors.index.json")
                 && files
@@ -1622,8 +1663,7 @@ mod tests {
                     .any(|f| f.starts_with("model-") && f.ends_with(".safetensors"));
             assert!(
                 sharded || files.contains(&"model.safetensors"),
-                "{} has no weights",
-                checkpoint.id
+                "{id} has no weights"
             );
         }
     }

@@ -8,7 +8,10 @@
   as `f41abf6`, because the d3 backend plugs into that skeleton. The merge deduplicated eight Seed rows that
   both branches added (kept the newest row per id; `audio-graph-60c7` kept this branch's status and evidence).
 - Commits: `158545f` (Phase A probe, fixtures, design note), `f734c42` (Seeds), `97bc66b` (fused Gated DeltaNet
-  kernels), `f41abf6` (merge), `5245dfc` (D3Engine), `26a1e1d` (Seeds: 60c7 closed).
+  kernels), `f41abf6` (merge), `5245dfc` (D3Engine), `26a1e1d` (Seeds: 60c7 closed), `ad3b925` (this note),
+  then the registry rework requested by the decision-engine owner: `lib.rs` is back to the skeleton except
+  the feature-gated `pub mod d3`; `d3::register` adds the engines through `EngineRegistry::register`, called
+  from `create_decision_engine`; the download table (URLs, files) moved into `src-tauri/src/models/mod.rs`.
 - The tree is clean after these commits. Nothing is pushed and no PR is open: publishing is not authorized,
   and the orchestrator integrates this branch with the skeleton branch and the `decision-contract` crate
   (`ao/audio-graph/root`).
