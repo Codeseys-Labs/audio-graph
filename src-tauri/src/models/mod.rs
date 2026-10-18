@@ -557,10 +557,14 @@ pub fn install_laya_bundle(
     checkpoint: &str,
     source: &Path,
 ) -> Result<PathBuf, String> {
-    if !matches!(checkpoint, LAYA_ENGLISH | LAYA_MULTILINGUAL) {
-        return Err("Unknown Laya checkpoint".into());
-    }
-    if !verify_archive_dir(source, LAYA_BUNDLE_FILES) {
+    // Each checkpoint is installed in the layout its model-manager entry checks: the legacy export bundle
+    // for English, the hosted repository layout for multilingual.
+    let files: &[&str] = match checkpoint {
+        LAYA_ENGLISH => LAYA_BUNDLE_FILES,
+        LAYA_MULTILINGUAL => LAYA_MULTILINGUAL_FILES,
+        _ => return Err("Unknown Laya checkpoint".into()),
+    };
+    if !verify_archive_dir(source, files) {
         return Err("Laya export is missing required non-empty bundle files".into());
     }
     let root = get_models_dir(app);
@@ -571,9 +575,13 @@ pub fn install_laya_bundle(
         );
     }
     let staging = root.join(format!("{checkpoint}.importing"));
+    // A killed import leaves its staging directory behind; without this every later import would fail.
+    if staging.exists() {
+        remove_path(&staging)?;
+    }
     fs::create_dir(&staging).map_err(|e| format!("Failed to create import directory: {e}"))?;
     let result = (|| {
-        for component in LAYA_BUNDLE_FILES {
+        for component in files {
             let destination = staging.join(component);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)
