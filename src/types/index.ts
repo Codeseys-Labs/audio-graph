@@ -2809,6 +2809,8 @@ export interface CredentialStore {
   groq_api_key?: string;
   together_api_key?: string;
   fireworks_api_key?: string;
+  typesafe_api_key?: string;
+  cloudflare_workers_ai_token?: string;
   deepgram_api_key?: string;
   assemblyai_api_key?: string;
   soniox_api_key?: string;
