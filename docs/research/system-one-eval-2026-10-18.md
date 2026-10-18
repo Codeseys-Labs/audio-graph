@@ -6,7 +6,23 @@ Seed `audio-graph-ad35`. Evaluation-only implementation. No UI, product route, h
 
 `src-tauri/crates/decision-contract` contains the shared typed engine contract. Questions and option maps retain insertion order through `indexmap`. Native score answers use a vector indexed by rubric level. HTTP score objects with numeric keys are normalized by index, not object insertion order. Noncontiguous or noncanonical indices are rejected.
 
-`WireRequest` and `WireResponse` are immutable typed projections plus original JSON. Their Serde serialization preserves original bytes, including whitespace, field order, numeric spelling, `legend`, `diagnostics`, `id`, `object`, and `created`. Serializing the typed projection alone is canonical output and does not retain vendor extensions. Fixtures come from the TypeSafe quickstart, vLLM's decision example, and Ollama's decision guide.
+`WireRequest` and `WireResponse` are immutable typed projections plus original JSON. Their Serde serialization preserves original bytes, including whitespace, field order, numeric spelling, `legend`, `diagnostics`, `id`, `object`, and `created`. Fixtures come from the TypeSafe quickstart, vLLM's decision example, and Ollama's decision guide.
+
+Native engines still return ordinary `DecisionResponse` values with `Answer::Score.probabilities: Vec<f64>`. `WireResponse::from_typed(response)` constructs canonical wire JSON, including index-keyed score probabilities. This conversion belongs to `decision-contract`; native engines and the registry need no wire types.
+
+Lossless replay through an owned typed value retains an opaque `WireFormat` token:
+
+```rust
+let wire = WireResponse::from_json(vendor_json)?;
+let (typed, format) = wire.into_parts();
+// Read the shared typed value without vendor-specific fields.
+let restored = WireResponse::from_parts(typed, format)?;
+assert_eq!(restored.json(), vendor_json);
+```
+
+The same API exists on `WireRequest`. Reconstruction checks that the typed projection, including map order, is unchanged and returns the original bytes. Modified projections return `WireConversionError::TypedValueChanged` rather than stale JSON. Use `from_typed` when canonical new output is wanted. `into_typed` intentionally discards wire metadata for engine-neutral processing; bare typed values cannot retain unknown vendor fields. The vLLM and Ollama fixtures test vendor JSON to Wire to owned typed value plus format token to Wire to byte-identical JSON. A compile assertion pins `Arc<dyn DecisionEngine + Send + Sync>` usability. No registry or factory types were added to this crate.
+
+A standalone Rust 1.95 binary also exercised the public conversion API with out-of-order score index keys, a legend, diagnostics, and preserved numeric spelling. Compilation and execution both exited 0. It verified byte-identical reconstruction and canonical native score encoding. Source was passed on stdin and temporary output files were removed.
 
 | Endpoint | Model | Questions | Choice options | Score levels | Context |
 | --- | --- | ---: | --- | --- | --- |
@@ -68,10 +84,11 @@ Commands ran from `src-tauri` unless stated otherwise.
 
 | Command | Result |
 | --- | --- |
-| `cargo +1.95.0 test -p audio-graph-decision-contract` | Passed, 2 integration tests |
+| `cargo +1.95.0 test --locked -p audio-graph-decision-contract` | Passed, 5 integration tests, including vLLM/Ollama owned typed round trips and canonical native score encoding |
 | `cargo +1.95.0 test --locked --no-default-features --features cloud` | Compiled; Windows loader aborted before tests with `0xc0000139` |
 | `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud` | 2,154 passed, 1 failed, 11 ignored; all 7 new decision/credential tests passed |
 | `cargo +1.95.0 check --locked` | Passed with the existing Windows debug local-ML CRT advisory |
+| `cargo +1.95.0 check --locked --no-default-features --features cloud` | Passed after wire reconstruction changes |
 | `cargo clippy --locked --all-targets -- -D warnings` | Failed with 41 diagnostics in untouched persistence test code |
 | `cargo +1.95.0 clippy --locked --no-default-features --features cloud --lib --example system_one_eval -- -D warnings` | Passed |
 | `cargo +1.95.0 clippy --locked -p audio-graph-decision-contract --all-targets -- -D warnings` | Passed |

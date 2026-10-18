@@ -131,6 +131,12 @@ fn reconstruction_rejects_changes_instead_of_emitting_stale_vendor_bytes() {
         WireResponse::from_parts(response, format),
         Err(WireConversionError::TypedValueChanged)
     ));
+    let (mut request, format) = WireRequest::from_json(TYPESAFE).unwrap().into_parts();
+    request.questions.swap_indices(0, 1);
+    assert!(matches!(
+        WireRequest::from_parts(request, format),
+        Err(WireConversionError::TypedValueChanged)
+    ));
 }
 
 #[test]
