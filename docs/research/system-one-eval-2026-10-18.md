@@ -146,6 +146,24 @@ The comparison used diagnostic code, severity, message, and primary source span,
 
 Both raw clippy commands still fail on the same baseline. The result is acceptance under the approved zero-delta rule, not a claim that all-target clippy is globally clean. The subsequent cloud-suite rerun with the Windows manifest and `--test-threads=1` passed 2,160 tests and one doctest, with 11 ignored.
 
+### Deepgram failure provenance check
+
+The requested isolated check used implementation head `5e63a6a592e7669782e7777d6db5043c9f97778b` and a detached scratch checkout of `origin/master` pinned at `a6ea3f8e51a6e93c0ebcc6812c60eb335595046c`. Both used Rust 1.95.0, cloud features without defaults, the same target cache, and `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1`:
+
+```sh
+AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo +1.95.0 test --locked --no-default-features --features cloud --lib speech::tests_integration::deepgram_final_after_writer_cleared_reaches_ledger_but_is_counted_as_display_miss -- --exact
+```
+
+| Revision | Run | Passed | Failed | Ignored | Exit | Test runtime |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Implementation | 1 | 1 | 0 | 0 | 0 | 0.54 s |
+| Implementation | 2 | 1 | 0 | 0 | 0 | 0.35 s |
+| Implementation | 3 | 1 | 0 | 0 | 0 | 0.35 s |
+| `origin/master` | 1 | 1 | 0 | 0 | 0 | 0.34 s |
+
+The failure was not reproduced in isolation on either revision. These four runs establish neither a pre-existing failure nor a branch-specific regression. The earlier parallel-suite failure remains an observed, unresolved failure; passing isolated and serial runs do not erase it or prove its cause. No speech, persistence, credential, or module-wiring source was changed for this check. The scratch checkout and temporary runner/logs were removed afterward. ad35 remains open with `live eval pending credential`.
+
+
 
 ## Reproduction
 
