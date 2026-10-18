@@ -574,6 +574,7 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
+ "audio-graph-decision-contract",
  "audio-graph-decision-engine",
  "audio-graph-ipc-contract",
  "audio-graph-provider-registry",

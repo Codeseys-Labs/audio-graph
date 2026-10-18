@@ -136,6 +136,7 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 audio-graph-provider-registry = { path = "crates/provider-registry" }
 audio-graph-ipc-contract = { path = "crates/ipc-contract" }
 audio-graph-decision-engine = { path = "crates/decision-engine" }
+audio-graph-decision-contract = { path = "crates/decision-contract" }
 
 # Tauri framework.
 # NOTE: `devtools` is intentionally NOT in this feature list. Enabling it here
