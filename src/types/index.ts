@@ -2781,6 +2781,8 @@ export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
   "groq_api_key",
   "together_api_key",
   "fireworks_api_key",
+  "typesafe_api_key",
+  "cloudflare_workers_ai_token",
   "deepgram_api_key",
   "assemblyai_api_key",
   "soniox_api_key",
@@ -2807,6 +2809,8 @@ export interface CredentialStore {
   groq_api_key?: string;
   together_api_key?: string;
   fireworks_api_key?: string;
+  typesafe_api_key?: string;
+  cloudflare_workers_ai_token?: string;
   deepgram_api_key?: string;
   assemblyai_api_key?: string;
   soniox_api_key?: string;

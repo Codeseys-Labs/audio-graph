@@ -6,7 +6,7 @@ authors = ["rsac contributors"]
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ipc-contract", "crates/provider-registry"]
+members = [".", "crates/ipc-contract", "crates/provider-registry", "crates/decision-contract", "crates/decision-engine"]
 default-members = ["."]
 resolver = "3"
 
@@ -49,14 +49,20 @@ cloud = []
 asr-whisper = ["dep:whisper-rs"]
 llm-llama = ["dep:llama-cpp-2"]
 llm-mistralrs = ["dep:mistralrs"]
+decision-laya = ["audio-graph-decision-engine/decision-laya"]
+decision-d3 = ["audio-graph-decision-engine/decision-d3"]
+decision-clef = ["audio-graph-decision-engine/decision-clef"]
+metal = ["audio-graph-decision-engine/metal"]
 surrealdb-embedded = ["dep:surrealdb"]
 cuda = [
     "whisper-rs?/cuda",
     "llama-cpp-2?/cuda",
+    "audio-graph-decision-engine/cuda",
 ] # NVIDIA GPUs (requires CUDA Toolkit); applies only when local ML is enabled
 vulkan = [
     "whisper-rs?/vulkan",
     "llama-cpp-2?/vulkan",
+    "audio-graph-decision-engine/vulkan",
 ] # Cross-vendor GPUs (requires Vulkan SDK); applies only when local ML is enabled
 # Streaming speaker diarization (Sortformer ONNX via parakeet-rs).
 diarization = ["dep:parakeet-rs"]
@@ -129,6 +135,8 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 [dependencies]
 audio-graph-provider-registry = { path = "crates/provider-registry" }
 audio-graph-ipc-contract = { path = "crates/ipc-contract" }
+audio-graph-decision-engine = { path = "crates/decision-engine" }
+audio-graph-decision-contract = { path = "crates/decision-contract" }
 
 # Tauri framework.
 # NOTE: `devtools` is intentionally NOT in this feature list. Enabling it here

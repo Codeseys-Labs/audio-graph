@@ -972,7 +972,7 @@ fn emit_agent_status(
     );
 }
 
-fn agent_proposal_kind(text: &str) -> Option<events::AgentProposalKind> {
+pub(crate) fn agent_proposal_kind(text: &str) -> Option<events::AgentProposalKind> {
     let lower = text.to_lowercase();
     if text.trim_end().ends_with('?')
         || lower.starts_with("who ")
@@ -1006,7 +1006,7 @@ fn agent_proposal_title(kind: &events::AgentProposalKind, speaker: &str) -> Stri
     }
 }
 
-fn agent_proposal_body(kind: &events::AgentProposalKind, text: &str) -> String {
+pub(crate) fn agent_proposal_body(kind: &events::AgentProposalKind, text: &str) -> String {
     match kind {
         events::AgentProposalKind::Question => {
             format!("Consider answering or linking this question: {}", text)
