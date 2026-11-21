@@ -90,7 +90,7 @@ ignore = [
     # listed here: the committed, `--locked` Cargo.lock resolves a patched
     # quinn-proto. Only add it here if a future pin holds it back.
     "RUSTSEC-2023-0071", # rsa: Marvin Attack (surrealdb-embedded only, no fix)
-    # The same gated adapter (surrealdb 3.3.x) carries three more advisories
+    # The same gated adapter (surrealdb 3.3.x) carries four more advisories
     # with no semver-compatible fix. Reachability: `cargo tree --locked -i <crate>
     # --target all -e normal` with default features and with
     # `--no-default-features --features cloud` prints nothing for
