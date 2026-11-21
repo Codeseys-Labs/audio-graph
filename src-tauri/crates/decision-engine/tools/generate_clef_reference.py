@@ -385,6 +385,8 @@ def main() -> int:
         bf16_hidden = streamed_hidden(root, text_config, list(record.input_ids), torch.bfloat16, args.device)
         streamed = run_head(record, bf16_hidden, torch.bfloat16)
         check_counts(case["id"], record, streamed, official[case["id"]])
+        if not all(math.isfinite(p) for q in streamed for p in q):
+            raise SystemExit(f"{case['id']}: non-finite streamed BF16 probability; fixture not written")
         # Harness check only, by maintainer decision: the streamed-vs-official difference is printed for review
         # and does not gate writing the fixture (the count and finiteness checks do).
         harness = max(
