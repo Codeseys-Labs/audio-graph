@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option, model-manager entry pinned to the parity-fixture revision (listed only
   in `decision-clef` builds). FP32 compute matches the reference to within 1e-6
   per probability.
+- Opt-in, shadow-only named decision routes for live-assist proposal kind and
+  answerable-question observations. Heuristics retain all mint and spend authority.
+  Records carry raw/calibrated probabilities, model-pin metadata, canonical state
+  digests, and movement-ledger correlation ids. Hosted routes remain deferred;
+  native cache selection never falls back to cloud.
 
 ### Changed
 

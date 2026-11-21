@@ -1,6 +1,8 @@
-//! Evaluation-only System One clients. No product route or UI selectability.
+//! System One engines and shadow-only product decision routes (ADR-0049).
 
 pub mod eval;
+pub mod route;
+pub mod shadow;
 
 use audio_graph_decision_contract::{
     Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Egress, EngineLimits,
@@ -157,6 +159,7 @@ pub struct SystemOneHttpEngine {
     url: Url,
     client: Client,
     credential: Option<Zeroizing<String>>,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 impl SystemOneHttpEngine {
@@ -209,7 +212,16 @@ impl SystemOneHttpEngine {
             url,
             client,
             credential,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         })
+    }
+
+    pub(crate) fn with_content_egress_policy(
+        mut self,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Self {
+        self.content_egress_policy = policy;
+        self
     }
 
     fn diagnostic(&self, message: &str) -> DecisionError {
@@ -223,6 +235,9 @@ impl SystemOneHttpEngine {
         &self,
         req: &DecisionRequest,
     ) -> Result<WireResponse, DecisionError> {
+        self.content_egress_policy
+            .check_text(self.id())
+            .map_err(|_| self.diagnostic("Decision content blocked by privacy policy"))?;
         self.limits().validate(req)?;
         if !matches!(self.kind, EndpointKind::Vllm { .. }) {
             for (id, question) in &req.questions {
@@ -346,9 +361,11 @@ fn validate_answers(req: &DecisionRequest, response: &DecisionResponse) -> Resul
                 },
             ) => {
                 probability(noul)
-                    && probabilities
-                        .as_ref()
-                        .is_none_or(|p| p.values().all(probability))
+                    && probabilities.as_ref().is_none_or(|p| {
+                        p.len() == 2
+                            && p.get("false").is_some_and(probability)
+                            && p.get("true").is_some_and(probability)
+                    })
                     && confidence.as_ref().is_none_or(probability)
             }
             (
@@ -400,9 +417,6 @@ impl DecisionEngine for SystemOneHttpEngine {
     async fn system_one(&self, req: &DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let mut response = self.evaluate_wire(req).await?.into_typed();
         response.engine_id = self.id().to_owned();
-        if response.model.is_empty() {
-            response.model = self.kind.model().to_owned();
-        }
         Ok(response)
     }
 }

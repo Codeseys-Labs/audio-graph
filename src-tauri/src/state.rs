@@ -240,6 +240,7 @@ pub struct AppState {
 
     /// Agent/react proposals that are awaiting user approval.
     pub pending_agent_proposals: Arc<Mutex<HashMap<String, crate::events::AgentProposalPayload>>>,
+    pub decision_shadow: Arc<crate::decision::shadow::ShadowRuntime>,
 
     /// Per-session running count of AUTO-answer dispatches (audio-graph-83cc,
     /// T3's spend gate). Counts DISPATCHES (attempts), never tokens or
@@ -859,6 +860,7 @@ impl AppState {
             openrouter_client.clone(),
             mistralrs_engine.clone(),
         );
+        let decision_shadow = Arc::new(crate::decision::shadow::ShadowRuntime::new(&session_id));
 
         Self {
             session_id: Arc::new(RwLock::new(session_id)),
@@ -889,6 +891,7 @@ impl AppState {
             audio_player: crate::playback::AudioPlayer::new(),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+            decision_shadow,
             agent_auto_answer_session_count: Arc::new(AtomicU64::new(0)),
             agent_auto_answer_last_dispatch_ms: Arc::new(AtomicU64::new(0)),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
@@ -1150,6 +1153,7 @@ impl AppState {
             };
             proposals.clear();
         }
+        self.decision_shadow.reset(new_session_id);
         // audio-graph-83cc T3: the auto-answer spend gate's counters are
         // per-SESSION (Q1's `max_per_session` / `min_interval_secs`), so a
         // rotation must reset both to their session-start values, same as

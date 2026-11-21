@@ -585,6 +585,25 @@ pub fn create_decision_engine(
     registry.create(id, &config)
 }
 
+/// Route pins and readiness share the model manager's download definitions.
+pub(crate) fn decision_model_metadata(id: &str) -> Option<(&'static str, &'static [&'static str])> {
+    MODELS
+        .iter()
+        .find(|model| model.filename == id)
+        .and_then(|model| {
+            model
+                .component_required_files
+                .map(|files| (model.url, files))
+        })
+}
+
+pub(crate) fn decision_model_cached(models_dir: &Path, id: &str) -> bool {
+    MODELS
+        .iter()
+        .find(|model| model.filename == id)
+        .is_some_and(|model| model_exists_and_is_valid(&models_dir.join(id), model).1)
+}
+
 /// Directory layouts `Model::load` reads for a Laya checkpoint: the `export/` bundle (`laya.onnx` with
 /// external data and `laya_config.json`, what `multilingual.py` writes) and, for multilingual, the hosted
 /// repository layout its model-manager entry downloads.

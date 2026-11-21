@@ -55,6 +55,71 @@ fn request() -> DecisionRequest {
 }
 
 #[tokio::test]
+async fn shadow_privacy_policy_blocks_cloud_http_before_connect_or_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut engine =
+        SystemOneHttpEngine::new(EndpointKind::TypeSafe, Some("fixture-private-token".into()))
+            .unwrap()
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::block(
+                "local_only",
+            ));
+    engine.url = Url::parse(&format!(
+        "http://{}/v1/systemone",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    engine.client = Client::builder().no_proxy().build().unwrap();
+    let error = engine.system_one(&request()).await.unwrap_err();
+    assert!(error.to_string().contains("blocked"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn omitted_served_model_remains_omitted_for_route_identity_source() {
+    let (url, served) = server(200, r#"{"answers":{"team":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"shipping":0.1},"confidence":0.8}},"usage":{"input_tokens":20,"output_tokens":0}}"#.into()).await;
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Ollama {
+            url,
+            model: "requested-only".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let response = engine.system_one(&request()).await.unwrap();
+    assert_eq!(response.model, "");
+    served.await.unwrap();
+}
+
+#[tokio::test]
+async fn noul_probability_keys_cannot_echo_content_into_decision_provenance() {
+    let (url, served) = server(200, r#"{"answers":{"team":{"type":"noul","noul":0.9,"probabilities":{"private transcript content":0.9,"false":0.1},"confidence":0.9}},"usage":{"input_tokens":20,"output_tokens":0}}"#.into()).await;
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Ollama {
+            url,
+            model: "fixture".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let mut request = request();
+    request.questions.insert(
+        "team".into(),
+        Question::Noul {
+            instructions: "Answerable?".into(),
+            criteria: None,
+        },
+    );
+    let error = engine.system_one(&request).await.unwrap_err();
+    assert!(error.to_string().contains("schema"));
+    assert!(!error.to_string().contains("private transcript content"));
+    served.await.unwrap();
+}
+
+#[tokio::test]
 async fn transport_rejects_wrong_answer_ids_and_does_not_echo_error_bodies() {
     let (url, served) = server(200, r#"{"model":"nimble","answers":{"wrong":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"shipping":0.1},"confidence":0.8}},"usage":{"input_tokens":20,"output_tokens":1}}"#.to_owned()).await;
     let engine = SystemOneHttpEngine::new(

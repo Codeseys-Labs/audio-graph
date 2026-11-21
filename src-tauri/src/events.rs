@@ -503,6 +503,8 @@ pub struct AgentProposalPayload {
     /// production mint site, `run_agent_proposal_task` (`speech/mod.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<SignalGrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_provenance: Option<Vec<crate::decision::route::DecisionRecord>>,
 }
 
 /// Result returned after the user approves an agent proposal.
@@ -806,6 +808,8 @@ pub struct LiveAssistCardRecord {
     /// Backend signal grade at mint (T2), mirrored from `proposal.signal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<SignalGrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_provenance: Option<Vec<crate::decision::route::DecisionRecord>>,
 }
 
 /// Payload for capture error events.
@@ -1010,6 +1014,7 @@ mod tests {
                 confidence: 0.92,
                 created_at_ms: 1_700_000_000_000,
                 signal: None,
+                decision_provenance: None,
             },
             status: LiveAssistCardStatus::Approved,
             source_span_ids: vec!["span-1".to_string()],
@@ -1027,6 +1032,7 @@ mod tests {
             origin: None,
             answer: None,
             signal: None,
+            decision_provenance: None,
         };
 
         let json = serde_json::to_value(card).expect("serialize live assist card");
@@ -1130,6 +1136,7 @@ mod tests {
                 confidence: 0.9,
                 created_at_ms: 1_700_000_000_000,
                 signal: Some(SignalGrade::Strong),
+                decision_provenance: None,
             },
             status: LiveAssistCardStatus::Pending,
             source_span_ids: vec!["segment-new".to_string()],
@@ -1153,6 +1160,7 @@ mod tests {
                 answered_at_ms: 1_700_000_001_000,
             }),
             signal: Some(SignalGrade::Strong),
+            decision_provenance: None,
         };
 
         let json = serde_json::to_string(&new_shape).expect("serialize new-shape record");
