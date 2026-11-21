@@ -158,7 +158,8 @@ weights. Community recipes serve Clef-flash in FP8 on 16 and 24 GB GPUs (`turloc
   (`qwen35::device_for`).
 - Model files: `ModelDef` `clef-flash` in the existing model manager, `resolve/8b2e5fd1...` with the
   config, tokenizer, joint head and all four weight shards (the vision tower shares the shards, so the
-  download is the full 19 GB even though only the text layers load).
+  download is the full 19 GB even though only the text layers load). The entry is compiled in only with
+  `decision-clef`, so builds that cannot create the engine neither list nor download it.
 - GPU smoke and latency (`examples/clef_bench.rs`, details in
   `docs/research/clef-flash-native-latency-2026-10-18.md`), warm p50 / p95 on the RTX 5090:
 

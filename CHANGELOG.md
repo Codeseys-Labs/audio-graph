@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opt-in (`decision-clef`) native Clef-flash engine (`Cloudflare/clef-flash`, 9B)
   on the same candle Qwen3.5 encoder: the checkpoint's joint schema prompt and
   head, one forward pass per request, BF16 on GPU (14 GB) with an FP32-compute
-  option, model-manager entry pinned to the parity-fixture revision. FP32
-  compute matches the reference to within 1e-6 per probability.
+  option, model-manager entry pinned to the parity-fixture revision (listed only
+  in `decision-clef` builds). FP32 compute matches the reference to within 1e-6
+  per probability.
 
 ### Changed
 

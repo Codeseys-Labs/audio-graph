@@ -228,7 +228,9 @@ const D3_MINI_URL: &str =
     "https://huggingface.co/vllm-sr/d3-mini/resolve/bd0090dd758d32ba59ef5c749910a8e87fc4391f";
 
 // Clef-flash (Cloudflare/clef-flash, Apache-2.0), pinned to the revision of fixtures/clef-flash.json. The
-// vision tower lives in the same shards, so all four are needed even for text-only use.
+// vision tower lives in the same shards, so all four are needed even for text-only use. Only builds with
+// the `decision-clef` engine list it: elsewhere the 19 GB download could never be loaded.
+#[cfg(feature = "decision-clef")]
 const CLEF_FLASH_FILES: &[&str] = &[
     "config.json",
     "tokenizer.json",
@@ -240,6 +242,7 @@ const CLEF_FLASH_FILES: &[&str] = &[
     "model-00003-of-00004.safetensors",
     "model-00004-of-00004.safetensors",
 ];
+#[cfg(feature = "decision-clef")]
 const CLEF_FLASH_URL: &str =
     "https://huggingface.co/Cloudflare/clef-flash/resolve/8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3";
 
@@ -448,6 +451,7 @@ const MODELS: &[ModelDef] = &[
         archive_required_files: None,
         component_required_files: Some(D3_MINI_FILES),
     },
+    #[cfg(feature = "decision-clef")]
     ModelDef {
         name: "Clef-flash (9B)",
         filename: "clef-flash",
@@ -1926,9 +1930,16 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "decision-clef"))]
+    #[test]
+    fn clef_flash_is_not_offered_without_its_engine() {
+        // list_models and download_model both read MODELS, so the UI cannot offer it either.
+        assert!(MODELS.iter().all(|m| m.filename != "clef-flash"));
+    }
+
+    #[cfg(feature = "decision-clef")]
     #[test]
     fn clef_flash_is_registered_with_every_weight_shard() {
-        #[cfg(feature = "decision-clef")]
         assert_eq!(audio_graph_decision_engine::clef::CLEF_FLASH, "clef-flash");
         let model = MODELS
             .iter()
