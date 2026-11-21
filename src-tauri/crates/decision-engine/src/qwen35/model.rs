@@ -11,7 +11,7 @@ use super::config::TextConfig;
 use super::gdn;
 use candle_core::{D, DType, Device, Module, Tensor};
 use candle_core::{Result, bail};
-use candle_nn::{Linear, VarBuilder};
+use candle_nn::VarBuilder;
 use std::path::{Path, PathBuf};
 
 /// How the full-attention layers read the prompt.
@@ -31,13 +31,31 @@ pub struct LoadOptions<'a> {
     pub attention: Attention,
     /// Compute dtype of the layers (F32 or BF16). The embedding table stays in its stored dtype on the host.
     pub dtype: DType,
+    /// Dtype the projection weights are kept in. Equal to `dtype` keeps one copy in the compute dtype; BF16
+    /// with an F32 `dtype` runs FP32 numerics on BF16-stored weights (the checkpoints store BF16, so the
+    /// values are identical) at half the memory, upcasting each weight for its matmul.
+    pub weights: DType,
+}
+
+/// A bias-free projection whose weight may be stored in a narrower dtype than the activations.
+struct Linear {
+    weight: Tensor,
+}
+
+impl Module for Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.weight.dtype() == x.dtype() {
+            candle_nn::Linear::new(self.weight.clone(), None).forward(x)
+        } else {
+            candle_nn::Linear::new(self.weight.to_dtype(x.dtype())?, None).forward(x)
+        }
+    }
 }
 
 fn linear(vb: &VarBuilder, out_dim: usize, in_dim: usize, name: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get((out_dim, in_dim), &format!("{name}.weight"))?,
-        None,
-    ))
+    Ok(Linear {
+        weight: vb.get((out_dim, in_dim), &format!("{name}.weight"))?,
+    })
 }
 
 /// Zero-centered RMSNorm (`x * rsqrt(mean(x^2) + eps) * (1 + w)`), as `Qwen3_5RMSNorm`.
@@ -47,9 +65,9 @@ struct RmsNorm {
 }
 
 impl RmsNorm {
-    fn load(vb: &VarBuilder, size: usize, eps: f64) -> Result<Self> {
+    fn load(vb: &VarBuilder, size: usize, eps: f64, dtype: DType) -> Result<Self> {
         let w = vb.get(size, "weight")?;
-        let alpha = (w.to_dtype(DType::F32)? + 1.0)?.to_dtype(w.dtype())?;
+        let alpha = (w.to_dtype(DType::F32)? + 1.0)?.to_dtype(dtype)?;
         Ok(Self {
             alpha,
             eps: eps as f32,
@@ -206,7 +224,9 @@ pub struct Encoder {
     device: Device,
 }
 
-fn weight_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// The safetensors files of a checkpoint: the shards of `model.safetensors.index.json`, else
+/// `model.safetensors`.
+pub fn weight_files(root: &Path) -> Result<Vec<PathBuf>> {
     let index = root.join("model.safetensors.index.json");
     if index.is_file() {
         let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?)
@@ -237,7 +257,8 @@ impl Encoder {
         let (prefix, dtype) = (options.prefix, options.dtype);
         let files = weight_files(root)?;
         // SAFETY: the checkpoint files are not modified while mapped.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? }.pp(prefix);
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, options.weights, device)? }
+            .pp(prefix);
         let cpu =
             unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &Device::Cpu)? };
         let embed = cpu.get(
@@ -261,8 +282,8 @@ impl Encoder {
                         k_proj: linear(&ab, kvh * hd, hs, "k_proj")?,
                         v_proj: linear(&ab, kvh * hd, hs, "v_proj")?,
                         o_proj: linear(&ab, hs, h * hd, "o_proj")?,
-                        q_norm: RmsNorm::load(&ab.pp("q_norm"), hd, eps)?,
-                        k_norm: RmsNorm::load(&ab.pp("k_norm"), hd, eps)?,
+                        q_norm: RmsNorm::load(&ab.pp("q_norm"), hd, eps, dtype)?,
+                        k_norm: RmsNorm::load(&ab.pp("k_norm"), hd, eps, dtype)?,
                         heads: h,
                         kv_heads: kvh,
                         head_dim: hd,
@@ -287,7 +308,7 @@ impl Encoder {
                         in_proj_z: linear(&gb, nv * dv, hs, "in_proj_z")?,
                         in_proj_b: linear(&gb, nv, hs, "in_proj_b")?,
                         in_proj_a: linear(&gb, nv, hs, "in_proj_a")?,
-                        conv_weight: conv.squeeze(1)?.t()?.contiguous()?,
+                        conv_weight: conv.squeeze(1)?.t()?.to_dtype(dtype)?.contiguous()?,
                         neg_a: a_log.exp()?.neg()?,
                         dt_bias: gb.get_with_hints_dtype(
                             nv,
@@ -295,7 +316,7 @@ impl Encoder {
                             Default::default(),
                             DType::F32,
                         )?,
-                        norm_weight: gb.get(dv, "norm.weight")?,
+                        norm_weight: gb.get(dv, "norm.weight")?.to_dtype(dtype)?,
                         out_proj: linear(&gb, hs, nv * dv, "out_proj")?,
                         k_heads: nk,
                         v_heads: nv,
@@ -308,9 +329,9 @@ impl Encoder {
             };
             let mb = lb.pp("mlp");
             layers.push(Layer {
-                input_norm: RmsNorm::load(&lb.pp("input_layernorm"), hs, eps)?,
+                input_norm: RmsNorm::load(&lb.pp("input_layernorm"), hs, eps, dtype)?,
                 mixer,
-                post_norm: RmsNorm::load(&lb.pp("post_attention_layernorm"), hs, eps)?,
+                post_norm: RmsNorm::load(&lb.pp("post_attention_layernorm"), hs, eps, dtype)?,
                 mlp: Mlp {
                     gate: linear(&mb, cfg.intermediate_size, hs, "gate_proj")?,
                     up: linear(&mb, cfg.intermediate_size, hs, "up_proj")?,
@@ -326,7 +347,7 @@ impl Encoder {
         Ok(Self {
             embed,
             layers,
-            norm: RmsNorm::load(&vb.pp("norm"), hs, eps)?,
+            norm: RmsNorm::load(&vb.pp("norm"), hs, eps, dtype)?,
             inv_freq,
             attention: options.attention,
             dtype,
