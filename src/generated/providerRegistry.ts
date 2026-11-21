@@ -3,6 +3,432 @@ import type { ProviderDescriptor } from "../types";
 
 export const GENERATED_PROVIDER_REGISTRY = [
   {
+    "id": "decision.laya",
+    "display_name": "Native Laya",
+    "stage": "decision",
+    "settings_variant": "laya",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "local",
+    "credential_keys": [],
+    "required_features": [
+      "decision-laya"
+    ],
+    "model_catalog": "local_files",
+    "local_models": [],
+    "default_model": "laya",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "local_in_process",
+      "keepalive": "none",
+      "close": "drop_runtime"
+    },
+    "privacy": {
+      "data_leaves_device": false,
+      "data_boundary": "local_only",
+      "data_classes_sent": [],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": false,
+      "retention_policy": "not_applicable",
+      "training_policy": "not_applicable",
+      "deletion_policy": "not_applicable",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.d3_edge",
+    "display_name": "Native D3 edge",
+    "stage": "decision",
+    "settings_variant": "d3-edge",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "local",
+    "credential_keys": [],
+    "required_features": [
+      "decision-d3"
+    ],
+    "model_catalog": "local_files",
+    "local_models": [],
+    "default_model": "d3-edge",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "local_in_process",
+      "keepalive": "none",
+      "close": "drop_runtime"
+    },
+    "privacy": {
+      "data_leaves_device": false,
+      "data_boundary": "local_only",
+      "data_classes_sent": [],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": false,
+      "retention_policy": "not_applicable",
+      "training_policy": "not_applicable",
+      "deletion_policy": "not_applicable",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.d3_lite",
+    "display_name": "Native D3 lite",
+    "stage": "decision",
+    "settings_variant": "d3-lite",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "local",
+    "credential_keys": [],
+    "required_features": [
+      "decision-d3"
+    ],
+    "model_catalog": "local_files",
+    "local_models": [],
+    "default_model": "d3-lite",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "local_in_process",
+      "keepalive": "none",
+      "close": "drop_runtime"
+    },
+    "privacy": {
+      "data_leaves_device": false,
+      "data_boundary": "local_only",
+      "data_classes_sent": [],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": false,
+      "retention_policy": "not_applicable",
+      "training_policy": "not_applicable",
+      "deletion_policy": "not_applicable",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.d3_nano",
+    "display_name": "Native D3 nano",
+    "stage": "decision",
+    "settings_variant": "d3-nano",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "local",
+    "credential_keys": [],
+    "required_features": [
+      "decision-d3"
+    ],
+    "model_catalog": "local_files",
+    "local_models": [],
+    "default_model": "d3-nano",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "local_in_process",
+      "keepalive": "none",
+      "close": "drop_runtime"
+    },
+    "privacy": {
+      "data_leaves_device": false,
+      "data_boundary": "local_only",
+      "data_classes_sent": [],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": false,
+      "retention_policy": "not_applicable",
+      "training_policy": "not_applicable",
+      "deletion_policy": "not_applicable",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.d3_mini",
+    "display_name": "Native D3 mini",
+    "stage": "decision",
+    "settings_variant": "d3-mini",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "local",
+    "credential_keys": [],
+    "required_features": [
+      "decision-d3"
+    ],
+    "model_catalog": "local_files",
+    "local_models": [],
+    "default_model": "d3-mini",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "local_in_process",
+      "keepalive": "none",
+      "close": "drop_runtime"
+    },
+    "privacy": {
+      "data_leaves_device": false,
+      "data_boundary": "local_only",
+      "data_classes_sent": [],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": false,
+      "retention_policy": "not_applicable",
+      "training_policy": "not_applicable",
+      "deletion_policy": "not_applicable",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.ollama_loopback",
+    "display_name": "Loopback Ollama",
+    "stage": "decision",
+    "settings_variant": "ollama",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "http",
+    "credential_keys": [],
+    "required_features": [],
+    "model_catalog": "user_supplied",
+    "local_models": [],
+    "default_model": "ollama",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "user_configured_endpoint",
+      "data_classes_sent": [
+        "transcript_text"
+      ],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.vllm_loopback",
+    "display_name": "Loopback vLLM",
+    "stage": "decision",
+    "settings_variant": "vllm",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "http",
+    "credential_keys": [],
+    "required_features": [],
+    "model_catalog": "user_supplied",
+    "local_models": [],
+    "default_model": "vllm",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "none",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "user_configured_endpoint",
+      "data_classes_sent": [
+        "transcript_text"
+      ],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.jev_typesafe",
+    "display_name": "TypeSafe Jev",
+    "stage": "decision",
+    "settings_variant": "jev-latest",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "http",
+    "credential_keys": [
+      "typesafe_api_key"
+    ],
+    "required_features": [],
+    "model_catalog": "user_supplied",
+    "local_models": [],
+    "default_model": "jev-latest",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "saved_api_key",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "vendor_cloud",
+      "data_classes_sent": [
+        "transcript_text"
+      ],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.jev_cloudflare",
+    "display_name": "Cloudflare Jev",
+    "stage": "decision",
+    "settings_variant": "typesafe/jev",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "http",
+    "credential_keys": [
+      "cloudflare_workers_ai_token"
+    ],
+    "required_features": [],
+    "model_catalog": "user_supplied",
+    "local_models": [],
+    "default_model": "typesafe/jev",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "saved_api_key",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "provider_account_boundary",
+      "data_classes_sent": [
+        "transcript_text"
+      ],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "decision.clef_flash_cloudflare",
+    "display_name": "Cloudflare Clef flash",
+    "stage": "decision",
+    "settings_variant": "clef-flash",
+    "status": "implemented",
+    "ui_selectable": false,
+    "transport": "http",
+    "credential_keys": [
+      "cloudflare_workers_ai_token"
+    ],
+    "required_features": [],
+    "model_catalog": "user_supplied",
+    "local_models": [],
+    "default_model": "clef-flash",
+    "settings_groups": [],
+    "lifecycle": {
+      "auth": "saved_api_key",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "provider_account_boundary",
+      "data_classes_sent": [
+        "transcript_text"
+      ],
+      "data_classes_returned": [
+        "usage_metadata"
+      ],
+      "health_check_data_classes": [],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": false,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
     "id": "asr.local_whisper",
     "display_name": "Local Whisper",
     "stage": "asr",

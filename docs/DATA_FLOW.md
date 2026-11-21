@@ -905,6 +905,83 @@ durability boundary. Snapshot failure after that point is cache lag, not event
 failure. Until implemented and fault-tested on all three operating systems,
 neither enqueue nor a materialized JSON save is evidence for a Saved label.
 
+### Shadow decision dispatch and producer inventory v1
+
+`decision_routes.shadow_enabled` defaults to `false`. When enabled, the backend
+observes proposal kind and, for heuristic questions, `answerable_question` in one
+System One request. The production M2 schema follows ADR-0049's `noul` decision,
+not the evaluation harness's three-level score. Neither answer changes the
+heuristic kind, signal grade, manual origin, or auto-answer spend gate.
+
+The `live_assist_route_id` setting selects one named route. Without an explicit
+selection, complete model-manager cache entries select d3-edge, then English
+Laya, or no route. This is pre-dispatch availability selection, not a retry
+walker. A selected route's error returns `unavailable`; it never invokes another
+route. CPU inference is FP32. Product Laya dispatch refuses multilingual input
+until the ADR's distribution gate is reconciled. Model revisions come from the
+model manager; missing verified component digests are recorded as missing.
+There is no authoritative decision variant in this implementation.
+
+Local shadow admission follows ADR-0049 section 2's zero-egress evidence.
+This explicitly differs from section 1's wording about mirroring ADR-0033's
+all-provider admission seal: local decision descriptors remain unselectable in
+the UI but may execute shadow observations. Hosted routes still pass the
+existing `ensure_provider_id_start_enabled` gate and the session privacy gate.
+No existing ASR, LLM, TTS, or realtime admission rule changes. All `decision.*`
+descriptors remain outside `MVP_SELECTABLE_PROVIDERS`; hosted content stays
+blocked pending promotion and the full content-egress checklist.
+
+The following is a versioned decision-producer inventory slice, not an
+exhaustive-runtime-coverage marker. Overall negative egress claims remain
+Unknown under ADR-0034.
+
+| Producer | Named route suffix | Engine boundary | Runtime evidence |
+|---|---|---|---|
+| `decision.laya` | `laya` | Native Local | Native dependency check, model-manager cache, ledger |
+| `decision.d3_edge` | `d3_edge` | Native Local | Native dependency check, model-manager cache, ledger |
+| `decision.d3_lite` | `d3_lite` | Native Local | Native dependency check, model-manager cache, ledger |
+| `decision.d3_nano` | `d3_nano` | Native Local | Native dependency check, model-manager cache, ledger |
+| `decision.d3_mini` | `d3_mini` | Native Local | Native dependency check, model-manager cache, ledger |
+| `decision.ollama_loopback` | `ollama_loopback` | Loopback Local | Literal loopback URL; no proxies or redirects; rejects `:cloud` |
+| `decision.vllm_loopback` | `vllm_loopback` | Loopback Local | Literal loopback URL; no proxies or redirects; rejects `:cloud` |
+| `decision.jev_typesafe` | `jev_typesafe` | Provider, deferred | Registry gate; privacy guard before HTTP write; blocked-connect fixture |
+| `decision.jev_cloudflare` | `jev_cloudflare` | Provider, deferred | Registry gate; privacy guard before HTTP write |
+| `decision.clef_flash_cloudflare` | `clef_flash_cloudflare` | Provider, deferred | Registry gate; privacy guard before HTTP write |
+
+All route ids start with `route.decision.`. The native dependency check is
+`cargo +1.95.0 tree --offline --locked -p audio-graph-decision-engine --features
+decision-laya,decision-d3 -e normal --prefix none`; its combined native dependency
+graph contains no reqwest, hyper, ureq, hf-hub, rustls, native-tls, or curl.
+This is dependency evidence, not packaged three-platform execution evidence.
+Loopback servers retain the ADR's unobservable relay risk, so their registry
+boundary is `UserConfiguredEndpoint`, never `LocalOnly`.
+
+Each attempted dispatch uses the existing session movement ledger, with
+`ProviderCallStarted` before inference and `Succeeded` or `Failed` afterward.
+Pre-dispatch refusals produce only a local failure row with no sent data
+classes. Failure to persist the started row prevents inference. The ledger's
+`source.kind` is the trusted route id, `source_id` is the shared call id, and
+model/count fields record identity and usage. Successful local calls carry
+`TranscriptText` and `UsageMetadata` under `DestinationBoundary::Local`.
+Hosted calls, once promoted, use `DestinationBoundary::Provider`.
+
+Per-question `DecisionRecord`s share that call id and are stamped on existing
+`AgentProposalPayload` and `LiveAssistCardRecord` artifacts. They contain the
+canonical state SHA-256, never the state text, plus span revisions, requested
+and served identity, raw/calibrated answers, calibration snapshot, outcome,
+latency, usage, and the authoritative heuristic answer. No new canonical stream
+is created. A heuristic `none` still mints no card; its observation contributes
+to session counters and the call lifecycle ledger. Counters are keyed by
+question schema and session generation, distinguish unavailable calls from
+evaluated answers, and reset on rotation.
+
+Missing fitted calibration uses an identity snapshot with `T = 1` and
+conservative `accept = abstain = 1`. Even a `decided` outcome remains shadow.
+Calibration fixtures exercise all four outcomes; G2/G3 evidence, verified
+component pins, native execution-provider latency admission, and an explicit
+authority-switch change are still required before changing heuristic behavior.
+
+
 ---
 
 ## 18. Implemented shell vs accepted product shell

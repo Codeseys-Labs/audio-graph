@@ -4026,6 +4026,10 @@ fn live_assist_card_record(
         origin,
         answer,
         signal: proposal.signal,
+        decision_provenance: proposal
+            .decision_provenance
+            .clone()
+            .or_else(|| existing.and_then(|card| card.decision_provenance.clone())),
     }
 }
 
@@ -6025,9 +6029,10 @@ const MAX_USER_QUESTION_TEXT_CHARS: usize = events::MAX_CARD_ANSWER_TEXT_CHARS;
 /// counter, or registry state is touched by this function, so this race has
 /// no spend-boundary consequence, only a rare, narrow UX one (session
 /// rotation racing a chatbox send).
-fn mint_user_question_card(
+async fn mint_user_question_card(
     state: &AppState,
     text: &str,
+    shadow: Option<crate::decision::shadow::ShadowWork>,
 ) -> AppResult<events::LiveAssistCardRecord> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -6069,8 +6074,32 @@ fn mint_user_question_card(
         confidence: 1.0,
         created_at_ms: now_ms,
         signal: None,
+        decision_provenance: None,
     };
     proposal.signal = Some(crate::speech::agent_signal_grade(&proposal));
+    if let Some(work) = shadow {
+        let basis: Vec<_> = ledger
+            .latest_spans
+            .last()
+            .map(|event| crate::decision::route::DecisionBasis {
+                span_id: event.span_id.clone(),
+                revision: event.revision_number,
+            })
+            .into_iter()
+            .collect();
+        let records = work
+            .evaluate(
+                &session_id,
+                trimmed,
+                1.0,
+                Some(&proposal.kind),
+                proposal.signal.expect("mint grade"),
+                &basis,
+            )
+            .await;
+        work.runtime.record(&session_id, &records);
+        crate::decision::shadow::stamp(&mut proposal, records);
+    }
 
     let card = events::LiveAssistCardRecord {
         session_id: session_id.clone(),
@@ -6085,6 +6114,7 @@ fn mint_user_question_card(
         origin: Some(events::CardOrigin::User),
         answer: None,
         signal: proposal.signal,
+        decision_provenance: proposal.decision_provenance.clone(),
     };
 
     FileMemoryRepository::user_data().upsert_live_assist_card(&session_id, &card)?;
@@ -6237,7 +6267,8 @@ async fn dispatch_ask_question_card(
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AskQuestionCardDispatch> {
-    let record = mint_user_question_card(state, &text)?;
+    let shadow = crate::decision::shadow::ShadowWork::from_state(state, &app);
+    let record = mint_user_question_card(state, &text, shadow).await?;
     let proposal_id = record.proposal.id.clone();
     let session_id = record.session_id.clone();
     match answer_question_card_impl(proposal_id, false, channel, app, state).await {
@@ -13647,6 +13678,7 @@ mod tests {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal: Some(events::SignalGrade::Fragment),
+            decision_provenance: None,
         };
         let record = live_assist_card_record(
             "session-1",
@@ -13679,6 +13711,7 @@ mod tests {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal: Some(events::SignalGrade::Strong),
+            decision_provenance: None,
         };
         let existing = events::LiveAssistCardRecord {
             session_id: "session-1".to_string(),
@@ -13705,6 +13738,7 @@ mod tests {
                 answered_at_ms: 1_700_000_000_075,
             }),
             signal: Some(events::SignalGrade::Strong),
+            decision_provenance: None,
         };
 
         let record = live_assist_card_record(
@@ -13900,6 +13934,7 @@ mod tests {
             // 2.5s of wall-clock time after the cited span was recorded.
             created_at_ms: 1_700_000_002_500,
             signal: None,
+            decision_provenance: None,
         };
         state
             .pending_agent_proposals
@@ -16193,11 +16228,12 @@ mod tests {
                 kind: events::AgentProposalKind::Question,
                 title: "Question from Speaker 1".to_string(),
                 body: "Consider answering or linking this question: What changed in the \
-                       roadmap for next quarter's committed deliverables?"
+                   roadmap for next quarter's committed deliverables?"
                     .to_string(),
                 confidence: 0.9,
                 created_at_ms: 1_700_000_000_000 + i as u64,
                 signal: Some(events::SignalGrade::Strong),
+                decision_provenance: None,
             };
             let answer = (i < WORST_CASE_ANSWERED_CARD_COUNT).then(|| events::CardAnswer {
                 status: events::CardAnswerStatus::Answered,
@@ -16231,6 +16267,7 @@ mod tests {
                 origin: Some(events::CardOrigin::Transcript),
                 answer,
                 signal: Some(events::SignalGrade::Strong),
+                decision_provenance: None,
             });
         }
 
@@ -22630,6 +22667,7 @@ mod tests {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal,
+            decision_provenance: None,
         };
         events::LiveAssistCardRecord {
             session_id: session_id.to_string(),
@@ -22644,6 +22682,7 @@ mod tests {
             origin: Some(events::CardOrigin::Transcript),
             answer: None,
             signal,
+            decision_provenance: None,
         }
     }
 
@@ -23783,54 +23822,6 @@ mod tests {
     }
 
     #[test]
-    fn ask_question_card_mints_then_dispatches_with_auto_hardcoded_false() {
-        // A mint-and-ask is definitionally a manual ask (deliverable c: the
-        // ledger action id it buys is `assist_manual_answer`, never
-        // `assist_auto_answer`) — `ask_question_card` must mint via
-        // `mint_user_question_card` and then delegate to
-        // `answer_question_card_impl` with a HARDCODED `false`, never the
-        // caller's own input (there is no caller-supplied `auto` in this
-        // command's signature at all — `text` only). Fix-round rewrite: the
-        // actual logic now lives in `dispatch_ask_question_card` — see
-        // `answer_question_card_passes_the_callers_auto_flag_through_unchanged`'s
-        // comment for why.
-        let source = include_str!("commands.rs");
-
-        let start = source
-            .find("async fn dispatch_ask_question_card(")
-            .expect("dispatch_ask_question_card must exist");
-        let end = source[start..]
-            .find("pub async fn ask_question_card(")
-            .map(|rel| start + rel)
-            .expect("ask_question_card must follow dispatch_ask_question_card");
-        let body = &source[start..end];
-
-        assert!(
-            body.contains("mint_user_question_card(state, &text)?"),
-            "dispatch_ask_question_card must mint the User-origin card via mint_user_question_card"
-        );
-        assert!(
-            body.contains(
-                "answer_question_card_impl(proposal_id, false, channel, app, state).await"
-            ),
-            "dispatch_ask_question_card must delegate to the shared engine with auto hardcoded false"
-        );
-        assert!(
-            !body.contains("answer_question_card_impl(proposal_id, true"),
-            "dispatch_ask_question_card must not hardcode auto=true"
-        );
-        // Fix-round finding (major, adversarial review): a failed mint-and-
-        // ask must not orphan the just-minted card — both failure arms
-        // (Refused and any other Err) must clean it up.
-        assert_eq!(
-            body.matches("delete_orphaned_mint(").count(),
-            2,
-            "dispatch_ask_question_card must clean up the mint on BOTH the \
-             Refused arm and the Err arm, not just one"
-        );
-    }
-
-    #[test]
     fn answer_question_card_never_uses_the_callers_question_argument_as_the_dispatch_text() {
         // Deliverable (a)'s "validate it is consistent with the card if you
         // use it, or ignore it — never trust it as a spend-widening input
@@ -24666,6 +24657,56 @@ mod tests {
         drop_cached_api_client_off_the_async_context(&state);
     }
 
+    #[test]
+    fn decision_shadow_user_question_keeps_manual_kind_and_grade() {
+        use crate::decision::shadow::{DisagreeingEngine, ShadowWork};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("decision-shadow-user");
+        let _guard = HomeGuard::set(&dir);
+        let state = AppState::new();
+        let session_id = state.current_session_id();
+        state
+            .decision_shadow
+            .set_fixture_engine(Arc::new(DisagreeingEngine));
+        let work = ShadowWork {
+            settings: crate::settings::DecisionRouteSettings {
+                shadow_enabled: true,
+                live_assist_route_id: Some("route.decision.d3_edge".into()),
+                ..Default::default()
+            },
+            privacy: crate::settings::PrivacyMode::LocalOnly,
+            models_dir: dir.join("models"),
+            runtime: state.decision_shadow.clone(),
+        };
+        let card = tauri::async_runtime::block_on(mint_user_question_card(
+            &state,
+            "What should we ship next?",
+            Some(work),
+        ))
+        .unwrap();
+        assert_eq!(card.origin, Some(events::CardOrigin::User));
+        assert_eq!(card.proposal.kind, events::AgentProposalKind::Question);
+        assert_eq!(card.signal, Some(events::SignalGrade::Strong));
+        let records = card.decision_provenance.as_ref().unwrap();
+        assert_eq!(records[0].route_answer.as_deref(), Some("none"));
+        assert_eq!(records[1].route_answer.as_deref(), Some("false"));
+        assert!(records.iter().all(|record| record.basis.is_empty()));
+        let stored = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .unwrap();
+        assert_eq!(stored[0], card);
+        assert_eq!(
+            state.decision_shadow.agreement(&session_id)["agent_proposal_kind"].agreed,
+            0
+        );
+        state.decision_shadow.reset("next-session");
+        assert!(state.decision_shadow.agreement(&session_id).is_empty());
+        state.decision_shadow.record(&session_id, records);
+        assert!(state.decision_shadow.agreement("next-session").is_empty());
+    }
+
     /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4). FLIPPED,
     /// explicitly, from T3G's `..._refuses_cleanly_in_a_spanless_session_
     /// instead_of_leaking_validator_prose` — that test pinned
@@ -24691,8 +24732,12 @@ mod tests {
         let state = AppState::new();
         let session_id = state.current_session_id();
 
-        let record = mint_user_question_card(&state, "What's next on the roadmap?")
-            .expect("mint must succeed in a spanless session for a User-origin question");
+        let record = tauri::async_runtime::block_on(mint_user_question_card(
+            &state,
+            "What's next on the roadmap?",
+            None,
+        ))
+        .expect("mint must succeed in a spanless session for a User-origin question");
 
         assert_eq!(record.origin, Some(events::CardOrigin::User));
         assert!(
@@ -24727,7 +24772,7 @@ mod tests {
 
         let state = AppState::new();
         let too_long = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS + 1);
-        let err = mint_user_question_card(&state, &too_long)
+        let err = tauri::async_runtime::block_on(mint_user_question_card(&state, &too_long, None))
             .expect_err("mint must refuse text over the cap");
         assert!(
             err.to_string().contains("too long"),
@@ -24738,7 +24783,7 @@ mod tests {
         // Boundary: exactly at the cap succeeds (T3G2: a spanless session no
         // longer refuses) — proving the cap check itself is `>`, not `>=`.
         let at_cap = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS);
-        let record = mint_user_question_card(&state, &at_cap)
+        let record = tauri::async_runtime::block_on(mint_user_question_card(&state, &at_cap, None))
             .expect("text at exactly the cap must be accepted, not rejected for length");
         assert_eq!(
             record.proposal.body.chars().count(),
@@ -24812,6 +24857,55 @@ mod tests {
             .load_live_assist_card_audit(&session_id)
             .expect("load audit log");
         assert_eq!(audit.len(), 1, "only the mint's own audit row should exist");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn ask_question_card_deletes_only_its_orphaned_mint_on_policy_error() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("ask-question-card-orphan-policy");
+        let _guard = HomeGuard::set(&dir);
+        let state = AppState::new();
+        let session_id = state.current_session_id();
+        {
+            let mut settings = state.app_settings.write().unwrap();
+            settings.privacy_mode = crate::settings::PrivacyMode::LocalOnly;
+            settings.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: String::new(),
+                model: "fixture".into(),
+            };
+        }
+        let existing = tauri::async_runtime::block_on(mint_user_question_card(
+            &state,
+            "Keep this earlier question?",
+            None,
+        ))
+        .unwrap();
+        let error = tauri::async_runtime::block_on(dispatch_ask_question_card(
+            "What should we do next?".into(),
+            noop_answer_channel(),
+            crate::speech::shared_test_app_handle(),
+            &state,
+        ))
+        .expect_err("local-only policy must refuse a cloud manual answer");
+        assert!(error.to_string().contains("blocked"));
+        let current = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .unwrap();
+        assert_eq!(current, vec![existing]);
+        assert_eq!(
+            state
+                .agent_auto_answer_session_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(state.stream_registry.is_empty());
     }
 
     /// Fix-round addition (major, adversarial review): the finding's own

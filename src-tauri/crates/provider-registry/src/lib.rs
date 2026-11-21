@@ -83,6 +83,7 @@ pub enum ProviderStage {
     Asr,
     Diarization,
     Llm,
+    Decision,
     Tts,
     RealtimeAgent,
 }
@@ -2079,7 +2080,186 @@ pub const fn provider_id_is_mvp_selectable(id: &str) -> bool {
     false
 }
 
+const fn decision_descriptor(
+    id: &'static str,
+    name: &'static str,
+    model: &'static str,
+    boundary: ProviderDataBoundary,
+    features: &'static [&'static str],
+    credentials: &'static [&'static str],
+) -> ProviderDescriptor {
+    let native = matches!(boundary, ProviderDataBoundary::LocalOnly);
+    ProviderDescriptor {
+        id,
+        display_name: name,
+        stage: ProviderStage::Decision,
+        settings_variant: model,
+        status: ProviderStatus::Implemented,
+        ui_selectable: provider_id_is_mvp_selectable(id),
+        transport: if native {
+            ProviderTransport::Local
+        } else {
+            ProviderTransport::Http
+        },
+        credential_keys: credentials,
+        required_features: features,
+        model_catalog: if native {
+            ModelCatalogPolicy::LocalFiles
+        } else {
+            ModelCatalogPolicy::UserSupplied
+        },
+        local_models: &[],
+        fixed_model_catalog: None,
+        default_model: Some(model),
+        health_check_command: None,
+        model_catalog_command: None,
+        source_policy: None,
+        source_policy_label: None,
+        event_semantics: None,
+        stt_fidelity: None,
+        settings_groups: &[],
+        audio_input: None,
+        lifecycle: ProviderLifecycleDescriptor {
+            auth: if credentials.is_empty() {
+                ProviderAuthLifecycle::None
+            } else {
+                ProviderAuthLifecycle::SavedApiKey
+            },
+            session: if native {
+                ProviderSessionLifecycle::LocalInProcess
+            } else {
+                ProviderSessionLifecycle::PerRequest
+            },
+            keepalive: ProviderKeepaliveStrategy::None,
+            close: if native {
+                ProviderCloseStrategy::DropRuntime
+            } else {
+                ProviderCloseStrategy::RequestCompletes
+            },
+        },
+        privacy: ProviderPrivacyDescriptor {
+            data_leaves_device: !native,
+            data_boundary: boundary,
+            data_classes_sent: if native {
+                &[]
+            } else {
+                &[ProviderDataClass::TranscriptText]
+            },
+            data_classes_returned: &[ProviderDataClass::UsageMetadata],
+            health_check_data_classes: &[],
+            cloud_transfer_acknowledgement_required: !native,
+            retention_policy: if native {
+                ProviderPolicyStatus::NotApplicable
+            } else {
+                ProviderPolicyStatus::Unknown
+            },
+            training_policy: if native {
+                ProviderPolicyStatus::NotApplicable
+            } else {
+                ProviderPolicyStatus::Unknown
+            },
+            deletion_policy: if native {
+                ProviderPolicyStatus::NotApplicable
+            } else {
+                ProviderPolicyStatus::Unknown
+            },
+            policy_url: None,
+            policy_url_source_date: None,
+            subprocessors_url: None,
+            enterprise_no_training_config: ProviderPolicyStatus::Unknown,
+            data_residency: ProviderPolicyStatus::Unknown,
+            sensitive_error_policy: ProviderSensitiveErrorPolicy::AudioGraphRedacted,
+            processor_identity: None,
+        },
+        enterprise: None,
+        roadmap: None,
+        supports_streaming: false,
+        supports_partial_revisions: false,
+        supports_diarization: false,
+    }
+}
+
 pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
+    decision_descriptor(
+        "decision.laya",
+        "Native Laya",
+        "laya",
+        ProviderDataBoundary::LocalOnly,
+        &["decision-laya"],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.d3_edge",
+        "Native D3 edge",
+        "d3-edge",
+        ProviderDataBoundary::LocalOnly,
+        &["decision-d3"],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.d3_lite",
+        "Native D3 lite",
+        "d3-lite",
+        ProviderDataBoundary::LocalOnly,
+        &["decision-d3"],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.d3_nano",
+        "Native D3 nano",
+        "d3-nano",
+        ProviderDataBoundary::LocalOnly,
+        &["decision-d3"],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.d3_mini",
+        "Native D3 mini",
+        "d3-mini",
+        ProviderDataBoundary::LocalOnly,
+        &["decision-d3"],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.ollama_loopback",
+        "Loopback Ollama",
+        "ollama",
+        ProviderDataBoundary::UserConfiguredEndpoint,
+        &[],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.vllm_loopback",
+        "Loopback vLLM",
+        "vllm",
+        ProviderDataBoundary::UserConfiguredEndpoint,
+        &[],
+        &[],
+    ),
+    decision_descriptor(
+        "decision.jev_typesafe",
+        "TypeSafe Jev",
+        "jev-latest",
+        ProviderDataBoundary::VendorCloud,
+        &[],
+        &["typesafe_api_key"],
+    ),
+    decision_descriptor(
+        "decision.jev_cloudflare",
+        "Cloudflare Jev",
+        "typesafe/jev",
+        ProviderDataBoundary::ProviderAccountBoundary,
+        &[],
+        &["cloudflare_workers_ai_token"],
+    ),
+    decision_descriptor(
+        "decision.clef_flash_cloudflare",
+        "Cloudflare Clef flash",
+        "clef-flash",
+        ProviderDataBoundary::ProviderAccountBoundary,
+        &[],
+        &["cloudflare_workers_ai_token"],
+    ),
     // ASR providers
     ProviderDescriptor {
         id: "asr.local_whisper",

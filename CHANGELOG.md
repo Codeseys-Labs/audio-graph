@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attention, fused Gated DeltaNet kernels (CPU, CUDA via NVRTC), 255-code
   readout, model-manager entries pinned to the parity-fixture revisions. FP32
   answers match the Hugging Face reference to within 5e-6 per probability.
+- Opt-in, shadow-only named decision routes for live-assist proposal kind and
+  answerable-question observations. Heuristics retain all mint and spend authority.
+  Records carry raw/calibrated probabilities, model-pin metadata, canonical state
+  digests, and movement-ledger correlation ids. Hosted routes remain deferred;
+  native cache selection never falls back to cloud.
 
 ### Changed
 
