@@ -98,6 +98,7 @@ fn heuristic(span: &ReplaySpan) -> (usize, Option<usize>) {
         confidence,
         created_at_ms: 0,
         signal: None,
+        decision_provenance: None,
     };
     let grade = match crate::speech::agent_signal_grade(&payload) {
         SignalGrade::Fragment => 0,

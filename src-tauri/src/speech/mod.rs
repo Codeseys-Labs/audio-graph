@@ -46,7 +46,7 @@ fn agent_pool() -> &'static rayon::ThreadPool {
 }
 
 use crossbeam_channel::Receiver;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::asr::AsrConfig;
 #[cfg(feature = "asr-whisper")]
@@ -1224,6 +1224,85 @@ fn run_agent_proposal_task(
     active_session_id: Arc<RwLock<String>>,
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 ) -> bool {
+    let shadow = app_handle
+        .try_state::<crate::state::AppState>()
+        .and_then(|state| crate::decision::shadow::ShadowWork::from_state(&state, &app_handle));
+    run_agent_proposal_task_with_shadow(
+        segment,
+        text,
+        expected_session_id,
+        source_span_id,
+        app_handle,
+        pending_agent_proposals,
+        active_session_id,
+        transcript_ledger,
+        shadow,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_agent_proposal_task_with_shadow(
+    segment: TranscriptSegment,
+    text: String,
+    expected_session_id: String,
+    source_span_id: String,
+    app_handle: AppHandle,
+    pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
+    active_session_id: Arc<RwLock<String>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+    shadow: Option<crate::decision::shadow::ShadowWork>,
+) -> bool {
+    let shadow_records = if let Some(work) = &shadow {
+        let Some(ledger) = lock_current_session_generation(
+            &active_session_id,
+            &transcript_ledger,
+            &expected_session_id,
+        ) else {
+            return false;
+        };
+        let basis: Vec<_> = ledger
+            .latest_spans
+            .iter()
+            .filter(|event| event.span_id == source_span_id)
+            .map(|event| crate::decision::route::DecisionBasis {
+                span_id: event.span_id.clone(),
+                revision: event.revision_number,
+            })
+            .collect();
+        drop(ledger);
+        let kind = agent_proposal_kind(&text);
+        let confidence = if segment.confidence.is_finite() {
+            segment.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let signal = kind.as_ref().map_or(events::SignalGrade::Strong, |kind| {
+            let probe = events::AgentProposalPayload {
+                id: String::new(),
+                source_segment_id: String::new(),
+                source_id: String::new(),
+                speaker_label: None,
+                kind: kind.clone(),
+                title: String::new(),
+                body: agent_proposal_body(kind, &text),
+                confidence,
+                created_at_ms: 0,
+                signal: None,
+                decision_provenance: None,
+            };
+            agent_signal_grade(&probe)
+        });
+        tauri::async_runtime::block_on(work.evaluate(
+            &expected_session_id,
+            &text,
+            confidence,
+            kind.as_ref(),
+            signal,
+            &basis,
+        ))
+    } else {
+        Vec::new()
+    };
     let Some(_generation_guard) = lock_current_session_generation(
         &active_session_id,
         &transcript_ledger,
@@ -1236,6 +1315,9 @@ fn run_agent_proposal_task(
         );
         return false;
     };
+    if let Some(work) = &shadow {
+        work.runtime.record(&expected_session_id, &shadow_records);
+    }
 
     let start = Instant::now();
     emit_agent_status(
@@ -1278,6 +1360,7 @@ fn run_agent_proposal_task(
         confidence,
         created_at_ms: current_unix_millis(),
         signal: None,
+        decision_provenance: None,
     };
     // audio-graph-83cc T2: stamp the backend signal grade at mint, before
     // the payload is cloned into the pending map / the card head below, so
@@ -1288,6 +1371,7 @@ fn run_agent_proposal_task(
     // log line (see this unit's own scope note on the 81a5 creation-log
     // seam).
     proposal.signal = Some(agent_signal_grade(&proposal));
+    crate::decision::shadow::stamp(&mut proposal, shadow_records);
 
     match pending_agent_proposals.lock() {
         Ok(mut pending) => {
@@ -1325,6 +1409,7 @@ fn run_agent_proposal_task(
         origin: Some(events::CardOrigin::Transcript),
         answer: None,
         signal: proposal.signal,
+        decision_provenance: proposal.decision_provenance.clone(),
     };
     if let Err(err) =
         FileMemoryRepository::user_data().upsert_live_assist_card(&expected_session_id, &live_card)
@@ -10494,6 +10579,7 @@ mod tests_status {
                 confidence: fixture.confidence,
                 created_at_ms: 1_700_000_000_000,
                 signal: None,
+                decision_provenance: None,
             };
             assert_eq!(
                 agent_signal_grade(&payload),
@@ -10535,6 +10621,7 @@ mod tests_status {
                 confidence: 0.9,
                 created_at_ms: 1_700_000_000_000,
                 signal: None,
+                decision_provenance: None,
             };
             assert_eq!(
                 agent_signal_content_text(&payload),
@@ -10571,6 +10658,7 @@ mod tests_status {
                 confidence: 0.9,
                 created_at_ms: 1_700_000_000_000,
                 signal: None,
+                decision_provenance: None,
             };
             assert_eq!(
                 agent_signal_grade(&payload),
@@ -10608,6 +10696,7 @@ mod tests_status {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal: None,
+            decision_provenance: None,
         };
         assert_eq!(
             agent_signal_grade(&payload),
@@ -10655,6 +10744,7 @@ mod tests_status {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal: None,
+            decision_provenance: None,
         };
         assert_eq!(
             agent_signal_grade(&payload),
@@ -10686,6 +10776,7 @@ mod tests_status {
             confidence: 0.9,
             created_at_ms: 1_700_000_000_000,
             signal: None,
+            decision_provenance: None,
         };
         assert_eq!(
             agent_signal_grade(&payload),
@@ -10767,6 +10858,118 @@ mod tests_status {
         app_handle.unlisten(listener);
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn decision_shadow_speech_end_to_end_keeps_heuristics_and_persists_disagreement() {
+        use crate::decision::{
+            route::{DecisionAuthority, DecisionOutcome},
+            shadow::{DisagreeingEngine, ShadowWork},
+        };
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("decision-shadow-speech");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let app_handle = super::shared_test_app_handle();
+        let session_id = app.current_session_id();
+        app.decision_shadow
+            .set_fixture_engine(Arc::new(DisagreeingEngine));
+        let work = ShadowWork {
+            settings: crate::settings::DecisionRouteSettings {
+                shadow_enabled: true,
+                live_assist_route_id: Some("route.decision.d3_edge".into()),
+                ..Default::default()
+            },
+            privacy: crate::settings::PrivacyMode::LocalOnly,
+            models_dir: dir.join("models"),
+            runtime: app.decision_shadow.clone(),
+        };
+        let segment = TranscriptSegment {
+            id: "shadow-segment".into(),
+            source_id: "system".into(),
+            speaker_id: None,
+            speaker_label: None,
+            text: "What did the team decide about pricing?".into(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = app_handle.listen_any(events::AGENT_PROPOSAL, move |event| {
+            let payload: events::AgentProposalPayload =
+                serde_json::from_str(event.payload()).unwrap();
+            tx.send(payload).unwrap();
+        });
+        assert!(super::run_agent_proposal_task_with_shadow(
+            segment.clone(),
+            segment.text.clone(),
+            session_id.clone(),
+            "shadow-span".into(),
+            app_handle.clone(),
+            app.pending_agent_proposals.clone(),
+            app.session_id.clone(),
+            app.transcript_ledger.clone(),
+            Some(work),
+        ));
+        let payload = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(payload.kind, events::AgentProposalKind::Question);
+        assert_eq!(payload.signal, Some(events::SignalGrade::Strong));
+        let records = payload.decision_provenance.as_ref().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].route_answer.as_deref(), Some("none"));
+        assert_eq!(records[1].question_id, "answerable_question");
+        assert_eq!(records[1].route_answer.as_deref(), Some("false"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.authority == DecisionAuthority::Shadow
+                    && record.outcome == DecisionOutcome::Decided)
+        );
+        let cards = FileMemoryRepository::user_data()
+            .load_live_assist_cards(&session_id)
+            .unwrap();
+        assert_eq!(cards[0].decision_provenance.as_ref(), Some(records));
+        assert_eq!(
+            cards[0].proposal.decision_provenance.as_ref(),
+            Some(records)
+        );
+        assert_eq!(cards[0].signal, Some(events::SignalGrade::Strong));
+        let agreement = app.decision_shadow.agreement(&session_id);
+        assert_eq!(agreement["agent_proposal_kind"].evaluated, 1);
+        assert_eq!(agreement["agent_proposal_kind"].agreed, 0);
+        assert_eq!(agreement["answerable_question"].evaluated, 1);
+        assert_eq!(agreement["answerable_question"].agreed, 0);
+        let ledger = FileMemoryRepository::user_data()
+            .load_data_movement_events(&session_id)
+            .unwrap();
+        assert_eq!(
+            ledger[0].event_type,
+            crate::persistence::DataMovementEventType::ProviderCallStarted
+        );
+        assert_eq!(
+            ledger[1].event_type,
+            crate::persistence::DataMovementEventType::ProviderCallSucceeded
+        );
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.destination.boundary
+                    == crate::persistence::DestinationBoundary::Local)
+        );
+        assert!(
+            !serde_json::to_string(&(records, ledger))
+                .unwrap()
+                .contains(&segment.text)
+        );
+        app_handle.unlisten(listener);
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn moonshine_speech_config(models_dir: PathBuf) -> SpeechConfig {

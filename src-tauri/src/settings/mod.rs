@@ -1373,6 +1373,23 @@ pub struct AppSettings {
     /// [`AgentAutoAnswerSettings`].
     #[serde(default)]
     pub agent_auto_answer: AgentAutoAnswerSettings,
+    #[serde(default)]
+    pub decision_routes: DecisionRouteSettings,
+}
+
+/// Shadow evaluation only. Selecting a route never promotes a provider or grants authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DecisionRouteSettings {
+    #[serde(default)]
+    pub shadow_enabled: bool,
+    #[serde(default)]
+    pub live_assist_route_id: Option<String>,
+    #[serde(default)]
+    pub local_http_url: Option<String>,
+    #[serde(default)]
+    pub local_http_model: Option<String>,
+    #[serde(default)]
+    pub cloudflare_account_id: Option<String>,
 }
 
 fn default_whisper_model() -> String {
@@ -1401,6 +1418,7 @@ impl Default for AppSettings {
             demo_mode: None,
             analytics_enabled: Some(false),
             agent_auto_answer: AgentAutoAnswerSettings::default(),
+            decision_routes: DecisionRouteSettings::default(),
         }
     }
 }

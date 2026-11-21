@@ -1101,6 +1101,7 @@ export type ProviderStage =
   | "asr"
   | "diarization"
   | "llm"
+  | "decision"
   | "tts"
   | "realtime_agent";
 

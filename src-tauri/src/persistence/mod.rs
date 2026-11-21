@@ -4070,6 +4070,7 @@ mod local_memory_repository_tests {
             confidence: 0.86,
             created_at_ms: 1_700_000_000_000,
             signal: None,
+            decision_provenance: None,
         }
     }
 
@@ -4100,6 +4101,7 @@ mod local_memory_repository_tests {
             origin: None,
             answer: None,
             signal: None,
+            decision_provenance: None,
         }
     }
 
