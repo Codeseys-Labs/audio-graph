@@ -17,7 +17,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "local_files",
     "local_models": [],
     "default_model": "laya",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "model_catalog"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "local_in_process",
@@ -38,7 +41,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "deletion_policy": "not_applicable",
       "enterprise_no_training_config": "unknown",
       "data_residency": "unknown",
-      "sensitive_error_policy": "audio_graph_redacted"
+      "sensitive_error_policy": "local_only"
     },
     "supports_streaming": false,
     "supports_partial_revisions": false,
@@ -59,7 +62,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "local_files",
     "local_models": [],
     "default_model": "d3-edge",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "model_catalog"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "local_in_process",
@@ -80,7 +86,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "deletion_policy": "not_applicable",
       "enterprise_no_training_config": "unknown",
       "data_residency": "unknown",
-      "sensitive_error_policy": "audio_graph_redacted"
+      "sensitive_error_policy": "local_only"
     },
     "supports_streaming": false,
     "supports_partial_revisions": false,
@@ -101,7 +107,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "local_files",
     "local_models": [],
     "default_model": "d3-lite",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "model_catalog"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "local_in_process",
@@ -122,7 +131,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "deletion_policy": "not_applicable",
       "enterprise_no_training_config": "unknown",
       "data_residency": "unknown",
-      "sensitive_error_policy": "audio_graph_redacted"
+      "sensitive_error_policy": "local_only"
     },
     "supports_streaming": false,
     "supports_partial_revisions": false,
@@ -143,7 +152,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "local_files",
     "local_models": [],
     "default_model": "d3-nano",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "model_catalog"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "local_in_process",
@@ -164,7 +176,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "deletion_policy": "not_applicable",
       "enterprise_no_training_config": "unknown",
       "data_residency": "unknown",
-      "sensitive_error_policy": "audio_graph_redacted"
+      "sensitive_error_policy": "local_only"
     },
     "supports_streaming": false,
     "supports_partial_revisions": false,
@@ -185,7 +197,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "local_files",
     "local_models": [],
     "default_model": "d3-mini",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "model_catalog"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "local_in_process",
@@ -206,7 +221,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "deletion_policy": "not_applicable",
       "enterprise_no_training_config": "unknown",
       "data_residency": "unknown",
-      "sensitive_error_policy": "audio_graph_redacted"
+      "sensitive_error_policy": "local_only"
     },
     "supports_streaming": false,
     "supports_partial_revisions": false,
@@ -225,7 +240,9 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "user_supplied",
     "local_models": [],
     "default_model": "ollama",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "per_request",
@@ -267,7 +284,9 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "user_supplied",
     "local_models": [],
     "default_model": "vllm",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic"
+    ],
     "lifecycle": {
       "auth": "none",
       "session": "per_request",
@@ -311,7 +330,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "user_supplied",
     "local_models": [],
     "default_model": "jev-latest",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "health"
+    ],
     "lifecycle": {
       "auth": "saved_api_key",
       "session": "per_request",
@@ -355,7 +377,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "user_supplied",
     "local_models": [],
     "default_model": "typesafe/jev",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "health"
+    ],
     "lifecycle": {
       "auth": "saved_api_key",
       "session": "per_request",
@@ -399,7 +424,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "model_catalog": "user_supplied",
     "local_models": [],
     "default_model": "clef-flash",
-    "settings_groups": [],
+    "settings_groups": [
+      "basic",
+      "health"
+    ],
     "lifecycle": {
       "auth": "saved_api_key",
       "session": "per_request",

@@ -784,6 +784,8 @@ const BASIC_HEALTH_ADVANCED_GROUPS: &[ProviderSettingsGroup] = &[
     ProviderSettingsGroup::Health,
     ProviderSettingsGroup::Advanced,
 ];
+const BASIC_HEALTH_GROUPS: &[ProviderSettingsGroup] =
+    &[ProviderSettingsGroup::Basic, ProviderSettingsGroup::Health];
 
 const LOCAL_IN_PROCESS_LIFECYCLE: ProviderLifecycleDescriptor = ProviderLifecycleDescriptor {
     auth: ProviderAuthLifecycle::None,
@@ -2117,7 +2119,13 @@ const fn decision_descriptor(
         source_policy_label: None,
         event_semantics: None,
         stt_fidelity: None,
-        settings_groups: &[],
+        settings_groups: if native {
+            BASIC_MODEL_GROUPS
+        } else if credentials.is_empty() {
+            BASIC_ONLY_GROUPS
+        } else {
+            BASIC_HEALTH_GROUPS
+        },
         audio_input: None,
         lifecycle: ProviderLifecycleDescriptor {
             auth: if credentials.is_empty() {
@@ -2168,7 +2176,11 @@ const fn decision_descriptor(
             subprocessors_url: None,
             enterprise_no_training_config: ProviderPolicyStatus::Unknown,
             data_residency: ProviderPolicyStatus::Unknown,
-            sensitive_error_policy: ProviderSensitiveErrorPolicy::AudioGraphRedacted,
+            sensitive_error_policy: if native {
+                ProviderSensitiveErrorPolicy::LocalOnly
+            } else {
+                ProviderSensitiveErrorPolicy::AudioGraphRedacted
+            },
             processor_identity: None,
         },
         enterprise: None,

@@ -111,7 +111,8 @@ describe("settings palette manifest (T4b, audio-graph-4850)", () => {
       model: 5,
     });
     expect(PALETTE_ENTRIES.length).toBe(43);
-    expect(PALETTE_EXCLUDED_PROVIDER_IDS.size).toBe(18);
+    // 18 + the 10 decision-stage descriptors (ADR-0049), none UI-selectable yet.
+    expect(PALETTE_EXCLUDED_PROVIDER_IDS.size).toBe(28);
   });
 
   it("tab entries are exactly the 8 rail sections, unchanged", () => {
