@@ -1,4 +1,3 @@
-pub mod contract;
 #[cfg(feature = "decision-d3")]
 pub mod d3;
 #[cfg(feature = "decision-laya")]
@@ -6,7 +5,7 @@ pub mod laya;
 #[cfg(feature = "decision-d3")]
 pub mod qwen35;
 
-pub use contract::*;
+pub use audio_graph_decision_contract::*;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 pub const LAYA_ENGLISH: &str = "laya-english";
