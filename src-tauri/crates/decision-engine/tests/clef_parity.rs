@@ -109,6 +109,9 @@ fn clef_flash_matches_the_reference() {
                 })
                 .collect();
             assert_eq!(eq.option_spans, spans, "{id}/{qid}: option spans");
+            let question_span: (usize, usize) =
+                serde_json::from_value(q["question_span"].clone()).unwrap();
+            assert_eq!(eq.question_span, question_span, "{id}/{qid}: question span");
             let option_ids: Vec<String> = serde_json::from_value(q["option_ids"].clone()).unwrap();
             assert_eq!(eq.option_ids, option_ids, "{id}/{qid}: option order");
             let got: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();

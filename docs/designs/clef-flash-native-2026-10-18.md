@@ -13,7 +13,9 @@ tensors). Default precision on GPU is BF16 (about 14 GB of weights on the device
 available on the same BF16-stored weights at the same memory cost by upcasting each weight for its
 matmul, which is how the parity run below reaches the FP32 reference on a 32 GB card.
 
-Measured on the committed fixture (9 requests, 23 questions, 204 to 1,930 tokens):
+Measured on the committed fixture (9 requests, 23 questions, 204 to 1,930 tokens) at faad77f, before
+the per-norm cosine clamp fix from the PR 110 review. Current FP32 and BF16 parity is unmeasured until
+the run tracked by `audio-graph-a1c7` replaces these figures:
 
 - FP32 compute on CUDA matches the FP32 reference to at most 6.0e-7 per probability, against the 1e-3
   target; picks match on 23 of 23 questions. Prompt token ids, question spans, option spans and option
@@ -116,7 +118,8 @@ French and Japanese text, a JSON list state with quotes and a newline, a single-
 
 ### Parity
 
-`tests/clef_parity.rs` (`AUDIOGRAPH_CLEF_DIR`, `AUDIOGRAPH_CLEF_EP=cuda-f32|cuda|cpu`):
+`tests/clef_parity.rs` (`AUDIOGRAPH_CLEF_DIR`, `AUDIOGRAPH_CLEF_EP=cuda-f32|cuda|cpu`). Figures measured at
+faad77f, before the per-norm cosine clamp fix; not yet re-measured (`audio-graph-a1c7`):
 
 | Mode | Reference | max abs diff | Picks |
 | --- | --- | ---: | --- |
