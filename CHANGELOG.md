@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attention, fused Gated DeltaNet kernels (CPU, CUDA via NVRTC), 255-code
   readout, model-manager entries pinned to the parity-fixture revisions. FP32
   answers match the Hugging Face reference to within 5e-6 per probability.
+- Opt-in (`decision-clef`) native Clef-flash engine (`Cloudflare/clef-flash`, 9B)
+  on the same candle Qwen3.5 encoder: the checkpoint's joint schema prompt and
+  head, one forward pass per request, BF16 on GPU (14 GB) with an FP32-compute
+  option, model-manager entry pinned to the parity-fixture revision. FP32
+  compute matches the reference to within 1e-6 per probability.
 
 ### Changed
 
