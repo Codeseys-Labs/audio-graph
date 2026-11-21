@@ -10,8 +10,21 @@ Sections below "Current state" are a snapshot taken at `ad3b925`, before the bra
   `0fd43c3`), the shared `qwen35` module (`9639ee2`), and merges of `cafeeae` (audio-graph-6) and
   `ao/audio-graph/root` `3603002` (audio-graph-5).
 - Verification at HEAD: `cargo test -p audio-graph-decision-engine --features decision-laya,decision-d3`
-  16 passed; `models::` lib tests 17 passed for `cloud` and `cloud,decision-d3`; cloud `check --locked`
-  and cloud clippy clean. The PR description holds the full matrix.
+  16 passed; `models::` lib tests (below); cloud `check --locked` and cloud clippy clean. The PR
+  description holds the full matrix.
+- `models::` lib test counts. Every count uses the same command in `src-tauri`, Rust 1.95.0:
+  `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo test --locked --no-default-features --features <set> --lib models::`.
+  The filter matches only `models::tests`, and none of its tests is feature-gated, so `cloud` and
+  `cloud,decision-d3` agree. The counts differ only because tests were added between runs:
+  - 15 (PR description, and "Verification" below): `cloud`, at the `ad3b925` snapshot.
+  - 17 (this section, earlier): `cloud` and `cloud,decision-d3`, at `34fc82c`; `9cefa1a` added
+    `component_hash_failure_never_installs_or_reports_complete` and
+    `component_cache_hash_mismatch_forces_verified_redownload`.
+  - 18: `cloud` and `cloud,decision-d3`, at `a87a2ae`; `4064452` added
+    `laya_import_accepts_the_export_layout_and_the_hosted_multilingual_layout`.
+  - 20: `cloud` and `cloud,decision-d3`, after the import-serialization and imported-bundle
+    preservation fixes added `laya_import_never_removes_a_concurrent_import_staging_directory` and
+    `failed_multilingual_download_keeps_an_imported_export_bundle`.
 
 ## Repository state (snapshot at `ad3b925`)
 
