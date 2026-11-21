@@ -20,6 +20,21 @@ pub struct HeadConfig {
     pub feedforward: usize,
 }
 
+impl HeadConfig {
+    /// Every attention layer splits `width` into `heads` equal parts; checked at load so a bad config
+    /// fails there instead of dividing by zero inside a request.
+    fn validate(&self) -> Result<()> {
+        if self.heads == 0 || !self.width.is_multiple_of(self.heads) {
+            bail!(
+                "joint_head_config.json: {} heads do not split width {}",
+                self.heads,
+                self.width
+            );
+        }
+        Ok(())
+    }
+}
+
 struct Weights {
     map: HashMap<String, Tensor>,
     dtype: DType,
@@ -57,6 +72,9 @@ impl Weights {
         let w = self.get(&format!("{name}.in_proj_weight"))?;
         let b = self.get(&format!("{name}.in_proj_bias"))?;
         let width = w.dim(1)?;
+        if !width.is_multiple_of(heads) {
+            bail!("{name}: {heads} heads do not split width {width}");
+        }
         let part = |i: usize| -> Result<Linear> {
             Ok(Linear::new(
                 w.narrow(0, i * width, width)?,
@@ -194,12 +212,17 @@ fn mean_span(values: &Tensor, (start, end): (usize, usize), dtype: DType) -> Res
 
 /// `torch.nn.functional.normalize` over the last dim (eps 1e-12).
 fn normalize(x: &Tensor) -> Result<Tensor> {
+    normalize_eps(x, 1e-12)
+}
+
+/// `x / max(||x||, eps)` over the last dim, the norm accumulated in FP32.
+fn normalize_eps(x: &Tensor, eps: f64) -> Result<Tensor> {
     let norm = x
         .to_dtype(DType::F32)?
         .sqr()?
         .sum_keepdim(D::Minus1)?
         .sqrt()?
-        .maximum(1e-12)?;
+        .maximum(eps)?;
     x.broadcast_div(&norm.to_dtype(x.dtype())?)
 }
 
@@ -212,6 +235,7 @@ impl JointSchemaHead {
     pub fn load(root: &Path, dtype: DType, device: &Device) -> Result<Self> {
         let config: HeadConfig =
             crate::qwen35::config::read_json(&root.join("joint_head_config.json"))?;
+        config.validate()?;
         let weights = Weights {
             map: candle_core::safetensors::load(root.join("joint_head.safetensors"), &Device::Cpu)?,
             dtype,
@@ -396,13 +420,10 @@ impl JointSchemaHead {
     }
 }
 
-/// `torch.nn.functional.cosine_similarity(a, b, dim=-1)` (eps 1e-8) row by row.
+/// `torch.nn.functional.cosine_similarity(a, b, dim=-1)` (eps 1e-8) row by row. Since PyTorch 1.12 each
+/// norm is clamped on its own (`a / max(||a||, eps) · b / max(||b||, eps)`), not their product.
 fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dot = (a * b)?.sum(D::Minus1)?;
-    let na = a.to_dtype(DType::F32)?.sqr()?.sum(D::Minus1)?;
-    let nb = b.to_dtype(DType::F32)?.sqr()?.sum(D::Minus1)?;
-    let denom = (na * nb)?.sqrt()?.maximum(1e-8)?;
-    (dot.to_dtype(DType::F32)? / denom)?.to_dtype(a.dtype())
+    (normalize_eps(a, 1e-8)? * normalize_eps(b, 1e-8)?)?.sum(D::Minus1)
 }
 
 /// Softmax of one question's logits (FP32, like `.float().softmax(-1)`).
@@ -411,4 +432,65 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.into_iter().map(|e| e / sum).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(heads: usize, width: usize) -> HeadConfig {
+        HeadConfig {
+            hidden_size: 4096,
+            width,
+            routing_layers: 2,
+            layers: 4,
+            heads,
+            feedforward: 4096,
+        }
+    }
+
+    #[test]
+    fn head_config_needs_heads_that_split_the_width() {
+        assert!(config(16, 1024).validate().is_ok());
+        assert!(config(0, 1024).validate().is_err());
+        assert!(config(3, 1024).validate().is_err());
+    }
+
+    #[test]
+    fn load_refuses_zero_heads_before_reading_weights() {
+        let root = std::env::temp_dir().join(format!("clef-head-config-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("joint_head_config.json"),
+            r#"{"hidden_size":4096,"width":1024,"routing_layers":2,"layers":4,"heads":0,"feedforward":4096}"#,
+        )
+        .unwrap();
+        let err = JointSchemaHead::load(&root, DType::F32, &Device::Cpu)
+            .err()
+            .expect("zero heads must not load");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(err.to_string().contains("0 heads"), "{err}");
+    }
+
+    fn rows(values: &[f32]) -> Tensor {
+        Tensor::from_slice(values, (1, values.len()), &Device::Cpu).unwrap()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        cosine_similarity(&rows(a), &rows(b))
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()[0]
+    }
+
+    #[test]
+    fn cosine_similarity_clamps_each_norm_like_pytorch() {
+        // torch.nn.functional.cosine_similarity(torch.tensor([[1e-6, 0.]]), torch.tensor([[1e-6, 0.]]))
+        // is 1.0 in PyTorch 2.11; clamping the product of the norms would give 1e-4.
+        assert!((cosine(&[1e-6, 0.0], &[1e-6, 0.0]) - 1.0).abs() < 1e-6);
+        // Below eps the norm is clamped: ([1e-9, 0] / 1e-8) · [1, 0] = 0.1.
+        assert!((cosine(&[1e-9, 0.0], &[1.0, 0.0]) - 0.1).abs() < 1e-6);
+        assert!((cosine(&[1.0, 0.0], &[1.0, 1.0]) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
 }

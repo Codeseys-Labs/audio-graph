@@ -205,6 +205,8 @@ impl ClefModel {
         let text = qwen35::config::load(root)?;
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|e| candle_core::Error::Msg(format!("tokenizer.json: {e}")))?;
+        // The small head (and its config check) first, so a bad head fails before the 19 GB backbone loads.
+        let head = JointSchemaHead::load(root, dtype, device)?;
         let options = LoadOptions {
             prefix: TEXT_PREFIX,
             attention: Attention::Causal,
@@ -218,7 +220,6 @@ impl ClefModel {
         let host =
             unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &Device::Cpu)? };
         let lm_head = host.get((text.vocab_size, text.hidden_size), "lm_head.weight")?;
-        let head = JointSchemaHead::load(root, dtype, device)?;
         Ok(Self {
             tokenizer,
             encoder,
@@ -254,11 +255,10 @@ impl ClefModel {
             .collect()
     }
 
-    /// One forward pass over an encoded request.
+    /// One forward pass over an encoded request. `encoded` may be built by hand, so its spans are checked
+    /// against the prompt before anything indexes it.
     pub fn score_encoded(&self, encoded: Encoded) -> Result<Scored> {
-        if encoded.input_ids.is_empty() {
-            bail!("empty prompt");
-        }
+        check_spans(&encoded)?;
         let hidden = self.encoder.hidden_states(&encoded.input_ids)?;
         let lexical = self.lexical(&encoded)?;
         let logits = self.head.logits(&hidden, &encoded, &lexical)?;
@@ -280,9 +280,62 @@ impl ClefModel {
     }
 }
 
+/// Every question span and option span must be a non-empty range inside `input_ids`, and every question
+/// needs an option; the head and the lexical lookup slice the prompt with them.
+fn check_spans(encoded: &Encoded) -> Result<()> {
+    let len = encoded.input_ids.len();
+    if len == 0 {
+        bail!("empty prompt");
+    }
+    for question in &encoded.questions {
+        if question.option_spans.is_empty() {
+            bail!("question {:?} has no options", question.id);
+        }
+        for &(start, end) in std::iter::once(&question.question_span).chain(&question.option_spans)
+        {
+            if start >= end || end > len {
+                bail!(
+                    "question {:?}: span {start}..{end} outside the {len}-token prompt",
+                    question.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use format::{EncodedQuestion, Kind};
+
+    fn encoded(question_span: (usize, usize), option_spans: Vec<(usize, usize)>) -> Encoded {
+        Encoded {
+            input_ids: vec![1, 2, 3, 4],
+            questions: vec![EncodedQuestion {
+                id: "q".into(),
+                kind: Kind::Noul,
+                question_span,
+                option_ids: option_spans.iter().map(|s| s.0.to_string()).collect(),
+                option_spans,
+            }],
+            truncated_state_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn hand_built_encodings_with_spans_outside_the_prompt_are_refused() {
+        assert!(check_spans(&encoded((0, 1), vec![(1, 2), (2, 4)])).is_ok());
+        // An option ending past the prompt would panic when the lexical lookup slices `input_ids`.
+        assert!(check_spans(&encoded((0, 1), vec![(1, 2), (2, 5)])).is_err());
+        assert!(check_spans(&encoded((0, 9), vec![(1, 2)])).is_err());
+        assert!(check_spans(&encoded((0, 1), vec![(2, 2)])).is_err());
+        assert!(check_spans(&encoded((0, 1), vec![(3, 1)])).is_err());
+        assert!(check_spans(&encoded((0, 1), vec![])).is_err());
+        let mut empty = encoded((0, 1), vec![(1, 2)]);
+        empty.input_ids.clear();
+        assert!(check_spans(&empty).is_err());
+    }
 
     #[tokio::test]
     async fn registered_engine_refuses_invalid_requests_before_loading_model_files() {
