@@ -44,6 +44,7 @@ pub mod config;
 pub mod converse;
 pub mod crash_handler;
 pub mod credentials;
+pub mod decision;
 pub mod diarization;
 pub mod error;
 pub mod events;

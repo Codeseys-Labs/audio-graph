@@ -1,0 +1,34 @@
+{
+  "source": {
+    "repo": "convaiinnovations/laya",
+    "revision": "7b928d828b7b0e022f929d9bd2e44165aa270148",
+    "subfolder": "multilingual"
+  },
+  "export_recipe": "receptron/laya@60d5ee6ef8e731646e8ca9ac0139d25fcf4fa295/export/export_onnx.py",
+  "python": "3.14.5",
+  "packages": {
+    "laya": "0.3.20",
+    "torch": "2.14.1",
+    "transformers": "4.57.6",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "numpy": "2.5.4",
+    "onnx": "1.23.2",
+    "onnxscript": "0.7.2",
+    "onnx-ir": "1.0.0"
+  },
+  "inputs": {
+    "rl_agent_config.json": "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6",
+    "model.safetensors": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204",
+    "encoder/config.json": "83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4",
+    "tokenizer/tokenizer.json": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+    "tokenizer/tokenizer_config.json": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+  },
+  "outputs": {
+    "laya.onnx": "9c8255899c463086842a9def7a9dd8c200a0d262ab47a181dbe1497c8f80365b",
+    "laya.onnx.data": "6ef993ee707fe1d6a75529f4a1f8347ff89966ff955d332ea3ebe4e5171a9ac1",
+    "laya_config.json": "0a8dc06a15263672671283eb5fc429184d8af11c5ce5a017b4f5409ed9acdcd3",
+    "tokenizer/tokenizer.json": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+    "tokenizer/tokenizer_config.json": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+  }
+}
