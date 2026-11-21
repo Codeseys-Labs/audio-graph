@@ -87,8 +87,49 @@ ignore = [
     # Remediation: drop when rsa ships a constant-time release, OR permanently if
     # the SurrealDB-embedded option is closed (seed audio-graph-2b2c decision).
     # NOTE: quinn-proto RUSTSEC-2026-0185 (also surrealdb-transitive) is NOT
-    # listed here — it self-resolves: the fix is quinn-proto >=0.11.15 and the
-    # gitignored Cargo.lock is regenerated to the latest-compatible on every CI
-    # run, which picks 0.11.15. Only add it here if a future pin holds it back.
+    # listed here: the committed, `--locked` Cargo.lock resolves a patched
+    # quinn-proto. Only add it here if a future pin holds it back.
     "RUSTSEC-2023-0071", # rsa: Marvin Attack (surrealdb-embedded only, no fix)
+    # The same gated adapter (surrealdb 3.3.x) carries three more advisories
+    # with no semver-compatible fix. Reachability: `cargo tree --locked -i <crate>
+    # --target all -e normal` with default features and with
+    # `--no-default-features --features cloud` prints nothing for
+    # surrealdb-core, crypto-bigint@0.5.5, or quick-xml@0.39; they resolve
+    # only under `--all-features`. Remove each entry with the adapter, or when
+    # the named upstream fix becomes semver-compatible.
+    # Crate: surrealdb-core  Title: Data race and double free via unsound
+    # `Send`/`Sync` in `reblessive`. Fix: surrealdb-core >=4.0.0 (major).
+    "RUSTSEC-2026-0454",
+    # Crate: crypto-bigint 0.5.5 (via jsonwebtoken 10 p256/p384 in surrealdb
+    # auth)  Title: Multiple timing variability issues in operations intended
+    # to be constant-time. Fix: >=0.7.6, needs elliptic-curve 0.14 upstream.
+    # The AWS SDK path already resolves the patched 0.7 line.
+    "RUSTSEC-2026-0387",
+    # Crate: quick-xml 0.39.4 (via object_store in surrealdb-core)
+    # Titles: quadratic duplicate-attribute check; unbounded NsReader
+    # namespace allocation. Fix: >=0.41.0, needs an object_store release.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # ── candle-core 0.10 → zip 7.2 (read-only, default-features = false) ──
+    # Source: mistralrs 0.8.1 (default `local-ml` → `llm-mistralrs`) requires
+    # candle-core ^0.10.2 (as do candle-based backends), which requires
+    # zip ^7.2.0. candle-core 0.11 moves only to zip ^8.6; every advisory below
+    # needs zip >=9. mistralrs 0.8.1 is the latest release (2026-11-21).
+    # Reachability: candle-core builds zip with `default-features = false`
+    # (Stored entries only: no AES, no deflate, no legacy Shrink/Reduce/Implode
+    # decoders) and only calls `ZipArchive::new` + `by_name` to read local
+    # `.npz` / `.pth` weights in `npy.rs` / `pickle.rs`. It never calls
+    # `ZipArchive::extract` or `ZipStreamReader`, and AudioGraph code does not
+    # depend on zip directly.
+    # Remediation: drop these IDs when mistralrs/candle resolve zip >=9, or if
+    # a direct zip dependency or an extract call path is added.
+    "RUSTSEC-2026-0367", # zip: SUID/SGID bits preserved by extract
+    "RUSTSEC-2026-0368", # zip: extract creates escaping symlinks
+    "RUSTSEC-2026-0369", # zip: extract applies permissions through symlinks
+    "RUSTSEC-2026-0429", # zip: extract aborts on large symlink entry
+    "RUSTSEC-2026-0545", # zip: AES entries returned without MAC check
+    "RUSTSEC-2026-0546", # zip: extract writes outside destination
+    "RUSTSEC-2026-0547", # zip: legacy decoders preallocate declared size
+    "RUSTSEC-2026-0548", # zip: ZipStreamReader local/central name mismatch
 ]

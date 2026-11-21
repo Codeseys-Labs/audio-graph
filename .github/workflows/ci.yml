@@ -194,7 +194,7 @@ jobs:
             cargo tree --locked --target all --all-features --edges all \
               --format '{p}' --prefix none 2>/dev/null \
             | awk '
-                $1 == "rkyv" {
+                $1 == "rkyv" && $2 ~ /^v[0-9]/ {
                   v = $2; sub(/^v/, "", v);
                   split(v, p, ".");
                   if ((p[1]+0) == 0 && ((p[2]+0) < 8 || ((p[2]+0) == 8 && (p[3]+0) < 17)))
