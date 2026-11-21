@@ -340,7 +340,7 @@ keyring = "4.1.1"
 
 # Optional embedded local memory adapter. The default file repository remains
 # the product store until file-backed engines have cross-platform release proof.
-surrealdb = { version = "3.1.4", default-features = false, features = ["kv-mem"], optional = true }
+surrealdb = { version = "3.3.5", default-features = false, features = ["kv-mem"], optional = true }
 
 # Platform directories (~/.config, etc.)
 dirs = "6"
