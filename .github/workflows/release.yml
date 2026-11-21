@@ -63,7 +63,7 @@ jobs:
       rsac_version: ${{ steps.rsac.outputs.version }}
       rsac_revision: ${{ steps.rsac.outputs.revision }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
 
       - name: Determine release tag
         id: tag
@@ -146,7 +146,7 @@ jobs:
     timeout-minutes: ${{ matrix.build_timeout }}
     steps:
       - name: Checkout audio-graph
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 
@@ -377,7 +377,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           path: audio-graph
 

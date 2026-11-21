@@ -85,7 +85,7 @@ jobs:
           && 'blacksmith-4vcpu-windows-2025'
           || 'blacksmith-6vcpu-macos-15' }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           ref: ${{ inputs.ref }}
           # No step here pushes, and later steps run build output from an
