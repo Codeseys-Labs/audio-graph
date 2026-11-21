@@ -562,6 +562,19 @@ fn laya_layouts(checkpoint: &str) -> Option<&'static [&'static [&'static str]]> 
     }
 }
 
+/// Whether `path` holds a Laya bundle in a layout other than the one the model manager downloads (an
+/// imported multilingual `export/` bundle). It is valid as is, so a download must not replace it.
+fn is_imported_laya_layout(path: &Path, def: &ModelDef) -> bool {
+    laya_layouts(def.filename).is_some_and(|layouts| {
+        layouts.iter().any(|files| {
+            Some(*files) != def.component_required_files && verify_archive_dir(path, files)
+        })
+    })
+}
+
+/// Serializes Laya imports: the single-instance app then owns every `.importing` directory it finds.
+static LAYA_IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Install a one-off exported checkpoint without introducing another cache.
 pub fn install_laya_bundle(
     app: &AppHandle,
@@ -582,6 +595,10 @@ fn install_laya_bundle_into(
         .copied()
         .find(|files| verify_archive_dir(source, files))
         .ok_or("Laya export is missing required non-empty bundle files")?;
+    // Held from the target check to the final rename so no import removes another's staging directory.
+    let _import = LAYA_IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let target = root.join(checkpoint);
     if target.exists() {
         return Err(
@@ -589,7 +606,7 @@ fn install_laya_bundle_into(
         );
     }
     let staging = root.join(format!("{checkpoint}.importing"));
-    // A killed import leaves its staging directory behind; without this every later import would fail.
+    // Imports are serialized, so a leftover staging directory is a killed import's; remove it.
     if staging.exists() {
         remove_path(&staging)?;
     }
@@ -682,10 +699,7 @@ fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
     if let Some(required) = def.component_required_files {
         let exists = path.exists();
         // An imported Laya export is installed even though it is not the downloaded layout.
-        let valid = match laya_layouts(def.filename) {
-            Some(layouts) => layouts.iter().any(|files| verify_archive_dir(path, files)),
-            None => verify_archive_dir(path, required),
-        };
+        let valid = verify_archive_dir(path, required) || is_imported_laya_layout(path, def);
         return (exists, exists && valid);
     }
 
@@ -1126,6 +1140,12 @@ fn download_component_directory(
             .all(|name| expected_hashes.iter().any(|(file, _)| file == name))
     {
         return Err("Model component SHA-256 metadata is incomplete".into());
+    }
+
+    // An imported export bundle is already valid (`model_exists_and_is_valid`); removing it to download
+    // the hosted layout would lose a working model whenever the download fails.
+    if is_imported_laya_layout(target_path, def) {
+        return Ok(target_path.to_string_lossy().to_string());
     }
 
     if verify_archive_dir(target_path, required_files)
@@ -1918,5 +1938,120 @@ mod tests {
         // English has only the export layout.
         assert!(install_laya_bundle_into(&base.join("models-c"), LAYA_ENGLISH, &hosted).is_err());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn laya_import_never_removes_a_concurrent_import_staging_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "audiograph-laya-import-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let write_bundle = |dir: &Path, contents: &[u8]| {
+            for file in LAYA_BUNDLE_FILES {
+                let path = dir.join(file);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, contents).unwrap();
+            }
+        };
+        let source = base.join("export");
+        write_bundle(&source, b"bundle");
+        let spawn_import = |root: &Path| {
+            let (root, source) = (root.to_path_buf(), source.clone());
+            std::thread::spawn(move || install_laya_bundle_into(&root, LAYA_MULTILINGUAL, &source))
+        };
+
+        // An import in progress holds the lock while it fills its staging directory.
+        let root = base.join("models");
+        let staging = root.join(format!("{LAYA_MULTILINGUAL}.importing"));
+        let in_progress = LAYA_IMPORT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("laya.onnx"), b"partial").unwrap();
+        let second = spawn_import(&root);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!second.is_finished());
+        assert_eq!(fs::read(staging.join("laya.onnx")).unwrap(), b"partial");
+        write_bundle(&staging, b"first");
+        fs::rename(&staging, root.join(LAYA_MULTILINGUAL)).unwrap();
+        drop(in_progress);
+        let error = second.join().unwrap().unwrap_err();
+        assert!(error.contains("already exists"));
+        for file in LAYA_BUNDLE_FILES {
+            assert_eq!(
+                fs::read(root.join(LAYA_MULTILINGUAL).join(file)).unwrap(),
+                b"first"
+            );
+        }
+        assert!(!staging.exists());
+
+        // Racing imports: exactly one installs, and its bundle is complete.
+        let root = base.join("models-race");
+        fs::create_dir_all(&root).unwrap();
+        let imports: Vec<_> = (0..8).map(|_| spawn_import(&root)).collect();
+        let installed = imports
+            .into_iter()
+            .filter_map(|import| import.join().unwrap().ok())
+            .count();
+        assert_eq!(installed, 1);
+        for file in LAYA_BUNDLE_FILES {
+            assert_eq!(
+                fs::read(root.join(LAYA_MULTILINGUAL).join(file)).unwrap(),
+                b"bundle"
+            );
+        }
+        assert!(!root.join(format!("{LAYA_MULTILINGUAL}.importing")).exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_multilingual_download_keeps_an_imported_export_bundle() {
+        let url = spawn_oneshot_http(404, "Not Found", "text/html", "<html>missing</html>");
+        let def = ModelDef {
+            name: "Laya multilingual fixture",
+            filename: LAYA_MULTILINGUAL,
+            url: &url,
+            expected_size: None,
+            description: "Imported-bundle preservation fixture",
+            archive_required_files: None,
+            component_required_files: Some(LAYA_MULTILINGUAL_FILES),
+        };
+        let root =
+            std::env::temp_dir().join(format!("audiograph-laya-download-{}", uuid::Uuid::new_v4()));
+        let target = root.join(LAYA_MULTILINGUAL);
+        for file in LAYA_BUNDLE_FILES {
+            let path = target.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"imported").unwrap();
+        }
+        let mut statuses = Vec::new();
+        let installed = download_component_directory(
+            &def,
+            LAYA_MULTILINGUAL_FILES,
+            LAYA_MULTILINGUAL_HASHES,
+            &root,
+            &target,
+            |progress| statuses.push(progress.status.clone()),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&installed), target);
+        assert!(statuses.is_empty());
+        for file in LAYA_BUNDLE_FILES {
+            assert_eq!(fs::read(target.join(file)).unwrap(), b"imported");
+        }
+        let multilingual = MODELS
+            .iter()
+            .find(|m| m.filename == LAYA_MULTILINGUAL)
+            .unwrap();
+        assert_eq!(
+            model_exists_and_is_valid(&target, multilingual),
+            (true, true)
+        );
+        assert!(
+            !root
+                .join(format!("{LAYA_MULTILINGUAL}.downloading"))
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
