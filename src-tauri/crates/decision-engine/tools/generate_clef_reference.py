@@ -1,6 +1,9 @@
 """Generate the Clef-flash parity fixture once from the checkpoint's own Python code (fixtures only).
 
-    python tools/generate_clef_reference.py <hf-snapshot-dir> fixtures/clef-flash.json
+    python tools/generate_clef_reference.py <hf-snapshot-dir> fixtures/clef-flash.json [--revision <sha>]
+
+The revision recorded in the fixture is the commit hash of a standard Hugging Face cache path
+(``.../snapshots/<sha>``); any other checkpoint directory needs an explicit ``--revision``.
 
 Environment used for the committed fixture: Python 3.11, torch 2.11.0+cu128, transformers==5.17.0, no
 flash-linear-attention (transformers' PyTorch Gated DeltaNet runs), RTX 5090, Cloudflare/clef-flash
@@ -23,6 +26,8 @@ import argparse
 import gc
 import importlib.util
 import json
+import math
+import re
 import sys
 from pathlib import Path
 
@@ -231,6 +236,35 @@ def probabilities(logits):
     return [q.float().softmax(-1).tolist() for q in logits]
 
 
+def snapshot_revision(root: Path, explicit: str | None) -> str:
+    """The checkpoint's commit hash: from a ``.../snapshots/<sha>`` cache path, or ``--revision``."""
+    sha = re.compile(r"[0-9a-f]{40}")
+    resolved = root.resolve()
+    cached = resolved.name if resolved.parent.name == "snapshots" and sha.fullmatch(resolved.name) else None
+    if explicit is not None:
+        if not sha.fullmatch(explicit):
+            raise SystemExit(f"--revision must be a 40-character commit hash, got {explicit!r}")
+        if cached is not None and cached != explicit:
+            raise SystemExit(f"--revision {explicit} disagrees with the snapshot path {resolved}")
+        return explicit
+    if cached is None:
+        raise SystemExit(f"{root} is not a Hugging Face cache snapshot (.../snapshots/<sha>); pass --revision")
+    return cached
+
+
+def check_counts(name: str, record, got, reference) -> None:
+    """``got`` and ``reference`` hold one probability list per question of ``record``, one per option."""
+    if len(got) != len(record.questions) or len(reference) != len(record.questions):
+        raise SystemExit(
+            f"{name}: {len(got)} vs {len(reference)} scored questions for {len(record.questions)} in the record"
+        )
+    for q, x, y in zip(record.questions, got, reference):
+        if len(x) != len(q.option_spans) or len(y) != len(q.option_spans):
+            raise SystemExit(
+                f"{name}/{q.question_id}: {len(x)} vs {len(y)} probabilities for {len(q.option_spans)} options"
+            )
+
+
 @torch.inference_mode()
 def streamed_hidden(root: Path, text_config, input_ids: list[int], dtype: torch.dtype, device: str):
     """Final-norm hidden states of the text model, one decoder layer resident at a time."""
@@ -299,8 +333,10 @@ def main() -> int:
     ap.add_argument("snapshot")
     ap.add_argument("out")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--revision", help="checkpoint commit hash; required unless <snapshot> is .../snapshots/<sha>")
     args = ap.parse_args()
     root = Path(args.snapshot)
+    revision = snapshot_revision(root, args.revision)
 
     import transformers
     from safetensors.torch import load_file
@@ -348,12 +384,21 @@ def main() -> int:
         record = encoded[case["id"]]
         bf16_hidden = streamed_hidden(root, text_config, list(record.input_ids), torch.bfloat16, args.device)
         streamed = run_head(record, bf16_hidden, torch.bfloat16)
+        check_counts(case["id"], record, streamed, official[case["id"]])
+        # Harness check only, by maintainer decision: the streamed-vs-official difference is printed for review
+        # and does not gate writing the fixture (the count and finiteness checks do).
         harness = max(
             abs(a - b) for x, y in zip(streamed, official[case["id"]]) for a, b in zip(x, y)
         )
         hidden = streamed_hidden(root, text_config, list(record.input_ids), torch.float32, args.device)
         fp32[case["id"]] = run_head(record, hidden, torch.float32)
+        check_counts(case["id"], record, fp32[case["id"]], official[case["id"]])
         print(f"{case['id']}: {len(record.input_ids)} tokens; streamed bf16 vs official max|d| {harness:.3e}", file=sys.stderr)
+
+    for case in CASES:
+        for kind, table in (("official", official), ("fp32", fp32)):
+            if not all(math.isfinite(p) for q in table[case["id"]] for p in q):
+                raise SystemExit(f"{case['id']}: non-finite {kind} probability; fixture not written")
 
     cases = []
     for case in CASES:
@@ -379,11 +424,11 @@ def main() -> int:
         )
     doc = {
         "model": "Cloudflare/clef-flash",
-        "revision": root.name,
+        "revision": revision,
         "generator": {
             "transformers": transformers.__version__,
             "torch": torch.__version__,
-            "device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else "cpu",
+            "device": torch.cuda.get_device_name(args.device) if args.device.startswith("cuda") else "cpu",
         },
         "cases": cases,
     }

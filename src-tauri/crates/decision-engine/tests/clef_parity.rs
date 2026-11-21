@@ -5,7 +5,8 @@
 //!
 //! AUDIOGRAPH_CLEF_DIR is the checkpoint directory (a `Cloudflare/clef-flash` snapshot);
 //! AUDIOGRAPH_CLEF_EP selects `cpu` (default) or `cuda-f32` (FP32 compute on the stored BF16 weights,
-//! compared with the FP32 reference), or `cuda` (BF16, compared with the published BF16 path).
+//! compared with the FP32 reference), or `cuda` (BF16, compared with the published BF16 path). The CUDA
+//! values need `--features cuda`; any other value fails the test.
 
 use audio_graph_decision_engine::DecisionRequest;
 use audio_graph_decision_engine::clef::{ClefModel, format};
@@ -40,12 +41,25 @@ fn clef_flash_matches_the_reference() {
     let root = std::path::PathBuf::from(
         std::env::var_os("AUDIOGRAPH_CLEF_DIR").expect("set AUDIOGRAPH_CLEF_DIR"),
     );
-    let (device, dtype, field) = match std::env::var("AUDIOGRAPH_CLEF_EP").as_deref() {
+    // An unknown or uncompiled provider must fail rather than quietly run (and pass) on the CPU.
+    let ep = match std::env::var("AUDIOGRAPH_CLEF_EP") {
+        Ok(ep) => Some(ep),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => panic!("AUDIOGRAPH_CLEF_EP: {e}"),
+    };
+    let (device, dtype, field) = match ep.as_deref() {
+        None | Some("cpu") => (Device::Cpu, DType::F32, "fp32"),
         #[cfg(feature = "cuda")]
-        Ok("cuda") => (Device::new_cuda(0).unwrap(), DType::BF16, "official"),
+        Some("cuda") => (Device::new_cuda(0).unwrap(), DType::BF16, "official"),
         #[cfg(feature = "cuda")]
-        Ok("cuda-f32") => (Device::new_cuda(0).unwrap(), DType::F32, "fp32"),
-        _ => (Device::Cpu, DType::F32, "fp32"),
+        Some("cuda-f32") => (Device::new_cuda(0).unwrap(), DType::F32, "fp32"),
+        #[cfg(not(feature = "cuda"))]
+        Some(ep @ ("cuda" | "cuda-f32")) => {
+            panic!("AUDIOGRAPH_CLEF_EP={ep} needs a build with --features cuda")
+        }
+        Some(other) => {
+            panic!("unknown AUDIOGRAPH_CLEF_EP={other:?}; expected cpu, cuda or cuda-f32")
+        }
     };
     let model = ClefModel::load(&root, dtype, &device).unwrap();
     let fixture: Value = serde_json::from_str(include_str!("../fixtures/clef-flash.json")).unwrap();
@@ -65,9 +79,19 @@ fn clef_flash_matches_the_reference() {
         let started = std::time::Instant::now();
         let scored = model.score_encoded(encoded).unwrap();
         let elapsed = started.elapsed().as_secs_f64();
-        for (q, (eq, probs)) in case["questions"]
-            .as_array()
-            .unwrap()
+        // `zip` stops at the shorter side; a dropped or extra question must fail, not shrink the check.
+        let expected = case["questions"].as_array().unwrap();
+        assert_eq!(
+            scored.encoded.questions.len(),
+            expected.len(),
+            "{id}: question count"
+        );
+        assert_eq!(
+            scored.probabilities.len(),
+            expected.len(),
+            "{id}: scored question count"
+        );
+        for (q, (eq, probs)) in expected
             .iter()
             .zip(scored.encoded.questions.iter().zip(&scored.probabilities))
         {
@@ -89,6 +113,7 @@ fn clef_flash_matches_the_reference() {
             assert_eq!(eq.option_ids, option_ids, "{id}/{qid}: option order");
             let got: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
             let reference = floats(&q[field]);
+            assert_eq!(got.len(), reference.len(), "{id}/{qid}: option count");
             let diff = got
                 .iter()
                 .zip(&reference)
