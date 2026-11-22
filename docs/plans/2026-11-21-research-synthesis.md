@@ -79,6 +79,28 @@ Projection decisions:
 
 Competitive tracking stays on `audio-graph-b153` and `audio-graph-8181`; both carry the refreshed findings in their extensions. `audio-graph-9509` and `audio-graph-9c45` are now covered by the Seeds above and can be re-scoped when those land.
 
+## Addendum 2026-11-22: speaker pipelines and clustering
+
+Two more reports:
+
+- [Speaker pipelines and clustering](../research/speaker-pipelines-and-clustering-2026-11-22.md) catalogs the pipelines (pyannote 3.1, community-1, precision-2 and speech-separation-ami/PixIT; NeMo; Sortformer and Nemotron-3-Diarization; DiariZen; 3D-Speaker; WeSpeaker; WhisperX; diart; Picovoice) and the identification patterns (enrollment and verification scoring, AS-norm and PLDA, TS-VAD, open-set rejection, roster and platform metadata).
+- [Clustering bench](../research/diarization-clustering-bench-2026-11-22.md) ran real TitaNet-small and CAM++ embeddings through the candidate clusterers. Reproduce it with `scripts/research/diarization-clustering-bench/`.
+
+Clustering conclusions (clustering-only evidence, two AMI meetings, not DER):
+
+- **e-means** (Meta FAIR, Faiss 1.16) is a faster optimizer for fixed-k k-means at very large scale. It ran on Windows but gave no consistent speaker-recovery gain, and it cannot choose the number of speakers. Research only.
+- **genieclust** works and tied spectral clustering on CAM++, but transferred poorly on TitaNet with a tuned cut, needs an external k or cut rule, and is **AGPL-3.0**. Research only, unless it gets a license review or a clean reimplementation from the paper.
+- **Offline refinement:** NME-SC spectral clustering was best (5.75% confusion on TitaNet AMI), with tuned average-linkage AHC close behind (7.38%). Sherpa's FastClustering uses complete linkage, which scored 34.38% even when tuned, and its 0.5 default was set for 3D-Speaker embeddings rather than the TitaNet model we ship.
+- **Live:** keep the registry in `stabilize.rs`, but feed it pooled per-window evidence and calibrate its similarity on meeting data. Feeding one short embedding at a time raised AMI confusion from 8.00% to 39.25%.
+- **Speed is not the constraint.** At 10,000 embeddings on one CPU thread, average AHC took 4.32 s and spectral 5.89 s.
+
+New Seeds:
+
+- `audio-graph-34cc`: threshold and linkage mismatch bug.
+- `audio-graph-60ea`: meeting-domain calibration gate before any default changes.
+- `audio-graph-d3a9`: Hungarian assignment and centroid admission in `stabilize.rs`.
+- `audio-graph-3089`: cross-session open-set voice-match calibration.
+
 ## Open decisions
 
 - Whether the identity stamp is an additive member of speaker revisions v1 or needs a schema-version bump (ADR-0043), and where decision records live (ADR-0049). Owner: `audio-graph-c32b`.
