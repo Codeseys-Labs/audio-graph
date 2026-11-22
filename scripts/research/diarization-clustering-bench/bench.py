@@ -265,9 +265,11 @@ def lloyd(x, k, seed):
 
 
 def emeans(x, k, seed):
-    # Reassign to returned final centroids rather than mixing last-epoch labels.
-    centroids, _ = NumpyEmeans(x.shape[1], k, nepochs=5, seed=seed).train(x)
-    return ((x[:, None, :]-centroids[None, :, :])**2).sum(axis=2).argmin(axis=1)
+    # Faiss assigns against the final centroids without an n x k x d temporary.
+    model = NumpyEmeans(x.shape[1], k, nepochs=5, seed=seed)
+    model.train(x)
+    _, labels = model.assign(x)
+    return labels
 
 
 def silhouette_k(x, seed):

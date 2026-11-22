@@ -24,8 +24,8 @@ Research and citations: [`docs/research/speaker-identification-2026-11-21.md`](.
 - **A binding change is applied only as a relabel batch.** For each span of the cluster, it writes
   a new `DiarizationSpanRevision` with the **same `span_id` and `speaker_id`**, a **new
   `speaker_label`**, and an additive `identity` stamp. The batch flows through the existing spine:
-  `SpeakerTimeline::apply_event` → `SpeakerLabelRemap` → graph `supersede_entity`, plus the planned
-  notes consumer `ReattributeNoteSpeaker` (`262a`) and the timeline re-fold (`dcd3`).
+  `SpeakerTimeline::apply_event` → `SpeakerLabelRemap` → graph reattribution, plus the planned
+  notes invalidation/re-projection consumer (`262a`) and the timeline re-fold (`dcd3`).
 - **Nothing else moves:**
   - No new canonical stream (ADR-0043).
   - No rewrite of `TranscriptEvent`s, so ADR-0042 transcript hashes are untouched.
@@ -35,8 +35,8 @@ Research and citations: [`docs/research/speaker-identification-2026-11-21.md`](.
     artifacts, and never sent off it.
 
 This copies the Zoom pattern described in the research: generic tags first, matching against a
-closed set of invitees, host edits after the meeting that "sync across ... captions, live
-transcripts, AI Companion, and cloud recording transcripts", and "most recent change is applied".
+closed set of invitees or users paired to the room, host edits after the meeting that "sync
+across ... captions, live transcripts, AI Companion, and cloud recording transcripts", and "most recent change is applied".
 Here it is rebuilt as event-sourced revisions.
 
 | Zoom behavior (research §A) | AudioGraph equivalent in this design |
@@ -61,14 +61,15 @@ Here it is rebuilt as event-sourced revisions.
     - **empty `basis_asr_span_ids` / `basis_transcript_segment_ids`** (Seed `ca06`)
     - `span_id = diarization_span_revision_id(provider, timeline, start, end, speaker_id)`
       (`:368-383`), so **the speaker id is part of the span identity**
-- **The retcon spine exists and persists.**
+- **The retcon spine exists; persistence is best-effort.**
   - `SpeakerTimeline::apply_event` (`projections.rs:792-835`) replaces a span's revision by
     `span_id`. It rejects stale or conflicting revisions. When a non-empty label changes, it
     returns a `SpeakerLabelRemap` (`:837-850`).
   - `dispatch_diarization_span_revision` (`speech/mod.rs:459-496`) passes every remap to
     `graph.supersede_entity(old, new, ts, 1.0)`.
-  - `emit_and_dispatch_diarization_span_revision` (`:498-593`) persists accepted revisions
-    (`:570-580`, Seed `719d`, closed) and emits `GRAPH_DELTA` / `GRAPH_UPDATE`.
+  - `emit_and_dispatch_diarization_span_revision` (`:498-593`) attempts to persist accepted revisions
+    (`:570-580`, Seed `719d`, closed) and emits `GRAPH_DELTA` / `GRAPH_UPDATE`. Append failures
+    are logged and swallowed (`:595-615`); the in-memory revision is then lost on reload.
   - Lock order is ledger (scoped and dropped), then timeline, then graph (`:199-230`).
 - **Readers resolve speakers through the timeline, with gaps.**
   - `timeline.rs:119-186` `build_session_timeline` joins through `speaker_attribution_index`
@@ -83,7 +84,7 @@ Here it is rebuilt as event-sourced revisions.
   validates each patch against speaker history bounded by its `created_at_ms`
   (`replay_accepted_patches_with_history`, `:3681`).
 - **Notes have no speaker consumer.** `ProjectionOperation` (`projections.rs:1825-1957`) has no
-  `ReattributeNoteSpeaker` yet (`262a`, which depends on `4796`).
+  speaker-correction consumer yet (`262a`, which depends on `4796`).
 - **The manual merge bypasses the timeline.** `commands.rs:4510-4560` `merge_graph_entities_impl`
   calls `supersede_entity` directly. A speaker rename done that way is never written to the
   speaker log, so it is lost on reload and invisible to the transcript and timeline.
@@ -239,12 +240,13 @@ pub struct Voiceprint {
     pub clean_speech_secs: f32,
     pub source: VoiceprintSource,          // ExplicitEnrollment | ConfirmedSession { session_id }
     pub created_at_ms: u64,
+    pub last_matched_at_ms: Option<u64>,    // this voiceprint only; never resets created_at_ms
 }
 pub struct ConsentRecord {
     pub kind: ConsentKind,                 // SelfEnrollment | ThirdPartyAttestation
     pub consent_text_version: u32,
     pub granted_at_ms: u64,
-    pub expire_after_unused_days: u32,     // default 365; hard max 1095 (BIPA 3-year cap)
+    pub expire_after_unused_days: u32,     // default 365; bounded to <= 1095
 }
 ```
 
@@ -266,8 +268,16 @@ pub struct ConsentRecord {
     `SpeakerEmbeddingManager::remove`.
   - `purge_voiceprints` deletes the file **and** the keychain key (crypto-shred) and clears the
     in-memory managers.
-  - A retention sweeper runs at startup and drops voiceprints unused for longer than
-    `expire_after_unused_days`.
+  - A retention sweeper runs at startup and before matching, and schedules deletion at the
+    earliest expiry while the app remains open. For each voiceprint, delete at the earlier of
+    `last_matched_at_ms.unwrap_or(created_at_ms) + expire_after_unused_days * DAY_MS` and
+    `created_at_ms + 1095 * DAY_MS` (using checked time arithmetic). The second deadline is an
+    **absolute 1,095-day cap from enrollment/creation**, not an inactivity limit. Matching may
+    advance that voiceprint's `last_matched_at_ms`, never its creation time or absolute deadline;
+    the person-level last-match summary does not extend any voiceprint's lifetime. Fresh explicit
+    enrollment creates a new voiceprint with new consent; automatic updates cannot reset the cap.
+    Delete earlier when consent is revoked or the purpose is satisfied. This absolute cap is a
+    product retention rule, not a claim that BIPA's statutory clock starts at enrollment.
   - Deleting a person **does not** rewrite past sessions by default: names in past labels fall
     under session retention (`c282`, `be7c`). Phase 5 adds "also anonymize this person in past
     sessions", which emits per-session `Unbind` batches.
@@ -545,29 +555,43 @@ Add `speech/mod.rs::emit_and_dispatch_speaker_relabel_batch(ctx, batch)` and the
 2. **Pre-validate the whole batch** under the timeline lock. Each revision must be exactly
    `current + 1` for its span. If any span has moved, reject the batch and rebuild it. This
    prevents partial application and `ConflictingDiarizationRevision`.
-3. Apply with the new `SpeakerTimeline::apply_batch`. It is the same as `apply_event` per revision
+3. **Persist one atomic replay unit before publishing.** While still holding the timeline lock,
+   append the entire batch as one versioned `SpeakerRelabelBatch` JSONL record to the existing
+   speaker log, through its serialized writer, and flush/sync it before applying in memory.
+   This is a new record envelope, not 1,200 independent revision records; legacy single-revision
+   rows remain readable. If append/flush fails, report failure and do not apply or emit the batch.
+   A crash after durable append but before in-memory apply is recovered by replay.
+4. Apply with the new `SpeakerTimeline::apply_batch`. It is the same as `apply_event` per revision
    but sorts once (`sort_latest_spans`), not once per revision. It returns the remaps,
    **deduplicated by `(superseded_label, canonical_label)`**.
-4. Call `graph.reattribute_speaker(old, new, scope, ts)` **once per distinct pair** (§5.4).
-5. Release the locks. Then:
-   - persist each revision with the existing `persist_diarization_span_revision` (`:602`)
+5. Call `graph.reattribute_speaker(old, new, scope, ts)` **once per distinct pair** (§5.4).
+6. Release the locks. Then:
    - emit `DIARIZATION_SPAN_REVISION` per revision, so the frontend `speakerTimeline.ts`
      materializes latest-wins
    - emit one `GRAPH_DELTA` and one `GRAPH_UPDATE`
    - enqueue the notes and materialized-graph consumers (§5.4)
    - emit `SPEAKER_DETECTED` with the resolved label
 
+**Replay behavior.** Decode and validate the complete envelope, revision count, batch indices,
+and all span revisions before applying any member. Apply a valid batch all-or-none; a batch
+already applied in full is an idempotent no-op. Reject a conflicting or malformed batch as a
+whole, with a recovery diagnostic, never apply its valid prefix. An unterminated/truncated final
+JSONL record is ignored as an uncommitted tail; the writer removes that tail before another
+append. A durable complete record replays even if the process died before live publication.
+Compaction must not expose a partial batch. These persistence/replay changes are prerequisites
+to `apply_batch`, not guarantees supplied by today's best-effort per-revision writer.
+
 **Cost.** A one-hour local-clustering session has about 1,200 spans (one per 3 s hop). A bind
-appends about 1,200 revisions to `speaker.jsonl`. That is acceptable and is the case compaction
-`e2d5` exists for. Batches larger than 2,000 spans are chunked with the same `batch_id` and
-`index/len`, all dispatched under one lock acquisition.
+appends one record containing about 1,200 revisions to `speaker.jsonl`. This pays synchronous
+I/O under the timeline lock to preserve validation/commit ordering. Do not split a durable
+batch into independently replayable chunks, even above 2,000 spans; serialization/transport
+may stream bytes, but publication and replay still require the entire record.
 
 ### 5.3 Forward labeling
 
 After a bind, new spans of the cluster must be **born** with the bound label. Otherwise every
 window would produce "Speaker 4" followed by a relabel. These call sites take an
-`IdentityResolver` handle and read it in a scoped block *before* calling
-`emit_and_dispatch_diarization_span_revision`:
+`IdentityResolver` handle; any producer-side read is only provisional:
 
 - `run_clustering_emit_loop` (`speech/mod.rs:2011-2023`)
 - `ClusteringSpeakerStats::record` (`diarization/mod.rs:916-930`)
@@ -575,8 +599,15 @@ window would produce "Speaker 4" followed by a relabel. These call sites take an
   (`speech/mod.rs:1842`)
 - `diarization_span_revision_for_transcript` (`:393-430`)
 
-The identity stamp is copied onto the new span. Past `TranscriptEvent`s keep their ingestion-time
-inline label. **Readers must resolve through the timeline**, which the `1586` fix ensures.
+The dispatcher performs the authoritative binding read **under the `speaker_timeline` lock**,
+immediately before applying the new span, and replaces its label and stamp with that binding.
+Binding changes and resolver updates commit under the same timeline lock (§5.2), taking the
+leaf identity lock only inside it; no producer holds the identity lock while entering dispatch.
+Emit the finalized payload only after this read/apply, not the producer's stale payload. Thus a
+producer that read Anonymous before a bind but dispatches after it gets the bound label and
+stamp. A span dispatched first is included in the subsequent bind's batch.
+Past `TranscriptEvent`s keep their ingestion-time inline label. **Readers must resolve through
+the timeline**, which the `1586` fix ensures.
 
 ### 5.4 Fan-out
 
@@ -592,42 +623,57 @@ inline label. **Readers must resolve through the timeline**, which the `1586` fi
 
     Today `supersede_entity` silently does nothing in this case (`:424-427`). This branch fixes
     it.
-  - In both branches, rewrite `from` to `to` in **every** node's `GraphEntity.speakers` list.
+  - In both branches, update `from` to `to` in every entity's speaker-mention provenance
+    (defined below), then derive its `GraphEntity.speakers` list from that provenance. Keep the
+    provenance synchronized on Entity-scope binds too, so a later segment correction cannot
+    resurrect stale anonymous labels.
 - `Segments(ids)` scope:
-  - Invalidate and re-create only those live edges incident on the `from` node whose
-    `TemporalEdge.source_segment_id` is in `ids`. These are the basis segment ids of the
-    relabeled spans. This is supersede-not-delete, like `supersede_entity`.
+  - Retain **all contributing segment provenance on live edges**, including folds. Today the
+    fold branch (`graph/temporal.rs:512-528`) adds the weight but keeps only the survivor's
+    `source_segment_id`, dropping the folded segment. Add persisted contribution records keyed
+    by `(segment_id, cluster_ref)` with endpoint attribution, weight and timing; expose their
+    deduplicated segment ids as `source_segment_ids`. Initialize them at extraction and union
+    them on every fold, clone and replay. The single seek id may remain a display choice, never
+    the correction lookup key.
+  - Find every live edge with a contribution from `ids` and the affected cluster, even if its
+    displayed `source_segment_id` belongs to another cluster. Invalidate the old aggregate for
+    audit, partition its contributions, and re-create aggregates: only selected contributions
+    get the corrected speaker endpoint; unrelated contributions keep their endpoint and weight.
+    Fold again only while retaining the full contribution records. A list of ids alone cannot
+    recover the weights needed for this split.
   - Re-point `name_index[to]` at the **retired node of that exact name** if one exists, otherwise
     call `add_entity(to)`. `supersede_entity` re-pointed the anonymous key at the person, and an
     unbind must undo that.
-  - Do not move other edges.
+  - Update **every affected entity's `GraphEntity.speakers`**, not only speaker nodes or edges.
+    Persist speaker-mention provenance per entity keyed by `(segment_id, cluster_ref)`, with its
+    resolved label/binding revision. Extraction records it; merges union it without losing the
+    cluster key. Change only the selected provenance entries, then derive the deduplicated
+    `speakers` list from all entries: keep `from` if any unaffected cluster still supports it,
+    and add `to` for the corrected mentions. Mark changed entities in the graph delta.
+  - Legacy aggregates/lists lacking complete provenance must first be rebuilt from their source
+    extraction records (or re-extracted from the affected transcript windows). Do not infer all
+    contributions from the surviving seek id or rewrite a whole label list as a fallback.
+  - Do not move other edges or alter other clusters' mention provenance.
 - **Behavior change for existing single-revision remaps.** Per-span provider or diarizer remaps
   (the AssemblyAI case in §1) switch from whole-entity supersede to `Segments` scope. A one-turn
   correction must not merge two people. This needs its own bug Seed and a regression test before
   this design lands.
 
-**Notes** (`262a`; depends on `4796`): a new trusted-code-only operation.
+**Notes** (`262a`; depends on `4796`): **re-project affected notes for every relabel scope**.
 
-```rust
-ProjectionOperation::ReattributeNoteSpeaker {
-    note_id: String,
-    superseded_label: String,
-    canonical_label: String,
-}
-```
-
-- For `Entity`-scope batches, one trusted `ProjectionPatch` (kind Notes) carries one operation
-  per note whose title or body (or `NoteBlock` text, after `4796`) contains `superseded_label` as
-  a whole, case-sensitive token.
-- The materializer replaces whole tokens only. It refuses with `ProjectionApplyError` when there
-  are zero occurrences, which signals a stale op.
-- `projection_llm::validate_operation` refuses the operation in model drafts
-  (`DerivedOnlyOperation`), mirroring `InvalidateNote` (`projections.rs:1891-1901`).
-- The patch's basis is the current transcript basis **plus the batch's diarization span
-  revisions**, via `ProjectionBasis::from_transcript_events_and_speaker_spans`. It goes through the
-  same apply gate, the same JSONL patch log, and the same replay as every other patch.
-- `Segments`-scope batches emit no `ReattributeNoteSpeaker`, because notes are window-granular.
-  The re-projection rule in §5.5 handles them instead.
+- Do not add a name-token replacement operation. A literal mention of Priya in a quote, title,
+  task description or user text is not necessarily speaker attribution, even if it matches a
+  whole, case-sensitive token.
+- Select affected generated notes/blocks by their cited diarization span ids or source transcript
+  segment/window basis, intersected with the batch's affected spans/segments. Legacy notes
+  without speaker-span citations use their source window, not a search for the old name.
+- Mark those generated projections stale through trusted invalidation and enqueue re-projection
+  with the timeline-resolved labels. Preserve human-authored text/edits under the existing notes
+  merge contract; no global search/replace in titles, bodies or `NoteBlock` text is permitted.
+- The replacement patch's basis is the current transcript basis **plus the diarization span
+  revisions actually used**, via `ProjectionBasis::from_transcript_events_and_speaker_spans`.
+  It goes through the same apply gate, JSONL patch log and historical replay as every other patch.
+  Until that patch is accepted, show the generated note as stale rather than claim it is corrected.
 
 **Materialized projection graph:** a trusted Graph patch. If a node named `superseded_label`
 exists, emit `UpsertGraphNode { id, name: canonical }` (a rename), or `MergeGraphNodes` when the
@@ -657,12 +703,11 @@ label.
 4. **I4. Cited spans get a staleness signal.** Requirement **R-basis**: once `1586` makes
    speaker-bearing prompts resolve labels from the timeline, the prompt builder must cite the
    diarization spans it used, through `from_transcript_events_and_speaker_spans`. Then:
-   - **Bind, Rename, Merge:** the trusted `ReattributeNoteSpeaker` patch fixes accepted notes at
-     once. Any in-flight LLM job whose basis cites the old revisions is classified `Revised`
+   - **Every relabel kind:** invalidate affected generated notes and schedule re-projection of
+     their source windows (§5.4); no deterministic name-token rewrite is safe. Any in-flight LLM
+     job whose basis cites the old revisions is classified `Revised`
      (`classify_basis_currency`, `projections.rs:1150-1166`) and rescheduled with the new labels
      (ADR-0031, ADR-0045 coalescing slots).
-   - **Split, Unbind:** the batch emits no deterministic note rewrite. The revised diarization
-     basis schedules a re-projection of the affected window.
 5. **I5. Stamps are not hashed.** The diarization basis is `(span_id, revision_number)` only, so
    identity stamps and `DecisionRecord`s never enter a hash.
 6. **I6. Compaction keeps stamps.** Compaction (`e2d5`) must keep each span's latest revision,
@@ -682,9 +727,9 @@ an explicit Phase 4 refinement can change them.
 | Step | Speaker revisions | Live graph | Notes |
 |---|---|---|---|
 | t=0–90 s | `speaker-c-3` spans labeled "Speaker 4" (rev 1) | Node "Speaker 4" (LLM-minted per `1586`) with edges from its segments. `speakers` lists contain "Speaker 4" | "Speaker 4 proposed moving the launch" |
-| t=95 s: "Hi, Priya here", with Priya on the calendar | Binder: SelfIntroduction (heuristic) + RosterStructure gives P = 0.93. `Bind` batch: every c-3 span gets rev 2 with label "Priya Raman" and stamp `Bound` | No "Priya Raman" node exists, so rename in place. The node id is kept, alias "Speaker 4" added, `speakers` lists rewritten. One `GRAPH_DELTA` | Trusted `ReattributeNoteSpeaker`: "Priya Raman proposed moving the launch" |
+| t=95 s: "Hi, Priya here", with Priya on the calendar | Binder: SelfIntroduction (heuristic) + RosterStructure gives P = 0.93. `Bind` batch: every c-3 span gets rev 2 with label "Priya Raman" and stamp `Bound` | No "Priya Raman" node exists, so rename in place. The node id is kept, alias "Speaker 4" added, `speakers` lists rewritten. One `GRAPH_DELTA` | Affected generated note is marked stale, then re-projected as "Priya Raman proposed moving the launch"; unrelated name mentions and human edits are preserved |
 | t=96 s onward | New c-3 spans are born "Priya Raman" (§5.3) | New mentions resolve directly | — |
-| t=20 min: user marks "Not Priya — this is Marcus" | `UserConfirmed` `Bind` to Marcus Lee: rev 3, label "Marcus Lee" | Entity scope: "Priya Raman" is now the node, so `supersede_entity("Priya Raman", "Marcus Lee")`, or rename if Marcus is absent | `ReattributeNoteSpeaker` Priya Raman → Marcus Lee |
+| t=20 min: user marks "Not Priya — this is Marcus" | `UserConfirmed` `Bind` to Marcus Lee: rev 3, label "Marcus Lee" | Entity scope: "Priya Raman" is now the node, so `supersede_entity("Priya Raman", "Marcus Lee")`, or rename if Marcus is absent | Affected generated notes are re-projected with Marcus Lee's attribution, not token-replaced |
 | If Priya also spoke from another cluster c-7 | c-7 stays "Priya Raman" | A whole-entity supersede would wrongly move c-7's edges. So when another cluster is bound to the same person, the binder chooses **`Segments` scope over c-3's segment ids** | Notes go through the re-projection path |
 
 Rule: `Entity` scope is allowed only when the person being relabeled **away from** is bound to no
@@ -733,12 +778,18 @@ Acceptance (Rust unit and integration tests, pure std, every build):
 
 - `relabel_batch_bind_revises_every_cluster_span_without_new_span_ids`
 - `relabel_batch_is_atomic_when_any_span_revision_moved`
+- `relabel_batch_replay_applies_complete_record_or_ignores_truncated_tail`
+- `relabel_batch_append_failure_publishes_nothing`
 - `relabel_batch_fires_one_reattribution_per_label_pair`
 - `bind_to_absent_person_renames_live_node_in_place_preserving_node_id`
 - `bind_rewrites_entity_speakers_lists`
 - `unbind_reattributes_only_cluster_segment_edges_and_restores_anonymous_key`
+- `unbind_finds_folded_segment_and_preserves_other_cluster_edge_contributions`
+- `segment_correction_rebuilds_entity_speakers_without_changing_other_cluster_mentions`
 - `single_span_provider_remap_uses_segment_scope_not_entity_merge` (AssemblyAI regression)
 - `forward_spans_after_bind_are_born_with_bound_label_and_stamp`
+- `span_prepared_before_bind_but_dispatched_after_uses_current_binding`
+- `note_reprojection_corrects_attribution_without_replacing_literal_names_or_human_edits`
 - `user_confirmed_binding_is_never_auto_reverted`
 - `relabel_survives_reload_via_replay_speaker_timeline`
 - `relabel_leaves_transcript_hash_and_historical_patch_replay_unchanged`
@@ -807,6 +858,8 @@ Tests:
 - `purge_removes_file_and_keychain_key`
 - `no_plaintext_store_when_keychain_unavailable`
 - `enrollment_rejects_overlapped_audio`
+- `frequently_matched_voiceprint_expires_1095_days_after_creation`
+- `unused_voiceprint_expires_at_earlier_inactivity_deadline`
 
 Design targets:
 
@@ -873,8 +926,9 @@ Gates:
 - **Transient matching.** Session centroids, including those of non-enrolled participants, live
   only in memory and are discarded at session end. This follows Zoom's on-device-then-delete
   pattern.
-- **Purge** is crypto-shred: delete the file and the keychain key. A retention cap of at most
-  1,095 days is enforced in code.
+- **Purge** is crypto-shred: delete the file and the keychain key. Each voiceprint expires at
+  the earlier inactivity deadline or absolute 1,095-day deadline from its creation (§3.4);
+  regular matching cannot extend the absolute cap.
 - **Logging.** Names and `person_ref` never appear in logs: every new type gets a redacted
   `Debug`, following `REDACTED_DEBUG_VALUE`. `DecisionRecord` stores only state digests.
 
@@ -900,14 +954,17 @@ Changed files:
   - `DiarizationSpanRevision.identity`, `SpeakerIdentityStamp`, `SpeakerLabelSource`
   - `SpeakerTimeline::apply_batch`
   - `SpeakerLabelRemap { scope, segment_ids }` (in-memory only, so the change is free)
-  - `ProjectionOperation::ReattributeNoteSpeaker` and its materializer (`262a`)
+  - basis-linked notes invalidation and re-projection consumer (`262a`), no token replacement
 - `events.rs`: `DiarizationSpanRevisionPayload.identity`, `SPEAKER_IDENTITY_SUGGESTION`
 - `speech/mod.rs`:
   - `emit_and_dispatch_speaker_relabel_batch`, `dispatch_speaker_relabel_batch`
   - resolver hooks in `run_clustering_emit_loop` and `diarization_span_revision_for_transcript`
   - remap scope in `dispatch_diarization_span_revision`
-- `graph/temporal.rs`: `reattribute_speaker`, rename in place, `speakers` list rewrite
-- `graph/entities.rs`: `GraphEntity.person_ref: Option<String>` with `#[serde(default)]`
+- `graph/temporal.rs`: `reattribute_speaker`, rename in place, contribution-preserving edge folds
+  and segment-scoped `speakers` derivation
+- `graph/entities.rs`: `GraphEntity.person_ref: Option<String>` with `#[serde(default)]`, plus
+  persisted per-segment/per-cluster speaker-mention provenance
+- `persistence/mod.rs`: versioned single-record relabel batches, atomic replay and tail recovery
 - `diarization/stabilize.rs`: `SpeakerRegistry::snapshot()` and clean-speech seconds
 - `diarization/worker.rs`: `exclusive_cluster_sample_ranges` and the centroid snapshot channel
 - `diarization/mod.rs`: `ClusteringSpeakerStats::record` takes the resolved label

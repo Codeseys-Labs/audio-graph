@@ -420,11 +420,20 @@ correctly kept as `provider_speaker_id` provenance and never treated as identity
    `SpeakerTimeline::apply_event` already emits a `SpeakerLabelRemap` whenever a span's label
    changes (`src-tauri/src/projections.rs:792-850`).
    `speech/mod.rs::dispatch_diarization_span_revision` (`:459-496`) feeds it to
-   `TemporalKnowledgeGraph::supersede_entity` (`graph/temporal.rs:413-594`). Accepted revisions are
-   persisted (`speech/mod.rs:570-580`, Seed `719d` closed). A late name binding should therefore be
-   a **new revision of each anonymous cluster's spans** with the same `speaker_id` and a new
-   `speaker_label`. That is the Zoom "edit the smart name tag, and it syncs everywhere,
-   latest-wins" behavior, rebuilt on event-sourced revisions.
+   `TemporalKnowledgeGraph::supersede_entity` (`graph/temporal.rs:413-594`). Persistence of accepted
+   revisions is **best-effort** (`speech/mod.rs:570-580,595-615`, Seed `719d` closed): an append
+   failure is logged and swallowed, the revision remains applied in memory, and it is lost on
+   reload. A late name binding should therefore be a **new revision of each anonymous cluster's
+   spans** with the same `speaker_id` and a new `speaker_label`, with recoverable batch persistence
+   as specified in [companion design §5.2](../designs/lazy-speaker-identification.md#52-dispatch).
+   The existing graph retcon is incomplete: `supersede_entity` is a no-op when the target name
+   has no node (`temporal.rs:424-427`; Seed `audio-graph-c321` adds rename-in-place), and it does
+   not rewrite other entities' `GraphEntity.speakers` lists (it only unions the merged node's
+   list, `:547-575`). Both fixes are specified in
+   [companion design §5.4](../designs/lazy-speaker-identification.md#54-fan-out), including
+   segment-scoped provenance so corrections do not change another cluster's attribution.
+   Thus Zoom's "edit the smart name tag, and it syncs everywhere, latest-wins" is the intended
+   event-sourced behavior, not a claim that today's dispatcher already achieves it end to end.
 2. **Keep `speaker_id` anonymous and stable. Change only `speaker_label` and an additive identity
    stamp.** Local clustering span ids embed the speaker id
    (`speech/mod.rs::diarization_span_revision_id`, `:368-383`). Changing the id would create new
