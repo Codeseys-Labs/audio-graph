@@ -247,6 +247,8 @@ The retained registry is already std-only Rust. [INFERENCE] Keep online anonymou
 
 ## Reproduction and evidence
 
+**Script revision after these runs:** in commit `0fca0b1` (PR 113 review), `emeans()` was changed to label points with Faiss `model.assign(x)` after `train(x)`, instead of building an n×k×d difference tensor. The reported numbers were produced before that change. Assignment to the final centroids is the same, so the quality rows should reproduce. The e-means **timings** (including 0.68 s at 10,000) included that tensor's cost and will come out somewhat lower if re-run.
+
 From the repository root:
 
 ```sh
