@@ -481,9 +481,19 @@ function projectionUpsertNoteMaterialized(
     // reappears as "present but unset" after a spread/copy.
     heading_level: headingLevel ?? null,
     // Issue #255 (ADR-0025 §2): a legacy `upsert_note` asserts the whole
-    // record — no block history, note active. `0` mirrors the Rust
-    // `#[serde(default)]` on a pre-#255 snapshot.
-    blocks: [],
+    // record and seeds ONE reserved `"body"` block carrying the asserted
+    // body (mirrors `MaterializedNote::BODY_BLOCK_ID` in the Rust backend),
+    // so `body == join(active blocks, "\n\n")` holds from creation and a
+    // `replace_note_text` can anchor into a note that only ever received
+    // `upsert_note`s. Block history otherwise resets on every full replace.
+    blocks: [
+      {
+        block_id: "body",
+        text: body,
+        valid_from_ms: patch.created_at_ms,
+        valid_until_ms: null,
+      },
+    ],
     valid_from_ms: patch.created_at_ms,
     valid_until_ms: null,
     updated_by_sequence: patch.sequence,

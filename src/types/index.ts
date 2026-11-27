@@ -2184,9 +2184,13 @@ export interface MaterializedNote {
   /**
    * Issue #255 (ADR-0025 §2): addressable sub-note blocks. Optional because
    * the Rust side skips serializing an empty vec — absent/undefined means
-   * "no block history" (every pre-#255 note and every pure-`UpsertNote`
-   * note), never anything else. When present and non-empty, the ACTIVE
-   * blocks are the source of truth for `body`.
+   * "no block history" (every pre-#255 note deserialized from a persisted
+   * snapshot), never anything else. Every note materialized SINCE the
+   * contract carries exactly one seed block under the reserved `"body"` id
+   * holding the last `upsert_note`-asserted body (mirrors
+   * `MaterializedNote::BODY_BLOCK_ID`), so `body == join(active blocks,
+   * "\n\n")` holds from creation and a `replace_note_text` can anchor into a
+   * pure-`upsert_note` note.
    */
   blocks?: NoteBlock[];
   /**

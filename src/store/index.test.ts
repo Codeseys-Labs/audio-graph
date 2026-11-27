@@ -2073,8 +2073,19 @@ describe("AudioGraphStore", () => {
     );
 
     let notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].body).toBe("first claim\n\nsecond claim");
+    // The `upsert_note` seed: a reserved `"body"` block holds the asserted
+    // body, so `body == join(active blocks)` holds from creation (mirrors
+    // `MaterializedNote::BODY_BLOCK_ID` in the Rust backend).
+    expect(notes?.notes[0].body).toBe(
+      "Whole body.\n\nfirst claim\n\nsecond claim",
+    );
     expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "body",
+        text: "Whole body.",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
       {
         block_id: "block-1",
         text: "first claim",
@@ -2102,8 +2113,10 @@ describe("AudioGraphStore", () => {
       ]),
     );
     notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks).toHaveLength(2);
-    expect(notes?.notes[0].body).toBe("revised claim\n\nsecond claim");
+    expect(notes?.notes[0].blocks).toHaveLength(3);
+    expect(notes?.notes[0].body).toBe(
+      "Whole body.\n\nrevised claim\n\nsecond claim",
+    );
 
     // A block op on a missing/invalidated note is skipped (reducer parity
     // with the Rust materializer's loud rejection — an emitted event cannot
@@ -2120,7 +2133,7 @@ describe("AudioGraphStore", () => {
     );
     notes = useAudioGraphStore.getState().materializedNotes;
     expect(notes?.notes).toHaveLength(1);
-    expect(notes?.notes[0].blocks).toHaveLength(2);
+    expect(notes?.notes[0].blocks).toHaveLength(3);
     expect(notes?.last_sequence).toBe(4);
   });
 
@@ -2157,10 +2170,12 @@ describe("AudioGraphStore", () => {
       ]),
     );
     let notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+    expect(notes?.notes[0].blocks?.[1]?.text).toBe(
       "Alice will demo on Monday.",
     );
-    expect(notes?.notes[0].body).toBe("Alice will demo on Monday.");
+    expect(notes?.notes[0].body).toBe(
+      "Whole body.\n\nAlice will demo on Monday.",
+    );
 
     // Missing anchor: skipped, nothing applied — mirrors the Rust
     // materializer's rejection; the reducer never applies a blind edit.
@@ -2176,7 +2191,7 @@ describe("AudioGraphStore", () => {
       ]),
     );
     notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+    expect(notes?.notes[0].blocks?.[1]?.text).toBe(
       "Alice will demo on Monday.",
     );
 
@@ -2193,7 +2208,7 @@ describe("AudioGraphStore", () => {
       ]),
     );
     notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+    expect(notes?.notes[0].blocks?.[1]?.text).toBe(
       "Alice will demo on Monday.",
     );
 
@@ -2216,9 +2231,9 @@ describe("AudioGraphStore", () => {
       ]),
     );
     notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks?.[1]?.text).toBe("demo demo");
+    expect(notes?.notes[0].blocks?.[2]?.text).toBe("demo demo");
     expect(notes?.notes[0].body).toBe(
-      "Alice will demo on Monday.\n\ndemo demo",
+      "Whole body.\n\nAlice will demo on Monday.\n\ndemo demo",
     );
 
     // Missing/invalidated block: skipped.
@@ -2234,7 +2249,7 @@ describe("AudioGraphStore", () => {
       ]),
     );
     notes = useAudioGraphStore.getState().materializedNotes;
-    expect(notes?.notes[0].blocks).toHaveLength(2);
+    expect(notes?.notes[0].blocks).toHaveLength(3);
   });
 
   it("hides invalidated blocks from the body but retains the audit trail", () => {
@@ -2275,8 +2290,14 @@ describe("AudioGraphStore", () => {
 
     const notes = useAudioGraphStore.getState().materializedNotes;
     // Hidden from the active body, retained in materialized state.
-    expect(notes?.notes[0].body).toBe("live claim");
+    expect(notes?.notes[0].body).toBe("Whole body.\n\nlive claim");
     expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "body",
+        text: "Whole body.",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
       {
         block_id: "block-1",
         text: "superseded claim",
@@ -2302,7 +2323,7 @@ describe("AudioGraphStore", () => {
       ]),
     );
     expect(
-      useAudioGraphStore.getState().materializedNotes?.notes[0].blocks?.[0]
+      useAudioGraphStore.getState().materializedNotes?.notes[0].blocks?.[1]
         ?.valid_until_ms,
     ).toBe(1_700_000_000_002);
   });
@@ -2331,6 +2352,12 @@ describe("AudioGraphStore", () => {
     const beforeBlocks = beforeNote?.blocks?.map((block) => ({ ...block }));
     const beforeBody = beforeNote?.body;
     expect(beforeBlocks).toEqual([
+      {
+        block_id: "body",
+        text: "Whole body.",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
       {
         block_id: "block-1",
         text: "price is 10 dollars",
@@ -2366,10 +2393,12 @@ describe("AudioGraphStore", () => {
     );
 
     const after = useAudioGraphStore.getState().materializedNotes;
-    expect(after?.notes[0].blocks?.[0]?.text).toBe(
+    expect(after?.notes[0].blocks?.[1]?.text).toBe(
       "price is $& dollars dollars",
     );
-    expect(after?.notes[0].body).toBe("price is $& dollars dollars");
+    expect(after?.notes[0].body).toBe(
+      "Whole body.\n\nprice is $& dollars dollars",
+    );
 
     // Rust-parity immutability: applying a patch must never touch the prior
     // `materializedNotes` snapshot (Rust clones the whole state before
@@ -2380,9 +2409,9 @@ describe("AudioGraphStore", () => {
     expect(beforeNote?.updated_by_sequence).toBe(1);
     expect(beforeNote?.body).toBe(beforeBody);
     expect(beforeNote?.blocks).toEqual(beforeBlocks);
-    expect(beforeNote?.blocks?.[0]?.text).toBe("price is 10 dollars");
-    expect(beforeNote?.blocks?.[0]?.valid_until_ms).toBeNull();
-    expect(beforeNote?.blocks?.[0]?.valid_from_ms).toBe(1_700_000_000_001);
+    expect(beforeNote?.blocks?.[1]?.text).toBe("price is 10 dollars");
+    expect(beforeNote?.blocks?.[1]?.valid_until_ms).toBeNull();
+    expect(beforeNote?.blocks?.[1]?.valid_from_ms).toBe(1_700_000_000_001);
   });
 
   it("soft-invalidates notes via invalidate_note and resurrects via upsert_note", () => {
@@ -2440,7 +2469,14 @@ describe("AudioGraphStore", () => {
     notes = useAudioGraphStore.getState().materializedNotes;
     expect(notes?.notes[0].valid_until_ms).toBeNull();
     expect(notes?.notes[0].body).toBe("Resurrected.");
-    expect(notes?.notes[0].blocks).toEqual([]);
+    expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "body",
+        text: "Resurrected.",
+        valid_from_ms: 1_700_000_000_004,
+        valid_until_ms: null,
+      },
+    ]);
     expect(notes?.notes[0].valid_from_ms).toBe(1_700_000_000_004);
 
     // delete_note stays the hard removal.
@@ -2453,6 +2489,48 @@ describe("AudioGraphStore", () => {
       ]),
     );
     expect(useAudioGraphStore.getState().materializedNotes?.notes).toEqual([]);
+  });
+
+  it("anchors a replace_note_text correction into a pure upsert_note via the reserved body block", () => {
+    // Issue #255's headline acceptance, FE parity: a note that only ever
+    // received `upsert_note`s (every pre-#255 note) is correctable by a
+    // minimal anchored patch against the reserved `"body"` seed block —
+    // not a full-body replace.
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Alice will demo on Friday.",
+          tags: [],
+        },
+      ]),
+    );
+
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "body",
+          search: "Friday",
+          replace: "Monday",
+        },
+      ]),
+    );
+
+    const notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "body",
+        text: "Alice will demo on Monday.",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
+    ]);
+    expect(notes?.notes[0].body).toBe("Alice will demo on Monday.");
   });
 
   it("ignores stale notes projection patch sequences while retaining event history", () => {

@@ -2257,14 +2257,15 @@ pub struct MaterializedNote {
     pub title: String,
     pub body: String,
     pub tags: Vec<String>,
-    /// Addressable sub-note blocks (issue #255 / ADR-0025 §2). Empty on
-    /// every note materialized before this field existed and on every note
-    /// whose history is pure `UpsertNote` full-replaces (see
-    /// [`upsert_note`](MaterializedNotes::upsert_note)); the
-    /// `#[serde(default)]` + `skip_serializing_if` pair keeps both wire- and
-    /// byte-identical to the pre-#255 shape. When non-empty, the ACTIVE
-    /// blocks (see [`sync_body_from_active_blocks`]) are the source of truth
-    /// for [`body`](Self::body).
+    /// Addressable sub-note blocks (issue #255 / ADR-0025 §2). Every note
+    /// materialized since this contract carries exactly one seed block under
+    /// the reserved [`MaterializedNote::BODY_BLOCK_ID`], holding the last
+    /// `UpsertNote`-asserted `body`; notes materialized BEFORE this contract
+    /// deserialize with an empty vec (`#[serde(default)]`, and empty is
+    /// skipped on the wire), so their asserted `body` is the only record.
+    /// The ACTIVE blocks (see
+    /// [`sync_body_from_active_blocks`]) are the source of truth for
+    /// [`body`](Self::body) whenever any block op has run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<NoteBlock>,
     /// Note-level temporal validity (issue #255 / ADR-0025 §2), mirroring
@@ -2315,6 +2316,29 @@ pub struct MaterializedNote {
     /// other field on the record (there is no incremental merge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading_level: Option<u8>,
+}
+
+impl MaterializedNote {
+    /// Reserved block id under which [`upsert_note`](MaterializedNotes::upsert_note)
+    /// seeds the asserted `body` as its one and only block (issue #255):
+    /// `body == active blocks joined by "\n\n"` therefore holds for every
+    /// note from creation on, and
+    /// [`ReplaceNoteText`](ProjectionOperation::ReplaceNoteText) can anchor
+    /// into a note that never received an explicit
+    /// [`UpsertNoteBlock`](ProjectionOperation::UpsertNoteBlock). A block op
+    /// targeting this id full-replaces the seed like any other block id.
+    pub const BODY_BLOCK_ID: &str = "body";
+
+    /// The seed block [`upsert_note`](MaterializedNotes::upsert_note) lands
+    /// for the asserted `body`.
+    fn body_block(text: &str, created_at_ms: u64) -> NoteBlock {
+        NoteBlock {
+            block_id: Self::BODY_BLOCK_ID.to_string(),
+            text: text.to_string(),
+            valid_from_ms: created_at_ms,
+            valid_until_ms: None,
+        }
+    }
 }
 
 impl fmt::Debug for MaterializedNote {
@@ -2472,15 +2496,19 @@ impl MaterializedNotes {
         Ok(())
     }
 
-    /// Legacy whole-body replace. Since issue #255 this is a FULL replace of
-    /// the record exactly like every pre-#255 release: `blocks` resets to
-    /// empty (an `UpsertNote` asserts the whole body, not block structure —
-    /// block state is owned by the block ops), `valid_from_ms` re-stamps to
-    /// this patch (mirroring `MaterializedGraph::upsert_node`'s full-replace
-    /// stamping) and `valid_until_ms` clears, so an `UpsertNote` on an
-    /// invalidated id resurrects it exactly like a same-id graph upsert.
-    /// Replaying any mix of `UpsertNote` + block ops is therefore
-    /// deterministic: whichever op ran last wins its own field.
+    /// Legacy whole-body replace, as in every pre-#255 release — with one
+    /// addition (issue #255 / ADR-0025 §2): the asserted `body` is seeded
+    /// as ONE reserved block under [`MaterializedNote::BODY_BLOCK_ID`], so
+    /// `body == active blocks joined by "\n\n"` holds for EVERY note from
+    /// creation on, and [`ReplaceNoteText`](ProjectionOperation::ReplaceNoteText)
+    /// can anchor into a note that only ever received `UpsertNote`s — which
+    /// is every note a real session had before this contract. Block state
+    /// otherwise resets (a full replace, not an incremental merge: any
+    /// prior blocks are dropped), `valid_from_ms` re-stamps to this patch
+    /// (mirroring `MaterializedGraph::upsert_node`), and `valid_until_ms`
+    /// clears, so an `UpsertNote` on an invalidated id resurrects it exactly
+    /// like a same-id graph upsert. Replaying any mix of `UpsertNote` +
+    /// block ops is deterministic: whichever op ran last wins its own field.
     #[allow(clippy::too_many_arguments)]
     fn upsert_note(
         &mut self,
@@ -2499,7 +2527,7 @@ impl MaterializedNotes {
             title: title.to_string(),
             body: body.to_string(),
             tags: tags.to_vec(),
-            blocks: Vec::new(),
+            blocks: vec![MaterializedNote::body_block(body, patch.created_at_ms)],
             valid_from_ms: patch.created_at_ms,
             valid_until_ms: None,
             heading_level,
@@ -6202,6 +6230,15 @@ mod tests {
             .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
             .expect("seed note");
 
+        // The UpsertNote seed: one reserved `body` block holding the
+        // asserted body, so body == join(active blocks) holds from creation.
+        let note = &notes.notes[0];
+        assert_eq!(note.blocks.len(), 1);
+        assert_eq!(note.blocks[0].block_id, MaterializedNote::BODY_BLOCK_ID);
+        assert_eq!(note.blocks[0].text, "Whole body.");
+        assert_eq!(note.blocks[0].valid_from_ms, 1_700_000_000_101);
+        assert_eq!(note.body, "Whole body.");
+
         // A block op on a missing note rejects the whole patch, loudly.
         let missing = notes_patch_with_operations(
             2,
@@ -6251,13 +6288,13 @@ mod tests {
             .expect("second block");
 
         let note = &notes.notes[0];
-        assert_eq!(note.blocks.len(), 2);
+        assert_eq!(note.blocks.len(), 3);
         assert_eq!(
             note.body,
-            "Alice owns the launch plan.\n\nLaunch is next week."
+            "Whole body.\n\nAlice owns the launch plan.\n\nLaunch is next week."
         );
-        assert_eq!(note.blocks[0].valid_from_ms, 1_700_000_000_302);
-        assert_eq!(note.blocks[0].valid_until_ms, None);
+        assert_eq!(note.blocks[1].valid_from_ms, 1_700_000_000_302);
+        assert_eq!(note.blocks[1].valid_until_ms, None);
         assert_eq!(
             note.valid_from_ms, 1_700_000_000_101,
             "seed UpsertNote stamp"
@@ -6277,17 +6314,17 @@ mod tests {
                 None,
             )
             .expect("replace block-1");
-        assert_eq!(notes.notes[0].blocks.len(), 2);
+        assert_eq!(notes.notes[0].blocks.len(), 3);
         assert_eq!(
             notes.notes[0].body,
-            "Alice owns the REVISED launch plan.\n\nLaunch is next week."
+            "Whole body.\n\nAlice owns the REVISED launch plan.\n\nLaunch is next week."
         );
-        assert_eq!(notes.notes[0].blocks[0].valid_from_ms, 1_700_000_000_304);
+        assert_eq!(notes.notes[0].blocks[1].valid_from_ms, 1_700_000_000_304);
         assert_eq!(notes.notes[0].updated_by_sequence, 4);
     }
 
     #[test]
-    fn upsert_note_resets_blocks_and_temporal_fields() {
+    fn upsert_note_reseeds_the_reserved_body_block() {
         let mut notes = MaterializedNotes::new("session-1");
         notes
             .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
@@ -6307,10 +6344,18 @@ mod tests {
             .expect("block");
 
         // A legacy full-replace UpsertNote asserts the WHOLE record: block
-        // history resets and the asserted body wins.
+        // history resets to a fresh seed of the asserted body.
         notes
             .apply_patch(
-                &notes_patch(3, "note-1", "Decision", "Fresh whole body."),
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::ReplaceNoteText {
+                        note_id: "note-1".to_string(),
+                        block_id: MaterializedNote::BODY_BLOCK_ID.to_string(),
+                        search: "Friday".to_string(),
+                        replace: "Monday".to_string(),
+                    }],
+                ),
                 None,
             )
             .expect("legacy upsert over blocks");
@@ -6356,10 +6401,13 @@ mod tests {
             )
             .expect("unique anchor");
         assert_eq!(
-            notes.notes[0].blocks[0].text,
+            notes.notes[0].blocks[1].text,
             "Alice will demo on Monday $&."
         );
-        assert_eq!(notes.notes[0].body, "Alice will demo on Monday $&.");
+        assert_eq!(
+            notes.notes[0].body,
+            "Whole body.\n\nAlice will demo on Monday $&."
+        );
 
         // Missing anchor: rejected with the typed count, nothing applied.
         let missing = notes_patch_with_operations(
@@ -6388,8 +6436,8 @@ mod tests {
         ));
         assert_eq!(
             notes.notes[0].blocks.len(),
-            1,
-            "all-or-nothing: no partial apply"
+            2,
+            "all-or-nothing: no partial apply (seed + block-1 only)"
         );
 
         // Ambiguous anchor: same typed rejection with the observed count.
@@ -6530,14 +6578,15 @@ mod tests {
             )
             .expect("invalidate block-1");
 
-        // Hidden from the active derived body, retained in materialized state.
-        assert_eq!(notes.notes[0].body, "live claim");
-        assert_eq!(notes.notes[0].blocks.len(), 2);
+        // Hidden from the active derived body, retained in materialized state
+        // (the reserved `body` seed stays active alongside).
+        assert_eq!(notes.notes[0].body, "Whole body.\n\nlive claim");
+        assert_eq!(notes.notes[0].blocks.len(), 3);
         assert_eq!(
             notes.notes[0].blocks[0].valid_until_ms,
             Some(1_700_000_000_304)
         );
-        assert_eq!(notes.notes[0].blocks[1].valid_until_ms, None);
+        assert_eq!(notes.notes[0].blocks[2].valid_until_ms, None);
 
         // Double-invalidate rejects loudly; ReplaceNoteText on the
         // invalidated block rejects as a missing ACTIVE block.
@@ -6572,7 +6621,8 @@ mod tests {
             })
         ));
 
-        // Every active block invalidated: empty derived body, note retained.
+        // All explicit claim blocks invalidated: only the reserved `body`
+        // seed remains active, note retained.
         notes
             .apply_patch(
                 &notes_patch_with_operations(
@@ -6586,8 +6636,8 @@ mod tests {
             )
             .expect("invalidate block-2");
         assert_eq!(notes.notes.len(), 1);
-        assert_eq!(notes.notes[0].body, "");
-        assert_eq!(notes.notes[0].blocks.len(), 2);
+        assert_eq!(notes.notes[0].body, "Whole body.");
+        assert_eq!(notes.notes[0].blocks.len(), 3);
     }
 
     #[test]
@@ -6775,7 +6825,7 @@ mod tests {
         let replayed: MaterializedNotes =
             serde_json::from_str(&json).expect("materialized notes round-trip");
         assert_eq!(replayed, notes);
-        assert_eq!(replayed.notes[0].body, "second claim");
+        assert_eq!(replayed.notes[0].body, "Whole body.\n\nsecond claim");
         assert_eq!(replayed.notes[0].valid_until_ms, Some(1_700_000_000_305));
     }
 
@@ -6824,7 +6874,7 @@ mod tests {
         for patch in &patches {
             live.apply_patch(patch, None).expect("live apply");
         }
-        assert_eq!(live.notes[0].body, "corrected claim");
+        assert_eq!(live.notes[0].body, "Whole body.\n\ncorrected claim");
 
         // Replay through the persisted JSONL shape: every patch serialized
         // and deserialized (the canonical log format) before re-applying.
