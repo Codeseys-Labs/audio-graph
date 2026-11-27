@@ -460,7 +460,7 @@ function applyAsrRevisionToTranscriptSegments(
   return withoutMatching;
 }
 
-function projectionPatchNote(
+function projectionUpsertNoteMaterialized(
   patch: ProjectionPatch,
   id: string,
   title: string,
@@ -480,11 +480,45 @@ function projectionPatchNote(
     // rather than leaving `undefined`, so this field never silently
     // reappears as "present but unset" after a spread/copy.
     heading_level: headingLevel ?? null,
+    // Issue #255 (ADR-0025 §2): a legacy `upsert_note` asserts the whole
+    // record — no block history, note active. `0` mirrors the Rust
+    // `#[serde(default)]` on a pre-#255 snapshot.
+    blocks: [],
+    valid_from_ms: patch.created_at_ms,
+    valid_until_ms: null,
     updated_by_sequence: patch.sequence,
     updated_at_ms: patch.created_at_ms,
     basis: patch.basis,
     provenance: patch.provenance,
   };
+}
+
+/**
+ * Issue #255 (ADR-0025 §2): re-derive a note's `body` from its ACTIVE
+ * blocks, joined by `\n\n` — mirrors Rust's
+ * `MaterializedNotes::sync_body_from_active_blocks` exactly. A note with no
+ * block history (absent/empty `blocks`) keeps its asserted body: block ops
+ * never ran on it, so the last `upsert_note` is still the source of truth.
+ */
+function syncNoteBodyFromActiveBlocks(note: MaterializedNote): void {
+  const blocks = note.blocks ?? [];
+  if (blocks.length === 0) return;
+  note.body = blocks
+    .filter((block) => block.valid_until_ms == null)
+    .map((block) => block.text)
+    .join("\n\n");
+}
+
+/** Issue #255: the ACTIVE note under `noteId`, or `undefined` when missing
+ * or already soft-invalidated — mirrors Rust's
+ * `MaterializedNotes::active_note_mut_or_err` guard shape. */
+function activeNote(
+  notes: MaterializedNotes,
+  noteId: string,
+): MaterializedNote | undefined {
+  return notes.notes.find(
+    (note) => note.id === noteId && note.valid_until_ms == null,
+  );
 }
 
 function applyProjectionNotesPatch(
@@ -497,9 +531,15 @@ function applyProjectionNotesPatch(
   const notes: MaterializedNotes = current
     ? {
         ...current,
+        // Issue #255: clone `blocks` (and each block object) alongside
+        // `tags`, or a block-level op below would mutate the PREVIOUS
+        // state's block rows — Rust clones the whole `MaterializedNotes`
+        // (`let mut next = self.clone()`) before any mutation, so the live
+        // reducer must never alias prior-state block objects either.
         notes: current.notes.map((note) => ({
           ...note,
           tags: [...note.tags],
+          blocks: (note.blocks ?? []).map((block) => ({ ...block })),
         })),
       }
     : {
@@ -512,7 +552,7 @@ function applyProjectionNotesPatch(
   for (const operation of patch.operations) {
     switch (operation.type) {
       case "upsert_note": {
-        const next = projectionPatchNote(
+        const next = projectionUpsertNoteMaterialized(
           patch,
           operation.id,
           operation.title,
@@ -546,6 +586,97 @@ function applyProjectionNotesPatch(
           break;
         }
         notes.notes.splice(afterIndex + 1, 0, note);
+        break;
+      }
+      // Issue #255 (ADR-0025 §2): notes-patching ops — mirrors of the Rust
+      // materializer arms in `MaterializedNotes::apply_patch`. The live path
+      // never receives these from the model today (the backend refuses them
+      // in a model-submitted draft), so the reducer is parity substrate for
+      // replayed/log events.
+      case "invalidate_note": {
+        const note = activeNote(notes, operation.id);
+        if (!note) break;
+        note.valid_until_ms = patch.created_at_ms;
+        note.updated_by_sequence = patch.sequence;
+        note.updated_at_ms = patch.created_at_ms;
+        note.basis = patch.basis;
+        note.provenance = patch.provenance;
+        break;
+      }
+      case "upsert_note_block": {
+        const note = activeNote(notes, operation.note_id);
+        if (!note) break;
+        note.blocks = note.blocks ?? [];
+        const next = {
+          block_id: operation.block_id,
+          text: operation.text,
+          valid_from_ms: patch.created_at_ms,
+          valid_until_ms: null,
+        };
+        const index = note.blocks.findIndex(
+          (block) => block.block_id === operation.block_id,
+        );
+        if (index >= 0) note.blocks[index] = next;
+        else note.blocks.push(next);
+        note.updated_by_sequence = patch.sequence;
+        note.updated_at_ms = patch.created_at_ms;
+        note.basis = patch.basis;
+        note.provenance = patch.provenance;
+        syncNoteBodyFromActiveBlocks(note);
+        break;
+      }
+      case "invalidate_note_block": {
+        const note = activeNote(notes, operation.note_id);
+        const block = note?.blocks?.find(
+          (candidate) =>
+            candidate.block_id === operation.block_id &&
+            candidate.valid_until_ms == null,
+        );
+        if (!note || !block) break;
+        block.valid_until_ms = patch.created_at_ms;
+        note.updated_by_sequence = patch.sequence;
+        note.updated_at_ms = patch.created_at_ms;
+        note.basis = patch.basis;
+        note.provenance = patch.provenance;
+        syncNoteBodyFromActiveBlocks(note);
+        break;
+      }
+      case "replace_note_text": {
+        const note = activeNote(notes, operation.note_id);
+        const block = note?.blocks?.find(
+          (candidate) =>
+            candidate.block_id === operation.block_id &&
+            candidate.valid_until_ms == null,
+        );
+        // Mirrors the Rust materializer's loud rejection exactly: an empty
+        // or non-uniquely-matching anchor refuses the edit (the Rust side
+        // rejects the WHOLE patch with `InvalidNoteTextAnchor`; a reducer
+        // cannot reject an already-emitted event, so it skips the one
+        // invalid operation instead — never applying a blind or ambiguous
+        // edit).
+        if (
+          !note ||
+          !block ||
+          operation.search === "" ||
+          block.text.split(operation.search).length !== 2
+        ) {
+          break;
+        }
+        // LITERAL splice-based replacement, mirroring Rust's
+        // `str::replacen(.., 1)` exactly: `String.prototype.replace`
+        // expands `$&`/`$'`/`$$` patterns in `replace`, silently rewriting
+        // a replacement string that happens to contain them. The anchor is
+        // unique (guard above), so `indexOf` is exact.
+        const start = block.text.indexOf(operation.search);
+        block.text =
+          block.text.slice(0, start) +
+          operation.replace +
+          block.text.slice(start + operation.search.length);
+        note.updated_by_sequence = patch.sequence;
+        note.updated_at_ms = patch.created_at_ms;
+        note.basis = patch.basis;
+        note.provenance = patch.provenance;
+        syncNoteBodyFromActiveBlocks(note);
         break;
       }
       default:
@@ -1338,6 +1469,9 @@ function sampleSessionPreviewState(language?: string) {
         title: copy.notes.setupTitle,
         body: copy.notes.setupBody,
         tags: [...copy.notes.setupTags],
+        blocks: [],
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        valid_until_ms: null,
         updated_by_sequence: 1,
         updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
         basis,
@@ -1349,6 +1483,9 @@ function sampleSessionPreviewState(language?: string) {
         body: copy.notes.retconBody,
         tags: [...copy.notes.retconTags],
         updated_by_sequence: 1,
+        blocks: [],
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        valid_until_ms: null,
         updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
         basis,
         provenance,
@@ -1359,6 +1496,9 @@ function sampleSessionPreviewState(language?: string) {
         body: copy.notes.platformBody,
         tags: [...copy.notes.platformTags],
         updated_by_sequence: 1,
+        blocks: [],
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        valid_until_ms: null,
         updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
         basis,
         provenance,

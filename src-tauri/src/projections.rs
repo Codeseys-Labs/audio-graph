@@ -2063,21 +2063,18 @@ pub enum ProjectionOperation {
     DeleteNote {
         id: String,
     },
-    /// Parity with `InvalidateGraphNode` / `InvalidateGraphEdge` (ADR-0037 part
-    /// 4) — notes previously had only a hard `DeleteNote`, with no
-    /// history-preserving retraction. Materialization currently treats this the
-    /// same as `DeleteNote` (`MaterializedNotes` carries no `valid_until_ms`
-    /// the way the graph structs do); giving notes that same soft-invalidate
-    /// temporal tracking is a separate, unscoped change (flagged, not decided
-    /// here — see audio-graph-2cf9's open questions).
+    /// Parity with `InvalidateGraphNode` / `InvalidateGraphEdge` (ADR-0037
+    /// part 4) — notes previously had only a hard `DeleteNote`, with no
+    /// history-preserving retraction. Since issue #255 (ADR-0025 §2) this
+    /// materializes as a true soft-invalidate: the note is RETAINED in
+    /// `MaterializedNotes::notes` with `valid_until_ms = patch.created_at_ms`
+    /// (mirroring `MaterializedGraph::invalidate_node` exactly), hidden from
+    /// active rendering but fully auditable in materialized state.
+    /// `DeleteNote` stays the hard removal.
     ///
     /// ADR-0037 part 4: "corrections and retractions are derived, not
     /// model-authored" — ADR-0031's pinned-revision advance is the mechanical
-    /// trigger, not free-form model judgement. Because this variant's
-    /// materialization is a hard delete with no `valid_until_ms` trace (the
-    /// unscoped gap above), a model-authored one would be an UNRECOVERABLE
-    /// hallucination rather than the auditable, reversible soft-invalidate
-    /// `InvalidateGraphNode`/`Edge` give. `projection_llm::validate_operation`
+    /// trigger, not free-form model judgement. `projection_llm::validate_operation`
     /// therefore refuses this variant in every model-submitted draft
     /// (`ProjectionPatchDraftError::DerivedOnlyOperation`); the variant stays
     /// defined here for a future ADR-0031-derived (trusted-code-only) caller,
@@ -2088,6 +2085,56 @@ pub enum ProjectionOperation {
     ReorderNote {
         id: String,
         after_id: Option<String>,
+    },
+    /// Issue #255 (ADR-0025 §2): create or full-replace ONE sub-note block on
+    /// an existing ACTIVE note. The block lands with
+    /// `valid_from_ms = patch.created_at_ms`, `valid_until_ms = None` — the
+    /// same stamping convention as `MaterializedGraph::upsert_node`. The note
+    /// must already exist and be active (there is no block-carried
+    /// `title`/`section`, so a block op can never create a note); a missing
+    /// or already-invalidated target rejects the whole patch with
+    /// [`ProjectionApplyError::MissingNoteForOperation`]. After the block
+    /// upsert, the note's `body` is re-derived from its active blocks
+    /// ([`MaterializedNotes::sync_body_from_active_blocks`]).
+    ///
+    /// Like `InvalidateNote`, this is a trusted-code-only operation today:
+    /// `projection_llm::validate_operation` refuses it in every
+    /// model-submitted draft (`DerivedOnlyOperation`) until the dedicated
+    /// prompt/schema emission ticket (#257) exposes the notes patch ops to
+    /// the model. The materializer contract itself is complete here.
+    UpsertNoteBlock {
+        note_id: String,
+        block_id: String,
+        /// Claim prose. Content-bearing: redacted in debug logs.
+        text: String,
+    },
+    /// Issue #255 (ADR-0025 §2): soft-invalidate ONE sub-note block —
+    /// `valid_until_ms = patch.created_at_ms`, mirroring
+    /// `InvalidateGraphNode`'s lean shape (no model-authored timestamp).
+    /// The block stays in `MaterializedNote::blocks` for audit but is excluded
+    /// from the derived `body`. Trusted-code-only in model drafts today, see
+    /// `UpsertNoteBlock`.
+    InvalidateNoteBlock {
+        note_id: String,
+        block_id: String,
+    },
+    /// Issue #255 (ADR-0025 §2): anchored search/replace on ONE active
+    /// block's text. The materializer REJECTS the operation — and therefore
+    /// the whole patch, all-or-nothing like every other notes op — unless
+    /// `search` is non-empty and matches EXACTLY ONE non-overlapping
+    /// occurrence in the target block's current text:
+    /// [`ProjectionApplyError::InvalidNoteTextAnchor`] carries the observed
+    /// occurrence count (0 = missing anchor, >1 = ambiguous). Never applies
+    /// a blind or ambiguous edit. Line-number edits are deliberately not
+    /// offered (ADR-0025: LLMs are unreliable at them). Trusted-code-only in
+    /// model drafts today, see `UpsertNoteBlock`.
+    ReplaceNoteText {
+        note_id: String,
+        block_id: String,
+        /// Anchor. Content-bearing: redacted in debug logs.
+        search: String,
+        /// Replacement. Content-bearing: redacted in debug logs.
+        replace: String,
     },
     UpsertGraphNode {
         id: String,
@@ -2138,13 +2185,47 @@ pub enum ProjectionOperation {
         replacement_nodes: Vec<GraphNodeDraft>,
     },
 }
-
+/// One addressable sub-note block (issue #255 / ADR-0025 §2 "sub-note
+/// blocks"): a note is a bitemporal collection of claims, the same shape as
+/// `MaterializedGraphNode` — a block is superseded (hidden from the active
+/// derived `body`, auditable in materialized state), never silently
+/// overwritten.
+///
+/// `valid_from_ms`/`valid_until_ms` follow the exact serde convention of
+/// `MaterializedGraphNode`'s temporal fields (`#[serde(default)]` for the
+/// u64, `skip_serializing_if` for the `Option`), so a pre-#255 persisted
+/// `MaterializedNote` JSON (which never carried a `blocks` key) and a
+/// post-#255 note with no block history (empty vec skipped) both
+/// deserialize byte-identically to their original shape.
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct MaterializedNote {
     pub id: String,
     pub title: String,
     pub body: String,
     pub tags: Vec<String>,
+    /// Addressable sub-note blocks (issue #255 / ADR-0025 §2). Empty on
+    /// every note materialized before this field existed and on every note
+    /// whose history is pure `UpsertNote` full-replaces (see
+    /// [`upsert_note`](MaterializedNotes::upsert_note)); the
+    /// `#[serde(default)]` + `skip_serializing_if` pair keeps both wire- and
+    /// byte-identical to the pre-#255 shape. When non-empty, the ACTIVE
+    /// blocks (see [`sync_body_from_active_blocks`]) are the source of truth
+    /// for [`body`](Self::body).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<NoteBlock>,
+    /// Note-level temporal validity (issue #255 / ADR-0025 §2), mirroring
+    /// `MaterializedGraphNode::valid_from_ms`/`valid_until_ms` exactly:
+    /// stamped from `patch.created_at_ms` by the materializer, never
+    /// model-authored. `valid_until_ms == None` = active; `Some(_)` =
+    /// soft-invalidated by [`InvalidateNote`](ProjectionOperation::InvalidateNote)
+    /// — hidden from active rendering but retained in materialized state
+    /// for audit. `0` on notes materialized before this field existed.
+    #[serde(default)]
+    pub valid_from_ms: u64,
+    /// See [`valid_from_ms`](Self::valid_from_ms). `None` on every note
+    /// materialized before this field existed and on every active note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until_ms: Option<u64>,
     pub updated_by_sequence: u64,
     pub updated_at_ms: u64,
     /// Shared, not owned per-note (audio-graph-cfa1): one `ProjectionPatch`
@@ -2189,6 +2270,9 @@ impl fmt::Debug for MaterializedNote {
             .field("title", &REDACTED_DEBUG_VALUE)
             .field("body", &REDACTED_DEBUG_VALUE)
             .field("tags", &self.tags)
+            .field("blocks", &self.blocks)
+            .field("valid_from_ms", &self.valid_from_ms)
+            .field("valid_until_ms", &self.valid_until_ms)
             .field("heading_level", &self.heading_level)
             .field("updated_by_sequence", &self.updated_by_sequence)
             .field("updated_at_ms", &self.updated_at_ms)
@@ -2281,20 +2365,36 @@ impl MaterializedNotes {
                     &basis,
                     patch,
                 ),
-                // InvalidateNote is applied identically to DeleteNote today:
-                // `MaterializedNote` carries no `valid_until_ms` the way
-                // `MaterializedGraphNode`/`Edge` do, so there is no
-                // history-preserving state to set. The variant exists for
-                // typed-operation parity with `InvalidateGraphNode`/
-                // `InvalidateGraphEdge` (ADR-0037 part 4); giving notes that
-                // same soft-invalidate temporal tracking is a separate,
-                // unscoped change (flagged, not decided here).
-                ProjectionOperation::DeleteNote { id }
-                | ProjectionOperation::InvalidateNote { id } => {
+                // InvalidateNote is a true soft-invalidate since issue #255
+                // (ADR-0025 §2): the note is retained with
+                // `valid_until_ms = patch.created_at_ms`, mirroring
+                // `MaterializedGraph::invalidate_node` — hidden from active
+                // rendering, auditable in materialized state. `DeleteNote`
+                // below stays the hard removal.
+                ProjectionOperation::DeleteNote { id } => {
                     next.notes.retain(|note| note.id != *id);
+                }
+                ProjectionOperation::InvalidateNote { id } => {
+                    next.invalidate_note(id, &basis, patch)?;
                 }
                 ProjectionOperation::ReorderNote { id, after_id } => {
                     next.reorder_note(id, after_id.as_deref())?;
+                }
+                ProjectionOperation::UpsertNoteBlock {
+                    note_id,
+                    block_id,
+                    text,
+                } => next.upsert_note_block(note_id, block_id, text, &basis, patch)?,
+                ProjectionOperation::InvalidateNoteBlock { note_id, block_id } => {
+                    next.invalidate_note_block(note_id, block_id, &basis, patch)?;
+                }
+                ProjectionOperation::ReplaceNoteText {
+                    note_id,
+                    block_id,
+                    search,
+                    replace,
+                } => {
+                    next.replace_note_text(note_id, block_id, search, replace, &basis, patch)?;
                 }
                 ProjectionOperation::UpsertGraphNode { .. }
                 | ProjectionOperation::RemoveGraphNode { .. }
@@ -2318,6 +2418,15 @@ impl MaterializedNotes {
         Ok(())
     }
 
+    /// Legacy whole-body replace. Since issue #255 this is a FULL replace of
+    /// the record exactly like every pre-#255 release: `blocks` resets to
+    /// empty (an `UpsertNote` asserts the whole body, not block structure —
+    /// block state is owned by the block ops), `valid_from_ms` re-stamps to
+    /// this patch (mirroring `MaterializedGraph::upsert_node`'s full-replace
+    /// stamping) and `valid_until_ms` clears, so an `UpsertNote` on an
+    /// invalidated id resurrects it exactly like a same-id graph upsert.
+    /// Replaying any mix of `UpsertNote` + block ops is therefore
+    /// deterministic: whichever op ran last wins its own field.
     #[allow(clippy::too_many_arguments)]
     fn upsert_note(
         &mut self,
@@ -2336,6 +2445,9 @@ impl MaterializedNotes {
             title: title.to_string(),
             body: body.to_string(),
             tags: tags.to_vec(),
+            blocks: Vec::new(),
+            valid_from_ms: patch.created_at_ms,
+            valid_until_ms: None,
             heading_level,
             updated_by_sequence: patch.sequence,
             updated_at_ms: patch.created_at_ms,
@@ -2349,6 +2461,192 @@ impl MaterializedNotes {
         } else {
             self.notes.push(next);
         }
+    }
+
+    /// Index of the note under `id` iff it exists AND is active
+    /// (`valid_until_ms == None`) — the notes-side twin of
+    /// `MaterializedGraph::active_node_index`.
+    fn active_note_index(&self, id: &str) -> Option<usize> {
+        self.notes
+            .iter()
+            .position(|note| note.id == id && note.valid_until_ms.is_none())
+    }
+
+    /// Re-stamp the note-level bookkeeping (`updated_by_sequence` /
+    /// `updated_at_ms` / `basis` / `provenance`) after a block-level op or an
+    /// `InvalidateNote`, mirroring `MaterializedGraph::invalidate_node_at`.
+    fn stamp_note(
+        note: &mut MaterializedNote,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) {
+        note.updated_by_sequence = patch.sequence;
+        note.updated_at_ms = patch.created_at_ms;
+        note.basis = Arc::clone(basis);
+        note.provenance = patch.provenance.clone();
+    }
+
+    /// Re-derive `note.body` from the note's ACTIVE blocks, joined by
+    /// `"\n\n"` (issue #255 / ADR-0025 §2). A note whose every block is
+    /// invalidated derives an empty body — the note itself is still retained
+    /// and auditable. A note with no block history keeps the `body` its last
+    /// `UpsertNote` asserted (blocks empty ⇒ no block op ever ran on it).
+    fn sync_body_from_active_blocks(note: &mut MaterializedNote) {
+        note.body = note
+            .blocks
+            .iter()
+            .filter(|block| block.valid_until_ms.is_none())
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    /// `&mut` access to the ACTIVE note under `note_id` for the block-level
+    /// operations and `InvalidateNote`, with the shared typed missing-note
+    /// error.
+    fn active_note_mut_or_err(
+        &mut self,
+        note_id: &str,
+        operation: &'static str,
+    ) -> Result<&mut MaterializedNote, ProjectionApplyError> {
+        let Some(index) = self.active_note_index(note_id) else {
+            return Err(ProjectionApplyError::MissingNoteForOperation {
+                operation,
+                note_id: note_id.to_string(),
+            });
+        };
+        Ok(&mut self.notes[index])
+    }
+
+    /// Issue #255 soft-invalidate: mirror of
+    /// `MaterializedGraph::invalidate_node` for the note itself. Rejects a
+    /// missing or already-invalidated note
+    /// ([`ProjectionApplyError::MissingNoteForOperation`]), never silently
+    /// no-ops.
+    fn invalidate_note(
+        &mut self,
+        id: &str,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) -> Result<(), ProjectionApplyError> {
+        let note = self.active_note_mut_or_err(id, "invalidate_note")?;
+        note.valid_until_ms = Some(patch.created_at_ms);
+        Self::stamp_note(note, basis, patch);
+        Ok(())
+    }
+
+    /// Issue #255 `UpsertNoteBlock` materialization: create or full-replace
+    /// one block on an ACTIVE note. Replaces by `block_id` regardless of the
+    /// existing block's active status (full-replace, mirroring
+    /// `MaterializedGraph::upsert_edge`'s find-by-id semantics) and appends
+    /// when the id is new. Always re-derives `body`.
+    fn upsert_note_block(
+        &mut self,
+        note_id: &str,
+        block_id: &str,
+        text: &str,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) -> Result<(), ProjectionApplyError> {
+        let note = self.active_note_mut_or_err(note_id, "upsert_note_block")?;
+        let next_block = NoteBlock {
+            block_id: block_id.to_string(),
+            text: text.to_string(),
+            valid_from_ms: patch.created_at_ms,
+            valid_until_ms: None,
+        };
+        match note
+            .blocks
+            .iter_mut()
+            .find(|block| block.block_id == block_id)
+        {
+            Some(existing) => *existing = next_block,
+            None => note.blocks.push(next_block),
+        }
+        Self::stamp_note(note, basis, patch);
+        Self::sync_body_from_active_blocks(note);
+        Ok(())
+    }
+
+    /// Issue #255 `InvalidateNoteBlock` materialization: soft-invalidate one
+    /// ACTIVE block (`valid_until_ms = patch.created_at_ms`), mirroring
+    /// `MaterializedGraph::invalidate_edge`. The block stays in
+    /// `MaterializedNote::blocks` for audit but drops out of the derived
+    /// `body`. Rejects a missing note, missing block, or already-invalidated
+    /// block — never silently no-ops.
+    fn invalidate_note_block(
+        &mut self,
+        note_id: &str,
+        block_id: &str,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) -> Result<(), ProjectionApplyError> {
+        let note = self.active_note_mut_or_err(note_id, "invalidate_note_block")?;
+        let Some(block) = note
+            .blocks
+            .iter_mut()
+            .find(|block| block.block_id == block_id && block.valid_until_ms.is_none())
+        else {
+            return Err(ProjectionApplyError::MissingNoteBlockForOperation {
+                operation: "invalidate_note_block",
+                note_id: note_id.to_string(),
+                block_id: block_id.to_string(),
+            });
+        };
+        block.valid_until_ms = Some(patch.created_at_ms);
+        Self::stamp_note(note, basis, patch);
+        Self::sync_body_from_active_blocks(note);
+        Ok(())
+    }
+
+    /// Issue #255 `ReplaceNoteText` materialization: anchored search/replace
+    /// on one ACTIVE block. FAILS LOUD — 0 matches or >1 matches reject the
+    /// whole patch with [`ProjectionApplyError::InvalidNoteTextAnchor`]; an
+    /// empty `search` is rejected outright (never an implicit prefix-edit);
+    /// a missing note/block or invalidated target rejects with the typed
+    /// missing-operation errors. The replacement is LITERAL
+    /// (`str::replacen`), so `replace` never rewrites anything beyond the
+    /// single matched anchor.
+    fn replace_note_text(
+        &mut self,
+        note_id: &str,
+        block_id: &str,
+        search: &str,
+        replace: &str,
+        basis: &Arc<ProjectionBasis>,
+        patch: &ProjectionPatch,
+    ) -> Result<(), ProjectionApplyError> {
+        if search.is_empty() {
+            return Err(ProjectionApplyError::InvalidNoteTextAnchor {
+                note_id: note_id.to_string(),
+                block_id: block_id.to_string(),
+                occurrences: 0,
+            });
+        }
+        let note = self.active_note_mut_or_err(note_id, "replace_note_text")?;
+        let Some(block) = note
+            .blocks
+            .iter_mut()
+            .find(|block| block.block_id == block_id && block.valid_until_ms.is_none())
+        else {
+            return Err(ProjectionApplyError::MissingNoteBlockForOperation {
+                operation: "replace_note_text",
+                note_id: note_id.to_string(),
+                block_id: block_id.to_string(),
+            });
+        };
+        let occurrences = block.text.match_indices(search).count();
+        if occurrences != 1 {
+            return Err(ProjectionApplyError::InvalidNoteTextAnchor {
+                note_id: note_id.to_string(),
+                block_id: block_id.to_string(),
+                occurrences,
+            });
+        }
+        block.text = block.text.replacen(search, replace, 1);
+        Self::stamp_note(note, basis, patch);
+        Self::sync_body_from_active_blocks(note);
+        Ok(())
     }
 
     fn reorder_note(
@@ -2709,7 +3007,10 @@ impl MaterializedGraph {
                 ProjectionOperation::UpsertNote { .. }
                 | ProjectionOperation::DeleteNote { .. }
                 | ProjectionOperation::InvalidateNote { .. }
-                | ProjectionOperation::ReorderNote { .. } => {
+                | ProjectionOperation::ReorderNote { .. }
+                | ProjectionOperation::UpsertNoteBlock { .. }
+                | ProjectionOperation::InvalidateNoteBlock { .. }
+                | ProjectionOperation::ReplaceNoteText { .. } => {
                     return Err(ProjectionApplyError::UnsupportedOperation {
                         kind: "note_operation_in_graph_patch",
                     });
@@ -4424,6 +4725,31 @@ pub enum ProjectionApplyError {
         id: String,
         after_id: String,
     },
+    /// Issue #255: a block-level op or `InvalidateNote` targeted a note that
+    /// does not exist or is already soft-invalidated.
+    MissingNoteForOperation {
+        operation: &'static str,
+        note_id: String,
+    },
+    /// Issue #255: `InvalidateNoteBlock`/`ReplaceNoteText` targeted a block
+    /// that does not exist on the note or is already invalidated.
+    MissingNoteBlockForOperation {
+        operation: &'static str,
+        note_id: String,
+        block_id: String,
+    },
+    /// Issue #255 (ADR-0025 §2): `ReplaceNoteText`'s anchor did not match
+    /// EXACTLY ONE non-overlapping occurrence in the target block's active
+    /// text. `occurrences` is the observed count: 0 = missing anchor, >1 =
+    /// ambiguous anchor. The whole patch is rejected; nothing is applied.
+    /// Deliberately carries NO anchor text (`search`) — the error is logged,
+    /// and transcript-derived prose never enters the log (see
+    /// `DebugProjectionOperation`'s redaction posture).
+    InvalidNoteTextAnchor {
+        note_id: String,
+        block_id: String,
+        occurrences: usize,
+    },
     StaleBasis {
         staleness: ProjectionBasisStaleness,
     },
@@ -5782,6 +6108,37 @@ mod tests {
         assert!(!debug.contains("Decision"));
         assert!(!debug.contains("SENSITIVE NOTE BODY"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    /// Issue #255 (ADR-0025 §2): a Notes-kind patch carrying arbitrary
+    /// operations, for the block-op tests below (`notes_patch` only builds
+    /// an `UpsertNote`).
+    fn notes_patch_with_operations(
+        sequence: u64,
+        operations: Vec<ProjectionOperation>,
+    ) -> ProjectionPatch {
+        let event = TranscriptEvent::from(asr_payload("span-block", sequence, "block basis"));
+        ProjectionPatch {
+            route: None,
+            sequence,
+            kind: ProjectionKind::Notes,
+            llm_request_id: format!("llm-block-req-{sequence}"),
+            basis: ProjectionBasis::from_transcript_events(&[event]),
+            operations,
+            confidence: 0.86,
+            provenance: ProjectionProvenance {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4".to_string(),
+                prompt_id: "notes-v1".to_string(),
+                route_id: None,
+                model_source: crate::llm::route::ModelIdentitySource::Requested,
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            basis_currency_at_apply: None,
+            created_at_ms: 1_700_000_000_300 + sequence,
+        }
     }
 
     #[test]

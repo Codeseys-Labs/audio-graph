@@ -229,7 +229,13 @@ export default function NotesPanel({
     };
   }, [segments, graph]);
 
-  const liveNotes = materializedNotes?.notes ?? [];
+  // Issue #255 (ADR-0025 §2): a soft-invalidated note (`valid_until_ms`
+  // set by an `invalidate_note` op) is hidden from the live panel but
+  // stays auditable in materialized state — hidden-but-auditable, the same
+  // posture as the graph lens's invalidated nodes.
+  const liveNotes = (materializedNotes?.notes ?? []).filter(
+    (note) => note.valid_until_ms == null,
+  );
   const noteRevisionCounts = useMemo(
     () => notePatchRevisionCounts(projectionEvents),
     [projectionEvents],

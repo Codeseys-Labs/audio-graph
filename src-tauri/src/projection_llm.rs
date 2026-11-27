@@ -2242,6 +2242,18 @@ fn validate_operation(
                 operation: operation_name(operation),
             })
         }
+        // Issue #255 (ADR-0025 §2): the notes-patching operations are
+        // trusted-code-only in model drafts until the dedicated prompt/schema
+        // emission ticket (#257) exposes them to the model; refuse them
+        // wholesale here, exactly like `InvalidateNote` above. The
+        // materializer contract itself lives in `projections.rs`.
+        ProjectionOperation::UpsertNoteBlock { .. }
+        | ProjectionOperation::InvalidateNoteBlock { .. }
+        | ProjectionOperation::ReplaceNoteText { .. } => {
+            Err(ProjectionPatchDraftError::DerivedOnlyOperation {
+                operation: operation_name(operation),
+            })
+        }
         ProjectionOperation::ReorderNote { id, .. } => require_non_empty(operation, "id", id),
         ProjectionOperation::UpsertGraphNode {
             id,
@@ -2408,7 +2420,11 @@ fn operation_kind(operation: &ProjectionOperation) -> ProjectionKind {
         ProjectionOperation::UpsertNote { .. }
         | ProjectionOperation::DeleteNote { .. }
         | ProjectionOperation::InvalidateNote { .. }
-        | ProjectionOperation::ReorderNote { .. } => ProjectionKind::Notes,
+        | ProjectionOperation::ReorderNote { .. }
+        // Issue #255 (ADR-0025 §2) notes-patching ops are Notes-kind.
+        | ProjectionOperation::UpsertNoteBlock { .. }
+        | ProjectionOperation::InvalidateNoteBlock { .. }
+        | ProjectionOperation::ReplaceNoteText { .. } => ProjectionKind::Notes,
         ProjectionOperation::UpsertGraphNode { .. }
         | ProjectionOperation::RemoveGraphNode { .. }
         | ProjectionOperation::InvalidateGraphNode { .. }
@@ -2428,6 +2444,9 @@ fn operation_name(operation: &ProjectionOperation) -> &'static str {
         ProjectionOperation::DeleteNote { .. } => "delete_note",
         ProjectionOperation::InvalidateNote { .. } => "invalidate_note",
         ProjectionOperation::ReorderNote { .. } => "reorder_note",
+        ProjectionOperation::UpsertNoteBlock { .. } => "upsert_note_block",
+        ProjectionOperation::InvalidateNoteBlock { .. } => "invalidate_note_block",
+        ProjectionOperation::ReplaceNoteText { .. } => "replace_note_text",
         ProjectionOperation::UpsertGraphNode { .. } => "upsert_graph_node",
         ProjectionOperation::RemoveGraphNode { .. } => "remove_graph_node",
         ProjectionOperation::InvalidateGraphNode { .. } => "invalidate_graph_node",
@@ -2447,6 +2466,11 @@ fn operation_identity(operation: &ProjectionOperation) -> (&'static str, &str) {
         | ProjectionOperation::DeleteNote { id }
         | ProjectionOperation::InvalidateNote { id }
         | ProjectionOperation::ReorderNote { id, .. } => ("note", id.as_str()),
+        // Issue #255: block ops identity on the target note (unreachable in
+        // model drafts — see `validate_operation`'s refusal below).
+        ProjectionOperation::UpsertNoteBlock { note_id, .. }
+        | ProjectionOperation::InvalidateNoteBlock { note_id, .. }
+        | ProjectionOperation::ReplaceNoteText { note_id, .. } => ("note", note_id.as_str()),
         ProjectionOperation::UpsertGraphNode { id, .. }
         | ProjectionOperation::RemoveGraphNode { id }
         | ProjectionOperation::InvalidateGraphNode { id }

@@ -8971,7 +8971,10 @@ fn projection_replay_evaluation_metrics(
                 crate::projections::ProjectionOperation::UpsertNote { .. }
                 | crate::projections::ProjectionOperation::DeleteNote { .. }
                 | crate::projections::ProjectionOperation::InvalidateNote { .. }
-                | crate::projections::ProjectionOperation::ReorderNote { .. } => {
+                | crate::projections::ProjectionOperation::ReorderNote { .. }
+                | crate::projections::ProjectionOperation::UpsertNoteBlock { .. }
+                | crate::projections::ProjectionOperation::InvalidateNoteBlock { .. }
+                | crate::projections::ProjectionOperation::ReplaceNoteText { .. } => {
                     note_operation_count += 1;
                 }
                 crate::projections::ProjectionOperation::UpsertGraphNode { .. }
@@ -15155,6 +15158,9 @@ mod tests {
             title: "Stale title".to_string(),
             body: "Stale materialized note should not survive replay repair.".to_string(),
             tags: vec!["stale".to_string()],
+            blocks: Vec::new(),
+            valid_from_ms: 1,
+            valid_until_ms: None,
             heading_level: None,
             updated_by_sequence: 0,
             updated_at_ms: 1,
@@ -23361,7 +23367,10 @@ mod tests {
                 title: title.to_string(),
                 body: "irrelevant body text".to_string(),
                 tags: vec![],
+                blocks: Vec::new(),
+                valid_from_ms: 1_700_000_000_000,
                 heading_level: *heading_level,
+                valid_until_ms: None,
                 updated_by_sequence: 1,
                 updated_at_ms: 1_700_000_000_000,
                 basis: std::sync::Arc::new(

@@ -403,6 +403,11 @@ export function notesToOutline(
   ];
 
   for (const note of notes.notes) {
+    // Issue #255 (ADR-0025 §2): a soft-invalidated note is hidden from the
+    // live outline (its `valid_until_ms` is set) but stays auditable in
+    // materialized state — same hidden-but-auditable posture as the graph's
+    // invalidated nodes in `materializedGraph.ts`.
+    if (note.valid_until_ms != null) continue;
     const headingLevel =
       note.heading_level != null ? clampHeadingLevel(note.heading_level) : null;
     if (headingLevel !== null) {
