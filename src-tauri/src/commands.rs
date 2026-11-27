@@ -9262,7 +9262,10 @@ fn projection_replay_report_for_session(session_id: &str) -> AppResult<Projectio
         &data_root,
         session_id,
         crate::persistence::session_semantics::SessionSemanticsVersion::V1,
-        |_admitted| projection_replay_report_for_admitted_session(session_id),
+        |_admitted| {
+            indexed_session_paths_resolve_only(session_id)?;
+            projection_replay_report_for_admitted_session(session_id)
+        },
     )
     .map_err(unadmitted_session_error)
 }
@@ -9440,26 +9443,9 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
 fn indexed_session_paths_resolve_only(
     session_id: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    validate_session_id(session_id)?;
-    if let Some(metadata) = crate::sessions::find_session_resolve_only(session_id) {
-        let root = crate::user_data::resolve_data_root()?;
-        let transcript = if metadata.transcript_path.trim().is_empty() {
-            root.join("transcripts").join(format!("{session_id}.jsonl"))
-        } else {
-            std::path::PathBuf::from(metadata.transcript_path)
-        };
-        let graph = if metadata.graph_path.trim().is_empty() {
-            root.join("graphs").join(format!("{session_id}.json"))
-        } else {
-            std::path::PathBuf::from(metadata.graph_path)
-        };
-        return Ok((transcript, graph));
-    }
     let root = crate::user_data::resolve_data_root()?;
-    Ok((
-        root.join("transcripts").join(format!("{session_id}.jsonl")),
-        root.join("graphs").join(format!("{session_id}.json")),
-    ))
+    let entry = crate::sessions::find_session_resolve_only(session_id);
+    crate::sessions::resolve_indexed_session_paths(&root, session_id, entry.as_ref())
 }
 
 struct SessionTranscriptSnapshot {
@@ -9503,47 +9489,14 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
 /// Read one past Session's transcript through the guarded compatibility-floor
 /// admission seam (ADR-0044 §5, seed audio-graph-e8e7).
 ///
-/// This is the shared canonical-versus-legacy fork for `load_session_impl`,
-/// `load_session_transcript`, and `session_export_bundle`, so gating it gates the
-/// transcript read of all three. Both branches of the fork run INSIDE the admitted
-/// floor: neither the canonical replay nor the legacy JSONL fallback can observe
-/// bytes of a Session whose floor this reader does not support.
-///
-/// CONSTRAINT the code cannot show: this is NOT every production read of canonical
-/// Session content. `projection_replay_report_for_session` and `session_timeline`
-/// call `load_transcript_event_stream` with no floor check, and the
-/// speaker-revision / projection-patch / materialized / live-assist reads inside
-/// `load_session_impl` and `session_export_bundle` happen outside this closure.
-/// Harmless only while nothing writes v2; the seed that activates a v2 writer owns
-/// routing them through here (report residual R8).
-///
-/// `maximum_supported` is v1 because this reader understands only v1 transcript
-/// semantics. Raising it belongs to whichever workstream activates v2 transcript
-/// revisions.
+/// Standalone transcript reads admit the floor here. Review and bundle export
+/// call the admitted reader directly while holding their snapshot guard across
+/// the transcript fork and all side reads.
 fn read_session_transcript_snapshot(
     repository: &FileMemoryRepository,
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
     validate_session_id(session_id)?;
-    // Byte ceiling (seed audio-graph-4fa5): stat before ever reading the
-    // canonical transcript event log into memory. The 2.1MB transcript that
-    // must keep loading sits far under this. Unlike the three SIDE artifacts
-    // `load_session_impl` degrades on a ceiling violation (live graph,
-    // diarization log, live-assist cards — see the comments there), this
-    // artifact IS the transcript lens's own content: there is no reasonable
-    // "missing" fallback for an oversized transcript, so exceeding this
-    // ceiling still fails the whole read, same as before this fix round.
-    // Collapsing to a `String` here (rather than propagating
-    // `AppError::ArtifactTooLarge` intact) trades away the typed refusal
-    // notice for this one artifact — accepted because the transcript lens
-    // has no dedicated refusal-notice UI the way the Notes/Graph lenses do,
-    // not because this path is expected to fail in practice.
-    enforce_artifact_ceiling(
-        &crate::user_data::resolve_transcript_events_path(session_id)?,
-        MAX_TRANSCRIPT_EVENTS_BYTES,
-        "transcript_events",
-    )
-    .map_err(|error| error.to_string())?;
     let data_root = crate::user_data::resolve_data_root()?;
     crate::persistence::session_semantics::open_session_for_content(
         &data_root,
@@ -9558,6 +9511,14 @@ fn read_admitted_session_transcript_snapshot(
     repository: &FileMemoryRepository,
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
+    // The transcript is primary content: unlike supplementary artifacts in
+    // Review, an oversized transcript cannot degrade to an empty result.
+    enforce_artifact_ceiling(
+        &crate::user_data::resolve_transcript_events_path(session_id)?,
+        MAX_TRANSCRIPT_EVENTS_BYTES,
+        "transcript_events",
+    )
+    .map_err(|error| error.to_string())?;
     match repository.load_transcript_event_stream(session_id)? {
         crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
             Ok(SessionTranscriptSnapshot {
@@ -9662,14 +9623,27 @@ fn load_session_data_movement_impl(
     // into the ledgers directory (audio-graph-e692). Mirrors every sibling
     // session command, which all validate first.
     validate_session_id(&session_id)?;
+    let data_root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        &session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| load_session_data_movement_for_admitted_session(&session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn load_session_data_movement_for_admitted_session(
+    session_id: &str,
+) -> AppResult<Vec<crate::persistence::DataMovementEvent>> {
     let read_start = std::time::Instant::now();
     let ledger_bytes = enforce_artifact_ceiling(
-        &crate::user_data::resolve_data_movement_ledger_path(&session_id)?,
+        &crate::user_data::resolve_data_movement_ledger_path(session_id)?,
         MAX_DATA_MOVEMENT_EVENTS_BYTES,
         "data_movement_events",
     )?;
     let events = FileMemoryRepository::user_data()
-        .load_data_movement_event_stream(&session_id)
+        .load_data_movement_event_stream(session_id)
         .map(crate::persistence::canonical_reader::StrictCanonicalRead::into_payloads)
         .map_err(AppError::from)?;
     let response_bytes = response_len_for_log(&events);
@@ -9726,8 +9700,19 @@ pub async fn load_session(session_id: String) -> AppResult<LoadedSession> {
 /// Read-only implementation of [`load_session`].
 fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     validate_session_id(&session_id)?;
-    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(&session_id)?;
-    if !session_has_any_artifact(&session_id)? {
+    let data_root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::open_session_for_content(
+        &data_root,
+        &session_id,
+        crate::persistence::session_semantics::SessionSemanticsVersion::V1,
+        |_admitted| load_session_for_admitted_session(&session_id),
+    )
+    .map_err(unadmitted_session_error)
+}
+
+fn load_session_for_admitted_session(session_id: &str) -> AppResult<LoadedSession> {
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
+    if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
@@ -9735,15 +9720,15 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     let read_start = std::time::Instant::now();
     let repository = FileMemoryRepository::user_data();
     let transcript_bytes = artifact_len_for_log(
-        &crate::user_data::resolve_transcript_events_path(&session_id).unwrap_or_default(),
+        &crate::user_data::resolve_transcript_events_path(session_id).unwrap_or_default(),
     );
-    let transcript_snapshot = read_session_transcript_snapshot(&repository, &session_id)?;
+    let transcript_snapshot = read_admitted_session_transcript_snapshot(&repository, session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
     // `load_session` bundles several artifacts behind one response, all
     // gated by `?` — but only `transcript`/`transcript_events` (via
-    // `read_session_transcript_snapshot` above) is the artifact this command
+    // `read_admitted_session_transcript_snapshot` above) is the artifact this command
     // exists to keep loading no matter what. The three side artifacts below
     // (live graph, diarization log, live-assist cards) degrade to their
     // "missing" fallback — logging a warning, never a silent no-op — rather
@@ -9789,15 +9774,15 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     // diarization rows loads an empty vec — same fallback an oversized log
     // degrades to (see the comment above `live_graph_ceiling`).
     let diarization_ceiling = enforce_artifact_ceiling(
-        &crate::user_data::resolve_diarization_events_path(&session_id)?,
+        &crate::user_data::resolve_diarization_events_path(session_id)?,
         MAX_DIARIZATION_EVENTS_BYTES,
         "diarization_events",
     );
     let (diarization_bytes, diarization_events) = match diarization_ceiling {
         Ok(bytes) => {
             let events = repository
-                .load_speaker_revision_stream(&session_id)?
-                .speaker_history(&session_id)?
+                .load_speaker_revision_stream(session_id)?
+                .speaker_history(session_id)?
                 .unwrap_or_default();
             (bytes, events)
         }
@@ -9814,12 +9799,12 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
         Err(other) => return Err(other),
     };
     let live_assist_ceiling = enforce_artifact_ceiling(
-        &crate::user_data::resolve_live_assist_current_path(&session_id)?,
+        &crate::user_data::resolve_live_assist_current_path(session_id)?,
         MAX_LIVE_ASSIST_CARDS_BYTES,
         "live_assist_cards",
     );
     let (live_assist_bytes, live_assist_cards) = match live_assist_ceiling {
-        Ok(bytes) => (bytes, repository.load_live_assist_cards(&session_id)?),
+        Ok(bytes) => (bytes, repository.load_live_assist_cards(session_id)?),
         Err(AppError::ArtifactTooLarge {
             size_bytes,
             ceiling_bytes,
@@ -9835,7 +9820,7 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     // Replay validates the persisted transcript history before returning it,
     // but the historical ledger is never installed into live AppState.
     let _validated_ledger =
-        crate::projections::TranscriptLedger::replay(&session_id, transcript_events.clone())
+        crate::projections::TranscriptLedger::replay(session_id, transcript_events.clone())
             .map_err(|e| {
                 format!(
                     "Failed to replay transcript ledger for session {}: {:?}",
@@ -10131,7 +10116,27 @@ fn load_session_graph_artifact_for_admitted_session(
     Ok(materialized_graph)
 }
 
-/// Assemble the version-1 core [`SessionExportBundle`] from durable artifacts.
+/// A portable export extends the legacy core wire shape only when the
+/// admitted session has control-plane evidence or residue to report.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionExportWithControlPlane {
+    #[serde(flatten)]
+    core: SessionExportBundle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_plane: Option<crate::persistence::session_semantics::SessionControlPlaneExport>,
+}
+
+impl std::ops::Deref for SessionExportWithControlPlane {
+    type Target = SessionExportBundle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+const CONTROL_PLANE_EXPORT_SCHEMA_VERSION: u32 = 2;
+
+/// Assemble the portable session bundle, including available control evidence.
 /// Usage, scheduler, live-assist audit, and data-movement records remain outside
 /// this schema until the one typed artifact manifest in ADR-0027 is complete.
 ///
@@ -10161,9 +10166,25 @@ fn load_session_graph_artifact_for_admitted_session(
 /// the user is a product decision, not a mechanical fix, and is out of scope
 /// for this unit — flagged as a seed-worthy follow-up rather than silently
 /// left broken.
-fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
+fn session_export_bundle(session_id: &str) -> AppResult<SessionExportWithControlPlane> {
     validate_session_id(session_id)?;
+    let data_root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::open_v1_session_for_export(
+        &data_root,
+        session_id,
+        |error| AppError::SessionInvalid {
+            reason: format!("Session control-plane export refused: {error:?}"),
+        },
+        |control_plane| session_export_for_admitted_session(&data_root, session_id, control_plane),
+    )
+    .map_err(unadmitted_session_error)
+}
 
+fn session_export_for_admitted_session(
+    data_root: &std::path::Path,
+    session_id: &str,
+    control_plane: Option<crate::persistence::session_semantics::SessionControlPlaneExport>,
+) -> AppResult<SessionExportWithControlPlane> {
     if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
@@ -10171,9 +10192,11 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     }
 
     let read_start = std::time::Instant::now();
-    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
+    let metadata = crate::sessions::find_session_resolve_only(session_id);
+    let (_transcript_path, graph_path) =
+        crate::sessions::resolve_indexed_session_paths(data_root, session_id, metadata.as_ref())?;
     let repository = FileMemoryRepository::user_data();
-    let transcript_snapshot = read_session_transcript_snapshot(&repository, session_id)?;
+    let transcript_snapshot = read_admitted_session_transcript_snapshot(&repository, session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
@@ -10217,17 +10240,24 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     )?;
     let materialized_graph = repository.load_materialized_graph(session_id)?;
 
-    let bundle = SessionExportBundle {
-        schema_version: SESSION_EXPORT_SCHEMA_VERSION,
-        session_id: session_id.to_string(),
-        metadata: crate::sessions::find_session_resolve_only(session_id),
-        transcript,
-        transcript_events,
-        diarization_events,
-        projection_events,
-        notes,
-        materialized_graph,
-        graph,
+    let bundle = SessionExportWithControlPlane {
+        core: SessionExportBundle {
+            schema_version: if control_plane.is_some() {
+                CONTROL_PLANE_EXPORT_SCHEMA_VERSION
+            } else {
+                SESSION_EXPORT_SCHEMA_VERSION
+            },
+            session_id: session_id.to_string(),
+            metadata,
+            transcript,
+            transcript_events,
+            diarization_events,
+            projection_events,
+            notes,
+            materialized_graph,
+            graph,
+        },
+        control_plane,
     };
     let response_bytes = response_len_for_log(&bundle);
     let elapsed_ms = read_start.elapsed().as_millis();
@@ -10242,11 +10272,9 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     Ok(bundle)
 }
 
-/// Export the version-1 portable core session bundle: transcript segments +
-/// transcript event log + diarization event log + projection event log +
-/// materialized notes + materialized graph + legacy graph snapshot, plus a
-/// schema version and index metadata. This is not yet the complete typed
-/// artifact export required by ADR-0027.
+/// Export the portable core session bundle: transcript segments, transcript
+/// events, speaker revisions, projection patches, notes, and graph snapshots.
+/// When present, include Session-owned control evidence, never the store lock.
 ///
 /// This is the session-level counterpart to the in-memory `export_transcript`
 /// / `export_graph` commands: it works on any on-disk session (not just the
@@ -10256,7 +10284,7 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
 /// `async fn` (seed audio-graph-e8a5): disk I/O now runs off the win32
 /// message-pump thread instead of inline in the IPC handler.
 #[tauri::command]
-pub async fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundle> {
+pub async fn export_session_bundle(session_id: String) -> AppResult<SessionExportWithControlPlane> {
     session_export_bundle(&session_id)
 }
 

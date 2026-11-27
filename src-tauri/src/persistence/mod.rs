@@ -1361,20 +1361,28 @@ impl LocalMemoryRepository for FileMemoryRepository {
         session_id: &str,
     ) -> Result<Vec<SessionArtifactDescriptor>, String> {
         match self.explicit_root() {
-            Some(_) => {
+            Some(root) => {
+                let entry = load_session_index_from_path(&root.join("sessions.json"))?
+                    .into_iter()
+                    .find(|entry| entry.id == session_id);
+                let (transcript, graph) = crate::sessions::resolve_indexed_session_paths(
+                    root,
+                    session_id,
+                    entry.as_ref(),
+                )?;
                 let mut artifacts = Vec::new();
-                if let Some(entry) = self.find_session(session_id)? {
+                if entry.is_some() {
                     push_unique_file_artifact(
                         &mut artifacts,
                         SessionArtifactKind::LegacyTranscript,
                         "Indexed transcript artifact",
-                        PathBuf::from(entry.transcript_path),
+                        transcript,
                     );
                     push_unique_file_artifact(
                         &mut artifacts,
                         SessionArtifactKind::LegacyGraph,
                         "Indexed graph artifact",
-                        PathBuf::from(entry.graph_path),
+                        graph,
                     );
                 }
                 for artifact in self.default_artifact_descriptors(session_id)? {
@@ -1389,16 +1397,18 @@ impl LocalMemoryRepository for FileMemoryRepository {
                 }
                 Ok(artifacts)
             }
-            None => Ok(crate::sessions::session_artifact_paths_for_id(session_id)
-                .into_iter()
-                .map(|path| {
-                    SessionArtifactDescriptor::file(
-                        SessionArtifactKind::RepositoryRecord,
-                        "User data file artifact",
-                        path,
-                    )
-                })
-                .collect()),
+            None => Ok(
+                crate::sessions::session_artifact_paths_for_id_resolve_only(session_id)?
+                    .into_iter()
+                    .map(|path| {
+                        SessionArtifactDescriptor::file(
+                            SessionArtifactKind::RepositoryRecord,
+                            "User data file artifact",
+                            path,
+                        )
+                    })
+                    .collect(),
+            ),
         }
     }
 
