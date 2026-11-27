@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream generations — instead of ending the session; recovery transitions are
   logged and reported as anonymous capture telemetry.
 - Name, merge, or unbind session speaker clusters with durable atomic relabels; local clustering now distinguishes capture sources.
+- Speaker identity panel (#340): name, claim ("This is me"), merge, or unbind session speaker clusters from the live/review workspace, plus a `self_display_name` setting backing the self-claim.
 - Backend-only decision-engine registry and opt-in Laya ONNX inference using the
   existing app-data model cache. Includes calibrated probabilities, state
   windowing, Unicode-script routing, Python-reference fixtures, and a native

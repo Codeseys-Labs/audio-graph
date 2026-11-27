@@ -195,6 +195,7 @@
     "fields": {
       "captureSampleRate": "Capture Sample Rate",
       "captureChannels": "Capture Channels",
+      "selfDisplayName": "Your Display Name (Speaker)",
       "whisperModelSize": "Whisper Model Size",
       "endpoint": "Endpoint URL",
       "apiKey": "API Key",
@@ -306,6 +307,7 @@
     },
     "hints": {
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
+      "selfDisplayName": "Used by “This is me” in the Speaker identity panel to label your own speech.",
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
       "deepgramMaxSpeakers": "Caps distinct Deepgram diarization speakers; 0 = no cap (raw Deepgram). The local Sortformer engine is fixed at 4.",
       "diarizationOverrideActive": "The global Speaker count setting (Fixed or Unbounded) currently overrides this provider cap.",
@@ -1514,6 +1516,33 @@
     "label": "Detected speakers",
     "empty": "No speakers detected yet",
     "talkTime": "{{duration}} · {{count}} segments"
+  },
+  "speakerIdentity": {
+    "title": "Speaker identity",
+    "label": "Speaker identity",
+    "empty": "No speaker clusters in this session yet",
+    "noSession": "Start or load a session to name its speakers",
+    "spans": "{{count}} spans",
+    "suggestedSelf": "Suggested as you",
+    "state": {
+      "anonymous": "Anonymous",
+      "suggested": "Suggested",
+      "bound": "Bound",
+      "userConfirmed": "Confirmed"
+    },
+    "rename": "Rename",
+    "renamePrompt": "New name for {{label}}",
+    "renameSave": "Save name",
+    "renameCancel": "Cancel",
+    "renameEmpty": "Enter a name before saving",
+    "renamed": "Renamed to {{label}}",
+    "thisIsMe": "This is me",
+    "markedSelf": "Marked as you",
+    "sameAsPrompt": "Same as which other speaker?",
+    "merge": "Merge",
+    "merged": "Clusters merged",
+    "unbind": "Not this person",
+    "unbound": "Binding removed"
   },
   "notifications": {
     "dismiss": "Dismiss notification",

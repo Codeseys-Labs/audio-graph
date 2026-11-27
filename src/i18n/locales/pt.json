@@ -195,6 +195,7 @@
     "fields": {
       "captureSampleRate": "Taxa de Amostragem de Captura",
       "captureChannels": "Canais de Captura",
+      "selfDisplayName": "Seu Nome de Exibição (Falante)",
       "whisperModelSize": "Tamanho do Modelo Whisper",
       "endpoint": "URL do Endpoint",
       "apiKey": "Chave API",
@@ -306,6 +307,7 @@
     },
     "hints": {
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
+      "selfDisplayName": "Usado por “Sou eu” no painel de identidade do falante para rotular sua própria fala.",
       "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
       "deepgramMaxSpeakers": "Limita os falantes distintos da diarização Deepgram; 0 = sem limite (Deepgram bruto). O mecanismo local Sortformer é fixo em 4.",
       "diarizationOverrideActive": "A configuração global de Contagem de falantes (Máximo fixo ou Sem limite) está substituindo este limite do provedor.",
@@ -1514,6 +1516,33 @@
     "label": "Falantes detectados",
     "empty": "Nenhum falante detectado ainda",
     "talkTime": "{{duration}} · {{count}} segmentos"
+  },
+  "speakerIdentity": {
+    "title": "Identidade do falante",
+    "label": "Identidade do falante",
+    "empty": "Ainda não há clusters de falantes nesta sessão",
+    "noSession": "Inicie ou carregue uma sessão para nomear seus falantes",
+    "spans": "{{count}} segmentos de fala",
+    "suggestedSelf": "Sugerido como você",
+    "state": {
+      "anonymous": "Anônimo",
+      "suggested": "Sugerido",
+      "bound": "Vinculado",
+      "userConfirmed": "Confirmado"
+    },
+    "rename": "Renomear",
+    "renamePrompt": "Novo nome para {{label}}",
+    "renameSave": "Salvar nome",
+    "renameCancel": "Cancelar",
+    "renameEmpty": "Digite um nome antes de salvar",
+    "renamed": "Renomeado para {{label}}",
+    "thisIsMe": "Sou eu",
+    "markedSelf": "Marcado como você",
+    "sameAsPrompt": "Mesmo que qual outro falante?",
+    "merge": "Mesclar",
+    "merged": "Clusters mesclados",
+    "unbind": "Não é esta pessoa",
+    "unbound": "Vínculo removido"
   },
   "notifications": {
     "dismiss": "Dispensar notificação",

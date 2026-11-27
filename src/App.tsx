@@ -99,8 +99,8 @@ import ResizeDivider from "./components/ResizeDivider";
 // chunk; verified via `bun run build:analyze`.
 import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
+import SpeakerIdentityPanel from "./components/SpeakerIdentityPanel";
 import SpeakerPanel from "./components/SpeakerPanel";
-// Living document (ticket W5, synthesis audio-graph-a6b5): replaces
 // `NotesPanel` as the document tile's body. `useLiveDocumentModel()` folds
 // ONCE per render here so `LiveDocumentHeaderActions` (mounted in the
 // tile's `headerSlot`) and `LiveDocument` (the tile's body) share the
@@ -544,6 +544,10 @@ function ShellRailContentAside({
         >
           <AudioSourceSelector />
           {asidePinned && <SpeakerPanel />}
+          {/* #340: per-cluster manual identity edits (rename / this is me /
+              same as / not this person) below the passive speaker roster.
+              Same `asidePinned` gating as `SpeakerPanel` above. */}
+          {asidePinned && <SpeakerIdentityPanel />}
         </aside>
       ) : (
         <div className="shell-drawer-trigger shell-drawer-trigger--rail">
@@ -1325,6 +1329,8 @@ function App() {
           onClose={closeSpeakersDrawer}
         >
           <SpeakerPanel />
+          {/* #340: the same identity panel the wide-tier aside pins inline. */}
+          <SpeakerIdentityPanel />
         </ShellDrawer>
       )}
 
