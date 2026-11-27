@@ -78,7 +78,7 @@ pub struct AudioFeatures {
 /// A known speaker profile, accumulated over time.
 #[derive(Debug, Clone)]
 pub struct SpeakerProfile {
-    simple_source_id: Option<String>,
+    source_id: String,
     /// Unique identifier (e.g. `"speaker-1"`).
     pub id: String,
     /// Human-readable label (e.g. `"Speaker A"`).
@@ -471,8 +471,10 @@ impl DiarizationWorker {
 
             // Map the Sortformer speaker_id (0..3) to our internal speaker tracking.
             let speaker_idx = match speaker_id {
-                Some(sid) => self.get_or_create_sortformer_speaker(sid),
-                None => self.get_or_create_unknown_speaker(),
+                Some(sid) => {
+                    self.get_or_create_sortformer_speaker(sid, &input.transcript.source_id)
+                }
+                None => self.get_or_create_unknown_speaker(&input.transcript.source_id),
             };
 
             // Update stats for this speaker
@@ -531,10 +533,14 @@ impl DiarizationWorker {
     /// Get or create a speaker profile for a Sortformer speaker ID (0-based).
     /// Maps Sortformer IDs (0..3) to stable "Speaker A".."Speaker D" labels.
     #[allow(dead_code)] // Used when `diarization` feature is enabled
-    fn get_or_create_sortformer_speaker(&mut self, sortformer_id: usize) -> usize {
+    fn get_or_create_sortformer_speaker(&mut self, sortformer_id: usize, source_id: &str) -> usize {
         let target_id = format!("speaker-sf-{}", sortformer_id);
 
-        if let Some(idx) = self.speakers.iter().position(|s| s.id == target_id) {
+        if let Some(idx) = self
+            .speakers
+            .iter()
+            .position(|s| s.id == target_id && s.source_id == source_id)
+        {
             return idx;
         }
 
@@ -542,7 +548,7 @@ impl DiarizationWorker {
         let color_idx = sortformer_id % SPEAKER_COLORS.len();
 
         let profile = SpeakerProfile {
-            simple_source_id: None,
+            source_id: source_id.to_owned(),
             id: target_id,
             label: format!("Speaker {}", letter),
             color: SPEAKER_COLORS[color_idx].to_string(),
@@ -563,15 +569,19 @@ impl DiarizationWorker {
 
     /// Get or create an "Unknown" speaker for when Sortformer returns no segments.
     #[allow(dead_code)] // Used when `diarization` feature is enabled
-    fn get_or_create_unknown_speaker(&mut self) -> usize {
+    fn get_or_create_unknown_speaker(&mut self, source_id: &str) -> usize {
         let target_id = "speaker-unknown";
 
-        if let Some(idx) = self.speakers.iter().position(|s| s.id == target_id) {
+        if let Some(idx) = self
+            .speakers
+            .iter()
+            .position(|s| s.id == target_id && s.source_id == source_id)
+        {
             return idx;
         }
 
         let profile = SpeakerProfile {
-            simple_source_id: None,
+            source_id: source_id.to_owned(),
             id: target_id.to_string(),
             label: "Unknown".to_string(),
             color: "#888888".to_string(),
@@ -694,7 +704,7 @@ impl DiarizationWorker {
             .speakers
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.simple_source_id.as_deref() == Some(source_id))
+            .filter(|(_, s)| s.features.is_some() && s.source_id == source_id)
             .collect();
 
         if simple_speakers.is_empty() {
@@ -745,7 +755,7 @@ impl DiarizationWorker {
         let color_idx = (num - 1) % SPEAKER_COLORS.len();
 
         let profile = SpeakerProfile {
-            simple_source_id: Some(source_id.to_owned()),
+            source_id: source_id.to_owned(),
             id: format!("speaker-{}", num),
             label: format!("Speaker {}", num),
             color: SPEAKER_COLORS[color_idx].to_string(),
@@ -1361,9 +1371,9 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
 
-        let idx_a = worker.get_or_create_sortformer_speaker(0);
-        let idx_b = worker.get_or_create_sortformer_speaker(1);
-        let idx_a2 = worker.get_or_create_sortformer_speaker(0); // same speaker
+        let idx_a = worker.get_or_create_sortformer_speaker(0, "mic");
+        let idx_b = worker.get_or_create_sortformer_speaker(1, "mic");
+        let idx_a2 = worker.get_or_create_sortformer_speaker(0, "mic"); // same speaker
 
         assert_eq!(worker.speakers[idx_a].label, "Speaker A");
         assert_eq!(worker.speakers[idx_b].label, "Speaker B");
@@ -1376,13 +1386,36 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
 
-        let idx1 = worker.get_or_create_unknown_speaker();
-        let idx2 = worker.get_or_create_unknown_speaker();
+        let idx1 = worker.get_or_create_unknown_speaker("mic");
+        let idx2 = worker.get_or_create_unknown_speaker("mic");
         assert_eq!(idx1, idx2);
         assert_eq!(worker.speakers[idx1].label, "Unknown");
     }
 
     // -- Backend selection --------------------------------------------------
+
+    #[test]
+    fn sortformer_profiles_keep_statistics_for_each_source() {
+        let mut worker = DiarizationWorker::new(
+            DiarizationConfig::default(),
+            crossbeam_channel::unbounded().0,
+        );
+        for known in [true, false] {
+            let mut observe = |source: &str| {
+                let idx = if known {
+                    worker.get_or_create_sortformer_speaker(0, source)
+                } else {
+                    worker.get_or_create_unknown_speaker(source)
+                };
+                let speaker = &mut worker.speakers[idx];
+                speaker.segment_count += 1;
+                speaker.segment_count
+            };
+            assert_eq!(observe("mic"), 1);
+            assert_eq!(observe("system"), 1);
+            assert_eq!(observe("mic"), 2);
+        }
+    }
 
     #[test]
     fn default_backend_is_simple() {

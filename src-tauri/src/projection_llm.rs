@@ -2529,7 +2529,14 @@ fn resolve_prompt_speakers(
         if let Some(winner) = winners.as_ref().and_then(|winners| {
             crate::timeline::candidate_keys(event.transcript_segment_id.as_deref(), &event.span_id)
                 .iter()
-                .find_map(|key| winners.get(key))
+                .filter_map(|key| winners.get(key))
+                .find(|span| {
+                    span.source_id
+                        .as_deref()
+                        .is_none_or(|source| source == event.source_id)
+                        && (span.basis_asr_span_ids.is_empty()
+                            || span.basis_asr_span_ids.contains(&event.span_id))
+                })
         }) {
             event.speaker_id = winner.speaker_id.clone();
             event.speaker_label = winner.speaker_label.clone();
@@ -3408,6 +3415,31 @@ mod tests {
                         || m.content.contains("speaker: Ada"))
             );
         }
+    }
+
+    #[test]
+    fn reused_display_segment_cannot_override_another_sources_exact_turn() {
+        let mut events = Vec::new();
+        let mut spans = Vec::new();
+        for source in ["mic", "system", "unattributed"] {
+            let id = format!("assemblyai:{source}:turn-0");
+            let mut turn = event(&id, 1, source);
+            turn.source_id = source.into();
+            turn.transcript_segment_id = Some("turn-0@final".into());
+            events.push(turn);
+            if source != "unattributed" {
+                let mut span = crate::identity::tests::span(source, source);
+                span.basis_transcript_segment_ids = vec!["turn-0@final".into()];
+                span.basis_asr_span_ids = vec![id];
+                span.speaker_label = Some(format!("from {source}"));
+                spans.push(span);
+            }
+        }
+        let timeline = crate::projections::SpeakerTimeline::replay("session-1", spans).unwrap();
+        resolve_prompt_speakers(&mut events, Some(&timeline));
+        assert_eq!(events[0].speaker_label.as_deref(), Some("from mic"));
+        assert_eq!(events[1].speaker_label.as_deref(), Some("from system"));
+        assert_eq!(events[2].speaker_label.as_deref(), Some("Speaker 1"));
     }
 
     #[test]
