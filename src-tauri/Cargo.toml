@@ -366,10 +366,11 @@ zeroize = { version = "1.8", features = ["derive", "serde"] }
 # and the `--no-default-features --features cloud` profile. `default-features =
 # false` drops the default `transport` (native-tls) in favour of an explicit
 # `reqwest` + `rustls` transport that matches our existing reqwest/rustls stack.
+# Omit sentry-panic: it reads PanicHookInfo before crash_handler can redact it.
+# Our hook already sends a content-free Category::Panic diagnostic.
 sentry = { version = "0.48.3", default-features = false, features = [
     "backtrace",
     "contexts",
-    "panic",
     "reqwest",
     "rustls",
 ] }

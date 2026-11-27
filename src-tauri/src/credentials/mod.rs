@@ -27,6 +27,7 @@
 //! 3. **Keychain value** — the migrated value as stored in the OS keychain.
 //! 4. **Imported / fallback file value** — for keys not yet in the keychain.
 
+use crate::crash_handler::{RedactedPanicOp, with_redacted_panic_scope};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -513,7 +514,9 @@ pub fn config_dir() -> Result<PathBuf, String> {
 }
 
 pub fn credentials_path() -> Result<PathBuf, String> {
-    Ok(config_dir()?.join("credentials.yaml"))
+    with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || {
+        Ok(config_dir()?.join("credentials.yaml"))
+    })
 }
 
 fn credential_state_path() -> Result<PathBuf, String> {
@@ -613,10 +616,10 @@ impl YamlCredentialBackend {
     }
 
     pub fn resolved_path(&self) -> Result<PathBuf, String> {
-        match &self.path {
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || match &self.path {
             Some(path) => Ok(path.clone()),
             None => credentials_path(),
-        }
+        })
     }
 
     /// Remove a single key's plaintext entry from `credentials.yaml`, preserving
@@ -635,16 +638,18 @@ impl YamlCredentialBackend {
     /// save never *creates* a plaintext credentials file (nor needlessly rewrites
     /// one, bumping its mtime) just to clear an entry that was never there.
     fn clear_key(&self, key: &str) -> Result<(), String> {
-        let path = self.resolved_path()?;
-        if !path.exists() {
-            return Ok(());
-        }
-        let mut store = self.load()?;
-        if store.get(key)?.is_none() {
-            return Ok(());
-        }
-        set_field(&mut store, key, None)?;
-        self.save(&store)
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
+            let path = self.resolved_path()?;
+            if !path.exists() {
+                return Ok(());
+            }
+            let mut store = self.load()?;
+            if store.get(key)?.is_none() {
+                return Ok(());
+            }
+            set_field(&mut store, key, None)?;
+            self.save(&store)
+        })
     }
 }
 
@@ -664,47 +669,53 @@ impl CredentialMigrationStateBackend {
     }
 
     fn load(&self) -> Result<CredentialMigrationState, String> {
-        let path = self.resolved_path()?;
-        if !path.exists() {
-            return Ok(CredentialMigrationState::default());
-        }
-        let contents = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        serde_yaml::from_str::<CredentialMigrationState>(&contents)
-            .map_err(|e| redacted_yaml_parse_error(&path, &e))
+        with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
+            let path = self.resolved_path()?;
+            if !path.exists() {
+                return Ok(CredentialMigrationState::default());
+            }
+            let contents = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            serde_yaml::from_str::<CredentialMigrationState>(&contents)
+                .map_err(|e| redacted_yaml_parse_error(&path, &e))
+        })
     }
 
     fn save(&self, state: &CredentialMigrationState) -> Result<(), String> {
-        let path = self.resolved_path()?;
-        let yaml = serde_yaml::to_string(state)
-            .map_err(|e| format!("Failed to serialize credential migration state: {}", e))?;
-        let tmp_path = path.with_extension("yaml.tmp");
+        with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
+            let path = self.resolved_path()?;
+            let yaml = serde_yaml::to_string(state)
+                .map_err(|e| format!("Failed to serialize credential migration state: {}", e))?;
+            let tmp_path = path.with_extension("yaml.tmp");
 
-        write_owner_only_temp_file(&tmp_path, &yaml)?;
-        // BEST-EFFORT ACL hardening on the presence-STATE file (this is not a
-        // secret — it records which keys are present, not their values). A
-        // non-zero icacls / chmod result here must NOT abort the state write:
-        // that regression spammed "Failed to finalize credential migration
-        // state" every session and could drop presence-state writes. We still
-        // attempt the hardening (security intent) and warn on failure.
-        crate::fs_util::set_owner_only(&tmp_path);
-        rename_with_retry(
-            &tmp_path,
-            &path,
-            "Failed to finalize credential migration state",
-        )?;
-        crate::fs_util::set_owner_only(&path);
+            write_owner_only_temp_file(&tmp_path, &yaml)?;
+            // BEST-EFFORT ACL hardening on the presence-STATE file (this is not a
+            // secret — it records which keys are present, not their values). A
+            // non-zero icacls / chmod result here must NOT abort the state write:
+            // that regression spammed "Failed to finalize credential migration
+            // state" every session and could drop presence-state writes. We still
+            // attempt the hardening (security intent) and warn on failure.
+            crate::fs_util::set_owner_only(&tmp_path);
+            rename_with_retry(
+                &tmp_path,
+                &path,
+                "Failed to finalize credential migration state",
+            )?;
+            crate::fs_util::set_owner_only(&path);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn update(
         &self,
         f: impl FnOnce(&mut CredentialMigrationState) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut state = self.load()?;
-        f(&mut state)?;
-        self.save(&state)
+        with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
+            let mut state = self.load()?;
+            f(&mut state)?;
+            self.save(&state)
+        })
     }
 
     fn mark_migrated(&self, key: &str) -> Result<(), String> {
@@ -767,71 +778,79 @@ impl CredentialBackend for YamlCredentialBackend {
     }
 
     fn load(&self) -> Result<CredentialStore, String> {
-        let path = self.resolved_path()?;
-        if !path.exists() {
-            // File doesn't exist — this is normal on first run, not an error.
-            return Ok(CredentialStore::default());
-        }
-        let contents = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        // credentials.yaml holds plaintext keys by design — a serde_yaml error's
-        // Display echoes the offending scalar, so route it through the
-        // location-only formatter to keep key fragments out of the surfaced
-        // reason and logs (audio-graph-4243 / cred-review M4).
-        serde_yaml::from_str::<CredentialStore>(&contents)
-            .map_err(|e| redacted_yaml_parse_error(&path, &e))
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || {
+            let path = self.resolved_path()?;
+            if !path.exists() {
+                // File doesn't exist — this is normal on first run, not an error.
+                return Ok(CredentialStore::default());
+            }
+            let contents = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            // credentials.yaml holds plaintext keys by design — a serde_yaml error's
+            // Display echoes the offending scalar, so route it through the
+            // location-only formatter to keep key fragments out of the surfaced
+            // reason and logs (audio-graph-4243 / cred-review M4).
+            serde_yaml::from_str::<CredentialStore>(&contents)
+                .map_err(|e| redacted_yaml_parse_error(&path, &e))
+        })
     }
 
     fn save(&self, store: &CredentialStore) -> Result<(), String> {
-        let path = self.resolved_path()?;
-        let yaml = serde_yaml::to_string(store)
-            .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
-        let tmp_path = path.with_extension("yaml.tmp");
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
+            let path = self.resolved_path()?;
+            let yaml = serde_yaml::to_string(store)
+                .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
+            let tmp_path = path.with_extension("yaml.tmp");
 
-        // The secret bytes are written under an owner-only temp file (0o600 on
-        // Unix; icacls before-write on Windows) inside write_owner_only_temp_file,
-        // so the file is never world-readable while it holds the secret. The two
-        // set_owner_only calls below are a BEST-EFFORT belt-and-suspenders
-        // re-harden (matching this code's pre-regression behaviour). A non-zero
-        // icacls result must NOT abort the whole credentials save — that made a
-        // transient icacls failure silently drop the user's key write. We still
-        // attempt the hardening and warn on failure.
-        write_owner_only_temp_file(&tmp_path, &yaml)?;
+            // The secret bytes are written under an owner-only temp file (0o600 on
+            // Unix; icacls before-write on Windows) inside write_owner_only_temp_file,
+            // so the file is never world-readable while it holds the secret. The two
+            // set_owner_only calls below are a BEST-EFFORT belt-and-suspenders
+            // re-harden (matching this code's pre-regression behaviour). A non-zero
+            // icacls result must NOT abort the whole credentials save — that made a
+            // transient icacls failure silently drop the user's key write. We still
+            // attempt the hardening and warn on failure.
+            write_owner_only_temp_file(&tmp_path, &yaml)?;
 
-        // Set restrictive permissions on the tmp file before rename, in case the
-        // rename preserves the source file's permissions on some platforms.
-        crate::fs_util::set_owner_only(&tmp_path);
+            // Set restrictive permissions on the tmp file before rename, in case the
+            // rename preserves the source file's permissions on some platforms.
+            crate::fs_util::set_owner_only(&tmp_path);
 
-        rename_with_retry(&tmp_path, &path, "Failed to finalize credentials")?;
+            rename_with_retry(&tmp_path, &path, "Failed to finalize credentials")?;
 
-        // And again on the final file to be safe.
-        crate::fs_util::set_owner_only(&path);
+            // And again on the final file to be safe.
+            crate::fs_util::set_owner_only(&path);
 
-        log::info!("Credentials saved to {}", path.display());
-        Ok(())
+            log::info!("Credentials saved to {}", path.display());
+            Ok(())
+        })
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            // Upgraded to info-level so an empty-value skip is visible in the
-            // normal log without turning on debug — this is the "silent skip"
-            // path that makes credential-save non-persistence look like a
-            // backend bug. Logs the key only, never the value.
-            log::info!(
-                "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
-            );
-            return Ok(());
-        }
-        let mut store = self.load()?;
-        set_field(&mut store, key, Some(trimmed.to_string()))?;
-        self.save(&store)
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                // Upgraded to info-level so an empty-value skip is visible in the
+                // normal log without turning on debug — this is the "silent skip"
+                // path that makes credential-save non-persistence look like a
+                // backend bug. Logs the key only, never the value.
+                log::info!(
+                    "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
+                );
+                return Ok(());
+            }
+            let mut store = self.load()?;
+            set_field(&mut store, key, Some(trimmed.to_string()))?;
+            self.save(&store)
+        })
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        let mut store = self.load()?;
-        set_field(&mut store, key, None)?;
-        self.save(&store)
+        with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
+            let mut store = self.load()?;
+            set_field(&mut store, key, None)?;
+            self.save(&store)
+        })
     }
 }
 
@@ -857,27 +876,33 @@ impl OsKeychainStore {
 
 impl KeychainStore for OsKeychainStore {
     fn get_key(&self, key: &str) -> Result<Option<String>, String> {
-        let entry = self.entry(key)?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(format!("Failed to read OS credential {key}: {}", e)),
-        }
+        with_redacted_panic_scope(RedactedPanicOp::KeychainRead, || {
+            let entry = self.entry(key)?;
+            match entry.get_password() {
+                Ok(value) => Ok(Some(value)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(format!("Failed to read OS credential {key}: {}", e)),
+            }
+        })
     }
 
     fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
-        let entry = self.entry(key)?;
-        entry
-            .set_password(value)
-            .map_err(|e| format!("Failed to save OS credential {key}: {}", e))
+        with_redacted_panic_scope(RedactedPanicOp::KeychainWrite, || {
+            let entry = self.entry(key)?;
+            entry
+                .set_password(value)
+                .map_err(|e| format!("Failed to save OS credential {key}: {}", e))
+        })
     }
 
     fn delete_key(&self, key: &str) -> Result<(), String> {
-        let entry = self.entry(key)?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(format!("Failed to delete OS credential {key}: {}", e)),
-        }
+        with_redacted_panic_scope(RedactedPanicOp::KeychainDelete, || {
+            let entry = self.entry(key)?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(format!("Failed to delete OS credential {key}: {}", e)),
+            }
+        })
     }
 }
 
@@ -1580,7 +1605,9 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
 // needed.
 
 pub fn load_credentials() -> CredentialStore {
-    default_backend().load_or_default()
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        default_backend().load_or_default()
+    })
 }
 
 /// Load credentials with detailed error reporting.
@@ -1588,11 +1615,15 @@ pub fn load_credentials() -> CredentialStore {
 /// empty store), and `Err(reason)` only when the file exists but cannot be
 /// parsed or read.
 pub fn try_load_credentials() -> Result<CredentialStore, String> {
-    default_backend().load()
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        default_backend().load()
+    })
 }
 
 pub fn try_load_credentials_with_source() -> Result<CredentialSnapshot, String> {
-    default_backend().load_with_source()
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        default_backend().load_with_source()
+    })
 }
 
 fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> Result<(), String> {
@@ -1627,20 +1658,24 @@ fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> R
 }
 
 pub fn set_credential(key: &str, value: &str) -> Result<(), String> {
-    default_backend().set(key, value)
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        default_backend().set(key, value)
+    })
 }
 
 /// Store the stdin-only Jev credential in the OS backend, never file fallback.
 /// Returns presence confirmation only; errors and input are never formatted.
 pub fn save_typesafe_credential_from_reader(reader: impl std::io::Read) -> bool {
-    let backend = DefaultCredentialBackend {
-        keychain: KeychainCredentialBackend::default(),
-        yaml: YamlCredentialBackend::default(),
-        state: CredentialMigrationStateBackend::default(),
-        file_backend: false,
-        fallback_to_yaml: false,
-    };
-    save_typesafe_from_reader(&backend, reader)
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::default(),
+            yaml: YamlCredentialBackend::default(),
+            state: CredentialMigrationStateBackend::default(),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        save_typesafe_from_reader(&backend, reader)
+    })
 }
 
 fn save_typesafe_from_reader(
@@ -1683,7 +1718,9 @@ fn save_typesafe_from_reader(
 }
 
 pub fn delete_credential(key: &str) -> Result<(), String> {
-    default_backend().delete(key)
+    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+        default_backend().delete(key)
+    })
 }
 
 #[cfg(test)]

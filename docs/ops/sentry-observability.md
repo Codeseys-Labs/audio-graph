@@ -58,9 +58,15 @@ Or just open the project dashboard:
 
 - **`app.startup`** — one anonymous Info event per launch (when enabled). Your
   "is telemetry on?" smoke signal.
-- **Panics** — the Sentry `panic` integration captures any thread panic
-  (scrubbed). The local crash handler (`crash_handler`) still writes a local
-  crash report independently — that one is never gated by this toggle.
+- **Panics** — AudioGraph's crash hook writes a local report regardless of the
+  analytics setting. Ordinary panics retain their payload, backtrace and stderr
+  output. Inside a credential boundary the hook records only the operation code
+  and skips stderr. When analytics is enabled the hook sends a `Category::Panic`
+  diagnostic with a controlled event name. The SDK panic hook is disabled.
+
+  Credential adapters must enter `with_redacted_panic_scope` on the thread
+  performing the work. The hook runs before the credential boundary can catch
+  an unwind and return a content-free failure (audio-graph-0350).
 - **Explicit diagnostics** — `analytics::capture_message` /
   `capture_anonymous_event` are the only intentional send paths; they are used
   sparingly and never carry transcript/audio/credential data.

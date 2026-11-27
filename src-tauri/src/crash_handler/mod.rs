@@ -2,20 +2,64 @@
 //!
 //! Installs a `std::panic::set_hook` that writes a structured crash report to
 //! the AudioGraph crash-log directory whenever any thread panics, and
-//! then chains to the default hook so stderr prints are preserved during
-//! development.
+//! then chains to the default hook for ordinary panics. Credential boundaries
+//! record only their operation code and suppress payload-bearing stderr.
 //!
 //! Design goals:
 //!   * Best-effort — never panic from inside the hook.
-//!   * Prepend (not replace) the default hook so existing behavior is kept.
 //!   * Zero new dependencies — use the shared user-data resolver + `std::backtrace`.
 //!
 //! Call [`install`] exactly once at the very start of the Tauri entry point so
 //! panics during startup (Tauri builder, state init, etc.) are captured too.
 
 use std::backtrace::Backtrace;
+use std::cell::Cell;
+use std::io::Write;
 use std::panic::PanicHookInfo;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactedPanicOp {
+    KeychainRead,
+    KeychainWrite,
+    KeychainDelete,
+    LegacyFileRead,
+    LegacyFileWrite,
+    LegacyStateIo,
+    CredentialBoundary,
+}
+
+impl RedactedPanicOp {
+    pub fn as_code(&self) -> &'static str {
+        match self {
+            Self::KeychainRead => "credential.keychain_read",
+            Self::KeychainWrite => "credential.keychain_write",
+            Self::KeychainDelete => "credential.keychain_delete",
+            Self::LegacyFileRead => "credential.legacy_file_read",
+            Self::LegacyFileWrite => "credential.legacy_file_write",
+            Self::LegacyStateIo => "credential.legacy_state_io",
+            Self::CredentialBoundary => "credential.boundary",
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_OP: Cell<Option<RedactedPanicOp>> = const { Cell::new(None) };
+}
+
+/// The hook observes the innermost operation before unwinding drops this frame.
+/// Enter on the thread performing the credential operation.
+pub fn with_redacted_panic_scope<R>(op: RedactedPanicOp, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<RedactedPanicOp>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE_OP.set(self.0);
+        }
+    }
+
+    let _restore = Restore(ACTIVE_OP.replace(Some(op)));
+    f()
+}
 
 /// Install the global panic hook. Safe to call multiple times, though only the
 /// first call has a useful effect — subsequent calls will still chain to the
@@ -26,6 +70,16 @@ pub fn install() {
     let default_hook = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |info| {
+        if let Some(op) = ACTIVE_OP.get() {
+            // Thread names, source paths, symbolized frames and the previous
+            // hook can all expose private data independently of the payload.
+            let code = op.as_code();
+            let _ = write_report(&format!(
+                "AudioGraph crash report\n\nPayload:\n[redacted panic payload: {code}]\n"
+            ));
+            capture_panic_diagnostic(code);
+            return;
+        }
         // Never panic in the hook — swallow every error.
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
@@ -41,25 +95,25 @@ pub fn install() {
         // default hook so the user still sees the stderr trace.
         let _ = write_report(&report);
 
-        // Best-effort anonymous diagnostic (no-op unless analytics is enabled).
-        // Only a controlled, id-shaped location marker rides along — never the
-        // payload/backtrace (both can carry free prose). `panic_event_name`
-        // derives a safe `^[a-z0-9._:-]{1,48}$` id; on failure the scrubber would
-        // drop the tag anyway. Never panic in the hook, so this is guarded.
+        // Ordinary analytics events carry only a normalized location marker.
         let event_name = panic_event_name(location.as_ref());
-        crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
-            name: &event_name,
-            category: crate::analytics::Category::Panic,
-            level: sentry::Level::Fatal,
-            provider: None,
-            kind: Some("panic"),
-            http_status: None,
-            recoverable: Some(false),
-        });
+        capture_panic_diagnostic(&event_name);
 
         // Chain to the default hook so stderr prints still happen.
         default_hook(info);
     }));
+}
+
+fn capture_panic_diagnostic(name: &str) {
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name,
+        category: crate::analytics::Category::Panic,
+        level: sentry::Level::Fatal,
+        provider: None,
+        kind: Some("panic"),
+        http_status: None,
+        recoverable: Some(false),
+    });
 }
 
 /// Extract the panic payload as a `String`, handling the common `&str` and
@@ -162,9 +216,17 @@ fn write_report(report: &str) -> Result<(), ()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = dir.join(format!("{millis}.log"));
-
-    std::fs::write(&path, report).map_err(|_| ())
+    let mut path = dir.join(format!("{millis}.log"));
+    for suffix in 1_u64.. {
+        match std::fs::File::create_new(&path) {
+            Ok(mut file) => return file.write_all(report.as_bytes()).map_err(|_| ()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                path = dir.join(format!("{millis}-{suffix}.log"));
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
 }
 
 /// User-data-root `crashes/`.
@@ -219,6 +281,136 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_restores_previous_operation_on_return_and_unwind() {
+        use RedactedPanicOp::*;
+        with_redacted_panic_scope(LegacyFileRead, || {
+            assert_eq!(ACTIVE_OP.get(), Some(LegacyFileRead));
+            let value = with_redacted_panic_scope(LegacyFileWrite, || {
+                assert_eq!(ACTIVE_OP.get(), Some(LegacyFileWrite));
+                42
+            });
+            assert_eq!(value, 42);
+            assert_eq!(ACTIVE_OP.get(), Some(LegacyFileRead));
+            let result = std::panic::catch_unwind(|| {
+                with_redacted_panic_scope(LegacyStateIo, || panic!("test unwind"))
+            });
+            assert!(result.is_err());
+            assert_eq!(ACTIVE_OP.get(), Some(LegacyFileRead));
+        });
+        assert_eq!(ACTIVE_OP.get(), None);
+    }
+
+    const CHILD_NONCE: &str = "AUDIOGRAPH_TEST_CRASH_NONCE";
+    const ORDINARY_PAYLOAD: &str = "ordinary diagnostic control";
+
+    fn private_fields(nonce: &str) -> Vec<String> {
+        let secret = format!("sk-canary-{nonce}");
+        vec![
+            format!("locator:{nonce}"),
+            format!("/private/path/{nonce}"),
+            format!("native-target-{nonce}"),
+            format!("platform diagnostic {nonce}"),
+            format!("exact-length={}", secret.len()),
+            crate::credentials::secret_fingerprint(Some(&secret)),
+            secret,
+        ]
+    }
+
+    #[test]
+    #[ignore = "invoked in isolation by concurrent_hook_reports"]
+    fn panic_hook_child() {
+        let Ok(nonce) = std::env::var(CHILD_NONCE) else {
+            return;
+        };
+        let private = private_fields(&nonce).join(" ");
+        install();
+        std::thread::Builder::new()
+            .name(format!("private-thread-{nonce}"))
+            .spawn(move || {
+                with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
+                    let ready = std::sync::Barrier::new(2);
+                    std::thread::scope(|threads| {
+                        let ordinary = threads.spawn(|| {
+                            ready.wait();
+                            panic!("{ORDINARY_PAYLOAD}");
+                        });
+                        let result = std::panic::catch_unwind(|| {
+                            with_redacted_panic_scope(RedactedPanicOp::KeychainRead, || {
+                                ready.wait();
+                                panic!("{private}");
+                            })
+                        });
+                        assert!(result.is_err());
+                        assert!(ordinary.join().is_err());
+                    });
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        // Exercise an actual public credential entry point with a panicking
+        // reader, before it can make any call to the machine's keychain.
+        struct PanickingReader(String);
+        impl std::io::Read for PanickingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("{}", self.0)
+            }
+        }
+        let result = std::panic::catch_unwind(|| {
+            crate::credentials::save_typesafe_credential_from_reader(PanickingReader(nonce))
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn concurrent_hook_reports() {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let root = std::env::temp_dir().join(format!("audiograph-crashes-{nonce}"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash_handler::tests::panic_hook_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env(CHILD_NONCE, &nonce)
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child status {}", output.status);
+        let reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(reports.len(), 3);
+        for code in ["credential.keychain_read", "credential.boundary"] {
+            let expected =
+                format!("AudioGraph crash report\n\nPayload:\n[redacted panic payload: {code}]\n");
+            assert!(
+                reports.contains(&expected),
+                "missing closed report for {code}"
+            );
+        }
+        assert!(
+            reports
+                .iter()
+                .any(|s| s.contains(ORDINARY_PAYLOAD) && s.contains("Backtrace:"))
+        );
+        assert!(stderr.contains(ORDINARY_PAYLOAD));
+        for field in private_fields(&nonce).iter().chain([&nonce]) {
+            assert!(!stderr.contains(field), "private field in child stderr");
+            assert!(
+                reports.iter().all(|s| !s.contains(field)),
+                "private field in report"
+            );
+        }
+    }
 
     #[test]
     fn panic_event_name_is_id_shaped_and_payload_free() {
