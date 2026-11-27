@@ -114,8 +114,93 @@ async fn noul_probability_keys_cannot_echo_content_into_decision_provenance() {
         },
     );
     let error = engine.system_one(&request).await.unwrap_err();
-    assert!(error.to_string().contains("schema"));
+    // Malformed binary key pairs are rejected at the parse boundary, never
+    // echoed into typed decision provenance.
+    assert!(error.to_string().contains("Invalid System One response"));
     assert!(!error.to_string().contains("private transcript content"));
+    served.await.unwrap();
+}
+
+#[tokio::test]
+async fn vllm_documented_yes_no_noul_keys_validate_and_preserve_wire_bytes() {
+    // https://docs.vllm.ai/en/latest/models/structured_decisions_models/ (2026-10-18).
+    let body = r#"{"id":"decision-...","object":"structured_decision","created":1790000000,"model":"Qwen/Qwen3-0.6B","answers":{"team":{"type":"noul","noul":0.02,"probabilities":{"yes":0.02,"no":0.98},"confidence":0.95}},"usage":{"input_tokens":142,"output_tokens":3}}"#;
+    let (url, served) = server(200, body.to_owned()).await;
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Vllm {
+            url,
+            model: "Qwen/Qwen3-0.6B".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let mut request = request();
+    request.questions.insert(
+        "team".to_owned(),
+        Question::Noul {
+            instructions: "The message conveys urgency or time-sensitivity".to_owned(),
+            criteria: None,
+        },
+    );
+    // A single request: the fixture server answers one connection, and
+    // validate_answers must already accept the normalized yes/no convention.
+    let wire = engine.evaluate_wire(&request).await.unwrap();
+    assert_eq!(wire.json(), body);
+    assert_eq!(serde_json::to_string(&wire).unwrap(), body);
+    let Answer::Noul {
+        noul,
+        probabilities,
+        confidence,
+    } = &wire.typed().answers["team"]
+    else {
+        panic!("team is a noul answer");
+    };
+    assert_eq!(*noul, 0.02);
+    assert_eq!(*confidence, Some(0.95));
+    let probabilities = probabilities.as_ref().unwrap();
+    assert_eq!(
+        probabilities.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["true", "false"]
+    );
+    assert_eq!(probabilities["true"], 0.02);
+    assert_eq!(probabilities["false"], 0.98);
+    served.await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_noul_pairs_fail_parsing_and_out_of_range_values_fail_schema_validation() {
+    let (url, served) = server(200, r#"{"answers":{"team":{"type":"noul","noul":0.9,"probabilities":{"yes":0.9,"false":0.1},"confidence":0.9}},"usage":{"input_tokens":20,"output_tokens":0}}"#.to_owned()).await;
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Vllm {
+            url,
+            model: "fixture".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let mut request = request();
+    request.questions.insert(
+        "team".to_owned(),
+        Question::Noul {
+            instructions: "Answerable?".to_owned(),
+            criteria: None,
+        },
+    );
+    let error = engine.system_one(&request).await.unwrap_err().to_string();
+    assert!(error.contains("Invalid System One response"));
+    served.await.unwrap();
+
+    let (url, served) = server(200, r#"{"answers":{"team":{"type":"noul","noul":0.9,"probabilities":{"true":1.4,"false":-0.4},"confidence":0.9}},"usage":{"input_tokens":20,"output_tokens":0}}"#.to_owned()).await;
+    let engine = SystemOneHttpEngine::new(
+        EndpointKind::Vllm {
+            url,
+            model: "fixture".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let error = engine.system_one(&request).await.unwrap_err().to_string();
+    assert!(error.contains("schema"));
     served.await.unwrap();
 }
 

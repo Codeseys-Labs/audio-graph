@@ -152,3 +152,85 @@ fn score_indices_follow_level_index_not_vendor_object_order() {
         assert!(serde_json::from_str::<Answer>(&json).is_err());
     }
 }
+
+#[test]
+fn vllm_yes_no_noul_keys_normalize_and_preserve_vendor_bytes() {
+    let wire = WireResponse::from_json(VLLM).unwrap();
+    assert_eq!(wire.json(), VLLM);
+    assert_eq!(serde_json::to_string(&wire).unwrap(), VLLM);
+    let Answer::Noul {
+        noul,
+        probabilities,
+        confidence,
+    } = &wire.typed().answers["urgent"]
+    else {
+        panic!("urgent is a noul answer");
+    };
+    assert_eq!(*noul, 0.02);
+    assert_eq!(*confidence, Some(0.95));
+    let probabilities = probabilities
+        .as_ref()
+        .expect("vLLM documents binary probabilities");
+    assert_eq!(
+        probabilities.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["true", "false"]
+    );
+    assert_eq!(probabilities["true"], 0.02);
+    assert_eq!(probabilities["false"], 0.98);
+
+    let (typed, format) = wire.into_parts();
+    let restored = WireResponse::from_parts(typed, format).unwrap();
+    assert_eq!(restored.json(), VLLM);
+    assert_eq!(serde_json::to_string(&restored).unwrap(), VLLM);
+
+    // The canonical true/false convention deserializes to the same typed value.
+    let canonical = VLLM.replace(r#""yes":0.02,"no":0.98}"#, r#""true":0.02,"false":0.98}"#);
+    assert_eq!(
+        WireResponse::from_json(&canonical).unwrap().typed(),
+        restored.typed()
+    );
+}
+
+#[test]
+fn noul_probability_key_order_follows_the_vendor_document() {
+    let answer: Answer = serde_json::from_str(
+        r#"{"type":"noul","noul":0.02,"probabilities":{"no":0.98,"yes":0.02},"confidence":0.95}"#,
+    )
+    .unwrap();
+    let Answer::Noul {
+        probabilities: Some(probabilities),
+        ..
+    } = &answer
+    else {
+        panic!("probabilities are present");
+    };
+    assert_eq!(
+        probabilities.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["false", "true"]
+    );
+    assert_eq!(
+        serde_json::to_string(&answer).unwrap(),
+        r#"{"type":"noul","noul":0.02,"probabilities":{"false":0.98,"true":0.02},"confidence":0.95}"#
+    );
+}
+
+#[test]
+fn noul_probability_maps_reject_mixed_partial_and_overlong_pairs() {
+    for probabilities in [
+        r#"{"yes":0.9,"false":0.1}"#,
+        r#"{"true":0.9,"no":0.1}"#,
+        r#"{"true":0.9}"#,
+        r#"{"yes":0.9}"#,
+        r#"{"true":0.4,"false":0.3,"yes":0.3}"#,
+        r#"{"private transcript content":0.9,"false":0.1}"#,
+        r#"{}"#,
+    ] {
+        let json = format!(
+            r#"{{"answers":{{"team":{{"type":"noul","noul":0.9,"probabilities":{probabilities},"confidence":0.9}}}},"usage":{{"input_tokens":20,"output_tokens":0}}}}"#
+        );
+        assert!(
+            serde_json::from_str::<DecisionResponse>(&json).is_err(),
+            "{json}"
+        );
+    }
+}

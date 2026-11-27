@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Live diarization now chooses the highest-scoring one-to-one speaker assignment
+  across each window, avoiding extra speaker IDs caused by greedy matches.
 - Native decision backends now re-export the shared decision contract directly;
   the obsolete vendored module and unused direct dependencies are removed.
 - Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
@@ -49,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
+- vLLM's documented `yes`/`no` noul probability keys are now normalized to the
+  canonical `true`/`false` pair at the parse boundary, so documented responses
+  validate; mixed, partial, or overlong key pairs are rejected, and the raw
+  `WireResponse` bytes plus vendor confidence stay untouched.
 - Updated `cookie` to 0.18.3 to prevent private-cookie nonce reuse after a fork
   ([RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594)).
 
