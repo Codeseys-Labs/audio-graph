@@ -1439,19 +1439,16 @@ mod tests {
 
         let refusals = tauri::async_runtime::block_on(async {
             [
-                load_session(id.into()).await.err().expect("Review refusal"),
+                load_session(id.into()).await.expect_err("Review refusal"),
                 load_session_transcript(id.into())
                     .await
-                    .err()
-                    .expect("transcript refusal"),
+                    .expect_err("transcript refusal"),
                 export_session_bundle(id.into())
                     .await
-                    .err()
-                    .expect("export refusal"),
+                    .expect_err("export refusal"),
                 build_session_timeline_cmd(id.into(), None)
                     .await
-                    .err()
-                    .expect("timeline refusal"),
+                    .expect_err("timeline refusal"),
             ]
         });
         for error in refusals {
@@ -1754,15 +1751,13 @@ mod tests {
         };
         let refusals = tauri::async_runtime::block_on(async {
             [
-                load_session(id.into()).await.err().expect("Review refusal"),
+                load_session(id.into()).await.expect_err("Review refusal"),
                 load_session_data_movement_cmd(id.into())
                     .await
-                    .err()
-                    .expect("ledger refusal"),
+                    .expect_err("ledger refusal"),
                 export_session_bundle(id.into())
                     .await
-                    .err()
-                    .expect("export refusal"),
+                    .expect_err("export refusal"),
             ]
         });
         for error in refusals {
