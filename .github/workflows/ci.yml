@@ -109,6 +109,26 @@ jobs:
         # clippy-clean, verified on Linux. Keep it that way.
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # ── Cross-target clippy coverage (#236) ──────────────────────────
+      # Lints the `#[cfg(windows)]` persistence test fixtures that are
+      # compiled out on Linux (they regressed silently before #236). Clippy
+      # is a check-only pipeline (no link), so cross-checking the Windows
+      # target needs no Windows toolchain — but native build scripts still
+      # execute, and on this Linux runner the mac target drags in
+      # aws-lc-sys/objc2 build scripts that need a macOS SDK. So the gate
+      # covers only the Windows triple; macOS fixtures are exercised by the
+      # native macOS Rust job. Default-feature (local-ml) coverage also
+      # stays with the native legs: whisper-rs-sys/llama-cpp-sys-2 build
+      # scripts compile C/C++ for the host and cannot run for a foreign
+      # target, hence `--no-default-features --features cloud`.
+      - name: Clippy (Windows target coverage, cloud-only)
+        working-directory: audio-graph/src-tauri
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc
+          cargo clippy --locked --no-default-features --features cloud \
+            --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
   # ── Frontend (fast, platform-independent) ──────────────────────────
   frontend:
     name: Frontend (TypeScript)
