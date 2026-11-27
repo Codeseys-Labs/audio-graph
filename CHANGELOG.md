@@ -42,8 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across each window, avoiding extra speaker IDs caused by greedy matches.
 - Native decision backends now re-export the shared decision contract directly;
   the obsolete vendored module and unused direct dependencies are removed.
+- Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
+  STA/COM and `SILENT` buffer fixes, PipeWire `DONT_RECONNECT` on Linux,
+  and system-capture capability reporting for macOS 14.4 and later.
 
 ### Fixed
+
+- Updated `cookie` to 0.18.3 to prevent private-cookie nonce reuse after a fork
+  ([RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594)).
 
 ## [0.1.0-rc.1] - 2026-05-20
 
