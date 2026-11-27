@@ -1993,18 +1993,14 @@ mod source_descriptor_tests {
         supports_process_tree_capture: bool,
         supports_device_selection: bool,
     ) -> rsac::PlatformCapabilities {
-        rsac::PlatformCapabilities {
-            supports_system_capture: true,
-            supports_application_capture,
-            supports_process_tree_capture,
-            supports_device_selection,
-            supports_device_change_notifications: true,
-            requires_user_consent: false,
-            supported_sample_formats: vec![SampleFormat::F32],
-            sample_rate_range: (8000, 48000),
-            max_channels: 2,
-            backend_name: "TestBackend",
-        }
+        let mut caps = rsac::PlatformCapabilities::query();
+        caps.backend_name = "TestBackend";
+        caps.supports_system_capture = true;
+        caps.supports_application_capture = supports_application_capture;
+        caps.supports_process_tree_capture = supports_process_tree_capture;
+        caps.supports_device_selection = supports_device_selection;
+        caps.supports_device_change_notifications = true;
+        caps
     }
 
     #[test]
