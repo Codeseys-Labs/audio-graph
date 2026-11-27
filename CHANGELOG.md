@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Native decision backends now re-export the shared decision contract directly;
   the obsolete vendored module and unused direct dependencies are removed.
+- Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
+  STA/COM and `SILENT` buffer fixes, PipeWire `DONT_RECONNECT` on Linux,
+  and system-capture capability reporting for macOS 14.4 and later.
 
 ### Fixed
 
@@ -47,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw
   `WireResponse` bytes plus vendor confidence stay untouched.
+- Updated `cookie` to 0.18.3 to prevent private-cookie nonce reuse after a fork
+  ([RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594)).
 
 ## [0.1.0-rc.1] - 2026-05-20
 
