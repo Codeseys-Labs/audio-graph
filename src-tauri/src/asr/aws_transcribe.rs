@@ -1054,6 +1054,7 @@ mod tests {
             sample_rate: 16_000,
             num_frames: 2,
             timestamp: Some(Duration::from_millis(32)),
+            metadata: Default::default(),
         }
     }
 

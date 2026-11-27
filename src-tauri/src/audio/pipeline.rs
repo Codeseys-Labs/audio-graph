@@ -15,7 +15,7 @@ use rubato::{
     WindowFunction,
 };
 
-use super::capture::AudioChunk;
+use super::capture::{AudioChunk, CaptureBufferDrops, CaptureTimestampOrigin};
 
 /// Ordered input to the process-lifetime audio pipeline. Reset travels on the
 /// same channel as raw audio, so its acknowledgement proves every older chunk
@@ -49,7 +49,56 @@ pub struct ProcessedAudioChunk {
     pub data: Vec<f32>,
     pub sample_rate: u32,
     pub num_frames: usize,
+    /// Position of the first represented frame in the capture timestamp domain.
     pub timestamp: Option<Duration>,
+    pub metadata: ProcessedAudioMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioDiscontinuity {
+    Gap {
+        missing_duration: Duration,
+    },
+    ClockReset {
+        previous_expected: Duration,
+        observed: Duration,
+    },
+    RateChange {
+        previous_rate_hz: u32,
+        new_rate_hz: u32,
+    },
+    StreamGenerationChange {
+        previous: u64,
+        current: u64,
+    },
+    TimestampOriginChange {
+        previous: CaptureTimestampOrigin,
+        current: CaptureTimestampOrigin,
+    },
+    TimestampEstablished,
+    DroppedBuffers(CaptureBufferDrops),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSegmentBoundary {
+    pub clock_generation: u64,
+    pub timestamp: Option<Duration>,
+    pub discontinuities: Vec<AudioDiscontinuity>,
+    pub previous_input_rate_hz: Option<u32>,
+    /// Native input frames from the previous segment that produced no PCM.
+    pub discarded_input_frames: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessedAudioMetadata {
+    /// Local to a source and reset with the session. Advances when its clock,
+    /// timestamp domain, capture generation, or sample rate changes.
+    pub clock_generation: u64,
+    pub stream_generation: u64,
+    /// Timestamp domain for chunks that carry a timestamp.
+    pub timestamp_origin: CaptureTimestampOrigin,
+    /// Boundaries preceding this PCM, delivered once, in input order.
+    pub boundaries: Vec<AudioSegmentBoundary>,
 }
 
 /// Canonical processed-audio sample rate emitted by the backend bus.
@@ -94,11 +143,18 @@ const TARGET_CHUNK_FRAMES: usize = PROCESSED_AUDIO_CHUNK_FRAMES;
 /// Resampler processing block size (input frames per rubato call).
 const RESAMPLER_CHUNK_SIZE: usize = 1024;
 
+/// Ignore small timestamp quantization and scheduling jitter between buffers.
+const TIMESTAMP_JITTER: Duration = Duration::from_millis(2);
+
 struct SourcePipelineState {
     /// rubato resampler (created lazily on first chunk).
     resampler: Option<Async<f32>>,
-    /// Input sample rate the resampler was created for.
-    resampler_input_rate: u32,
+    /// Input rate of this segment, including the passthrough case.
+    input_rate: Option<u32>,
+    /// Startup delay and frame totals for the current resampler segment.
+    resampler_delay: usize,
+    segment_input_frames: usize,
+    produced_output_frames: usize,
     /// Buffer accumulating mono samples waiting for the resampler.
     /// rubato requires exactly `input_frames_next()` samples per call.
     resampler_input_buffer: Vec<f32>,
@@ -109,20 +165,46 @@ struct SourcePipelineState {
     /// allocating a fresh Vec on every `drain_resampler` inner-loop iteration.
     /// (Precedent: diarization worker's reused `scratch` buffer.)
     resampler_scratch: Vec<Vec<f32>>,
+    /// Source timestamp anchoring the current segment.
+    segment_timestamp: Option<Duration>,
     /// Timestamp of the next processed output frame.
     current_timestamp: Option<Duration>,
+    expected_input_timestamp: Option<Duration>,
+    metadata: ProcessedAudioMetadata,
 }
 
 impl SourcePipelineState {
     fn new() -> Self {
         Self {
             resampler: None,
-            resampler_input_rate: 0,
+            input_rate: None,
+            resampler_delay: 0,
+            segment_input_frames: 0,
+            produced_output_frames: 0,
             resampler_input_buffer: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
             accumulation_buffer: Vec::with_capacity(TARGET_CHUNK_FRAMES * 4),
             resampler_scratch: vec![Vec::with_capacity(RESAMPLER_CHUNK_SIZE)],
+            segment_timestamp: None,
             current_timestamp: None,
+            expected_input_timestamp: None,
+            metadata: ProcessedAudioMetadata::default(),
         }
+    }
+
+    fn output_frames_for_input(&self) -> usize {
+        (self.segment_input_frames as u128 * TARGET_SAMPLE_RATE as u128
+            / self.input_rate.expect("resampling requires an input rate") as u128) as usize
+    }
+
+    fn discarded_input_frames(&self) -> usize {
+        if self.resampler.is_none() {
+            return 0;
+        }
+        let covered_input_frames = (self.produced_output_frames as u128
+            * self.input_rate.expect("resampling requires an input rate") as u128)
+            .div_ceil(TARGET_SAMPLE_RATE as u128) as usize;
+        self.segment_input_frames
+            .saturating_sub(covered_input_frames)
     }
 }
 
@@ -179,30 +261,36 @@ impl AudioPipeline {
 
     /// Process a single audio chunk: mixdown → resample → accumulate → emit.
     fn process_chunk(&mut self, chunk: AudioChunk) {
+        if chunk.sample_rate == 0 {
+            log::warn!(
+                "AudioPipeline: ignoring zero sample rate for {}",
+                chunk.source_id
+            );
+            return;
+        }
         // Step 1: Stereo (or multi-channel) → mono mixdown
         let mono = Self::stereo_to_mono(&chunk.data, chunk.channels);
-        let source_id = chunk.source_id;
+        if mono.is_empty() {
+            return;
+        }
+        let source_id = &chunk.source_id;
         let state = self
             .source_states
-            .entry(Arc::clone(&source_id))
+            .entry(Arc::clone(source_id))
             .or_insert_with(SourcePipelineState::new);
 
-        if state.current_timestamp.is_none() {
-            state.current_timestamp = chunk.timestamp;
-        }
+        Self::prepare_segment(&self.output_tx, state, &chunk);
 
         // Step 2: Resample if needed
         if chunk.sample_rate == TARGET_SAMPLE_RATE {
             // No resampling needed — push directly to accumulation
             state.accumulation_buffer.extend_from_slice(&mono);
         } else {
-            // Ensure resampler exists and matches input rate
-            if state.resampler.is_none() || state.resampler_input_rate != chunk.sample_rate {
+            if state.resampler.is_none() {
                 match Self::create_resampler(chunk.sample_rate) {
                     Ok(r) => {
+                        state.resampler_delay = r.output_delay();
                         state.resampler = Some(r);
-                        state.resampler_input_rate = chunk.sample_rate;
-                        state.resampler_input_buffer.clear();
                         log::info!(
                             "AudioPipeline: created resampler for {}: {}Hz → {}Hz",
                             source_id,
@@ -227,11 +315,114 @@ impl AudioPipeline {
         // Pass `&self.output_tx` directly: it is a distinct field from
         // `self.source_states` (which backs `state`), so NLL permits the
         // disjoint borrows without cloning the Sender per chunk.
-        Self::emit_chunks(&self.output_tx, &source_id, state);
+        Self::emit_chunks(&self.output_tx, source_id, state, false);
+    }
+
+    fn prepare_segment(
+        output_tx: &Sender<ProcessedPipelineMessage>,
+        state: &mut SourcePipelineState,
+        chunk: &AudioChunk,
+    ) {
+        let mut boundaries = Vec::new();
+        let mut clock_changed = false;
+        if let Some(previous_rate_hz) = state.input_rate {
+            if previous_rate_hz != chunk.sample_rate {
+                boundaries.push(AudioDiscontinuity::RateChange {
+                    previous_rate_hz,
+                    new_rate_hz: chunk.sample_rate,
+                });
+                clock_changed = true;
+            }
+            if state.metadata.stream_generation != chunk.metadata.stream_generation {
+                boundaries.push(AudioDiscontinuity::StreamGenerationChange {
+                    previous: state.metadata.stream_generation,
+                    current: chunk.metadata.stream_generation,
+                });
+                clock_changed = true;
+            }
+            if state.metadata.timestamp_origin != chunk.metadata.timestamp_origin {
+                boundaries.push(AudioDiscontinuity::TimestampOriginChange {
+                    previous: state.metadata.timestamp_origin,
+                    current: chunk.metadata.timestamp_origin,
+                });
+                clock_changed = true;
+            } else if let Some(observed) = chunk.timestamp {
+                match state.expected_input_timestamp {
+                    Some(expected) if observed.saturating_sub(expected) > TIMESTAMP_JITTER => {
+                        boundaries.push(AudioDiscontinuity::Gap {
+                            missing_duration: observed - expected,
+                        });
+                    }
+                    Some(expected) if expected.saturating_sub(observed) > TIMESTAMP_JITTER => {
+                        boundaries.push(AudioDiscontinuity::ClockReset {
+                            previous_expected: expected,
+                            observed,
+                        });
+                        clock_changed = true;
+                    }
+                    None => boundaries.push(AudioDiscontinuity::TimestampEstablished),
+                    _ => {}
+                }
+            }
+        }
+        if chunk.metadata.drops != CaptureBufferDrops::default() {
+            boundaries.push(AudioDiscontinuity::DroppedBuffers(chunk.metadata.drops));
+        }
+
+        let input_timestamp = if clock_changed {
+            chunk.timestamp
+        } else {
+            chunk.timestamp.or(state.expected_input_timestamp)
+        };
+        if state.input_rate.is_none() || !boundaries.is_empty() {
+            // Drain the old filter on its own timeline and account for any
+            // native tail shorter than a target frame (or a failed drain).
+            Self::drain_resampler_tail(state);
+            Self::emit_chunks(output_tx, &chunk.source_id, state, true);
+            let discarded_input_frames = state.discarded_input_frames();
+            let previous_input_rate_hz = state.input_rate;
+            if previous_input_rate_hz == Some(chunk.sample_rate) {
+                if let Some(resampler) = state.resampler.as_mut() {
+                    resampler.reset();
+                    state.resampler_delay = resampler.output_delay();
+                }
+            } else {
+                state.resampler = None;
+            }
+            state.resampler_input_buffer.clear();
+            state.segment_input_frames = 0;
+            state.produced_output_frames = 0;
+            state.segment_timestamp = input_timestamp;
+            state.current_timestamp = input_timestamp;
+            state.input_rate = Some(chunk.sample_rate);
+            state.metadata.stream_generation = chunk.metadata.stream_generation;
+            state.metadata.timestamp_origin = chunk.metadata.timestamp_origin;
+            if clock_changed {
+                state.metadata.clock_generation += 1;
+            }
+            if !boundaries.is_empty() {
+                state.metadata.boundaries.push(AudioSegmentBoundary {
+                    clock_generation: state.metadata.clock_generation,
+                    timestamp: state.current_timestamp,
+                    discontinuities: boundaries,
+                    previous_input_rate_hz,
+                    discarded_input_frames,
+                });
+            }
+        }
+        // Derive the expectation from the segment's total frame count. This
+        // prevents per-buffer timestamp rounding from accumulating as drift.
+        state.segment_input_frames += chunk.num_frames;
+        let duration =
+            Duration::from_secs_f64(state.segment_input_frames as f64 / chunk.sample_rate as f64);
+        state.expected_input_timestamp = state
+            .segment_timestamp
+            .map(|at| at.saturating_add(duration));
     }
 
     /// Feed the resampler with buffered input in exact chunk sizes.
-    fn drain_resampler(state: &mut SourcePipelineState) {
+    fn drain_resampler(state: &mut SourcePipelineState) -> bool {
+        let max_output_frames = state.output_frames_for_input();
         // Borrow the relevant fields disjointly so the reusable scratch can be
         // mutated while `resampler` is held mutably (NLL splits the borrows).
         let SourcePipelineState {
@@ -239,12 +430,14 @@ impl AudioPipeline {
             resampler_input_buffer,
             resampler_scratch,
             accumulation_buffer,
+            resampler_delay,
+            produced_output_frames,
             ..
         } = state;
 
         let resampler = match resampler.as_mut() {
             Some(r) => r,
-            None => return,
+            None => return true,
         };
 
         // Single reusable inner buffer (created in the ctor as a one-element Vec).
@@ -271,7 +464,7 @@ impl AudioPipeline {
                 Ok(a) => a,
                 Err(e) => {
                     log::error!("AudioPipeline: failed to create input adapter: {}", e);
-                    break;
+                    return false;
                 }
             };
 
@@ -279,34 +472,49 @@ impl AudioPipeline {
                 Ok(interleaved_out) => {
                     // For mono, interleaved data is just the samples directly
                     let resampled = interleaved_out.take_data();
-                    accumulation_buffer.extend_from_slice(&resampled);
+                    // Trim Rubato's startup delay so the first emitted sample
+                    // represents the segment anchor. Cap output at the real
+                    // input duration, excluding any shutdown padding.
+                    let delay = (*resampler_delay).min(resampled.len());
+                    *resampler_delay -= delay;
+                    let available = max_output_frames - *produced_output_frames;
+                    let count = available.min(resampled.len() - delay);
+                    accumulation_buffer.extend_from_slice(&resampled[delay..delay + count]);
+                    *produced_output_frames += count;
                 }
                 Err(e) => {
                     log::error!("AudioPipeline: resampling error: {}", e);
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
 
-    /// Emit TARGET_CHUNK_FRAMES-sized chunks from the accumulation buffer.
+    /// Emit full chunks, plus any short remainder when closing a segment.
     fn emit_chunks(
         output_tx: &Sender<ProcessedPipelineMessage>,
         source_id: &Arc<str>,
         state: &mut SourcePipelineState,
+        flush_remainder: bool,
     ) {
-        while state.accumulation_buffer.len() >= TARGET_CHUNK_FRAMES {
-            let chunk_data: Vec<f32> = state
-                .accumulation_buffer
-                .drain(..TARGET_CHUNK_FRAMES)
-                .collect();
+        while !state.accumulation_buffer.is_empty() {
+            let frames = state.accumulation_buffer.len().min(TARGET_CHUNK_FRAMES);
+            if frames < TARGET_CHUNK_FRAMES && !flush_remainder {
+                break;
+            }
+            let chunk_data: Vec<f32> = state.accumulation_buffer.drain(..frames).collect();
 
             let processed = ProcessedAudioChunk {
                 source_id: Arc::clone(source_id),
                 num_frames: chunk_data.len(),
                 data: chunk_data,
                 sample_rate: TARGET_SAMPLE_RATE,
-                timestamp: Self::next_processed_timestamp(state, TARGET_CHUNK_FRAMES),
+                timestamp: Self::next_processed_timestamp(state, frames),
+                metadata: ProcessedAudioMetadata {
+                    boundaries: std::mem::take(&mut state.metadata.boundaries),
+                    ..state.metadata
+                },
             };
 
             if let Err(e) = output_tx.send(ProcessedPipelineMessage::Chunk(processed)) {
@@ -324,36 +532,27 @@ impl AudioPipeline {
         // process_chunk hot path).
         let output_tx = &self.output_tx;
         for (source_id, state) in self.source_states.iter_mut() {
-            // Try to flush remaining resampler input by zero-padding
-            if let Some(resampler) = state.resampler.as_mut() {
-                let needed = resampler.input_frames_next();
-                let current = state.resampler_input_buffer.len();
-                if current > 0 && current < needed {
-                    state.resampler_input_buffer.resize(needed, 0.0);
-                    // drain_resampler will process this padded chunk
-                }
-            }
-            Self::drain_resampler(state);
-
-            // Emit any remaining accumulated samples as a final (possibly undersized) chunk
-            if !state.accumulation_buffer.is_empty() {
-                let remaining: Vec<f32> = state.accumulation_buffer.drain(..).collect();
-                let remaining_len = remaining.len();
-                let processed = ProcessedAudioChunk {
-                    source_id: source_id.clone(),
-                    num_frames: remaining_len,
-                    data: remaining,
-                    sample_rate: TARGET_SAMPLE_RATE,
-                    timestamp: Self::next_processed_timestamp(state, remaining_len),
-                };
-
-                if let Err(e) = output_tx.send(ProcessedPipelineMessage::Chunk(processed)) {
-                    log::warn!("AudioPipeline: could not send final flush chunk: {}", e);
-                }
-            }
+            Self::drain_resampler_tail(state);
+            Self::emit_chunks(output_tx, source_id, state, true);
         }
 
         log::info!("AudioPipeline: flushed remaining audio");
+    }
+
+    fn drain_resampler_tail(state: &mut SourcePipelineState) {
+        let Some(resampler) = state.resampler.as_ref() else {
+            return;
+        };
+        // Fixed-input Rubato needs a full block to drain the filter. The
+        // output cap in drain_resampler excludes any time beyond real input.
+        let needed = resampler.input_frames_next();
+        let output_frames = state.output_frames_for_input();
+        while state.produced_output_frames < output_frames {
+            state.resampler_input_buffer.resize(needed, 0.0);
+            if !Self::drain_resampler(state) {
+                break;
+            }
+        }
     }
 
     fn next_processed_timestamp(
@@ -362,7 +561,8 @@ impl AudioPipeline {
     ) -> Option<Duration> {
         let timestamp = state.current_timestamp;
         if let Some(current) = timestamp {
-            state.current_timestamp = Some(current + processed_audio_duration(num_frames));
+            state.current_timestamp =
+                Some(current.saturating_add(processed_audio_duration(num_frames)));
         }
         timestamp
     }
@@ -438,6 +638,256 @@ mod tests {
             .collect()
     }
 
+    fn timed_input(
+        source_id: &str,
+        sample_rate: u32,
+        frames: usize,
+        timestamp: Duration,
+        sample: f32,
+    ) -> AudioChunk {
+        AudioChunk {
+            source_id: source_id.into(),
+            data: vec![sample; frames],
+            sample_rate,
+            channels: 1,
+            num_frames: frames,
+            timestamp: Some(timestamp),
+            metadata: Default::default(),
+        }
+    }
+
+    fn process_inputs(inputs: impl IntoIterator<Item = AudioChunk>) -> Vec<ProcessedAudioChunk> {
+        let (in_tx, in_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        for chunk in inputs {
+            in_tx.send(AudioPipelineInput::Chunk(chunk)).unwrap();
+        }
+        drop(in_tx);
+        AudioPipeline::new(in_rx, out_tx).run();
+        collect_chunks(&out_rx)
+    }
+
+    #[test]
+    fn pipeline_preserves_two_second_gap_at_16k_and_48k() {
+        for rate in [16_000, 48_000] {
+            let frames = rate as usize / 10;
+            let resumed_at = Duration::from_secs(2);
+            let chunks = process_inputs([
+                timed_input("mic", rate, frames, Duration::ZERO, 0.75),
+                timed_input("mic", rate, frames, resumed_at, 0.0),
+            ]);
+            let first_new_index = chunks
+                .iter()
+                .position(|chunk| chunk.timestamp == Some(resumed_at))
+                .expect("resumed segment starts at its source timestamp");
+            let (old, new) = chunks.split_at(first_new_index);
+            assert_eq!(old[0].timestamp, Some(Duration::ZERO));
+            assert!(old.iter().all(|chunk| chunk.metadata.boundaries.is_empty()));
+            let boundary = &new[0].metadata.boundaries[0];
+            assert_eq!(boundary.timestamp, Some(resumed_at));
+            assert_eq!(boundary.clock_generation, 0);
+            assert_eq!(
+                boundary.discontinuities,
+                [AudioDiscontinuity::Gap {
+                    missing_duration: Duration::from_millis(1900),
+                }]
+            );
+            let old_frames = old.iter().map(|chunk| chunk.num_frames).sum::<usize>();
+            assert_eq!(
+                old_frames * (rate as usize / 16_000) + boundary.discarded_input_frames,
+                frames,
+                "all old input was represented or accounted for"
+            );
+            assert_eq!(
+                new.iter().map(|chunk| chunk.num_frames).sum::<usize>(),
+                1600
+            );
+            assert!(
+                new[1..]
+                    .iter()
+                    .all(|chunk| chunk.metadata.boundaries.is_empty())
+            );
+            assert!(
+                new.iter()
+                    .flat_map(|chunk| &chunk.data)
+                    .all(|sample| *sample == 0.0)
+            );
+            assert!(
+                chunks
+                    .iter()
+                    .all(ProcessedAudioChunk::matches_processed_audio_contract)
+            );
+        }
+    }
+
+    #[test]
+    fn backward_clock_jump_reanchors_and_increments_generation() {
+        let chunks = process_inputs([
+            timed_input("mic", 16_000, 512, Duration::from_secs(1), 0.25),
+            timed_input("mic", 16_000, 1024, Duration::from_millis(5), 0.75),
+        ]);
+        assert_eq!(chunks[0].metadata.clock_generation, 0);
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(5)));
+        assert_eq!(chunks[1].metadata.clock_generation, 1);
+        assert_eq!(
+            chunks[1].metadata.boundaries[0].discontinuities,
+            [AudioDiscontinuity::ClockReset {
+                previous_expected: Duration::from_millis(1032),
+                observed: Duration::from_millis(5),
+            }]
+        );
+        assert_eq!(chunks[2].timestamp, Some(Duration::from_millis(37)));
+        assert_eq!(chunks[2].metadata.clock_generation, 1);
+        assert!(chunks[2].metadata.boundaries.is_empty());
+    }
+
+    #[test]
+    fn rate_changes_flush_old_pcm_and_account_for_subframe_tail() {
+        let first_transition = Duration::from_millis(10);
+        let second_transition = Duration::from_millis(20);
+        let chunks = process_inputs([
+            timed_input("mic", 48_000, 481, Duration::ZERO, 0.75),
+            timed_input("mic", 44_100, 442, first_transition, 0.5),
+            timed_input("mic", 16_000, 512, second_transition, 0.0),
+        ]);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].timestamp, Some(Duration::ZERO));
+        assert_eq!(chunks[0].num_frames, 160);
+        assert!(chunks[0].metadata.boundaries.is_empty());
+        assert_eq!(chunks[1].timestamp, Some(first_transition));
+        assert_eq!(chunks[1].num_frames, 160);
+        assert_eq!(
+            chunks[1].metadata.boundaries,
+            [AudioSegmentBoundary {
+                clock_generation: 1,
+                timestamp: Some(first_transition),
+                discontinuities: vec![AudioDiscontinuity::RateChange {
+                    previous_rate_hz: 48_000,
+                    new_rate_hz: 44_100,
+                }],
+                previous_input_rate_hz: Some(48_000),
+                discarded_input_frames: 1,
+            }]
+        );
+        let chunk = &chunks[2];
+        assert_eq!(chunk.timestamp, Some(second_transition));
+        assert_eq!(chunk.metadata.clock_generation, 2);
+        assert!(chunk.data.iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            chunk.metadata.boundaries,
+            [AudioSegmentBoundary {
+                clock_generation: 2,
+                timestamp: Some(second_transition),
+                discontinuities: vec![AudioDiscontinuity::RateChange {
+                    previous_rate_hz: 44_100,
+                    new_rate_hz: 16_000,
+                }],
+                previous_input_rate_hz: Some(44_100),
+                discarded_input_frames: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_drop_deltas_are_forwarded_once_even_with_contiguous_timestamps() {
+        let drops = CaptureBufferDrops {
+            ring_buffers: 2,
+            subscriber_buffers: 3,
+            pipeline_buffers: 1,
+            pipeline_input_frames: 256,
+        };
+        let mut after_drops = timed_input("mic", 16_000, 1024, Duration::from_millis(16), 0.5);
+        after_drops.metadata.drops = drops;
+        let chunks = process_inputs([
+            timed_input("mic", 16_000, 256, Duration::ZERO, 0.25),
+            after_drops,
+        ]);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].data, vec![0.25; 256]);
+        assert!(chunks[0].metadata.boundaries.is_empty());
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(16)));
+        assert_eq!(chunks[1].data, vec![0.5; 512]);
+        assert_eq!(
+            chunks[1].metadata.boundaries[0].discontinuities,
+            [AudioDiscontinuity::DroppedBuffers(drops)]
+        );
+        assert!(chunks[2].metadata.boundaries.is_empty());
+    }
+
+    #[test]
+    fn device_recovery_marks_new_stream_generation_on_rsac_timeline() {
+        let mut recovered = timed_input("mic", 16_000, 512, Duration::from_millis(32), 0.0);
+        recovered.metadata.stream_generation = 3;
+        let chunks = process_inputs([
+            timed_input("mic", 16_000, 512, Duration::ZERO, 0.75),
+            recovered,
+        ]);
+
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(32)));
+        assert_eq!(chunks[1].metadata.clock_generation, 1);
+        assert_eq!(chunks[1].metadata.stream_generation, 3);
+        assert_eq!(
+            chunks[1].metadata.boundaries[0].discontinuities,
+            [AudioDiscontinuity::StreamGenerationChange {
+                previous: 0,
+                current: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn fallback_and_rsac_timestamps_are_not_compared_as_the_same_clock() {
+        let mut fallback = timed_input("mic", 16_000, 512, Duration::from_secs(1), 0.0);
+        fallback.metadata.timestamp_origin = CaptureTimestampOrigin::ElapsedFallback;
+        let chunks = process_inputs([
+            fallback,
+            timed_input("mic", 16_000, 512, Duration::from_millis(10), 0.0),
+        ]);
+
+        assert_eq!(
+            chunks[0].metadata.timestamp_origin,
+            CaptureTimestampOrigin::ElapsedFallback
+        );
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(10)));
+        assert_eq!(
+            chunks[1].metadata.timestamp_origin,
+            CaptureTimestampOrigin::Rsac
+        );
+        assert_eq!(
+            chunks[1].metadata.boundaries[0].discontinuities,
+            [AudioDiscontinuity::TimestampOriginChange {
+                previous: CaptureTimestampOrigin::ElapsedFallback,
+                current: CaptureTimestampOrigin::Rsac,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_gap_does_not_break_an_interleaved_contiguous_source() {
+        let chunks = process_inputs([
+            timed_input("mic", 16_000, 512, Duration::ZERO, 0.25),
+            timed_input("loopback", 16_000, 512, Duration::from_millis(50), 0.5),
+            timed_input("mic", 16_000, 512, Duration::from_secs(2), 0.25),
+            timed_input("loopback", 16_000, 512, Duration::from_millis(82), 0.5),
+        ]);
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(&*chunks[2].source_id, "mic");
+        assert_eq!(chunks[2].timestamp, Some(Duration::from_secs(2)));
+        assert_eq!(
+            chunks[2].metadata.boundaries[0].discontinuities,
+            [AudioDiscontinuity::Gap {
+                missing_duration: Duration::from_millis(1968),
+            }]
+        );
+        assert_eq!(&*chunks[3].source_id, "loopback");
+        assert_eq!(chunks[3].timestamp, Some(Duration::from_millis(82)));
+        assert_eq!(chunks[3].metadata, ProcessedAudioMetadata::default());
+        assert_eq!(chunks[3].data, vec![0.5; 512]);
+    }
+
     #[test]
     fn stereo_to_mono_basic() {
         let stereo = vec![1.0, 0.0, 0.5, 0.5, 0.0, 1.0];
@@ -474,6 +924,7 @@ mod tests {
             sample_rate: PROCESSED_AUDIO_SAMPLE_RATE_HZ,
             num_frames: PROCESSED_AUDIO_CHUNK_FRAMES,
             timestamp: Some(Duration::from_millis(123)),
+            metadata: Default::default(),
         };
         assert!(good.matches_processed_audio_contract());
         assert_eq!(good.duration(), Duration::from_millis(32));
@@ -538,6 +989,7 @@ mod tests {
             channels: 1,
             num_frames: 1024,
             timestamp: Some(Duration::from_millis(10)),
+            metadata: Default::default(),
         };
         in_tx.send(AudioPipelineInput::Chunk(chunk)).unwrap();
         drop(in_tx); // close channel so run() exits
@@ -573,7 +1025,7 @@ mod tests {
 
         // 1 second of 48kHz mono silence -> ~16000 frames at 16kHz -> many 512 chunks.
         // Split across several input chunks so multiple resampler batches run.
-        for _ in 0..6 {
+        for index in 0..6 {
             in_tx
                 .send(AudioPipelineInput::Chunk(AudioChunk {
                     source_id: "rs".into(),
@@ -581,7 +1033,9 @@ mod tests {
                     sample_rate: 48000,
                     channels: 1,
                     num_frames: 8000,
-                    timestamp: Some(Duration::from_millis(0)),
+                    // Whole milliseconds simulate quantization of 1/6-second steps.
+                    timestamp: Some(Duration::from_millis(index * 1000 / 6)),
+                    metadata: Default::default(),
                 }))
                 .unwrap();
         }
@@ -598,6 +1052,7 @@ mod tests {
             chunks.len()
         );
         for c in &chunks {
+            assert!(c.metadata.boundaries.is_empty());
             assert_eq!(c.sample_rate, 16000);
             assert_eq!(&*c.source_id, "rs");
             assert!(c.timestamp.is_some());
@@ -637,6 +1092,7 @@ mod tests {
                 channels: 1,
                 num_frames: 256,
                 timestamp: Some(Duration::from_millis(10)),
+                metadata: Default::default(),
             }))
             .unwrap();
         in_tx
@@ -647,6 +1103,7 @@ mod tests {
                 channels: 1,
                 num_frames: 512,
                 timestamp: Some(Duration::from_millis(20)),
+                metadata: Default::default(),
             }))
             .unwrap();
         in_tx
@@ -656,7 +1113,8 @@ mod tests {
                 sample_rate: 16000,
                 channels: 1,
                 num_frames: 256,
-                timestamp: Some(Duration::from_millis(30)),
+                timestamp: Some(Duration::from_millis(26)),
+                metadata: Default::default(),
             }))
             .unwrap();
         drop(in_tx);
@@ -703,6 +1161,7 @@ mod tests {
                 channels: 1,
                 num_frames: 256,
                 timestamp: Some(Duration::from_millis(10)),
+                metadata: Default::default(),
             }))
             .unwrap();
         let (completion, _completion_rx) = crossbeam_channel::bounded(1);
@@ -717,6 +1176,7 @@ mod tests {
                 channels: 1,
                 num_frames: 512,
                 timestamp: Some(Duration::from_millis(100)),
+                metadata: Default::default(),
             }))
             .unwrap();
         drop(input_tx);
@@ -784,6 +1244,7 @@ mod tests {
                 channels: 1,
                 num_frames: 512,
                 timestamp: Some(Duration::ZERO),
+                metadata: Default::default(),
             }))
             .unwrap();
         let (completion, _completion_rx) = crossbeam_channel::bounded(1);
@@ -798,6 +1259,7 @@ mod tests {
                 channels: 1,
                 num_frames: 4_800,
                 timestamp: Some(Duration::from_secs(1)),
+                metadata: Default::default(),
             }))
             .unwrap();
         drop(input_tx);

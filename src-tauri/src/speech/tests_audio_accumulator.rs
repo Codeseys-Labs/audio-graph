@@ -53,6 +53,7 @@ fn chunk(
         sample_rate: 16_000,
         num_frames: frames,
         timestamp: timestamp_ms.map(Duration::from_millis),
+        metadata: Default::default(),
     }
 }
 

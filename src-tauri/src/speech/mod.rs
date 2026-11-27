@@ -11366,6 +11366,7 @@ mod tests_status {
             sample_rate: PROCESSED_AUDIO_SAMPLE_RATE_HZ,
             num_frames: 512,
             timestamp: Some(Duration::from_millis(0)),
+            metadata: Default::default(),
         }
     }
 

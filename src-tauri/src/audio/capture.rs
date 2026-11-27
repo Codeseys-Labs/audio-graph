@@ -3,7 +3,7 @@
 //! Responsibilities:
 //! - Enumerate audio devices and applications via rsac
 //! - Start/stop capture sessions
-//! - Tag audio buffers with source ID and wall-clock time
+//! - Tag audio buffers with source ID, source position, and capture loss
 //! - Forward tagged buffers to the processing pipeline via crossbeam channel
 
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{SendTimeoutError, Sender};
 use rsac::{
-    AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget, SampleFormat,
+    AudioBuffer, AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget, SampleFormat,
     get_device_enumerator,
 };
 // rsac 0.5.0 `hotplug-recovery`: Windows/Linux only — the recovery symbols
@@ -59,8 +59,62 @@ pub struct AudioChunk {
     pub channels: u16,
     /// Number of audio frames in this chunk.
     pub num_frames: usize,
-    /// Elapsed time since the capture session started.
+    /// rsac's first-frame timestamp, or capture-thread elapsed time as a fallback.
     pub timestamp: Option<Duration>,
+    pub metadata: CaptureAudioMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaptureTimestampOrigin {
+    #[default]
+    Rsac,
+    ElapsedFallback,
+}
+
+/// Newly observed loss at each capture delivery layer. The rsac counters
+/// identify counts, but cannot identify the lost buffers' timestamps or sizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureBufferDrops {
+    pub ring_buffers: u64,
+    pub subscriber_buffers: u64,
+    pub pipeline_buffers: u64,
+    pub pipeline_input_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureAudioMetadata {
+    pub timestamp_origin: CaptureTimestampOrigin,
+    pub stream_generation: u64,
+    pub drops: CaptureBufferDrops,
+}
+
+impl AudioChunk {
+    fn from_rsac_buffer(
+        source_id: Arc<str>,
+        buffer: AudioBuffer,
+        elapsed: Duration,
+        drops: CaptureBufferDrops,
+    ) -> Self {
+        let source_timestamp = buffer.timestamp();
+        let timestamp_origin = if source_timestamp.is_some() {
+            CaptureTimestampOrigin::Rsac
+        } else {
+            CaptureTimestampOrigin::ElapsedFallback
+        };
+        Self {
+            source_id,
+            sample_rate: buffer.sample_rate(),
+            channels: buffer.channels(),
+            num_frames: buffer.num_frames(),
+            timestamp: Some(source_timestamp.unwrap_or(elapsed)),
+            metadata: CaptureAudioMetadata {
+                timestamp_origin,
+                stream_generation: buffer.stream_generation(),
+                drops,
+            },
+            data: buffer.into_data(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,17 +185,7 @@ fn await_capture_commit(commit_rx: &Receiver<()>, timeout: Duration) -> bool {
     commit_rx.recv_timeout(timeout).is_ok()
 }
 
-/// Prefer rsac's source-position timestamp (v0.4.1). Older/backends without a
-/// timestamp retain the prior monotonic wall-clock fallback.
-fn capture_chunk_timestamp(
-    source_timestamp: Option<Duration>,
-    fallback_elapsed: Duration,
-) -> Duration {
-    source_timestamp.unwrap_or(fallback_elapsed)
-}
-
-/// Return newly observed subscriber-channel drops and advance the cumulative
-/// baseline. rsac's subscriber counter is separate from ring backpressure.
+/// Return newly observed drops and advance the counter's cumulative baseline.
 fn advance_drop_counter(previous: &mut u64, current: u64) -> u64 {
     let delta = current.saturating_sub(*previous);
     *previous = current;
@@ -442,15 +486,39 @@ mod rsac_v041_contract_tests {
     }
 
     #[test]
-    fn rsac_source_timestamp_wins_over_the_elapsed_fallback() {
+    fn rsac_buffer_preserves_timestamp_generation_and_observed_loss() {
         let source_position = Duration::from_millis(125);
         let fallback = Duration::from_secs(9);
+        let drop_delta = CaptureBufferDrops {
+            ring_buffers: 2,
+            subscriber_buffers: 3,
+            pipeline_buffers: 1,
+            pipeline_input_frames: 480,
+        };
+        let buffer =
+            AudioBuffer::with_timestamp(vec![0.25, 0.75], AudioFormat::default(), source_position)
+                .with_stream_generation(4);
+        let chunk = AudioChunk::from_rsac_buffer("mic".into(), buffer, fallback, drop_delta);
 
+        assert_eq!(chunk.timestamp, Some(source_position));
+        assert_eq!(chunk.metadata.stream_generation, 4);
+        assert_eq!(chunk.metadata.drops, drop_delta);
         assert_eq!(
-            capture_chunk_timestamp(Some(source_position), fallback),
-            source_position
+            chunk.metadata.timestamp_origin,
+            CaptureTimestampOrigin::Rsac
         );
-        assert_eq!(capture_chunk_timestamp(None, fallback), fallback);
+
+        let untimed = AudioChunk::from_rsac_buffer(
+            "mic".into(),
+            AudioBuffer::new(vec![0.5], 1, 16_000),
+            fallback,
+            CaptureBufferDrops::default(),
+        );
+        assert_eq!(untimed.timestamp, Some(fallback));
+        assert_eq!(
+            untimed.metadata.timestamp_origin,
+            CaptureTimestampOrigin::ElapsedFallback
+        );
     }
 
     #[test]
@@ -1783,10 +1851,10 @@ impl AudioCaptureManager {
         const DROP_RATE_TRIP: f64 = 0.05;
         let mut last_backpressured = false;
         let mut last_subscriber_dropped = 0;
-        // Cheap rate limiter: poll every 10 iterations (~50ms at 48kHz / 5ms
-        // buffers). `backpressure_report()` is a lock-free, alloc-free
-        // consumer-side read (a Relaxed pass over a few atomics), so it's safe
-        // at this cadence; this just keeps the hot path tight.
+        let mut last_ring_dropped = 0;
+        let mut pending_drops = CaptureBufferDrops::default();
+        let mut subscriber_drops_since_report = 0u64;
+        // Throttle the public health report separately from per-chunk loss.
         let mut poll_counter: u32 = 0;
 
         // Stream-generation tracking for `hotplug-recovery` (Windows/Linux
@@ -1838,75 +1906,79 @@ impl AudioCaptureManager {
                         }
                         drain_recovery_events(recovery_rx.as_ref(), &source_id);
                     }
-                    let chunk = AudioChunk {
-                        source_id: Arc::clone(&source_id_arc),
-                        data: buffer.data().to_vec(),
-                        sample_rate: buffer.sample_rate(),
-                        channels: buffer.channels(),
-                        num_frames: buffer.num_frames(),
-                        timestamp: Some(capture_chunk_timestamp(
-                            buffer.timestamp(),
-                            start_time.elapsed(),
-                        )),
-                    };
-                    // Non-blocking-ish send: retry on timeout (re-checking the
-                    // stop signal each time) so a stalled consumer can never
-                    // pin this thread.
-                    let mut pending = Some(AudioPipelineInput::Chunk(chunk));
-                    while let Some(c) = pending.take() {
-                        if stop_signal.load(Ordering::Relaxed) {
-                            break;
+                    if stop_signal.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if buffer.is_empty() {
+                        continue;
+                    }
+                    let subscriber_drops = advance_drop_counter(
+                        &mut last_subscriber_dropped,
+                        capture.subscriber_dropped_count(),
+                    );
+                    subscriber_drops_since_report =
+                        subscriber_drops_since_report.saturating_add(subscriber_drops);
+                    pending_drops.subscriber_buffers = pending_drops
+                        .subscriber_buffers
+                        .saturating_add(subscriber_drops);
+                    pending_drops.ring_buffers =
+                        pending_drops
+                            .ring_buffers
+                            .saturating_add(advance_drop_counter(
+                                &mut last_ring_dropped,
+                                capture.overrun_count(),
+                            ));
+                    let chunk = AudioChunk::from_rsac_buffer(
+                        Arc::clone(&source_id_arc),
+                        buffer,
+                        start_time.elapsed(),
+                        pending_drops,
+                    );
+                    let input_frames = chunk.num_frames as u64;
+                    match pipeline_tx.send_timeout(AudioPipelineInput::Chunk(chunk), SEND_TIMEOUT) {
+                        Ok(()) => pending_drops = CaptureBufferDrops::default(),
+                        Err(SendTimeoutError::Timeout(_)) => {
+                            // Carry all unreported losses to the next successful send.
+                            pending_drops.pipeline_buffers =
+                                pending_drops.pipeline_buffers.saturating_add(1);
+                            pending_drops.pipeline_input_frames = pending_drops
+                                .pipeline_input_frames
+                                .saturating_add(input_frames);
+                            log::warn!(
+                                "[capture-{}] Pipeline send timed out — \
+                                 consumer stalled, dropping chunk",
+                                source_id
+                            );
                         }
-                        match pipeline_tx.send_timeout(c, SEND_TIMEOUT) {
-                            Ok(()) => {}
-                            Err(SendTimeoutError::Timeout(_)) => {
-                                // Consumer is stalled; drop this chunk and move
-                                // on rather than block. (Do not stash it back —
-                                // holding a chunk indefinitely just relocates
-                                // the wedge.)
-                                log::warn!(
-                                    "[capture-{}] Pipeline send timed out — \
-                                     consumer stalled, dropping chunk",
-                                    source_id
-                                );
-                            }
-                            Err(SendTimeoutError::Disconnected(_)) => {
-                                log::warn!(
-                                    "[capture-{}] Pipeline channel closed, exiting",
-                                    source_id
-                                );
-                                // Mirror the Ok-path teardown below.
-                                log::info!("[capture-{}] Stopping capture", source_id);
-                                let _ = capture.stop();
-                                log::info!("[capture-{}] Thread exiting", source_id);
-                                emit_or_log(
-                                    &app_handle,
-                                    CAPTURE_ERROR,
-                                    CaptureErrorPayload {
-                                        source_id: source_id.clone(),
-                                        error: "audio pipeline stopped accepting capture data"
-                                            .to_string(),
-                                        recoverable: false,
-                                    },
-                                );
-                                return true;
-                            }
+                        Err(SendTimeoutError::Disconnected(_)) => {
+                            log::warn!("[capture-{}] Pipeline channel closed, exiting", source_id);
+                            let _ = capture.stop();
+                            emit_or_log(
+                                &app_handle,
+                                CAPTURE_ERROR,
+                                CaptureErrorPayload {
+                                    source_id: source_id.clone(),
+                                    error: "audio pipeline stopped accepting capture data"
+                                        .to_string(),
+                                    recoverable: false,
+                                },
+                            );
+                            return true;
                         }
                     }
 
                     poll_counter = poll_counter.wrapping_add(1);
                     if poll_counter.is_multiple_of(10) {
                         let report = capture.backpressure_report();
-                        let subscriber_dropped = capture.subscriber_dropped_count();
                         let subscriber_drop_delta =
-                            advance_drop_counter(&mut last_subscriber_dropped, subscriber_dropped);
+                            std::mem::take(&mut subscriber_drops_since_report);
                         if subscriber_drop_delta > 0 {
                             log::warn!(
                                 "[capture-{}] rsac subscriber channel dropped {} buffer(s) \
                                  since the last poll ({} total)",
                                 source_id,
                                 subscriber_drop_delta,
-                                subscriber_dropped
+                                last_subscriber_dropped
                             );
                         }
                         let now_backpressured = report.is_under_backpressure
