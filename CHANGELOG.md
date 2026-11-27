@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Live diarization now chooses the highest-scoring one-to-one speaker assignment
+  across each window, avoiding extra speaker IDs caused by greedy matches.
 - Native decision backends now re-export the shared decision contract directly;
   the obsolete vendored module and unused direct dependencies are removed.
 

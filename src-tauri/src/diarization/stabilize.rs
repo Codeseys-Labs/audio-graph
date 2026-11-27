@@ -18,7 +18,7 @@
 //! Algorithm (per the diart / Coria et al. 2021 incremental-clustering scheme):
 //! 1. one L2-normalized embedding + active duration per local cluster;
 //! 2. cosine similarity matrix local × global;
-//! 3. greedy one-to-one assignment above `sim_threshold` (cannot-link);
+//! 3. maximum-weight one-to-one assignment at or above `sim_threshold` (cannot-link);
 //! 4. unmatched locals mint new global speakers;
 //! 5. confident, long-enough matches update the global centroid (running mean,
 //!    re-normalized) — short segments don't corrupt centroids.
@@ -63,7 +63,7 @@ pub struct SpeakerRegistry {
 pub const DEFAULT_SIM_THRESHOLD: f32 = 0.6;
 /// Default minimum active duration (s) before a match updates its centroid.
 pub const DEFAULT_MIN_UPDATE_SECS: f32 = 1.5;
-/// Id returned for a local cluster whose embedding was empty/degenerate and so
+/// Id returned for an inactive local or one whose embedding was unusable and so
 /// could neither be matched nor registered. Reserved so such clusters never
 /// mint permanent, never-matching "dead" globals that would grow the registry
 /// unboundedly over a long live session.
@@ -96,13 +96,20 @@ impl SpeakerRegistry {
     /// Assign global speaker ids to a window's local clusters.
     ///
     /// Returns one global id per input local cluster, in the same order. Locals
-    /// with an empty or wrong-dimension embedding are still assigned (a fresh
-    /// global is minted) so the caller never loses a segment, but they do not
-    /// update any centroid.
+    /// with no active speech or an unusable embedding receive [`UNKNOWN_SPEAKER`]
+    /// without reserving a global id or updating a centroid.
     pub fn assign(&mut self, locals: &[LocalCluster]) -> Vec<u32> {
         // Pre-normalize local embeddings once.
-        let normalized: Vec<Option<Vec<f32>>> =
-            locals.iter().map(|l| l2_normalize(&l.embedding)).collect();
+        let mut normalized: Vec<_> = locals
+            .iter()
+            .map(|l| {
+                if l.duration_secs > 0.0 {
+                    l2_normalize(&l.embedding)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Lock the embedding dimension from the first usable vector we ever see.
         if self.dim == 0
@@ -115,8 +122,9 @@ impl SpeakerRegistry {
         let n_global = self.speakers.len();
 
         // Build the local × global cosine matrix. Both sides are normalized, so
-        // cosine == dot product. Unusable locals get an all-`-1` row (no match).
-        let mut sim = vec![vec![-1.0f32; n_global]; n_local];
+        // cosine == dot product. NaN marks missing evidence, not a low cosine
+        // that could accidentally pass a permissive threshold.
+        let mut sim = vec![vec![f32::NAN; n_global]; n_local];
         for (li, lvec) in normalized.iter().enumerate() {
             let Some(lvec) = lvec else { continue };
             if self.dim != 0 && lvec.len() != self.dim {
@@ -127,7 +135,7 @@ impl SpeakerRegistry {
             }
         }
 
-        let matches = greedy_assign(&sim, self.sim_threshold);
+        let matches = optimal_assignment(&sim, self.sim_threshold);
 
         let mut out = vec![0u32; n_local];
         for li in 0..n_local {
@@ -147,13 +155,13 @@ impl SpeakerRegistry {
                     // a degenerate/empty (or wrong-dim) one gets the reserved
                     // UNKNOWN_SPEAKER id so it never becomes a permanent dead
                     // global that can never re-match (unbounded-growth guard).
-                    match &normalized[li] {
+                    match normalized[li].take() {
                         Some(v) if self.dim == 0 || v.len() == self.dim => {
                             let id = self.next_id;
                             self.next_id += 1;
                             self.speakers.push(GlobalSpeaker {
                                 id,
-                                centroid: v.clone(),
+                                centroid: v,
                                 count: 1,
                             });
                             out[li] = id;
@@ -174,7 +182,7 @@ pub fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
         return None;
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm <= f32::EPSILON {
+    if !norm.is_finite() || norm <= f32::EPSILON {
         return None;
     }
     Some(v.iter().map(|x| x / norm).collect())
@@ -189,15 +197,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Greedy one-to-one assignment with a cannot-link constraint: sort every
-/// (local, global) pair by descending similarity and accept a pair only if
-/// neither side is already taken and the similarity meets `threshold`. This is
-/// the cheap, deterministic alternative to Hungarian assignment and is adequate
-/// at the handful-of-speakers scale of a single window.
-///
-/// Returns, for each local row index, the matched global column index (or
-/// `None` if it should become a new speaker).
-pub fn greedy_assign(sim: &[Vec<f32>], threshold: f32) -> Vec<Option<usize>> {
+/// Rectangular Hungarian assignment. At positive thresholds a valid edge weighs
+/// its cosine; a dummy (new speaker) weighs zero. Maximize total evidence, not
+/// match count: two marginal matches need not displace one much stronger match.
+/// For a nonpositive floor, shift all eligible cosines by 2 so even −1 beats a
+/// dummy. In either case, below-floor edges are forbidden, not just low weight.
+fn optimal_assignment(sim: &[Vec<f32>], threshold: f32) -> Vec<Option<usize>> {
     let n_local = sim.len();
     let n_global = sim.first().map(Vec::len).unwrap_or(0);
     let mut result = vec![None; n_local];
@@ -205,29 +210,74 @@ pub fn greedy_assign(sim: &[Vec<f32>], threshold: f32) -> Vec<Option<usize>> {
         return result;
     }
 
-    let mut triples: Vec<(f32, usize, usize)> = Vec::with_capacity(n_local * n_global);
-    for (li, row) in sim.iter().enumerate() {
-        for (gi, &s) in row.iter().enumerate() {
-            if s >= threshold {
-                triples.push((s, li, gi));
+    // One dummy per local makes a complete row assignment feasible even if
+    // no real edge qualifies. Columns are implicit; no padded matrix is needed.
+    // Indices are 1-based; column 0 roots each augmenting path at the new row.
+    let cols = n_global + n_local;
+    let shift = if threshold <= 0.0 { 2.0 } else { 0.0 };
+    let mut row_price = vec![0.0; n_local + 1];
+    let mut col_price = vec![0.0; cols + 1];
+    let mut owner = vec![0; cols + 1];
+    let mut previous = vec![0; cols + 1];
+    let mut slack = vec![f64::INFINITY; cols + 1];
+    let mut visited = vec![false; cols + 1];
+
+    for row in 1..=n_local {
+        owner[0] = row;
+        let mut col = 0;
+        slack.fill(f64::INFINITY);
+        visited.fill(false);
+        loop {
+            visited[col] = true;
+            let i = owner[col];
+            let scores = &sim[i - 1];
+            let mut delta = f64::INFINITY;
+            let mut next = 0;
+            // Shortest augmenting path on reduced costs (negated weights).
+            // Ascending scans and strict comparisons keep the first equal path.
+            for j in 1..=cols {
+                if visited[j] {
+                    continue;
+                }
+                let cost = match scores.get(j - 1) {
+                    Some(&s) if s >= threshold => -(f64::from(s) + shift),
+                    Some(_) => f64::INFINITY,
+                    None => 0.0, // dummy
+                };
+                let reduced = cost - row_price[i] - col_price[j];
+                if reduced < slack[j] {
+                    slack[j] = reduced;
+                    previous[j] = col;
+                }
+                if slack[j] < delta {
+                    delta = slack[j];
+                    next = j;
+                }
+            }
+            // Make the next edge tight while keeping matched edges tight.
+            for j in 0..=cols {
+                if visited[j] {
+                    row_price[owner[j]] += delta;
+                    col_price[j] -= delta;
+                } else {
+                    slack[j] -= delta;
+                }
+            }
+            col = next;
+            if owner[col] == 0 {
+                break;
             }
         }
+        // Flip the tight path ending at the free column.
+        while col != 0 {
+            let parent = previous[col];
+            owner[col] = owner[parent];
+            col = parent;
+        }
     }
-    // Descending similarity; ties broken by (local, global) for determinism.
-    triples.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
-
-    let mut local_taken = vec![false; n_local];
-    let mut global_taken = vec![false; n_global];
-    for (_, li, gi) in triples {
-        if !local_taken[li] && !global_taken[gi] {
-            result[li] = Some(gi);
-            local_taken[li] = true;
-            global_taken[gi] = true;
+    for (global, &row) in owner[1..=n_global].iter().enumerate() {
+        if row != 0 {
+            result[row - 1] = Some(global);
         }
     }
     result
@@ -341,26 +391,39 @@ mod tests {
     }
 
     #[test]
-    fn greedy_assign_respects_cannot_link() {
-        // 2 locals, 2 globals. local0 ~ global1, local1 ~ global0.
-        let sim = vec![vec![0.1, 0.9], vec![0.8, 0.2]];
-        let m = greedy_assign(&sim, 0.6);
-        assert_eq!(m, vec![Some(1), Some(0)]);
+    fn optimal_assignment_avoids_greedy_dead_end() {
+        // Greedy takes .90, leaving only the forbidden .40. Reassigning the
+        // first local gives .80 + .85 and avoids minting a third speaker.
+        let sim = vec![vec![0.90, 0.80], vec![0.85, 0.40]];
+        assert_eq!(optimal_assignment(&sim, 0.6), [Some(1), Some(0)]);
     }
 
     #[test]
-    fn greedy_assign_no_double_booking() {
+    fn optimal_assignment_no_double_booking() {
         // Both locals most resemble global0; only the stronger one wins it, the
         // other stays unmatched (cannot-link) rather than double-booking.
         let sim = vec![vec![0.95, 0.1], vec![0.9, 0.05]];
-        let m = greedy_assign(&sim, 0.6);
+        let m = optimal_assignment(&sim, 0.6);
         assert_eq!(m, vec![Some(0), None]);
     }
 
     #[test]
-    fn greedy_assign_threshold_filters() {
-        let sim = vec![vec![0.4, 0.3]];
-        assert_eq!(greedy_assign(&sim, 0.6), vec![None]);
+    fn optimal_assignment_maximizes_similarity_not_match_count() {
+        let sim = vec![vec![0.95, 0.3], vec![0.3, 0.0]];
+        assert_eq!(optimal_assignment(&sim, 0.3), [Some(0), None]);
+    }
+
+    #[test]
+    fn optimal_assignment_breaks_ties_by_scan_order() {
+        let sim = vec![vec![0.6; 2]; 3];
+        assert_eq!(optimal_assignment(&sim, 0.6), [Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn optimal_assignment_accepts_the_floor_but_not_missing_evidence() {
+        let sim = vec![vec![-1.0, f32::NAN], vec![f32::NAN, f32::NAN]];
+        assert_eq!(optimal_assignment(&sim, -1.0), [Some(0), None]);
+        assert_eq!(optimal_assignment(&sim, -0.99), [None, None]);
     }
 
     #[test]
@@ -411,6 +474,38 @@ mod tests {
     }
 
     #[test]
+    fn registry_reassigns_contested_global_instead_of_minting() {
+        let local = |x, y| LocalCluster {
+            embedding: vec![x, y],
+            duration_secs: 2.0,
+        };
+        let mut reg = SpeakerRegistry::with_defaults();
+        assert_eq!(reg.assign(&[local(1.0, 0.0), local(0.0, 1.0)]), [0, 1]);
+        // First row (.8, .6); second row (~.71, ~−.71) can only reuse id 0.
+        assert_eq!(reg.assign(&[local(4.0, 3.0), local(1.0, -1.0)]), [1, 0]);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn registry_empty_and_inactive_windows_leave_identity_untouched() {
+        let mut reg = SpeakerRegistry::with_defaults();
+        let mut local = LocalCluster {
+            embedding: vec![1.0],
+            duration_secs: 0.0,
+        };
+        assert!(reg.assign(&[]).is_empty());
+        assert_eq!(reg.assign(std::slice::from_ref(&local)), [UNKNOWN_SPEAKER]);
+        assert!(reg.is_empty());
+        local.embedding = vec![1.0, 0.0];
+        local.duration_secs = 2.0;
+        assert_eq!(reg.assign(std::slice::from_ref(&local)), [0]);
+        assert!(reg.assign(&[]).is_empty());
+        local.duration_secs = 0.0;
+        assert_eq!(reg.assign(&[local]), [UNKNOWN_SPEAKER]);
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
     fn registry_adds_new_speaker_when_dissimilar() {
         let mut reg = SpeakerRegistry::with_defaults();
         reg.assign(&[LocalCluster {
@@ -445,12 +540,15 @@ mod tests {
             duration_secs: 0.2,
         }]);
         assert_eq!(w2[0], w1[0]);
+        assert_eq!(reg.speakers[0].centroid, [1.0, 0.0]);
+        assert_eq!(reg.speakers[0].count, 1);
         // Still recognizes the original clean vector strongly.
         let w3 = reg.assign(&[LocalCluster {
             embedding: vec![1.0, 0.0],
             duration_secs: 3.0,
         }]);
         assert_eq!(w3[0], w1[0]);
+        assert_eq!(reg.speakers[0].count, 2);
         assert_eq!(reg.len(), 1);
     }
 
