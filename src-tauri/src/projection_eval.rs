@@ -7,9 +7,9 @@
 
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulers};
 use crate::projections::{
-    DiarizationSpanRevision, MaterializedNotes, MaterializedProjectionState, ProjectionApplyError,
-    ProjectionJob, ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptEvent,
-    TranscriptLedger, TranscriptLedgerError,
+    DiarizationSpanRevision, MaterializedProjectionState, ProjectionApplyError, ProjectionJob,
+    ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptEvent, TranscriptLedger,
+    TranscriptLedgerError,
 };
 
 const TWO_SPAN_REPAIR_FIXTURE_JSON: &str =
@@ -254,13 +254,8 @@ pub fn summarize_offline_projection_fixture_costs(
     summary
 }
 
-/// `generator`'s third parameter is the live Notes-kind notes snapshot (seed
-/// audio-graph-253c part 2), mirroring the production
-/// `ProjectionPatchGenerator::generate_projection_patch` signature. This
-/// harness can supply a REAL one trivially — `complete_kind` below already
-/// holds the replay's own `MaterializedProjectionState` in scope at the exact
-/// point it calls `generator`, so it passes `Some(&materialized.notes)`
-/// rather than `None` with an unwired excuse.
+/// Each generator receives the replay's current speaker timeline and, for
+/// notes jobs, the document as materialized before this completion.
 pub fn run_offline_projection_replay<G>(
     session_id: impl Into<String>,
     steps: impl IntoIterator<Item = OfflineProjectionReplayStep>,
@@ -270,7 +265,7 @@ where
     G: FnMut(
         &ProjectionJob,
         &TranscriptLedger,
-        Option<&MaterializedNotes>,
+        crate::projection_llm::ProjectionContext<'_>,
         u64,
         u64,
     ) -> Result<OfflineProjectionPatchOutcome, String>,
@@ -417,7 +412,7 @@ fn complete_kind<G>(
     G: FnMut(
         &ProjectionJob,
         &TranscriptLedger,
-        Option<&MaterializedNotes>,
+        crate::projection_llm::ProjectionContext<'_>,
         u64,
         u64,
     ) -> Result<OfflineProjectionPatchOutcome, String>,
@@ -437,7 +432,11 @@ fn complete_kind<G>(
         ProjectionKind::Notes => Some(&materialized.notes),
         ProjectionKind::Graph => None,
     };
-    let generated = generator(&job, ledger, notes, *sequence, now_ms);
+    let snapshot = crate::projection_llm::ProjectionContext {
+        notes,
+        speakers: Some(speaker_timeline),
+    };
+    let generated = generator(&job, ledger, snapshot, *sequence, now_ms);
     match generated {
         Ok(outcome) => {
             metrics.generated_patch_count += 1;
@@ -800,7 +799,7 @@ mod tests {
                 },
                 OfflineProjectionReplayStep::CompleteNotes { now_ms: 1_200 },
             ],
-            |job, ledger, notes, sequence, created_at_ms| {
+            |job, ledger, snapshot, sequence, created_at_ms| {
                 let started = Instant::now();
                 // `attempted_route` is unused here: this is an offline replay
                 // smoke test, not the live ledger path, so there is no
@@ -810,7 +809,10 @@ mod tests {
                     .generate_projection_patch(
                         job.clone(),
                         ledger.clone(),
-                        notes.cloned(),
+                        crate::projection_llm::ProjectionSnapshots {
+                            notes: snapshot.notes.cloned(),
+                            speakers: snapshot.speakers.cloned().map(std::sync::Arc::new),
+                        },
                         provider.clone(),
                         sequence,
                         created_at_ms,

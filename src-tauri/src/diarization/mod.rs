@@ -78,6 +78,7 @@ pub struct AudioFeatures {
 /// A known speaker profile, accumulated over time.
 #[derive(Debug, Clone)]
 pub struct SpeakerProfile {
+    simple_source_id: Option<String>,
     /// Unique identifier (e.g. `"speaker-1"`).
     pub id: String,
     /// Human-readable label (e.g. `"Speaker A"`).
@@ -90,6 +91,26 @@ pub struct SpeakerProfile {
     pub segment_count: u32,
     /// Cumulative speaking time in seconds.
     pub total_speaking_time: f64,
+}
+
+impl SpeakerProfile {
+    fn attribute(&self, mut segment: TranscriptSegment, backend: &str) -> DiarizedTranscript {
+        let lane = hex::encode(&segment.source_id);
+        let id = format!("{}:{lane}", self.id);
+        let label = format!("{} [{backend}:{lane}]", self.label);
+        segment.speaker_id = Some(id.clone());
+        segment.speaker_label = Some(label.clone());
+        DiarizedTranscript {
+            segment,
+            speaker_info: Some(SpeakerInfo {
+                id,
+                label,
+                color: self.color.clone(),
+                total_speaking_time: self.total_speaking_time,
+                segment_count: self.segment_count,
+            }),
+        }
+    }
 }
 
 /// Which diarization backend to use.
@@ -180,7 +201,7 @@ impl DiarizationConfig {
 /// raw speech audio that produced it.
 #[derive(Debug, Clone)]
 pub struct DiarizationInput {
-    /// The transcript segment (with `speaker_id` / `speaker_label` = `None`).
+    /// The transcript segment, including any upstream speaker attribution.
     pub transcript: TranscriptSegment,
     /// 16 kHz mono f32 audio for this segment.
     pub speech_audio: Vec<f32>,
@@ -195,8 +216,8 @@ pub struct DiarizationInput {
 pub struct DiarizedTranscript {
     /// Transcript segment with `speaker_id` and `speaker_label` filled in.
     pub segment: TranscriptSegment,
-    /// Current state of the assigned speaker.
-    pub speaker_info: SpeakerInfo,
+    /// Updated only when audio provided evidence for a local assignment.
+    pub speaker_info: Option<SpeakerInfo>,
 }
 
 // ── Sortformer wrapper (feature-gated) ───────────────────────────────────
@@ -257,8 +278,7 @@ pub struct DiarizationWorker {
     config: DiarizationConfig,
     speakers: Vec<SpeakerProfile>,
     output_tx: Sender<DiarizedTranscript>,
-    next_speaker_num: u32,
-    last_segment_end: Option<f64>,
+    last_segment_end: std::collections::HashMap<String, f64>,
 
     /// Sortformer engine (only present when backend = Sortformer and feature enabled).
     #[cfg(feature = "diarization")]
@@ -337,8 +357,7 @@ impl DiarizationWorker {
             config,
             speakers: Vec::new(),
             output_tx,
-            next_speaker_num: 1,
-            last_segment_end: None,
+            last_segment_end: Default::default(),
             #[cfg(feature = "diarization")]
             sortformer,
         }
@@ -397,6 +416,16 @@ impl DiarizationWorker {
 
     /// Process a single diarization input and return an enriched transcript.
     pub fn process_input(&mut self, input: DiarizationInput) -> DiarizedTranscript {
+        if input.speech_audio.is_empty() {
+            log::trace!(
+                "Diarization skipped: no audio, source={}",
+                input.transcript.source_id
+            );
+            return DiarizedTranscript {
+                segment: input.transcript,
+                speaker_info: None,
+            };
+        }
         if self.is_sortformer_active() {
             self.process_input_sortformer(input)
         } else {
@@ -463,22 +492,7 @@ impl DiarizationWorker {
             );
 
             // Build enriched transcript
-            let mut segment = input.transcript;
-            segment.speaker_id = Some(speaker.id.clone());
-            segment.speaker_label = Some(speaker.label.clone());
-
-            let speaker_info = SpeakerInfo {
-                id: speaker.id.clone(),
-                label: speaker.label.clone(),
-                color: speaker.color.clone(),
-                total_speaking_time: speaker.total_speaking_time,
-                segment_count: speaker.segment_count,
-            };
-
-            DiarizedTranscript {
-                segment,
-                speaker_info,
-            }
+            speaker.attribute(input.transcript, "sortformer")
         }
 
         #[cfg(not(feature = "diarization"))]
@@ -528,6 +542,7 @@ impl DiarizationWorker {
         let color_idx = sortformer_id % SPEAKER_COLORS.len();
 
         let profile = SpeakerProfile {
+            simple_source_id: None,
             id: target_id,
             label: format!("Speaker {}", letter),
             color: SPEAKER_COLORS[color_idx].to_string(),
@@ -556,6 +571,7 @@ impl DiarizationWorker {
         }
 
         let profile = SpeakerProfile {
+            simple_source_id: None,
             id: target_id.to_string(),
             label: "Unknown".to_string(),
             color: "#888888".to_string(),
@@ -586,14 +602,17 @@ impl DiarizationWorker {
         );
 
         // 2. Compute time gap from previous segment
-        let time_gap = match self.last_segment_end {
+        let time_gap = match self.last_segment_end.insert(
+            input.transcript.source_id.clone(),
+            input.transcript.end_time,
+        ) {
             Some(prev_end) => (input.transcript.start_time - prev_end).max(0.0),
             None => 0.0,
         };
-        self.last_segment_end = Some(input.transcript.end_time);
 
         // 3. Find or create speaker
-        let speaker_idx = self.find_or_create_speaker_simple(&features, time_gap);
+        let speaker_idx =
+            self.find_or_create_speaker_simple(&features, time_gap, &input.transcript.source_id);
 
         // 4. Update the matched speaker's running features & stats
         let segment_duration =
@@ -617,22 +636,7 @@ impl DiarizationWorker {
         );
 
         // 5. Build enriched transcript
-        let mut segment = input.transcript;
-        segment.speaker_id = Some(speaker.id.clone());
-        segment.speaker_label = Some(speaker.label.clone());
-
-        let speaker_info = SpeakerInfo {
-            id: speaker.id.clone(),
-            label: speaker.label.clone(),
-            color: speaker.color.clone(),
-            total_speaking_time: speaker.total_speaking_time,
-            segment_count: speaker.segment_count,
-        };
-
-        DiarizedTranscript {
-            segment,
-            speaker_info,
-        }
+        speaker.attribute(input.transcript, "simple")
     }
 
     // ── Feature extraction (Simple) ──────────────────────────────────
@@ -679,17 +683,22 @@ impl DiarizationWorker {
 
     /// Find the best matching speaker for the given features, or create a new one.
     /// (Simple backend only.)
-    fn find_or_create_speaker_simple(&mut self, features: &AudioFeatures, time_gap: f64) -> usize {
+    fn find_or_create_speaker_simple(
+        &mut self,
+        features: &AudioFeatures,
+        time_gap: f64,
+        source_id: &str,
+    ) -> usize {
         // Only consider speakers that have feature profiles (Simple-created speakers).
         let simple_speakers: Vec<(usize, &SpeakerProfile)> = self
             .speakers
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.features.is_some())
+            .filter(|(_, s)| s.simple_source_id.as_deref() == Some(source_id))
             .collect();
 
         if simple_speakers.is_empty() {
-            return self.create_speaker_simple(features);
+            return self.create_speaker_simple(features, source_id, 1);
         }
 
         // Find closest existing speaker
@@ -707,8 +716,7 @@ impl DiarizationWorker {
         };
 
         log::debug!(
-            "DiarizationWorker [Simple]: best match = {} (dist={:.4}, threshold={:.4}, gap={:.2}s)",
-            self.speakers[best_idx].label,
+            "DiarizationWorker [Simple]: source={source_id} best_idx={best_idx} (dist={:.4}, threshold={:.4}, gap={:.2}s)",
             best_dist,
             effective_threshold,
             time_gap,
@@ -716,8 +724,8 @@ impl DiarizationWorker {
 
         if best_dist < effective_threshold {
             best_idx
-        } else if self.speakers.len() < self.config.max_speakers {
-            self.create_speaker_simple(features)
+        } else if simple_speakers.len() < self.config.max_speakers {
+            self.create_speaker_simple(features, source_id, simple_speakers.len() + 1)
         } else {
             log::debug!(
                 "DiarizationWorker [Simple]: max speakers reached ({}), assigning to closest",
@@ -728,13 +736,16 @@ impl DiarizationWorker {
     }
 
     /// Create a new speaker profile (Simple backend) and return its index.
-    fn create_speaker_simple(&mut self, features: &AudioFeatures) -> usize {
-        let num = self.next_speaker_num;
-        self.next_speaker_num += 1;
-
-        let color_idx = (num as usize - 1) % SPEAKER_COLORS.len();
+    fn create_speaker_simple(
+        &mut self,
+        features: &AudioFeatures,
+        source_id: &str,
+        num: usize,
+    ) -> usize {
+        let color_idx = (num - 1) % SPEAKER_COLORS.len();
 
         let profile = SpeakerProfile {
+            simple_source_id: Some(source_id.to_owned()),
             id: format!("speaker-{}", num),
             label: format!("Speaker {}", num),
             color: SPEAKER_COLORS[color_idx].to_string(),
@@ -744,8 +755,7 @@ impl DiarizationWorker {
         };
 
         log::info!(
-            "DiarizationWorker [Simple]: created new speaker '{}' (color={})",
-            profile.label,
+            "DiarizationWorker [Simple]: source={source_id} created speaker_num={num} (color={})",
             profile.color,
         );
 
@@ -1196,14 +1206,62 @@ mod tests {
         let input = make_test_input(vec![0.1; 8000], 0.0, 0.5);
         let result = worker.process_input(input);
 
-        assert_eq!(result.segment.speaker_id, Some("speaker-1".to_string()));
-        assert_eq!(result.segment.speaker_label, Some("Speaker 1".to_string()));
-        assert_eq!(result.speaker_info.id, "speaker-1");
-        assert_eq!(result.speaker_info.color, "#4A90D9");
-        assert_eq!(result.speaker_info.segment_count, 1);
+        let lane = hex::encode("test-source");
+        assert_eq!(result.segment.speaker_id, Some(format!("speaker-1:{lane}")));
+        assert_eq!(
+            result.segment.speaker_label,
+            Some(format!("Speaker 1 [simple:{lane}]"))
+        );
+        let info = result.speaker_info.unwrap();
+        assert_eq!(info.id, format!("speaker-1:{lane}"));
+        assert_eq!(info.color, "#4A90D9");
+        assert_eq!(info.segment_count, 1);
         assert_eq!(worker.speakers.len(), 1);
 
         drop(rx);
+    }
+
+    #[test]
+    fn empty_audio_preserves_upstream_attribution_without_updating_profiles() {
+        let mut worker = DiarizationWorker::new(
+            DiarizationConfig::default(),
+            crossbeam_channel::unbounded().0,
+        );
+        worker.process_input(make_test_input(vec![0.; 100], 0., 1.));
+        for upstream in [None, Some("Provider speaker")] {
+            let mut input = make_test_input(Vec::new(), 1., 2.);
+            input.transcript.speaker_label = upstream.map(str::to_owned);
+            input.transcript.speaker_id = upstream.map(|_| "provider-id".into());
+            let result = worker.process_input(input);
+            assert_eq!(result.segment.speaker_label.as_deref(), upstream);
+            assert_eq!(
+                result.segment.speaker_id.as_deref(),
+                upstream.map(|_| "provider-id")
+            );
+            assert!(result.speaker_info.is_none());
+        }
+        assert_eq!(worker.speakers.len(), 1);
+        assert_eq!(worker.speakers[0].segment_count, 1);
+    }
+
+    #[test]
+    fn independent_workers_assign_distinct_graph_names_across_sources() {
+        let first = |source: &str| {
+            let mut worker = DiarizationWorker::new(
+                DiarizationConfig::default(),
+                crossbeam_channel::unbounded().0,
+            );
+            let mut input = make_test_input(vec![0.1; 100], 0., 1.);
+            input.transcript.source_id = source.into();
+            worker.process_input(input).segment
+        };
+        let mic = first("Mic");
+        let system = first("mic");
+        assert_ne!(mic.speaker_id, system.speaker_id);
+        assert_ne!(
+            mic.speaker_label.unwrap().to_lowercase(),
+            system.speaker_label.unwrap().to_lowercase()
+        );
     }
 
     #[test]

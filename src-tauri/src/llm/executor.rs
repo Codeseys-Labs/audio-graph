@@ -13,14 +13,13 @@ use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::{ChatMessage, ChatOutcome};
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::projection_llm::{
-    PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionPatchBuildContext,
-    ProjectionPatchDraftError, projection_patch_draft_json_schema,
-    projection_patch_prompt_messages, projection_patch_repair_prompt_messages,
-    projection_patch_strict_json_schema, trusted_projection_patch_from_model_json,
+    PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionContext,
+    ProjectionPatchBuildContext, ProjectionPatchDraftError, ProjectionSnapshots,
+    projection_patch_draft_json_schema, projection_patch_prompt_messages,
+    projection_patch_repair_prompt_messages, projection_patch_strict_json_schema,
+    trusted_projection_patch_from_model_json,
 };
-use crate::projections::{
-    MaterializedNotes, ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger,
-};
+use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
 
 use super::route::{
@@ -192,14 +191,8 @@ enum LlmJob {
     ProjectionPatch {
         job: ProjectionJob,
         ledger: TranscriptLedger,
-        /// Live Notes-kind notes snapshot (seed audio-graph-253c part 2),
-        /// cloned by the caller under `AppState`'s
-        /// `materialized_projection_state` lock at job-spawn time — never
-        /// re-read from that lock by this executor. `None` for a Graph-kind
-        /// job (which never renders the notes block) or when a Notes-kind
-        /// caller could not confirm the snapshot belonged to this job's own
-        /// session (see `ProjectionRuntimeHandle::materialized_notes_snapshot_for_session`).
-        notes: Option<MaterializedNotes>,
+        /// Notes and speaker attribution captured for this session before enqueue.
+        snapshots: ProjectionSnapshots,
         sequence: u64,
         created_at_ms: u64,
         provider: LlmProvider,
@@ -370,7 +363,7 @@ impl LlmExecutor {
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
-        notes: Option<MaterializedNotes>,
+        snapshots: impl Into<ProjectionSnapshots>,
         provider: LlmProvider,
         sequence: u64,
         created_at_ms: u64,
@@ -381,7 +374,7 @@ impl LlmExecutor {
             LlmJob::ProjectionPatch {
                 job,
                 ledger,
-                notes,
+                snapshots: snapshots.into(),
                 sequence,
                 created_at_ms,
                 provider,
@@ -497,7 +490,7 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
             LlmJob::ProjectionPatch {
                 job,
                 ledger,
-                notes,
+                snapshots,
                 sequence,
                 created_at_ms,
                 provider,
@@ -508,7 +501,7 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
                     &provider,
                     &job,
                     &ledger,
-                    notes.as_ref(),
+                    snapshots.view(),
                     sequence,
                     created_at_ms,
                 );
@@ -715,7 +708,7 @@ fn run_projection_patch(
     provider: &LlmProvider,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    snapshot: ProjectionContext<'_>,
     sequence: u64,
     created_at_ms: u64,
 ) -> ProjectionPatchAttempt {
@@ -725,7 +718,7 @@ fn run_projection_patch(
         provider,
         job,
         ledger,
-        notes,
+        snapshot,
         sequence,
         created_at_ms,
         &mut attempted_route,
@@ -745,7 +738,7 @@ fn run_projection_patch_dispatch(
     provider: &LlmProvider,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    snapshot: ProjectionContext<'_>,
     sequence: u64,
     created_at_ms: u64,
     attempted_route: &mut Option<AttemptedRouteIdentity>,
@@ -766,7 +759,7 @@ fn run_projection_patch_dispatch(
     // license the model to mint ids as if none existed, which is the same
     // overwrite-storm failure mode this seed exists to fix.
     let messages =
-        projection_patch_prompt_messages(job, ledger, notes).map_err(|e| e.to_string())?;
+        projection_patch_prompt_messages(job, ledger, snapshot).map_err(|e| e.to_string())?;
     let cache_context = ProjectionCacheContext {
         session_id: job.session_id.clone(),
         cache_breakpoint_message_index:
@@ -779,7 +772,7 @@ fn run_projection_patch_dispatch(
         &messages,
         job,
         ledger,
-        notes,
+        snapshot,
         sequence,
         created_at_ms,
     )
@@ -840,7 +833,7 @@ fn run_projection_patch_on_route(
     messages: &[ChatMessage],
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    snapshot: ProjectionContext<'_>,
     sequence: u64,
     created_at_ms: u64,
 ) -> Result<ProjectionPatchOutcome, String> {
@@ -851,7 +844,7 @@ fn run_projection_patch_on_route(
         &output,
         job,
         ledger,
-        notes,
+        snapshot,
         sequence,
         created_at_ms,
         PROJECTION_PATCH_PROMPT_ID,
@@ -865,7 +858,7 @@ fn run_projection_patch_on_route(
             let repair_messages = projection_patch_repair_prompt_messages(
                 job,
                 ledger,
-                notes,
+                snapshot,
                 &output.raw_json,
                 &first_error,
             )
@@ -876,7 +869,7 @@ fn run_projection_patch_on_route(
                 &repair_output,
                 job,
                 ledger,
-                notes,
+                snapshot,
                 sequence,
                 created_at_ms,
                 PROJECTION_PATCH_REPAIR_PROMPT_ID,
@@ -933,7 +926,7 @@ fn projection_outcome_from_output(
     output: &ProjectionBackendOutput,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    snapshot: ProjectionContext<'_>,
     sequence: u64,
     created_at_ms: u64,
     prompt_id: &str,
@@ -956,7 +949,7 @@ fn projection_outcome_from_output(
         &output.raw_json,
         job,
         ledger,
-        notes,
+        snapshot,
         ProjectionPatchBuildContext {
             sequence,
             llm_request_id,
@@ -1792,7 +1785,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -1854,7 +1847,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -1915,7 +1908,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             9,
             456,
         )
@@ -1975,7 +1968,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -2013,7 +2006,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -2047,7 +2040,7 @@ mod tests {
             &[],
             &projection_test_job(ProjectionKind::Notes).0,
             &projection_test_job(ProjectionKind::Notes).1,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -2126,7 +2119,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -2180,7 +2173,7 @@ mod tests {
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
             &job,
             &ledger,
-            None,
+            None.into(),
             4,
             123,
         )
@@ -2640,7 +2633,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let attempt = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
         })
         .join()
         .expect("worker thread panic");
@@ -2699,7 +2692,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let err = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2759,7 +2752,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let outcome = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2808,7 +2801,7 @@ mod tests {
             model: "probe-model".to_string(),
         };
         let outcome = std::thread::spawn(move || {
-            run_projection_patch(&handles, &provider, &job, &ledger, None, 1, 100)
+            run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
         })
         .join()
         .expect("worker thread panic")
@@ -2850,7 +2843,15 @@ mod tests {
             model: "gpt-oss-120b".to_string(),
         };
 
-        let attempt = run_projection_patch(&handles, &stale_snapshot, &job, &ledger, None, 1, 100);
+        let attempt = run_projection_patch(
+            &handles,
+            &stale_snapshot,
+            &job,
+            &ledger,
+            None.into(),
+            1,
+            100,
+        );
         let err = attempt
             .outcome
             .expect_err("a re-pointed client must fail closed");

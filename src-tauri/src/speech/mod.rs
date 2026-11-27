@@ -2640,6 +2640,7 @@ pub(crate) struct TranscriptProcessingContext {
 
 #[derive(Clone)]
 struct ProjectionDispatchContext {
+    speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
     transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
     projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     projection_runtime: ProjectionRuntimeHandle,
@@ -2697,7 +2698,7 @@ trait ProjectionPatchGenerator: Send + Sync {
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
-        notes: Option<MaterializedNotes>,
+        snapshots: crate::projection_llm::ProjectionSnapshots,
         sequence: u64,
         created_at_ms: u64,
     ) -> ProjectionPatchAttempt;
@@ -2790,14 +2791,14 @@ impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
         &self,
         job: ProjectionJob,
         ledger: TranscriptLedger,
-        notes: Option<MaterializedNotes>,
+        snapshots: crate::projection_llm::ProjectionSnapshots,
         sequence: u64,
         created_at_ms: u64,
     ) -> ProjectionPatchAttempt {
         self.llm_executor.generate_projection_patch(
             job,
             ledger,
-            notes,
+            snapshots,
             self.llm_provider.clone(),
             sequence,
             created_at_ms,
@@ -2808,6 +2809,7 @@ impl ProjectionPatchGenerator for ExecutorProjectionPatchGenerator {
 impl TranscriptProcessingContext {
     fn projection_dispatch_context(&self) -> ProjectionDispatchContext {
         ProjectionDispatchContext {
+            speaker_timeline: self.speaker_timeline.clone(),
             transcript_ledger: self.transcript_ledger.clone(),
             projection_schedulers: self.projection_schedulers.clone(),
             projection_runtime: self.projection_runtime.clone(),
@@ -3613,7 +3615,7 @@ fn projection_movement_facts(
     job: &ProjectionJob,
     sequence: u64,
     ledger: &crate::projections::TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    snapshot: crate::projection_llm::ProjectionContext<'_>,
     tokens_in: u64,
     tokens_out: u64,
     // audio-graph-a6b5 W2: 0 at the pre-generation `Started` call site (no
@@ -3623,7 +3625,7 @@ fn projection_movement_facts(
     no_op_filtered_count: u32,
     backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
-    let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, notes);
+    let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, snapshot);
     let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
         ProjectionLedgerBackend::Actual(provenance, attempted_route) => {
             let (provider_id, cloud, prefix) =
@@ -3717,6 +3719,18 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             .materialized_notes_snapshot_for_session(&job.session_id),
         ProjectionKind::Graph => None,
     };
+    let speakers = {
+        let timeline = dispatch
+            .speaker_timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (timeline.session_id == job.session_id && !timeline.latest_spans.is_empty())
+            .then(|| Arc::new(timeline.clone()))
+    };
+    let snapshots = crate::projection_llm::ProjectionSnapshots {
+        notes: notes_snapshot,
+        speakers,
+    };
     let generation_started_ms = current_unix_millis();
 
     // Ledger the remote-LLM data flow before the call leaves the device
@@ -3730,7 +3744,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             &job,
             sequence,
             &ledger,
-            notes_snapshot.as_ref(),
+            snapshots.view(),
             0,
             0,
             0,
@@ -3745,7 +3759,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let attempt = dispatch.patch_generator.generate_projection_patch(
         job.clone(),
         ledger.clone(),
-        notes_snapshot.clone(),
+        snapshots.clone(),
         sequence,
         created_at_ms,
     );
@@ -3762,7 +3776,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &job,
                 sequence,
                 &ledger,
-                notes_snapshot.as_ref(),
+                snapshots.view(),
                 u64::from(outcome.tokens_used),
                 0,
                 outcome.no_op_filtered_count,
@@ -3947,7 +3961,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &job,
                 sequence,
                 &ledger,
-                notes_snapshot.as_ref(),
+                snapshots.view(),
                 0,
                 0,
                 0,
@@ -6043,13 +6057,13 @@ fn run_asr_worker(
                                 }
                                 // Diarizer hasn't covered this time yet — keep the
                                 // Simple fallback label + its speaker_info.
-                                None => Some(diarized.speaker_info),
+                                None => diarized.speaker_info,
                             }
                         }
-                        None => Some(diarized.speaker_info),
+                        None => diarized.speaker_info,
                     };
                     #[cfg(not(feature = "diarization-clustering"))]
-                    let speaker_info_to_emit = Some(diarized.speaker_info);
+                    let speaker_info_to_emit = diarized.speaker_info;
 
                     let final_meta = final_only_revision_meta(
                         "local_whisper",
@@ -6162,6 +6176,7 @@ pub(crate) fn run_speech_processor_diarization_only(
         is_transcribing,
     } = channels;
     let projection_dispatch = ProjectionDispatchContext {
+        speaker_timeline: shared.speaker_timeline.clone(),
         transcript_ledger: shared.transcript_ledger.clone(),
         projection_schedulers: shared.projection_schedulers.clone(),
         projection_runtime: shared.projection_runtime.clone(),
@@ -6422,10 +6437,8 @@ pub(crate) fn run_speech_processor_diarization_only(
         let _ = shared
             .app_handle
             .emit(events::TRANSCRIPT_UPDATE, &final_segment);
-        if emit_simple_speaker {
-            let _ = shared
-                .app_handle
-                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+        if emit_simple_speaker && let Some(info) = diarized.speaker_info {
+            let _ = shared.app_handle.emit(events::SPEAKER_DETECTED, &info);
         }
         spawn_agent_proposal_task(
             final_segment.clone(),
@@ -6695,7 +6708,7 @@ fn run_cloud_asr_worker(
                     );
                     emit_transcript_and_extract_with_meta(
                         final_segment,
-                        Some(diarized.speaker_info),
+                        diarized.speaker_info,
                         &ctx,
                         asr_count,
                         diarization_count,
@@ -7220,7 +7233,6 @@ fn promote_pending_interim(
     speaker_map: &mut HashMap<u32, u32>,
     last_speaker: &mut u32,
     max_speakers: u32,
-    diarization_worker: &mut DiarizationWorker,
     asr_count: &mut u64,
     diarization_count: &mut u64,
     extraction_count: &Arc<AtomicU64>,
@@ -7253,7 +7265,7 @@ fn promote_pending_interim(
         });
 
         *asr_count += 1;
-        let segment = TranscriptSegment {
+        let final_segment = TranscriptSegment {
             id: uuid::Uuid::new_v4().to_string(),
             source_id: source_id.clone(),
             speaker_id: speaker_from_deepgram.clone(),
@@ -7264,23 +7276,7 @@ fn promote_pending_interim(
             confidence,
         };
 
-        let final_segment = if segment.speaker_label.is_some() {
-            *diarization_count += 1;
-            segment.clone()
-        } else {
-            let input = DiarizationInput {
-                transcript: segment.clone(),
-                speech_audio: vec![],
-                speech_start_time: Duration::from_secs_f64(start),
-                speech_end_time: Duration::from_secs_f64(end_time),
-            };
-            let diarized = diarization_worker.process_input(input);
-            *diarization_count += 1;
-            let _ = ctx
-                .app_handle
-                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-            diarized.segment
-        };
+        *diarization_count += u64::from(final_segment.speaker_label.is_some());
 
         emit_transcript_and_extract_with_meta(
             final_segment,
@@ -7360,7 +7356,7 @@ fn promote_pending_interim(
         });
 
         *asr_count += 1;
-        let run_segment = TranscriptSegment {
+        let final_run_segment = TranscriptSegment {
             id: uuid::Uuid::new_v4().to_string(),
             source_id: source_id.clone(),
             speaker_id: speaker_from_deepgram.clone(),
@@ -7371,23 +7367,7 @@ fn promote_pending_interim(
             confidence,
         };
 
-        let final_run_segment = if run_segment.speaker_label.is_some() {
-            *diarization_count += 1;
-            run_segment.clone()
-        } else {
-            let input = DiarizationInput {
-                transcript: run_segment.clone(),
-                speech_audio: vec![],
-                speech_start_time: Duration::from_secs_f64(run_start),
-                speech_end_time: Duration::from_secs_f64(run_end),
-            };
-            let diarized = diarization_worker.process_input(input);
-            *diarization_count += 1;
-            let _ = ctx
-                .app_handle
-                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-            diarized.segment
-        };
+        *diarization_count += u64::from(final_run_segment.speaker_label.is_some());
 
         emit_transcript_and_extract_with_meta(
             final_run_segment,
@@ -7442,9 +7422,8 @@ fn run_deepgram_event_receiver(
     provider_native_diarization_active: bool,
 ) {
     use crate::asr::deepgram::{DeepgramEvent, DeepgramTurnKind};
-    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let (diarization_config, diarization_degradation) =
+    let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
     apply_diarization_degradation(
         &shared.app_handle,
@@ -7454,8 +7433,6 @@ fn run_deepgram_event_receiver(
             diarization_degradation,
         ),
     );
-    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
-    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
@@ -7522,7 +7499,6 @@ fn run_deepgram_event_receiver(
                             &mut speaker_map,
                             &mut last_speaker,
                             max_speakers,
-                            &mut diarization_worker,
                             &mut asr_count,
                             &mut diarization_count,
                             &extraction_count,
@@ -7643,7 +7619,6 @@ fn run_deepgram_event_receiver(
                             &mut speaker_map,
                             &mut last_speaker,
                             max_speakers,
-                            &mut diarization_worker,
                             &mut asr_count,
                             &mut diarization_count,
                             &extraction_count,
@@ -7685,7 +7660,7 @@ fn run_deepgram_event_receiver(
                         format!("Speaker {}", id)
                     });
 
-                    let segment = TranscriptSegment {
+                    let final_segment = TranscriptSegment {
                         id: uuid::Uuid::new_v4().to_string(),
                         source_id: source_id.clone(),
                         speaker_id: speaker_from_deepgram.clone(),
@@ -7696,33 +7671,7 @@ fn run_deepgram_event_receiver(
                         confidence,
                     };
 
-                    // If Deepgram provides speaker labels, use them directly.
-                    // Otherwise, run through local diarization (needs audio, which
-                    // we don't have in the event path — so we skip diarization
-                    // and use the segment as-is).
-                    let final_segment = if segment.speaker_label.is_some() {
-                        // Deepgram diarization provided speaker labels.
-                        diarization_count += 1;
-                        segment.clone()
-                    } else {
-                        // No speaker from Deepgram; create a minimal diarization input
-                        // with empty audio (the Simple diarization backend will
-                        // assign a speaker based on signal heuristics, but with
-                        // empty audio it will just assign a default speaker).
-                        let input = DiarizationInput {
-                            transcript: segment.clone(),
-                            speech_audio: vec![],
-                            speech_start_time: Duration::from_secs_f64(start),
-                            speech_end_time: Duration::from_secs_f64(end_time),
-                        };
-                        let diarized = diarization_worker.process_input(input);
-                        diarization_count += 1;
-
-                        let _ = ctx
-                            .app_handle
-                            .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                        diarized.segment
-                    };
+                    diarization_count += u64::from(final_segment.speaker_label.is_some());
 
                     log::debug!(
                         "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
@@ -7734,8 +7683,6 @@ fn run_deepgram_event_receiver(
                         final_segment.speaker_label.is_some(),
                     );
 
-                    // SPEAKER_DETECTED was already emitted above (if needed) — pass
-                    // `None` here so the shared helper doesn't double-emit.
                     emit_transcript_and_extract_with_meta(
                         final_segment,
                         None,
@@ -7843,7 +7790,7 @@ fn run_deepgram_event_receiver(
                             format!("Speaker {}", id)
                         });
 
-                        let run_segment = TranscriptSegment {
+                        let final_run_segment = TranscriptSegment {
                             id: uuid::Uuid::new_v4().to_string(),
                             source_id: source_id.clone(),
                             speaker_id: speaker_from_deepgram.clone(),
@@ -7854,24 +7801,7 @@ fn run_deepgram_event_receiver(
                             confidence,
                         };
 
-                        let final_run_segment = if run_segment.speaker_label.is_some() {
-                            diarization_count += 1;
-                            run_segment.clone()
-                        } else {
-                            let input = DiarizationInput {
-                                transcript: run_segment.clone(),
-                                speech_audio: vec![],
-                                speech_start_time: Duration::from_secs_f64(run_start),
-                                speech_end_time: Duration::from_secs_f64(run_end),
-                            };
-                            let diarized = diarization_worker.process_input(input);
-                            diarization_count += 1;
-
-                            let _ = ctx
-                                .app_handle
-                                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                            diarized.segment
-                        };
+                        diarization_count += u64::from(final_run_segment.speaker_label.is_some());
 
                         log::debug!(
                             "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={} run={}/{}",
@@ -7885,9 +7815,6 @@ fn run_deepgram_event_receiver(
                             run_count,
                         );
 
-                        // SPEAKER_DETECTED was already emitted above (if needed)
-                        // — pass `None` here so the shared helper doesn't
-                        // double-emit.
                         emit_transcript_and_extract_with_meta(
                             final_run_segment,
                             None,
@@ -8029,7 +7956,6 @@ fn run_deepgram_event_receiver(
             &mut speaker_map,
             &mut last_speaker,
             max_speakers,
-            &mut diarization_worker,
             &mut asr_count,
             &mut diarization_count,
             &extraction_count,
@@ -8873,20 +8799,17 @@ fn run_openai_realtime_event_receiver(
     source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::openai_realtime::OpenAiRealtimeEvent;
-    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let (diarization_config, diarization_degradation) =
+    let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
     apply_diarization_degradation(
         &shared.app_handle,
         &shared.pipeline_status,
         diarization_degradation,
     );
-    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
-    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
     let mut asr_count: u64 = 0;
-    let mut diarization_count: u64 = 0;
+    let diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
@@ -8983,7 +8906,7 @@ fn run_openai_realtime_event_receiver(
                 let supersedes = (final_revision_number > 1)
                     .then(|| revision_ref(&span_id, final_revision_number - 1));
 
-                let segment = TranscriptSegment {
+                let final_segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
                     source_id,
                     speaker_id: None,
@@ -8997,23 +8920,6 @@ fn run_openai_realtime_event_receiver(
                     confidence: 1.0,
                 };
 
-                // Run through local diarization with empty audio (assigns a
-                // default speaker when no audio signal is available) — same as
-                // the AssemblyAI path.
-                let input = DiarizationInput {
-                    transcript: segment.clone(),
-                    speech_audio: vec![],
-                    speech_start_time: Duration::from_secs_f64(now_secs),
-                    speech_end_time: Duration::from_secs_f64(now_secs),
-                };
-                let diarized = diarization_worker.process_input(input);
-                diarization_count += 1;
-
-                let _ = ctx
-                    .app_handle
-                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                let final_segment = diarized.segment;
-
                 log::debug!(
                     "OpenAI Realtime event receiver: emitted transcript metadata provider=openai_realtime count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
                     asr_count,
@@ -9024,8 +8930,6 @@ fn run_openai_realtime_event_receiver(
                     final_segment.speaker_label.is_some(),
                 );
 
-                // SPEAKER_DETECTED was already emitted above — pass `None` so
-                // the shared helper doesn't double-emit.
                 emit_transcript_and_extract_with_meta(
                     final_segment,
                     None,
@@ -9129,15 +9033,13 @@ pub(crate) fn run_aws_transcribe_speech_processor(
         is_transcribing,
     } = channels;
 
-    let (diarization_config, diarization_degradation) =
+    let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
     apply_diarization_degradation(
         &shared.app_handle,
         &shared.pipeline_status,
         diarization_degradation,
     );
-    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
-    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
@@ -9244,18 +9146,10 @@ pub(crate) fn run_aws_transcribe_speech_processor(
                     final_span_revision(&mut revisions, &span_id)
                 });
 
-            let input = DiarizationInput {
-                transcript: transcript.segment,
-                speech_audio: vec![],
-                speech_start_time: Duration::ZERO,
-                speech_end_time: Duration::ZERO,
-            };
-            let diarized = diarization_worker.process_input(input);
-            diarization_count += 1;
-
+            diarization_count += u64::from(transcript.segment.speaker_label.is_some());
             emit_transcript_and_extract_with_meta(
-                diarized.segment,
-                Some(diarized.speaker_info),
+                transcript.segment,
+                None,
                 &ctx_for_transcript,
                 asr_count,
                 diarization_count,
@@ -9358,7 +9252,6 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
     sherpa_config: crate::asr::sherpa_streaming::SherpaStreamingConfig,
 ) {
     use crate::asr::sherpa_streaming::SherpaStreamingWorker;
-    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
     let mut worker = match SherpaStreamingWorker::new(&sherpa_config) {
         Ok(w) => w,
@@ -9392,18 +9285,16 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
         is_transcribing,
     } = channels;
 
-    let (diarization_config, diarization_degradation) =
+    let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
     apply_diarization_degradation(
         &shared.app_handle,
         &shared.pipeline_status,
         diarization_degradation,
     );
-    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
-    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
     let mut asr_count: u64 = 0;
-    let mut diarization_count: u64 = 0;
+    let diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
     let session_start = std::time::Instant::now();
@@ -9472,7 +9363,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                 let (final_revision_number, supersedes) =
                     final_span_revision(&mut revision_numbers_by_span, &span_id);
 
-                let segment = TranscriptSegment {
+                let final_segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
                     source_id,
                     speaker_id: None,
@@ -9483,19 +9374,6 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                     confidence: 0.9,
                 };
 
-                let input = DiarizationInput {
-                    transcript: segment,
-                    speech_audio: vec![],
-                    speech_start_time: Duration::from_secs_f64(start_time),
-                    speech_end_time: Duration::from_secs_f64(end_time),
-                };
-                let diarized = diarization_worker.process_input(input);
-                diarization_count += 1;
-
-                let _ = ctx
-                    .app_handle
-                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                let final_segment = diarized.segment;
                 let final_meta = AsrRevisionMeta {
                     span_id: Some(span_id),
                     provider_item_id: Some(provider_item_id),
@@ -9513,8 +9391,6 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                     &final_meta,
                 );
 
-                // SPEAKER_DETECTED was already emitted above — pass `None`
-                // so the shared helper doesn't double-emit.
                 emit_transcript_and_extract_with_meta(
                     final_segment,
                     None,
@@ -10239,13 +10115,13 @@ mod tests_status {
             &self,
             job: ProjectionJob,
             ledger: TranscriptLedger,
-            notes: Option<MaterializedNotes>,
+            snapshots: crate::projection_llm::ProjectionSnapshots,
             sequence: u64,
             created_at_ms: u64,
         ) -> ProjectionPatchAttempt {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ProjectionPatchAttempt {
-                outcome: (self.generate)(job, ledger, notes, sequence, created_at_ms),
+                outcome: (self.generate)(job, ledger, snapshots.notes, sequence, created_at_ms),
                 attempted_route: self.attempted_route,
             }
         }
@@ -10497,6 +10373,7 @@ mod tests_status {
         let movement_sink = RecordingProjectionDataMovementSink::default();
         (
             ProjectionDispatchContext {
+                speaker_timeline: app.speaker_timeline.clone(),
                 transcript_ledger: app.transcript_ledger.clone(),
                 projection_schedulers: app.projection_schedulers.clone(),
                 projection_runtime: app.projection_runtime_handle(),
@@ -15675,6 +15552,15 @@ mod tests_status {
             }
         };
 
+        let mut speaker = crate::identity::tests::span("diarized-1", "system");
+        speaker.basis_asr_span_ids = vec!["executor-chain-span-1".into()];
+        speaker.speaker_label = Some("Wire speaker".into());
+        app.speaker_timeline
+            .lock()
+            .unwrap()
+            .apply_event(speaker)
+            .unwrap();
+
         let job_one_response = serde_json::json!({
             "choices": [{
                 "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
@@ -15695,6 +15581,7 @@ mod tests_status {
             Arc::new(Mutex::new(None)),
         );
         let dispatch_one = ProjectionDispatchContext {
+            speaker_timeline: app.speaker_timeline.clone(),
             transcript_ledger: app.transcript_ledger.clone(),
             projection_schedulers: app.projection_schedulers.clone(),
             projection_runtime: app.projection_runtime_handle(),
@@ -15711,6 +15598,13 @@ mod tests_status {
         };
 
         run_projection_job(dispatch_one, job_one);
+        assert!(
+            captured_one
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|body| body.contains("speaker: Wire speaker"))
+        );
 
         assert_eq!(
             captured_one.lock().unwrap_or_else(|e| e.into_inner()).len(),
@@ -15782,6 +15676,7 @@ mod tests_status {
             Arc::new(Mutex::new(None)),
         );
         let dispatch_two = ProjectionDispatchContext {
+            speaker_timeline: app.speaker_timeline.clone(),
             transcript_ledger: app.transcript_ledger.clone(),
             projection_schedulers: app.projection_schedulers.clone(),
             projection_runtime: app.projection_runtime_handle(),
