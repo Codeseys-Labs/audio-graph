@@ -109,26 +109,14 @@ jobs:
         # clippy-clean, verified on Linux. Keep it that way.
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # ── Cross-target clippy coverage (#236) ──────────────────────────
-      # Lints the `#[cfg(windows)]` persistence test fixtures that are
-      # compiled out on Linux (they regressed silently before #236). Clippy
-      # is a check-only pipeline (no link), so cross-checking the Windows
-      # target needs no Windows toolchain — but native build scripts still
-      # execute, and on this Linux runner the mac target drags in
-      # aws-lc-sys/objc2 build scripts that need a macOS SDK. So the gate
-      # covers only the Windows triple; macOS fixtures are exercised by the
-      # native macOS Rust job. Default-feature (local-ml) coverage also
-      # stays with the native legs: whisper-rs-sys/llama-cpp-sys-2 build
-      # scripts compile C/C++ for the host and cannot run for a foreign
-      # target, hence `--no-default-features --features cloud`.
-      - name: Clippy (Windows target coverage, cloud-only)
-        working-directory: audio-graph/src-tauri
-        run: |
-          set -euo pipefail
-          rustup target add x86_64-pc-windows-msvc
-          cargo clippy --locked --no-default-features --features cloud \
-            --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 
+      # NOTE (#236 cross-target coverage): the Windows `#[cfg]` fixture gate
+      # lives in the `rust-windows` job below (native MSVC clippy), NOT here.
+      # A Linux cross-`--target x86_64-pc-windows-msvc` clippy leg was tried and
+      # reverted: native build scripts (aws-lc-sys via rustls) compile C for the
+      # foreign triple and fail without an MSVC environment
+      # (pthread_rwlock_t et al.) — same class as the mac leg (aws-lc-sys/objc2
+      # need a macOS SDK). Keep cross-target experiments out of required gates.
   # ── Frontend (fast, platform-independent) ──────────────────────────
   frontend:
     name: Frontend (TypeScript)
@@ -786,7 +774,7 @@ jobs:
     runs-on: blacksmith-4vcpu-windows-2025
     # See rust-linux above. Windows is the slowest documented leg
     # (docs/WINDOWS_QUICKSTART.md: ~13-15 min for the first release build
-    # alone), and this job also runs the full test suite after `cargo check`,
+    # alone), and this job also runs the full test suite after clippy,
     # so it gets more headroom than the Linux/macOS legs.
     timeout-minutes: 35
     steps:
@@ -795,6 +783,8 @@ jobs:
           path: audio-graph
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           workspaces: audio-graph/src-tauri
@@ -835,9 +825,15 @@ jobs:
           where.exe cmake
           clang --version
 
-      - name: Cargo check
+      - name: Cargo clippy
         working-directory: audio-graph/src-tauri
-        run: cargo check --locked
+        # Native MSVC clippy (supersedes the old bare `cargo check` — clippy
+        # --all-targets compiles everything check did, plus lints). This is
+        # the Windows-side gate for the `#[cfg(windows)]` test fixtures that
+        # are compiled out on Linux (#236): the Linux Lints job cannot
+        # cross-check them (aws-lc-sys build scripts need an MSVC
+        # environment), so Windows fixture lint coverage lives here.
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
