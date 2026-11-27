@@ -56,6 +56,8 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0047] | A Tier-3 `.ag-*` Recipe Layer in `@layer components`, and `--edge`/`--edge-subtle` Non-Text Contrast Tokens | accepted | Amends ADR-0016's 2026-06-29 "two channels only" convention clause; extends ADR-0009's surface/border tokens; seed `audio-graph-b9dc` | 2026-08-20 |
 | [0048] | Compact the Projection-Basis Summarized Prefix Behind a Content-Hash Digest | accepted | Amends ADR-0031's ordered-identity requirement for the summarized prefix only; depends on ADR-0025 §2c; relates to ADR-0042 and ADR-0037; seed `audio-graph-cfa1` | 2026-08-24 |
 | [0049] | Route System-One Decisions Through a Named Decision Route Table | proposed | Sits beside ADR-0038 (mirrors its no-walker discipline); extends ADR-0033/0034 to `decision.*` producers; feeds ADR-0037's judge; gate before S1-T7 `audio-graph-0ac0`; seed `audio-graph-8b3e` | 2026-10-18 |
+| [0050] | Bind Speaker Identity Lazily Through `speaker_revisions` v2 Relabel Batches | accepted | Implements `docs/designs/lazy-speaker-identification.md`; refines ADR-0043 without advancing ADR-0041/0042 Session floor; embeds ADR-0049 `DecisionRecord`s at batch level; seed `audio-graph-c32b` | 2026-11-26 |
+| [0051] | Screen Snapshots Evidence Storage, v1 Basis Isolation, and Offline OCR Baseline | proposed | Phase 0 contract for `docs/designs/conversation-aware-screen-snapshots.md`; preserves golden v1 hashes; selects Tesseract 5 + `tessdata_fast` Apache-2.0 baseline; seed `audio-graph-40ad` / `058f` | 2026-11-26 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -106,6 +108,8 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0047]: 0047-tier-3-recipe-layer-and-non-text-contrast-edge-tokens.md
 [0048]: 0048-compact-the-projection-basis-summarized-prefix-behind-a-content-hash-digest.md
 [0049]: 0049-decision-route-layer.md
+[0050]: 0050-lazy-speaker-identity-relabels.md
+[0051]: 0051-screen-snapshots-evidence-and-ocr-contract.md
 
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036
