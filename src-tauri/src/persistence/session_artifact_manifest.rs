@@ -896,7 +896,7 @@ impl SessionArtifactManifestStore {
         reader(head).map_err(CheckedManifestReadError::Reader)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn checked_read_with_after_establishment<T, E>(
         &self,
         reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
@@ -1020,7 +1020,7 @@ impl SessionArtifactManifestStore {
 
     /// Session-addressed peer of `qualified_for_test`, with the same
     /// `cfg(unix)` call-site requirement and the same reason for it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn qualified_for_test_session(
         root: impl Into<PathBuf>,
         session_id: &str,
@@ -4225,6 +4225,7 @@ mod tests {
         (root, store, advanced, proof_bytes)
     }
 
+    #[cfg(unix)]
     fn export_notes() -> SessionArtifactEntry {
         SessionArtifactEntry {
             kind: SessionArtifactKind::MaterializedNotes,
@@ -4238,6 +4239,7 @@ mod tests {
 
     /// A genuine later generation of an advanced Session: same durable proof,
     /// same provenance entry, one new artifact, a new transition id.
+    #[cfg(unix)]
     fn later_generation(
         advanced: &SessionArtifactManifestV1,
         idempotency_id: &str,
@@ -4249,6 +4251,7 @@ mod tests {
         later
     }
 
+    #[cfg(unix)]
     fn provenance_entry_mut(manifest: &mut SessionArtifactManifestV1) -> &mut SessionArtifactEntry {
         manifest
             .artifacts
@@ -4257,6 +4260,7 @@ mod tests {
             .expect("Session provenance entry")
     }
 
+    #[cfg(unix)]
     fn provenance_entry(manifest: &SessionArtifactManifestV1) -> &SessionArtifactEntry {
         manifest
             .artifacts
@@ -4269,6 +4273,7 @@ mod tests {
     /// control provenance identity and carries the durable proof's own digest
     /// and length, so nothing about the provenance binding can be the cause of
     /// the refusals `quarantine_recovery_remains_closed_on_a_v2_session` asserts.
+    #[cfg(unix)]
     fn v2_quarantine_candidate(
         state: ManifestTransitionState,
         residual_state: QuarantineResidualState,

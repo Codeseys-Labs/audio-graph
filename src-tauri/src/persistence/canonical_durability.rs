@@ -305,6 +305,8 @@ struct FilesystemObservation {
     mount_point: PathBuf,
     file_system: OsString,
     #[cfg(test)]
+    // The synthetic fixture retains volume evidence even where no test checks it.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     volume: Option<VolumeIdentity>,
     #[cfg(any(test, target_os = "macos"))]
     live_mount: Option<LiveMountIdentity>,
@@ -858,6 +860,7 @@ struct InjectedFailure {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum InjectedRenameFault {
     PreflightDeviceMismatch,
@@ -1107,7 +1110,7 @@ impl CanonicalDurability {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_before_atomic_create(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
@@ -1155,7 +1158,7 @@ impl CanonicalDurability {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_before_existing_open(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
@@ -1170,7 +1173,7 @@ impl CanonicalDurability {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_before_snapshot_revalidation(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
@@ -1185,7 +1188,7 @@ impl CanonicalDurability {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn for_test_name_equivalence(reserved_internal_names: ReservedInternalNameEquivalence) -> Self {
         Self {
             platform: current_platform(),
@@ -1200,7 +1203,7 @@ impl CanonicalDurability {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn with_rename_fault(fault: InjectedRenameFault, rename_invoked: Arc<AtomicBool>) -> Self {
         Self {
             platform: current_platform(),
@@ -1434,7 +1437,7 @@ impl CanonicalExclusiveGuard {
         self.unlink_canonical_entry_inner(path, qualification, recovery_key, None)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn unlink_canonical_entry_with_fault(
         &self,
         path: &Path,
@@ -1660,7 +1663,7 @@ impl CanonicalExclusiveGuard {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn create_or_reconcile_immutable_exact(
         &self,
         path: &Path,
@@ -1724,7 +1727,7 @@ impl CanonicalExclusiveGuard {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn create_or_reconcile_immutable_exact_with_fault(
         &self,
         path: &Path,
@@ -3402,7 +3405,7 @@ fn select_exact_macos_mount(
     })
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn require_stable_live_mount(
     before: &LiveMountIdentity,
     after: &LiveMountIdentity,
@@ -3918,7 +3921,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(target_os = "linux")]
     use std::thread;
 
     #[cfg(unix)]
@@ -3933,6 +3937,7 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     fn qualification(root: &Path) -> CanonicalFilesystemQualification {
         CanonicalFilesystemQualification::for_test_root(root)
             .expect("bind test qualification to root identity")
