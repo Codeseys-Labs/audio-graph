@@ -13467,19 +13467,15 @@ mod tests_status {
             &final_revision
         ));
 
-        // `>= 2`, not `== 2`: an `AppendedTail` completion unconditionally
-        // chains a follow-up job per lane (ADR-0045 decision 3/4 — see this
-        // file's `dispatch_projection_decision` comments) to actually
-        // project the newly-appended span, so this scenario legitimately
-        // emits MORE than 2 patches once those follow-ups land. Racing to
-        // read `patches_snapshot()` at the instant `patch_count()` first
-        // hits exactly 2 is exactly what this test must NOT depend on — the
-        // property under test is about the FIRST patch per kind (the one
-        // whose basis is `job.basis`, pinned before this test's mutation),
-        // not about the total count.
+        // One lane can emit its AppendedTail follow-up before the other lane's first patch.
         wait_until(
             "notes and graph projection dispatch success (appended tail)",
-            || event_sink.patch_count() >= 2,
+            || {
+                let emitted = event_sink.patches_snapshot();
+                [ProjectionKind::Notes, ProjectionKind::Graph]
+                    .iter()
+                    .all(|kind| emitted.iter().any(|patch| patch.kind == *kind))
+            },
         );
 
         let emitted = event_sink.patches_snapshot();
