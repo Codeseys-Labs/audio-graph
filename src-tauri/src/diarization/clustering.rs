@@ -1,9 +1,9 @@
 //! Unbounded offline speaker diarization via sherpa-onnx (ADR-0017).
 //!
-//! Wraps `sherpa_onnx::OfflineSpeakerDiarization` = pyannote **segmentation** +
-//! 3D-Speaker **embedding** extraction + **FastClustering**. With
-//! `num_clusters = -1` and a cosine `threshold`, the speaker count is
-//! **unknown / unbounded** — unlike the Sortformer backend, which is hard-capped
+//! Production passes pyannote segmentation and NeMo TitaNet-small embeddings
+//! (`DIAR_EMB_TITANET_FILENAME`) to sherpa-onnx 1.13.4's `FastClustering` via
+//! `sherpa_onnx::OfflineSpeakerDiarization`. With `num_clusters = -1`, a distance
+//! threshold determines the speaker count — unlike Sortformer, which is hard-capped
 //! at 4 by its model. This is *offline*: feed a complete mono 16 kHz f32
 //! waveform to [`ClusteringDiarizer::diarize`] and get back speaker-labeled
 //! segments. The live-pipeline (rolling-window) integration is tracked
@@ -24,9 +24,11 @@ pub struct ClusterSegment {
     pub speaker: i32,
 }
 
-/// Default cosine-distance clustering threshold. Smaller ⇒ more speakers,
-/// larger ⇒ fewer; 0.5 is the sherpa-onnx default starting point for the
-/// 3D-Speaker embeddings.
+/// Complete-linkage distance cut: sherpa's `FastClustering` uses
+/// `HCLUST_METHOD_COMPLETE` on `max(0, 1 - cosine)`. Smaller ⇒ more speakers.
+/// The 0.5 default is not calibrated for TitaNet-small. Recalibration or a
+/// linkage change is gated on audio-graph-60ea; see
+/// `docs/research/diarization-clustering-bench-2026-11-22.md`.
 pub const DEFAULT_CLUSTERING_THRESHOLD: f32 = 0.5;
 
 /// Sample rate (Hz) the segmentation + embedding models expect. Inputs must be
