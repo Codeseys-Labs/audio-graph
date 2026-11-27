@@ -37,6 +37,10 @@ vi.mock("./components/AudioSourceSelector", () => ({
 vi.mock("./components/SpeakerPanel", () => ({
   default: () => <div data-testid="speakers-stub" />,
 }));
+// #340: same stub convention as SpeakerPanel above.
+vi.mock("./components/SpeakerIdentityPanel", () => ({
+  default: () => <div data-testid="speaker-identity-stub" />,
+}));
 vi.mock("./components/LiveTranscript", () => ({
   default: () => <div data-testid="transcript-stub" />,
 }));

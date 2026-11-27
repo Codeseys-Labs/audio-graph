@@ -13,6 +13,8 @@
  */
 
 import AudioSettings from "../AudioSettings";
+import FieldRow from "../FieldRow";
+import { setField } from "../settingsTypes";
 import { useSettings } from "./SettingsContext";
 import { LANGUAGE_OPTIONS, THEME_OPTIONS } from "./useSettingsController";
 
@@ -84,6 +86,27 @@ export default function GeneralPanel() {
             ))}
           </select>
         </div>
+      </section>
+      <section className="settings-section">
+        <h3 className="settings-section-title">
+          {t("settings.fields.selfDisplayName")}
+        </h3>
+        <FieldRow
+          htmlFor="settings-self-display-name"
+          label={t("settings.fields.selfDisplayName")}
+          hint={t("settings.hints.selfDisplayName")}
+        >
+          <input
+            id="settings-self-display-name"
+            className="settings-input"
+            type="text"
+            autoComplete="name"
+            value={state.selfDisplayName}
+            onChange={(e) =>
+              dispatch(setField("selfDisplayName", e.target.value))
+            }
+          />
+        </FieldRow>
       </section>
       <AudioSettings state={state} dispatch={dispatch} t={t} />
     </>

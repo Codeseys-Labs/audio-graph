@@ -1101,6 +1101,7 @@ export function useSettingsController() {
     audioSampleRate,
     audioChannels,
     logLevel,
+    selfDisplayName,
     confirmDelete,
     testResults,
     testingKey,
@@ -2861,6 +2862,11 @@ export function useSettingsController() {
     ];
     const raw = (settings.log_level ?? "info").toLowerCase() as LogLevel;
     patch.logLevel = LOG_LEVELS.includes(raw) ? raw : "info";
+    // Speaker identity (#340): the configured display name backs "This is me"
+    // in the Speaker identity panel (`mark_cluster_is_self` reads it backend-
+    // side and rejects with "set your display name first" while unset). Plain
+    // text, not a secret — this is the one non-credential settings field.
+    patch.selfDisplayName = settings.self_display_name ?? "";
 
     // Gemini settings
     if (settings.gemini) {
@@ -3309,6 +3315,10 @@ export function useSettingsController() {
     };
 
     await saveSettings({
+      // Speaker identity (#340): `null` (not an empty string) when blank —
+      // the backend's `mark_cluster_is_self` treats unset as "not configured".
+      self_display_name:
+        selfDisplayName.trim() === "" ? null : selfDisplayName.trim(),
       asr_provider: asrProvider,
       whisper_model: whisperModel,
       llm_provider: llmProvider,

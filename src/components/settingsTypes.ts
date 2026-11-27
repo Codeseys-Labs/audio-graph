@@ -203,6 +203,7 @@ export interface SettingsState {
   audioSampleRate: SampleRate;
   audioChannels: ChannelCount;
   logLevel: LogLevel;
+  selfDisplayName: string;
   // UI
   confirmDelete: string | null;
   awsProfiles: string[];
@@ -340,6 +341,7 @@ export const initialSettingsState: SettingsState = {
   audioChannels: 2,
   logLevel: "info",
   confirmDelete: null,
+  selfDisplayName: "",
   awsProfiles: [],
   testResults: {},
   testingKey: null,
