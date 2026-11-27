@@ -123,6 +123,8 @@ pub(crate) struct ExtractionDeps<'a> {
     /// The ledger changes session ownership before rotation clears graph state.
     /// Holding this lock across the commit closes the check-then-mutate race.
     pub transcript_ledger: &'a Arc<Mutex<crate::projections::TranscriptLedger>>,
+    /// AssemblyAI turn attribution, refreshed at graph commit after asynchronous extraction.
+    pub turn_speaker_timeline: Option<&'a Arc<Mutex<crate::projections::SpeakerTimeline>>>,
     /// Session generation captured when this extraction task was submitted.
     pub expected_session_id: &'a str,
     pub llm_engine: &'a Arc<Mutex<Option<LlmEngine>>>,

@@ -172,11 +172,14 @@ conversation. Use ONLY these entity types:\n{entity_lines}\n\nPrefer these relat
 Rules:\n\
 - Only extract entities explicitly present or clearly referenced in THIS segment. Do not invent.\n\
 - Normalize names (trim filler, no leading articles). Merge obvious co-references.\n\
+- For speaker attribution (for example, first-person speech), name that endpoint using the \
+current speaker label and set speaker_endpoint_mask to \"source\", \"target\", or \"both\". \
+Use \"neither\" for literal named entities, even if a name equals the speaker label.\n\
 - Capture action items as Task, open questions as Question, and conclusions as Decision.\n\
 - Be conservative: an empty result is better than noise.\n\n\
 Output ONLY valid JSON with this exact shape:\n\
 {{\"entities\": [{{\"name\": \"...\", \"entity_type\": \"{enum_}\", \"description\": \"...\"}}], \
-\"relations\": [{{\"source\": \"...\", \"target\": \"...\", \"relation_type\": \"...\", \"detail\": \"...\"}}]}}\n\
+\"relations\": [{{\"source\": \"...\", \"target\": \"...\", \"relation_type\": \"...\", \"detail\": \"...\", \"speaker_endpoint_mask\": \"neither\"}}]}}\n\
 If nothing is found, return {{\"entities\": [], \"relations\": []}}.",
         entity_lines = entity_lines,
         relation_lines = relation_lines,

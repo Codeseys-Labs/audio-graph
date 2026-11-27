@@ -4,15 +4,16 @@
 //! Each edge carries temporal metadata (valid_from, valid_until) for
 //! time-aware relationship tracking.
 
-use petgraph::stable_graph::{NodeIndex, StableGraph};
+use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use super::entities::{
     ExtractedEntity, ExtractedRelation, ExtractionResult, GraphDelta, GraphEdge, GraphEntity,
-    GraphLink, GraphNode, GraphSnapshot, GraphStats, entity_type_color, relation_type_color,
+    GraphLink, GraphNode, GraphSnapshot, GraphStats, SpeakerEndpointMask, SpeakerMention,
+    entity_type_color, relation_type_color,
 };
 
 /// Edge data in the temporal graph.
@@ -39,6 +40,135 @@ pub struct TemporalEdge {
     pub detail: Option<String>,
     /// Strength — incremented on repeated mentions of the same relation.
     pub weight: f32,
+    /// Every observation represented by the folded edge. Legacy graphs have only the seek hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contributions: Option<Vec<EdgeContribution>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeContribution {
+    pub source_segment_id: Option<String>,
+    pub speaker_endpoint_mask: SpeakerEndpointMask,
+    pub weight: f32,
+    pub observed_at: f64,
+    pub confidence: f32,
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_speaker_label: Option<String>,
+}
+
+fn attributed_node(
+    mask: SpeakerEndpointMask,
+    source: NodeIndex,
+    target: NodeIndex,
+) -> Option<NodeIndex> {
+    match mask {
+        SpeakerEndpointMask::Source => Some(source),
+        SpeakerEndpointMask::Target => Some(target),
+        SpeakerEndpointMask::Both if source == target => Some(source),
+        SpeakerEndpointMask::Both | SpeakerEndpointMask::Neither => None,
+    }
+}
+
+impl TemporalEdge {
+    /// Segment keys for every observation (or the sole legacy seek hint).
+    pub fn all_source_segment_ids(&self) -> impl Iterator<Item = &str> {
+        self.contributions
+            .iter()
+            .flatten()
+            .filter_map(|observation| observation.source_segment_id.as_deref())
+            .chain(
+                (self.contributions.is_none() && !self.source_segment_id.is_empty())
+                    .then_some(self.source_segment_id.as_str()),
+            )
+    }
+
+    fn legacy_contribution(&self) -> EdgeContribution {
+        EdgeContribution {
+            source_segment_id: (!self.source_segment_id.is_empty())
+                .then(|| self.source_segment_id.clone()),
+            // No roles were recorded. Preserve the legacy seek-hint fallback
+            // when this opaque aggregate is later folded into a modern edge.
+            speaker_endpoint_mask: SpeakerEndpointMask::Both,
+            weight: self.weight,
+            observed_at: self.valid_from,
+            confidence: self.confidence,
+            detail: self.detail.clone(),
+            origin_speaker_label: None,
+            current_speaker_label: None,
+        }
+    }
+
+    fn complete_contributions(&mut self) -> &mut Vec<EdgeContribution> {
+        if self.contributions.is_none() {
+            self.contributions = Some(vec![self.legacy_contribution()]);
+        }
+        self.contributions
+            .as_mut()
+            .expect("contributions initialized")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelabelScope {
+    Entity,
+    Segments { segment_ids: BTreeSet<String> },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SpeakerReattributionResult {
+    pub edges_retconned: usize,
+    pub entities_updated: usize,
+    pub renamed_in_place: bool,
+    pub merged: bool,
+}
+
+impl SpeakerReattributionResult {
+    pub fn changed(&self) -> bool {
+        self.renamed_in_place
+            || self.merged
+            || self.edges_retconned > 0
+            || self.entities_updated > 0
+    }
+}
+
+fn same_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+        || ((!a.is_ascii() || !b.is_ascii()) && a.to_lowercase() == b.to_lowercase())
+}
+
+fn record_speaker_mention(node: &mut GraphEntity, speaker: &str, segment_id: Option<&str>) {
+    node.speaker_mentions
+        .get_or_insert_with(|| {
+            node.speakers
+                .iter()
+                .map(|speaker_label| SpeakerMention {
+                    segment_id: None,
+                    speaker_label: speaker_label.clone(),
+                })
+                .collect()
+        })
+        .push(SpeakerMention {
+            segment_id: segment_id.map(str::to_owned),
+            speaker_label: speaker.to_owned(),
+        });
+    if !node.speakers.iter().any(|label| label == speaker) {
+        node.speakers.push(speaker.to_owned());
+    }
+}
+
+fn rebuild_speakers(node: &mut GraphEntity) {
+    node.speakers = node
+        .speaker_mentions
+        .iter()
+        .flatten()
+        .map(|mention| mention.speaker_label.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
 }
 
 /// Maximum number of nodes before eviction of oldest (lowest `last_seen`).
@@ -171,17 +301,9 @@ impl TemporalKnowledgeGraph {
         self.event_counter
     }
 
-    /// Group the stable, frontend-facing link ids of every **live** edge by the
-    /// transcript segment id that produced it ([`TemporalEdge::source_segment_id`]).
-    ///
-    /// This is the per-utterance "relates to" join the session-timeline read-model
-    /// fold ([`crate::timeline::build_session_timeline`]) consumes: an entry's
-    /// `related_edge_ids` are the live edges whose `source_segment_id` matches its
-    /// span/segment id. The live-graph `TemporalEdge` is the only structure that
-    /// carries `source_segment_id` — `MaterializedGraphEdge` carries only the
-    /// whole-window basis — so this join must fold over the live graph (ADR-0026
-    /// §4.1, sev4 critique); folding it over the materialized graph would leave
-    /// every `related_edge_ids` silently empty.
+    /// Group the stable link ids of every live edge by all contributing segment
+    /// ids. The live graph carries per-observation provenance, unlike the
+    /// materialized graph's whole-window basis (ADR-0026 §4.1).
     ///
     /// Only live edges (`valid_until == None`) are included, matching
     /// [`Self::snapshot`]'s link filter — a retconned/invalidated edge is excluded
@@ -189,25 +311,28 @@ impl TemporalKnowledgeGraph {
     /// ids within each group are sorted by the monotonic `seq_id` for
     /// deterministic output.
     pub fn live_edges_by_source_segment(&self) -> HashMap<String, Vec<String>> {
-        let mut by_segment: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-        for idx in self.graph.edge_indices() {
-            let Some(edge) = self.graph.edge_weight(idx) else {
-                continue;
-            };
-            // Skip invalidated (retconned) edges — mirrors `snapshot()`'s filter.
-            if edge.valid_until.is_some() {
-                continue;
+        let mut by_segment: HashMap<&str, Vec<u64>> = HashMap::new();
+        for edge in self
+            .graph
+            .edge_weights()
+            .filter(|edge| edge.valid_until.is_none())
+        {
+            for segment in edge.all_source_segment_ids() {
+                let ids = by_segment.entry(segment).or_default();
+                // Observations of the same edge can repeat a segment key.
+                if ids.last() != Some(&edge.seq_id) {
+                    ids.push(edge.seq_id);
+                }
             }
-            by_segment
-                .entry(edge.source_segment_id.clone())
-                .or_default()
-                .push((edge.seq_id, edge_link_id(edge.seq_id)));
         }
         by_segment
             .into_iter()
             .map(|(segment, mut ids)| {
-                ids.sort_by_key(|(seq, _)| *seq);
-                (segment, ids.into_iter().map(|(_, id)| id).collect())
+                ids.sort_unstable();
+                (
+                    segment.to_owned(),
+                    ids.into_iter().map(edge_link_id).collect(),
+                )
             })
             .collect()
     }
@@ -220,47 +345,61 @@ impl TemporalKnowledgeGraph {
         timestamp: f64,
         speaker: &str,
     ) -> NodeIndex {
-        let key = entity.name.to_lowercase();
+        self.add_entity_with_segment(entity, timestamp, speaker, None)
+    }
 
-        if let Some(&idx) = self.name_index.get(&key) {
-            // Update existing entity
-            if let Some(node) = self.graph.node_weight_mut(idx) {
-                node.last_seen = timestamp;
-                node.mention_count += 1;
-                if !node.speakers.contains(&speaker.to_string()) {
-                    node.speakers.push(speaker.to_string());
-                }
-                // Update description if we have a better one
-                if entity.description.is_some() && node.description.is_none() {
-                    node.description = entity.description.clone();
-                }
-                // Track as updated (if not already tracked as newly added)
-                if !self.delta_added_node_ids.contains(&node.id) {
-                    let id = node.id.clone();
-                    if !self.delta_updated_node_ids.contains(&id) {
-                        self.delta_updated_node_ids.push(id);
-                    }
-                }
-            }
-            idx
-        } else {
-            // Create new entity
-            let id = uuid::Uuid::new_v4().to_string();
-            self.delta_added_node_ids.push(id.clone());
-            let node = GraphEntity {
-                id,
-                name: entity.name.clone(),
-                entity_type: entity.entity_type.clone(),
-                mention_count: 1,
-                first_seen: timestamp,
-                last_seen: timestamp,
-                aliases: vec![],
-                description: entity.description.clone(),
-                speakers: vec![speaker.to_string()],
-            };
-            let idx = self.graph.add_node(node);
-            self.name_index.insert(key, idx);
-            idx
+    fn add_entity_with_segment(
+        &mut self,
+        entity: &ExtractedEntity,
+        timestamp: f64,
+        speaker: &str,
+        segment_id: Option<&str>,
+    ) -> NodeIndex {
+        let key = entity.name.to_lowercase();
+        let idx = match self.name_index.get(&key) {
+            Some(&idx) => idx,
+            None => self.insert_entity(entity, key, timestamp),
+        };
+        let node = &mut self.graph[idx];
+        node.last_seen = timestamp;
+        node.mention_count += 1;
+        record_speaker_mention(node, speaker, segment_id);
+        if node.description.is_none() {
+            node.description.clone_from(&entity.description);
+        }
+        self.track_updated_node(idx);
+        idx
+    }
+
+    fn insert_entity(
+        &mut self,
+        entity: &ExtractedEntity,
+        key: String,
+        timestamp: f64,
+    ) -> NodeIndex {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.delta_added_node_ids.push(id.clone());
+        let idx = self.graph.add_node(GraphEntity {
+            id,
+            name: entity.name.clone(),
+            entity_type: entity.entity_type.clone(),
+            mention_count: 0,
+            first_seen: timestamp,
+            last_seen: timestamp,
+            aliases: vec![],
+            description: None,
+            speakers: vec![],
+            person_ref: None,
+            speaker_mentions: Some(Vec::new()),
+        });
+        self.name_index.insert(key, idx);
+        idx
+    }
+
+    fn track_updated_node(&mut self, idx: NodeIndex) {
+        let id = &self.graph[idx].id;
+        if !self.delta_added_node_ids.contains(id) && !self.delta_updated_node_ids.contains(id) {
+            self.delta_updated_node_ids.push(id.clone());
         }
     }
 
@@ -274,61 +413,115 @@ impl TemporalKnowledgeGraph {
         timestamp: f64,
         segment_id: &str,
     ) {
-        let source_key = source_name.to_lowercase();
-        let target_key = target_name.to_lowercase();
-
-        let source_idx = match self.name_index.get(&source_key) {
-            Some(&idx) => idx,
-            None => {
-                log::warn!("Source entity '{}' not found in graph", source_name);
+        if let Some((source, target)) =
+            self.add_relation_observation(source_name, target_name, relation, timestamp, segment_id)
+        {
+            let Some(speaker) = attributed_node(relation.speaker_endpoint_mask, source, target)
+            else {
                 return;
-            }
-        };
-        let target_idx = match self.name_index.get(&target_key) {
-            Some(&idx) => idx,
-            None => {
-                log::warn!("Target entity '{}' not found in graph", target_name);
-                return;
-            }
-        };
-
-        // Check if same relation already exists between these nodes
-        let existing_edge = self
-            .graph
-            .edges_connecting(source_idx, target_idx)
-            .find(|e| e.weight().relation_type == relation.relation_type);
-
-        if let Some(edge_ref) = existing_edge {
-            let edge_idx = edge_ref.id();
-            if let Some(edge) = self.graph.edge_weight_mut(edge_idx) {
-                edge.weight += 1.0;
-                edge.valid_from = edge.valid_from.min(timestamp); // earliest mention
-            }
-            // Track as updated so the frontend refreshes edge strength between
-            // full snapshots — unless it was newly added this same delta window
-            // (in which case the added_edges entry already carries fresh weight).
-            if !self.delta_added_edge_indices.contains(&edge_idx)
-                && !self.delta_updated_edge_indices.contains(&edge_idx)
-            {
-                self.delta_updated_edge_indices.push(edge_idx);
-            }
-        } else {
-            // Assign a monotonic, never-reused seq_id (NOT the recyclable
-            // EdgeIndex) so the frontend-facing link id stays unique for life.
-            let seq_id = self.edge_seq_counter;
-            self.edge_seq_counter += 1;
-            let edge = TemporalEdge {
-                seq_id,
-                relation_type: relation.relation_type.clone(),
-                valid_from: timestamp,
-                valid_until: None,
-                confidence: 1.0,
-                source_segment_id: segment_id.to_string(),
-                detail: relation.detail.clone(),
-                weight: 1.0,
             };
-            let edge_idx = self.graph.add_edge(source_idx, target_idx, edge);
-            self.delta_added_edge_indices.push(edge_idx);
+            let label = self.graph[speaker].name.clone();
+            let segment = (!segment_id.is_empty()).then_some(segment_id);
+            record_speaker_mention(&mut self.graph[source], &label, segment);
+            self.track_updated_node(source);
+            if target != source {
+                record_speaker_mention(&mut self.graph[target], &label, segment);
+                self.track_updated_node(target);
+            }
+        }
+    }
+
+    fn add_relation_observation(
+        &mut self,
+        source_name: &str,
+        target_name: &str,
+        relation: &ExtractedRelation,
+        timestamp: f64,
+        segment_id: &str,
+    ) -> Option<(NodeIndex, NodeIndex)> {
+        let Some(&source) = self.name_index.get(&source_name.to_lowercase()) else {
+            log::warn!("Source entity '{}' not found in graph", source_name);
+            return None;
+        };
+        let Some(&target) = self.name_index.get(&target_name.to_lowercase()) else {
+            log::warn!("Target entity '{}' not found in graph", target_name);
+            return None;
+        };
+
+        let mask = relation.speaker_endpoint_mask;
+        let speaker = attributed_node(mask, source, target);
+        let contribution = EdgeContribution {
+            source_segment_id: (!segment_id.is_empty()).then(|| segment_id.to_owned()),
+            speaker_endpoint_mask: mask,
+            weight: 1.0,
+            observed_at: timestamp,
+            confidence: 1.0,
+            detail: relation.detail.clone(),
+            origin_speaker_label: speaker.map(|_| {
+                if mask.source() {
+                    source_name
+                } else {
+                    target_name
+                }
+                .to_owned()
+            }),
+            current_speaker_label: speaker.map(|idx| self.graph[idx].name.clone()),
+        };
+        if let Some(idx) = self.live_edge(source, target, &relation.relation_type) {
+            let edge = &mut self.graph[idx];
+            edge.complete_contributions().push(contribution);
+            edge.weight += 1.0;
+            edge.valid_from = edge.valid_from.min(timestamp);
+            if edge.source_segment_id.is_empty() {
+                segment_id.clone_into(&mut edge.source_segment_id);
+            }
+            self.track_updated_edge(idx);
+        } else {
+            self.insert_live_edge(
+                source,
+                target,
+                TemporalEdge {
+                    seq_id: 0,
+                    relation_type: relation.relation_type.clone(),
+                    valid_from: timestamp,
+                    valid_until: None,
+                    confidence: contribution.confidence,
+                    source_segment_id: segment_id.to_owned(),
+                    detail: contribution.detail.clone(),
+                    weight: contribution.weight,
+                    contributions: Some(vec![contribution]),
+                },
+            );
+        }
+        Some((source, target))
+    }
+
+    fn live_edge(
+        &self,
+        source: NodeIndex,
+        target: NodeIndex,
+        relation_type: &str,
+    ) -> Option<EdgeIndex> {
+        self.graph
+            .edges_connecting(source, target)
+            .find(|edge| {
+                edge.weight().valid_until.is_none() && edge.weight().relation_type == relation_type
+            })
+            .map(|edge| edge.id())
+    }
+
+    fn insert_live_edge(&mut self, source: NodeIndex, target: NodeIndex, mut edge: TemporalEdge) {
+        edge.seq_id = self.edge_seq_counter;
+        self.edge_seq_counter += 1;
+        let idx = self.graph.add_edge(source, target, edge);
+        self.delta_added_edge_indices.push(idx);
+    }
+
+    fn track_updated_edge(&mut self, idx: EdgeIndex) {
+        if !self.delta_added_edge_indices.contains(&idx)
+            && !self.delta_updated_edge_indices.contains(&idx)
+        {
+            self.delta_updated_edge_indices.push(idx);
         }
     }
 
@@ -364,47 +557,24 @@ impl TemporalKnowledgeGraph {
     /// Invalidate an edge by setting its `valid_until` timestamp (Graphiti
     /// temporal concept).
     ///
-    /// This is the sole producer of `valid_until`, which [`Self::snapshot`] and
-    /// the delta `build_delta_edge` helper filter on to hide retracted
-    /// relations. Its live caller is [`Self::supersede_entity`]: when a
-    /// diarization / entity retcon merges a superseded speaker entity into a
-    /// canonical one, every edge incident to the superseded node is invalidated
-    /// here so it disappears from snapshots and deltas while remaining auditable
-    /// in the persisted graph (the row is hidden, not deleted).
+    /// Snapshots and deltas hide the retired row, but persistence keeps it for audit.
     pub fn invalidate_edge(&mut self, edge_idx: petgraph::graph::EdgeIndex, timestamp: f64) {
-        if let Some(edge) = self.graph.edge_weight_mut(edge_idx) {
+        if let Some(edge) = self.graph.edge_weight_mut(edge_idx)
+            && edge.valid_until.is_none()
+        {
             edge.valid_until = Some(timestamp);
+            self.delta_removed_edge_ids.push(edge_link_id(edge.seq_id));
+            self.delta_added_edge_indices.retain(|&idx| idx != edge_idx);
+            self.delta_updated_edge_indices
+                .retain(|&idx| idx != edge_idx);
         }
     }
 
     /// Retcon a superseded entity into a canonical one (speaker / entity merge).
     ///
-    /// This is the live producer for [`Self::invalidate_edge`]. When later
-    /// context resolves a provisional speaker (e.g. the local diarizer's
-    /// `"Speaker 2"`) to a stable identity (e.g. `"Alice"`), or two extracted
-    /// entity names turn out to denote the same thing, every relation that was
-    /// attached to the *superseded* entity must stop being shown under the old
-    /// node and reappear under the canonical node.
-    ///
-    /// Rather than mutate transcript-derived edges in place (which would lose the
-    /// pre-retcon provenance), each incident edge is **invalidated** via
-    /// [`Self::invalidate_edge`] — setting `valid_until` so [`Self::snapshot`]
-    /// and the delta `build_delta_edge` helper hide it — and an equivalent live
-    /// edge is re-created between the *canonical* node and the original other
-    /// endpoint. The superseded node itself is then evicted (its
-    /// already-invalidated edges cascade out of the delta as removals).
-    ///
-    /// `timestamp` is the retcon time recorded as the invalidated edges'
-    /// `valid_until` and the re-pointed edges' `valid_from`.
-    ///
-    /// `threshold` is the fuzzy-match cutoff used to resolve both names via
-    /// [`Self::resolve_entity`]; pass `1.0` for exact-only resolution.
-    ///
-    /// The superseded node and its now-invalidated edges are deliberately
-    /// **kept** in the graph (and in the persisted file) rather than deleted:
-    /// hiding them via `valid_until` preserves the pre-retcon attribution for
-    /// audit/replay while keeping them out of the live snapshot. The superseded
-    /// node simply has no live edges afterward.
+    /// Re-point live relations at `timestamp`, preserving their original
+    /// observations. The retired node and its invalidated edges are kept for
+    /// audit. `threshold` is the name-resolution cutoff; `1.0` is exact-only.
     ///
     /// Returns the number of edges that were invalidated (re-pointed). Returns
     /// `0` — and makes no change — when either name does not resolve, when both
@@ -417,180 +587,404 @@ impl TemporalKnowledgeGraph {
         timestamp: f64,
         threshold: f64,
     ) -> usize {
-        let superseded_idx = match self.resolve_entity(superseded_name, threshold) {
-            Some(idx) => idx,
-            None => return 0,
+        let Some(from) = self.resolve_entity(superseded_name, threshold) else {
+            return 0;
         };
-        let canonical_idx = match self.resolve_entity(canonical_name, threshold) {
-            Some(idx) => idx,
-            None => return 0,
+        let Some(to) = self.resolve_entity(canonical_name, threshold) else {
+            return 0;
         };
-        if superseded_idx == canonical_idx {
-            // A name that resolves to the same node as the canonical target is a
-            // no-op merge — never invalidate an entity into itself.
+        if from == to {
             return 0;
         }
-
-        // Snapshot the incident edges (BOTH directions, since the graph is
-        // directed) before mutating, so we re-point each one onto the canonical
-        // node while preserving its direction relative to the other endpoint.
-        struct Repoint {
-            edge_idx: petgraph::graph::EdgeIndex,
-            other: NodeIndex,
-            superseded_is_source: bool,
-            edge: TemporalEdge,
+        let invalidated = self.repoint_entity_edges(from, to, timestamp);
+        if invalidated > 0 {
+            self.merge_entity_bookkeeping(from, to);
         }
-        let mut repoints: Vec<Repoint> = Vec::new();
-        for edge_ref in self
-            .graph
-            .edges_directed(superseded_idx, petgraph::Direction::Outgoing)
+        invalidated
+    }
+
+    /// Correct speaker attribution for an entire identity or for exact turns.
+    pub fn reattribute_speaker(
+        &mut self,
+        from_name: &str,
+        to_name: &str,
+        scope: RelabelScope,
+        timestamp: f64,
+    ) -> SpeakerReattributionResult {
+        let mut result = SpeakerReattributionResult::default();
+        if from_name == to_name {
+            return result;
+        }
+        let from = self.name_index.get(&from_name.to_lowercase()).copied();
+        match scope {
+            RelabelScope::Entity => {
+                let Some(from) = from else {
+                    return result;
+                };
+                let old_name = self.graph[from].name.clone();
+                let to_key = to_name.to_lowercase();
+                let to = self.name_index.get(&to_key).copied();
+                let next_name = if let Some(to) = to.filter(|&to| to != from) {
+                    result.edges_retconned = self.repoint_entity_edges(from, to, timestamp);
+                    self.merge_entity_bookkeeping(from, to);
+                    result.merged = true;
+                    self.graph[to].name.clone()
+                } else if old_name != to_name {
+                    let node = &mut self.graph[from];
+                    node.aliases.retain(|alias| !same_name(alias, to_name));
+                    if !same_name(&old_name, to_name)
+                        && !node.aliases.iter().any(|alias| same_name(alias, &old_name))
+                    {
+                        node.aliases.push(old_name.clone());
+                    }
+                    node.name = to_name.to_owned();
+                    self.name_index.insert(to_key, from);
+                    self.track_updated_node(from);
+                    for edge in self
+                        .graph
+                        .edge_weights_mut()
+                        .filter(|edge| edge.valid_until.is_none())
+                    {
+                        for contribution in edge.contributions.iter_mut().flatten() {
+                            if contribution
+                                .current_speaker_label
+                                .as_deref()
+                                .is_some_and(|label| same_name(label, &old_name))
+                            {
+                                contribution.current_speaker_label = Some(to_name.to_owned());
+                            }
+                        }
+                    }
+                    result.renamed_in_place = true;
+                    to_name.to_owned()
+                } else {
+                    old_name.clone()
+                };
+                result.entities_updated =
+                    self.reattribute_mentions(from_name, &old_name, &next_name, None);
+            }
+            RelabelScope::Segments { segment_ids } => {
+                if same_name(from_name, to_name) || segment_ids.is_empty() {
+                    return result;
+                }
+                if let Some(from) = from.filter(|&idx| same_name(&self.graph[idx].name, from_name))
+                {
+                    result.edges_retconned =
+                        self.reattribute_segment_edges(from, to_name, &segment_ids, timestamp);
+                }
+                result.entities_updated =
+                    self.reattribute_mentions(from_name, from_name, to_name, Some(&segment_ids));
+                if result.edges_retconned == 0 && result.entities_updated > 0 {
+                    self.get_or_create_split_target(to_name, timestamp);
+                }
+            }
+        }
+        result
+    }
+
+    fn live_incident_edges(
+        &self,
+        node: NodeIndex,
+    ) -> impl Iterator<Item = (EdgeIndex, NodeIndex, NodeIndex, &TemporalEdge)> {
+        self.graph
+            .edges_directed(node, petgraph::Direction::Outgoing)
             .chain(
                 self.graph
-                    .edges_directed(superseded_idx, petgraph::Direction::Incoming),
+                    .edges_directed(node, petgraph::Direction::Incoming)
+                    .filter(move |edge| edge.source() != node),
             )
-        {
-            let edge_idx = edge_ref.id();
-            // Skip already-invalidated edges — they are not live, so there is
-            // nothing to hide or re-point.
-            if edge_ref.weight().valid_until.is_some() {
-                continue;
-            }
-            let (src, tgt) = match self.graph.edge_endpoints(edge_idx) {
-                Some(pair) => pair,
-                None => continue,
-            };
-            let superseded_is_source = src == superseded_idx;
-            let other = if superseded_is_source { tgt } else { src };
-            // A self-loop on the superseded node collapses to a self-loop on the
-            // canonical node; the "other" endpoint becomes the canonical node.
-            let other = if other == superseded_idx {
-                canonical_idx
-            } else {
-                other
-            };
-            repoints.push(Repoint {
-                edge_idx,
-                other,
-                superseded_is_source,
-                edge: edge_ref.weight().clone(),
-            });
-        }
+            .filter(|edge| edge.weight().valid_until.is_none())
+            .map(|edge| (edge.id(), edge.source(), edge.target(), edge.weight()))
+    }
 
-        let invalidated = repoints.len();
-        if invalidated == 0 {
+    fn repoint_entity_edges(&mut self, from: NodeIndex, to: NodeIndex, timestamp: f64) -> usize {
+        let incident: Vec<_> = self
+            .live_incident_edges(from)
+            .map(|(idx, src, tgt, _)| (idx, src, tgt))
+            .collect();
+        for &(idx, src, tgt) in &incident {
+            let mut edge = self.graph[idx].clone();
+            self.invalidate_edge(idx, timestamp);
+            let new_src = if src == from { to } else { src };
+            let new_tgt = if tgt == from { to } else { tgt };
+            for contribution in edge.complete_contributions() {
+                let mask = contribution.speaker_endpoint_mask;
+                if (src == from && mask.source()) || (tgt == from && mask.target()) {
+                    contribution.current_speaker_label = attributed_node(mask, new_src, new_tgt)
+                        .map(|node| self.graph[node].name.clone());
+                }
+            }
+            self.refold_edge(new_src, new_tgt, edge, timestamp);
+        }
+        incident.len()
+    }
+
+    fn refold_edge(
+        &mut self,
+        src: NodeIndex,
+        tgt: NodeIndex,
+        mut incoming: TemporalEdge,
+        timestamp: f64,
+    ) {
+        incoming.complete_contributions();
+        if let Some(idx) = self.live_edge(src, tgt, &incoming.relation_type) {
+            let edge = &mut self.graph[idx];
+            if let Some(contributions) = incoming.contributions.take() {
+                edge.complete_contributions().extend(contributions);
+            }
+            edge.weight += incoming.weight;
+            edge.valid_from = edge.valid_from.min(incoming.valid_from);
+            if edge.source_segment_id.is_empty() {
+                edge.source_segment_id = incoming.source_segment_id;
+            }
+            self.track_updated_edge(idx);
+        } else {
+            // Retcon validity starts now; observations keep their original timestamps.
+            incoming.valid_from = timestamp;
+            incoming.valid_until = None;
+            self.insert_live_edge(src, tgt, incoming);
+        }
+    }
+
+    /// Fold source bookkeeping and preserve the redirect on disk via aliases.
+    fn merge_entity_bookkeeping(&mut self, from: NodeIndex, to: NodeIndex) {
+        let source = self.graph[from].clone();
+        let canonical = &mut self.graph[to];
+        canonical.mention_count = canonical.mention_count.saturating_add(source.mention_count);
+        canonical.first_seen = canonical.first_seen.min(source.first_seen);
+        canonical.last_seen = canonical.last_seen.max(source.last_seen);
+        if canonical.description.is_none() {
+            canonical.description = source.description;
+        }
+        if canonical.person_ref.is_none() {
+            canonical.person_ref = source.person_ref;
+        }
+        if canonical.speaker_mentions.is_none() {
+            canonical.speaker_mentions = Some(
+                canonical
+                    .speakers
+                    .iter()
+                    .map(|label| SpeakerMention {
+                        segment_id: None,
+                        speaker_label: label.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        let mentions = canonical
+            .speaker_mentions
+            .as_mut()
+            .expect("mentions initialized");
+        if let Some(observations) = source.speaker_mentions {
+            mentions.extend(observations);
+        } else {
+            mentions.extend(
+                source
+                    .speakers
+                    .into_iter()
+                    .map(|speaker_label| SpeakerMention {
+                        segment_id: None,
+                        speaker_label,
+                    }),
+            );
+        }
+        rebuild_speakers(canonical);
+        for alias in source
+            .aliases
+            .into_iter()
+            .chain(std::iter::once(source.name))
+        {
+            if !same_name(&alias, &canonical.name)
+                && !canonical
+                    .aliases
+                    .iter()
+                    .any(|existing| same_name(existing, &alias))
+            {
+                canonical.aliases.push(alias);
+            }
+        }
+        self.graph[from].aliases.clear();
+        for target in self.name_index.values_mut() {
+            if *target == from {
+                *target = to;
+            }
+        }
+        self.track_updated_node(to);
+    }
+
+    fn reattribute_segment_edges(
+        &mut self,
+        from: NodeIndex,
+        to_name: &str,
+        segments: &BTreeSet<String>,
+        timestamp: f64,
+    ) -> usize {
+        // Index into one of four groups by which endpoint(s) move. Untouched
+        // observations stay in group 0, including literal names on a mixed edge.
+        let group = |contribution: &EdgeContribution, src, tgt| {
+            if contribution
+                .source_segment_id
+                .as_ref()
+                .is_none_or(|id| !segments.contains(id))
+            {
+                return 0;
+            }
+            let mask = contribution.speaker_endpoint_mask;
+            usize::from(src == from && mask.source())
+                | (usize::from(tgt == from && mask.target()) << 1)
+        };
+        let affected: Vec<_> = self
+            .live_incident_edges(from)
+            .filter_map(|(idx, src, tgt, edge)| {
+                let selected = match &edge.contributions {
+                    Some(contributions) => contributions.iter().any(|c| group(c, src, tgt) != 0),
+                    None => {
+                        !edge.source_segment_id.is_empty()
+                            && segments.contains(&edge.source_segment_id)
+                    }
+                };
+                selected.then_some((idx, src, tgt))
+            })
+            .collect();
+        if affected.is_empty() {
             return 0;
         }
-
-        for repoint in repoints {
-            // 1) Invalidate the old edge (the producer call): sets valid_until so
-            //    snapshot()/build_delta_edge hide it. Surface it as a removal so
-            //    the frontend drops the stale link immediately.
-            self.invalidate_edge(repoint.edge_idx, timestamp);
-            self.delta_removed_edge_ids
-                .push(edge_link_id(repoint.edge.seq_id));
-            self.delta_added_edge_indices
-                .retain(|&ei| ei != repoint.edge_idx);
-            self.delta_updated_edge_indices
-                .retain(|&ei| ei != repoint.edge_idx);
-
-            // 2) Re-create an equivalent LIVE edge on the canonical node, unless
-            //    one with the same relation_type already connects the same
-            //    endpoints (in which case fold the weight in to avoid a dup).
-            let (new_src, new_tgt) = if repoint.superseded_is_source {
-                (canonical_idx, repoint.other)
-            } else {
-                (repoint.other, canonical_idx)
-            };
-            let existing = self
-                .graph
-                .edges_connecting(new_src, new_tgt)
-                .find(|e| {
-                    e.weight().relation_type == repoint.edge.relation_type
-                        && e.weight().valid_until.is_none()
-                })
-                .map(|e| e.id());
-            if let Some(existing_idx) = existing {
-                if let Some(edge) = self.graph.edge_weight_mut(existing_idx) {
-                    edge.weight += repoint.edge.weight;
-                    edge.valid_from = edge.valid_from.min(repoint.edge.valid_from);
-                    // Provenance policy (b272, epic 0d72 P2): on this
-                    // fold-weight-into-existing-live-edge path the survivor keeps
-                    // its OWN `source_segment_id` — we deliberately do NOT
-                    // accumulate the folded duplicate's segment id. The folded
-                    // edge is a redundant restatement of the same relation, so a
-                    // single triggering segment id per surfaced edge stays a clean
-                    // 1:1 for the P3 seek-view; the clone/new-edge path below
-                    // preserves the moved edge's provenance verbatim via `clone()`.
-                    // Trade-off: an utterance that only restated an existing
-                    // relation drops out of that edge's `related_edge_ids` after a
-                    // fold-in retcon (thinned, not wrong). Revisit with a
-                    // `Vec<segment_id>` if a consumer needs every contributing
-                    // utterance.
-                }
-                if !self.delta_added_edge_indices.contains(&existing_idx)
-                    && !self.delta_updated_edge_indices.contains(&existing_idx)
-                {
-                    self.delta_updated_edge_indices.push(existing_idx);
-                }
-            } else {
-                let seq_id = self.edge_seq_counter;
-                self.edge_seq_counter += 1;
-                let mut new_edge = repoint.edge.clone();
-                new_edge.seq_id = seq_id;
-                new_edge.valid_from = timestamp;
-                new_edge.valid_until = None;
-                let new_idx = self.graph.add_edge(new_src, new_tgt, new_edge);
-                self.delta_added_edge_indices.push(new_idx);
-            }
+        let to = self.get_or_create_split_target(to_name, timestamp);
+        // Retire all source rows before refolding: a mixed self-loop can
+        // produce the same endpoints as another affected row.
+        for &(idx, _, _) in &affected {
+            self.invalidate_edge(idx, timestamp);
         }
 
-        // Fold the superseded node's mention bookkeeping into the canonical node
-        // so the merged identity reflects the combined activity. The superseded
-        // node is intentionally NOT removed — it lingers with only invalidated
-        // (hidden) edges so the pre-retcon attribution stays auditable.
-        if let (Some(superseded), Some(canonical)) = (
-            self.graph.node_weight(superseded_idx).cloned(),
-            self.graph.node_weight_mut(canonical_idx),
-        ) {
-            canonical.mention_count = canonical
-                .mention_count
-                .saturating_add(superseded.mention_count);
-            canonical.first_seen = canonical.first_seen.min(superseded.first_seen);
-            canonical.last_seen = canonical.last_seen.max(superseded.last_seen);
-            for spk in superseded.speakers {
-                if !canonical.speakers.contains(&spk) {
-                    canonical.speakers.push(spk);
+        for &(idx, src, tgt) in &affected {
+            let edge = &self.graph[idx];
+            let legacy = edge
+                .contributions
+                .is_none()
+                .then(|| edge.legacy_contribution());
+            let mut groups: [Vec<EdgeContribution>; 4] = std::array::from_fn(|_| Vec::new());
+            for mut observation in edge.contributions.iter().flatten().cloned().chain(legacy) {
+                let bucket = group(&observation, src, tgt);
+                if bucket != 0 {
+                    observation.current_speaker_label = attributed_node(
+                        observation.speaker_endpoint_mask,
+                        if bucket & 1 != 0 { to } else { src },
+                        if bucket & 2 != 0 { to } else { tgt },
+                    )
+                    .map(|node| self.graph[node].name.clone());
+                }
+                groups[bucket].push(observation);
+            }
+            let relation_type = edge.relation_type.clone();
+            for (bucket, contributions) in groups.into_iter().enumerate() {
+                let Some(first) = contributions.first() else {
+                    continue;
+                };
+                let edge = TemporalEdge {
+                    seq_id: 0,
+                    relation_type: relation_type.clone(),
+                    valid_from: timestamp,
+                    valid_until: None,
+                    confidence: first.confidence,
+                    source_segment_id: contributions
+                        .iter()
+                        .find_map(|c| c.source_segment_id.clone())
+                        .unwrap_or_default(),
+                    detail: first.detail.clone(),
+                    weight: contributions.iter().map(|c| c.weight).sum(),
+                    contributions: Some(contributions),
+                };
+                self.refold_edge(
+                    if bucket & 1 != 0 { to } else { src },
+                    if bucket & 2 != 0 { to } else { tgt },
+                    edge,
+                    timestamp,
+                );
+            }
+        }
+        affected.len()
+    }
+
+    fn get_or_create_split_target(&mut self, name: &str, timestamp: f64) -> NodeIndex {
+        let key = name.to_lowercase();
+        let redirect = self.name_index.get(&key).copied();
+        if let Some(idx) = redirect {
+            if same_name(&self.graph[idx].name, name) {
+                return idx;
+            }
+            // Splits/unbinds restore an exact display name, not its old redirect.
+            self.graph[idx]
+                .aliases
+                .retain(|alias| !same_name(alias, name));
+        }
+        if let Some(idx) = self
+            .graph
+            .node_indices()
+            .find(|&idx| same_name(&self.graph[idx].name, name))
+        {
+            self.name_index.insert(key, idx);
+            idx
+        } else {
+            self.insert_entity(
+                &ExtractedEntity {
+                    name: name.to_owned(),
+                    entity_type: "Person".to_owned(),
+                    description: None,
+                },
+                key,
+                timestamp,
+            )
+        }
+    }
+
+    fn reattribute_mentions(
+        &mut self,
+        from: &str,
+        from_display: &str,
+        to: &str,
+        segments: Option<&BTreeSet<String>>,
+    ) -> usize {
+        let matches_from =
+            |label: &str| label != to && (same_name(label, from) || same_name(label, from_display));
+        let mut updated = 0;
+        for idx in self.graph.node_indices().collect::<Vec<_>>() {
+            let node = &mut self.graph[idx];
+            let mut changed = false;
+            if let Some(mentions) = &mut node.speaker_mentions {
+                for mention in mentions {
+                    if matches_from(&mention.speaker_label)
+                        && segments.is_none_or(|ids| {
+                            mention
+                                .segment_id
+                                .as_ref()
+                                .is_some_and(|id| ids.contains(id))
+                        })
+                    {
+                        mention.speaker_label = to.to_owned();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    rebuild_speakers(node);
+                }
+            } else if segments.is_none() {
+                for label in &mut node.speakers {
+                    if matches_from(label) {
+                        *label = to.to_owned();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    node.speakers.sort_unstable();
+                    node.speakers.dedup();
                 }
             }
-            if canonical.description.is_none() && superseded.description.is_some() {
-                canonical.description = superseded.description;
-            }
-            // The canonical node changed — surface it as updated.
-            let canonical_id = canonical.id.clone();
-            if !self.delta_added_node_ids.contains(&canonical_id)
-                && !self.delta_updated_node_ids.contains(&canonical_id)
-            {
-                self.delta_updated_node_ids.push(canonical_id);
+            if changed {
+                updated += 1;
+                self.track_updated_node(idx);
             }
         }
-
-        // Re-point the name index so the superseded name now resolves to the
-        // canonical node (78d0). Without this, `name_index[superseded_key]` keeps
-        // mapping to the retired node: a later `add_relation("Speaker 2", ...)`
-        // (or any name lookup) would re-attach fresh, live (`valid_until = None`)
-        // edges to the node we just retired, resurrecting the pre-merge identity
-        // and stranding those edges out of every snapshot. Sweeping every index
-        // key that still aims at the superseded node sends future mentions of the
-        // old name straight to the canonical node instead. We sweep ALL keys (not
-        // just the superseded node's stored-name key) because callers may have
-        // superseded via a fuzzy/alias name, so several keys can target one node.
-        for target in self.name_index.values_mut() {
-            if *target == superseded_idx {
-                *target = canonical_idx;
-            }
-        }
-
-        invalidated
+        updated
     }
 
     /// Process a full extraction result from a transcript segment.
@@ -606,20 +1000,33 @@ impl TemporalKnowledgeGraph {
         speaker: &str,
         segment_id: &str,
     ) {
-        // First, add/update all entities
+        let segment = (!segment_id.is_empty()).then_some(segment_id);
+        let canonical_speaker = self
+            .name_index
+            .get(&speaker.to_lowercase())
+            .map(|&idx| &self.graph[idx].name)
+            .filter(|name| name.as_str() != speaker)
+            .cloned();
+        let speaker = canonical_speaker.as_deref().unwrap_or(speaker);
+        let mut mentioned = HashSet::new();
         for entity in &result.entities {
-            self.add_entity(entity, timestamp, speaker);
+            mentioned.insert(self.add_entity_with_segment(entity, timestamp, speaker, segment));
         }
-
-        // Then, add all relations
         for relation in &result.relations {
-            self.add_relation(
+            if let Some((source, target)) = self.add_relation_observation(
                 &relation.source,
                 &relation.target,
                 relation,
                 timestamp,
                 segment_id,
-            );
+            ) {
+                for idx in [source, target] {
+                    if mentioned.insert(idx) {
+                        record_speaker_mention(&mut self.graph[idx], speaker, segment);
+                        self.track_updated_node(idx);
+                    }
+                }
+            }
         }
 
         self.event_counter += 1;
@@ -661,16 +1068,9 @@ impl TemporalKnowledgeGraph {
     /// edge-cascade bookkeeping lives in one place (and so tests can drive a
     /// single eviction without depending on the [`MAX_NODES`] threshold).
     fn evict_node(&mut self, idx: NodeIndex) {
-        // Remove from name_index before removing from graph.
+        // All primary names and redirects into a recycled index must disappear.
+        self.name_index.retain(|_, target| *target != idx);
         if let Some(entity) = self.graph.node_weight(idx) {
-            let key = entity.name.to_lowercase();
-            // Only drop the name_index entry if it still points at THIS node. A
-            // later node inserted under the same lowercased key may have
-            // overwritten the mapping; removing it then would strand the
-            // surviving node (its key would resolve to nothing).
-            if self.name_index.get(&key) == Some(&idx) {
-                self.name_index.remove(&key);
-            }
             // Track removal in delta
             self.delta_removed_node_ids.push(entity.id.clone());
             // Remove from added/updated lists if present
@@ -1043,6 +1443,14 @@ impl TemporalKnowledgeGraph {
             }
         }
 
+        // Build edges from the stored primary names first so historical rows
+        // still point to retired nodes. Restore redirects only for live lookup.
+        for idx in graph.node_indices() {
+            for alias in &graph[idx].aliases {
+                name_index.insert(alias.to_lowercase(), idx);
+            }
+        }
+
         Ok(Self {
             graph,
             name_index,
@@ -1083,6 +1491,245 @@ mod tests {
             target: tgt.to_string(),
             relation_type: rel.to_string(),
             detail: None,
+            speaker_endpoint_mask: SpeakerEndpointMask::Neither,
+        }
+    }
+
+    fn segments(ids: &[&str]) -> RelabelScope {
+        RelabelScope::Segments {
+            segment_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn entity_relabel_renames_in_place_with_stable_ids_and_persistent_alias() {
+        let mut graph = TemporalKnowledgeGraph::new();
+        let mut edge = relation("Speaker A", "Acme", "mentions");
+        edge.speaker_endpoint_mask = SpeakerEndpointMask::Source;
+        graph.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("Speaker A"), entity("Acme")],
+                relations: vec![edge],
+            },
+            1.0,
+            "Speaker A",
+            "turn-1",
+        );
+        let speaker = graph.resolve_entity("Speaker A", 1.0).unwrap();
+        let acme = graph.resolve_entity("Acme", 1.0).unwrap();
+        let node_id = graph.graph[speaker].id.clone();
+        let edge_id = graph.snapshot().links[0].id.clone();
+        let _ = graph.take_delta();
+
+        let result = graph.reattribute_speaker("Speaker A", "Alice", RelabelScope::Entity, 2.0);
+        assert!(result.renamed_in_place);
+        assert!(result.changed());
+        assert_eq!(result.edges_retconned, 0);
+        assert_eq!(graph.resolve_entity("SPEAKER A", 1.0), Some(speaker));
+        assert_eq!(graph.resolve_entity("alice", 1.0), Some(speaker));
+        assert_eq!(graph.graph[speaker].id, node_id);
+        assert_eq!(graph.graph[speaker].aliases, ["Speaker A"]);
+        let delta = graph.take_delta();
+        assert!(delta.added_edges.is_empty() && delta.removed_edge_ids.is_empty());
+        assert!(
+            delta
+                .updated_nodes
+                .iter()
+                .any(|node| node.id == node_id && node.name == "Alice")
+        );
+        assert_eq!(graph.snapshot().links[0].id, edge_id);
+        assert_eq!(graph.graph[acme].speakers, ["Alice"]);
+        assert_eq!(
+            graph.graph[acme].speaker_mentions.as_ref().unwrap()[0].speaker_label,
+            "Alice"
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("audiograph-retcon-{}.json", uuid::Uuid::new_v4()));
+        graph.save_to_file(&path).unwrap();
+        let mut reloaded = TemporalKnowledgeGraph::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let alice = reloaded.resolve_entity("Alice", 1.0).unwrap();
+        assert_eq!(reloaded.resolve_entity("Speaker A", 1.0), Some(alice));
+        assert_eq!(reloaded.graph[alice].id, node_id);
+        reloaded.evict_node(alice);
+        assert_eq!(reloaded.resolve_entity("Speaker A", 1.0), None);
+        assert_eq!(reloaded.resolve_entity("Alice", 1.0), None);
+    }
+
+    #[test]
+    fn segment_relabel_splits_folded_observations_and_rebuilds_speakers() {
+        let mut graph = TemporalKnowledgeGraph::new();
+        let mut edge = relation("Speaker A", "Acme", "mentions");
+        edge.speaker_endpoint_mask = SpeakerEndpointMask::Source;
+        let mut extraction = ExtractionResult {
+            entities: vec![entity("Speaker A"), entity("Acme")],
+            relations: vec![edge],
+        };
+        extraction.relations[0].detail = Some("first".into());
+        graph.process_extraction(&extraction, 1.0, "Speaker A", "turn-1");
+        extraction.relations[0].detail = Some("second".into());
+        graph.process_extraction(&extraction, 2.0, "Speaker A", "turn-2");
+        let original = graph.live_edges_by_source_segment();
+        assert_eq!(original["turn-1"], original["turn-2"]);
+
+        let result =
+            graph.reattribute_speaker("Speaker A", "Speaker B", segments(&["turn-2"]), 3.0);
+        assert_eq!(result.edges_retconned, 1);
+        let a = graph.resolve_entity("Speaker A", 1.0).unwrap();
+        let b = graph.resolve_entity("Speaker B", 1.0).unwrap();
+        let acme = graph.resolve_entity("Acme", 1.0).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(graph.graph[b].entity_type, "Person");
+        let retired = graph
+            .graph
+            .edge_weights()
+            .find(|e| e.valid_until == Some(3.0))
+            .unwrap();
+        assert_eq!(retired.weight, 2.0);
+        assert_eq!(retired.contributions.as_ref().unwrap().len(), 2);
+        for (source, label, turn, observed_at, detail) in [
+            (a, "Speaker A", "turn-1", 1.0, "first"),
+            (b, "Speaker B", "turn-2", 2.0, "second"),
+        ] {
+            let idx = graph.live_edge(source, acme, "mentions").unwrap();
+            let live = &graph.graph[idx];
+            assert_eq!(live.weight, 1.0);
+            assert_eq!(live.source_segment_id, turn);
+            assert_eq!(live.detail.as_deref(), Some(detail));
+            let observations = live.contributions.as_ref().unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].observed_at, observed_at);
+            assert_eq!(
+                observations[0].origin_speaker_label.as_deref(),
+                Some("Speaker A")
+            );
+            assert_eq!(
+                observations[0].current_speaker_label.as_deref(),
+                Some(label)
+            );
+        }
+        let joined = graph.live_edges_by_source_segment();
+        assert_ne!(joined["turn-1"], joined["turn-2"]);
+        assert_eq!(graph.graph[acme].speakers, ["Speaker A", "Speaker B"]);
+        assert_eq!(
+            graph.graph[acme]
+                .speaker_mentions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|m| { (m.segment_id.as_deref().unwrap(), m.speaker_label.as_str()) })
+                .collect::<Vec<_>>(),
+            [("turn-1", "Speaker A"), ("turn-2", "Speaker B")]
+        );
+
+        let result =
+            graph.reattribute_speaker("Speaker A", "Speaker B", segments(&["turn-1"]), 4.0);
+        assert_eq!(result.edges_retconned, 1);
+        assert_eq!(graph.graph[acme].speakers, ["Speaker B"]);
+        assert_eq!(graph.snapshot().links[0].weight, 2.0);
+        let folded = graph.live_edges_by_source_segment();
+        assert_eq!(folded["turn-1"], folded["turn-2"]);
+    }
+
+    #[test]
+    fn scoped_relabel_only_moves_speaker_role_on_self_loop() {
+        let mut graph = TemporalKnowledgeGraph::new();
+        let literal = relation("Speaker A", "Speaker A", "mentions");
+        let mut source_role = literal.clone();
+        source_role.speaker_endpoint_mask = SpeakerEndpointMask::Source;
+        let mut target_role = literal.clone();
+        target_role.speaker_endpoint_mask = SpeakerEndpointMask::Target;
+        let mut both = literal.clone();
+        both.speaker_endpoint_mask = SpeakerEndpointMask::Both;
+        graph.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("Speaker A")],
+                relations: vec![literal, source_role, target_role, both],
+            },
+            1.0,
+            "Speaker A",
+            "turn-1",
+        );
+        let result =
+            graph.reattribute_speaker("Speaker A", "Speaker B", segments(&["turn-1"]), 2.0);
+        assert_eq!(
+            result.edges_retconned, 1,
+            "a self-loop is retired only once"
+        );
+        let a = graph.resolve_entity("Speaker A", 1.0).unwrap();
+        let b = graph.resolve_entity("Speaker B", 1.0).unwrap();
+        for (src, tgt) in [(a, a), (a, b), (b, a), (b, b)] {
+            let idx = graph.live_edge(src, tgt, "mentions").unwrap();
+            assert_eq!(graph.graph[idx].weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn merge_without_edges_updates_mentions_and_split_reclaims_retired_name() {
+        let mut graph = TemporalKnowledgeGraph::new();
+        graph.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("Speaker A"), entity("Acme")],
+                relations: vec![],
+            },
+            1.0,
+            "Speaker A",
+            "turn-1",
+        );
+        let retired = graph.resolve_entity("Speaker A", 1.0).unwrap();
+        let acme = graph.resolve_entity("Acme", 1.0).unwrap();
+        let alice = graph.add_entity(&entity("Alice"), 2.0, "Other");
+        graph.graph[acme].speaker_mentions = None; // Legacy speaker list.
+        let result = graph.reattribute_speaker("Speaker A", "Alice", RelabelScope::Entity, 3.0);
+        assert!(result.changed() && result.merged);
+        assert_eq!(result.edges_retconned, 0);
+        assert_eq!(graph.graph[acme].speakers, ["Alice"]);
+        assert_eq!(graph.graph[alice].speakers, ["Alice", "Other"]);
+        assert_eq!(graph.resolve_entity("Speaker A", 1.0), Some(alice));
+
+        let result = graph.reattribute_speaker("Alice", "Speaker A", segments(&["turn-1"]), 4.0);
+        assert!(result.changed());
+        assert_eq!(graph.resolve_entity("Speaker A", 1.0), Some(retired));
+        assert_eq!(
+            graph.graph[acme].speakers,
+            ["Alice"],
+            "cannot split unanchored legacy mentions"
+        );
+        assert_eq!(graph.graph[alice].speakers, ["Other", "Speaker A"]);
+    }
+
+    #[test]
+    fn legacy_edge_uses_seek_hint_and_keeps_later_observations() {
+        let mut graph = TemporalKnowledgeGraph::new();
+        let source = graph.add_entity(&entity("Speaker A"), 1.0, "Speaker A");
+        let target = graph.add_entity(&entity("Acme"), 1.0, "Speaker A");
+        let legacy: TemporalEdge = serde_json::from_str(
+            r#"{
+            "relation_type":"mentions", "valid_from":1.0, "valid_until":null,
+            "confidence":1.0, "source_segment_id":"old-turn", "detail":null, "weight":3.0
+        }"#,
+        )
+        .unwrap();
+        assert!(legacy.contributions.is_none());
+        assert_eq!(
+            legacy.all_source_segment_ids().collect::<Vec<_>>(),
+            ["old-turn"]
+        );
+        graph.insert_live_edge(source, target, legacy);
+        let mut later = relation("Speaker A", "Acme", "mentions");
+        later.speaker_endpoint_mask = SpeakerEndpointMask::Source;
+        graph.add_relation("Speaker A", "Acme", &later, 2.0, "new-turn");
+
+        let result =
+            graph.reattribute_speaker("Speaker A", "Speaker B", segments(&["old-turn"]), 3.0);
+        assert_eq!(result.edges_retconned, 1);
+        let b = graph.resolve_entity("Speaker B", 1.0).unwrap();
+        for (node, segment, weight) in [(source, "new-turn", 1.0), (b, "old-turn", 3.0)] {
+            let idx = graph.live_edge(node, target, "mentions").unwrap();
+            let edge = &graph.graph[idx];
+            assert_eq!(edge.weight, weight);
+            assert_eq!(edge.source_segment_id, segment);
         }
     }
 
@@ -1541,6 +2188,8 @@ mod tests {
             aliases: vec![],
             description: None,
             speakers: vec![],
+            person_ref: None,
+            speaker_mentions: None,
         };
         let new_idx = g.graph.add_node(new_node);
         g.name_index.insert("alice".to_string(), new_idx); // re-point key
@@ -1739,14 +2388,14 @@ mod tests {
         assert_eq!(live.len(), 1, "duplicate relation folds into one live edge");
         // Its weight is the sum of the two original weights (1.0 + 1.0).
         assert_eq!(live[0].weight, 2.0, "folded edge accumulates weight");
-        // b272 provenance policy — fold-into-existing-edge path: the SURVIVOR
-        // keeps its OWN source segment (seg-alice); the folded duplicate's
-        // seg-speaker2 is intentionally NOT accumulated (thinned, not wrong).
+        // Keep the surviving seek hint, but join both contributing turns.
         assert_eq!(
             live[0].source_segment_id, "seg-alice",
-            "the fold-in survivor keeps its own source segment; the folded \
-             duplicate's provenance is dropped by the accepted-thinning policy"
+            "the fold-in survivor keeps its own seek hint",
         );
+        let by_segment = g.live_edges_by_source_segment();
+        assert_eq!(by_segment["seg-alice"], [live[0].id.clone()]);
+        assert_eq!(by_segment["seg-speaker2"], [live[0].id.clone()]);
     }
 
     /// 78d0 (P2): after a merge, a LATER mention of the superseded name must
@@ -1809,6 +2458,7 @@ mod tests {
             target: "Bob".to_string(),
             relation_type: "greets".to_string(),
             detail: None,
+            speaker_endpoint_mask: SpeakerEndpointMask::Neither,
         };
         g.add_relation("Speaker 2", "Bob", &later, 200.0, "seg-2");
 

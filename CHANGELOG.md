@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Speaker revisions now correct only the affected turn in the graph, preserving
+  other turns and their timeline links. Whole-speaker renames keep the original
+  graph node when the new name is unused.
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw

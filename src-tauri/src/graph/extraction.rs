@@ -3,7 +3,9 @@
 //! Provides rule-based entity extraction as a fallback when no LLM is available.
 //! Uses regex patterns and heuristics to identify entities and relations.
 
-use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+use crate::graph::entities::{
+    ExtractedEntity, ExtractedRelation, ExtractionResult, SpeakerEndpointMask,
+};
 use regex::Regex;
 
 /// Rule-based entity extractor using regex patterns and heuristics.
@@ -81,6 +83,7 @@ impl RuleBasedExtractor {
                         target: name,
                         relation_type: "mentioned".to_string(),
                         detail: None,
+                        speaker_endpoint_mask: SpeakerEndpointMask::Source,
                     });
                 }
             }
@@ -103,6 +106,7 @@ impl RuleBasedExtractor {
                         target: name,
                         relation_type: "mentioned".to_string(),
                         detail: None,
+                        speaker_endpoint_mask: SpeakerEndpointMask::Source,
                     });
                 }
             }
@@ -132,6 +136,7 @@ impl RuleBasedExtractor {
                         target: name,
                         relation_type: "mentioned".to_string(),
                         detail: None,
+                        speaker_endpoint_mask: SpeakerEndpointMask::Source,
                     });
                 }
             }

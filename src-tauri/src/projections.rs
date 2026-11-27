@@ -730,13 +730,13 @@ impl From<DiarizationSpanRevisionPayload> for DiarizationSpanRevision {
 /// [`SpeakerTimeline::apply_event`] when a span's `speaker_label` is remapped
 /// from one non-empty label to a different one.
 ///
-/// This is the durable signal that drives the knowledge-graph entity retcon:
-/// the `superseded_label` entity's relations are folded onto the
-/// `canonical_label` entity via
-/// [`crate::graph::TemporalKnowledgeGraph::supersede_entity`]. Labels can carry
-/// PII, so the `Debug` impl redacts them.
+/// Carries the exact span and explicitly cited basis keys so the graph retcon
+/// cannot silently broaden a provider correction to a whole speaker entity.
+/// Labels can carry PII, so the `Debug` impl redacts them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SpeakerLabelRemap {
+    pub span_id: String,
+    pub basis_segment_ids: Vec<String>,
     pub superseded_label: String,
     pub canonical_label: String,
 }
@@ -744,6 +744,8 @@ pub struct SpeakerLabelRemap {
 impl fmt::Debug for SpeakerLabelRemap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpeakerLabelRemap")
+            .field("span_id", &self.span_id)
+            .field("basis_segment_ids", &self.basis_segment_ids)
             .field("superseded_label", &REDACTED_DEBUG_VALUE)
             .field("canonical_label", &REDACTED_DEBUG_VALUE)
             .finish()
@@ -816,10 +818,7 @@ impl SpeakerTimeline {
             Some(current) => {
                 // Newer (or identical) revision: the later attribution replaces
                 // the earlier one, collapsing provisional -> stable remaps.
-                let remap = Self::detect_label_remap(
-                    current.speaker_label.as_deref(),
-                    event.speaker_label.as_deref(),
-                );
+                let remap = Self::detect_label_remap(current.speaker_label.as_deref(), &event);
                 *current = event;
                 self.accepted_event_count += 1;
                 self.sort_latest_spans();
@@ -836,14 +835,29 @@ impl SpeakerTimeline {
 
     fn detect_label_remap(
         old_label: Option<&str>,
-        new_label: Option<&str>,
+        event: &DiarizationSpanRevision,
     ) -> Option<SpeakerLabelRemap> {
         let old = old_label.map(str::trim).filter(|s| !s.is_empty())?;
-        let new = new_label.map(str::trim).filter(|s| !s.is_empty())?;
+        let new = event
+            .speaker_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
         if old == new {
             return None;
         }
+        let mut basis_segment_ids = event
+            .basis_transcript_segment_ids
+            .iter()
+            .chain(&event.basis_asr_span_ids)
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        basis_segment_ids.sort_unstable();
+        basis_segment_ids.dedup();
         Some(SpeakerLabelRemap {
+            span_id: event.span_id.clone(),
+            basis_segment_ids,
             superseded_label: old.to_string(),
             canonical_label: new.to_string(),
         })
@@ -9862,6 +9876,8 @@ mod tests {
             .expect("changed human-facing speaker label should report remap");
         assert_eq!(remap.superseded_label, "Speaker 2");
         assert_eq!(remap.canonical_label, "Speaker Alice");
+        assert_eq!(remap.span_id, "span-1");
+        assert_eq!(remap.basis_segment_ids, ["span-1-asr", "span-1-segment"]);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 ## Issue Hygiene Loop
 
-- Start broad work by querying open GitHub Issues (`gh issue list --state open --limit 50` or filtering by `priority:p0` / `priority:p1` / area label) and choosing the highest-priority unblocked item that can be advanced without sweeping unrelated changes.
+- Start broad work by querying open GitHub Issues (`gh issue list --state open --limit 500`, or filtering by `--label priority:p0` / `--label priority:p1` / area label with `--limit 200`) and choosing the highest-priority unblocked item that can be advanced without sweeping unrelated changes.
 - During implementation, post partial progress on the relevant GitHub Issue (or link the open PR) instead of pretending the whole epic is complete.
 - Close duplicate or narrow issues only when their stated acceptance criteria are actually met and the verification evidence is known; when closing a duplicate, name the canonical issue `#N`.
 - If a patch resolves part of an epic, keep the epic open and check off or record remaining work on the epic issue.
@@ -30,7 +30,7 @@
 ## Deep Work Loop
 
 - Begin large pushes by documenting the current commit/worktree state in `docs/commit-state-*.md`: HEAD, branch, dirty-tree caveats, active issues, known verification, and why any broad changes are not being committed or synced yet.
-- Audit the backlog with `gh issue list --state open`; treat the result as a dynamic priority queue, not a static plan. If a new dependency or risk appears, create or update a GitHub Issue immediately.
+- Audit the full open backlog with `gh issue list --state open --limit 500` (or paginated `gh api` when open issues exceed 500); treat the result as a dynamic priority queue, not a static plan. If a new dependency or risk appears, create or update a GitHub Issue immediately.
 - Research before acting when the task depends on provider APIs, CI behavior, cross-platform packaging, UX conventions, or architecture tradeoffs. Prefer primary sources and record source/date in docs or issue comments.
 - Plan work in waves. Run independent research, implementation, and review tracks in parallel only when their file ownership is clear and the main agent can integrate the results without collisions.
 - Keep a concurrent review mindset: every implementation wave should have either a subagent review, focused tests, or a main-thread critique pass that looks for regressions, edge cases, and missing issues.

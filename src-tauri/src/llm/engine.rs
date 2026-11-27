@@ -498,10 +498,8 @@ fn do_extract(
     // drift that came from a hard-coded type list here). The LFM2-specific
     // ChatML wrapper is preserved — `extraction_system_prompt()` only supplies
     // the system *content*; the `<|im_start|>` framing remains the model's
-    // template. Schema is identical to the previous inline prompt
-    // (entities[name,entity_type,description] + relations[source,target,
-    // relation_type,detail]), so the downstream `ExtractionResult` parse is
-    // unchanged.
+    // template. ExtractionResult still accepts outputs that omit the additive
+    // speaker endpoint mask, treating those endpoints as literal names.
     let system_prompt = crate::ontology::extraction_system_prompt();
 
     // LFM2 ChatML template. BOS (<|startoftext|>) is added by AddBos::Always.

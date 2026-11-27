@@ -4252,7 +4252,9 @@ fn approve_agent_proposal_impl(
             return Err(error.into());
         }
     };
-    use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+    use crate::graph::entities::{
+        ExtractedEntity, ExtractedRelation, ExtractionResult, SpeakerEndpointMask,
+    };
     // Decide what (if anything) to write to the graph for this proposal kind.
     // Questions now DEFAULT to the graph (a Question node linked from the
     // speaker), built locally with no LLM call so it can never rate-limit. The
@@ -4288,6 +4290,7 @@ fn approve_agent_proposal_impl(
                     target: q,
                     relation_type: "asks".to_string(),
                     detail: None,
+                    speaker_endpoint_mask: SpeakerEndpointMask::Source,
                 }],
             };
             (Some(ex), "graph_update")
@@ -4411,7 +4414,9 @@ fn add_question_to_graph_impl(
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<bool> {
-    use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+    use crate::graph::entities::{
+        ExtractedEntity, ExtractedRelation, ExtractionResult, SpeakerEndpointMask,
+    };
     let q = question_text_from_body(text.trim());
     if q.is_empty() {
         return Ok(false);
@@ -4439,6 +4444,7 @@ fn add_question_to_graph_impl(
             target: q,
             relation_type: "asks".to_string(),
             detail: None,
+            speaker_endpoint_mask: SpeakerEndpointMask::Source,
         }],
     };
 
@@ -7112,6 +7118,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                         &speech::ExtractionDeps {
                                             active_session_id: &session_id_handle,
                                             transcript_ledger: &transcript_ledger,
+                                            turn_speaker_timeline: None,
                                             expected_session_id: &expected_session_id,
                                             llm_engine: &llm_engine,
                                             api_client: &api_client,
@@ -14013,6 +14020,7 @@ mod tests {
                         target: "Acme".to_string(),
                         relation_type: "works_at".to_string(),
                         detail: None,
+                        speaker_endpoint_mask: Default::default(),
                     }],
                 },
                 1.0,
