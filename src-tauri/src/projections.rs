@@ -1851,6 +1851,37 @@ impl fmt::Debug for DebugProjectionOperation<'_> {
                 .field("id", id)
                 .field("after_id", after_id)
                 .finish(),
+            // Issue #255: block-level ops carry claim prose (`text` /
+            // `search` / `replace`) — redacted exactly like `UpsertNote`'s
+            // `title`/`body` above; the ids and (for upsert) the
+            // materializer-stamped timestamps are structural metadata.
+            ProjectionOperation::UpsertNoteBlock {
+                note_id,
+                block_id,
+                text: _,
+            } => f
+                .debug_struct("UpsertNoteBlock")
+                .field("note_id", note_id)
+                .field("block_id", block_id)
+                .field("text", &REDACTED_DEBUG_VALUE)
+                .finish(),
+            ProjectionOperation::InvalidateNoteBlock { note_id, block_id } => f
+                .debug_struct("InvalidateNoteBlock")
+                .field("note_id", note_id)
+                .field("block_id", block_id)
+                .finish(),
+            ProjectionOperation::ReplaceNoteText {
+                note_id,
+                block_id,
+                search: _,
+                replace: _,
+            } => f
+                .debug_struct("ReplaceNoteText")
+                .field("note_id", note_id)
+                .field("block_id", block_id)
+                .field("search", &REDACTED_DEBUG_VALUE)
+                .field("replace", &REDACTED_DEBUG_VALUE)
+                .finish(),
             ProjectionOperation::UpsertGraphNode {
                 id,
                 name: _,
@@ -2197,6 +2228,29 @@ pub enum ProjectionOperation {
 /// `MaterializedNote` JSON (which never carried a `blocks` key) and a
 /// post-#255 note with no block history (empty vec skipped) both
 /// deserialize byte-identically to their original shape.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct NoteBlock {
+    pub block_id: String,
+    /// Claim prose. Transcript-derived content — redacted by the manual
+    /// `Debug` impl below, never logged.
+    pub text: String,
+    #[serde(default)]
+    pub valid_from_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until_ms: Option<u64>,
+}
+
+impl fmt::Debug for NoteBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NoteBlock")
+            .field("block_id", &self.block_id)
+            .field("text", &REDACTED_DEBUG_VALUE)
+            .field("valid_from_ms", &self.valid_from_ms)
+            .field("valid_until_ms", &self.valid_until_ms)
+            .finish()
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct MaterializedNote {
     pub id: String,
@@ -6139,6 +6193,676 @@ mod tests {
             basis_currency_at_apply: None,
             created_at_ms: 1_700_000_000_300 + sequence,
         }
+    }
+
+    #[test]
+    fn upsert_note_block_appends_replaces_and_derives_body() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .expect("seed note");
+
+        // A block op on a missing note rejects the whole patch, loudly.
+        let missing = notes_patch_with_operations(
+            2,
+            vec![ProjectionOperation::UpsertNoteBlock {
+                note_id: "note-missing".to_string(),
+                block_id: "block-1".to_string(),
+                text: "never lands".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&missing, None),
+            Err(ProjectionApplyError::MissingNoteForOperation {
+                operation: "upsert_note_block",
+                note_id,
+            }) if note_id == "note-missing"
+        ));
+        assert_eq!(
+            notes.last_sequence, 1,
+            "rejected patch must not advance state"
+        );
+
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "Alice owns the launch plan.".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("first block");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    3,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-2".to_string(),
+                        text: "Launch is next week.".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("second block");
+
+        let note = &notes.notes[0];
+        assert_eq!(note.blocks.len(), 2);
+        assert_eq!(
+            note.body,
+            "Alice owns the launch plan.\n\nLaunch is next week."
+        );
+        assert_eq!(note.blocks[0].valid_from_ms, 1_700_000_000_302);
+        assert_eq!(note.blocks[0].valid_until_ms, None);
+        assert_eq!(
+            note.valid_from_ms, 1_700_000_000_101,
+            "seed UpsertNote stamp"
+        );
+
+        // Full-replace by block_id, regardless of the old block's text.
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    4,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "Alice owns the REVISED launch plan.".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("replace block-1");
+        assert_eq!(notes.notes[0].blocks.len(), 2);
+        assert_eq!(
+            notes.notes[0].body,
+            "Alice owns the REVISED launch plan.\n\nLaunch is next week."
+        );
+        assert_eq!(notes.notes[0].blocks[0].valid_from_ms, 1_700_000_000_304);
+        assert_eq!(notes.notes[0].updated_by_sequence, 4);
+    }
+
+    #[test]
+    fn upsert_note_resets_blocks_and_temporal_fields() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .expect("seed note");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "block claim".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("block");
+
+        // A legacy full-replace UpsertNote asserts the WHOLE record: block
+        // history resets and the asserted body wins.
+        notes
+            .apply_patch(
+                &notes_patch(3, "note-1", "Decision", "Fresh whole body."),
+                None,
+            )
+            .expect("legacy upsert over blocks");
+        assert!(notes.notes[0].blocks.is_empty());
+        assert_eq!(notes.notes[0].body, "Fresh whole body.");
+        assert_eq!(notes.notes[0].valid_from_ms, 1_700_000_000_103);
+        assert_eq!(notes.notes[0].valid_until_ms, None);
+    }
+
+    #[test]
+    fn replace_note_text_accepts_unique_anchor_and_rejects_everything_else() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .expect("seed note");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "Alice will demo on Friday.".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("block");
+
+        // Unique anchor: applied, literally, once.
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    3,
+                    vec![ProjectionOperation::ReplaceNoteText {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        search: "Friday".to_string(),
+                        replace: "Monday $&".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("unique anchor");
+        assert_eq!(
+            notes.notes[0].blocks[0].text,
+            "Alice will demo on Monday $&."
+        );
+        assert_eq!(notes.notes[0].body, "Alice will demo on Monday $&.");
+
+        // Missing anchor: rejected with the typed count, nothing applied.
+        let missing = notes_patch_with_operations(
+            4,
+            vec![
+                ProjectionOperation::UpsertNoteBlock {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-2".to_string(),
+                    text: "untouched".to_string(),
+                },
+                ProjectionOperation::ReplaceNoteText {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-1".to_string(),
+                    search: "Tuesday".to_string(),
+                    replace: "never".to_string(),
+                },
+            ],
+        );
+        assert!(matches!(
+            notes.apply_patch(&missing, None),
+            Err(ProjectionApplyError::InvalidNoteTextAnchor {
+                note_id,
+                block_id,
+                occurrences: 0,
+            }) if note_id == "note-1" && block_id == "block-1"
+        ));
+        assert_eq!(
+            notes.notes[0].blocks.len(),
+            1,
+            "all-or-nothing: no partial apply"
+        );
+
+        // Ambiguous anchor: same typed rejection with the observed count.
+        let ambiguous = notes_patch_with_operations(
+            4,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-1".to_string(),
+                block_id: "block-1".to_string(),
+                search: "demo".to_string(),
+                replace: "never".to_string(),
+            }],
+        );
+        // ("demo" is unique in this text; plant a real duplicate first.)
+        drop(ambiguous);
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    4,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "demo demo".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("plant duplicate text");
+        let ambiguous = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-1".to_string(),
+                block_id: "block-1".to_string(),
+                search: "demo".to_string(),
+                replace: "never".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&ambiguous, None),
+            Err(ProjectionApplyError::InvalidNoteTextAnchor { occurrences: 2, .. })
+        ));
+
+        // Empty anchor: rejected outright, never an implicit prefix-edit.
+        let empty = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-1".to_string(),
+                block_id: "block-1".to_string(),
+                search: String::new(),
+                replace: "never".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&empty, None),
+            Err(ProjectionApplyError::InvalidNoteTextAnchor { occurrences: 0, .. })
+        ));
+
+        // Missing / invalidated target block: typed missing-block rejection.
+        let missing_block = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-1".to_string(),
+                block_id: "block-missing".to_string(),
+                search: "demo".to_string(),
+                replace: "never".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&missing_block, None),
+            Err(ProjectionApplyError::MissingNoteBlockForOperation {
+                operation: "replace_note_text",
+                ..
+            })
+        ));
+
+        // Missing note: typed missing-note rejection.
+        let missing_note = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-missing".to_string(),
+                block_id: "block-1".to_string(),
+                search: "demo".to_string(),
+                replace: "never".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&missing_note, None),
+            Err(ProjectionApplyError::MissingNoteForOperation {
+                operation: "replace_note_text",
+                ..
+            })
+        ));
+        assert_eq!(notes.last_sequence, 4, "no rejected patch advanced state");
+    }
+
+    #[test]
+    fn invalidate_note_block_hides_from_active_body_but_retains_audit_trail() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .expect("seed note");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "superseded claim".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("block-1");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    3,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-2".to_string(),
+                        text: "live claim".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("block-2");
+
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    4,
+                    vec![ProjectionOperation::InvalidateNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("invalidate block-1");
+
+        // Hidden from the active derived body, retained in materialized state.
+        assert_eq!(notes.notes[0].body, "live claim");
+        assert_eq!(notes.notes[0].blocks.len(), 2);
+        assert_eq!(
+            notes.notes[0].blocks[0].valid_until_ms,
+            Some(1_700_000_000_304)
+        );
+        assert_eq!(notes.notes[0].blocks[1].valid_until_ms, None);
+
+        // Double-invalidate rejects loudly; ReplaceNoteText on the
+        // invalidated block rejects as a missing ACTIVE block.
+        let double = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::InvalidateNoteBlock {
+                note_id: "note-1".to_string(),
+                block_id: "block-1".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&double, None),
+            Err(ProjectionApplyError::MissingNoteBlockForOperation {
+                operation: "invalidate_note_block",
+                ..
+            })
+        ));
+        let patch_invalidated = notes_patch_with_operations(
+            5,
+            vec![ProjectionOperation::ReplaceNoteText {
+                note_id: "note-1".to_string(),
+                block_id: "block-1".to_string(),
+                search: "claim".to_string(),
+                replace: "never".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&patch_invalidated, None),
+            Err(ProjectionApplyError::MissingNoteBlockForOperation {
+                operation: "replace_note_text",
+                ..
+            })
+        ));
+
+        // Every active block invalidated: empty derived body, note retained.
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    5,
+                    vec![ProjectionOperation::InvalidateNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-2".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("invalidate block-2");
+        assert_eq!(notes.notes.len(), 1);
+        assert_eq!(notes.notes[0].body, "");
+        assert_eq!(notes.notes[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn invalidate_note_soft_invalidates_and_upsert_resurrects() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "First."), None)
+            .expect("seed note-1");
+        notes
+            .apply_patch(&notes_patch(2, "note-2", "Follow-up", "Second."), None)
+            .expect("seed note-2");
+
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    3,
+                    vec![ProjectionOperation::InvalidateNote {
+                        id: "note-1".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("soft-invalidate note-1");
+
+        // Soft: retained and stamped, not removed (DeleteNote is the hard one).
+        assert_eq!(notes.notes.len(), 2);
+        assert_eq!(notes.notes[0].id, "note-1");
+        assert_eq!(notes.notes[0].valid_until_ms, Some(1_700_000_000_303));
+        assert_eq!(notes.notes[1].valid_until_ms, None);
+
+        // Double-invalidate rejects loudly (note exists but is not active).
+        let double = notes_patch_with_operations(
+            4,
+            vec![ProjectionOperation::InvalidateNote {
+                id: "note-1".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&double, None),
+            Err(ProjectionApplyError::MissingNoteForOperation {
+                operation: "invalidate_note",
+                note_id,
+            }) if note_id == "note-1"
+        ));
+
+        // A missing note rejects too.
+        let missing = notes_patch_with_operations(
+            4,
+            vec![ProjectionOperation::InvalidateNote {
+                id: "note-missing".to_string(),
+            }],
+        );
+        assert!(matches!(
+            notes.apply_patch(&missing, None),
+            Err(ProjectionApplyError::MissingNoteForOperation { .. })
+        ));
+
+        // UpsertNote full-replaces the record: clears valid_until (resurrect).
+        notes
+            .apply_patch(&notes_patch(4, "note-1", "Decision", "Resurrected."), None)
+            .expect("resurrect note-1");
+        assert_eq!(notes.notes[0].valid_until_ms, None);
+        assert_eq!(notes.notes[0].body, "Resurrected.");
+        assert_eq!(notes.notes[0].valid_from_ms, 1_700_000_000_104);
+
+        // DeleteNote is still the hard removal.
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    5,
+                    vec![ProjectionOperation::DeleteNote {
+                        id: "note-1".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("hard delete note-1");
+        assert_eq!(
+            notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-2"]
+        );
+    }
+
+    #[test]
+    fn materialized_note_legacy_json_deserializes_and_roundtrips_cleanly() {
+        // Pre-#255 persisted snapshot: no `blocks` / `valid_from_ms` /
+        // `valid_until_ms` keys at all.
+        let legacy_json = serde_json::json!({
+            "id": "note-legacy",
+            "title": "Legacy",
+            "body": "Legacy body.",
+            "tags": ["legacy"],
+            "updated_by_sequence": 3,
+            "updated_at_ms": 1_700_000_000_000_u64,
+            "basis": {
+                "span_revisions": [],
+                "diarization_span_revisions": [],
+                "transcript_hash": "fnv1a64:abc",
+            },
+            "provenance": {
+                "provider": "openrouter",
+                "model": "m",
+                "prompt_id": "p",
+                "model_source": "requested",
+            },
+        });
+        let legacy: MaterializedNote =
+            serde_json::from_value(legacy_json.clone()).expect("legacy note deserializes");
+        assert!(legacy.blocks.is_empty());
+        assert_eq!(legacy.valid_from_ms, 0);
+        assert_eq!(legacy.valid_until_ms, None);
+
+        // Additive-field stability: `blocks`/`valid_until_ms` stay absent
+        // (empty/None) on a legacy record — only the basis's own
+        // `hash_version` (a pre-existing `ProjectionBasis` field, absent
+        // from this hand-written legacy JSON) is added on reserialize.
+        let reserialized = serde_json::to_value(&legacy).expect("reserialize legacy");
+        assert!(reserialized.get("blocks").is_none());
+        assert!(reserialized.get("valid_until_ms").is_none());
+        assert_eq!(
+            reserialized.get("valid_from_ms"),
+            Some(&serde_json::json!(0))
+        );
+
+        // Post-#255 round-trip: blocks + soft-invalidated note survive.
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .expect("seed note");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    2,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                        text: "block claim".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("block");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    3,
+                    vec![ProjectionOperation::UpsertNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-2".to_string(),
+                        text: "second claim".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("second block");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    4,
+                    vec![ProjectionOperation::InvalidateNoteBlock {
+                        note_id: "note-1".to_string(),
+                        block_id: "block-1".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("invalidate block");
+        notes
+            .apply_patch(
+                &notes_patch_with_operations(
+                    5,
+                    vec![ProjectionOperation::InvalidateNote {
+                        id: "note-1".to_string(),
+                    }],
+                ),
+                None,
+            )
+            .expect("soft-invalidate note");
+
+        let json = serde_json::to_string(&notes).expect("serialize materialized notes");
+        let replayed: MaterializedNotes =
+            serde_json::from_str(&json).expect("materialized notes round-trip");
+        assert_eq!(replayed, notes);
+        assert_eq!(replayed.notes[0].body, "second claim");
+        assert_eq!(replayed.notes[0].valid_until_ms, Some(1_700_000_000_305));
+    }
+
+    #[test]
+    fn block_operations_replay_deterministically_from_a_fresh_materialized_state() {
+        // JSONL replay parity: the same accepted patch log applied to a
+        // fresh `MaterializedNotes` reproduces the live state exactly —
+        // including the derived body after every block op.
+        let patches = vec![
+            notes_patch(1, "note-1", "Decision", "Whole body."),
+            notes_patch_with_operations(
+                2,
+                vec![ProjectionOperation::UpsertNoteBlock {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-1".to_string(),
+                    text: "first claim".to_string(),
+                }],
+            ),
+            notes_patch_with_operations(
+                3,
+                vec![ProjectionOperation::UpsertNoteBlock {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-2".to_string(),
+                    text: "typo claim".to_string(),
+                }],
+            ),
+            notes_patch_with_operations(
+                4,
+                vec![ProjectionOperation::ReplaceNoteText {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-2".to_string(),
+                    search: "typo".to_string(),
+                    replace: "corrected".to_string(),
+                }],
+            ),
+            notes_patch_with_operations(
+                5,
+                vec![ProjectionOperation::InvalidateNoteBlock {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-1".to_string(),
+                }],
+            ),
+        ];
+
+        let mut live = MaterializedNotes::new("session-1");
+        for patch in &patches {
+            live.apply_patch(patch, None).expect("live apply");
+        }
+        assert_eq!(live.notes[0].body, "corrected claim");
+
+        // Replay through the persisted JSONL shape: every patch serialized
+        // and deserialized (the canonical log format) before re-applying.
+        let mut replayed = MaterializedNotes::new("session-1");
+        for patch in &patches {
+            let json = serde_json::to_string(patch).expect("serialize patch");
+            let patch: ProjectionPatch = serde_json::from_str(&json).expect("deserialize patch");
+            replayed.apply_patch(&patch, None).expect("replay apply");
+        }
+        assert_eq!(replayed, live);
+    }
+
+    #[test]
+    fn block_operation_debug_output_redacts_block_text_search_and_replace() {
+        let patch = notes_patch_with_operations(
+            1,
+            vec![
+                ProjectionOperation::UpsertNoteBlock {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-1".to_string(),
+                    text: "SENSITIVE BLOCK TEXT".to_string(),
+                },
+                ProjectionOperation::ReplaceNoteText {
+                    note_id: "note-1".to_string(),
+                    block_id: "block-1".to_string(),
+                    search: "SENSITIVE ANCHOR".to_string(),
+                    replace: "SENSITIVE REPLACEMENT".to_string(),
+                },
+            ],
+        );
+
+        let debug = format!("{patch:?}");
+        assert!(!debug.contains("SENSITIVE BLOCK TEXT"));
+        assert!(!debug.contains("SENSITIVE ANCHOR"));
+        assert!(!debug.contains("SENSITIVE REPLACEMENT"));
+        assert!(debug.contains("UpsertNoteBlock"));
+        assert!(debug.contains("ReplaceNoteText"));
+        assert!(debug.contains("note-1"));
     }
 
     #[test]

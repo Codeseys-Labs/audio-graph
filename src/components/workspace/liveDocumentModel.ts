@@ -49,7 +49,12 @@ export interface LiveDocumentSourceNote {
   title: string;
   body: string;
   tags: string[];
+  /** Issue #255: `Some(ms)`/number = soft-invalidated — excluded from the
+   * outline (hidden-but-auditable in materialized state). */
   heading_level?: number | null;
+  /** Issue #255: `Some(ms)`/number = soft-invalidated — excluded from the
+   * outline (hidden-but-auditable in materialized state). */
+  valid_until_ms?: number | null;
   updated_by_sequence: number;
 }
 

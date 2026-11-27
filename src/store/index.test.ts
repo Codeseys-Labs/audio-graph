@@ -2039,6 +2039,422 @@ describe("AudioGraphStore", () => {
     ).toEqual(["note-a", "note-c"]);
   });
 
+  // ----- Issue #255 (ADR-0025 §2): diff-based note patching parity ------
+
+  it("applies upsert_note_block operations and derives the body from active blocks", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Whole body.",
+          tags: [],
+        },
+      ]),
+    );
+
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+          text: "first claim",
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-2",
+          text: "second claim",
+        },
+      ]),
+    );
+
+    let notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].body).toBe("first claim\n\nsecond claim");
+    expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "block-1",
+        text: "first claim",
+        valid_from_ms: 1_700_000_000_002,
+        valid_until_ms: null,
+      },
+      {
+        block_id: "block-2",
+        text: "second claim",
+        valid_from_ms: 1_700_000_000_002,
+        valid_until_ms: null,
+      },
+    ]);
+    expect(notes?.notes[0].updated_by_sequence).toBe(2);
+
+    // Full-replace by block_id (an upsert of an existing block).
+    store.addProjectionPatch(
+      noteProjectionPatch(3, [
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+          text: "revised claim",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks).toHaveLength(2);
+    expect(notes?.notes[0].body).toBe("revised claim\n\nsecond claim");
+
+    // A block op on a missing/invalidated note is skipped (reducer parity
+    // with the Rust materializer's loud rejection — an emitted event cannot
+    // be un-emitted, so nothing is applied for that op).
+    store.addProjectionPatch(
+      noteProjectionPatch(4, [
+        {
+          type: "upsert_note_block",
+          note_id: "note-missing",
+          block_id: "block-9",
+          text: "never lands",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes).toHaveLength(1);
+    expect(notes?.notes[0].blocks).toHaveLength(2);
+    expect(notes?.last_sequence).toBe(4);
+  });
+
+  it("applies replace_note_text only on a unique non-empty anchor", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Whole body.",
+          tags: [],
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+          text: "Alice will demo on Friday.",
+        },
+      ]),
+    );
+
+    // Unique anchor: applied literally, once; body re-derived.
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-1",
+          search: "Friday",
+          replace: "Monday",
+        },
+      ]),
+    );
+    let notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+      "Alice will demo on Monday.",
+    );
+    expect(notes?.notes[0].body).toBe("Alice will demo on Monday.");
+
+    // Missing anchor: skipped, nothing applied — mirrors the Rust
+    // materializer's rejection; the reducer never applies a blind edit.
+    store.addProjectionPatch(
+      noteProjectionPatch(3, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-1",
+          search: "Tuesday",
+          replace: "never",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+      "Alice will demo on Monday.",
+    );
+
+    // Empty anchor: skipped outright (never an implicit prefix-edit).
+    store.addProjectionPatch(
+      noteProjectionPatch(4, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-1",
+          search: "",
+          replace: "never",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks?.[0]?.text).toBe(
+      "Alice will demo on Monday.",
+    );
+
+    // Ambiguous anchor (two occurrences): skipped, never an arbitrary pick.
+    store.addProjectionPatch(
+      noteProjectionPatch(5, [
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-2",
+          text: "demo demo",
+        },
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-2",
+          search: "demo",
+          replace: "never",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks?.[1]?.text).toBe("demo demo");
+    expect(notes?.notes[0].body).toBe(
+      "Alice will demo on Monday.\n\ndemo demo",
+    );
+
+    // Missing/invalidated block: skipped.
+    store.addProjectionPatch(
+      noteProjectionPatch(6, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-missing",
+          search: "demo",
+          replace: "never",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].blocks).toHaveLength(2);
+  });
+
+  it("hides invalidated blocks from the body but retains the audit trail", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Whole body.",
+          tags: [],
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+          text: "superseded claim",
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-2",
+          text: "live claim",
+        },
+      ]),
+    );
+
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "invalidate_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+        },
+      ]),
+    );
+
+    const notes = useAudioGraphStore.getState().materializedNotes;
+    // Hidden from the active body, retained in materialized state.
+    expect(notes?.notes[0].body).toBe("live claim");
+    expect(notes?.notes[0].blocks).toEqual([
+      {
+        block_id: "block-1",
+        text: "superseded claim",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: 1_700_000_000_002,
+      },
+      {
+        block_id: "block-2",
+        text: "live claim",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
+    ]);
+
+    // Double-invalidate / invalidated-block target: skipped.
+    store.addProjectionPatch(
+      noteProjectionPatch(3, [
+        {
+          type: "invalidate_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+        },
+      ]),
+    );
+    expect(
+      useAudioGraphStore.getState().materializedNotes?.notes[0].blocks?.[0]
+        ?.valid_until_ms,
+    ).toBe(1_700_000_000_002);
+  });
+
+  it("replaces literally (no $-pattern expansion) and never mutates the prior snapshot", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Whole body.",
+          tags: [],
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-1",
+          text: "price is 10 dollars",
+        },
+      ]),
+    );
+    const before = useAudioGraphStore.getState().materializedNotes;
+    const beforeNote = before?.notes[0];
+    const beforeBlocks = beforeNote?.blocks?.map((block) => ({ ...block }));
+    const beforeBody = beforeNote?.body;
+    expect(beforeBlocks).toEqual([
+      {
+        block_id: "block-1",
+        text: "price is 10 dollars",
+        valid_from_ms: 1_700_000_000_001,
+        valid_until_ms: null,
+      },
+    ]);
+
+    // A replacement containing `String.prototype.replace` $-patterns must
+    // land LITERALLY (Rust `str::replacen` parity): `$&` must not expand to
+    // the matched anchor, `$$` must not collapse to `$`.
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "replace_note_text",
+          note_id: "note-a",
+          block_id: "block-1",
+          search: "10",
+          replace: "$& dollars",
+        },
+        {
+          type: "upsert_note_block",
+          note_id: "note-a",
+          block_id: "block-2",
+          text: "second claim",
+        },
+        {
+          type: "invalidate_note_block",
+          note_id: "note-a",
+          block_id: "block-2",
+        },
+      ]),
+    );
+
+    const after = useAudioGraphStore.getState().materializedNotes;
+    expect(after?.notes[0].blocks?.[0]?.text).toBe(
+      "price is $& dollars dollars",
+    );
+    expect(after?.notes[0].body).toBe("price is $& dollars dollars");
+
+    // Rust-parity immutability: applying a patch must never touch the prior
+    // `materializedNotes` snapshot (Rust clones the whole state before
+    // mutating). Without the per-note/per-block clone in
+    // `applyProjectionNotesPatch`, the ops above would have pushed into and
+    // restamped the `before` snapshot's own block rows.
+    expect(before?.last_sequence).toBe(1);
+    expect(beforeNote?.updated_by_sequence).toBe(1);
+    expect(beforeNote?.body).toBe(beforeBody);
+    expect(beforeNote?.blocks).toEqual(beforeBlocks);
+    expect(beforeNote?.blocks?.[0]?.text).toBe("price is 10 dollars");
+    expect(beforeNote?.blocks?.[0]?.valid_until_ms).toBeNull();
+    expect(beforeNote?.blocks?.[0]?.valid_from_ms).toBe(1_700_000_000_001);
+  });
+
+  it("soft-invalidates notes via invalidate_note and resurrects via upsert_note", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "First.",
+          tags: [],
+        },
+      ]),
+    );
+
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "invalidate_note",
+          id: "note-a",
+        },
+      ]),
+    );
+
+    // Soft: retained with valid_until_ms stamped, not removed.
+    let notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes).toHaveLength(1);
+    expect(notes?.notes[0].valid_until_ms).toBe(1_700_000_000_002);
+
+    // Double-invalidate: skipped.
+    store.addProjectionPatch(
+      noteProjectionPatch(3, [
+        {
+          type: "invalidate_note",
+          id: "note-a",
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].valid_until_ms).toBe(1_700_000_000_002);
+
+    // UpsertNote full-replaces the record: resurrects (clears valid_until).
+    store.addProjectionPatch(
+      noteProjectionPatch(4, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "Decision",
+          body: "Resurrected.",
+          tags: [],
+        },
+      ]),
+    );
+    notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.notes[0].valid_until_ms).toBeNull();
+    expect(notes?.notes[0].body).toBe("Resurrected.");
+    expect(notes?.notes[0].blocks).toEqual([]);
+    expect(notes?.notes[0].valid_from_ms).toBe(1_700_000_000_004);
+
+    // delete_note stays the hard removal.
+    store.addProjectionPatch(
+      noteProjectionPatch(5, [
+        {
+          type: "delete_note",
+          id: "note-a",
+        },
+      ]),
+    );
+    expect(useAudioGraphStore.getState().materializedNotes?.notes).toEqual([]);
+  });
+
   it("ignores stale notes projection patch sequences while retaining event history", () => {
     const store = useAudioGraphStore.getState();
     store.addProjectionPatch(
