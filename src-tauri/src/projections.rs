@@ -6327,7 +6327,10 @@ mod tests {
     fn upsert_note_reseeds_the_reserved_body_block() {
         let mut notes = MaterializedNotes::new("session-1");
         notes
-            .apply_patch(&notes_patch(1, "note-1", "Decision", "Whole body."), None)
+            .apply_patch(
+                &notes_patch(1, "note-1", "Decision", "First whole body."),
+                None,
+            )
             .expect("seed note");
         notes
             .apply_patch(
@@ -6347,6 +6350,36 @@ mod tests {
         // history resets to a fresh seed of the asserted body.
         notes
             .apply_patch(
+                &notes_patch(3, "note-1", "Decision", "Fresh whole body."),
+                None,
+            )
+            .expect("legacy upsert over blocks");
+        let note = &notes.notes[0];
+        assert_eq!(note.blocks.len(), 1);
+        assert_eq!(note.blocks[0].block_id, MaterializedNote::BODY_BLOCK_ID);
+        assert_eq!(note.blocks[0].text, "Fresh whole body.");
+        assert_eq!(note.blocks[0].valid_from_ms, 1_700_000_000_103);
+        assert_eq!(note.body, "Fresh whole body.");
+        assert_eq!(note.valid_from_ms, 1_700_000_000_103);
+        assert_eq!(note.valid_until_ms, None);
+    }
+
+    /// The issue's headline acceptance: a correction to a note that only
+    /// ever received `UpsertNote`s (every pre-#255 note) can be a minimal
+    /// anchored `ReplaceNoteText` against the reserved `body` block — not a
+    /// full-body replace.
+    #[test]
+    fn replace_note_text_anchors_into_a_pure_upsert_note_via_the_reserved_body_block() {
+        let mut notes = MaterializedNotes::new("session-1");
+        notes
+            .apply_patch(
+                &notes_patch(1, "note-1", "Decision", "Alice will demo on Friday."),
+                None,
+            )
+            .expect("seed note");
+
+        notes
+            .apply_patch(
                 &notes_patch_with_operations(
                     2,
                     vec![ProjectionOperation::ReplaceNoteText {
@@ -6358,11 +6391,16 @@ mod tests {
                 ),
                 None,
             )
-            .expect("legacy upsert over blocks");
-        assert!(notes.notes[0].blocks.is_empty());
-        assert_eq!(notes.notes[0].body, "Fresh whole body.");
-        assert_eq!(notes.notes[0].valid_from_ms, 1_700_000_000_103);
-        assert_eq!(notes.notes[0].valid_until_ms, None);
+            .expect("anchored correction on a legacy note");
+
+        let note = &notes.notes[0];
+        assert_eq!(note.blocks.len(), 1);
+        assert_eq!(note.blocks[0].text, "Alice will demo on Monday.");
+        assert_eq!(note.body, "Alice will demo on Monday.");
+        assert_eq!(
+            note.blocks[0].valid_from_ms, 1_700_000_000_101,
+            "seed stamp"
+        );
     }
 
     #[test]
@@ -6583,7 +6621,11 @@ mod tests {
         assert_eq!(notes.notes[0].body, "Whole body.\n\nlive claim");
         assert_eq!(notes.notes[0].blocks.len(), 3);
         assert_eq!(
-            notes.notes[0].blocks[0].valid_until_ms,
+            notes.notes[0].blocks[0].valid_until_ms, None,
+            "seed block stays active"
+        );
+        assert_eq!(
+            notes.notes[0].blocks[1].valid_until_ms,
             Some(1_700_000_000_304)
         );
         assert_eq!(notes.notes[0].blocks[2].valid_until_ms, None);
