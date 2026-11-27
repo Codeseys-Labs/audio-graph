@@ -18,6 +18,11 @@ use rsac::{
     AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget, SampleFormat,
     get_device_enumerator,
 };
+// rsac 0.5.0 `hotplug-recovery`: Windows/Linux only — the recovery symbols
+// (and every call site below) are compiled out on macOS, where rsac withholds
+// the feature (rsac ADR-0021) and `with_auto_recovery` would fail preflight.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use rsac::{AutoRecoveryConfig, RecoveryEvent};
 use tauri::AppHandle;
 
 use crate::audio::pipeline::AudioPipelineInput;
@@ -142,6 +147,217 @@ fn advance_drop_counter(previous: &mut u64, current: u64) -> u64 {
     let delta = current.saturating_sub(*previous);
     *previous = current;
     delta
+}
+
+// ---------------------------------------------------------------------------
+// Hotplug recovery (rsac 0.5.0 `hotplug-recovery`) — Windows/Linux only
+// ---------------------------------------------------------------------------
+//
+// rsac 0.5.0 can supervise `SystemDefault` capture: a default-device change or
+// stream invalidation reopens the stream — delivered buffers keep one
+// monotonic session timeline and carry the generation of the backend stream
+// that produced them — instead of ending the session with a fatal
+// `StreamEnded`. The feature is withheld on macOS (rsac ADR-0021:
+// `with_auto_recovery` fails `preflight()`/`build()` there with
+// `PlatformNotSupported`), so `Cargo.toml` links it for `feat_linux` /
+// `feat_windows` builds only and every symbol below is compiled only where
+// those features exist.
+
+/// Whether this capture opts into rsac's auto-recovery: `SystemDefault`
+/// targets only. rsac's supervisor follows the *default* device, so any other
+/// target (`Device`, `Application`, …) stays unsupervised (and passing a
+/// recovery config for one is a `preflight` error in rsac anyway).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn system_default_auto_recovery_applies(target: &CaptureTarget) -> bool {
+    matches!(target, CaptureTarget::SystemDefault)
+}
+
+/// Edge-triggered stream-generation tracking for a supervised read loop.
+///
+/// rsac stamps every delivered buffer with the generation of the backend
+/// stream that produced it (restarting at 0 per session). Buffers arrive
+/// continuously, so the read loop observes one generation per buffer and
+/// surfaces only *changes* — a reopen is reported exactly once, not once per
+/// 5 ms buffer.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct GenerationTracker {
+    last: Option<u64>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+impl GenerationTracker {
+    /// Records one observed generation.
+    ///
+    /// Returns `Some((previous, current))` on the first observation and on
+    /// every change, `None` while the generation is unchanged.
+    fn observe(&mut self, generation: u64) -> Option<(Option<u64>, u64)> {
+        if self.last == Some(generation) {
+            return None;
+        }
+        Some((self.last.replace(generation), generation))
+    }
+}
+
+/// Flat, ownable copy of one rsac [`RecoveryEvent`].
+///
+/// rsac's event enum is `#[non_exhaustive]` on the enum *and* on every
+/// struct-like variant, so out-of-crate code can neither construct events
+/// (ruling them out of unit tests) nor match them exhaustively. This local
+/// enum is the pure core of the mapping: [`classify_recovery_event`]
+/// flattens an event into it (wildcard arm for future variants), and
+/// [`recovery_signal_report`] — fully unit-testable — decides the log level,
+/// telemetry kind, and message.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoverySignal {
+    /// The system default device changed; the supervisor may reopen.
+    DefaultChanged,
+    /// The backend stream died; a replacement is being arranged.
+    DeviceInvalidated {
+        /// Diagnostic description of the invalidation.
+        reason: String,
+    },
+    /// Another reopen attempt was scheduled.
+    RetryScheduled {
+        /// One-based number of the scheduled attempt.
+        attempt: u32,
+    },
+    /// A replacement stream was published and is delivering.
+    Recovered,
+    /// Recovery gave up; the session will end with a fatal error.
+    Exhausted {
+        /// Attempts spent before recovery ended.
+        attempts: u32,
+        /// Diagnostic description of the terminal failure.
+        reason: String,
+    },
+    /// A future rsac event variant this build does not know.
+    Unknown,
+}
+
+/// Flattens one rsac [`RecoveryEvent`] into a [`RecoverySignal`].
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn classify_recovery_event(event: &RecoveryEvent) -> RecoverySignal {
+    match event {
+        RecoveryEvent::DefaultChanged { .. } => RecoverySignal::DefaultChanged,
+        RecoveryEvent::DeviceInvalidated { reason, .. } => RecoverySignal::DeviceInvalidated {
+            reason: reason.clone(),
+        },
+        RecoveryEvent::RetryScheduled { attempt, .. } => {
+            RecoverySignal::RetryScheduled { attempt: *attempt }
+        }
+        RecoveryEvent::Recovered { .. } => RecoverySignal::Recovered,
+        RecoveryEvent::Exhausted {
+            attempts, reason, ..
+        } => RecoverySignal::Exhausted {
+            attempts: *attempts,
+            reason: reason.clone(),
+        },
+        // `RecoveryEvent` is `#[non_exhaustive]`: unknown future variants
+        // degrade to a benign, logged unknown rather than a build break.
+        _ => RecoverySignal::Unknown,
+    }
+}
+
+/// Log level + telemetry classification of one recovery signal, with the
+/// human-readable log line. Pure std — the unit tests assert the mapping.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Debug)]
+struct RecoverySignalReport {
+    level: sentry::Level,
+    telemetry_kind: &'static str,
+    message: String,
+}
+
+/// Whether a signal leaves the session running (i.e. is not terminal).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn recovery_signal_recoverable(signal: &RecoverySignal) -> bool {
+    !matches!(signal, RecoverySignal::Exhausted { .. })
+}
+
+/// Maps a [`RecoverySignal`] to its log level, telemetry kind, and message.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn recovery_signal_report(signal: &RecoverySignal) -> RecoverySignalReport {
+    let (level, telemetry_kind, message) = match signal {
+        RecoverySignal::DefaultChanged => (
+            sentry::Level::Info,
+            "recovery_default_changed",
+            "system default capture device changed; supervisor will reopen the stream".to_string(),
+        ),
+        RecoverySignal::DeviceInvalidated { reason } => (
+            sentry::Level::Warning,
+            "recovery_device_invalidated",
+            format!("capture stream invalidated ({reason}); reopening on the default device"),
+        ),
+        RecoverySignal::RetryScheduled { attempt } => (
+            sentry::Level::Warning,
+            "recovery_retry_scheduled",
+            format!("default device not recovered yet; reopen attempt {attempt} scheduled"),
+        ),
+        RecoverySignal::Recovered => (
+            sentry::Level::Info,
+            "recovery_recovered",
+            "replacement stream opened; capture resumed on the current default device".to_string(),
+        ),
+        RecoverySignal::Exhausted { attempts, reason } => (
+            sentry::Level::Error,
+            "recovery_exhausted",
+            format!("auto-recovery gave up after {attempts} attempt(s): {reason}"),
+        ),
+        RecoverySignal::Unknown => (
+            sentry::Level::Warning,
+            "recovery_unknown",
+            "unrecognized rsac recovery event (newer variant); treated as a hiccup".to_string(),
+        ),
+    };
+    RecoverySignalReport {
+        level,
+        telemetry_kind,
+        message,
+    }
+}
+
+/// Handles one supervisor event: log line + anonymous telemetry.
+///
+/// Never touches the `AudioCapture` handle. The rsac CHANGELOG warns that an
+/// event handler must not call back into the capture (and must not hold a
+/// lock across such a call); this only logs and emits a `DiagEvent`, which
+/// cannot re-enter the capture.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn handle_recovery_event(source_id: &str, event: RecoveryEvent) {
+    let signal = classify_recovery_event(&event);
+    let report = recovery_signal_report(&signal);
+    match report.level {
+        sentry::Level::Error => log::error!("[capture-{source_id}] {}", report.message),
+        sentry::Level::Warning => log::warn!("[capture-{source_id}] {}", report.message),
+        _ => log::info!("[capture-{source_id}] {}", report.message),
+    }
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: "audio.capture.recovery_event",
+        category: crate::analytics::Category::Audio,
+        level: report.level,
+        provider: None,
+        kind: Some(report.telemetry_kind),
+        http_status: None,
+        recoverable: Some(recovery_signal_recoverable(&signal)),
+    });
+}
+
+/// Drains every queued supervisor event without blocking.
+///
+/// Called from the read loop (buffer and no-data paths) — `try_recv` only, so
+/// a quiet queue is one cheap check and the read path never stalls. rsac's
+/// queue is bounded (32) and drops the *newest* events on overflow, so a slow
+/// drain degrades telemetry, never capture.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn drain_recovery_events(recovery_rx: Option<&Receiver<RecoveryEvent>>, source_id: &str) {
+    let Some(rx) = recovery_rx else {
+        return;
+    };
+    while let Ok(event) = rx.try_recv() {
+        handle_recovery_event(source_id, event);
+    }
 }
 
 #[cfg(test)]
@@ -1383,13 +1599,27 @@ impl AudioCaptureManager {
                 }
             };
 
-        let mut capture = match AudioCaptureBuilder::new()
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let supervised = system_default_auto_recovery_applies(&target);
+        let builder = AudioCaptureBuilder::new()
             .with_target(target)
             .sample_rate(cap_sr)
             .channels(cap_ch)
-            .sample_format(cap_fmt)
-            .build()
-        {
+            .sample_format(cap_fmt);
+        // rsac 0.5.0 `hotplug-recovery`: supervise SystemDefault capture so a
+        // default-device change or stream invalidation reopens the stream
+        // instead of ending the session. Windows/Linux only — rsac withholds
+        // the feature on macOS (ADR-0021), where `with_auto_recovery` would
+        // fail `preflight()` with `PlatformNotSupported`; this re-bind exists
+        // only where Cargo.toml links the feature, so a macOS build never
+        // calls it.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let builder = if supervised {
+            builder.with_auto_recovery(AutoRecoveryConfig::default())
+        } else {
+            builder
+        };
+        let mut capture = match builder.build() {
             Ok(c) => c,
             Err(e) => {
                 let error = format!("Failed to build AudioCapture: {e}");
@@ -1442,6 +1672,26 @@ impl AudioCaptureManager {
             );
             return false;
         }
+
+        // 2b. `hotplug-recovery` (Windows/Linux only): subscribe to the
+        //     supervisor's event feed. Exactly one subscriber per rsac
+        //     handle; the read loop drains it (try_recv only — never a
+        //     callback into `capture`, per the rsac CHANGELOG lock rule).
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let recovery_rx = if supervised {
+            match capture.subscribe_recovery_events() {
+                Ok(rx) => Some(rx),
+                // Never fatal: the capture is supervised regardless, and the
+                // generation tracking in the read loop still surfaces any
+                // reopen that delivers audio.
+                Err(e) => {
+                    log::warn!("[capture-{source_id}] Failed to subscribe to recovery events: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // 3. Subscribe to push-based audio delivery via the *error-carrying*
         //    channel. `subscribe()` forwards only `Ok(buffer)` and drops the
@@ -1526,6 +1776,14 @@ impl AudioCaptureManager {
         // at this cadence; this just keeps the hot path tight.
         let mut poll_counter: u32 = 0;
 
+        // Stream-generation tracking for `hotplug-recovery` (Windows/Linux
+        // only): rsac stamps each delivered buffer with the generation of the
+        // backend stream that produced it. A supervised SystemDefault session
+        // reopens on device changes, so the generation can bump mid-session;
+        // an unsupervised capture never leaves generation 0.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let mut generation_tracker = GenerationTracker::default();
+
         // Short send timeout: if the pipeline consumer stalls (e.g. a panicked
         // downstream stage that hasn't dropped the receiver yet), a *blocking*
         // `pipeline_tx.send` on the bounded(64) channel would wedge this thread
@@ -1541,6 +1799,32 @@ impl AudioCaptureManager {
         while !stop_signal.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(buffer)) => {
+                    // `hotplug-recovery` (Windows/Linux only): surface a replacement
+                    // stream exactly once per reopen (the generation stamped on this
+                    // buffer moved), then drain queued supervisor events. The session
+                    // keeps running — this is the recovery working, not a fault.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    {
+                        if let Some((Some(previous), current)) =
+                            generation_tracker.observe(buffer.stream_generation())
+                        {
+                            log::warn!(
+                                "[capture-{source_id}] capture stream generation changed \
+                         {previous} -> {current}: a reopened default-device stream \
+                         (hotplug recovery) is delivering audio",
+                            );
+                            crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+                                name: "audio.capture.generation_change",
+                                category: crate::analytics::Category::Audio,
+                                level: sentry::Level::Warning,
+                                provider: None,
+                                kind: Some("capture_generation_change"),
+                                http_status: None,
+                                recoverable: Some(true),
+                            });
+                        }
+                        drain_recovery_events(recovery_rx.as_ref(), &source_id);
+                    }
                     let chunk = AudioChunk {
                         source_id: Arc::clone(&source_id_arc),
                         data: buffer.data().to_vec(),
@@ -1679,11 +1963,18 @@ impl AudioCaptureManager {
                             source_id,
                             e
                         );
+                        #[cfg(any(target_os = "windows", target_os = "linux"))]
+                        drain_recovery_events(recovery_rx.as_ref(), &source_id);
                         continue;
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No data yet — loop back and check stop_signal.
+                    // Recovery reopens can outlast several 100 ms poll ticks
+                    // (backoff / device wait): drain here too so transitions
+                    // are logged even while no audio flows.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    drain_recovery_events(recovery_rx.as_ref(), &source_id);
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2324,5 +2615,117 @@ mod fatal_branch_recoverability_tests {
             !recoverable,
             "a fatal stream death must be reported recoverable:false (#63)"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod hotplug_recovery_tests {
+    //! Deterministic, pure-std coverage for the rsac 0.5.0 `hotplug-recovery`
+    //! wiring: the SystemDefault-only opt-in, the read-loop generation
+    //! tracking, and the event→(level, telemetry kind) mapping. No hardware
+    //! and no backend — rsac's `RecoveryEvent`/`RecoveryState` are
+    //! `#[non_exhaustive]`, so the mapping is exercised through the local
+    //! `RecoverySignal` copy rather than constructed rsac values.
+    use super::*;
+    use rsac::{ApplicationId, DeviceId};
+
+    #[test]
+    fn only_system_default_opts_into_auto_recovery() {
+        assert!(system_default_auto_recovery_applies(
+            &CaptureTarget::SystemDefault
+        ));
+        assert!(!system_default_auto_recovery_applies(
+            &CaptureTarget::Device(DeviceId("hw:0,0".into()))
+        ));
+        assert!(!system_default_auto_recovery_applies(
+            &CaptureTarget::Application(ApplicationId("4242".into()))
+        ));
+    }
+
+    #[test]
+    fn generation_tracker_reports_onset_then_only_changes() {
+        let mut tracker = GenerationTracker::default();
+
+        // The first observation establishes the baseline, not a change.
+        assert_eq!(tracker.observe(0), Some((None, 0)));
+        assert_eq!(tracker.observe(0), None);
+
+        // A reopen bumps the generation: reported once, with the previous.
+        assert_eq!(tracker.observe(1), Some((Some(0), 1)));
+        assert_eq!(tracker.observe(1), None);
+
+        // A further reopen, and a session restart that renumbers from 0.
+        assert_eq!(tracker.observe(2), Some((Some(1), 2)));
+        assert_eq!(tracker.observe(0), Some((Some(2), 0)));
+    }
+
+    #[test]
+    fn recovery_signals_map_to_levels_and_telemetry_kinds() {
+        let cases = [
+            (
+                RecoverySignal::DefaultChanged,
+                sentry::Level::Info,
+                "recovery_default_changed",
+            ),
+            (
+                RecoverySignal::DeviceInvalidated {
+                    reason: "device unplugged".into(),
+                },
+                sentry::Level::Warning,
+                "recovery_device_invalidated",
+            ),
+            (
+                RecoverySignal::RetryScheduled { attempt: 3 },
+                sentry::Level::Warning,
+                "recovery_retry_scheduled",
+            ),
+            (
+                RecoverySignal::Recovered,
+                sentry::Level::Info,
+                "recovery_recovered",
+            ),
+            (
+                RecoverySignal::Exhausted {
+                    attempts: 5,
+                    reason: "no device reappeared".into(),
+                },
+                sentry::Level::Error,
+                "recovery_exhausted",
+            ),
+        ];
+        for (signal, level, kind) in cases {
+            let report = recovery_signal_report(&signal);
+            assert_eq!(report.level, level, "log level for {signal:?}");
+            assert_eq!(report.telemetry_kind, kind, "telemetry kind for {signal:?}");
+            assert_eq!(
+                recovery_signal_recoverable(&signal),
+                !matches!(signal, RecoverySignal::Exhausted { .. }),
+                "recoverability for {signal:?}"
+            );
+            assert!(!report.message.is_empty(), "log line for {signal:?}");
+        }
+    }
+
+    #[test]
+    fn recovery_log_lines_carry_attempt_and_reason_details() {
+        let retry = recovery_signal_report(&RecoverySignal::RetryScheduled { attempt: 4 });
+        assert!(retry.message.contains('4'), "attempt in {retry:?}");
+
+        let exhausted = recovery_signal_report(&RecoverySignal::Exhausted {
+            attempts: 5,
+            reason: "device never reappeared".into(),
+        });
+        assert!(exhausted.message.contains('5'), "attempts in {exhausted:?}");
+        assert!(
+            exhausted.message.contains("device never reappeared"),
+            "reason in {exhausted:?}"
+        );
+    }
+
+    #[test]
+    fn draining_without_a_subscription_is_a_no_op() {
+        // A non-supervised target (or a failed subscribe) drains nothing.
+        drain_recovery_events(None, "system-default");
     }
 }

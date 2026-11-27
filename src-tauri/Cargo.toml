@@ -103,11 +103,15 @@ wdio-e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 # the committed lockfile is the build/release source of truth. Contributors
 # developing both repositories may use an explicit, untracked local [patch]
 # override; a sibling checkout is never selected implicitly.
+# rsac 0.5.0 `hotplug-recovery` (auto-recovery of SystemDefault capture):
+# enabled ONLY for Windows and Linux — rsac withholds the feature on macOS
+# (ADR-0021), where `with_auto_recovery` fails preflight/build with
+# `PlatformNotSupported`. Keep `feat_macos` below free of it.
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_linux"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_linux", "hotplug-recovery"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_windows"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_windows", "hotplug-recovery"] }
 # SID-native owner-only ACL hardening (seed 403d). Direct dep so `fs_util` can
 # resolve the current process token SID and call SetNamedSecurityInfoW without
 # shelling out to `icacls`/`%USERNAME%`. Pinned to 0.62.2 — the exact version
