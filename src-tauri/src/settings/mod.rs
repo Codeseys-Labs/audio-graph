@@ -1282,6 +1282,8 @@ impl Default for AgentAutoAnswerSettings {
 /// cross-cutting cloud-content-egress gate — see [`PrivacyMode`].
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AppSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_display_name: Option<String>,
     #[serde(default)]
     pub asr_provider: AsrProvider,
     #[serde(default = "default_whisper_model")]
@@ -1399,6 +1401,7 @@ fn default_whisper_model() -> String {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            self_display_name: None,
             asr_provider: AsrProvider::default(),
             whisper_model: default_whisper_model(),
             llm_provider: LlmProvider::default(),

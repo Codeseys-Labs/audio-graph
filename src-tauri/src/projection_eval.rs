@@ -1309,6 +1309,8 @@ mod tests {
         received_at_ms: u64,
     ) -> DiarizationSpanRevision {
         DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: span_id.to_string(),
             provider: "deepgram".to_string(),
             timeline_id: source_id

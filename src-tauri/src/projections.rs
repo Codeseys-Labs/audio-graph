@@ -630,6 +630,12 @@ pub struct DiarizationSpanRevision {
     /// Human-facing label for the resolved speaker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::identity::SpeakerIdentityStamp>,
+    /// Original engine sequence once relabels have consumed revisions on this span.
+    /// This is not a second timeline clock; it only fences stale provider updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_revision_number: Option<u64>,
     /// Raw provider-supplied speaker identifier. Retained for provenance only;
     /// it is never the durable span identity and may be remapped across
     /// revisions.
@@ -704,6 +710,8 @@ impl From<DiarizationSpanRevisionPayload> for DiarizationSpanRevision {
             source_id: payload.source_id,
             speaker_id: payload.speaker_id,
             speaker_label: payload.speaker_label,
+            identity: payload.identity,
+            provider_revision_number: None,
             // The live payload's provider attribution is carried via the
             // provider/source fields; raw provider speaker ids are not part of
             // the live payload yet, so durable provenance starts unset.
@@ -736,6 +744,7 @@ impl From<DiarizationSpanRevisionPayload> for DiarizationSpanRevision {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SpeakerLabelRemap {
     pub span_id: String,
+    pub scope: crate::identity::relabel::RemapScope,
     pub basis_segment_ids: Vec<String>,
     pub superseded_label: String,
     pub canonical_label: String,
@@ -760,14 +769,24 @@ impl fmt::Debug for SpeakerLabelRemap {
 /// same `span_id`), stale revisions are rejected, and a same-revision payload
 /// that disagrees with the accepted one is rejected as a conflict. The ledger
 /// never derives identity from a provider speaker id.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpeakerTimeline {
     pub schema_version: u32,
     pub session_id: String,
     pub accepted_event_count: u64,
     pub latest_spans: Vec<DiarizationSpanRevision>,
+    #[serde(skip)]
+    forward_bindings: crate::identity::ForwardBindings,
 }
 
+impl PartialEq for SpeakerTimeline {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.session_id == other.session_id
+            && self.accepted_event_count == other.accepted_event_count
+            && self.latest_spans == other.latest_spans
+    }
+}
 impl SpeakerTimeline {
     pub const SCHEMA_VERSION: u32 = 1;
 
@@ -777,6 +796,7 @@ impl SpeakerTimeline {
             session_id: session_id.into(),
             accepted_event_count: 0,
             latest_spans: Vec::new(),
+            forward_bindings: Default::default(),
         }
     }
 
@@ -791,48 +811,183 @@ impl SpeakerTimeline {
         Ok(timeline)
     }
 
+    pub fn resolve_forward_label(
+        &self,
+        provider: &str,
+        lane: &str,
+        speaker_id: &str,
+    ) -> Option<(&str, &crate::identity::SpeakerIdentityStamp)> {
+        self.forward_bindings
+            .resolve(self, provider, lane, speaker_id)
+    }
     pub fn apply_event(
         &mut self,
         event: DiarizationSpanRevision,
     ) -> Result<Option<SpeakerLabelRemap>, SpeakerTimelineError> {
-        match self
-            .latest_spans
-            .iter_mut()
-            .find(|span| span.span_id == event.span_id)
-        {
-            Some(current) if event.revision_number < current.revision_number => {
-                Err(SpeakerTimelineError::StaleDiarizationRevision {
-                    span_id: event.span_id,
-                    current_revision: current.revision_number,
-                    incoming_revision: event.revision_number,
-                })
-            }
-            Some(current)
-                if event.revision_number == current.revision_number && event != *current =>
-            {
-                Err(SpeakerTimelineError::ConflictingDiarizationRevision {
-                    span_id: event.span_id,
-                    revision_number: event.revision_number,
-                })
-            }
-            Some(current) => {
-                // Newer (or identical) revision: the later attribution replaces
-                // the earlier one, collapsing provisional -> stable remaps.
-                let remap = Self::detect_label_remap(current.speaker_label.as_deref(), &event);
-                *current = event;
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(remap)
-            }
-            None => {
-                self.latest_spans.push(event);
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(None)
-            }
-        }
+        let pos = self.event_position(&event)?;
+        Ok(self.apply_validated_event(pos, event))
     }
 
+    pub(crate) fn event_position(
+        &self,
+        event: &DiarizationSpanRevision,
+    ) -> Result<Option<usize>, SpeakerTimelineError> {
+        let Some((i, current)) = self
+            .latest_spans
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.span_id == event.span_id)
+        else {
+            return Ok(None);
+        };
+        if event.revision_number < current.revision_number {
+            return Err(SpeakerTimelineError::StaleDiarizationRevision {
+                span_id: event.span_id.clone(),
+                current_revision: current.revision_number,
+                incoming_revision: event.revision_number,
+            });
+        }
+        if event.revision_number == current.revision_number && event != current {
+            return Err(SpeakerTimelineError::ConflictingDiarizationRevision {
+                span_id: event.span_id.clone(),
+                revision_number: event.revision_number,
+            });
+        }
+        Ok(Some(i))
+    }
+    pub(crate) fn apply_validated_event(
+        &mut self,
+        pos: Option<usize>,
+        event: DiarizationSpanRevision,
+    ) -> Option<SpeakerLabelRemap> {
+        if pos.is_some() || event.identity.as_ref().is_some_and(|s| s.batch.is_some()) {
+            self.forward_bindings.invalidate();
+        }
+        let remap = if let Some(i) = pos {
+            let current = &mut self.latest_spans[i];
+            let remap = Self::detect_label_remap(current.speaker_label.as_deref(), &event);
+            *current = event;
+            remap
+        } else {
+            self.latest_spans.push(event);
+            None
+        };
+        self.accepted_event_count += 1;
+        self.sort_latest_spans();
+        remap
+    }
+
+    pub fn apply_batch(
+        &mut self,
+        batch: &crate::identity::relabel::SpeakerRelabelBatch,
+    ) -> Result<Vec<SpeakerLabelRemap>, String> {
+        self.admit_batch(batch, || Ok(()))
+    }
+
+    /// Persistence runs after the last fallible validation and before the first mutation.
+    pub(crate) fn admit_batch(
+        &mut self,
+        batch: &crate::identity::relabel::SpeakerRelabelBatch,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Vec<SpeakerLabelRemap>, String> {
+        batch.validate_header()?;
+        let by_id: std::collections::HashMap<_, _> = self
+            .latest_spans
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.span_id.as_str(), i))
+            .collect();
+        // Retries must agree on every member. The writer independently verifies the
+        // record commitment (including decision records) before acknowledging a retry.
+        if batch.revisions.iter().all(|s| {
+            by_id
+                .get(s.span_id.as_str())
+                .is_some_and(|&i| self.latest_spans[i] == *s)
+        }) {
+            persist()?;
+            return Ok(Vec::new());
+        }
+        let mut positions = Vec::with_capacity(batch.revisions.len());
+        let mut remaps = BTreeMap::new();
+        for next in &batch.revisions {
+            let &pos = by_id
+                .get(next.span_id.as_str())
+                .ok_or("unknown relabel span")?;
+            let old = &self.latest_spans[pos];
+            let stamp = next.identity.as_ref().expect("validated header");
+            if old
+                .identity
+                .as_ref()
+                .is_some_and(|s| s.binding_revision >= stamp.binding_revision)
+                || (!matches!(
+                    batch.kind,
+                    crate::identity::relabel::RelabelKind::Merge
+                        | crate::identity::relabel::RelabelKind::Split
+                ) && !stamp.cluster_ref.contains(old))
+            {
+                return Err("binding revision or cluster mismatch".into());
+            }
+            if old.revision_number.checked_add(1) != Some(next.revision_number)
+                || next.supersedes.as_deref()
+                    != Some(&format!("{}@rev{}", old.span_id, old.revision_number))
+                || old.provider != next.provider
+                || old.timeline_id != next.timeline_id
+                || old.source_id != next.source_id
+                || old.speaker_id != next.speaker_id
+                || next.provider_revision_number
+                    != Some(old.provider_revision_number.unwrap_or(old.revision_number))
+                || old.start_time != next.start_time
+                || old.end_time != next.end_time
+                || old.stability != next.stability
+                || old.basis_asr_span_ids != next.basis_asr_span_ids
+                || old.basis_transcript_segment_ids != next.basis_transcript_segment_ids
+                || old.channel != next.channel
+                || old.is_final != next.is_final
+                || old.confidence != next.confidence
+                || old.provider_speaker_id != next.provider_speaker_id
+                || old.capture_latency_ms != next.capture_latency_ms
+                || old.asr_latency_ms != next.asr_latency_ms
+                || old.raw_event_ref != next.raw_event_ref
+            {
+                return Err("invalid relabel revision or changed span provenance".into());
+            }
+            if let Some(mut remap) = Self::detect_label_remap(
+                old.speaker_label.as_deref().or(old.speaker_id.as_deref()),
+                next,
+            ) {
+                remap.scope = batch.scope;
+                remaps
+                    .entry((
+                        remap.superseded_label.clone(),
+                        remap.canonical_label.clone(),
+                    ))
+                    .and_modify(|r: &mut SpeakerLabelRemap| {
+                        r.basis_segment_ids.append(&mut remap.basis_segment_ids)
+                    })
+                    .or_insert(remap);
+            }
+            positions.push(pos);
+        }
+        let count = self
+            .accepted_event_count
+            .checked_add(positions.len() as u64)
+            .ok_or("speaker event count exhausted")?;
+        persist()?;
+        self.forward_bindings.invalidate();
+        for (pos, span) in positions.into_iter().zip(&batch.revisions) {
+            self.latest_spans[pos] = span.clone();
+        }
+        self.accepted_event_count = count;
+        self.sort_latest_spans();
+        Ok(remaps
+            .into_values()
+            .map(|mut r| {
+                r.basis_segment_ids.sort_unstable();
+                r.basis_segment_ids.dedup();
+                r
+            })
+            .collect())
+    }
     fn detect_label_remap(
         old_label: Option<&str>,
         event: &DiarizationSpanRevision,
@@ -856,6 +1011,7 @@ impl SpeakerTimeline {
         basis_segment_ids.sort_unstable();
         basis_segment_ids.dedup();
         Some(SpeakerLabelRemap {
+            scope: crate::identity::relabel::RemapScope::Segments,
             span_id: event.span_id.clone(),
             basis_segment_ids,
             superseded_label: old.to_string(),
@@ -865,15 +1021,28 @@ impl SpeakerTimeline {
 
     /// Distinct resolved speaker ids currently attributed across the timeline.
     pub fn speaker_count(&self) -> usize {
-        let mut speakers = std::collections::BTreeSet::new();
-        for span in &self.latest_spans {
-            if let Some(speaker_id) = &span.speaker_id
-                && !speaker_id.trim().is_empty()
-            {
-                speakers.insert(speaker_id.as_str());
-            }
-        }
-        speakers.len()
+        self.latest_spans
+            .iter()
+            .filter_map(|span| {
+                if let Some(stamp) = &span.identity {
+                    let c = &stamp.cluster_ref;
+                    Some((
+                        c.provider.as_str(),
+                        c.timeline_id.as_str(),
+                        c.speaker_id.as_str(),
+                    ))
+                } else {
+                    Some((
+                        span.provider.as_str(),
+                        span.timeline_id.as_str(),
+                        span.speaker_id
+                            .as_deref()
+                            .filter(|id| !id.trim().is_empty())?,
+                    ))
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 
     /// Provider-neutral basis spans for the current diarization timeline.
@@ -3395,6 +3564,7 @@ impl<'a> LedgerHistory<'a> {
     /// `(start_time, end_time, span_id)` order exactly.
     fn materialize_speaker_timeline(&self) -> SpeakerTimeline {
         let mut timeline = SpeakerTimeline {
+            forward_bindings: Default::default(),
             schema_version: SpeakerTimeline::SCHEMA_VERSION,
             session_id: self.session_id.to_string(),
             accepted_event_count: self.speaker_accepted,
@@ -3435,6 +3605,7 @@ impl<'a> LedgerHistory<'a> {
             accepted += 1;
         }
         let mut timeline = SpeakerTimeline {
+            forward_bindings: Default::default(),
             schema_version: SpeakerTimeline::SCHEMA_VERSION,
             session_id: session_id.to_string(),
             accepted_event_count: accepted,
@@ -3479,6 +3650,7 @@ impl<'a> LedgerHistory<'a> {
             }
         }
         let mut timeline = SpeakerTimeline {
+            forward_bindings: Default::default(),
             schema_version: SpeakerTimeline::SCHEMA_VERSION,
             session_id: session_id.to_string(),
             accepted_event_count: accepted,
@@ -9748,6 +9920,7 @@ mod tests {
     ) -> DiarizationSpanRevisionPayload {
         let is_final = matches!(stability, DiarizationSpanStability::Final);
         DiarizationSpanRevisionPayload {
+            identity: None,
             span_id: span_id.to_string(),
             provider: provider.to_string(),
             timeline_id: "session".to_string(),

@@ -63,7 +63,6 @@ pub struct AudioChunk {
 // ---------------------------------------------------------------------------
 
 /// Handle to a running audio capture thread.
-#[allow(dead_code)] // M8: source_info is stored for future introspection (e.g., active-capture queries)
 struct CaptureHandle {
     thread: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
@@ -1239,6 +1238,20 @@ impl AudioCaptureManager {
         self.sources.len()
     }
 
+    /// Live source provenance for ephemeral speaker suggestions; never infer input kind from an ID.
+    pub(crate) fn speaker_channel_kinds(&self) -> HashMap<String, AudioChannelProvenanceKind> {
+        self.sources
+            .iter()
+            .filter(|(_, h)| !h.finished.load(Ordering::Acquire))
+            .map(|(id, h)| {
+                let kind = source_channel_provenance_kind(
+                    &h.source_info.source_type,
+                    h.source_info.device_kind,
+                );
+                (id.clone(), kind)
+            })
+            .collect()
+    }
     /// Returns the list of currently active source IDs.
     ///
     /// A handle whose capture thread has already exited (clean stop, fatal

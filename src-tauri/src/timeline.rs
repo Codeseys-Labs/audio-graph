@@ -69,6 +69,8 @@ pub struct TimelineEntry {
     pub speaker_id: Option<String>,
     /// Resolved human-facing speaker label (redacted in `Debug`).
     pub speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_provenance: Option<SpeakerProvenanceView>,
     /// Utterance text (redacted in `Debug`).
     pub text: String,
     /// Frontend-facing ids of the live graph edges this utterance produced
@@ -78,6 +80,14 @@ pub struct TimelineEntry {
     pub related_edge_ids: Vec<String>,
 }
 
+#[derive(Clone, PartialEq, serde::Serialize)]
+pub struct SpeakerProvenanceView {
+    pub label_source: crate::identity::LabelSource,
+    pub state: crate::identity::BindingState,
+    /// Ingestion-time attribution superseded by this view, if different.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_label: Option<String>,
+}
 impl fmt::Debug for TimelineEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `text` is raw transcript content and `speaker_label` is a human-facing
@@ -139,11 +149,22 @@ pub fn build_session_timeline(
 
             // Speaker: latest-wins diarization attribution overrides the inline
             // ASR label; an unattributed span keeps its inline speaker.
-            let (speaker_id, speaker_label) = keys
-                .iter()
-                .find_map(|key| attribution.get(key.as_str()))
-                .map(|span| (span.speaker_id.clone(), span.speaker_label.clone()))
+            let attribution = keys.iter().find_map(|key| attribution.get(key.as_str()));
+            let (speaker_id, speaker_label) = attribution
+                .map(|s| (s.speaker_id.clone(), s.speaker_label.clone()))
                 .unwrap_or_else(|| (event.speaker_id.clone(), event.speaker_label.clone()));
+            let speaker_provenance =
+                attribution
+                    .and_then(|s| s.identity.as_ref())
+                    .map(|stamp| SpeakerProvenanceView {
+                        state: stamp.state,
+                        label_source: stamp.label_source,
+                        previous_label: event
+                            .speaker_label
+                            .as_ref()
+                            .filter(|label| Some(*label) != speaker_label.as_ref())
+                            .cloned(),
+                    });
 
             // Forward "relates to" links: live edges grouped by source segment.
             let mut related_edge_ids: Vec<String> = Vec::new();
@@ -166,6 +187,7 @@ pub fn build_session_timeline(
                 turn_id: event.turn_id.clone(),
                 speaker_id,
                 speaker_label,
+                speaker_provenance,
                 text: event.text.clone(),
                 related_edge_ids,
             }
@@ -308,6 +330,7 @@ mod tests {
     ) -> DiarizationSpanRevision {
         let is_final = matches!(stability, DiarizationSpanStability::Final);
         DiarizationSpanRevision::from(DiarizationSpanRevisionPayload {
+            identity: None,
             span_id: span_id.to_string(),
             provider: "local_clustering".to_string(),
             timeline_id: "session".to_string(),

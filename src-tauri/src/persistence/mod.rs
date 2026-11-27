@@ -36,6 +36,8 @@ mod canonical_crash_harness;
 pub mod canonical_durability;
 pub mod canonical_log;
 pub(crate) mod canonical_reader;
+pub(crate) mod speaker_log;
+pub(crate) const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
 pub mod data_movement;
 pub mod io;
 pub mod session_artifact_manifest;
@@ -924,10 +926,24 @@ impl FileMemoryRepository {
         .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn append_speaker_relabel_batch(
+        &self,
+        session_id: &str,
+        batch: &crate::identity::relabel::SpeakerRelabelBatch,
+    ) -> Result<(), String> {
+        speaker_log::append(
+            &self.diarization_events_path(session_id)?,
+            session_id,
+            speaker_log::SpeakerWrite::RelabelBatch(batch),
+        )
+    }
     pub(crate) fn load_speaker_revision_stream(
         &self,
         session_id: &str,
-    ) -> Result<canonical_reader::StrictCanonicalRead<DiarizationSpanRevision>, String> {
+    ) -> Result<
+        canonical_reader::StrictCanonicalRead<speaker_log::CompatibleSpeakerRevisionRecord>,
+        String,
+    > {
         canonical_reader::load_speaker_revisions(
             &self.resolve_diarization_events_path(session_id)?,
             session_id,
@@ -1164,6 +1180,14 @@ impl FileMemoryRepository {
             "Diarization span revision event log",
             self.diarization_events_path(session_id)?,
         );
+        for path in speaker_log::legacy_quarantines(&self.diarization_events_path(session_id)?)? {
+            push_unique_file_artifact(
+                &mut artifacts,
+                SessionArtifactKind::DiarizationEvents,
+                "Quarantined speaker log tail",
+                path,
+            );
+        }
         push_unique_file_artifact(
             &mut artifacts,
             SessionArtifactKind::ProjectionEvents,
@@ -1417,10 +1441,10 @@ impl LocalMemoryRepository for FileMemoryRepository {
         session_id: &str,
         revision: &DiarizationSpanRevision,
     ) -> Result<(), String> {
-        append_jsonl(
-            revision,
+        speaker_log::append(
             &self.diarization_events_path(session_id)?,
-            "diarization span revision",
+            session_id,
+            speaker_log::SpeakerWrite::SpanRevision { revision },
         )
     }
 
@@ -1428,8 +1452,10 @@ impl LocalMemoryRepository for FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<Vec<DiarizationSpanRevision>, String> {
-        self.load_speaker_revision_stream(session_id)
-            .map(canonical_reader::StrictCanonicalRead::into_payloads)
+        Ok(self
+            .load_speaker_revision_stream(session_id)?
+            .speaker_history(session_id)?
+            .unwrap_or_default())
     }
 
     fn replay_projection_state(
@@ -1439,16 +1465,9 @@ impl LocalMemoryRepository for FileMemoryRepository {
         let transcript_events = self
             .load_transcript_event_stream(session_id)?
             .into_payloads();
-        let speaker_events = match self.load_speaker_revision_stream(session_id)? {
-            canonical_reader::StrictCanonicalRead::Missing => None,
-            canonical_reader::StrictCanonicalRead::Present(snapshot) => Some(
-                snapshot
-                    .records
-                    .into_iter()
-                    .map(|record| record.payload)
-                    .collect(),
-            ),
-        };
+        let speaker_events = self
+            .load_speaker_revision_stream(session_id)?
+            .speaker_history(session_id)?;
         let projection_patches = self
             .load_projection_patch_stream(session_id)?
             .into_payloads();
@@ -2926,10 +2945,23 @@ pub fn load_projection_events(session_id: &str) -> Result<Vec<ProjectionPatch>, 
         .map(canonical_reader::StrictCanonicalRead::into_payloads)
 }
 
+pub(crate) fn speaker_timeline_at(
+    path: &std::path::Path,
+    session_id: &str,
+) -> Result<SpeakerTimeline, String> {
+    let rows = canonical_reader::load_speaker_revisions(path, session_id)
+        .map_err(|e| e.to_string())?
+        .speaker_history(session_id)?
+        .unwrap_or_default();
+    SpeakerTimeline::replay(session_id, rows).map_err(|e| format!("speaker replay: {e:?}"))
+}
 /// Load immutable diarization span revision events for a session.
 pub(crate) fn load_speaker_revision_stream(
     session_id: &str,
-) -> Result<canonical_reader::StrictCanonicalRead<DiarizationSpanRevision>, String> {
+) -> Result<
+    canonical_reader::StrictCanonicalRead<speaker_log::CompatibleSpeakerRevisionRecord>,
+    String,
+> {
     let path = crate::user_data::resolve_diarization_events_path(session_id)?;
     canonical_reader::load_speaker_revisions(&path, session_id).map_err(|error| error.to_string())
 }
@@ -2938,8 +2970,9 @@ pub(crate) fn load_speaker_revision_stream(
 pub fn load_diarization_span_revisions(
     session_id: &str,
 ) -> Result<Vec<DiarizationSpanRevision>, String> {
-    load_speaker_revision_stream(session_id)
-        .map(canonical_reader::StrictCanonicalRead::into_payloads)
+    Ok(load_speaker_revision_stream(session_id)?
+        .speaker_history(session_id)?
+        .unwrap_or_default())
 }
 
 /// Load the session's data-movement ledger events in append order
@@ -3705,6 +3738,8 @@ mod local_memory_repository_tests {
         received_at_ms: u64,
     ) -> DiarizationSpanRevision {
         DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: span_id.into(),
             provider: "fixture-diarizer".into(),
             timeline_id: "session".into(),
