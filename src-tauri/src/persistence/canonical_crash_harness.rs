@@ -60,11 +60,14 @@ mod tests {
         CanonicalLogSnapshot, CanonicalRecoveryDescriptor, CanonicalRecoveryOutcome,
         CanonicalRecoveryTransaction, CanonicalTailRecovery, load_canonical_stream,
     };
+    #[cfg(unix)]
     use crate::persistence::session_artifact_manifest::{
-        ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass,
-        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestCasOutcome,
-        ManifestLoadOutcome, ManifestTransition, ManifestTransitionState, SessionArtifactEntry,
-        SessionArtifactKind, SessionArtifactManifestStore, SessionArtifactManifestV1, Sha256Digest,
+        ArtifactAvailability, ArtifactPrivacyClass, ArtifactUnavailableReason, ManifestCasOutcome,
+        ManifestTransition, SessionArtifactEntry, SessionArtifactKind, SessionArtifactManifestV1,
+    };
+    use crate::persistence::session_artifact_manifest::{
+        ArtifactContentIdentity, ManagedArtifactIdentity, ManifestLoadOutcome,
+        ManifestTransitionState, SessionArtifactManifestStore, Sha256Digest,
     };
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -88,6 +91,7 @@ mod tests {
     const QUARANTINE_IDENTITY: &str = "recovery/events.recovery.bin";
     const SOURCE_PREFIX: &[u8] = b"{\"value\":1}\n";
     const SOURCE_TAIL: &[u8] = b"private incomplete tail";
+    #[cfg(unix)]
     const SOURCE_FULL: &[u8] = b"{\"value\":1}\nprivate incomplete tail";
     const FIRST_CREATE_BYTES: &[u8] = b"first-create-proof";
     const CONTINUE_FILE: &str = ".audio-graph-b77b-continue";
@@ -390,7 +394,7 @@ mod tests {
             };
             let detail: &'static str = match &observed {
                 ProbedFilesystem::Observed(_) => "fsutil-ok",
-                ProbedFilesystem::Unavailable(reason) => *reason,
+                ProbedFilesystem::Unavailable(reason) => reason,
             };
             let detail = detail.to_owned();
             FixtureFilesystemEvidence {
@@ -468,11 +472,12 @@ mod tests {
         fixture_contract_is_qualified(path, context) == FixtureContract::Qualified
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn macos_fixture_is_qualified(_path: &Path, _context: &str) -> bool {
         true
     }
 
+    #[cfg(unix)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ObservedManifestPhase {
         SeedCompleted,
@@ -480,6 +485,7 @@ mod tests {
         RecoveryCompleted,
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     struct ExpectedResidual {
         phase: ObservedManifestPhase,
@@ -489,12 +495,14 @@ mod tests {
         quarantine: Option<&'static [u8]>,
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     struct RecoveryCase {
         checkpoint: &'static str,
         residual: ExpectedResidual,
     }
 
+    #[cfg(unix)]
     const RECOVERY_CASES: &[RecoveryCase] = &[
         RecoveryCase {
             checkpoint: "quarantine_create_before",
@@ -718,6 +726,7 @@ mod tests {
         },
     ];
 
+    #[cfg(unix)]
     const FIRST_CREATE_CUTS: &[&str] = &[
         "first_create_file_sync_before",
         "first_create_file_sync_after",
@@ -971,6 +980,7 @@ mod tests {
         .expect("construct recovery descriptor")
     }
 
+    #[cfg(unix)]
     fn setup_recovery_fixture(root: &Path) {
         fs::create_dir_all(root.join("streams")).expect("create stream fixture directory");
         fs::create_dir_all(root.join("recovery")).expect("create recovery fixture directory");
@@ -1046,12 +1056,14 @@ mod tests {
         emit_handshake("second_retry_already_completed");
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     struct ObservedFile {
         length: u64,
         sha256: String,
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     struct RecoveryObservation {
         phase: ObservedManifestPhase,
@@ -1061,6 +1073,7 @@ mod tests {
         quarantine: Option<ObservedFile>,
     }
 
+    #[cfg(unix)]
     fn observe_file(path: &Path) -> Option<ObservedFile> {
         match fs::read(path) {
             Ok(bytes) => Some(ObservedFile {
@@ -1072,6 +1085,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn observe_recovery(root: &Path) -> RecoveryObservation {
         let store = SessionArtifactManifestStore::new(root);
         let ManifestLoadOutcome::Present(manifest) = store.load().expect("load manifest evidence")
@@ -1103,6 +1117,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn assert_file_residual(
         cut: &str,
         label: &str,
@@ -1128,6 +1143,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn assert_expected_residual(case: RecoveryCase, observed: &RecoveryObservation) {
         assert_eq!(
             observed.phase, case.residual.phase,
@@ -1159,6 +1175,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn optional_file_summary(file: Option<&ObservedFile>) -> String {
         file.map_or_else(
             || "absent".to_owned(),

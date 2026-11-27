@@ -1430,16 +1430,20 @@ fn historical_inventory_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckedSessionOpenError, SessionSemanticsAdvanceError, SessionSemanticsArtifact,
-        SessionSemanticsCorruption, SessionSemanticsVersion, admitted_session_semantics_floor,
-        checked_session_open, validate_artifact_semantics,
+        CheckedSessionOpenError, SessionSemanticsArtifact, SessionSemanticsCorruption,
+        SessionSemanticsVersion, checked_session_open, validate_artifact_semantics,
     };
+    #[cfg(unix)]
+    use super::{SessionSemanticsAdvanceError, admitted_session_semantics_floor};
     use crate::persistence::session_artifact_manifest::{
         ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass,
-        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestCasOutcome, ManifestStoreError,
-        ManifestTransition, ManifestTransitionState, SessionArtifactEntry, SessionArtifactKind,
+        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestStoreError, ManifestTransition,
+        ManifestTransitionState, SessionArtifactEntry, SessionArtifactKind,
         SessionArtifactManifestStore, SessionArtifactManifestV1, Sha256Digest,
-        V2SessionProvenanceError,
+    };
+    #[cfg(unix)]
+    use crate::persistence::session_artifact_manifest::{
+        ManifestCasOutcome, V2SessionProvenanceError,
     };
 
     fn identity(value: &str) -> ManagedArtifactIdentity {
@@ -1724,25 +1728,34 @@ mod guarded_admission_tests {
     use super::{
         AdmittedSessionFloor, GuardedSessionOpenError, HISTORICAL_ORIGINAL_AUDIO_IDENTITY,
         HistoricalBootstrapError, HistoricalOriginalAudio, ObservedManagedArtifact,
-        SessionControlPlaneExportError, SessionControlPlaneRetirement, SessionFloorEvidence,
-        SessionSemanticsAdmissionError, SessionSemanticsVersion, admit_session_semantics_v1_to_v2,
-        admitted_session_semantics_floor, export_session_control_plane, guarded_session_open,
-        historical_session_bootstrap_candidate, historical_session_bootstrap_from_live_inventory,
-        open_session_for_content, retire_observed_session_control_plane,
+        SessionFloorEvidence, SessionSemanticsVersion, historical_session_bootstrap_candidate,
+        historical_session_bootstrap_from_live_inventory, open_session_for_content,
         session_control_plane_paths, store_coordination_path,
     };
+    #[cfg(unix)]
+    use super::{
+        SessionControlPlaneExportError, SessionControlPlaneRetirement,
+        SessionSemanticsAdmissionError, admit_session_semantics_v1_to_v2,
+        admitted_session_semantics_floor, export_session_control_plane, guarded_session_open,
+        retire_observed_session_control_plane,
+    };
+    #[cfg(unix)]
     use crate::persistence::canonical_durability::{
         CanonicalDurabilityRejection, CanonicalPlatform,
     };
     use crate::persistence::session_artifact_manifest::{
         ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass,
-        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestCasOutcome,
-        ManifestCasRejection, ManifestLoadOutcome, ManifestStoreError, ManifestTransition,
-        ManifestTransitionState, ManifestValidationError, SessionArtifactEntry,
-        SessionArtifactKind, SessionArtifactManifestStore, SessionArtifactManifestV1,
-        SessionSemanticsTransitionProofV1, Sha256Digest,
+        ArtifactUnavailableReason, ManagedArtifactIdentity, ManifestValidationError,
+        SessionArtifactKind, SessionArtifactManifestStore, SessionArtifactManifestV1, Sha256Digest,
+    };
+    #[cfg(unix)]
+    use crate::persistence::session_artifact_manifest::{
+        ManifestCasOutcome, ManifestCasRejection, ManifestLoadOutcome, ManifestStoreError,
+        ManifestTransition, ManifestTransitionState, SessionArtifactEntry,
+        SessionSemanticsTransitionProofV1,
     };
     use sha2::{Digest as _, Sha256};
+    #[cfg(unix)]
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
 
@@ -1766,10 +1779,12 @@ mod guarded_admission_tests {
         ManagedArtifactIdentity::new(value).expect("managed identity")
     }
 
+    #[cfg(unix)]
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
     }
 
+    #[cfg(unix)]
     fn v2_candidate(idempotency_id: &str) -> SessionArtifactManifestV1 {
         let mut candidate = SessionArtifactManifestV1::candidate(
             SESSION,
@@ -1899,6 +1914,7 @@ mod guarded_admission_tests {
         std::fs::write(path, bytes).expect("fixture bytes");
     }
 
+    #[cfg(unix)]
     fn v1_candidate(idempotency_id: &str) -> SessionArtifactManifestV1 {
         SessionArtifactManifestV1::candidate(
             SESSION,
@@ -1922,6 +1938,7 @@ mod guarded_admission_tests {
 
     /// Hand-install one persisted manifest at a Session's derived control
     /// identity, for stores whose platform cannot mutate the namespace.
+    #[cfg(unix)]
     fn persist_manifest(root: &Path, session_id: &str, mut manifest: SessionArtifactManifestV1) {
         manifest.generation = 1;
         let paths = session_control_plane_paths(root, session_id).expect("control paths");
@@ -1933,6 +1950,7 @@ mod guarded_admission_tests {
 
     /// A Session advanced to a durable V2 floor, with its write transaction
     /// released so the exclusive guard is free.
+    #[cfg(unix)]
     fn advanced_v2_session(label: &str) -> (PathBuf, SessionArtifactManifestStore, Vec<u8>) {
         let root = root(label);
         let store = SessionArtifactManifestStore::qualified_for_test_session(&root, SESSION)
