@@ -161,14 +161,14 @@ jobs:
             || { echo "::error::no openrouter strict-pass marker in openrouter.log — 0-tests-matched or a credential precondition-skip may be masquerading as green"; status=1; }
           exit "$status"
 
-      # Docs/Seeds-scoped gate (f3e3): the scanner's allowlist is deliberately
+      # Docs-scoped gate (f3e3): the scanner's allowlist is deliberately
       # narrow (see scripts/check-docs-secret-hygiene.mjs's comment on why a
-      # broad docs/ or .seeds/ exemption would defeat audio-graph-de28) and it
+      # broad docs/ or docs/history/seeds/ exemption would defeat audio-graph-de28) and it
       # accepts no path argument, so it is run here UNMODIFIED over its fixed
-      # scanRoots (docs/.seeds/README.md/AGENTS.md) — this covers any narrative
-      # written back into Seeds/docs about this smoke, not the smoke evidence
+      # scanRoots (docs/README.md/AGENTS.md, which includes docs/history/seeds/) — this covers
+      # any narrative written into docs about this smoke, not the smoke evidence
       # artifact itself (that is the separate step below).
-      - name: Secret-hygiene scan (docs/Seeds narrative)
+      - name: Secret-hygiene scan (docs narrative)
         if: always()
         working-directory: audio-graph
         run: bun scripts/check-docs-secret-hygiene.mjs

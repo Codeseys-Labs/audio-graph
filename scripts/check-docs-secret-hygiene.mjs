@@ -12,7 +12,7 @@ const unknownArgs = args.filter((arg) => !["--fixture-self-test", "--help", "-h"
 if (help) {
   console.log(`Usage: bun scripts/check-docs-secret-hygiene.mjs [--fixture-self-test]
 
-Scans docs and Seeds text for provider-shaped API keys and live credential
+Scans docs, archived Seeds history, and agent/README text for provider-shaped API keys and live credential
 presence claims. Findings are redacted and cause a nonzero exit.
 
 The fixture self-test runs against in-memory samples and exits 0 only if
@@ -25,7 +25,7 @@ if (unknownArgs.length > 0) {
   process.exit(2);
 }
 
-const scanRoots = ["docs", ".seeds", "README.md", "AGENTS.md"];
+const scanRoots = ["docs", "README.md", "AGENTS.md"];
 const textExtensions = new Set([
   ".jsonl",
   ".md",
@@ -110,7 +110,7 @@ const secretRedactions = [
 // - Keep the scanner self-contained so future CI use does not rely on hidden state.
 // - Allow only explicit redaction/test fixtures, not prose docs that claim a real
 //   local credentials file exists or show provider-shaped example tokens.
-// - Path allowlists should stay narrow and named; broad docs/ or .seeds/
+// - Path allowlists should stay narrow and named; broad docs/ or docs/history/seeds/
 //   exemptions would defeat audio-graph-de28.
 const allowlist = [
   {
