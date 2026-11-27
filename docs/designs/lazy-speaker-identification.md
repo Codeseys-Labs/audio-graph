@@ -1,6 +1,8 @@
 # Lazy speaker identification
 
-Status: **Proposed** (2026-11-21). Needs an ADR before code lands (see §12).
+Status: Phase 1 backend implemented under [ADR-0050](../adr/0050-lazy-speaker-identity-relabels.md). The People panel and later evidence/voiceprint phases are separate work.
+
+The active-session command surface is `list_session_speaker_clusters`, `relabel_speaker_cluster`, `mark_cluster_is_self`, `merge_speaker_clusters`, and `unbind_speaker_cluster`. The list returns a session-scoped cluster snapshot; mutations commit a single speaker-log batch before publishing revisions and return the number of graph edges reattributed. A channel prior is only a suggestion and is never written as a binding.
 Parent epics: `audio-graph-3588` (speaker timeline) and `audio-graph-5011` (local worker).
 Related: `audio-graph-9509` (identity ladder), `9c45`, `262a`, `dcd3`, `1f56`, `1fbd`, `eebf`,
 `1586`, `ca06`, `8848`, `4796`, `53cf`, `c237`, `dd19`.

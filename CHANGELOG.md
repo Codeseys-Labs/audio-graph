@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Name, merge, or unbind session speaker clusters with durable atomic relabels; local clustering now distinguishes capture sources.
 - Backend-only decision-engine registry and opt-in Laya ONNX inference using the
   existing app-data model cache. Includes calibrated probabilities, state
   windowing, Unicode-script routing, Python-reference fixtures, and a native

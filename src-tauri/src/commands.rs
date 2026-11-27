@@ -119,7 +119,7 @@ mod session_artifact_ceilings {
     /// transcript that must keep loading is 2.1MB.
     pub const MAX_TRANSCRIPT_EVENTS_BYTES: u64 = 8 * 1024 * 1024;
     /// Diarization span-revision log (`transcripts/<id>.speaker.jsonl`).
-    pub const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
+    pub(crate) use crate::persistence::MAX_DIARIZATION_EVENTS_BYTES;
     /// Materialized projection graph (`graphs/<id>.materialized.json`), the
     /// artifact the field crash's ~156.6MB response was dominated by.
     pub const MAX_MATERIALIZED_GRAPH_BYTES: u64 = 24 * 1024 * 1024;
@@ -4475,6 +4475,107 @@ fn add_question_to_graph_impl(
     Ok(true)
 }
 
+#[tauri::command]
+pub fn list_session_speaker_clusters(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::identity::SessionSpeakerCluster>, String> {
+    let sources = state
+        .capture_manager
+        .lock()
+        .map_err(|_| "capture metadata unavailable")?
+        .speaker_channel_kinds();
+    let timeline = state
+        .speaker_timeline
+        .lock()
+        .map_err(|_| "speaker timeline unavailable")?;
+    if timeline.session_id != session_id {
+        return Err("speaker session has changed".into());
+    }
+    let candidates = crate::identity::channel::self_candidates(&timeline, &sources);
+    Ok(
+        crate::identity::SessionIdentityLedger::from_timeline(&timeline)
+            .clusters
+            .into_values()
+            .map(|b| crate::identity::SessionSpeakerCluster {
+                suggested_self: candidates.contains(&b.cluster),
+                cluster: b.cluster,
+                label: b.label.to_owned(),
+                span_count: b.span_count,
+                state: b.state,
+            })
+            .collect(),
+    )
+}
+#[tauri::command]
+pub fn relabel_speaker_cluster(
+    session_id: String,
+    cluster: crate::identity::ClusterRef,
+    label: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    crate::speech::emit_and_dispatch_speaker_relabel_batch(
+        &state,
+        &app,
+        &session_id,
+        &cluster,
+        crate::identity::ManualEdit::Name(label),
+    )
+}
+#[tauri::command]
+pub fn mark_cluster_is_self(
+    session_id: String,
+    cluster: crate::identity::ClusterRef,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let label = state
+        .app_settings
+        .read()
+        .map_err(|_| "settings unavailable")?
+        .self_display_name
+        .clone()
+        .ok_or("set your display name first")?;
+    crate::speech::emit_and_dispatch_speaker_relabel_batch(
+        &state,
+        &app,
+        &session_id,
+        &cluster,
+        crate::identity::ManualEdit::MarkSelf(label),
+    )
+}
+#[tauri::command]
+pub fn merge_speaker_clusters(
+    session_id: String,
+    cluster: crate::identity::ClusterRef,
+    into: crate::identity::ClusterRef,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    crate::speech::emit_and_dispatch_speaker_relabel_batch(
+        &state,
+        &app,
+        &session_id,
+        &cluster,
+        crate::identity::ManualEdit::Merge(into),
+    )
+}
+#[tauri::command]
+pub fn unbind_speaker_cluster(
+    session_id: String,
+    cluster: crate::identity::ClusterRef,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    crate::speech::emit_and_dispatch_speaker_relabel_batch(
+        &state,
+        &app,
+        &session_id,
+        &cluster,
+        crate::identity::ManualEdit::Unbind,
+    )
+}
 /// Retcon-merge a superseded graph entity into a canonical one (speaker /
 /// entity resolution).
 ///
@@ -4520,6 +4621,47 @@ fn merge_graph_entities_impl(
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<usize> {
+    // Speaker edits must survive replay. Only a unique exact current label can select
+    // a cluster; name-only UI requests must never guess between two capture sources.
+    let speaker_edit = {
+        let timeline = state
+            .speaker_timeline
+            .lock()
+            .map_err(|_| "speaker timeline unavailable".to_string())?;
+        let ledger = crate::identity::SessionIdentityLedger::from_timeline(&timeline);
+        let lookup = |label: &str| -> Result<Option<crate::identity::ClusterRef>, String> {
+            let key = label.trim().to_lowercase();
+            let mut matches = ledger
+                .clusters
+                .values()
+                .filter(|b| b.label.to_lowercase() == key);
+            let first = matches.next();
+            if matches.next().is_some() {
+                Err("ambiguous speaker label; select a cluster instead".into())
+            } else {
+                Ok(first.map(|b| b.cluster.clone()))
+            }
+        };
+        if let Some(cluster) = lookup(&superseded_name)? {
+            let edit = if let Some(into) = lookup(&canonical_name)? {
+                if into == cluster {
+                    return Ok(0);
+                }
+                crate::identity::ManualEdit::Merge(into)
+            } else {
+                crate::identity::ManualEdit::Name(canonical_name.clone())
+            };
+            Some((timeline.session_id.clone(), cluster, edit))
+        } else {
+            None
+        }
+    };
+    if let Some((session, cluster, edit)) = speaker_edit {
+        return crate::speech::emit_and_dispatch_speaker_relabel_batch(
+            state, &app, &session, &cluster, edit,
+        )
+        .map_err(Into::into);
+    }
     // Same epoch-vs-session-relative conversion as `approve_agent_proposal` /
     // `add_question_to_graph` (audio-graph-4b52): `unix_millis()` is wall
     // clock, but `supersede_entity`'s `timestamp` lands in `invalidate_edge`'s
@@ -9109,23 +9251,6 @@ fn record_projection_replay_stage_latency(
     kind_metrics.max_ms = kind_metrics.max_ms.max(latency_ms);
 }
 
-fn strict_speaker_history(
-    read: crate::persistence::canonical_reader::StrictCanonicalRead<
-        crate::projections::DiarizationSpanRevision,
-    >,
-) -> Option<Vec<crate::projections::DiarizationSpanRevision>> {
-    match read {
-        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => None,
-        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => Some(
-            snapshot
-                .records
-                .into_iter()
-                .map(|record| record.payload)
-                .collect(),
-        ),
-    }
-}
-
 /// Floor-admitted like [`read_session_transcript_snapshot`]: every canonical
 /// stream this reads is v1-only, so an unadmitted v2 Session would replay v2
 /// revisions through v1 logic. `maximum_supported` is v1 for that reason.
@@ -9165,8 +9290,9 @@ fn projection_replay_report_for_admitted_session(
     let transcript_events = repository
         .load_transcript_event_stream(session_id)?
         .into_payloads();
-    let speaker_events =
-        strict_speaker_history(repository.load_speaker_revision_stream(session_id)?);
+    let speaker_events = repository
+        .load_speaker_revision_stream(session_id)?
+        .speaker_history(session_id)?;
     let projection_events = repository
         .load_projection_patch_stream(session_id)?
         .into_payloads();
@@ -9669,9 +9795,10 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     );
     let (diarization_bytes, diarization_events) = match diarization_ceiling {
         Ok(bytes) => {
-            let events =
-                strict_speaker_history(repository.load_speaker_revision_stream(&session_id)?)
-                    .unwrap_or_default();
+            let events = repository
+                .load_speaker_revision_stream(&session_id)?
+                .speaker_history(&session_id)?
+                .unwrap_or_default();
             (bytes, events)
         }
         Err(AppError::ArtifactTooLarge {
@@ -9830,8 +9957,9 @@ fn gather_projection_lens_state(
             MAX_DIARIZATION_EVENTS_BYTES,
             "diarization_events",
         )?;
-        let speaker_history =
-            strict_speaker_history(repository.load_speaker_revision_stream(session_id)?);
+        let speaker_history = repository
+            .load_speaker_revision_stream(session_id)?
+            .speaker_history(session_id)?;
         Some(replay_projection_state_or_invalid(
             session_id,
             transcript_events,
@@ -10066,7 +10194,8 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     )?;
     let diarization_events = repository
         .load_speaker_revision_stream(session_id)?
-        .into_payloads();
+        .speaker_history(session_id)?
+        .unwrap_or_default();
     let projection_events_bytes = enforce_artifact_ceiling(
         &crate::user_data::resolve_projection_events_path(session_id)?,
         MAX_PROJECTION_EVENTS_BYTES,
@@ -10205,7 +10334,8 @@ fn session_timeline_for_admitted_session(
     )?;
     let diarization_events = repository
         .load_speaker_revision_stream(session_id)?
-        .into_payloads();
+        .speaker_history(session_id)?
+        .unwrap_or_default();
 
     let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
         .map_err(|e| {
@@ -14691,6 +14821,8 @@ mod tests {
         span_id: &str,
     ) -> crate::projections::DiarizationSpanRevision {
         crate::projections::DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: span_id.to_string(),
             provider: "test-diarizer".to_string(),
             timeline_id: "session".to_string(),
@@ -16738,6 +16870,8 @@ mod tests {
         speaker_id: &str,
     ) -> crate::projections::DiarizationSpanRevision {
         crate::projections::DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: span_id.to_string(),
             provider: "deepgram".to_string(),
             timeline_id: session_id.to_string(),

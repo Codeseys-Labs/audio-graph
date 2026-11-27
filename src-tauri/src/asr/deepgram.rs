@@ -2160,6 +2160,7 @@ where
             };
 
             revisions.push(DiarizationSpanRevisionPayload {
+                identity: None,
                 span_id,
                 provider: "deepgram".to_string(),
                 timeline_id: spec.timeline_id.clone(),

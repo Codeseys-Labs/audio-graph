@@ -442,17 +442,30 @@ fn diarization_span_revision_for_transcript(
     received_at_ms: u64,
 ) -> Option<events::DiarizationSpanRevisionPayload> {
     let speaker_key = transcript_speaker_key(segment)?;
+    // A transcript overlap inherits the local cluster's identity namespace, not the ASR engine's.
+    let local = speaker_key.starts_with("local-cluster:");
+    let provider = if local { "local_clustering" } else { provider };
+    let timeline_id = if local && segment.source_id.is_empty() {
+        "session"
+    } else {
+        &segment.source_id
+    };
     Some(events::DiarizationSpanRevisionPayload {
-        span_id: diarization_span_revision_id(
-            provider,
-            &segment.source_id,
-            segment.start_time,
-            segment.end_time,
-            Some(speaker_key),
-        ),
+        identity: None,
+        span_id: if local {
+            format!("local_clustering:turn:{basis_asr_span_id}")
+        } else {
+            diarization_span_revision_id(
+                provider,
+                timeline_id,
+                segment.start_time,
+                segment.end_time,
+                Some(speaker_key),
+            )
+        },
         provider: provider.to_string(),
-        timeline_id: segment.source_id.clone(),
-        source_id: Some(segment.source_id.clone()),
+        timeline_id: timeline_id.to_owned(),
+        source_id: (!segment.source_id.is_empty()).then(|| segment.source_id.clone()),
         speaker_id: segment.speaker_id.clone(),
         speaker_label: segment.speaker_label.clone(),
         channel,
@@ -499,6 +512,7 @@ pub(crate) struct DiarizationRevisionOutcome {
     pub edges_retconned: usize,
 }
 
+#[cfg(test)]
 fn dispatch_diarization_span_revision(
     timeline: &mut SpeakerTimeline,
     graph: &mut TemporalKnowledgeGraph,
@@ -517,7 +531,14 @@ fn dispatch_diarization_span_revision(
             };
         }
     };
-
+    apply_segment_remap(graph, remap, timestamp, segment_ids)
+}
+fn apply_segment_remap(
+    graph: &mut TemporalKnowledgeGraph,
+    remap: Option<crate::projections::SpeakerLabelRemap>,
+    timestamp: f64,
+    segment_ids: BTreeSet<String>,
+) -> DiarizationRevisionOutcome {
     let Some(remap) =
         remap.filter(|remap| !remap.basis_segment_ids.is_empty() && !segment_ids.is_empty())
     else {
@@ -543,13 +564,9 @@ fn dispatch_diarization_span_revision(
 
 fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>(
     dispatch_ctx: &DiarizationDispatchContext<'_, E>,
-    payload: events::DiarizationSpanRevisionPayload,
+    mut payload: events::DiarizationSpanRevisionPayload,
 ) -> DiarizationRevisionOutcome {
-    dispatch_ctx
-        .event_sink
-        .emit_diarization_span_revision(&payload);
-
-    let revision = DiarizationSpanRevision::from(payload);
+    let mut revision = DiarizationSpanRevision::from(payload.clone());
 
     // Convert the wall-clock receipt time into the graph's session-relative-
     // seconds clock (audio-graph-9b11, same bug class as audio-graph-4b52):
@@ -598,6 +615,71 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
                 poisoned.into_inner()
             }
         };
+        if let Some(id) = revision.speaker_id.as_deref()
+            && let Some((label, stamp)) =
+                timeline.resolve_forward_label(&revision.provider, &revision.timeline_id, id)
+        {
+            let mut stamp = stamp.clone();
+            stamp.batch = None;
+            revision.identity = Some(stamp);
+            revision.speaker_label = Some(label.to_owned());
+            payload.identity = revision.identity.clone();
+            payload.speaker_label = revision.speaker_label.clone();
+        }
+        let rejected = || DiarizationRevisionOutcome {
+            accepted: false,
+            retcon_fired: false,
+            edges_retconned: 0,
+        };
+        if dispatch_ctx.session_id != timeline.session_id {
+            return rejected();
+        }
+        // User edits and engine corrections share one revision chain. Keep the engine's
+        // original counter so a later turn correction is neither rejected nor replayed twice.
+        if revision.revision_number > 1
+            && let Some(old) = timeline
+                .latest_spans
+                .iter()
+                .find(|s| s.span_id == revision.span_id)
+            && let Some(previous) = old.provider_revision_number
+        {
+            let Some(delta) = revision.revision_number.checked_sub(previous) else {
+                return rejected();
+            };
+            let Some(sequence) = old.revision_number.checked_add(delta) else {
+                return rejected();
+            };
+            revision.provider_revision_number = Some(revision.revision_number);
+            revision.revision_number = sequence;
+            revision.supersedes = if delta == 0 {
+                old.supersedes.clone()
+            } else {
+                Some(revision_ref(&old.span_id, old.revision_number))
+            };
+            payload.revision_number = sequence;
+            payload.supersedes = revision.supersedes.clone();
+        }
+        let pos = match timeline.event_position(&revision) {
+            Ok(pos) => pos,
+            Err(e) => {
+                log::warn!("speaker revision rejected: {e:?}");
+                return rejected();
+            }
+        };
+        if pos.is_some_and(|i| timeline.latest_spans[i] == revision) {
+            return DiarizationRevisionOutcome {
+                accepted: true,
+                retcon_fired: false,
+                edges_retconned: 0,
+            };
+        }
+        if let Err(e) = FileMemoryRepository::user_data()
+            .append_diarization_span_revision(dispatch_ctx.session_id, &revision)
+        {
+            log::warn!("speaker revision not committed: {e}");
+            return rejected();
+        }
+        let remap = timeline.apply_validated_event(pos, revision);
         let mut graph = match dispatch_ctx.knowledge_graph.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -605,68 +687,128 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
                 poisoned.into_inner()
             }
         };
-        let outcome = dispatch_diarization_span_revision(
-            &mut timeline,
-            &mut graph,
-            revision.clone(),
-            timestamp,
-            segment_ids,
-        );
+        let outcome = apply_segment_remap(&mut graph, remap, timestamp, segment_ids);
         if outcome.retcon_fired {
             let delta = graph.has_delta().then(|| graph.take_delta());
             let snapshot = graph.snapshot();
+            if let Ok(mut cached) = dispatch_ctx.graph_snapshot.write() {
+                *cached = snapshot.clone();
+            }
             (outcome, delta, Some(snapshot))
         } else {
             (outcome, None, None)
         }
     };
 
-    // Durably append the accepted revision to the session's speaker log so a
-    // live speaker relabel survives reload and can be replayed into a
-    // `SpeakerTimeline` (audio-graph-719d; ADR-0025 §2b / ADR-0026 §3). This is
-    // deliberately done OUTSIDE the timeline/graph locks and after the in-memory
-    // apply, mirroring the ASR ledger-write posture: best-effort, log on
-    // failure, never break the live path. Only accepted revisions are persisted
-    // so the durable log never diverges from the in-memory timeline with a
-    // stale/rejected row.
-    if outcome.accepted {
-        persist_diarization_span_revision(dispatch_ctx.session_id, &revision);
-    }
+    dispatch_ctx
+        .event_sink
+        .emit_diarization_span_revision(&payload);
 
     if let Some(delta) = delta {
         dispatch_ctx.event_sink.emit_graph_delta(&delta);
     }
     if let Some(snapshot) = snapshot {
-        if let Ok(mut cached) = dispatch_ctx.graph_snapshot.write() {
-            *cached = snapshot.clone();
-        }
         dispatch_ctx.event_sink.emit_graph_update(&snapshot);
     }
 
     outcome
 }
 
-/// Best-effort durable append of an accepted diarization span revision to the
-/// session's `<session>.speaker.jsonl` log (audio-graph-719d).
-///
-/// A failed write is logged and swallowed — persistence must never break the
-/// live diarization/retcon path (the same posture as the ASR event writer). An
-/// empty session id (no active session, e.g. some diarization-only test seams)
-/// is skipped silently rather than logging a validation warning per revision.
-fn persist_diarization_span_revision(session_id: &str, revision: &DiarizationSpanRevision) {
-    if session_id.is_empty() {
-        return;
+/// Commit a user edit in the same timeline admission order as incoming spans.
+pub(crate) fn emit_and_dispatch_speaker_relabel_batch(
+    state: &crate::state::AppState,
+    app: &AppHandle,
+    session_id: &str,
+    cluster: &crate::identity::ClusterRef,
+    edit: crate::identity::ManualEdit,
+) -> Result<usize, String> {
+    use crate::identity::relabel::RemapScope;
+    let ledger = state
+        .transcript_ledger
+        .lock()
+        .map_err(|_| "transcript ledger unavailable")?;
+    let mut timeline = state
+        .speaker_timeline
+        .lock()
+        .map_err(|_| "speaker timeline unavailable")?;
+    if ledger.session_id != session_id || timeline.session_id != session_id {
+        return Err("speaker session has changed".into());
     }
-    if let Err(error) =
-        FileMemoryRepository::user_data().append_diarization_span_revision(session_id, revision)
-    {
-        log::warn!(
-            "Failed to persist diarization span revision span_id={} revision={} for session {}: {error}",
-            revision.span_id,
-            revision.revision_number,
-            session_id
-        );
+    let now = current_unix_millis();
+    let ts = ledger.session_relative_timestamp("", now);
+    let repo = FileMemoryRepository::user_data();
+    let batch = crate::identity::manual_batch(&timeline, cluster, edit, now, || {
+        let history = repo.load_diarization_span_revisions(session_id)?;
+        Ok(history
+            .into_iter()
+            .find(|s| cluster.matches_origin(s) && s.identity.is_none())
+            .and_then(|s| s.speaker_label)
+            .unwrap_or_else(|| cluster.speaker_id.clone()))
+    })?;
+    // A legacy session (or provider) can share a display label across origins. Never
+    // broaden such a correction to the other cluster merely because graph keys are names.
+    let affected: std::collections::HashSet<_> =
+        batch.revisions.iter().map(|s| s.span_id.as_str()).collect();
+    let shared_labels: std::collections::HashSet<_> = timeline
+        .latest_spans
+        .iter()
+        .filter(|s| !affected.contains(s.span_id.as_str()))
+        .filter_map(|s| s.speaker_label.as_deref())
+        .map(str::to_lowercase)
+        .collect();
+    let mut segment_keys: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for s in &timeline.latest_spans {
+        if affected.contains(s.span_id.as_str())
+            && let Some(label) = s.speaker_label.as_deref().or(s.speaker_id.as_deref())
+            && (batch.scope == RemapScope::Segments
+                || shared_labels.contains(&label.to_lowercase()))
+        {
+            segment_keys
+                .entry(label.to_owned())
+                .or_default()
+                .extend(diarization_graph_segment_ids(s, &ledger));
+        }
     }
+    drop(ledger);
+    let mut graph = state
+        .knowledge_graph
+        .lock()
+        .map_err(|_| "knowledge graph unavailable")?;
+    let remaps = timeline.admit_batch(&batch, || {
+        repo.append_speaker_relabel_batch(session_id, &batch)
+    })?;
+    let mut edges_retconned = 0;
+    for remap in remaps {
+        let scope = if remap.scope == RemapScope::Segments
+            || shared_labels.contains(&remap.superseded_label.to_lowercase())
+        {
+            RelabelScope::Segments {
+                segment_ids: segment_keys
+                    .remove(&remap.superseded_label)
+                    .unwrap_or_default(),
+            }
+        } else {
+            RelabelScope::Entity
+        };
+        edges_retconned += graph
+            .reattribute_speaker(&remap.superseded_label, &remap.canonical_label, scope, ts)
+            .edges_retconned;
+    }
+    let delta = graph.has_delta().then(|| graph.take_delta());
+    let snapshot = graph.snapshot();
+    if let Ok(mut cached) = state.graph_snapshot.write() {
+        *cached = snapshot.clone()
+    }
+    drop(graph);
+    drop(timeline);
+    for revision in &batch.revisions {
+        events::emit_or_log(app, events::DIARIZATION_SPAN_REVISION, revision);
+    }
+    if let Some(delta) = delta {
+        events::emit_or_log(app, events::GRAPH_DELTA, &delta);
+    }
+    events::emit_or_log(app, events::GRAPH_UPDATE, &snapshot);
+    Ok(edges_retconned)
 }
 
 #[derive(Default)]
@@ -1865,6 +2007,8 @@ const CLUSTERING_SPAN_HISTORY: usize = 512;
 /// handles. Held by the speech processor for the session's duration.
 #[cfg(feature = "diarization-clustering")]
 pub(crate) struct ClusteringDiarizationHandle {
+    source_id: String,
+    timeline: Arc<Mutex<SpeakerTimeline>>,
     feed: crate::diarization::worker::DiarizationFeed,
     /// Session-time speaker spans, kept fresh by the consumer thread; read here
     /// to label transcript segments by time overlap.
@@ -1894,10 +2038,14 @@ impl ClusteringDiarizationHandle {
         let slice: Vec<_> = spans.iter().copied().collect();
         drop(spans);
         let gid = crate::diarization::overlap_speaker_for_segment(start_time, end_time, &slice)?;
-        Some((
-            crate::diarization::clustering_speaker_id(gid),
-            crate::diarization::clustering_speaker_label(gid),
-        ))
+        let (id, mut label) = crate::identity::local_cluster_key(&self.source_id, gid);
+        let timeline = self.timeline.lock().ok()?;
+        if let Some(label_now) =
+            crate::identity::forward_local_label(&timeline, &self.source_id, &id)
+        {
+            label = label_now.to_owned()
+        }
+        Some((id, label))
     }
 
     /// Signal the worker + consumer to drain once more and exit.
@@ -1906,6 +2054,54 @@ impl ClusteringDiarizationHandle {
     }
 }
 
+#[cfg(feature = "diarization-clustering")]
+struct SourceClustering {
+    shared: SpeechShared,
+    backend: crate::diarization::DiarizationBackend,
+    session_id: String,
+    workers: HashMap<String, Option<ClusteringDiarizationHandle>>,
+}
+#[cfg(feature = "diarization-clustering")]
+impl SourceClustering {
+    fn new(shared: &SpeechShared, config: &DiarizationConfig) -> Self {
+        Self {
+            shared: shared.clone(),
+            session_id: shared.projection_runtime.current_session_id(),
+            backend: config.backend.clone(),
+            workers: HashMap::new(),
+        }
+    }
+    fn push(&mut self, source: &str, audio: &[f32]) {
+        if !matches!(
+            self.backend,
+            crate::diarization::DiarizationBackend::Clustering { .. }
+        ) {
+            return;
+        }
+        if !self.workers.contains_key(source) {
+            let handle = maybe_spawn_clustering_diarization(
+                &self.backend,
+                &self.shared,
+                &self.session_id,
+                source,
+            );
+            self.workers.insert(source.to_owned(), handle);
+        }
+        if let Some(Some(handle)) = self.workers.get_mut(source) {
+            handle.push(audio);
+        }
+    }
+    fn get(&self, source: &str) -> Option<&ClusteringDiarizationHandle> {
+        self.workers.get(source)?.as_ref()
+    }
+    fn stop(self) {
+        for worker in self.workers.into_values().flatten() {
+            worker.stop();
+            let _ = worker._worker.join();
+            let _ = worker._consumer.join();
+        }
+    }
+}
 /// If the configured backend is `Clustering`, build + spawn the live
 /// [`LiveDiarizationWorker`] and its `SPEAKER_DETECTED`-emitting consumer thread,
 /// returning a handle the caller feeds 16 kHz mono audio into. Returns `None`
@@ -1913,13 +2109,10 @@ impl ClusteringDiarizationHandle {
 /// or if the worker fails to construct (logged; the Simple path still runs).
 #[cfg(feature = "diarization-clustering")]
 pub(crate) fn maybe_spawn_clustering_diarization(
-    diarization_config: &DiarizationConfig,
-    app_handle: AppHandle,
-    speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
-    session_id: String,
+    backend: &crate::diarization::DiarizationBackend,
+    shared: &SpeechShared,
+    session_id: &str,
+    source_id: &str,
 ) -> Option<ClusteringDiarizationHandle> {
     use crate::diarization::DiarizationBackend;
     use crate::diarization::worker::{
@@ -1927,7 +2120,7 @@ pub(crate) fn maybe_spawn_clustering_diarization(
         StableSegment,
     };
 
-    let (segmentation_model, embedding_model, threshold) = match &diarization_config.backend {
+    let (segmentation_model, embedding_model, threshold) = match backend {
         DiarizationBackend::Clustering {
             segmentation_model,
             embedding_model,
@@ -1969,6 +2162,13 @@ pub(crate) fn maybe_spawn_clustering_diarization(
         .name("diarization-clustering-emit".to_string())
         .spawn({
             let spans = spans.clone();
+            let source_id = source_id.to_owned();
+            let session_id = session_id.to_owned();
+            let app_handle = shared.app_handle.clone();
+            let speaker_timeline = shared.speaker_timeline.clone();
+            let knowledge_graph = shared.knowledge_graph.clone();
+            let graph_snapshot = shared.graph_snapshot.clone();
+            let transcript_ledger = shared.transcript_ledger.clone();
             move || {
                 run_clustering_emit_loop(
                     seg_rx,
@@ -1979,6 +2179,7 @@ pub(crate) fn maybe_spawn_clustering_diarization(
                     transcript_ledger,
                     spans,
                     session_id,
+                    source_id,
                 );
             }
         }) {
@@ -2006,6 +2207,8 @@ pub(crate) fn maybe_spawn_clustering_diarization(
     );
 
     Some(ClusteringDiarizationHandle {
+        source_id: source_id.to_owned(),
+        timeline: shared.speaker_timeline.clone(),
         feed,
         spans,
         stop,
@@ -2036,7 +2239,13 @@ fn run_clustering_emit_loop(
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
     session_id: String,
+    source_id: String,
 ) {
+    let timeline_id = if source_id.is_empty() {
+        "session"
+    } else {
+        &source_id
+    };
     let mut stats = crate::diarization::ClusteringSpeakerStats::new();
     let event_sink = TauriDiarizationEventSink {
         app_handle: &app_handle,
@@ -2062,40 +2271,29 @@ fn run_clustering_emit_loop(
             buffer_start_abs,
             seg.global_speaker,
         );
-        let (speaker_id, speaker_label) =
-            if seg.global_speaker == crate::diarization::stabilize::UNKNOWN_SPEAKER {
-                (None, None)
-            } else {
-                (
-                    Some(crate::diarization::clustering_speaker_id(
-                        seg.global_speaker,
-                    )),
-                    Some(crate::diarization::clustering_speaker_label(
-                        seg.global_speaker,
-                    )),
-                )
-            };
+        let (speaker_id, speaker_label) = if seg.global_speaker
+            == crate::diarization::stabilize::UNKNOWN_SPEAKER
+        {
+            (None, None)
+        } else {
+            let (id, label) = crate::identity::local_cluster_key(&source_id, seg.global_speaker);
+            (Some(id), Some(label))
+        };
 
-        if let Ok(mut q) = spans.write() {
-            q.push_back(session_span);
-            while q.len() > CLUSTERING_SPAN_HISTORY {
-                q.pop_front();
-            }
-        }
-
-        emit_and_dispatch_diarization_span_revision(
+        let admission = emit_and_dispatch_diarization_span_revision(
             &diarization_dispatch,
             events::DiarizationSpanRevisionPayload {
+                identity: None,
                 span_id: diarization_span_revision_id(
                     "local_clustering",
-                    "session",
+                    timeline_id,
                     session_span.start,
                     session_span.end,
                     speaker_id.as_deref(),
                 ),
                 provider: "local_clustering".to_string(),
-                timeline_id: "session".to_string(),
-                source_id: None,
+                timeline_id: timeline_id.to_owned(),
+                source_id: (!source_id.is_empty()).then(|| source_id.clone()),
                 speaker_id: speaker_id.clone(),
                 speaker_label: speaker_label.clone(),
                 channel: None,
@@ -2114,13 +2312,33 @@ fn run_clustering_emit_loop(
                 received_at_ms: current_unix_millis(),
             },
         );
+        if !admission.accepted {
+            continue;
+        }
+        if let Ok(mut q) = spans.write() {
+            q.push_back(session_span);
+            while q.len() > CLUSTERING_SPAN_HISTORY {
+                q.pop_front();
+            }
+        }
 
         let duration = (seg.end - seg.start).max(0.0) as f64;
-        if let Some(info) = stats.record(seg.global_speaker, duration) {
+        if let Some(mut info) = stats.record(seg.global_speaker, duration)
+            && let (Some(id), Some(label)) = (speaker_id, speaker_label)
+        {
+            info.id = id;
+            info.label = speaker_timeline
+                .lock()
+                .ok()
+                .and_then(|t| {
+                    crate::identity::forward_local_label(&t, &source_id, &info.id)
+                        .map(str::to_owned)
+                })
+                .unwrap_or(label);
             let _ = app_handle.emit(events::SPEAKER_DETECTED, &info);
             log::debug!(
                 "Clustering diarization: SPEAKER_DETECTED {} (segments={}, total={:.1}s)",
-                info.label,
+                seg.global_speaker,
                 info.segment_count,
                 info.total_speaking_time,
             );
@@ -2233,7 +2451,7 @@ fn apply_extraction_result_if_current(
                 .map(|timeline| timeline.lock().unwrap_or_else(|e| e.into_inner()));
             let label = timeline
                 .as_ref()
-                .and_then(|timeline| assemblyai_turn_speaker_label(timeline, segment_id))
+                .and_then(|timeline| current_turn_label(timeline, segment_id))
                 .unwrap_or(speaker);
             if label != speaker {
                 retarget_extraction_speaker(&mut extraction_result, speaker, label);
@@ -2315,17 +2533,17 @@ fn apply_extraction_result_if_current(
     true
 }
 
-fn assemblyai_turn_speaker_label<'a>(
-    timeline: &'a SpeakerTimeline,
-    asr_span_id: &str,
-) -> Option<&'a str> {
-    let speaker_span_id = assemblyai_turn_speaker_span_id(asr_span_id);
-    timeline
-        .latest_spans
-        .iter()
-        .find(|span| span.span_id == speaker_span_id)
-        .and_then(|span| span.speaker_label.as_deref())
-        .filter(|label| !label.trim().is_empty())
+fn current_turn_label<'a>(timeline: &'a SpeakerTimeline, segment_id: &str) -> Option<&'a str> {
+    let mut matches = timeline.latest_spans.iter().filter(|s| {
+        s.basis_asr_span_ids
+            .iter()
+            .chain(&s.basis_transcript_segment_ids)
+            .any(|id| id == segment_id)
+    });
+    let first = matches.next()?.speaker_label.as_deref()?;
+    matches
+        .all(|s| s.speaker_label.as_deref() == Some(first))
+        .then_some(first)
 }
 
 fn retarget_extraction_speaker(extraction: &mut ExtractionResult, from: &str, to: &str) {
@@ -4412,6 +4630,7 @@ fn assemblyai_initial_turn_speaker(
         return None;
     }
     Some(events::DiarizationSpanRevisionPayload {
+        identity: None,
         span_id,
         provider: turn.provider.clone(),
         timeline_id: turn.source_id.clone(),
@@ -4487,6 +4706,7 @@ fn emit_assemblyai_speaker_revision_with_dispatch<E: DiarizationEventSink + ?Siz
     emit_and_dispatch_diarization_span_revision(
         dispatch_ctx,
         events::DiarizationSpanRevisionPayload {
+            identity: None,
             span_id,
             provider: "assemblyai".to_string(),
             timeline_id: source_id.clone(),
@@ -4569,7 +4789,7 @@ fn flush_batch(
     let deps = ExtractionDeps {
         active_session_id: &ctx.active_session_id,
         transcript_ledger: &ctx.transcript_ledger,
-        turn_speaker_timeline: (ctx.asr_provider == "assemblyai").then_some(&ctx.speaker_timeline),
+        turn_speaker_timeline: Some(&ctx.speaker_timeline),
         expected_session_id: &expected_session_id,
         llm_engine: &ctx.llm_engine,
         api_client: &ctx.api_client,
@@ -5700,15 +5920,7 @@ fn run_asr_worker(
     // (the per-utterance DiarizationWorker falls back to Simple for this
     // backend — it doesn't own the clustering engine). The feed is pushed below.
     #[cfg(feature = "diarization-clustering")]
-    let mut clustering = maybe_spawn_clustering_diarization(
-        &diarization_config,
-        shared.app_handle.clone(),
-        shared.speaker_timeline.clone(),
-        shared.knowledge_graph.clone(),
-        shared.graph_snapshot.clone(),
-        shared.transcript_ledger.clone(),
-        shared.projection_runtime.current_session_id(),
-    );
+    let mut clustering = SourceClustering::new(&shared, &diarization_config);
 
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
@@ -5759,9 +5971,7 @@ fn run_asr_worker(
         // re-diarizes a trailing window and emits only the fresh hop), so this
         // is acceptable for B16's first wiring. Exact de-dup is a follow-up.
         #[cfg(feature = "diarization-clustering")]
-        if let Some(handle) = clustering.as_mut() {
-            handle.push(&segment.audio);
-        }
+        clustering.push(&segment.source_id, &segment.audio);
 
         // 1. Run ASR transcription
         let speech_segment = AccumulatedSegment::to_asr_segment(&segment);
@@ -5821,7 +6031,7 @@ fn run_asr_worker(
                     // SPEAKER_DETECTED, so suppress the Simple `speaker_info` to
                     // avoid clobbering the UI's speaker stats.
                     #[cfg(feature = "diarization-clustering")]
-                    let speaker_info_to_emit = match clustering.as_ref() {
+                    let speaker_info_to_emit = match clustering.get(&final_segment.source_id) {
                         Some(handle) => {
                             match handle
                                 .label_segment(final_segment.start_time, final_segment.end_time)
@@ -5901,9 +6111,7 @@ fn run_asr_worker(
 
     // Stop the live clustering diarizer (drains once more, emits, exits).
     #[cfg(feature = "diarization-clustering")]
-    if let Some(handle) = clustering.as_ref() {
-        handle.stop();
-    }
+    clustering.stop();
 
     log::info!(
         "ASR worker: exiting. ASR segments={}, diarized={}",
@@ -5989,15 +6197,7 @@ pub(crate) fn run_speech_processor_diarization_only(
     // selected, fed the same 16 kHz mono segment audio used for the placeholder
     // transcript below.
     #[cfg(feature = "diarization-clustering")]
-    let mut clustering = maybe_spawn_clustering_diarization(
-        &diarization_config,
-        shared.app_handle.clone(),
-        shared.speaker_timeline.clone(),
-        shared.knowledge_graph.clone(),
-        shared.graph_snapshot.clone(),
-        shared.transcript_ledger.clone(),
-        shared.projection_runtime.current_session_id(),
-    );
+    let mut clustering = SourceClustering::new(&shared, &diarization_config);
 
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
@@ -6063,9 +6263,7 @@ pub(crate) fn run_speech_processor_diarization_only(
 
         // Feed the live clustering diarizer (if active) the 16 kHz mono audio.
         #[cfg(feature = "diarization-clustering")]
-        if let Some(handle) = clustering.as_mut() {
-            handle.push(&segment.audio);
-        }
+        clustering.push(&segment.source_id, &segment.audio);
 
         count += 1;
 
@@ -6111,7 +6309,7 @@ pub(crate) fn run_speech_processor_diarization_only(
         // this time. The clustering consumer thread owns the SPEAKER_DETECTED
         // emission for relabeled segments, so suppress the Simple one then.
         #[cfg(feature = "diarization-clustering")]
-        let emit_simple_speaker = match clustering.as_ref() {
+        let emit_simple_speaker = match clustering.get(&final_segment.source_id) {
             Some(handle) => {
                 match handle.label_segment(final_segment.start_time, final_segment.end_time) {
                     Some((id, label)) => {
@@ -6264,7 +6462,7 @@ pub(crate) fn run_speech_processor_diarization_only(
             &ExtractionDeps {
                 active_session_id: &shared.active_session_id,
                 transcript_ledger: &shared.transcript_ledger,
-                turn_speaker_timeline: None,
+                turn_speaker_timeline: Some(&shared.speaker_timeline),
                 expected_session_id: &expected_session_id,
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
@@ -6285,9 +6483,7 @@ pub(crate) fn run_speech_processor_diarization_only(
 
     // Stop the live clustering diarizer (drains once more, emits, exits).
     #[cfg(feature = "diarization-clustering")]
-    if let Some(handle) = clustering.as_ref() {
-        handle.stop();
-    }
+    clustering.stop();
 
     log::info!(
         "Speech processor (diarization-only): exiting. Segments processed={}",
@@ -10148,6 +10344,100 @@ mod tests_status {
         }
     }
 
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri AppHandle needs the macOS main thread"
+    )]
+    fn span_prepared_before_bind_uses_committed_identity_without_crossing_sources() {
+        use crate::identity::{ClusterRef, ManualEdit, tests::span};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("bind-forward");
+        let _guard = DataDirGuard::set(&dir);
+        let state = AppState::new();
+        let id = state.current_session_id();
+        let sink = RecordingDiarizationEventSink::default();
+        let ctx = DiarizationDispatchContext {
+            event_sink: &sink,
+            speaker_timeline: &state.speaker_timeline,
+            transcript_ledger: &state.transcript_ledger,
+            knowledge_graph: &state.knowledge_graph,
+            graph_snapshot: &state.graph_snapshot,
+            session_id: &id,
+        };
+        let payload = |s: &crate::projections::DiarizationSpanRevision| {
+            serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap()
+        };
+        let a = span("a", "mic");
+        let b = span("b", "system");
+        let later = payload(&span("c", "mic"));
+        let (first, other) = {
+            let mut graph = state.knowledge_graph.lock().unwrap();
+            let mut node = |s: &crate::projections::DiarizationSpanRevision| {
+                let name = s.speaker_label.clone().unwrap();
+                graph.add_entity(
+                    &crate::graph::ExtractedEntity {
+                        name: name.clone(),
+                        entity_type: "Person".into(),
+                        description: None,
+                    },
+                    0.0,
+                    &name,
+                )
+            };
+            (node(&a), node(&b))
+        };
+        assert_ne!(first, other);
+        for s in [&a, &b] {
+            assert!(emit_and_dispatch_diarization_span_revision(&ctx, payload(s)).accepted)
+        }
+        super::emit_and_dispatch_speaker_relabel_batch(
+            &state,
+            &super::shared_test_app_handle(),
+            &id,
+            &ClusterRef::origin(&a).unwrap(),
+            ManualEdit::Name("Alice".into()),
+        )
+        .unwrap();
+        assert!(emit_and_dispatch_diarization_span_revision(&ctx, later).accepted);
+        let mut correction = a.clone();
+        correction.revision_number = 2;
+        correction.supersedes = Some(revision_ref(&a.span_id, 1));
+        correction.received_at_ms = 200;
+        assert!(emit_and_dispatch_diarization_span_revision(&ctx, payload(&correction)).accepted);
+        assert!(emit_and_dispatch_diarization_span_revision(&ctx, payload(&correction)).accepted);
+        let timeline = state.speaker_timeline.lock().unwrap();
+        let updated = timeline
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == a.span_id)
+            .unwrap();
+        assert_eq!(updated.revision_number, 3);
+        assert_eq!(updated.supersedes.as_deref(), Some("a@rev2"));
+        assert_eq!(updated.speaker_label.as_deref(), Some("Alice"));
+        drop(timeline);
+        let graph = state.knowledge_graph.lock().unwrap();
+        assert_eq!(graph.resolve_entity("Alice", 1.0), Some(first));
+        assert_eq!(
+            graph.resolve_entity(b.speaker_label.as_deref().unwrap(), 1.0),
+            Some(other)
+        );
+        drop(graph);
+        let replay = FileMemoryRepository::user_data()
+            .replay_speaker_timeline(&id)
+            .unwrap();
+        assert_eq!(replay, *state.speaker_timeline.lock().unwrap());
+        let latest = replay
+            .latest_spans
+            .iter()
+            .find(|s| s.span_id == "c")
+            .unwrap();
+        assert_eq!(latest.speaker_label.as_deref(), Some("Alice"));
+        assert_eq!(latest.revision_number, 1);
+        assert!(latest.identity.as_ref().unwrap().batch.is_none());
+    }
     #[derive(Clone, Default)]
     struct RecordingProjectionDataMovementSink {
         events: Arc<Mutex<Vec<crate::persistence::DataMovementEvent>>>,
@@ -11366,7 +11656,7 @@ mod tests_status {
 
         let app = AppState::new();
         let event_sink = RecordingDiarizationEventSink::default();
-        let session_id = "assemblyai-diarization-retcon";
+        let session_id = &*app.current_session_id();
         let diarization_dispatch = DiarizationDispatchContext {
             event_sink: &event_sink,
             speaker_timeline: &app.speaker_timeline,
@@ -11594,7 +11884,7 @@ mod tests_status {
 
         let app = AppState::new();
         let event_sink = RecordingDiarizationEventSink::default();
-        let session_id = "live-diarization-persist-replay";
+        let session_id = &*app.current_session_id();
         let diarization_dispatch = DiarizationDispatchContext {
             event_sink: &event_sink,
             speaker_timeline: &app.speaker_timeline,
@@ -11608,6 +11898,7 @@ mod tests_status {
         // durable log carries the correction that replay must collapse to.
         let span_id = "local_clustering:session:0-1000:2";
         let provisional = events::DiarizationSpanRevisionPayload {
+            identity: None,
             span_id: span_id.to_string(),
             provider: "local_clustering".to_string(),
             timeline_id: "session".to_string(),
@@ -11765,6 +12056,7 @@ mod tests_status {
         events::DiarizationSpanRevisionPayload,
     ) {
         let provisional = events::DiarizationSpanRevisionPayload {
+            identity: None,
             span_id: span_id.to_string(),
             provider: "local_clustering".to_string(),
             timeline_id: "session".to_string(),
@@ -11875,7 +12167,7 @@ mod tests_status {
 
         let app = AppState::new();
         let event_sink = RecordingDiarizationEventSink::default();
-        let session_id = "live-diarization-retcon-session-relative";
+        let session_id = &*app.current_session_id();
         let diarization_dispatch = DiarizationDispatchContext {
             event_sink: &event_sink,
             speaker_timeline: &app.speaker_timeline,
@@ -11969,7 +12261,7 @@ mod tests_status {
 
         let app = AppState::new();
         let event_sink = RecordingDiarizationEventSink::default();
-        let session_id = "live-diarization-retcon-edge-eviction";
+        let session_id = &*app.current_session_id();
         let diarization_dispatch = DiarizationDispatchContext {
             event_sink: &event_sink,
             speaker_timeline: &app.speaker_timeline,
@@ -12081,7 +12373,7 @@ mod tests_status {
 
         let app = AppState::new();
         let event_sink = RecordingDiarizationEventSink::default();
-        let session_id = "live-diarization-retcon-fallback-anchor";
+        let session_id = &*app.current_session_id();
         let diarization_dispatch = DiarizationDispatchContext {
             event_sink: &event_sink,
             speaker_timeline: &app.speaker_timeline,

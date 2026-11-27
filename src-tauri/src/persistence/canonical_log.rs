@@ -1451,6 +1451,7 @@ pub struct CanonicalAppendDurabilityReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalAppendRejection {
+    ArtifactTooLarge,
     InvalidEventId,
     InvalidCausalEventId,
     InvalidBasisHead,
@@ -1725,7 +1726,14 @@ pub fn load_canonical_stream<T: DeserializeOwned>(
         operation: CanonicalIoOperation::Read,
         kind: error.kind(),
     })?;
-    match parse_structural_records(&bytes, session_id, stream_id, domain_schema_version) {
+    // Only an LF commits a speaker record. Read-only replay ignores an interrupted suffix;
+    // it does not repair or modify the source.
+    let bytes = if mixed_speaker_versions(stream_id, domain_schema_version) {
+        &bytes[..bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)]
+    } else {
+        bytes.as_slice()
+    };
+    match parse_structural_records(bytes, session_id, stream_id, domain_schema_version) {
         Ok(snapshot) => raw_to_typed(snapshot),
         Err(failure) => Err(failure.error),
     }
@@ -1883,6 +1891,27 @@ where
         )
     }
 
+    pub(super) fn open_speaker(
+        path: &Path,
+        session_id: &str,
+        recovery: CanonicalTailRecovery,
+    ) -> Result<Self, CanonicalLogError> {
+        let file = open_locked_appender(path)?;
+        Self::from_locked_file(
+            path.into(),
+            session_id.into(),
+            "speaker_revisions".into(),
+            2,
+            recovery,
+            Box::new(file),
+        )
+    }
+    pub(super) fn speaker_version(&self) -> u32 {
+        self.domain_schema_version
+    }
+    pub(super) fn activate_speaker_v2(&mut self) {
+        self.domain_schema_version = 2;
+    }
     fn from_locked_file(
         path: PathBuf,
         session_id: String,
@@ -1940,6 +1969,11 @@ where
         };
         let initial_quarantine = raw.tail_quarantine.clone();
         let cache = cache_from_raw::<T>(&raw)?;
+        let domain_schema_version = if mixed_speaker_versions(&stream_id, domain_schema_version) {
+            raw.records.last().map_or(1, |r| r.domain_schema_version)
+        } else {
+            domain_schema_version
+        };
 
         // A fresh barrier on open prevents a post-crash, previously uncertain
         // complete frame from being treated as accepted merely because it is
@@ -1994,6 +2028,13 @@ where
         &mut self,
         metadata: &CanonicalEventMetadata,
         payload: &T,
+    ) -> CanonicalAppendOutcome {
+        self.append_serializable(metadata, payload)
+    }
+    pub(super) fn append_serializable(
+        &mut self,
+        metadata: &CanonicalEventMetadata,
+        payload: &impl Serialize,
     ) -> CanonicalAppendOutcome {
         let normalized = match normalize_event_metadata(metadata) {
             Ok(metadata) => metadata,
@@ -2129,6 +2170,12 @@ where
         frame.push(b' ');
         frame.extend_from_slice(&json);
         frame.push(b'\n');
+        if self.stream_id == "speaker_revisions"
+            && self.byte_len.saturating_add(frame.len() as u64)
+                > super::MAX_DIARIZATION_EVENTS_BYTES
+        {
+            return CanonicalAppendOutcome::Rejected(CanonicalAppendRejection::ArtifactTooLarge);
+        }
 
         self.attempt_pending(PendingAppend {
             event_id: wire.event_id,
@@ -2512,6 +2559,27 @@ fn raw_to_typed<T: DeserializeOwned>(
 fn validate_payload_schema<T: DeserializeOwned>(
     records: &[RawCanonicalRecord],
 ) -> Result<(), CanonicalLogError> {
+    if records
+        .iter()
+        .any(|r| mixed_speaker_versions(&r.stream_id, r.domain_schema_version))
+    {
+        let mut timeline = crate::projections::SpeakerTimeline::new(&records[0].session_id);
+        for (index, r) in records.iter().enumerate() {
+            let error = || CanonicalLogError::PayloadDecode {
+                record_index: index + 1,
+            };
+            let row: super::speaker_log::CompatibleSpeakerRevisionRecord =
+                serde_json::from_value(r.payload.clone()).map_err(|_| error())?;
+            row.fold(
+                r.domain_schema_version,
+                &r.event_id,
+                Some(&mut timeline),
+                None,
+            )
+            .map_err(|_| error())?;
+        }
+        return Ok(());
+    }
     for (index, record) in records.iter().enumerate() {
         serde_json::from_value::<T>(record.payload.clone()).map_err(|_| {
             CanonicalLogError::PayloadDecode {
@@ -2551,6 +2619,9 @@ fn cache_from_raw<T: DeserializeOwned>(
     })
 }
 
+fn mixed_speaker_versions(stream_id: &str, version: u32) -> bool {
+    stream_id == "speaker_revisions" && version == 2
+}
 fn parse_structural_records(
     bytes: &[u8],
     session_id: &str,
@@ -2569,6 +2640,17 @@ fn parse_structural_records(
             .map(|relative| offset + relative);
         let newline_terminated = newline.is_some();
         let line_end = newline.unwrap_or(bytes.len());
+        if !newline_terminated && mixed_speaker_versions(stream_id, domain_schema_version) {
+            return Err(StructuralFailure {
+                valid_up_to: offset,
+                repairable_unterminated_tail: true,
+                error: CanonicalLogError::CorruptRecord {
+                    record_index: records.len() + 1,
+                    reason: CanonicalCorruptionReason::InvalidFrame,
+                    newline_terminated: false,
+                },
+            });
+        }
         let mut line = &bytes[offset..line_end];
         if newline_terminated && line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
@@ -2599,6 +2681,21 @@ fn parse_structural_records(
             framed_seen,
         ) {
             Ok(record) => {
+                if mixed_speaker_versions(stream_id, domain_schema_version)
+                    && records.last().is_some_and(|prev| {
+                        prev.domain_schema_version > record.domain_schema_version
+                    })
+                {
+                    return Err(StructuralFailure {
+                        valid_up_to: offset,
+                        repairable_unterminated_tail: false,
+                        error: CanonicalLogError::CorruptRecord {
+                            record_index,
+                            reason: CanonicalCorruptionReason::DomainSchemaVersionMismatch,
+                            newline_terminated,
+                        },
+                    });
+                }
                 if record.encoding == CanonicalRecordEncoding::FramedV1 && !newline_terminated {
                     return Err(StructuralFailure {
                         error: CanonicalLogError::CorruptRecord {
@@ -2677,6 +2774,12 @@ fn parse_structural_record(
         return Err(CanonicalCorruptionReason::LegacyRecordAfterFramedRecord);
     }
 
+    // A bare prefix was written under v1. Its synthetic hashes must use exactly that version.
+    let domain_schema_version = if mixed_speaker_versions(stream_id, domain_schema_version) {
+        1
+    } else {
+        domain_schema_version
+    };
     let payload: Value =
         serde_json::from_slice(line).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
     let payload = canonicalize_json_value(payload);
@@ -2770,8 +2873,26 @@ fn parse_framed_v1(
     if wire.stream_id != stream_id {
         return Err(CanonicalCorruptionReason::StreamMismatch);
     }
-    if wire.domain_schema_version != domain_schema_version {
+    if wire.domain_schema_version != domain_schema_version
+        && !(mixed_speaker_versions(stream_id, domain_schema_version)
+            && wire.domain_schema_version == 1)
+    {
         return Err(CanonicalCorruptionReason::DomainSchemaVersionMismatch);
+    }
+    let domain_schema_version = wire.domain_schema_version;
+    if mixed_speaker_versions(stream_id, domain_schema_version)
+        && !matches!(
+            wire.payload.get("type").and_then(Value::as_str),
+            Some("span_revision" | "relabel_batch")
+        )
+    {
+        return Err(CanonicalCorruptionReason::InvalidFrame);
+    }
+    if stream_id == "speaker_revisions"
+        && domain_schema_version == 1
+        && wire.payload.get("type").is_some()
+    {
+        return Err(CanonicalCorruptionReason::InvalidFrame);
     }
     if wire.sequence != expected_sequence {
         return Err(CanonicalCorruptionReason::SequenceMismatch);

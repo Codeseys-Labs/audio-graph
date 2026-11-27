@@ -51,6 +51,7 @@ pub mod events;
 pub mod fs_util;
 pub mod gemini;
 pub mod graph;
+pub mod identity;
 pub mod llm;
 pub mod logging;
 pub mod models;
@@ -640,6 +641,11 @@ pub fn run() {
             commands::answer_question_card,
             commands::ask_question_card,
             commands::merge_graph_entities,
+            commands::relabel_speaker_cluster,
+            commands::mark_cluster_is_self,
+            commands::merge_speaker_clusters,
+            commands::unbind_speaker_cluster,
+            commands::list_session_speaker_clusters,
             commands::list_available_models,
             commands::download_model_cmd,
             commands::get_model_status,
