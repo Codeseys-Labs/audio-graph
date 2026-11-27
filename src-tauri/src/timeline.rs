@@ -13,10 +13,10 @@
 //!   `speakerTimeline.ts` does, done backend per ADR-0026 F3 so a *loaded*
 //!   session resolves trustworthy speakers without the store-side gap).
 //! - live [`TemporalKnowledgeGraph`] — the per-utterance "relates to" links,
-//!   grouped by [`TemporalEdge::source_segment_id`](crate::graph::temporal).
+//!   grouped by every contributing segment key, including folded relations.
 //!
 //! **Why the LIVE graph, not the materialized graph (ADR-0026 §4.1, sev4
-//! critique).** Only the live `TemporalEdge` carries `source_segment_id`; the
+//! critique).** Only the live `TemporalEdge` carries per-segment provenance;
 //! `MaterializedGraphEdge` carries only the whole-window `basis`. Folding the
 //! per-utterance edge join over the materialized graph would leave every
 //! `related_edge_ids` silently empty. The materialized graph is reserved for the
@@ -26,7 +26,7 @@
 //!
 //! **Media-time sort** (by `start_time`) is the backbone: transcript and
 //! diarization persist to separate JSONL logs with no merged wall-clock stream,
-//! so media time is the only axis both share. The build is `O(spans + edges)`.
+//! so media time is the only axis both share.
 //!
 //! **Privacy (ADR-0026 F2).** [`TimelineEntry`] carries raw `text` +
 //! `speaker_label`, so — like [`TranscriptEvent`](crate::projections) and
@@ -105,7 +105,7 @@ impl fmt::Debug for TimelineEntry {
 /// event-sourced structures. See the module docs for the design rationale
 /// (ADR-0026 §4.1); in particular `live_graph` MUST be the live
 /// [`TemporalKnowledgeGraph`] (the only structure carrying per-utterance
-/// `source_segment_id`), never a materialized graph.
+/// provenance), never a materialized graph.
 ///
 /// - One entry per surviving span (the ledger already collapses each span to its
 ///   latest accepted revision), ordered by media-clock `start_ms`
@@ -114,8 +114,8 @@ impl fmt::Debug for TimelineEntry {
 /// - `speaker_id`/`speaker_label` are resolved via the [`SpeakerTimeline`]
 ///   latest-revision-wins attribution index; a span the timeline does not
 ///   attribute keeps its inline ASR label.
-/// - `related_edge_ids` are the live edges whose `source_segment_id` matches the
-///   span's segment/span id.
+/// - `related_edge_ids` are the live edges with a contribution matching the
+///   span's segment/span id, using the seek hint only on legacy edges.
 pub fn build_session_timeline(
     ledger: &TranscriptLedger,
     speakers: &SpeakerTimeline,
@@ -359,6 +359,7 @@ mod tests {
                 target: target.to_string(),
                 relation_type: relation.to_string(),
                 detail: None,
+                speaker_endpoint_mask: crate::graph::entities::SpeakerEndpointMask::Source,
             }],
         }
     }
@@ -586,9 +587,8 @@ mod tests {
             "live edge is linked pre-retcon"
         );
 
-        // Retcon: merge "Speaker 2" into "Alice". The original seg-a edge is
-        // invalidated (valid_until set) and re-pointed onto the canonical node
-        // with a fresh source_segment_id-less identity carried from the repoint.
+        // The old edge is hidden, but both contributing turns still link to
+        // the live result of folding onto Alice's existing relation.
         graph.process_extraction(
             &extraction("Alice", "Deadline", "mentions"),
             2.0,
@@ -599,13 +599,9 @@ mod tests {
         assert!(invalidated > 0, "the retcon must invalidate the seg-a edge");
 
         let after = build_session_timeline(&ledger, &speakers, &graph);
-        // The invalidated edge no longer surfaces on span-a; the re-pointed live
-        // edge carries seg-later (not seg-a), so span-a ends up with no links.
-        assert!(
-            after[0].related_edge_ids.is_empty(),
-            "an invalidated (retconned) edge must be excluded, got {:?}",
-            after[0].related_edge_ids
-        );
+        let live = graph.snapshot();
+        assert_eq!(after[0].related_edge_ids, [live.links[0].id.clone()]);
+        assert_ne!(after[0].related_edge_ids, before[0].related_edge_ids);
     }
 
     #[test]

@@ -60,9 +60,11 @@ Invariants:
 ### 3. Provenance-preserving graph retcon (`audio-graph-94a1` and `audio-graph-c321`)
 
 - **Standalone provider speaker revisions (`94a1`):** Extend `SpeakerLabelRemap` to carry exact turn/segment anchors and old/new cluster identifiers. Route every standalone provider remap through `RelabelScope::Segments`, never whole-entity `supersede_entity`. Missing or ambiguous anchors must not widen a correction to the whole speaker entity.
+  AssemblyAI finals and revisions share a source-qualified turn key; the live graph uses the ASR span ID so display segment IDs reused by two sources cannot move both turns.
 - **Folded-edge and entity speaker provenance (`c321`):**
   - `TemporalEdge.contributions: Option<Vec<EdgeContribution>>` records per-contribution `(segment_key, origin_cluster, current_cluster, speaker_endpoint_mask, weight, observed_at_ms)` and is preserved across both `add_relation` folds and retcon refolds (`source_segment_id` remains a seek hint).
   - `GraphEntity.speaker_mentions: Option<Vec<SpeakerMention>>` records per-segment/per-cluster mention provenance so `GraphEntity.speakers` is deterministically rebuilt from surviving mentions rather than left stale.
+  The live graph records origin/current speaker labels and session-relative observation seconds; canonical cluster references are owned by the speaker identity stream.
   - `TemporalKnowledgeGraph::reattribute_speaker(from, to, scope, ts)`:
     - `Entity` scope: when `to` is absent, rename `from` in place (preserving node UUID/index and incident edges, adding old name as deduplicated alias, updating `name_index` and all `speaker_mentions`); when `to` exists, merge preserving all contributions and mentions even when 0 live edges exist.
     - `Segments` scope: partition live edge contributions by `(segment_key, old_cluster)`, retarget only speaker-role endpoints on selected contributions, retire the changed aggregate at `ts`, refold moved and residual contributions separately, and rebuild `speakers` on every affected entity.

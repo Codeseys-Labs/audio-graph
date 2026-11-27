@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Speaker revisions now correct only the affected turn in the graph, preserving
+  other turns and their timeline links. Whole-speaker renames keep the original
+  graph node when the new name is unused.
+
 ## [0.1.0-rc.1] - 2026-05-20
 
 First release candidate. The full STT → LLM → TTS pipeline is wired

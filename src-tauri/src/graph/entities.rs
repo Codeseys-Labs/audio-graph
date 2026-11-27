@@ -26,6 +26,17 @@ pub struct GraphEntity {
     pub description: Option<String>,
     /// Which speakers mentioned this entity.
     pub speakers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_ref: Option<String>,
+    /// Per-turn support for `speakers`; absent on legacy graph nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_mentions: Option<Vec<SpeakerMention>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerMention {
+    pub segment_id: Option<String>,
+    pub speaker_label: String,
 }
 
 /// An edge in the knowledge graph representing a relationship between entities.
@@ -187,6 +198,29 @@ pub struct ExtractedRelation {
     pub relation_type: String,
     #[serde(default)]
     pub detail: Option<String>,
+    /// Endpoints derived from who said the segment rather than a literal name.
+    #[serde(default)]
+    pub speaker_endpoint_mask: SpeakerEndpointMask,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerEndpointMask {
+    #[default]
+    Neither,
+    Source,
+    Target,
+    Both,
+}
+
+impl SpeakerEndpointMask {
+    pub(crate) fn source(self) -> bool {
+        matches!(self, Self::Source | Self::Both)
+    }
+
+    pub(crate) fn target(self) -> bool {
+        matches!(self, Self::Target | Self::Both)
+    }
 }
 
 // ---------------------------------------------------------------------------

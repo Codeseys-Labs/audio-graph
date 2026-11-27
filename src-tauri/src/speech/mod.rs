@@ -3,7 +3,7 @@
 //! Contains the speech processor logic (ASR + diarization + entity extraction)
 //! extracted from `commands.rs` to keep command handlers thin.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,9 +62,9 @@ use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
 use crate::events::{self, PipelineStatus, StageStatus};
-use crate::graph::entities::{ExtractionResult, GraphDelta, GraphSnapshot};
+use crate::graph::entities::{ExtractedEntity, ExtractionResult, GraphDelta, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
-use crate::graph::temporal::TemporalKnowledgeGraph;
+use crate::graph::temporal::{RelabelScope, TemporalKnowledgeGraph};
 use crate::llm::{
     ApiClient, LlmEngine, LlmExecutor, LlmPriority, MistralRsEngine, ProjectionPatchAttempt,
 };
@@ -268,6 +268,49 @@ fn diarization_revision_anchor_id(revision: &DiarizationSpanRevision) -> &str {
         .unwrap_or("")
 }
 
+/// Graph extractions may have cited an ASR span or its display segment. A
+/// display ID shared by multiple spans (e.g. AssemblyAI `turn-1@final` across
+/// sources) is not an exact anchor and must not move either turn's old edges.
+fn diarization_graph_segment_ids(
+    revision: &DiarizationSpanRevision,
+    ledger: &TranscriptLedger,
+) -> BTreeSet<String> {
+    let spans: BTreeSet<_> = revision
+        .basis_asr_span_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    let mut segments: BTreeSet<_> = revision
+        .basis_transcript_segment_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    segments.extend(
+        ledger
+            .latest_spans
+            .iter()
+            .filter(|event| spans.contains(event.span_id.as_str()))
+            .filter_map(|event| event.transcript_segment_id.as_deref()),
+    );
+    let mut result: BTreeSet<_> = spans.iter().map(|&id| id.to_owned()).collect();
+    for segment in segments {
+        let mut owners = ledger
+            .latest_spans
+            .iter()
+            .filter(|event| event.transcript_segment_id.as_deref() == Some(segment));
+        let owner = owners.next();
+        if owners.next().is_none()
+            && (spans.is_empty()
+                || owner.is_some_and(|event| spans.contains(event.span_id.as_str())))
+        {
+            result.insert(segment.to_owned());
+        }
+    }
+    result
+}
+
 fn millis_from_secs(value: f64) -> i64 {
     if value.is_finite() {
         (value * 1000.0).round() as i64
@@ -461,6 +504,7 @@ fn dispatch_diarization_span_revision(
     graph: &mut TemporalKnowledgeGraph,
     revision: DiarizationSpanRevision,
     timestamp: f64,
+    segment_ids: BTreeSet<String>,
 ) -> DiarizationRevisionOutcome {
     let remap = match timeline.apply_event(revision) {
         Ok(remap) => remap,
@@ -474,7 +518,9 @@ fn dispatch_diarization_span_revision(
         }
     };
 
-    let Some(remap) = remap else {
+    let Some(remap) =
+        remap.filter(|remap| !remap.basis_segment_ids.is_empty() && !segment_ids.is_empty())
+    else {
         return DiarizationRevisionOutcome {
             accepted: true,
             retcon_fired: false,
@@ -482,16 +528,16 @@ fn dispatch_diarization_span_revision(
         };
     };
 
-    let invalidated = graph.supersede_entity(
+    let result = graph.reattribute_speaker(
         &remap.superseded_label,
         &remap.canonical_label,
+        RelabelScope::Segments { segment_ids },
         timestamp,
-        1.0,
     );
     DiarizationRevisionOutcome {
         accepted: true,
-        retcon_fired: invalidated > 0,
-        edges_retconned: invalidated,
+        retcon_fired: result.changed(),
+        edges_retconned: result.edges_retconned,
     }
 }
 
@@ -523,7 +569,7 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
     // `apply_extraction_result_if_current`'s held ledger guard). So the ledger
     // lock stays up-front and unconditional; it is intentionally paid on
     // every revision to keep the lock order fixed, not an oversight.
-    let timestamp = {
+    let (timestamp, segment_ids) = {
         let ledger = match dispatch_ctx.transcript_ledger.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -531,9 +577,16 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
                 poisoned.into_inner()
             }
         };
-        ledger.session_relative_timestamp(
-            diarization_revision_anchor_id(&revision),
-            current_unix_millis(),
+        (
+            ledger.session_relative_timestamp(
+                diarization_revision_anchor_id(&revision),
+                current_unix_millis(),
+            ),
+            if revision.revision_number > 1 {
+                diarization_graph_segment_ids(&revision, &ledger)
+            } else {
+                BTreeSet::new()
+            },
         )
     };
 
@@ -557,6 +610,7 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
             &mut graph,
             revision.clone(),
             timestamp,
+            segment_ids,
         );
         if outcome.retcon_fired {
             let delta = graph.has_delta().then(|| graph.take_delta());
@@ -2143,7 +2197,7 @@ pub(crate) fn process_extraction_and_emit(
 /// rotation cannot clear the new session between validation and commit.
 #[allow(clippy::too_many_arguments)]
 fn apply_extraction_result_if_current(
-    extraction_result: ExtractionResult,
+    mut extraction_result: ExtractionResult,
     speaker: &str,
     segment_id: &str,
     timestamp: f64,
@@ -2171,11 +2225,25 @@ fn apply_extraction_result_if_current(
     if !extraction_result.entities.is_empty() {
         let graph_start = Instant::now();
         {
+            // The provider can correct a turn while the extraction is queued
+            // or running. Consult the exact turn under the timeline lock and
+            // keep that lock through graph mutation (timeline -> graph).
+            let timeline = deps
+                .turn_speaker_timeline
+                .map(|timeline| timeline.lock().unwrap_or_else(|e| e.into_inner()));
+            let label = timeline
+                .as_ref()
+                .and_then(|timeline| assemblyai_turn_speaker_label(timeline, segment_id))
+                .unwrap_or(speaker);
+            if label != speaker {
+                retarget_extraction_speaker(&mut extraction_result, speaker, label);
+            }
             let mut graph = deps.knowledge_graph.lock().unwrap_or_else(|e| {
                 log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
                 e.into_inner()
             });
-            graph.process_extraction(&extraction_result, timestamp, speaker, segment_id);
+            graph.process_extraction(&extraction_result, timestamp, label, segment_id);
+            drop(timeline);
 
             *graph_update_count += 1;
 
@@ -2245,6 +2313,52 @@ fn apply_extraction_result_if_current(
         extraction_elapsed,
     );
     true
+}
+
+fn assemblyai_turn_speaker_label<'a>(
+    timeline: &'a SpeakerTimeline,
+    asr_span_id: &str,
+) -> Option<&'a str> {
+    let speaker_span_id = assemblyai_turn_speaker_span_id(asr_span_id);
+    timeline
+        .latest_spans
+        .iter()
+        .find(|span| span.span_id == speaker_span_id)
+        .and_then(|span| span.speaker_label.as_deref())
+        .filter(|label| !label.trim().is_empty())
+}
+
+fn retarget_extraction_speaker(extraction: &mut ExtractionResult, from: &str, to: &str) {
+    let mut attributed = false;
+    for relation in &mut extraction.relations {
+        for (name, is_speaker) in [
+            (
+                &mut relation.source,
+                relation.speaker_endpoint_mask.source(),
+            ),
+            (
+                &mut relation.target,
+                relation.speaker_endpoint_mask.target(),
+            ),
+        ] {
+            if is_speaker && name.eq_ignore_ascii_case(from) {
+                to.clone_into(name);
+                attributed = true;
+            }
+        }
+    }
+    if attributed
+        && !extraction
+            .entities
+            .iter()
+            .any(|entity| entity.name.eq_ignore_ascii_case(to))
+    {
+        extraction.entities.push(ExtractedEntity {
+            name: to.to_owned(),
+            entity_type: "Person".to_owned(),
+            description: None,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3938,18 +4052,27 @@ fn emit_transcript_and_extract_with_meta(
         transcript_ledger: &ctx.transcript_ledger,
         session_id: &diarization_session_id,
     };
-    emit_diarization_span_revision_for_transcript(
-        &diarization_dispatch,
-        ctx.asr_provider,
-        &segment,
-        &span_id,
-        channel,
-        raw_event_ref,
-    );
+    if ctx.asr_provider != "assemblyai" {
+        emit_diarization_span_revision_for_transcript(
+            &diarization_dispatch,
+            ctx.asr_provider,
+            &segment,
+            &span_id,
+            channel,
+            raw_event_ref,
+        );
+    }
     let _ = ctx.app_handle.emit(events::TRANSCRIPT_UPDATE, &segment);
     if let Some(info) = speaker_info.as_ref() {
         let _ = ctx.app_handle.emit(events::SPEAKER_DETECTED, info);
     }
+    // AssemblyAI's display id is not source-qualified. Use the exact ASR
+    // turn key for extraction provenance so another source cannot share it.
+    let extraction_segment_id = if ctx.asr_provider == "assemblyai" {
+        span_id.clone()
+    } else {
+        segment.id.clone()
+    };
     spawn_agent_proposal_task(
         segment.clone(),
         active_session_id_snapshot(&ctx.active_session_id),
@@ -4016,7 +4139,7 @@ fn emit_transcript_and_extract_with_meta(
             .clone()
             .unwrap_or_else(|| "Unknown".to_string()),
         context,
-        segment.id.clone(),
+        extraction_segment_id,
         segment.start_time,
         extraction_count,
         graph_update_count,
@@ -4267,6 +4390,51 @@ fn assemblyai_source_id_from_span_id(span_id: &str) -> String {
         .to_string()
 }
 
+fn assemblyai_turn_speaker_span_id(asr_span_id: &str) -> String {
+    format!("{asr_span_id}:speaker")
+}
+
+/// Seed a turn's speaker from the first accepted final. A standalone provider
+/// correction that arrived even earlier outranks the inline label.
+fn assemblyai_initial_turn_speaker(
+    turn: &events::AsrSpanRevisionPayload,
+    speaker_revision_numbers_by_span: &HashMap<String, u64>,
+) -> Option<events::DiarizationSpanRevisionPayload> {
+    if !turn.is_final {
+        return None;
+    }
+    let speaker_label = turn
+        .speaker_label
+        .as_ref()
+        .filter(|label| !label.trim().is_empty())?;
+    let span_id = assemblyai_turn_speaker_span_id(&turn.span_id);
+    if speaker_revision_numbers_by_span.contains_key(&span_id) {
+        return None;
+    }
+    Some(events::DiarizationSpanRevisionPayload {
+        span_id,
+        provider: turn.provider.clone(),
+        timeline_id: turn.source_id.clone(),
+        source_id: Some(turn.source_id.clone()),
+        speaker_id: turn.speaker_id.clone(),
+        speaker_label: Some(speaker_label.clone()),
+        channel: turn.channel.clone(),
+        start_time: turn.start_time,
+        end_time: turn.end_time,
+        confidence: None,
+        is_final: true,
+        stability: events::DiarizationSpanStability::Final,
+        revision_number: 1,
+        supersedes: None,
+        basis_asr_span_ids: vec![turn.span_id.clone()],
+        basis_transcript_segment_ids: turn.transcript_segment_id.iter().cloned().collect(),
+        raw_event_ref: turn.raw_event_ref.clone(),
+        capture_latency_ms: turn.capture_latency_ms,
+        asr_latency_ms: turn.asr_latency_ms,
+        received_at_ms: turn.received_at_ms,
+    })
+}
+
 fn emit_assemblyai_speaker_revision(
     revision: &crate::asr::assemblyai::AssemblyAiV3SpeakerRevision,
     ctx: &TranscriptProcessingContext,
@@ -4312,10 +4480,7 @@ fn emit_assemblyai_speaker_revision_with_dispatch<E: DiarizationEventSink + ?Siz
         .filter_map(|word| word.end_time)
         .max_by(f64::total_cmp)
         .unwrap_or(start_time);
-    let span_id = format!(
-        "assemblyai:{source_id}:turn-{}:speaker",
-        revision.turn_order
-    );
+    let span_id = assemblyai_turn_speaker_span_id(&revision.span_id);
     let (revision_number, supersedes) =
         next_span_revision(speaker_revision_numbers_by_span, &span_id);
 
@@ -4404,6 +4569,7 @@ fn flush_batch(
     let deps = ExtractionDeps {
         active_session_id: &ctx.active_session_id,
         transcript_ledger: &ctx.transcript_ledger,
+        turn_speaker_timeline: (ctx.asr_provider == "assemblyai").then_some(&ctx.speaker_timeline),
         expected_session_id: &expected_session_id,
         llm_engine: &ctx.llm_engine,
         api_client: &ctx.api_client,
@@ -4444,6 +4610,26 @@ fn coalesce_submit(
 ) {
     let now = Instant::now();
     let trimmed = text.trim();
+    if ctx.asr_provider == "assemblyai" {
+        // Each of its turns can be revised independently. Coalescing would
+        // attach earlier turns' facts to the final turn's provenance key.
+        flush_batch(
+            ctx,
+            PendingBatch {
+                speaker,
+                text,
+                context,
+                last_segment_id: segment_id,
+                first_ts: timestamp,
+                seg_count: 1,
+                last_push: now,
+                batch_start: now,
+            },
+            extraction_count,
+            graph_update_count,
+        );
+        return;
+    }
     let mut to_flush: Option<PendingBatch> = None;
     {
         let mut guard = ctx
@@ -4559,6 +4745,7 @@ pub(crate) fn spawn_extraction_task(
     let app_handle = deps.app_handle.clone();
     let active_session_id = deps.active_session_id.clone();
     let transcript_ledger = deps.transcript_ledger.clone();
+    let turn_speaker_timeline = deps.turn_speaker_timeline.cloned();
     let expected_session_id = deps.expected_session_id.to_string();
     let llm_allow_cloud_fallbacks = deps.llm_allow_cloud_fallbacks;
     let extraction_count = extraction_count.clone();
@@ -4570,6 +4757,7 @@ pub(crate) fn spawn_extraction_task(
         let owned_deps = ExtractionDeps {
             active_session_id: &active_session_id,
             transcript_ledger: &transcript_ledger,
+            turn_speaker_timeline: turn_speaker_timeline.as_ref(),
             expected_session_id: &expected_session_id,
             llm_engine: &llm_engine,
             api_client: &api_client,
@@ -6076,6 +6264,7 @@ pub(crate) fn run_speech_processor_diarization_only(
             &ExtractionDeps {
                 active_session_id: &shared.active_session_id,
                 transcript_ledger: &shared.transcript_ledger,
+                turn_speaker_timeline: None,
                 expected_session_id: &expected_session_id,
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
@@ -7928,13 +8117,33 @@ fn run_assemblyai_event_receiver(
                     if revision.payload.is_final {
                         asr_count += 1;
                     }
-                    let _ = emit_provider_span_revision_payload(
+                    let initial_speaker = assemblyai_initial_turn_speaker(
+                        &revision.payload,
+                        &speaker_revision_numbers_by_span,
+                    );
+                    if emit_provider_span_revision_payload(
                         revision.payload,
                         &ctx,
                         asr_count,
                         &extraction_count,
                         &graph_update_count,
-                    );
+                    ) && let Some(initial_speaker) = initial_speaker
+                    {
+                        let event_sink = TauriDiarizationEventSink {
+                            app_handle: &ctx.app_handle,
+                        };
+                        let session_id = ctx.projection_runtime.current_session_id();
+                        let dispatch = DiarizationDispatchContext {
+                            event_sink: &event_sink,
+                            speaker_timeline: &ctx.speaker_timeline,
+                            knowledge_graph: &ctx.knowledge_graph,
+                            graph_snapshot: &ctx.graph_snapshot,
+                            transcript_ledger: &ctx.transcript_ledger,
+                            session_id: &session_id,
+                        };
+                        speaker_revision_numbers_by_span.insert(initial_speaker.span_id.clone(), 1);
+                        emit_and_dispatch_diarization_span_revision(&dispatch, initial_speaker);
+                    }
                 }
 
                 if parsed.terminated {
@@ -10229,6 +10438,7 @@ mod tests_status {
             let deps = ExtractionDeps {
                 active_session_id: &shared.active_session_id,
                 transcript_ledger: &shared.transcript_ledger,
+                turn_speaker_timeline: None,
                 expected_session_id: &expected_session_id,
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
@@ -11143,7 +11353,10 @@ mod tests_status {
 
     #[test]
     fn assemblyai_speaker_revision_emission_retcons_graph_on_label_remap() {
-        use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+        use crate::asr::assemblyai::AssemblyAiV3Parser;
+        use crate::graph::entities::{
+            ExtractedEntity, ExtractedRelation, ExtractionResult, SpeakerEndpointMask,
+        };
 
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -11163,52 +11376,80 @@ mod tests_status {
             session_id,
         };
 
+        let mut parser = AssemblyAiV3Parser::new("source-retcon");
+        let turn = parser.parse_message(
+            r#"{"type":"Turn","turn_order":7,"end_of_turn":true,"turn_is_formatted":true,"speaker_label":"2","transcript":"I know Bob","words":[]}"#,
+            1_700_000_000_001,
+        ).unwrap().revisions.remove(0).payload;
+        assert_eq!(turn.speaker_label.as_deref(), Some("Speaker 2"));
+        {
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger.apply_event(turn.clone().into()).unwrap();
+            // Another source can reuse the provider's unqualified display ID.
+            ledger
+                .apply_event(
+                    AsrSpanRevisionPayload {
+                        span_id: "assemblyai:other-source:turn-7".into(),
+                        source_id: "other-source".into(),
+                        ..turn.clone()
+                    }
+                    .into(),
+                )
+                .unwrap();
+        }
+
         {
             let mut graph = app
                 .knowledge_graph
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            let extraction = ExtractionResult {
+                entities: vec![
+                    ExtractedEntity {
+                        name: "Speaker 2".to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                    ExtractedEntity {
+                        name: "Alice".to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                    ExtractedEntity {
+                        name: "Bob".to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                ],
+                relations: vec![ExtractedRelation {
+                    source: "Speaker 2".to_string(),
+                    target: "Bob".to_string(),
+                    relation_type: "knows".to_string(),
+                    detail: None,
+                    speaker_endpoint_mask: SpeakerEndpointMask::Source,
+                }],
+            };
+            let mut other_turn = extraction.clone();
+            other_turn.relations[0].relation_type = "greets".to_owned();
             graph.process_extraction(
-                &ExtractionResult {
-                    entities: vec![
-                        ExtractedEntity {
-                            name: "Speaker 2".to_string(),
-                            entity_type: "Person".to_string(),
-                            description: None,
-                        },
-                        ExtractedEntity {
-                            name: "Alice".to_string(),
-                            entity_type: "Person".to_string(),
-                            description: None,
-                        },
-                        ExtractedEntity {
-                            name: "Bob".to_string(),
-                            entity_type: "Person".to_string(),
-                            description: None,
-                        },
-                    ],
-                    relations: vec![ExtractedRelation {
-                        source: "Speaker 2".to_string(),
-                        target: "Bob".to_string(),
-                        relation_type: "knows".to_string(),
-                        detail: None,
-                    }],
-                },
-                1.0,
+                &other_turn,
+                0.5,
                 "Speaker 2",
-                "seg-1",
+                "assemblyai:source-retcon:turn-6",
             );
+            // Old graph artifacts may have retained only this ambiguous key.
+            graph.process_extraction(&other_turn, 0.75, "Speaker 2", "turn-7@final");
+            graph.process_extraction(&extraction, 1.0, "Speaker 2", &turn.span_id);
             let _ = graph.take_delta();
         }
 
         let mut revision_numbers_by_span = HashMap::new();
 
-        let first_outcome = emit_assemblyai_speaker_revision_with_dispatch(
-            &assemblyai_speaker_revision("speaker-2", "Speaker 2"),
-            &diarization_dispatch,
-            &mut revision_numbers_by_span,
-            1_700_000_000_001,
-        );
+        let initial = super::assemblyai_initial_turn_speaker(&turn, &revision_numbers_by_span)
+            .expect("first final seeds the provider's turn-scoped speaker revision");
+        revision_numbers_by_span.insert(initial.span_id.clone(), 1);
+        let first_outcome =
+            emit_and_dispatch_diarization_span_revision(&diarization_dispatch, initial);
         assert!(first_outcome.accepted);
         assert!(!first_outcome.retcon_fired);
         assert_eq!(first_outcome.edges_retconned, 0);
@@ -11216,7 +11457,7 @@ mod tests_status {
         assert_eq!(
             event_sink.graph_delta_count(),
             0,
-            "first-seen provisional label should not retcon"
+            "first-seen turn label should not retcon"
         );
 
         let second_outcome = emit_assemblyai_speaker_revision_with_dispatch(
@@ -11268,9 +11509,71 @@ mod tests_status {
             live_knows[0].source, alice_id,
             "speaker-label remap should re-point the live edge to Alice"
         );
+        let prior_speaker = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name == "Speaker 2")
+            .unwrap();
+        let other_turn = snapshot
+            .links
+            .iter()
+            .find(|link| link.relation_type == "greets")
+            .unwrap();
+        assert_eq!(other_turn.source, prior_speaker.id);
+        assert_eq!(
+            other_turn.weight, 2.0,
+            "unrelated and ambiguous keys both stay put"
+        );
+        assert_eq!(snapshot.links.len(), 2);
 
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unanchored_diarization_remap_never_merges_whole_speakers() {
+        let mut timeline = SpeakerTimeline::new("test");
+        let mut graph = crate::graph::TemporalKnowledgeGraph::new();
+        seed_provisional_speaker_graph(&mut graph, "seg-1");
+        let (mut original, mut correction) =
+            diarization_relabel_pair("diarization", "seg-1", 1.0, "Speaker 2", "Alice");
+        original.basis_asr_span_ids.clear();
+        correction.basis_asr_span_ids.clear();
+        for revision in [original, correction] {
+            let outcome = super::dispatch_diarization_span_revision(
+                &mut timeline,
+                &mut graph,
+                revision.into(),
+                2.0,
+                Default::default(),
+            );
+            assert!(outcome.accepted);
+            assert!(!outcome.retcon_fired);
+        }
+        assert_eq!(
+            graph.live_edge_valid_from_for_test("Speaker 2", "Acme", "works_at"),
+            Some(1.0)
+        );
+        assert!(!graph.has_delta());
+    }
+
+    #[test]
+    fn late_extraction_reattributes_only_speaker_role_endpoints() {
+        use crate::graph::entities::{ExtractedRelation, ExtractionResult, SpeakerEndpointMask};
+        let mut extraction = ExtractionResult {
+            entities: vec![],
+            relations: vec![ExtractedRelation {
+                source: "Speaker 2".into(),
+                target: "Speaker 2".into(),
+                relation_type: "mentions".into(),
+                detail: None,
+                speaker_endpoint_mask: SpeakerEndpointMask::Source,
+            }],
+        };
+        super::retarget_extraction_speaker(&mut extraction, "Speaker 2", "Alice");
+        assert_eq!(extraction.relations[0].source, "Alice");
+        assert_eq!(extraction.relations[0].target, "Speaker 2");
+        assert_eq!(extraction.entities[0].name, "Alice");
     }
 
     /// audio-graph-719d acceptance: a mid-session speaker relabel dispatched on
@@ -11502,8 +11805,13 @@ mod tests_status {
     /// shape `assemblyai_speaker_revision_emission_retcons_graph_on_label_remap`
     /// and `graph/temporal.rs`'s audio-graph-4b52 tests use, so a diarization
     /// relabel of "Speaker 2" -> "Alice" retcons exactly one edge.
-    fn seed_provisional_speaker_graph(graph: &mut crate::graph::temporal::TemporalKnowledgeGraph) {
-        use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+    fn seed_provisional_speaker_graph(
+        graph: &mut crate::graph::temporal::TemporalKnowledgeGraph,
+        segment_id: &str,
+    ) {
+        use crate::graph::entities::{
+            ExtractedEntity, ExtractedRelation, ExtractionResult, SpeakerEndpointMask,
+        };
         graph.process_extraction(
             &ExtractionResult {
                 entities: vec![
@@ -11528,19 +11836,20 @@ mod tests_status {
                     target: "Acme".to_string(),
                     relation_type: "works_at".to_string(),
                     detail: None,
+                    speaker_endpoint_mask: SpeakerEndpointMask::Source,
                 }],
             },
             1.0,
             "Speaker 2",
-            "seg-1",
+            segment_id,
         );
         let _ = graph.take_delta();
     }
 
     /// audio-graph-9b11 acceptance (fix for the bug the 4b52 fix escalated):
     /// a live diarization relabel dispatched through
-    /// `emit_and_dispatch_diarization_span_revision` must call
-    /// `supersede_entity` with a SESSION-RELATIVE timestamp derived from the
+    /// `emit_and_dispatch_diarization_span_revision` must retarget the affected
+    /// turn with a SESSION-RELATIVE timestamp derived from the
     /// revision's own `basis_asr_span_ids` anchor via
     /// `TranscriptLedger::session_relative_timestamp` — not raw
     /// `current_unix_millis() as f64 / 1000.0` (epoch scale). Master's bug:
@@ -11604,7 +11913,7 @@ mod tests_status {
                 .knowledge_graph
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            seed_provisional_speaker_graph(&mut graph);
+            seed_provisional_speaker_graph(&mut graph, &format!("{anchor_span_id}-segment"));
         }
 
         let (provisional, relabel) = diarization_relabel_pair(
@@ -11688,7 +11997,7 @@ mod tests_status {
                 .knowledge_graph
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            seed_provisional_speaker_graph(&mut graph);
+            seed_provisional_speaker_graph(&mut graph, anchor_span_id);
         }
 
         let (provisional, relabel) = diarization_relabel_pair(
@@ -11725,6 +12034,7 @@ mod tests_status {
                             target: "Acme".to_string(),
                             relation_type: format!("filler-{i}"),
                             detail: None,
+                            speaker_endpoint_mask: Default::default(),
                         }],
                     },
                     100.0 + i as f64,
@@ -11805,7 +12115,7 @@ mod tests_status {
                 .knowledge_graph
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            seed_provisional_speaker_graph(&mut graph);
+            seed_provisional_speaker_graph(&mut graph, "span-id-never-recorded-in-the-ledger");
         }
 
         let (provisional, relabel) = diarization_relabel_pair(
