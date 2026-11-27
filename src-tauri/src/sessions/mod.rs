@@ -520,6 +520,8 @@ pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
         push_artifact_path(&mut paths, path);
     }
     if let Ok(path) = crate::user_data::diarization_events_path(session_id) {
+        paths
+            .extend(crate::persistence::speaker_log::legacy_quarantines(&path).unwrap_or_default());
         push_artifact_path(&mut paths, path);
     }
     if let Ok(path) = crate::user_data::projection_events_path(session_id) {
@@ -591,6 +593,11 @@ fn default_session_artifact_paths_resolve_only(session_id: &str) -> Result<Vec<P
         root.join("transcripts")
             .join(format!("{session_id}.events.jsonl")),
     );
+    paths.extend(crate::persistence::speaker_log::legacy_quarantines(
+        &root
+            .join("transcripts")
+            .join(format!("{session_id}.speaker.jsonl")),
+    )?);
     push_artifact_path(
         &mut paths,
         root.join("transcripts")
@@ -1032,45 +1039,14 @@ fn transcript_event_stats(path: &Path, errors: &mut Vec<String>) -> (u64, u64) {
 /// Count distinct resolved speakers across a diarization span-revision log,
 /// collapsing revisions by their provider-neutral span id (so a span that was
 /// remapped provisional -> stable only contributes its latest attribution).
-fn diarization_event_speaker_count(path: &Path, errors: &mut Vec<String>) -> u64 {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
+fn diarization_event_speaker_count(path: &Path, session_id: &str, errors: &mut Vec<String>) -> u64 {
+    match crate::persistence::speaker_timeline_at(path, session_id) {
+        Ok(t) => t.speaker_count() as u64,
         Err(e) => {
-            errors.push(format!("read diarization events {}: {}", path.display(), e));
-            return 0;
-        }
-    };
-    let mut latest_speaker_by_span: HashMap<String, (u64, Option<String>)> = HashMap::new();
-    for (line_no, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<crate::projections::DiarizationSpanRevision>(line) {
-            Ok(revision) => {
-                let entry = latest_speaker_by_span
-                    .entry(revision.span_id.clone())
-                    .or_insert((0, None));
-                if revision.revision_number >= entry.0 {
-                    *entry = (revision.revision_number, revision.speaker_id.clone());
-                }
-            }
-            Err(e) => errors.push(format!(
-                "skip malformed diarization event line {}:{}: {}",
-                path.display(),
-                line_no + 1,
-                e
-            )),
+            errors.push(format!("read diarization history: {e}"));
+            0
         }
     }
-    let mut speakers = HashSet::new();
-    for (_, speaker_id) in latest_speaker_by_span.into_values() {
-        if let Some(speaker_id) = speaker_id
-            && !speaker_id.trim().is_empty()
-        {
-            speakers.insert(speaker_id);
-        }
-    }
-    speakers.len() as u64
 }
 
 fn graph_entity_count(path: &Path, errors: &mut Vec<String>) -> u64 {
@@ -1164,7 +1140,7 @@ fn recovered_metadata(
     let diarization_speaker_count = candidate
         .diarization_event_path
         .as_deref()
-        .map(|path| diarization_event_speaker_count(path, errors));
+        .map(|path| diarization_event_speaker_count(path, &candidate.id, errors));
     let speaker_count = diarization_speaker_count
         .map(|diarization| diarization.max(transcript_speaker_count))
         .unwrap_or(transcript_speaker_count);
@@ -2012,6 +1988,8 @@ mod tests {
         let path =
             crate::user_data::diarization_events_path(session_id).expect("diarization event path");
         let revision = crate::projections::DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: span_id.into(),
             provider: "deepgram".into(),
             timeline_id: "session".into(),

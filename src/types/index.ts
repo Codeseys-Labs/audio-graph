@@ -207,6 +207,68 @@ export interface AsrSpanRevisionEvent {
 
 export type DiarizationSpanStability = "provisional" | "stable" | "final";
 
+export interface ClusterRef {
+  provider: string;
+  timeline_id: string;
+  speaker_id: string;
+}
+export type SpeakerBindingState =
+  | "anonymous"
+  | "suggested"
+  | "bound"
+  | "user_confirmed";
+export interface SpeakerIdentityStamp {
+  schema_version: number;
+  cluster_ref: ClusterRef;
+  person_ref?: string;
+  state: SpeakerBindingState;
+  label_source: "diarizer" | "provider" | "identity_binding" | "user";
+  binding_id: string;
+  binding_revision: number;
+  confidence?: number;
+  evidence: {
+    kind: "user_manual" | "user_self" | "mic_self" | "decision";
+    weight: number;
+    decision_record_id?: string;
+    basis_span_ids: string[];
+  }[];
+  batch?: {
+    batch_id: string;
+    kind: "bind" | "rename" | "unbind" | "merge" | "split";
+    scope: "entity" | "segments";
+    index: number;
+    len: number;
+  };
+}
+export interface SessionSpeakerCluster {
+  suggested_self: boolean;
+  cluster: ClusterRef;
+  label: string;
+  span_count: number;
+  state: SpeakerBindingState;
+}
+
+/** Tauri command arguments are camelCase; records and event payloads are snake_case. */
+export interface SessionSpeakerCommandArgs {
+  list_session_speaker_clusters: { sessionId: string };
+  relabel_speaker_cluster: {
+    sessionId: string;
+    cluster: ClusterRef;
+    label: string;
+  };
+  mark_cluster_is_self: { sessionId: string; cluster: ClusterRef };
+  merge_speaker_clusters: {
+    sessionId: string;
+    cluster: ClusterRef;
+    into: ClusterRef;
+  };
+  unbind_speaker_cluster: { sessionId: string; cluster: ClusterRef };
+}
+export type SessionSpeakerCommandResults = {
+  [K in keyof SessionSpeakerCommandArgs]: K extends "list_session_speaker_clusters"
+    ? SessionSpeakerCluster[]
+    : number;
+};
 /** Provider-neutral speaker timeline span revision for diffable diarization. */
 export interface DiarizationSpanRevisionEvent {
   span_id: string;
@@ -215,6 +277,7 @@ export interface DiarizationSpanRevisionEvent {
   source_id?: SourceId | null;
   speaker_id?: string | null;
   speaker_label?: string | null;
+  identity?: SpeakerIdentityStamp;
   channel?: string | null;
   start_time: number;
   end_time: number;
@@ -252,6 +315,9 @@ export interface TimelineEntry {
   turn_id?: string | null;
   speaker_id?: string | null;
   speaker_label?: string | null;
+  speaker_provenance?: Pick<SpeakerIdentityStamp, "label_source" | "state"> & {
+    previous_label?: string;
+  };
   text: string;
   related_edge_ids: string[];
 }
@@ -1593,6 +1659,7 @@ export interface AudioSettings {
 
 /** Top-level application settings (matches Rust AppSettings) */
 export interface AppSettings {
+  self_display_name?: string | null;
   asr_provider: AsrProvider;
   whisper_model: string;
   llm_provider: LlmProvider;

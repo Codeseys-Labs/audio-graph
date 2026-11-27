@@ -14,8 +14,11 @@ use super::canonical_log::{
     CanonicalIoOperation, CanonicalLogError, CanonicalLogSnapshot, CanonicalTailRecovery,
     load_canonical_stream,
 };
+use super::speaker_log::CompatibleSpeakerRevisionRecord;
 use super::{DATA_MOVEMENT_SCHEMA_VERSION, DataMovementEvent};
-use crate::projections::{DiarizationSpanRevision, ProjectionPatch, TranscriptEvent};
+#[cfg(test)]
+use crate::projections::DiarizationSpanRevision;
+use crate::projections::{ProjectionPatch, TranscriptEvent};
 use crate::speech_span_revision::CompatibleSpeechSpanRevision;
 
 const TRANSCRIPT_REVISIONS_STREAM_ID: &str = "transcript_revisions";
@@ -24,7 +27,7 @@ const PROJECTION_PATCHES_STREAM_ID: &str = "projection_patches";
 const DATA_MOVEMENT_EVENTS_STREAM_ID: &str = "data_movement_events";
 
 const TRANSCRIPT_REVISIONS_SCHEMA_VERSION: u32 = 1;
-const SPEAKER_REVISIONS_SCHEMA_VERSION: u32 = 1;
+const SPEAKER_REVISIONS_SCHEMA_VERSION: u32 = 2;
 const PROJECTION_PATCHES_SCHEMA_VERSION: u32 = 1;
 const DATA_MOVEMENT_EVENTS_SCHEMA_VERSION: u32 = 1;
 const DATA_MOVEMENT_EVENTS_EMBEDDED_SCHEMA_VERSION: u32 = 1;
@@ -156,7 +159,7 @@ pub(super) fn load_speech_span_revisions(
 pub(super) fn load_speaker_revisions(
     path: &Path,
     session_id: &str,
-) -> Result<StrictCanonicalRead<DiarizationSpanRevision>, CanonicalReaderError> {
+) -> Result<StrictCanonicalRead<CompatibleSpeakerRevisionRecord>, CanonicalReaderError> {
     load_strict_canonical_stream(path, session_id, SPEAKER_REVISIONS)
 }
 
@@ -257,6 +260,8 @@ mod tests {
 
     fn speaker_revision(revision_number: u64) -> DiarizationSpanRevision {
         DiarizationSpanRevision {
+            identity: None,
+            provider_revision_number: None,
             span_id: "speaker-span-1".into(),
             provider: "fixture-diarizer".into(),
             timeline_id: "source-1".into(),
@@ -431,7 +436,7 @@ mod tests {
         assert_eq!(PROJECTION_PATCHES.stream_id, "projection_patches");
         assert_eq!(DATA_MOVEMENT_EVENTS.stream_id, "data_movement_events");
         assert_eq!(TRANSCRIPT_REVISIONS_SCHEMA_VERSION, 1);
-        assert_eq!(SPEAKER_REVISIONS_SCHEMA_VERSION, 1);
+        assert_eq!(SPEAKER_REVISIONS_SCHEMA_VERSION, 2);
         assert_eq!(PROJECTION_PATCHES_SCHEMA_VERSION, 1);
         assert_eq!(DATA_MOVEMENT_EVENTS_SCHEMA_VERSION, 1);
         assert_eq!(DATA_MOVEMENT_EVENTS_EMBEDDED_SCHEMA_VERSION, 1);
@@ -509,9 +514,12 @@ mod tests {
         assert_legacy_then_mixed(
             &root.join("speaker.jsonl"),
             session_id,
-            SPEAKER_REVISIONS,
-            speaker_revision(1),
-            speaker_revision(2),
+            CanonicalStreamDescriptor {
+                stream_id: SPEAKER_REVISIONS.stream_id,
+                domain_schema_version: 1,
+            },
+            CompatibleSpeakerRevisionRecord::Legacy(Box::new(speaker_revision(1))),
+            CompatibleSpeakerRevisionRecord::Legacy(Box::new(speaker_revision(2))),
             load_speaker_revisions,
         );
         assert_legacy_then_mixed(
@@ -649,7 +657,7 @@ mod tests {
         );
         assert_single_legacy_snapshot(
             repo.load_speaker_revision_stream(session_id).unwrap(),
-            &speaker,
+            &CompatibleSpeakerRevisionRecord::Legacy(Box::new(speaker)),
         );
         assert_single_legacy_snapshot(
             repo.load_projection_patch_stream(session_id).unwrap(),

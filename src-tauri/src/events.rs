@@ -335,6 +335,8 @@ pub struct DiarizationSpanRevisionPayload {
     pub speaker_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::identity::SpeakerIdentityStamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     pub start_time: f64,
@@ -1290,6 +1292,7 @@ mod tests {
     #[test]
     fn diarization_span_revision_serializes_snake_case_contract() {
         let payload = DiarizationSpanRevisionPayload {
+            identity: None,
             span_id: "local_clustering:session:1000-2000:speaker-c-0".to_string(),
             provider: "local_clustering".to_string(),
             timeline_id: "session".to_string(),
