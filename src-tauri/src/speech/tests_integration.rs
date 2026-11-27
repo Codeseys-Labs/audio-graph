@@ -108,6 +108,7 @@ fn stop_and_drain_projection_lane(
 }
 
 struct DataDirGuard {
+    _home_lock: std::sync::MutexGuard<'static, ()>,
     prev_data_dir: Option<std::ffi::OsString>,
     prev_home: Option<std::ffi::OsString>,
     prev_userprofile: Option<std::ffi::OsString>,
@@ -116,6 +117,9 @@ struct DataDirGuard {
 impl DataDirGuard {
     #[allow(unsafe_code)]
     fn set(dir: &Path) -> Self {
+        let home_lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev_data_dir = std::env::var_os(crate::user_data::DATA_DIR_ENV);
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
@@ -125,6 +129,7 @@ impl DataDirGuard {
             std::env::set_var("USERPROFILE", dir);
         }
         Self {
+            _home_lock: home_lock,
             prev_data_dir,
             prev_home,
             prev_userprofile,
