@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Native decision backends now re-export the shared decision contract directly;
   the obsolete vendored module and unused direct dependencies are removed.
+- Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
+  STA/COM and `SILENT` buffer fixes, PipeWire `DONT_RECONNECT` on Linux,
+  and system-capture capability reporting for macOS 14.4 and later.
 
 ### Fixed
 
