@@ -58,7 +58,11 @@ pub enum Answer {
     },
     Noul {
         noul: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "noul_probabilities::deserialize"
+        )]
         probabilities: Option<OrderedMap<String, f64>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
@@ -106,6 +110,43 @@ mod score_probabilities {
                 Ok(values)
             }
         }
+    }
+}
+
+/// vLLM documents binary `noul` probabilities as `yes`/`no`; the canonical keys
+/// are `true`/`false`. Normalize at the parse boundary so typed validation and
+/// native serialization see a single convention. Mixed or partial pairs are
+/// rejected instead of being guessed into a mapping, and the raw vendor bytes
+/// a `Wire` carries are never rewritten.
+mod noul_probabilities {
+    use super::*;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<OrderedMap<String, f64>>, D::Error> {
+        let Some(map) = Option::<OrderedMap<String, f64>>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        normalize(map).map(Some).map_err(serde::de::Error::custom)
+    }
+
+    fn normalize(map: OrderedMap<String, f64>) -> Result<OrderedMap<String, f64>, String> {
+        let binary = |true_key: &str, false_key: &str| {
+            map.len() == 2 && map.contains_key(true_key) && map.contains_key(false_key)
+        };
+        if binary("true", "false") {
+            return Ok(map);
+        }
+        if binary("yes", "no") {
+            return Ok(map
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = if key == "yes" { "true" } else { "false" };
+                    (key.to_owned(), value)
+                })
+                .collect());
+        }
+        Err("noul probability keys must be exactly true/false or yes/no".to_owned())
     }
 }
 

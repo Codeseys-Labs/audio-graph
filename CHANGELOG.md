@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- vLLM's documented `yes`/`no` noul probability keys are now normalized to the
+  canonical `true`/`false` pair at the parse boundary, so documented responses
+  validate; mixed, partial, or overlong key pairs are rejected, and the raw
+  `WireResponse` bytes plus vendor confidence stay untouched.
+
 ## [0.1.0-rc.1] - 2026-05-20
 
 First release candidate. The full STT → LLM → TTS pipeline is wired
