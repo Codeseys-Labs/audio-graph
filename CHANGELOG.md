@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- vLLM's documented `yes`/`no` noul probability keys are now normalized to the
+  canonical `true`/`false` pair at the parse boundary, so documented responses
+  validate; mixed, partial, or overlong key pairs are rejected, and the raw
+  `WireResponse` bytes plus vendor confidence stay untouched.
 - Updated `cookie` to 0.18.3 to prevent private-cookie nonce reuse after a fork
   ([RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594)).
 
