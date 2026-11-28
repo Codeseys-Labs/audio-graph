@@ -108,9 +108,7 @@ mod linux {
     ) -> WireResult<Option<DefaultCollection>> {
         drive(deadline, async {
             let client = Client::connect(address).await?;
-            let alias: OwnedObjectPath = client
-                .call(SERVICE_PATH, SERVICE, "ReadAlias", &("default",))
-                .await?;
+            let alias: OwnedObjectPath = client.service_call("ReadAlias", &("default",)).await?;
             Ok((alias.as_str() != "/").then_some(DefaultCollection(alias)))
         })
     }
@@ -119,8 +117,8 @@ mod linux {
     /// The timer drops the pending future and its connection on expiry.
     fn drive<T>(timeout: Duration, work: impl Future<Output = WireResult<T>>) -> WireResult<T> {
         let deadline = Instant::now() + timeout;
-        let runtime = zruntime::SharedRuntime::current().map_err(|_| Failure::Unavailable)?;
         zbus::block_on(async {
+            let runtime = zruntime::SharedRuntime::current().map_err(|_| Failure::Unavailable)?;
             runtime
                 .timeout_at(deadline, work)
                 .await
@@ -154,8 +152,19 @@ mod linux {
                 "GetNameOwner",
                 &(SERVICE_NAME,),
             )
-            .await?;
+            .await
+            .map_err(unavailable_if_missing)?;
             Ok(Self { connection, owner })
+        }
+
+        async fn service_call<B, R>(&self, method: &str, body: &B) -> WireResult<R>
+        where
+            B: Serialize + DynamicType,
+            R: for<'de> DynamicDeserialize<'de>,
+        {
+            self.call(SERVICE_PATH, SERVICE, method, body)
+                .await
+                .map_err(unavailable_if_missing)
         }
 
         async fn call<B, R>(
@@ -193,15 +202,17 @@ mod linux {
         }
 
         async fn read_exact(&self, attributes: &Attributes) -> WireResult<Option<SecretBytes>> {
-            let (unlocked, locked): SearchResults = self
-                .call(SERVICE_PATH, SERVICE, "SearchItems", &(attributes,))
-                .await?;
+            let (unlocked, locked): SearchResults =
+                self.service_call("SearchItems", &(attributes,)).await?;
             let mut candidate = None;
             // SearchItems can return supersets of the requested attributes.
             // Preserve each candidate's search half while checking equality.
             for (items, was_locked) in [(unlocked, false), (locked, true)] {
                 for item in items {
                     let actual = match self.attributes(&item).await {
+                        Err(WireError(Failure::Missing)) if was_locked => {
+                            return Err(Failure::Locked.into());
+                        }
                         Err(WireError(Failure::Missing)) => continue,
                         result => result?,
                     };
@@ -216,22 +227,23 @@ mod linux {
             let Some((item, was_locked)) = candidate else {
                 return Ok(None);
             };
-            match self.read_candidate(&item, was_locked, attributes).await {
+            if was_locked {
+                return Err(Failure::Locked.into());
+            }
+            match self.read_unlocked_candidate(&item, attributes).await {
                 Ok(secret) => Ok(Some(secret)),
                 Err(WireError(Failure::Missing)) => Ok(None),
                 Err(error) => Err(error),
             }
         }
 
-        async fn read_candidate(
+        async fn read_unlocked_candidate(
             &self,
             item: &OwnedObjectPath,
-            was_locked: bool,
             attributes: &Attributes,
         ) -> WireResult<SecretBytes> {
-            if was_locked
-                || bool::try_from(self.property(item, "Locked").await?)
-                    .map_err(|_| Failure::CorruptRecord)?
+            if bool::try_from(self.property(item, "Locked").await?)
+                .map_err(|_| Failure::CorruptRecord)?
             {
                 return Err(Failure::Locked.into());
             }
@@ -243,12 +255,7 @@ mod linux {
             };
             let public_key = Variant::from(exchange.public_key().to_vec());
             let (peer_key, session): (OwnedVariant, OwnedObjectPath) = self
-                .call(
-                    SERVICE_PATH,
-                    SERVICE,
-                    "OpenSession",
-                    &(ALGORITHM, public_key),
-                )
+                .service_call("OpenSession", &(ALGORITHM, public_key))
                 .await?;
             if session.as_str() == "/" || matches!(&*peer_key, Variant::Str(_)) {
                 return Err(Failure::Unsupported.into());
@@ -298,6 +305,13 @@ mod linux {
             .await
             .map_err(map_error)?
             .ok_or_else(|| Failure::Internal.into())
+    }
+
+    fn unavailable_if_missing(error: WireError) -> WireError {
+        match error {
+            WireError(Failure::Missing) => Failure::Unavailable.into(),
+            error => error,
+        }
     }
 
     fn map_error(error: zbus::Error) -> WireError {

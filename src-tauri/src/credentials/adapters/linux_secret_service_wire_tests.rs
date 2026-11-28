@@ -125,6 +125,10 @@ enum Scenario {
     PlainReply,
     WrongSession,
     AttributesChanged,
+    SearchObjectMissing,
+    SessionServiceObjectMissing,
+    LockedItemMissing,
+    UnlockedItemMissing,
     Disconnect,
     Silent,
     Denied,
@@ -248,6 +252,20 @@ async fn serve(
     key: &mut Option<super::super::crypto::SessionKey>,
     calls: &[Call],
 ) {
+    if matches!(
+        (scenario, call),
+        (Scenario::SearchObjectMissing, Call::Search)
+            | (Scenario::SessionServiceObjectMissing, Call::Session)
+            | (Scenario::LockedItemMissing, Call::Attributes)
+            | (Scenario::UnlockedItemMissing, Call::Secret)
+    ) {
+        return reply_error(
+            connection,
+            message,
+            "org.freedesktop.DBus.Error.UnknownObject",
+        )
+        .await;
+    }
     let header = message.header();
     let path = |value: &'static str| OwnedObjectPath::try_from(value).unwrap();
     let replied = match call {
@@ -275,7 +293,7 @@ async fn serve(
             }
             let (unlocked, locked) = match scenario {
                 Scenario::Absent => (vec![], vec![]),
-                Scenario::Locked => (vec![], vec![path(ITEM_PATH)]),
+                Scenario::Locked | Scenario::LockedItemMissing => (vec![], vec![path(ITEM_PATH)]),
                 Scenario::Duplicate => (vec![path(ITEM_PATH)], vec![path(OTHER_ITEM)]),
                 _ => (vec![path(ITEM_PATH)], vec![]),
             };
@@ -459,6 +477,59 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
     }
     test_log_capture::assert_process_logs_exclude(&[SECRET, ATTRIBUTE, LOCATOR]);
     assert!(!bus.root.join("started").exists());
+}
+
+#[test]
+fn missing_search_object_is_unavailable() {
+    assert_missing_outcome(
+        Scenario::SearchObjectMissing,
+        Err(Failure::Unavailable),
+        &[Call::Search],
+    );
+}
+
+#[test]
+fn missing_open_session_object_is_unavailable() {
+    assert_missing_outcome(
+        Scenario::SessionServiceObjectMissing,
+        Err(Failure::Unavailable),
+        &[Call::Search, Call::Attributes, Call::Locked, Call::Session],
+    );
+}
+
+#[test]
+fn missing_locked_item_attributes_leave_the_item_locked() {
+    assert_missing_outcome(
+        Scenario::LockedItemMissing,
+        Err(Failure::Locked),
+        &[Call::Search, Call::Attributes],
+    );
+}
+
+#[test]
+fn missing_unlocked_item_at_get_secret_is_absent() {
+    assert_missing_outcome(
+        Scenario::UnlockedItemMissing,
+        Ok(false),
+        &[
+            Call::Search,
+            Call::Attributes,
+            Call::Locked,
+            Call::Session,
+            Call::Secret,
+        ],
+    );
+}
+
+fn assert_missing_outcome(scenario: Scenario, expected: Result<bool, Failure>, calls: &[Call]) {
+    let bus = Bus::start();
+    let peer = Peer::start(&bus, scenario);
+    let read = read_at(bus.address(), &wanted(), DEADLINE);
+    assert_eq!(peer.finish(), calls);
+    assert_eq!(
+        read.map(|found| found.is_some()).map_err(|err| err.0),
+        expected
+    );
 }
 
 #[test]

@@ -130,6 +130,32 @@ fn session_keeps_the_leading_zero_in_public_key() {
 }
 
 #[test]
+fn session_keeps_the_leading_zero_in_the_shared_secret() {
+    // Python pow(4, 1270, p), using the RFC 2409 prime, starts with 00 37 35 42.
+    // Python hmac yields this key for 128 bytes and a different key for 127.
+    let expected = [
+        0xcb, 0xd5, 0x2a, 0x69, 0xc0, 0x84, 0x4a, 0xf8, 0x1f, 0x9d, 0x0e, 0x23, 0x6c, 0xc9, 0x69,
+        0xde,
+    ];
+    assert_eq!(exchange(1270).finish(&[4]).unwrap().0.as_slice(), expected);
+}
+
+#[test]
+fn accepts_leading_zero_extension_of_a_peer_key() {
+    let mut extended = [0; PUBLIC_BYTES + 1];
+    extended[PUBLIC_BYTES] = 4;
+    let extended_key = exchange(1270).finish(&extended).unwrap();
+    let group_width_key = exchange(1270).finish(&extended[1..]).unwrap();
+    assert_eq!(extended_key.0.as_slice(), group_width_key.0.as_slice());
+
+    extended[0] = 1;
+    assert!(matches!(
+        exchange(1270).finish(&extended),
+        Err(CryptoError::InvalidPeerKey)
+    ));
+}
+
+#[test]
 fn rejects_invalid_peer_keys() {
     let below_prime = PRIME.wrapping_sub(&U1024::ONE).to_be_bytes();
     let prime = PRIME.to_be_bytes();

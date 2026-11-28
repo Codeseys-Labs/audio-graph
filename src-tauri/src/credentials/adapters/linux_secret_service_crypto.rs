@@ -71,10 +71,15 @@ impl Exchange {
 }
 
 fn validate_peer_key(bytes: &[u8]) -> Result<GroupElement, CryptoError> {
-    if bytes.is_empty() || bytes.len() > PUBLIC_BYTES {
+    // The peer's public integer may contain redundant leading zeroes.
+    let first_nonzero = bytes
+        .iter()
+        .position(|&byte| byte != 0)
+        .ok_or(CryptoError::InvalidPeerKey)?;
+    let bytes = &bytes[first_nonzero..];
+    if bytes.len() > PUBLIC_BYTES {
         return Err(CryptoError::InvalidPeerKey);
     }
-    // Providers may return a minimal unsigned representation.
     let mut padded = [0; PUBLIC_BYTES];
     padded[PUBLIC_BYTES - bytes.len()..].copy_from_slice(bytes);
     let value = U1024::from_be_slice(&padded);
