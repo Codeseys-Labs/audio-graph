@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::canonical_durability::{
-    CanonicalDurabilityIndeterminate, CanonicalFilesystemQualificationError, CanonicalUnlinkOutcome,
-};
+use super::canonical_durability::{CanonicalDurabilityIndeterminate, CanonicalUnlinkOutcome};
 use super::session_artifact_manifest::{
     ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass, ArtifactUnavailableReason,
     CheckedManifestReadError, MAX_SESSION_SEMANTICS_TRANSITION_PROOF_BYTES,
@@ -569,13 +567,11 @@ fn open_session_for_content_with_head<T, E>(
     }
     match SessionArtifactManifestStore::qualified_existing_session(data_root, session_id) {
         Ok(store) => guarded_session_open_with_head(&store, maximum_supported, content_reader),
-        // The production namespace policy makes manifest mutation unavailable on
-        // this platform, which is exactly ADR-0044 §5's read-only branch.
-        Err(ManifestStoreError::Qualification(
-            CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { .. },
-        )) => {
-            let store = SessionArtifactManifestStore::for_session(data_root, session_id)
-                .map_err(GuardedSessionOpenError::ControlPlaneStore)?;
+        Err(ManifestStoreError::Qualification(refusal)) => {
+            let store = SessionArtifactManifestStore::after_qualification_refusal(
+                data_root, session_id, refusal,
+            )
+            .map_err(GuardedSessionOpenError::ControlPlaneStore)?;
             guarded_session_open_with_head(&store, maximum_supported, content_reader)
         }
         // Every other refusal is a refusal. A control plane that exists and
@@ -1824,8 +1820,11 @@ mod guarded_admission_tests {
     #[cfg(unix)]
     use crate::persistence::session_artifact_manifest::{
         ManifestCasOutcome, ManifestCasRejection, ManifestLoadOutcome, ManifestStoreError,
-        ManifestTransition, ManifestTransitionState, SessionArtifactEntry,
         SessionSemanticsTransitionProofV1,
+    };
+    #[cfg(any(unix, windows))]
+    use crate::persistence::session_artifact_manifest::{
+        ManifestTransition, ManifestTransitionState, SessionArtifactEntry,
     };
     use sha2::{Digest as _, Sha256};
     #[cfg(unix)]
@@ -1852,7 +1851,7 @@ mod guarded_admission_tests {
         ManagedArtifactIdentity::new(value).expect("managed identity")
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
     }
@@ -1987,7 +1986,7 @@ mod guarded_admission_tests {
         std::fs::write(path, bytes).expect("fixture bytes");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn v1_candidate(idempotency_id: &str) -> SessionArtifactManifestV1 {
         SessionArtifactManifestV1::candidate(
             SESSION,
@@ -2011,7 +2010,7 @@ mod guarded_admission_tests {
 
     /// Hand-install one persisted manifest at a Session's derived control
     /// identity, for stores whose platform cannot mutate the namespace.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn persist_manifest(root: &Path, session_id: &str, mut manifest: SessionArtifactManifestV1) {
         manifest.generation = 1;
         let paths = session_control_plane_paths(root, session_id).expect("control paths");
@@ -2778,18 +2777,121 @@ mod guarded_admission_tests {
         );
     }
 
+    #[cfg(unix)]
+    fn unqualified_windows_store(root: &Path) -> SessionArtifactManifestStore {
+        use crate::persistence::canonical_durability::{
+            CanonicalFilesystemClass, CanonicalFilesystemQualificationError,
+        };
+        SessionArtifactManifestStore::after_qualification_refusal(
+            root,
+            SESSION,
+            CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                platform: CanonicalPlatform::Windows,
+                class: CanonicalFilesystemClass::Remote,
+            },
+        )
+        .expect("read-only Windows store")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unqualified_windows_root_admits_v1_content_and_export_without_mutation() {
+        let base = root("windows-history");
+        // Ordinary CI uses fixed NTFS. When TEMP is itself on an unqualified
+        // volume, exercise that volume directly instead of creating a junction.
+        let path =
+            if SessionArtifactManifestStore::qualified_existing_session(&base, SESSION).is_ok() {
+                std::fs::create_dir(base.join("real")).unwrap();
+                let status = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/j", "junction", "real"])
+                    .current_dir(&base)
+                    .output()
+                    .unwrap()
+                    .status;
+                assert!(status.success());
+                base.join("junction")
+            } else {
+                base.clone()
+            };
+        let Err(super::ManifestStoreError::Qualification(refusal)) =
+            SessionArtifactManifestStore::qualified_existing_session(&path, SESSION)
+        else {
+            panic!("fixture must refuse namespace qualification");
+        };
+        let store =
+            SessionArtifactManifestStore::after_qualification_refusal(&path, SESSION, refusal)
+                .unwrap();
+        assert!(matches!(
+            store.begin_write(),
+            Err(super::ManifestStoreError::NamespaceQualificationRequired)
+        ));
+
+        let read = || {
+            open_session_for_content(&path, SESSION, SessionSemanticsVersion::V1, |floor| {
+                Ok::<_, ()>(floor.evidence)
+            })
+        };
+        let export =
+            || super::open_v1_session_for_export(&path, SESSION, std::convert::identity, Ok);
+        assert_eq!(
+            read().unwrap(),
+            SessionFloorEvidence::UnguardedObservedAbsence
+        );
+        assert_eq!(export().unwrap(), None);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+
+        persist_manifest(&path, SESSION, v1_candidate("historical"));
+        let paths = session_control_plane_paths(&path, SESSION).unwrap();
+        let original = std::fs::read(&paths.manifest).unwrap();
+        assert!(read().is_err());
+        assert!(export().is_err());
+        let lock = store_coordination_path(&path, SESSION).unwrap();
+        assert!(!lock.exists());
+        write_fixture(&lock, b"");
+        // Some network filesystems provide ordinary reads but no shared lock.
+        // Compare their native lock outcome to the read and export refusals.
+        let lock_probe = std::fs::File::open(&lock).unwrap().try_lock_shared();
+        if let Err(std::fs::TryLockError::Error(error)) = lock_probe {
+            assert!(matches!(error.raw_os_error(), Some(1 | 50)), "{error}");
+            let refusal = super::ManifestLoadError::Coordination(
+                crate::persistence::canonical_durability::CanonicalCoordinationError::Io {
+                    stage:
+                        crate::persistence::canonical_durability::CanonicalCoordinationStage::Lock,
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                },
+            );
+            assert_eq!(
+                read(),
+                Err(GuardedSessionOpenError::ControlPlaneUnreadable(
+                    refusal.clone()
+                ))
+            );
+            assert_eq!(
+                export(),
+                Err(GuardedSessionOpenError::ControlPlaneUnreadable(refusal))
+            );
+        } else {
+            lock_probe.expect("uncontended fixture lock");
+            assert_eq!(read().unwrap(), SessionFloorEvidence::GuardedManifest);
+            let manifest = export().unwrap().unwrap().manifest.unwrap();
+            assert_eq!(manifest.transition.idempotency_id, "historical");
+        }
+        assert_eq!(std::fs::read(paths.manifest).unwrap(), original);
+        assert!(!paths.temporary.exists() && !paths.provenance.exists());
+        if path != base {
+            std::fs::remove_dir(path).unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     // -- acceptance (5): Windows -------------------------------------------
 
     #[cfg(unix)]
     #[test]
     fn windows_platform_reads_compatible_state_through_the_guarded_open() {
         let root = root("windows-compatible-read");
-        let store = SessionArtifactManifestStore::for_test_session_platform(
-            &root,
-            SESSION,
-            CanonicalPlatform::Windows,
-        )
-        .expect("windows-platform store");
+        let store = unqualified_windows_store(&root);
         persist_manifest(&root, SESSION, v1_candidate("historical-1"));
         write_fixture(
             &store_coordination_path(&root, SESSION).expect("coordination path"),
@@ -2828,12 +2930,7 @@ mod guarded_admission_tests {
     #[test]
     fn windows_platform_refuses_v2_mutation_before_any_side_effect() {
         let root = root("windows-refuses-mutation");
-        let store = SessionArtifactManifestStore::for_test_session_platform(
-            &root,
-            SESSION,
-            CanonicalPlatform::Windows,
-        )
-        .expect("windows-platform store");
+        let store = unqualified_windows_store(&root);
         assert!(matches!(
             store.begin_write(),
             Err(ManifestStoreError::NamespaceQualificationRequired)

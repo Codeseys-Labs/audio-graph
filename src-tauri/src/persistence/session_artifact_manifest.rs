@@ -24,8 +24,8 @@ use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
     CanonicalExclusiveGuard, CanonicalFilesystemQualification,
-    CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSnapshotExpectation,
-    CanonicalUnlinkOutcome,
+    CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSharedGuard,
+    CanonicalSnapshotExpectation, CanonicalUnlinkOutcome,
 };
 use super::session_semantics::{SESSIONS_INDEX_IDENTITY, SessionSemanticsVersion};
 
@@ -706,13 +706,18 @@ pub enum ManifestCasOutcome {
     DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
 }
 
+enum UnqualifiedReadPolicy {
+    PlatformDefault,
+    ReadOnly,
+}
+
 /// One explicit-root manifest store. It never resolves or provisions a
 /// default application path.
 pub struct SessionArtifactManifestStore {
     root: PathBuf,
     address: Option<SessionControlAddress>,
     durability: CanonicalDurability,
-    qualification: Option<CanonicalFilesystemQualification>,
+    qualification: Result<CanonicalFilesystemQualification, UnqualifiedReadPolicy>,
 }
 
 impl SessionArtifactManifestStore {
@@ -722,7 +727,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: None,
             durability: CanonicalDurability::new(),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         }
     }
 
@@ -739,8 +744,46 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: Some(address),
             durability: CanonicalDurability::new(),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         })
+    }
+
+    /// Build the read-only fallback only for a known namespace capability refusal.
+    /// Resolve the supplied root once so the existing lock and addressed manifest
+    /// are opened beneath the same directory, including for a Windows junction.
+    pub(crate) fn after_qualification_refusal(
+        root: &Path,
+        session_id: &str,
+        refusal: CanonicalFilesystemQualificationError,
+    ) -> Result<Self, ManifestStoreError> {
+        use CanonicalFilesystemQualificationError as Error;
+        let read_only = matches!(
+            refusal,
+            Error::NamespaceDurabilityUnsupported { .. }
+                | Error::FilesystemUnsupported {
+                    platform: super::canonical_durability::CanonicalPlatform::Windows,
+                    ..
+                }
+        ) || (cfg!(windows)
+            && matches!(
+                refusal,
+                Error::ReadOnlyFilesystem { .. }
+                    | Error::RemovableFilesystem { .. }
+                    | Error::Io {
+                        stage: super::canonical_durability::CanonicalCoordinationStage::ResolveRoot,
+                        kind: io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported,
+                        ..
+                    }
+            ));
+        if !read_only {
+            return Err(ManifestStoreError::Qualification(refusal));
+        }
+        let mut store = Self::for_session(root, session_id)?;
+        store.root = root
+            .canonicalize()
+            .map_err(|error| ManifestStoreError::Load(load_io(&error)))?;
+        store.qualification = Err(UnqualifiedReadPolicy::ReadOnly);
+        Ok(store)
     }
 
     /// Bind one existing managed root to live production filesystem evidence.
@@ -756,7 +799,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -775,7 +818,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -806,19 +849,25 @@ impl SessionArtifactManifestStore {
         if !manifest_exists && !coordination_exists {
             return Ok(ManifestLoadOutcome::Absent);
         }
-        let guard = match self.qualification.as_ref() {
-            Some(qualification) => self
-                .durability
-                .try_lock_shared_qualified(&self.root, qualification),
-            None => self.durability.try_lock_shared(&self.root),
-        };
-        let _guard = guard.map_err(ManifestLoadError::Coordination)?;
+        let _guard = self
+            .shared_guard()
+            .map_err(ManifestLoadError::Coordination)?;
         if !entry_exists(&manifest_path)? {
             return Ok(ManifestLoadOutcome::Absent);
         }
         let (manifest, _) = load_manifest_file(&manifest_path)?;
         self.validate_requested_session(&manifest)?;
         Ok(ManifestLoadOutcome::Present(Box::new(manifest)))
+    }
+
+    fn shared_guard(&self) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+        match &self.qualification {
+            Ok(proof) => self.durability.try_lock_shared_qualified(&self.root, proof),
+            Err(UnqualifiedReadPolicy::ReadOnly) => CanonicalSharedGuard::open_existing(&self.root),
+            Err(UnqualifiedReadPolicy::PlatformDefault) => {
+                self.durability.try_lock_shared(&self.root)
+            }
+        }
     }
 
     /// Read one complete Session snapshot while the store's coordination
@@ -835,8 +884,13 @@ impl SessionArtifactManifestStore {
         reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
         after_establishment: impl FnOnce(),
     ) -> Result<T, CheckedManifestReadError<E>> {
-        let Some(qualification) = self.qualification.as_ref() else {
-            if self.durability.namespace_mutation_supported() {
+        let Ok(qualification) = self.qualification.as_ref() else {
+            if self.durability.namespace_mutation_supported()
+                && matches!(
+                    self.qualification,
+                    Err(UnqualifiedReadPolicy::PlatformDefault)
+                )
+            {
                 return Err(CheckedManifestReadError::NamespaceQualificationRequired);
             }
             let manifest_before =
@@ -845,12 +899,9 @@ impl SessionArtifactManifestStore {
             let coordination_before =
                 entry_exists(&coordination_path).map_err(CheckedManifestReadError::Load)?;
             if coordination_before {
-                let _guard = self
-                    .durability
-                    .try_lock_shared(&self.root)
-                    .map_err(|error| {
-                        CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
-                    })?;
+                let _guard = self.shared_guard().map_err(|error| {
+                    CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
+                })?;
                 let head = self
                     .load_selected_manifest()
                     .map_err(CheckedManifestReadError::Load)?;
@@ -921,7 +972,7 @@ impl SessionArtifactManifestStore {
         let qualification = self
             .qualification
             .as_ref()
-            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
+            .map_err(|_| ManifestStoreError::NamespaceQualificationRequired)?;
         let guard = self
             .durability
             .try_lock_exclusive_qualified(&self.root, qualification)
@@ -938,7 +989,7 @@ impl SessionArtifactManifestStore {
         };
         Ok(ManifestWriteTransaction {
             guard,
-            qualification: self.qualification.as_ref(),
+            qualification: Some(qualification),
             expected_session_id: self
                 .address
                 .as_ref()
@@ -1014,7 +1065,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability: CanonicalDurability::new(),
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1033,7 +1084,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability: CanonicalDurability::new(),
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1059,7 +1110,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1082,7 +1133,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1102,7 +1153,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1112,7 +1163,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: None,
             durability: CanonicalDurability::for_test_platform(platform),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         }
     }
 
@@ -1126,7 +1177,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: Some(session_control_address(session_id)?),
             durability: CanonicalDurability::for_test_platform(platform),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         })
     }
 }
@@ -3045,7 +3096,7 @@ impl SessionArtifactManifestStore {
         let qualification = self
             .qualification
             .as_ref()
-            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
+            .map_err(|_| ManifestStoreError::NamespaceQualificationRequired)?;
         let guard = self
             .durability
             .try_lock_exclusive_qualified(&self.root, qualification)
@@ -3054,7 +3105,7 @@ impl SessionArtifactManifestStore {
         let temporary_path = self.temporary_path();
         let temporary = guard.unlink_canonical_entry(
             &temporary_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             temporary_abandon_recovery_key(&temporary_path),
         );
         if !reached_absence(temporary) {
@@ -3068,7 +3119,7 @@ impl SessionArtifactManifestStore {
         let manifest_path = self.manifest_path();
         let manifest = guard.unlink_canonical_entry(
             &manifest_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             control_plane_retirement_recovery_key(&manifest_path),
         );
         if !reached_absence(manifest) {
@@ -3082,7 +3133,7 @@ impl SessionArtifactManifestStore {
         let provenance_path = self.root.join(address.identities.provenance.as_str());
         let provenance = guard.unlink_canonical_entry(
             &provenance_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             control_plane_retirement_recovery_key(&provenance_path),
         );
         Ok(SessionControlPlaneRetirementReport {
@@ -5923,7 +5974,7 @@ mod tests {
             &windows_root,
             CanonicalPlatform::Windows,
         );
-        assert!(windows_store.qualification.is_none());
+        assert!(windows_store.qualification.is_err());
         assert!(matches!(
             windows_store.begin_write(),
             Err(ManifestStoreError::NamespaceQualificationRequired)

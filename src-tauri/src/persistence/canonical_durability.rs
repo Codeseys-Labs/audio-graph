@@ -621,7 +621,7 @@ impl ManagedNamespace {
         missing: CanonicalCoordinationError,
     ) -> Result<Self, CanonicalCoordinationError> {
         #[cfg(windows)]
-        windows_ntfs::check_directory_chain(root).map_err(|error| {
+        windows_ntfs::check_managed_root(root).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 missing
             } else {
@@ -863,7 +863,6 @@ impl Drop for CanonicalExclusiveGuard {
 /// Shared strict-reader guard bound to the same deterministic coordination
 /// file. Acquisition never creates the managed root or lock file.
 pub struct CanonicalSharedGuard {
-    _namespace: ManagedNamespace,
     _lock_file: File,
 }
 
@@ -1110,15 +1109,7 @@ impl CanonicalDurability {
             None => namespace,
         };
         self.validate_guard_binding(&namespace, qualification)?;
-        let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
-        ensure_regular_lock_entry(&lock_path)?;
-        let file = open_plain_existing(&lock_path, OpenOptions::new().read(true))
-            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
-        let file = try_lock_shared(file)?;
-        Ok(CanonicalSharedGuard {
-            _namespace: namespace,
-            _lock_file: file,
-        })
+        CanonicalSharedGuard::open_existing(&namespace.canonical_root)
     }
 
     #[cfg(test)]
@@ -3354,6 +3345,19 @@ fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationEr
     }
 }
 
+impl CanonicalSharedGuard {
+    /// Acquire only the existing reader lock in the caller's bound root.
+    pub(super) fn open_existing(root: &Path) -> Result<Self, CanonicalCoordinationError> {
+        let lock_path = root.join(COORDINATION_FILE_NAME);
+        ensure_regular_lock_entry(&lock_path)?;
+        let file = open_plain_existing(&lock_path, OpenOptions::new().read(true))
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
+        Ok(Self {
+            _lock_file: try_lock_shared(file)?,
+        })
+    }
+}
+
 fn ensure_regular_lock_entry(path: &Path) -> Result<(), CanonicalCoordinationError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
@@ -3972,7 +3976,7 @@ mod windows_ntfs {
         FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
         GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumePathNameW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        VOLUME_NAME_DOS,
+        QueryDosDeviceW, VOLUME_NAME_DOS,
     };
     use windows::Win32::System::SystemServices::{FILE_PERSISTENT_ACLS, FILE_READ_ONLY_VOLUME};
     use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE};
@@ -4006,12 +4010,37 @@ mod windows_ntfs {
         Ok(())
     }
 
+    pub(super) fn check_managed_root(path: &Path) -> io::Result<()> {
+        let absolute = std::path::absolute(path)?;
+        let drive = match absolute.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                _ => return Err(io::ErrorKind::Unsupported.into()),
+            },
+            _ => return Err(io::ErrorKind::Unsupported.into()),
+        };
+        // SUBST exposes a directory as a drive. Resolving its target first
+        // would let the directory inherit the backing volume's qualification.
+        let name = [u16::from(drive), u16::from(b':'), 0];
+        let mut target = vec![0u16; 32768];
+        // SAFETY: name is NUL-terminated and target is a writable UTF-16 buffer.
+        let count = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut target)) };
+        if count == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A DOS path target uses the NT object-manager prefix.
+        if target.starts_with(&br"\??\".map(u16::from)) {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        check_directory_chain(&absolute)
+    }
+
     pub(super) fn check_directory_chain(path: &Path) -> io::Result<()> {
         let absolute = std::path::absolute(path)?;
         match absolute.components().next() {
             Some(Component::Prefix(prefix))
                 if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
-            _ => return Err(io::Error::from(io::ErrorKind::Unsupported)),
+            _ => return Err(io::ErrorKind::Unsupported.into()),
         }
         // canonicalize follows junctions, so inspect the caller's chain first.
         for ancestor in absolute.ancestors() {
