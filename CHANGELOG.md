@@ -56,9 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A crash inside one LLM job no longer leaves chat, question cards, notes
-  synthesis and projection waiting forever. The job and the ones queued behind
-  it fail with an error, and the next request runs normally (#539).
+- A panic inside one LLM executor job no longer leaves other jobs waiting
+  forever. That job and the jobs queued behind it end at once (notes synthesis
+  and projection with an error, entity extraction with its rule-based
+  fallback), and the next job starts a new worker (#539).
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
