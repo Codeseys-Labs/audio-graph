@@ -1449,7 +1449,7 @@
     "stageAsr": "ASR",
     "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
     "transcriptNotSaving": {
-      "confirmation_delayed": "Aguardando confirmação de que a transcrição foi salva",
+      "confirmation_delayed": "Aguardando confirmação do salvamento da transcrição",
       "writer_absent": "A transcrição não está sendo salva",
       "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
       "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"

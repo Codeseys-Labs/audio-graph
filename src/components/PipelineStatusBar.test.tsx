@@ -114,15 +114,11 @@ describe("PipelineStatusBar", () => {
       "write_failed",
       "A transcrição não está sendo salva porque houve uma falha na gravação",
     ],
-    [
-      "en",
-      "confirmation_delayed",
-      "Waiting for confirmation that the transcript was saved",
-    ],
+    ["en", "confirmation_delayed", "Transcript save confirmation pending"],
     [
       "pt",
       "confirmation_delayed",
-      "Aguardando confirmação de que a transcrição foi salva",
+      "Aguardando confirmação do salvamento da transcrição",
     ],
   ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
     const previous = i18n.language;
