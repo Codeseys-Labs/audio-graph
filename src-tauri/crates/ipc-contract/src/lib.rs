@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod credential_contract;
 pub mod endpoint_credential_routing;
+pub mod runtime_diagnostic;
 pub mod session_data_movement;
 pub mod speech_span_revision;
 

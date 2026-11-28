@@ -12,6 +12,7 @@
  */
 import i18n from "../i18n";
 import type { AppErrorPayload } from "../types";
+import { runtimeDiagnosticPresentation } from "./runtimeDiagnostic";
 
 /**
  * Narrow an unknown value to an `AppErrorPayload` if it has the shape
@@ -93,6 +94,14 @@ function formatAppError(err: AppErrorPayload): string {
  *   - anything else (objects, undefined, numbers)
  */
 export function errorToMessage(e: unknown): string {
+  if (
+    typeof e === "object" &&
+    e !== null &&
+    "code" in e &&
+    e.code === "runtime_diagnostic"
+  ) {
+    return i18n.t(runtimeDiagnosticPresentation(e).translationKey);
+  }
   if (isAppErrorPayload(e)) {
     return formatAppError(e);
   }

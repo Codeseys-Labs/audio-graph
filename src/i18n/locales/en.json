@@ -1551,6 +1551,48 @@
     "details": "Details",
     "hideDetails": "Hide details"
   },
+  "runtimeDiagnostics": {
+    "credential": {
+      "missing": "The required credential is missing.",
+      "locked": "Unlock the credential store and try again.",
+      "access_denied": "Access to the credential was denied.",
+      "cancelled": "The credential operation was cancelled.",
+      "store_unavailable": "The credential store is unavailable.",
+      "store_unsupported": "This credential store is not supported.",
+      "corrupt_record": "The saved credential record is damaged.",
+      "unsupported_schema": "This version of the app cannot read the saved credential record.",
+      "payload_too_large": "The credential set exceeds the storage limit.",
+      "ambiguous_match": "More than one credential matches this request.",
+      "conflict": "The credential operation conflicts with saved data.",
+      "migration_required": "Migrate the saved credentials before using them.",
+      "migration_conflict": "Resolve the conflicting credentials before migrating.",
+      "recovery_required": "The credential store needs recovery.",
+      "legacy_cleanup_required": "Remove the remaining legacy credentials before continuing.",
+      "permission_hardening_failed": "The app could not secure the credential store permissions.",
+      "invalid_credential_set": "The selected credential set is invalid.",
+      "audience_not_allowed": "The credential is not authorized for this destination.",
+      "insecure_transport": "The credential requires a secure connection.",
+      "revision_conflict": "The credential changed. Reload its status before trying again.",
+      "operation_in_progress": "A credential operation is already in progress.",
+      "stalled_worker": "The credential store stopped responding.",
+      "commit_unknown": "The app could not confirm whether the credential change was saved.",
+      "internal": "The credential operation failed unexpectedly."
+    },
+    "runtime": {
+      "rate_limited": "The provider is rate limiting requests. Try again later.",
+      "network_unreachable": "The app could not reach the provider. Check your connection.",
+      "timeout": "The provider did not respond in time.",
+      "provider_unavailable": "The provider is unavailable.",
+      "protocol_error": "The app could not communicate with the provider.",
+      "invalid_response": "The provider returned an invalid response.",
+      "request_rejected": "The provider rejected the request.",
+      "capacity_exhausted": "The provider is at capacity. Try again later.",
+      "policy_blocked": "The current policy blocks this operation.",
+      "unsupported": "The provider does not support this operation.",
+      "cancelled": "The operation was cancelled.",
+      "internal": "The operation failed unexpectedly."
+    }
+  },
   "errors": {
     "providerDeferred": "{{provider}} is not available for new sessions in the current MVP. Your saved settings are unchanged.",
     "providerSettingsLoading": "Provider settings are still loading. Try again shortly.",
