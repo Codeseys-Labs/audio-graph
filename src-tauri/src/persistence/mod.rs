@@ -2345,6 +2345,28 @@ pub(crate) type LiveTranscriptResult =
 pub(crate) const MAX_TRANSCRIPT_GROUP: usize = 16;
 const TRANSCRIPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(test)]
+thread_local! {
+    static LIVE_ACK_BOUND: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(TRANSCRIPT_ACK_TIMEOUT) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestLiveAckBound(std::time::Duration);
+
+#[cfg(test)]
+impl TestLiveAckBound {
+    pub(crate) fn set(bound: std::time::Duration) -> Self {
+        Self(LIVE_ACK_BOUND.replace(bound))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLiveAckBound {
+    fn drop(&mut self) {
+        LIVE_ACK_BOUND.set(self.0);
+    }
+}
+
 pub(crate) struct PendingTranscriptReceipt<T> {
     reply: mpsc::Receiver<Result<T, canonical_log::TranscriptCommitError>>,
     deadline: std::time::Instant,
@@ -2397,7 +2419,11 @@ impl TranscriptCommitClient {
         ledger: Arc<Mutex<TranscriptLedger>>,
         publication: live_receipt::LatePublication,
     ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
-        self.submit_live_observed(event, ledger, TRANSCRIPT_ACK_TIMEOUT, Some(publication))
+        #[cfg(not(test))]
+        let timeout = TRANSCRIPT_ACK_TIMEOUT;
+        #[cfg(test)]
+        let timeout = LIVE_ACK_BOUND.get();
+        self.submit_live_observed(event, ledger, timeout, Some(publication))
     }
 
     pub(crate) fn submit_live_observed(
