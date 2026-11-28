@@ -2426,8 +2426,15 @@ describe("SettingsPage", () => {
         cmd === "get_provider_readiness_cmd"
       ) {
         throw {
-          code: "credential_file_error",
-          message: { reason: "malformed credentials.yaml" },
+          code: "runtime_diagnostic",
+          diagnostic: {
+            kind: "credential",
+            detail: {
+              code: "corrupt_record",
+              retryable: false,
+              recovery_action: "reconcile",
+            },
+          },
         };
       }
       if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
@@ -2441,7 +2448,7 @@ describe("SettingsPage", () => {
     // readiness section now.
     goToCredentials();
     expect(
-      await screen.findByText(/malformed credentials\.yaml/i),
+      await screen.findByText(/saved credential record is damaged/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/repair the local credential store/i),

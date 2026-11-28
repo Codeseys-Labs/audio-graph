@@ -205,14 +205,17 @@ function mockStartupProbe(
   modelStatus: ModelStatus = readyModels,
   awsProfiles: readonly string[] = [],
 ) {
-  mockedInvoke.mockImplementation(async (cmd: string) => {
+  mockedInvoke.mockImplementation(async (cmd: string, args) => {
     if (cmd === "load_credential_cmd") {
       throw new Error(
         "load_credential_cmd should not be invoked by frontend tests; use load_credential_presence_cmd and provider readiness instead.",
       );
     }
     if (cmd === "load_credential_presence_cmd") {
-      return credentialPresence(...keys);
+      const presence = credentialPresence(...keys);
+      return args && "includeDiagnostics" in args
+        ? { presence, legacy_file_warning: null }
+        : presence;
     }
     if (cmd === "load_settings_cmd") return settings;
     if (cmd === "get_model_status") return modelStatus;
@@ -462,7 +465,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expectNoPlaintextCredentialLoadback();
     expect(
@@ -489,12 +495,15 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     // pins that the filter is load-bearing, not a no-op: an otherwise
     // fully-configured Deepgram → OpenRouter route must NOT read as
     // configured when the backend reports both keys as absent.
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "load_credential_presence_cmd") {
-        return [
+        const presence = [
           { key: "deepgram_api_key", present: false, source: "missing" },
           { key: "openrouter_api_key", present: false, source: "missing" },
         ] satisfies CredentialPresence[];
+        return args && "includeDiagnostics" in args
+          ? { presence, legacy_file_warning: null }
+          : presence;
       }
       if (cmd === "load_settings_cmd") return startupSettings();
       if (cmd === "get_model_status") return readyModels;
@@ -684,7 +693,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
 
     expect(screen.getByRole("tab", { name: /ready/i })).toHaveAttribute(
@@ -960,7 +972,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
 
     // No ExpressSetup, no banner to start with.
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
@@ -1069,14 +1084,20 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     // Fail on mount, then succeed with a configured Deepgram + OpenRouter route so
     // ExpressSetup stays suppressed and the During panels come back.
     let probeCalls = 0;
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "load_credential_cmd") {
         throw new Error("plaintext loadback is forbidden");
       }
       if (cmd === "load_credential_presence_cmd") {
         probeCalls += 1;
         if (probeCalls === 1) throw new Error("backend not ready");
-        return credentialPresence("deepgram_api_key", "openrouter_api_key");
+        const presence = credentialPresence(
+          "deepgram_api_key",
+          "openrouter_api_key",
+        );
+        return args && "includeDiagnostics" in args
+          ? { presence, legacy_file_warning: null }
+          : presence;
       }
       if (cmd === "load_settings_cmd") return startupSettings();
       return undefined;
@@ -1161,7 +1182,10 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
 
     // Probe still throws, but real content (the sample) owns the surface.
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expect(
       screen.queryByTestId("get-started-fallback"),
@@ -1182,25 +1206,50 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps the keychain presence and shows the secondary file repair warning", async () => {
+    const rows = credentialPresence("openai_api_key");
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd")
+        return {
+          presence: rows,
+          legacy_file_warning: {
+            kind: "credential",
+            detail: {
+              code: "corrupt_record",
+              retryable: false,
+              recovery_action: "reconcile",
+            },
+          },
+        };
+      if (cmd === "load_settings_cmd") return startupSettings();
+      if (cmd === "get_model_status") return readyModels;
+      return undefined;
+    });
+    render(<App />);
+    expect(
+      await screen.findByText(/system keychain is available/i),
+    ).toBeInTheDocument();
+    expect(useAudioGraphStore.getState().credentialPresence).toEqual(rows);
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows a repair hint (not the first-run card) when saved credentials are unreadable", async () => {
-    // cred-review m6 + PR #84 review: the repair-hint copy is reserved for a
-    // RECOGNIZED parse failure. The backend's redacted_yaml_parse_error keeps
-    // the stable "Failed to parse {path}:" prefix (content omitted), which is
-    // what the frontend classifies on. The fallback must warn about unreadable
-    // credentials rather than tell the user to "get started" (which would
-    // invite ExpressSetup to re-prompt and overwrite recoverable keys).
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_cmd") {
         throw new Error("plaintext loadback is forbidden");
       }
       if (cmd === "load_credential_presence_cmd") {
-        // Structured AppError payload as serde emits it, with the real
-        // redacted parse-reason shape from credentials/mod.rs.
         throw {
-          code: "credential_file_error",
-          message: {
-            reason:
-              "Failed to parse /home/user/.config/audio-graph/credentials.yaml: invalid YAML at line 3 column 18 (content omitted)",
+          code: "runtime_diagnostic",
+          diagnostic: {
+            kind: "credential",
+            detail: {
+              code: "corrupt_record",
+              retryable: false,
+              recovery_action: "reconcile",
+            },
           },
         };
       }
@@ -1226,22 +1275,20 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
   });
 
   it("shows the generic retryable fallback (not the corrupt-file hint) when the keychain is locked", async () => {
-    // PR #84 review (Codex P2): the backend wraps EVERY presence-load failure
-    // as credential_file_error — including OS-keychain-locked/unavailable
-    // failures, whose reason strings come from the keyring layer ("Failed to
-    // read OS credential …"), not the parse formatter. Telling that user the
-    // credential FILE is corrupt is wrong and scary; unlock+retry is the right
-    // recovery, so the generic fallback copy (with its Retry button) must show.
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_cmd") {
         throw new Error("plaintext loadback is forbidden");
       }
       if (cmd === "load_credential_presence_cmd") {
         throw {
-          code: "credential_file_error",
-          message: {
-            reason:
-              "Failed to read OS credential openai_api_key: keyring is locked",
+          code: "runtime_diagnostic",
+          diagnostic: {
+            kind: "credential",
+            detail: {
+              code: "locked",
+              retryable: true,
+              recovery_action: "unlock_store",
+            },
           },
         };
       }
