@@ -237,6 +237,7 @@ pub enum CanonicalPlatform {
 pub enum CanonicalFilesystemClass {
     Ext4,
     Apfs,
+    Ntfs,
     Remote,
     Fuse,
     Temporary,
@@ -283,7 +284,7 @@ struct ProductionQualificationBinding {
     filesystem: QualifiedFilesystemMount,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct QualifiedFilesystemMount {
     mount_point: PathBuf,
     class: CanonicalFilesystemClass,
@@ -383,6 +384,16 @@ pub enum CanonicalDurabilityBarrier {
     /// Only the qualified parent-directory namespace barrier was crossed. A
     /// removal claims no file barrier: the object is gone.
     ParentNamespace,
+    /// Flushed file data and verified name on fixed local NTFS. NTFS journals
+    /// namespace changes in $LogFile. No directory flush or move was issued.
+    FileAndWindowsNtfsObservedNamespace,
+    /// Flushed file, same-volume MoveFileExW with MOVEFILE_WRITE_THROUGH,
+    /// then destination identity readback. These Windows levels describe
+    /// process-crash recovery. Abrupt power-loss evidence is tracked in #139.
+    FileAndWindowsNtfsWriteThroughNamespace,
+    /// Verified absence under the cooperative lock on qualified NTFS.
+    /// This does not provide the Unix fsync(dir_fd) persistence guarantee.
+    WindowsNtfsUnlinkNamespace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +515,9 @@ pub(crate) enum CanonicalImmutableExactState {
 pub enum CanonicalSnapshotExpectation<'a> {
     Absent,
     Existing(&'a File),
+    /// Transfer the validated head to the guard so it can close the last
+    /// handle immediately before a Windows write-through replacement.
+    ExistingOwned(File),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,11 +526,21 @@ enum SnapshotDisposition {
     Install,
 }
 
+impl CanonicalSnapshotExpectation<'_> {
+    fn file(&self) -> Option<&File> {
+        match self {
+            Self::Absent => None,
+            Self::Existing(file) => Some(file),
+            Self::ExistingOwned(file) => Some(file),
+        }
+    }
+}
+
 impl fmt::Debug for CanonicalSnapshotExpectation<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Absent => formatter.write_str("CanonicalSnapshotExpectation::Absent"),
-            Self::Existing(_) => {
+            Self::Existing(_) | Self::ExistingOwned(_) => {
                 formatter.write_str("CanonicalSnapshotExpectation::Existing([BOUND])")
             }
         }
@@ -549,32 +573,46 @@ pub enum CanonicalCoordinationError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum VolumeIdentity {
+    #[cfg(windows)]
+    WindowsVolume(u64),
     #[cfg(unix)]
     UnixDevice(u64),
     #[cfg(test)]
     SyntheticAlgorithmNamespace(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum ObjectIdentity {
+    #[cfg(windows)]
+    WindowsFileId(u128),
     #[cfg(unix)]
     UnixInode(u64),
     #[cfg(test)]
     SyntheticAlgorithmObject(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct FilesystemIdentity {
     volume: Option<VolumeIdentity>,
     object: Option<ObjectIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ManagedNamespace {
     canonical_root: PathBuf,
     identity: FilesystemIdentity,
+}
+
+#[cfg(test)]
+impl fmt::Debug for QualifiedFilesystemMount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualifiedFilesystemMount")
+            .field("class", &self.class)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ManagedNamespace {
@@ -582,6 +620,14 @@ impl ManagedNamespace {
         root: &Path,
         missing: CanonicalCoordinationError,
     ) -> Result<Self, CanonicalCoordinationError> {
+        #[cfg(windows)]
+        windows_ntfs::check_directory_chain(root).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                missing
+            } else {
+                coordination_io(CanonicalCoordinationStage::ResolveRoot, &error)
+            }
+        })?;
         let canonical_root = std::fs::canonicalize(root).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 missing
@@ -595,17 +641,19 @@ impl ManagedNamespace {
             return Err(CanonicalCoordinationError::ManagedRootNotDirectory);
         }
         Ok(Self {
+            identity: path_identity(&canonical_root, &metadata).map_err(|error| {
+                coordination_io(CanonicalCoordinationStage::ResolveRoot, &error)
+            })?,
             canonical_root,
-            identity: filesystem_identity(&metadata),
         })
     }
 
-    fn observed_identity(&self, metadata: &Metadata) -> FilesystemIdentity {
+    fn observed_identity(&self, identity: FilesystemIdentity) -> FilesystemIdentity {
         #[cfg(test)]
         if synthetic_algorithm_identity_token(&self.identity).is_some() {
             return self.identity.clone();
         }
-        filesystem_identity(metadata)
+        identity
     }
 
     fn validate_current(&self) -> Result<(), CanonicalDurabilityRejection> {
@@ -615,7 +663,9 @@ impl ManagedNamespace {
             .map_err(|error| durability_io(CanonicalDurabilityStage::ValidateNamespace, &error))?;
         if current_root != self.canonical_root
             || !metadata.is_dir()
-            || self.observed_identity(&metadata) != self.identity
+            || self.observed_identity(path_identity(&current_root, &metadata).map_err(|error| {
+                durability_io(CanonicalDurabilityStage::ValidateNamespace, &error)
+            })?) != self.identity
         {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
@@ -627,45 +677,7 @@ impl ManagedNamespace {
         target: &Path,
         platform: CanonicalPlatform,
     ) -> Result<BoundParent, CanonicalDurabilityRejection> {
-        self.validate_current()?;
-        if target.file_name().is_none() {
-            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
-        }
-        let parent = parent_directory(target);
-        let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CanonicalDurabilityRejection::ParentProvisioningRequired
-            } else {
-                durability_io(CanonicalDurabilityStage::OpenParent, &error)
-            }
-        })?;
-        if canonical_parent != self.canonical_root {
-            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
-        }
-        let metadata = std::fs::metadata(&canonical_parent)
-            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
-        let identity = self.observed_identity(&metadata);
-        if !metadata.is_dir() {
-            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
-        }
-        if identity_is_available(&self.identity) && identity != self.identity {
-            return Err(CanonicalDurabilityRejection::IdentityChanged);
-        }
-        let directory = open_parent_directory(platform, &canonical_parent)?;
-        if let Some(directory) = &directory {
-            let opened_metadata = directory
-                .metadata()
-                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
-            let opened_identity = self.observed_identity(&opened_metadata);
-            if identity_is_available(&identity) && opened_identity != identity {
-                return Err(CanonicalDurabilityRejection::IdentityChanged);
-            }
-        }
-        Ok(BoundParent {
-            canonical_path: canonical_parent,
-            identity,
-            barrier: ParentDurabilityBarrier::new(directory, &self.identity),
-        })
+        self.bind_target_parent(target, platform, false)
     }
 
     fn bind_descendant_parent(
@@ -673,11 +685,28 @@ impl ManagedNamespace {
         target: &Path,
         platform: CanonicalPlatform,
     ) -> Result<BoundParent, CanonicalDurabilityRejection> {
+        self.bind_target_parent(target, platform, true)
+    }
+
+    fn bind_target_parent(
+        &self,
+        target: &Path,
+        platform: CanonicalPlatform,
+        allow_descendant: bool,
+    ) -> Result<BoundParent, CanonicalDurabilityRejection> {
         self.validate_current()?;
         if target.file_name().is_none() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
         let parent = parent_directory(target);
+        #[cfg(windows)]
+        windows_ntfs::check_directory_chain(&parent).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CanonicalDurabilityRejection::ParentProvisioningRequired
+            } else {
+                durability_io(CanonicalDurabilityStage::OpenParent, &error)
+            }
+        })?;
         let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 CanonicalDurabilityRejection::ParentProvisioningRequired
@@ -685,7 +714,8 @@ impl ManagedNamespace {
                 durability_io(CanonicalDurabilityStage::OpenParent, &error)
             }
         })?;
-        if !canonical_parent.starts_with(&self.canonical_root) {
+        let is_root = canonical_parent == self.canonical_root;
+        if !(is_root || allow_descendant && canonical_parent.starts_with(&self.canonical_root)) {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
         let metadata = std::fs::metadata(&canonical_parent)
@@ -693,14 +723,24 @@ impl ManagedNamespace {
         if !metadata.is_dir() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
-        let identity = self.observed_identity(&metadata);
+        let identity = self.observed_identity(
+            path_identity(&canonical_parent, &metadata)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?,
+        );
+        if is_root && identity_is_available(&self.identity) && identity != self.identity {
+            return Err(CanonicalDurabilityRejection::IdentityChanged);
+        }
         let directory = open_parent_directory(platform, &canonical_parent)?;
         if let Some(directory) = &directory {
             let opened_metadata = directory
                 .metadata()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
             if identity_is_available(&identity)
-                && self.observed_identity(&opened_metadata) != identity
+                && self.observed_identity(
+                    handle_identity(directory, &opened_metadata).map_err(|error| {
+                        durability_io(CanonicalDurabilityStage::OpenParent, &error)
+                    })?,
+                ) != identity
             {
                 return Err(CanonicalDurabilityRejection::IdentityChanged);
             }
@@ -742,27 +782,36 @@ impl ParentDurabilityBarrier {
         self.native.is_some()
     }
 
+    /// Cross the platform's parent barrier. On Windows the held handle
+    /// supplies identity evidence only; the receipt names the namespace check.
     fn sync_all(&self) -> io::Result<()> {
         #[cfg(test)]
         if self.algorithm_test {
             return Ok(());
         }
-        self.native
+        let directory = self
+            .native
             .as_ref()
-            .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?
-            .sync_all()
+            .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?;
+        #[cfg(not(windows))]
+        {
+            directory.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            windows_ntfs::identity(directory).map(|_| ())
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 fn open_parent_directory(
     _platform: CanonicalPlatform,
-    _path: &Path,
+    path: &Path,
 ) -> Result<Option<File>, CanonicalDurabilityRejection> {
-    // Rust's ordinary `File::open` does not request the directory-handle flags
-    // required by Windows. Existing-file append needs no directory handle, and
-    // every Windows namespace mutation is refused before a parent barrier.
-    Ok(None)
+    windows_ntfs::open_attributes(path)
+        .map(Some)
+        .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1063,9 +1112,7 @@ impl CanonicalDurability {
         self.validate_guard_binding(&namespace, qualification)?;
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         ensure_regular_lock_entry(&lock_path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&lock_path)
+        let file = open_plain_existing(&lock_path, OpenOptions::new().read(true))
             .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
         let file = try_lock_shared(file)?;
         Ok(CanonicalSharedGuard {
@@ -1367,17 +1414,24 @@ impl CanonicalExclusiveGuard {
                 },
             );
         }
-        if let Err(rejection) = self.open_existing_regular(path) {
-            return CanonicalDurabilityOutcome::Rejected(rejection);
+        let file = match self.open_existing_regular(path) {
+            Ok(file) => file,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
+        if self.platform == CanonicalPlatform::Windows
+            && let Err(error) = self.checked(CanonicalDurabilityStage::FileSync, || file.sync_all())
+        {
+            return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
+            self.verify_windows_name(path, &file)?;
             parent.barrier.sync_all()
         }) {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation: CanonicalMutation::Rename,
-            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            barrier: self.file_namespace_barrier(false),
         })
     }
 
@@ -1493,7 +1547,7 @@ impl CanonicalExclusiveGuard {
         }
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return self.publish_unlink_absence(&parent, recovery_key, injected_fault);
+                return self.publish_unlink_absence(path, &parent, recovery_key, injected_fault);
             }
             Err(error) => {
                 return CanonicalUnlinkOutcome::Rejected(durability_io(
@@ -1543,21 +1597,16 @@ impl CanonicalExclusiveGuard {
             // resolves it.
             return unlink_indeterminate(CanonicalDurabilityStage::Unlink, &error, recovery_key);
         }
-        if let Err(error) =
-            self.checked_unlink(CanonicalDurabilityStage::ParentSync, injected_fault, || {
-                parent.barrier.sync_all()
-            })
-        {
-            return unlink_indeterminate(
-                CanonicalDurabilityStage::ParentSync,
-                &error,
-                recovery_key,
-            );
+        drop(file);
+        match self.publish_unlink_absence(path, &parent, recovery_key, injected_fault) {
+            CanonicalUnlinkOutcome::AlreadyAbsent(barrier) => {
+                CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                    mutation: CanonicalMutation::Unlink,
+                    barrier,
+                })
+            }
+            outcome => outcome,
         }
-        CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
-            mutation: CanonicalMutation::Unlink,
-            barrier: CanonicalDurabilityBarrier::ParentNamespace,
-        })
     }
 
     /// The absent arm still crosses the qualified parent barrier, so an exact
@@ -1565,12 +1614,20 @@ impl CanonicalExclusiveGuard {
     /// calling an unpublished removal durable.
     fn publish_unlink_absence(
         &self,
+        path: &Path,
         parent: &BoundParent,
         recovery_key: CanonicalRecoveryKey,
         injected_fault: Option<CanonicalDurabilityStage>,
     ) -> CanonicalUnlinkOutcome {
         if let Err(error) =
             self.checked_unlink(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                if self.platform == CanonicalPlatform::Windows {
+                    match std::fs::symlink_metadata(path) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                        Ok(_) => return Err(io::Error::other("unlink absence unconfirmed")),
+                    }
+                }
                 parent.barrier.sync_all()
             })
         {
@@ -1580,7 +1637,7 @@ impl CanonicalExclusiveGuard {
                 recovery_key,
             );
         }
-        CanonicalUnlinkOutcome::AlreadyAbsent(CanonicalDurabilityBarrier::ParentNamespace)
+        CanonicalUnlinkOutcome::AlreadyAbsent(self.unlink_barrier())
     }
 
     fn checked_unlink(
@@ -1972,6 +2029,10 @@ impl CanonicalExclusiveGuard {
             }
         };
 
+        #[cfg(windows)]
+        if let Err(error) = windows_ntfs::protect_private_file(path, &file) {
+            return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
+        }
         let remaining = &expected[observed_len..];
         if injected_fault == Some(CanonicalDurabilityStage::PostCreate) && observed_len == 0 {
             return indeterminate(
@@ -2039,7 +2100,7 @@ impl CanonicalExclusiveGuard {
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation,
-            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            barrier: self.file_namespace_barrier(false),
         })
     }
 
@@ -2058,8 +2119,8 @@ impl CanonicalExclusiveGuard {
     /// Append bytes whose immediate canonical parent is the bound directory.
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
-    /// additionally requires matching opaque qualification evidence and parent
-    /// directory `sync_all` on a supported host platform.
+    /// additionally requires matching qualification and the platform's
+    /// namespace barrier (Unix directory sync or NTFS identity readback).
     pub fn append(
         &self,
         path: &Path,
@@ -2140,7 +2201,7 @@ impl CanonicalExclusiveGuard {
             }
         };
 
-        self.append_opened(opened, bytes, recovery_key)
+        self.append_opened(path, opened, bytes, recovery_key)
     }
 
     /// Publish a regular source file under a new unique name in the same bound
@@ -2247,10 +2308,16 @@ impl CanonicalExclusiveGuard {
                 ));
             }
         };
-        if self.preflight_volumes_differ(
-            &self.observed_filesystem_identity(&source_metadata),
-            &source_parent.identity,
-        ) {
+        let source_identity = match handle_identity(&source_file, &source_metadata) {
+            Ok(identity) => self.namespace.observed_identity(identity),
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::OpenExisting,
+                    &error,
+                ));
+            }
+        };
+        if self.preflight_volumes_differ(&source_identity, &source_parent.identity) {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None },
             );
@@ -2279,6 +2346,9 @@ impl CanonicalExclusiveGuard {
                 "quarantine_parent_sync_before",
             );
         }
+        if let Err(error) = self.verify_windows_name(destination, &source_file) {
+            return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
+        }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
             source_parent_directory.sync_all()
         }) {
@@ -2291,7 +2361,7 @@ impl CanonicalExclusiveGuard {
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation: CanonicalMutation::Rename,
-            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            barrier: self.file_namespace_barrier(true),
         })
     }
 
@@ -2302,8 +2372,9 @@ impl CanonicalExclusiveGuard {
     /// fallback. An existing destination expectation must carry the same open
     /// file from which the caller validated its generation. `Accepted` follows
     /// owner-only protection, complete temp write and flush, temp `sync_all`,
-    /// one atomic same-directory install, and the qualified parent-directory
-    /// barrier. Windows and unqualified namespaces refuse before temp creation.
+    /// one same-directory install, and the qualified namespace barrier. On
+    /// Windows, transfer the validated head via ExistingOwned to release it
+    /// before MoveFileExW. Additional open readers can still deny replacement.
     /// Once the temp may be visible, every failed barrier or destination
     /// revalidation is indeterminate and retains a caller recovery key.
     pub fn install_snapshot(
@@ -2500,11 +2571,16 @@ impl CanonicalExclusiveGuard {
         }
 
         self.wait_before_existing_open();
-        let validated_destination =
-            match self.validate_snapshot_destination(destination, expectation) {
-                Ok(destination) => destination,
-                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
-            };
+        let validated_destination = match self.validate_snapshot_destination(
+            destination,
+            expectation.file().map_or(
+                CanonicalSnapshotExpectation::Absent,
+                CanonicalSnapshotExpectation::Existing,
+            ),
+        ) {
+            Ok(destination) => destination,
+            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+        };
         if self.preflight_volumes_differ(
             validated_destination.filesystem_identity(),
             &self.namespace.identity,
@@ -2540,6 +2616,22 @@ impl CanonicalExclusiveGuard {
             );
         }
 
+        #[cfg(windows)]
+        if let Err(rejection) = self.refuse_lock_alias(&temporary_file) {
+            // A lock alias can only be an existing temporary in the resume path.
+            if rejection == CanonicalDurabilityRejection::ReservedCoordinationEntry {
+                return CanonicalDurabilityOutcome::Rejected(rejection);
+            }
+            return indeterminate(
+                CanonicalDurabilityStage::InspectEntry,
+                &io::Error::other("identity unavailable"),
+                recovery_key,
+            );
+        }
+        #[cfg(windows)]
+        if let Err(error) = windows_ntfs::protect_private_file(temporary, &temporary_file) {
+            return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
+        }
         let mut writer = BufWriter::new(&mut temporary_file);
         let remaining = &bytes[already_written..];
         if injected_fault == Some(CanonicalDurabilityStage::Write) && !remaining.is_empty() {
@@ -2608,18 +2700,25 @@ impl CanonicalExclusiveGuard {
             }
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::SnapshotIntentStage,
-                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                barrier: self.file_namespace_barrier(false),
             });
         }
+        // After final revalidation the cooperative lock protects the names.
+        // MoveFileExW can deny replacement while the old head is still open.
+        let mutation = validated_destination.mutation();
+        #[cfg(test)]
+        drop(validated_destination);
+        drop(expectation);
         if let Err(error) =
             self.checked_snapshot(CanonicalDurabilityStage::Rename, injected_fault, || {
-                self.rename_source(temporary, destination)
+                self.move_source(temporary, destination, true)
             })
         {
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) =
             self.checked_snapshot(CanonicalDurabilityStage::ParentSync, injected_fault, || {
+                self.verify_windows_name(destination, &temporary_file)?;
                 temporary_parent.barrier.sync_all()
             })
         {
@@ -2627,8 +2726,8 @@ impl CanonicalExclusiveGuard {
         }
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
-            mutation: validated_destination.mutation(),
-            barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            mutation,
+            barrier: self.file_namespace_barrier(true),
         })
     }
 
@@ -2655,6 +2754,17 @@ impl CanonicalExclusiveGuard {
             .is_some_and(|binding| !binding.is_current())
         {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
+        }
+        #[cfg(windows)]
+        for target in targets {
+            // Named streams share the base file's ID. Refuse syntax that
+            // Win32 can resolve to a different entry than the supplied basename.
+            if target.file_name().is_some_and(|name| {
+                let name = name.as_encoded_bytes();
+                name.contains(&b':') || matches!(name.last(), Some(b'.' | b' '))
+            }) {
+                return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+            }
         }
         if targets.into_iter().any(|target| {
             self.reserved_internal_names
@@ -2741,7 +2851,39 @@ impl CanonicalExclusiveGuard {
         volumes_differ(source, parent)
     }
 
+    fn verify_windows_name(&self, path: &Path, file: &File) -> io::Result<()> {
+        if self.platform == CanonicalPlatform::Windows {
+            self.validate_snapshot_destination(path, CanonicalSnapshotExpectation::Existing(file))
+                .map_err(|_| io::Error::other("identity unavailable or changed"))?;
+        }
+        Ok(())
+    }
+
+    fn file_namespace_barrier(&self, moved: bool) -> CanonicalDurabilityBarrier {
+        match (self.platform, moved) {
+            (CanonicalPlatform::Windows, true) => {
+                CanonicalDurabilityBarrier::FileAndWindowsNtfsWriteThroughNamespace
+            }
+            (CanonicalPlatform::Windows, false) => {
+                CanonicalDurabilityBarrier::FileAndWindowsNtfsObservedNamespace
+            }
+            _ => CanonicalDurabilityBarrier::FileAndParentNamespace,
+        }
+    }
+
+    fn unlink_barrier(&self) -> CanonicalDurabilityBarrier {
+        if self.platform == CanonicalPlatform::Windows {
+            CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+        } else {
+            CanonicalDurabilityBarrier::ParentNamespace
+        }
+    }
+
     fn rename_source(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        self.move_source(source, destination, false)
+    }
+
+    fn move_source(&self, source: &Path, destination: &Path, _replace: bool) -> io::Result<()> {
         #[cfg(test)]
         if let Some(injection) = &self.injected_rename_fault {
             injection.rename_invoked.store(true, Ordering::SeqCst);
@@ -2749,11 +2891,25 @@ impl CanonicalExclusiveGuard {
                 return Err(io::Error::from_raw_os_error(raw_os_error));
             }
         }
-        std::fs::rename(source, destination)
+        #[cfg(all(test, windows))]
+        if _replace && self.algorithm_test.is_some() {
+            // The algorithm fixture deliberately models replace-over-open
+            // independently of Win32 sharing. Native tests use production tokens.
+            return std::fs::rename(source, destination);
+        }
+        #[cfg(windows)]
+        {
+            windows_ntfs::rename(source, destination, _replace)
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(source, destination)
+        }
     }
 
     fn append_opened(
         &self,
+        path: &Path,
         opened: OpenedCanonicalFile,
         bytes: &[u8],
         recovery_key: CanonicalRecoveryKey,
@@ -2807,6 +2963,9 @@ impl CanonicalExclusiveGuard {
             crate::persistence::canonical_crash_harness::checkpoint(
                 "first_create_parent_sync_before",
             );
+            if let Err(error) = self.verify_windows_name(path, &file) {
+                return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
+            }
             if let Err(error) =
                 self.checked(CanonicalDurabilityStage::ParentSync, || parent.sync_all())
             {
@@ -2818,7 +2977,7 @@ impl CanonicalExclusiveGuard {
             );
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation,
-                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                barrier: self.file_namespace_barrier(false),
             });
         }
 
@@ -2834,12 +2993,12 @@ impl CanonicalExclusiveGuard {
         if !metadata.file_type().is_file() {
             return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
         }
-        let expected_identity = self.observed_filesystem_identity(&metadata);
+        let expected_identity = self.namespace.observed_identity(
+            path_identity(path, &metadata)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?,
+        );
         self.wait_before_existing_open();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
+        let file = open_plain_existing(path, OpenOptions::new().read(true).write(true))
             .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
         let opened_metadata = file
             .metadata()
@@ -2851,22 +3010,27 @@ impl CanonicalExclusiveGuard {
         {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
-        #[cfg(not(test))]
-        let observed_identity = filesystem_identity(&opened_metadata);
-        #[cfg(test)]
-        let observed_identity = self.observed_filesystem_identity(&opened_metadata);
+        let observed_identity = self.namespace.observed_identity(
+            handle_identity(&file, &opened_metadata)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?,
+        );
         if identity_is_available(&expected_identity) && observed_identity != expected_identity {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
+        #[cfg(windows)]
+        self.refuse_lock_alias(&file)?;
         Ok(file)
     }
 
-    fn observed_filesystem_identity(&self, metadata: &Metadata) -> FilesystemIdentity {
-        #[cfg(test)]
-        if uses_synthetic_algorithm_identity(&self.namespace.identity) {
-            return self.namespace.identity.clone();
+    #[cfg(windows)]
+    fn refuse_lock_alias(&self, file: &File) -> Result<(), CanonicalDurabilityRejection> {
+        let error = |error| durability_io(CanonicalDurabilityStage::InspectEntry, &error);
+        if windows_ntfs::identity(file).map_err(error)?
+            == windows_ntfs::identity(&self._lock_file).map_err(error)?
+        {
+            return Err(CanonicalDurabilityRejection::ReservedCoordinationEntry);
         }
-        filesystem_identity(metadata)
+        Ok(())
     }
 
     fn validate_snapshot_destination(
@@ -2874,6 +3038,10 @@ impl CanonicalExclusiveGuard {
         destination: &Path,
         expectation: CanonicalSnapshotExpectation<'_>,
     ) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
+        #[cfg(windows)]
+        if let Some(expected) = expectation.file() {
+            self.refuse_lock_alias(expected)?;
+        }
         #[cfg(test)]
         if uses_synthetic_algorithm_identity(&self.namespace.identity) {
             return validate_algorithm_test_snapshot_destination(
@@ -2981,12 +3149,12 @@ fn validate_snapshot_destination(
     destination: &Path,
     expectation: CanonicalSnapshotExpectation<'_>,
 ) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
-    match expectation {
-        CanonicalSnapshotExpectation::Absent => {
+    match expectation.file() {
+        None => {
             ensure_destination_absent(destination)?;
             Ok(ValidatedSnapshotDestination::Absent)
         }
-        CanonicalSnapshotExpectation::Existing(expected_file) => {
+        Some(expected_file) => {
             let expected_metadata = expected_file
                 .metadata()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
@@ -3003,8 +3171,10 @@ fn validate_snapshot_destination(
             if !actual_metadata.file_type().is_file() {
                 return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
             }
-            let expected_identity = filesystem_identity(&expected_metadata);
-            let actual_identity = filesystem_identity(&actual_metadata);
+            let expected_identity = handle_identity(expected_file, &expected_metadata)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
+            let actual_identity = path_identity(destination, &actual_metadata)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
             if !identity_is_available(&expected_identity) || actual_identity != expected_identity {
                 return Err(CanonicalDurabilityRejection::IdentityChanged);
             }
@@ -3019,12 +3189,12 @@ fn validate_algorithm_test_snapshot_destination(
     expectation: CanonicalSnapshotExpectation<'_>,
     identity: &FilesystemIdentity,
 ) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
-    match expectation {
-        CanonicalSnapshotExpectation::Absent => {
+    match expectation.file() {
+        None => {
             ensure_destination_absent(destination)?;
             Ok(ValidatedSnapshotDestination::Absent)
         }
-        CanonicalSnapshotExpectation::Existing(expected_file) => {
+        Some(expected_file) => {
             let expected_metadata = expected_file
                 .metadata()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
@@ -3073,7 +3243,7 @@ fn revalidate_snapshot_destination(
         ValidatedSnapshotDestination::Existing(expected_identity) => {
             let metadata = std::fs::symlink_metadata(destination)?;
             if metadata.file_type().is_file()
-                && filesystem_identity(&metadata) == *expected_identity
+                && path_identity(destination, &metadata)? == *expected_identity
             {
                 Ok(())
             } else {
@@ -3151,10 +3321,7 @@ fn open_snapshot_temporary(
             if !metadata.file_type().is_file() {
                 return Err(CanonicalDurabilityRejection::SnapshotTempAlreadyExists);
             }
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
+            let mut file = open_plain_existing(path, OpenOptions::new().read(true).write(true))
                 .map_err(|error| durability_io(CanonicalDurabilityStage::OpenExisting, &error))?;
             let mut observed = Vec::new();
             (&mut file)
@@ -3175,6 +3342,19 @@ fn open_snapshot_temporary(
     }
 }
 
+fn open_plain_existing(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    windows_ntfs::require_plain(&file.metadata()?)?;
+    Ok(file)
+}
+
 fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationError> {
     match OpenOptions::new()
         .read(true)
@@ -3185,10 +3365,7 @@ fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationEr
         Ok(file) => Ok(file),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             ensure_regular_lock_entry(path)?;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
+            open_plain_existing(path, OpenOptions::new().read(true).write(true))
                 .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))
         }
         Err(error) => Err(coordination_io(CanonicalCoordinationStage::Open, &error)),
@@ -3315,7 +3492,7 @@ fn live_filesystem_inventory() -> Vec<FilesystemObservation> {
             #[cfg(test)]
             let volume = std::fs::metadata(disk.mount_point())
                 .ok()
-                .and_then(|metadata| filesystem_identity(&metadata).volume);
+                .and_then(|metadata| path_identity(disk.mount_point(), &metadata).ok()?.volume);
             FilesystemObservation {
                 mount_point: disk.mount_point().to_path_buf(),
                 file_system: disk.file_system().to_os_string(),
@@ -3357,7 +3534,17 @@ fn resolve_live_filesystem(
                 Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
             }
         }
-        CanonicalPlatform::Windows | CanonicalPlatform::Other => {
+        CanonicalPlatform::Windows => {
+            #[cfg(windows)]
+            {
+                windows_ntfs::resolve(namespace)
+            }
+            #[cfg(not(windows))]
+            {
+                Err(CanonicalFilesystemQualificationError::IdentityUnavailable)
+            }
+        }
+        CanonicalPlatform::Other => {
             unreachable!("unsupported platforms return before filesystem inventory")
         }
     }
@@ -3662,10 +3849,10 @@ fn assess_filesystem_policy(
             .filter(|observation| canonical_root.starts_with(&observation.mount_point))
             .max_by_key(|observation| observation.mount_point.components().count())
             .ok_or(CanonicalFilesystemQualificationError::NoMatchingMount)?,
-        CanonicalPlatform::MacOs => {
+        CanonicalPlatform::MacOs | CanonicalPlatform::Windows => {
             return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
         }
-        CanonicalPlatform::Windows | CanonicalPlatform::Other => {
+        CanonicalPlatform::Other => {
             unreachable!("unsupported platforms return before filesystem observation selection")
         }
     };
@@ -3701,9 +3888,10 @@ fn classify_filesystem(file_system: &OsStr) -> CanonicalFilesystemClass {
     let normalized = file_system.to_ascii_lowercase();
     match normalized.as_str() {
         "ext4" => CanonicalFilesystemClass::Ext4,
+        "ntfs" => CanonicalFilesystemClass::Ntfs,
         "apfs" => CanonicalFilesystemClass::Apfs,
         "tmpfs" | "devtmpfs" | "ramfs" => CanonicalFilesystemClass::Temporary,
-        "nfs" | "nfs4" | "cifs" | "smbfs" | "9p" | "afs" | "ceph" => {
+        "nfs" | "nfs4" | "cifs" | "smbfs" | "smb" | "webdav" | "9p" | "afs" | "ceph" => {
             CanonicalFilesystemClass::Remote
         }
         other if other == "fuse" || other.starts_with("fuse.") => CanonicalFilesystemClass::Fuse,
@@ -3717,7 +3905,8 @@ fn validate_mount_volume(
 ) -> Result<(), CanonicalFilesystemQualificationError> {
     let metadata = std::fs::metadata(&filesystem.mount_point)
         .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
-    let mount_identity = filesystem_identity(&metadata);
+    let mount_identity = path_identity(&filesystem.mount_point, &metadata)
+        .map_err(|error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error))?;
     match (
         root_identity.volume.as_ref(),
         mount_identity.volume.as_ref(),
@@ -3783,10 +3972,287 @@ const fn current_platform() -> CanonicalPlatform {
 const fn namespace_supported_for(platform: CanonicalPlatform) -> bool {
     matches!(
         platform,
-        CanonicalPlatform::Linux | CanonicalPlatform::MacOs
+        CanonicalPlatform::Linux | CanonicalPlatform::MacOs | CanonicalPlatform::Windows
     )
 }
 
+#[cfg(windows)]
+mod windows_ntfs {
+    use super::*;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Component, Prefix};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        GetVolumePathNameW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        VOLUME_NAME_DOS,
+    };
+    use windows::Win32::System::SystemServices::{FILE_PERSISTENT_ACLS, FILE_READ_ONLY_VOLUME};
+    use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE};
+    use windows::core::PCWSTR;
+
+    // windows-result 0.4 converts Error to io::Error using the HRESULT. Win32
+    // calls in this module return HRESULT_FROM_WIN32; preserve the native errno.
+    fn native_error(error: windows::core::Error) -> io::Error {
+        let code = error.code().0;
+        io::Error::from_raw_os_error(if code as u32 >> 16 == 0x8007 {
+            code & 0xffff
+        } else {
+            code
+        })
+    }
+
+    pub(super) fn require_plain(metadata: &Metadata) -> io::Result<()> {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            Err(io::Error::from(io::ErrorKind::InvalidInput))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn protect_private_file(path: &Path, file: &File) -> io::Result<()> {
+        let expected = identity(file)?;
+        if identity(&open_attributes(path)?)? != expected {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        crate::fs_util::try_set_owner_only(path).map_err(|_| io::ErrorKind::PermissionDenied)?;
+        Ok(())
+    }
+
+    pub(super) fn check_directory_chain(path: &Path) -> io::Result<()> {
+        let absolute = std::path::absolute(path)?;
+        match absolute.components().next() {
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
+            _ => return Err(io::Error::from(io::ErrorKind::Unsupported)),
+        }
+        // canonicalize follows junctions, so inspect the caller's chain first.
+        for ancestor in absolute.ancestors() {
+            require_plain(&std::fs::symlink_metadata(ancestor)?)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn open_attributes(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(path)?;
+        require_plain(&file.metadata()?)?;
+        Ok(file)
+    }
+
+    pub(super) fn identity(file: &File) -> io::Result<FilesystemIdentity> {
+        require_plain(&file.metadata()?)?;
+        let handle = HANDLE(file.as_raw_handle());
+        let mut id = FILE_ID_INFO::default();
+        // SAFETY: file owns the live handle. The output buffer has the type
+        // and size specified for FileIdInfo and is initialized on success.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&raw mut id).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        let (volume, object) = match result.map_err(native_error) {
+            Ok(()) => (
+                id.VolumeSerialNumber,
+                u128::from_le_bytes(id.FileId.Identifier),
+            ),
+            Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87 | 120)) => {
+                let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
+                // SAFETY: same held handle and an exactly typed output buffer.
+                unsafe { GetFileInformationByHandle(handle, &mut legacy) }.map_err(native_error)?;
+                (
+                    u64::from(legacy.dwVolumeSerialNumber),
+                    (u128::from(legacy.nFileIndexHigh) << 32) | u128::from(legacy.nFileIndexLow),
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        if object == 0 {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        Ok(FilesystemIdentity {
+            volume: Some(VolumeIdentity::WindowsVolume(volume)),
+            object: Some(ObjectIdentity::WindowsFileId(object)),
+        })
+    }
+
+    fn inspect(
+        file: &File,
+    ) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+        let fail = |error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error);
+        let handle = HANDLE(file.as_raw_handle());
+        let mut name = [0; 256];
+        let mut flags = 0;
+        // SAFETY: held directory handle, writable name and flags buffers.
+        unsafe {
+            GetVolumeInformationByHandleW(
+                handle,
+                None,
+                None,
+                None,
+                Some(&mut flags),
+                Some(&mut name),
+            )
+        }
+        .map_err(|error| fail(native_error(error)))?;
+        let end = name
+            .iter()
+            .position(|&unit| unit == 0)
+            .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
+        let class = classify_filesystem(&OsString::from_wide(&name[..end]));
+        let mut path = vec![0; 32768];
+        // SAFETY: the slice includes room for the terminating NUL.
+        let len = unsafe { GetFinalPathNameByHandleW(handle, &mut path, VOLUME_NAME_DOS) } as usize;
+        if len == 0 {
+            return Err(fail(io::Error::last_os_error()));
+        }
+        if len >= path.len() {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        let final_path = PathBuf::from(OsString::from_wide(&path[..len]));
+        if !matches!(final_path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimDisk(_)))
+        {
+            return Err(
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    class: CanonicalFilesystemClass::Remote,
+                },
+            );
+        }
+        let mut root = vec![0; 32768];
+        // SAFETY: both buffers are live, and path is NUL-terminated.
+        unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut root) }
+            .map_err(|error| fail(native_error(error)))?;
+        let end = root
+            .iter()
+            .position(|&unit| unit == 0)
+            .filter(|&end| end > 0)
+            .ok_or(CanonicalFilesystemQualificationError::IdentityUnavailable)?;
+        // SAFETY: GetVolumePathNameW returned a NUL-terminated volume root.
+        let drive = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        if !matches!(drive, DRIVE_FIXED | DRIVE_REMOTE | DRIVE_REMOVABLE) {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        qualify_ntfs(
+            class,
+            drive == DRIVE_FIXED,
+            drive == DRIVE_REMOTE,
+            flags & FILE_READ_ONLY_VOLUME != 0,
+            flags & FILE_PERSISTENT_ACLS != 0,
+        )?;
+        Ok(QualifiedFilesystemMount {
+            mount_point: PathBuf::from(OsString::from_wide(&root[..end])),
+            class,
+            #[cfg(test)]
+            live_mount: None,
+        })
+    }
+
+    pub(super) fn resolve(
+        namespace: &ManagedNamespace,
+    ) -> Result<QualifiedFilesystemMount, CanonicalFilesystemQualificationError> {
+        let root = &namespace.canonical_root;
+        let fail = |error| qualification_io_error(CanonicalCoordinationStage::ResolveRoot, &error);
+        let held = open_attributes(root).map_err(fail)?;
+        if identity(&held).map_err(fail)? != namespace.identity {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        let mount = inspect(&held)?;
+        check_directory_chain(root).map_err(fail)?;
+        let reopened = open_attributes(root).map_err(fail)?;
+        if identity(&reopened).map_err(fail)? != namespace.identity || inspect(&reopened)? != mount
+        {
+            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+        }
+        Ok(mount)
+    }
+
+    fn move_path(path: &Path) -> io::Result<Vec<u16>> {
+        let name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+        let absolute = std::fs::canonicalize(parent_directory(path))?.join(name);
+        let mut wide: Vec<_> = absolute.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    pub(super) fn rename(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+        let source = move_path(source)?;
+        let destination = move_path(destination)?;
+        let mut flags = MOVEFILE_WRITE_THROUGH;
+        if replace {
+            flags |= MOVEFILE_REPLACE_EXISTING;
+        }
+        // SAFETY: both path buffers are terminated and live until return.
+        unsafe { MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr()), flags) }
+            .map_err(native_error)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn qualify_ntfs(
+    class: CanonicalFilesystemClass,
+    fixed: bool,
+    remote: bool,
+    read_only: bool,
+    persistent_acls: bool,
+) -> Result<(), CanonicalFilesystemQualificationError> {
+    use CanonicalFilesystemQualificationError as Error;
+    if remote || class != CanonicalFilesystemClass::Ntfs || !persistent_acls {
+        return Err(Error::FilesystemUnsupported {
+            platform: CanonicalPlatform::Windows,
+            class: if remote {
+                CanonicalFilesystemClass::Remote
+            } else {
+                class
+            },
+        });
+    }
+    if read_only {
+        return Err(Error::ReadOnlyFilesystem { class });
+    }
+    if !fixed {
+        return Err(Error::RemovableFilesystem { class });
+    }
+    Ok(())
+}
+
+fn path_identity(_path: &Path, _metadata: &Metadata) -> io::Result<FilesystemIdentity> {
+    #[cfg(windows)]
+    {
+        windows_ntfs::identity(&windows_ntfs::open_attributes(_path)?)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(filesystem_identity(_metadata))
+    }
+}
+
+fn handle_identity(_file: &File, _metadata: &Metadata) -> io::Result<FilesystemIdentity> {
+    #[cfg(windows)]
+    {
+        windows_ntfs::identity(_file)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(filesystem_identity(_metadata))
+    }
+}
+
+#[cfg(not(windows))]
 fn filesystem_identity(metadata: &Metadata) -> FilesystemIdentity {
     #[cfg(unix)]
     {
@@ -3983,9 +4449,7 @@ mod tests {
                 "windows",
                 CanonicalPlatform::Windows,
                 vec![nested_ext4.clone()],
-                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
-                    platform: CanonicalPlatform::Windows,
-                },
+                CanonicalFilesystemQualificationError::IdentityUnavailable,
             ),
             (
                 "other-platform",
@@ -4166,7 +4630,7 @@ mod tests {
             class: CanonicalFilesystemClass::Apfs,
             live_mount: Some(LiveMountIdentity::Synthetic(42)),
         };
-        assert_eq!(system.volume, data.volume);
+        assert!(system.volume == data.volume);
         assert_eq!(
             select_exact_macos_mount(&root_mount, &[system.clone(), data.clone()]),
             Ok(qualified)
@@ -6074,7 +6538,7 @@ mod tests {
             ),
             CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::FirstCreate,
-                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+                barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsObservedNamespace,
             })
         );
         drop(guard);
@@ -6093,16 +6557,165 @@ mod tests {
         fs::remove_dir_all(displaced_root).expect("clean displaced algorithm root");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn platform_namespace_contract_is_linux_macos_only() {
+    fn native_ntfs_receipts_bind_files_moves_and_unlink_to_the_qualified_root() {
+        use CanonicalDurabilityBarrier as B;
+        use CanonicalMutation as M;
+        let root = temp_root("ntfs-receipts");
+        fs::create_dir(&root).unwrap();
+        let (proof, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&root)
+                .expect("test fixture requires writable fixed local NTFS");
+        let guard = durability
+            .try_lock_exclusive_qualified(&root, &proof)
+            .unwrap();
+        let proof = Some(&proof);
+        let key = CanonicalRecoveryKey::from_opaque_bytes([19; 16]);
+        let entry = root.join("entry");
+        let head = root.join("head");
+        let tmp = root.join("temporary");
+        let accepted = |mutation, barrier| {
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt { mutation, barrier })
+        };
+        assert_eq!(
+            guard.append(&entry, b"old", proof, key),
+            accepted(M::FirstCreate, B::FileAndWindowsNtfsObservedNamespace)
+        );
+        assert_eq!(
+            guard.append(&entry, b" head", proof, key),
+            accepted(M::ExistingAppend, B::FileDataAndMetadata)
+        );
+        let old = windows_ntfs::open_attributes(&entry).unwrap();
+        assert_eq!(
+            guard.rename(&entry, &head, proof, key),
+            accepted(M::Rename, B::FileAndWindowsNtfsWriteThroughNamespace)
+        );
+        assert!(
+            validate_snapshot_destination(&head, CanonicalSnapshotExpectation::Existing(&old))
+                .is_ok()
+        );
+        assert_eq!(
+            guard.install_snapshot(
+                &tmp,
+                &head,
+                b"new head",
+                CanonicalSnapshotExpectation::ExistingOwned(old),
+                proof,
+                key
+            ),
+            accepted(
+                M::SnapshotReplacement,
+                B::FileAndWindowsNtfsWriteThroughNamespace
+            )
+        );
+        assert_eq!(fs::read(&head).unwrap(), b"new head");
+        assert_eq!(
+            guard.unlink_canonical_entry(&head, proof, key),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: M::Unlink,
+                barrier: B::WindowsNtfsUnlinkNamespace
+            })
+        );
+        assert_eq!(
+            guard.unlink_canonical_entry(&head, proof, key),
+            CanonicalUnlinkOutcome::AlreadyAbsent(B::WindowsNtfsUnlinkNamespace)
+        );
+        assert_eq!(
+            guard.stage_snapshot_temporary(
+                &tmp,
+                &head,
+                b"candidate",
+                CanonicalSnapshotExpectation::Absent,
+                proof,
+                key
+            ),
+            accepted(
+                M::SnapshotIntentStage,
+                B::FileAndWindowsNtfsObservedNamespace
+            )
+        );
+        assert_eq!(
+            guard.install_snapshot_recovery(
+                &tmp,
+                &head,
+                b"candidate",
+                CanonicalSnapshotExpectation::Absent,
+                proof,
+                key
+            ),
+            accepted(
+                M::InitialSnapshotInstall,
+                B::FileAndWindowsNtfsWriteThroughNamespace
+            )
+        );
+        assert_eq!(
+            guard.create_or_reconcile_immutable_exact_with_identity_prefix(
+                &entry, b"record", 1, proof, key
+            ),
+            accepted(
+                M::ImmutableExactCreate,
+                B::FileAndWindowsNtfsObservedNamespace
+            )
+        );
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_qualification_rejects_a_junction_in_the_root_chain() {
+        let base = temp_root("ntfs-junction");
+        let real = base.join("real");
+        let junction = base.join("junction");
+        fs::create_dir_all(real.join("child")).unwrap();
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/j", "junction", "real"])
+            .current_dir(&base)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        for path in [&junction, &junction.join("child")] {
+            assert!(CanonicalFilesystemQualification::for_existing_managed_root(path).is_err());
+        }
+        assert!(!real.join(COORDINATION_FILE_NAME).exists());
+        fs::remove_dir(junction).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn windows_requires_writable_fixed_local_ntfs_with_acls() {
+        let ntfs = classify_filesystem(OsStr::new("NTFS"));
+        assert_eq!(qualify_ntfs(ntfs, true, false, false, true), Ok(()));
+        for name in ["ReFS", "FAT", "FAT32", "exFAT", "smb", "cifs", "webdav"] {
+            assert!(
+                qualify_ntfs(
+                    classify_filesystem(OsStr::new(name)),
+                    true,
+                    false,
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+        assert!(qualify_ntfs(ntfs, false, false, false, true).is_err());
+        assert!(qualify_ntfs(ntfs, true, true, false, true).is_err());
+        assert!(qualify_ntfs(ntfs, true, false, true, true).is_err());
+        assert!(qualify_ntfs(ntfs, true, false, false, false).is_err());
+    }
+
+    #[test]
+    fn namespace_contract_requires_a_supported_platform() {
         assert!(namespace_supported_for(CanonicalPlatform::Linux));
         assert!(namespace_supported_for(CanonicalPlatform::MacOs));
-        assert!(!namespace_supported_for(CanonicalPlatform::Windows));
+        assert!(namespace_supported_for(CanonicalPlatform::Windows));
         assert!(!namespace_supported_for(CanonicalPlatform::Other));
     }
 
     #[test]
-    fn windows_policy_path_allows_existing_append_and_refuses_namespace_mutation() {
+    fn unqualified_windows_allows_existing_append_and_refuses_namespace_mutation() {
         let root = temp_root("windows-policy-path");
         fs::create_dir_all(&root).expect("create fixture root");
         let existing = root.join("existing.log");
