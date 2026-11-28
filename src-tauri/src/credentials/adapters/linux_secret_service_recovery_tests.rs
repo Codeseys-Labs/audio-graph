@@ -5,7 +5,7 @@ use crate::credentials::adapters::linux_secret_service_wire::{
 };
 use crate::credentials::adapters::native_interaction::NativeInteractionGate;
 use crate::test_log_capture;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use tokio::sync::oneshot;
 use zbus::connection::Builder;
@@ -28,6 +28,13 @@ enum Behavior {
     VerificationDenied,
     ChangedTarget,
     QueuedApproval,
+    QueuedDismissal,
+    DeadlineQueuedApproval,
+    DeadlineQueuedDismissal,
+    ApprovesDuringCancel,
+    ApprovesDuringDeadline,
+    IgnoresDeadline,
+    WrongWorker,
     Panic,
     ForgedSender,
     ForgedPath,
@@ -51,7 +58,11 @@ enum Event {
     Verification,
 }
 
-fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outcome, Vec<Event>) {
+fn run(
+    behavior: Behavior,
+    scope: RecoveryScope,
+    window: Option<&str>,
+) -> (Result<RecoveryOutcome, Failure>, Vec<Event>) {
     let capture = test_log_capture::ThreadLogCapture::start();
     let bus = script::Bus::start();
     let cancellation = Arc::new(CancellationToken::new());
@@ -65,6 +76,14 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
             let connection = Builder::address(address.clone()).build().await.unwrap();
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
+            let _other_owner = if behavior == Behavior::KWallet {
+                let other = Builder::address(address.clone()).build().await.unwrap();
+                other.request_name("org.gnome.keyring").await.unwrap();
+                Some(other)
+            } else {
+                connection.request_name("org.gnome.keyring").await.unwrap();
+                None
+            };
             ready.send(()).unwrap();
             let mut retired = false;
             let mut shown = false;
@@ -151,6 +170,9 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                                 | Behavior::VerificationFails
                                 | Behavior::VerificationDenied
                                 | Behavior::QueuedApproval
+                                | Behavior::QueuedDismissal
+                                | Behavior::DeadlineQueuedApproval
+                                | Behavior::DeadlineQueuedDismissal
                                 | Behavior::ForgedSender
                                 | Behavior::ForgedPath
                         ) {
@@ -160,6 +182,7 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                                     | Behavior::VerificationFails
                                     | Behavior::VerificationDenied
                                     | Behavior::QueuedApproval
+                                    | Behavior::DeadlineQueuedApproval
                             );
                             // Broadcast and emit before replying. The private bus
                             // only routes this signal if AddMatch preceded Prompt.
@@ -168,6 +191,8 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                                 matches!(
                                     behavior,
                                     Behavior::UserDismisses
+                                        | Behavior::QueuedDismissal
+                                        | Behavior::DeadlineQueuedDismissal
                                         | Behavior::ForgedSender
                                         | Behavior::ForgedPath,
                                 ),
@@ -178,7 +203,9 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                         connection.reply(&header, &()).await.unwrap();
                         if matches!(
                             behavior,
-                            Behavior::CancelOnPrompt | Behavior::IgnoresDismiss
+                            Behavior::CancelOnPrompt
+                                | Behavior::IgnoresDismiss
+                                | Behavior::ApprovesDuringCancel
                         ) {
                             cancellation_for_peer.cancel();
                         }
@@ -188,8 +215,15 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                         assert_eq!(path, PROMPT_PATH);
                         assert_eq!(interactive.as_deref(), Some(sender));
                         assert!(shown);
-                        if behavior != Behavior::IgnoresDismiss {
-                            emit_completion(&connection, true).await;
+                        if !matches!(
+                            behavior,
+                            Behavior::IgnoresDismiss | Behavior::IgnoresDeadline
+                        ) {
+                            unlocked = matches!(
+                                behavior,
+                                Behavior::ApprovesDuringCancel | Behavior::ApprovesDuringDeadline
+                            );
+                            emit_completion(&connection, !unlocked).await;
                             shown = false;
                         }
                         connection.reply(&header, &()).await.unwrap();
@@ -242,7 +276,13 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                 };
                 events.push(event);
             }
-            assert_eq!(shown, behavior == Behavior::IgnoresDismiss);
+            assert_eq!(
+                shown,
+                matches!(
+                    behavior,
+                    Behavior::IgnoresDismiss | Behavior::IgnoresDeadline
+                )
+            );
             events
         })
     });
@@ -274,27 +314,61 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
             Failure::CommitUnknown
         );
     }
-    let budget = if behavior == Behavior::NeverCompletes {
+    let budget = if matches!(
+        behavior,
+        Behavior::NeverCompletes
+            | Behavior::ApprovesDuringDeadline
+            | Behavior::DeadlineQueuedApproval
+            | Behavior::DeadlineQueuedDismissal
+            | Behavior::IgnoresDeadline
+    ) {
         Duration::from_secs(2)
     } else {
         Duration::from_secs(4)
     };
-    let outcome = recover_exact(
+    let facade = recovery_facade(
         target,
         window.map(str::to_owned),
         budget,
-        &cancellation,
         TestOptions {
             gate: Some(gate),
-            daemon: Some(if behavior == Behavior::KWallet {
-                "ksecretd"
-            } else {
-                "gnome-keyring-daemon"
-            }),
-            cancel_with_queued_completion: behavior == Behavior::QueuedApproval,
+            address: Some(bus.address()),
+            cancel_with_queued_completion: matches!(
+                behavior,
+                Behavior::QueuedApproval | Behavior::QueuedDismissal
+            ),
+            timeout_with_queued_completion: matches!(
+                behavior,
+                Behavior::DeadlineQueuedApproval | Behavior::DeadlineQueuedDismissal
+            ),
             panic_after_prompt: behavior == Behavior::Panic,
         },
-    );
+    )
+    .unwrap();
+    let recover = || facade.diagnose_or_unlock(RecoveryTarget::CredentialStore, &cancellation);
+    let outcome = if behavior == Behavior::WrongWorker {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { recover() })
+    } else {
+        recover()
+    };
+    if !matches!(
+        behavior,
+        Behavior::Panic | Behavior::Stalled | Behavior::CommitUnknown
+    ) {
+        assert!(
+            gate.acquire().is_ok(),
+            "closed recovery must leave the gate healthy"
+        );
+        assert_eq!(
+            facade.diagnose_or_unlock(RecoveryTarget::CredentialStore, &CancellationToken::new()),
+            Err(Failure::RevisionConflict)
+        );
+    } else {
+        assert!(matches!(gate.acquire(), Err(Failure::StalledWorker)));
+    }
     let _ = stop.send(());
     let events = scripted.join().unwrap();
     let rendered = format!("{outcome:?}");
@@ -351,7 +425,7 @@ fn subscribes_before_prompt_and_retires_before_fresh_verification() {
         (RecoveryScope::DefaultCollection, None),
     ] {
         let (outcome, events) = run(Behavior::Accept, scope, window);
-        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(outcome, Ok(RecoveryOutcome::Ready));
         assert_eq!(
             interactive_events(&events),
             [Event::Unlock, Event::Prompt, Event::Verification]
@@ -366,25 +440,17 @@ fn subscribes_before_prompt_and_retires_before_fresh_verification() {
 #[test]
 fn dismissal_by_the_user_does_not_verify_or_send_dismiss_again() {
     let (outcome, events) = run(Behavior::UserDismisses, RecoveryScope::Item, None);
-    assert_eq!(outcome, Outcome::DismissedByUser);
+    assert_eq!(outcome, Err(Failure::Cancelled));
     assert_eq!(interactive_events(&events), [Event::Unlock, Event::Prompt]);
 }
 
 #[test]
 fn cancel_and_deadline_dismiss_and_report_unconfirmed_settlement() {
     for (behavior, expected) in [
-        (
-            Behavior::CancelOnPrompt,
-            Outcome::Cancelled(Dismissal::ServiceAcknowledged),
-        ),
-        (
-            Behavior::NeverCompletes,
-            Outcome::TimedOut(Dismissal::ServiceAcknowledged),
-        ),
-        (
-            Behavior::IgnoresDismiss,
-            Outcome::Cancelled(Dismissal::Unacknowledged),
-        ),
+        (Behavior::CancelOnPrompt, Err(Failure::Cancelled)),
+        (Behavior::NeverCompletes, Err(Failure::Unavailable)),
+        (Behavior::IgnoresDismiss, Err(Failure::Cancelled)),
+        (Behavior::IgnoresDeadline, Err(Failure::Unavailable)),
     ] {
         let (actual, events) = run(behavior, RecoveryScope::Item, None);
         assert_eq!(actual, expected);
@@ -398,7 +464,7 @@ fn cancel_and_deadline_dismiss_and_report_unconfirmed_settlement() {
 #[test]
 fn immediate_unlock_verifies_and_a_completed_prompt_does_not_prove_unlock() {
     let (outcome, events) = run(Behavior::NoPrompt, RecoveryScope::Item, None);
-    assert_eq!(outcome, Outcome::Verified);
+    assert_eq!(outcome, Ok(RecoveryOutcome::Ready));
     assert_eq!(
         interactive_events(&events),
         [Event::Unlock, Event::Verification]
@@ -406,7 +472,7 @@ fn immediate_unlock_verifies_and_a_completed_prompt_does_not_prove_unlock() {
 
     for behavior in [Behavior::StillLocked, Behavior::VerificationFails] {
         let (outcome, events) = run(behavior, RecoveryScope::Item, None);
-        assert_eq!(outcome, Outcome::StillLocked);
+        assert_eq!(outcome, Ok(RecoveryOutcome::RecoveryRequired));
         assert_eq!(
             interactive_events(&events),
             [Event::Unlock, Event::Prompt, Event::Verification]
@@ -416,7 +482,7 @@ fn immediate_unlock_verifies_and_a_completed_prompt_does_not_prove_unlock() {
         }
     }
     let (outcome, events) = run(Behavior::VerificationDenied, RecoveryScope::Item, None);
-    assert_eq!(outcome, Outcome::Failed(Failure::AccessDenied));
+    assert_eq!(outcome, Err(Failure::AccessDenied));
     assert_eq!(
         interactive_events(&events),
         [Event::Unlock, Event::Prompt, Event::Verification]
@@ -426,14 +492,14 @@ fn immediate_unlock_verifies_and_a_completed_prompt_does_not_prove_unlock() {
 #[test]
 fn changed_target_never_reaches_interactive_methods() {
     let (outcome, events) = run(Behavior::ChangedTarget, RecoveryScope::Item, None);
-    assert_eq!(outcome, Outcome::Failed(Failure::AmbiguousMatch));
+    assert_eq!(outcome, Err(Failure::AmbiguousMatch));
     assert!(interactive_events(&events).is_empty());
 }
 
 #[test]
 fn queued_approval_wins_cancellation_and_is_verified() {
     let (outcome, events) = run(Behavior::QueuedApproval, RecoveryScope::Item, None);
-    assert_eq!(outcome, Outcome::Verified);
+    assert_eq!(outcome, Ok(RecoveryOutcome::Ready));
     assert_eq!(
         interactive_events(&events),
         [Event::Unlock, Event::Prompt, Event::Verification]
@@ -441,10 +507,76 @@ fn queued_approval_wins_cancellation_and_is_verified() {
 }
 
 #[test]
+fn queued_completions_win_both_cancellation_and_the_deadline() {
+    for behavior in [Behavior::QueuedDismissal, Behavior::DeadlineQueuedDismissal] {
+        let (outcome, events) = run(behavior, RecoveryScope::Item, None);
+        assert_eq!(outcome, Err(Failure::Cancelled));
+        assert_eq!(interactive_events(&events), [Event::Unlock, Event::Prompt]);
+    }
+    let (outcome, events) = run(Behavior::DeadlineQueuedApproval, RecoveryScope::Item, None);
+    assert_eq!(outcome, Ok(RecoveryOutcome::Ready));
+    assert_eq!(
+        interactive_events(&events),
+        [Event::Unlock, Event::Prompt, Event::Verification]
+    );
+}
+
+#[test]
+fn approval_during_dismissal_is_verified_for_cancel_and_deadline() {
+    for behavior in [
+        Behavior::ApprovesDuringCancel,
+        Behavior::ApprovesDuringDeadline,
+    ] {
+        let (outcome, events) = run(behavior, RecoveryScope::Item, None);
+        assert_eq!(outcome, Ok(RecoveryOutcome::Ready));
+        assert_eq!(
+            interactive_events(&events),
+            [
+                Event::Unlock,
+                Event::Prompt,
+                Event::Dismiss,
+                Event::Verification
+            ]
+        );
+    }
+}
+
+#[test]
+fn recovery_refuses_wrong_worker_inside_the_sealed_facade() {
+    let (outcome, events) = run(Behavior::WrongWorker, RecoveryScope::Item, None);
+    assert_eq!(outcome, Err(Failure::Unsupported));
+    assert_eq!(
+        events,
+        [
+            Event::Ordinary(script::Call::Search),
+            Event::Ordinary(script::Call::Attributes)
+        ]
+    );
+}
+
+#[test]
+fn a_poisoned_boundary_state_fails_closed_without_io() {
+    let boundary = Boundary {
+        state: Mutex::new(State::Used),
+        window: None,
+        end: Instant::now(),
+        test: TestOptions::default(),
+    };
+    let _ = std::panic::catch_unwind(|| {
+        let _held = boundary.state.lock().unwrap();
+        panic!("scripted boundary state poison");
+    });
+    assert!(matches!(
+        boundary.take_pending(),
+        Err(RecoveryFailure::Closed(Failure::RevisionConflict))
+    ));
+}
+
+#[test]
 fn forged_completions_from_other_sender_or_path_cannot_approve() {
     for behavior in [Behavior::ForgedSender, Behavior::ForgedPath] {
         let (outcome, events) = run(behavior, RecoveryScope::Item, None);
-        assert_eq!(outcome, Outcome::DismissedByUser);
+        assert_eq!(outcome, Err(Failure::Cancelled));
         assert_eq!(interactive_events(&events), [Event::Unlock, Event::Prompt]);
     }
 }
@@ -452,10 +584,7 @@ fn forged_completions_from_other_sender_or_path_cannot_approve() {
 #[test]
 fn a_prompt_panic_attempts_dismissal_and_reports_possible_open_dialog() {
     let (outcome, events) = run(Behavior::Panic, RecoveryScope::Item, None);
-    assert_eq!(
-        outcome,
-        Outcome::PromptMayStillBeOpen(Dismissal::ServiceAcknowledged)
-    );
+    assert_eq!(outcome, Err(Failure::StalledWorker));
     assert_eq!(
         interactive_events(&events),
         [Event::Unlock, Event::Prompt, Event::Dismiss]
@@ -465,18 +594,12 @@ fn a_prompt_panic_attempts_dismissal_and_reports_possible_open_dialog() {
 #[test]
 fn kwallet_and_latched_gates_never_dispatch_recovery() {
     for (behavior, expected) in [
-        (Behavior::KWallet, Outcome::Unsupported),
-        (Behavior::Stalled, Outcome::Failed(Failure::StalledWorker)),
-        (
-            Behavior::CommitUnknown,
-            Outcome::Failed(Failure::StalledWorker),
-        ),
+        (Behavior::KWallet, Err(Failure::Unsupported)),
+        (Behavior::Stalled, Err(Failure::StalledWorker)),
+        (Behavior::CommitUnknown, Err(Failure::StalledWorker)),
     ] {
         let (outcome, events) = run(behavior, RecoveryScope::Item, None);
         assert_eq!(outcome, expected);
         assert!(interactive_events(&events).is_empty());
-    }
-    for name in ["ksecretd", "kwalletd5", "kwalletd6", "keepassxc", "unknown"] {
-        assert!(!allows_interactive_recovery(Path::new(name)));
     }
 }
