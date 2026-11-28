@@ -13792,10 +13792,16 @@ fn readiness_failure_diagnostic(error: &AppError) -> RuntimeDiagnostic {
             false,
             RuntimeSafeRecoveryAction::ReviewPolicy,
         ),
+        // Capture-control refusals never come from a readiness probe; they
+        // are closed too, and mapped by kind like the rest.
         AppError::Io(_)
         | AppError::ModelNotFound { .. }
         | AppError::SessionInvalid { .. }
         | AppError::ArtifactTooLarge { .. }
+        | AppError::CaptureStartFailed(_)
+        | AppError::CaptureStopFailed(_)
+        | AppError::TranscriptionRefused(_)
+        | AppError::CaptureAttachSuperseded
         | AppError::Unknown(_) => RuntimeDiagnostic::internal(context),
     }
 }
