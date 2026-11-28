@@ -24,8 +24,8 @@ use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
     CanonicalExclusiveGuard, CanonicalFilesystemQualification,
-    CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSnapshotExpectation,
-    CanonicalUnlinkOutcome,
+    CanonicalFilesystemQualificationError, CanonicalRecoveryKey, CanonicalSharedGuard,
+    CanonicalSnapshotExpectation, CanonicalUnlinkOutcome,
 };
 use super::session_semantics::{SESSIONS_INDEX_IDENTITY, SessionSemanticsVersion};
 
@@ -706,13 +706,18 @@ pub enum ManifestCasOutcome {
     DurabilityIndeterminate(CanonicalDurabilityIndeterminate),
 }
 
+enum UnqualifiedReadPolicy {
+    PlatformDefault,
+    ReadOnly,
+}
+
 /// One explicit-root manifest store. It never resolves or provisions a
 /// default application path.
 pub struct SessionArtifactManifestStore {
     root: PathBuf,
     address: Option<SessionControlAddress>,
     durability: CanonicalDurability,
-    qualification: Option<CanonicalFilesystemQualification>,
+    qualification: Result<CanonicalFilesystemQualification, UnqualifiedReadPolicy>,
 }
 
 impl SessionArtifactManifestStore {
@@ -722,7 +727,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: None,
             durability: CanonicalDurability::new(),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         }
     }
 
@@ -739,8 +744,40 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: Some(address),
             durability: CanonicalDurability::new(),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         })
+    }
+
+    /// Build the read-only fallback only for a known namespace capability refusal.
+    /// Resolve the supplied root once so the existing lock and addressed manifest
+    /// are opened beneath the same directory, including for a Windows junction.
+    pub(crate) fn after_qualification_refusal(
+        root: &Path,
+        session_id: &str,
+        refusal: CanonicalFilesystemQualificationError,
+    ) -> Result<Self, ManifestStoreError> {
+        use CanonicalFilesystemQualificationError as Error;
+        let read_only = matches!(
+            refusal,
+            Error::NamespaceDurabilityUnsupported { .. }
+                | Error::FilesystemUnsupported {
+                    platform: super::canonical_durability::CanonicalPlatform::Windows,
+                    ..
+                }
+        ) || (cfg!(windows)
+            && !matches!(
+                refusal,
+                Error::ParentProvisioningRequired | Error::ManagedRootNotDirectory
+            ));
+        if !read_only {
+            return Err(ManifestStoreError::Qualification(refusal));
+        }
+        let mut store = Self::for_session(root, session_id)?;
+        store.root = root
+            .canonicalize()
+            .map_err(|error| ManifestStoreError::Load(load_io(&error)))?;
+        store.qualification = Err(UnqualifiedReadPolicy::ReadOnly);
+        Ok(store)
     }
 
     /// Bind one existing managed root to live production filesystem evidence.
@@ -756,7 +793,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -775,7 +812,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -806,19 +843,25 @@ impl SessionArtifactManifestStore {
         if !manifest_exists && !coordination_exists {
             return Ok(ManifestLoadOutcome::Absent);
         }
-        let guard = match self.qualification.as_ref() {
-            Some(qualification) => self
-                .durability
-                .try_lock_shared_qualified(&self.root, qualification),
-            None => self.durability.try_lock_shared(&self.root),
-        };
-        let _guard = guard.map_err(ManifestLoadError::Coordination)?;
+        let _guard = self
+            .shared_guard()
+            .map_err(ManifestLoadError::Coordination)?;
         if !entry_exists(&manifest_path)? {
             return Ok(ManifestLoadOutcome::Absent);
         }
         let (manifest, _) = load_manifest_file(&manifest_path)?;
         self.validate_requested_session(&manifest)?;
         Ok(ManifestLoadOutcome::Present(Box::new(manifest)))
+    }
+
+    fn shared_guard(&self) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+        match &self.qualification {
+            Ok(proof) => self.durability.try_lock_shared_qualified(&self.root, proof),
+            Err(UnqualifiedReadPolicy::ReadOnly) => CanonicalSharedGuard::open_existing(&self.root),
+            Err(UnqualifiedReadPolicy::PlatformDefault) => {
+                self.durability.try_lock_shared(&self.root)
+            }
+        }
     }
 
     /// Read one complete Session snapshot while the store's coordination
@@ -835,8 +878,13 @@ impl SessionArtifactManifestStore {
         reader: impl FnOnce(ManifestLoadOutcome) -> Result<T, E>,
         after_establishment: impl FnOnce(),
     ) -> Result<T, CheckedManifestReadError<E>> {
-        let Some(qualification) = self.qualification.as_ref() else {
-            if self.durability.namespace_mutation_supported() {
+        let Ok(qualification) = self.qualification.as_ref() else {
+            if self.durability.namespace_mutation_supported()
+                && matches!(
+                    self.qualification,
+                    Err(UnqualifiedReadPolicy::PlatformDefault)
+                )
+            {
                 return Err(CheckedManifestReadError::NamespaceQualificationRequired);
             }
             let manifest_before =
@@ -845,12 +893,9 @@ impl SessionArtifactManifestStore {
             let coordination_before =
                 entry_exists(&coordination_path).map_err(CheckedManifestReadError::Load)?;
             if coordination_before {
-                let _guard = self
-                    .durability
-                    .try_lock_shared(&self.root)
-                    .map_err(|error| {
-                        CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
-                    })?;
+                let _guard = self.shared_guard().map_err(|error| {
+                    CheckedManifestReadError::Load(ManifestLoadError::Coordination(error))
+                })?;
                 let head = self
                     .load_selected_manifest()
                     .map_err(CheckedManifestReadError::Load)?;
@@ -921,7 +966,7 @@ impl SessionArtifactManifestStore {
         let qualification = self
             .qualification
             .as_ref()
-            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
+            .map_err(|_| ManifestStoreError::NamespaceQualificationRequired)?;
         let guard = self
             .durability
             .try_lock_exclusive_qualified(&self.root, qualification)
@@ -938,7 +983,7 @@ impl SessionArtifactManifestStore {
         };
         Ok(ManifestWriteTransaction {
             guard,
-            qualification: self.qualification.as_ref(),
+            qualification: Some(qualification),
             expected_session_id: self
                 .address
                 .as_ref()
@@ -995,16 +1040,9 @@ impl SessionArtifactManifestStore {
 
     /// Qualify a live fixture root against real filesystem identity.
     ///
-    /// This fixture demands the substrate the durability layer supports: it
-    /// forwards to `CanonicalFilesystemQualification::for_test_root`, which
-    /// requires both a volume and a directory-object identity. Those come from
-    /// `unix` metadata, so every call site must be gated on `cfg(unix)` —
-    /// elsewhere this returns `ManifestStoreError::Coordination(IdentityUnavailable)`
-    /// and an ungated caller panics on its `expect`. Use it only when the
-    /// behaviour under test is the real-substrate binding itself; reach for
-    /// `qualified_for_algorithm_test` for platform-independent algorithm
-    /// behaviour. `real_filesystem_qualified_fixtures_stay_platform_gated`
-    /// enforces the gate.
+    /// This fixture uses real volume and directory identity. Its historical Unix fixtures
+    /// retain explicit platform gates. Native Windows tests use production NTFS
+    /// qualification. Portable algorithm tests use synthetic identity.
     #[cfg(test)]
     pub(crate) fn qualified_for_test(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
         let root = root.into();
@@ -1014,7 +1052,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability: CanonicalDurability::new(),
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1033,7 +1071,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability: CanonicalDurability::new(),
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1043,8 +1081,8 @@ impl SessionArtifactManifestStore {
     /// temporary are real files; only volume/object identity is synthetic, and
     /// the durability layer substitutes an open-handle identity check for the
     /// inode comparison it cannot make. That substitution is portable, so this
-    /// fixture constructs on every target — including Windows, where the
-    /// namespace durability policy is unsupported and `for_test_root` refuses.
+    /// fixture constructs on every target — including Windows, independently of whether
+    /// the live fixture would qualify for namespace mutation.
     /// It is the right fixture whenever the subject is platform-independent
     /// store or CAS algorithm behaviour rather than the substrate binding.
     #[cfg(test)]
@@ -1059,7 +1097,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1082,7 +1120,7 @@ impl SessionArtifactManifestStore {
             root,
             address: Some(address),
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1102,7 +1140,7 @@ impl SessionArtifactManifestStore {
             root,
             address: None,
             durability,
-            qualification: Some(qualification),
+            qualification: Ok(qualification),
         })
     }
 
@@ -1112,7 +1150,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: None,
             durability: CanonicalDurability::for_test_platform(platform),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         }
     }
 
@@ -1126,7 +1164,7 @@ impl SessionArtifactManifestStore {
             root: root.into(),
             address: Some(session_control_address(session_id)?),
             durability: CanonicalDurability::for_test_platform(platform),
-            qualification: None,
+            qualification: Err(UnqualifiedReadPolicy::PlatformDefault),
         })
     }
 }
@@ -1699,6 +1737,13 @@ impl ManifestWriteTransaction<'_> {
         proof_owned: bool,
     ) -> ManifestCasPreparationResult {
         let reject = ManifestCasPreparationResult::Rejected;
+        // A Windows replacement may have released the old head before an
+        // indeterminate rename. A fresh transaction must bind the current head.
+        if self.head.is_some() && self.head_file.is_none() {
+            return reject(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged,
+            ));
+        }
         if self
             .expected_session_id
             .is_some_and(|expected| expected != candidate.session_id)
@@ -1809,7 +1854,7 @@ impl ManifestWriteTransaction<'_> {
         &mut self,
         preparation: ManifestCasPreparation,
         disposition: ManifestInstallDisposition,
-        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
     ) -> ManifestCasOutcome {
         let resume_temporary = !matches!(disposition, ManifestInstallDisposition::Fresh);
         let (candidate, bytes, recovery_key) = match preparation {
@@ -1822,54 +1867,24 @@ impl ManifestWriteTransaction<'_> {
                 return ManifestCasOutcome::AlreadyCompleted { manifest };
             }
         };
-        let expectation = self
-            .head_file
-            .as_ref()
-            .map_or(CanonicalSnapshotExpectation::Absent, |file| {
-                CanonicalSnapshotExpectation::Existing(file)
-            });
-        let outcome = if resume_temporary {
-            #[cfg(test)]
-            if let Some(injected_fault) = _injected_fault {
-                self.guard.install_snapshot_recovery_with_fault(
-                    &self.temporary_path,
-                    &self.manifest_path,
-                    &bytes,
-                    expectation,
-                    self.qualification,
-                    recovery_key,
-                    injected_fault,
-                )
-            } else {
-                self.guard.install_snapshot_recovery(
-                    &self.temporary_path,
-                    &self.manifest_path,
-                    &bytes,
-                    expectation,
-                    self.qualification,
-                    recovery_key,
-                )
-            }
-
-            #[cfg(not(test))]
-            self.guard.install_snapshot_recovery(
-                &self.temporary_path,
-                &self.manifest_path,
-                &bytes,
-                expectation,
-                self.qualification,
-                recovery_key,
-            )
-        } else {
-            self.guard.install_snapshot(
-                &self.temporary_path,
-                &self.manifest_path,
-                &bytes,
-                expectation,
-                self.qualification,
-                recovery_key,
-            )
-        };
+        let mut expectation = self.head_file.take().map_or(
+            CanonicalSnapshotExpectation::Absent,
+            CanonicalSnapshotExpectation::ExistingOwned,
+        );
+        let outcome = self.guard.install_manifest_snapshot(
+            &self.temporary_path,
+            &self.manifest_path,
+            &bytes,
+            &mut expectation,
+            self.qualification,
+            recovery_key,
+            resume_temporary,
+            injected_fault,
+        );
+        // A pre-rename refusal leaves the exact head available for a retry.
+        if let CanonicalSnapshotExpectation::ExistingOwned(file) = expectation {
+            self.head_file = Some(file);
+        }
         match outcome {
             CanonicalDurabilityOutcome::Accepted(durability) => {
                 match load_manifest_file(&self.manifest_path) {
@@ -3068,7 +3083,7 @@ impl SessionArtifactManifestStore {
         let qualification = self
             .qualification
             .as_ref()
-            .ok_or(ManifestStoreError::NamespaceQualificationRequired)?;
+            .map_err(|_| ManifestStoreError::NamespaceQualificationRequired)?;
         let guard = self
             .durability
             .try_lock_exclusive_qualified(&self.root, qualification)
@@ -3077,7 +3092,7 @@ impl SessionArtifactManifestStore {
         let temporary_path = self.temporary_path();
         let temporary = guard.unlink_canonical_entry(
             &temporary_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             temporary_abandon_recovery_key(&temporary_path),
         );
         if !reached_absence(temporary) {
@@ -3091,7 +3106,7 @@ impl SessionArtifactManifestStore {
         let manifest_path = self.manifest_path();
         let manifest = guard.unlink_canonical_entry(
             &manifest_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             control_plane_retirement_recovery_key(&manifest_path),
         );
         if !reached_absence(manifest) {
@@ -3105,7 +3120,7 @@ impl SessionArtifactManifestStore {
         let provenance_path = self.root.join(address.identities.provenance.as_str());
         let provenance = guard.unlink_canonical_entry(
             &provenance_path,
-            self.qualification.as_ref(),
+            Some(qualification),
             control_plane_retirement_recovery_key(&provenance_path),
         );
         Ok(SessionControlPlaneRetirementReport {
@@ -3519,7 +3534,12 @@ mod tests {
     fn unqualified_absent_checked_read_refuses_before_reader_when_aba_is_unobservable() {
         use std::cell::Cell;
 
-        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+        for platform in [
+            CanonicalPlatform::Linux,
+            CanonicalPlatform::MacOs,
+            CanonicalPlatform::Windows,
+            CanonicalPlatform::Other,
+        ] {
             for transient in ["manifest", "lock"] {
                 let root = root(&format!("unqualified-{platform:?}-{transient}-aba-refusal"));
                 let store = SessionArtifactManifestStore::for_test_session_platform(
@@ -3543,7 +3563,12 @@ mod tests {
                     Ok::<_, ()>("manifest-or-lock ABA must not escape")
                 });
 
-                assert_eq!(outcome, Err(CheckedManifestReadError::UncoordinatedAbsence));
+                let expected = if platform == CanonicalPlatform::Other {
+                    CheckedManifestReadError::UncoordinatedAbsence
+                } else {
+                    CheckedManifestReadError::NamespaceQualificationRequired
+                };
+                assert_eq!(outcome, Err(expected));
                 assert!(!reader_invoked.get());
                 assert!(
                     std::fs::read_dir(&root)
@@ -3557,8 +3582,13 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_windows_other_checked_read_uses_existing_global_shared_guard() {
-        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+    fn unqualified_present_checked_read_uses_existing_guard_only_on_unsupported_platforms() {
+        for platform in [
+            CanonicalPlatform::Linux,
+            CanonicalPlatform::MacOs,
+            CanonicalPlatform::Windows,
+            CanonicalPlatform::Other,
+        ] {
             let root = root(&format!("unqualified-{platform:?}-present-read"));
             let store = SessionArtifactManifestStore::for_test_session_platform(
                 &root,
@@ -3573,11 +3603,16 @@ mod tests {
                 &serde_json::to_vec(&present).expect("present manifest bytes"),
             );
 
-            let observed = store
-                .checked_read(Ok::<_, ()>)
-                .expect("guarded read-only present Session");
+            let observed = store.checked_read(Ok::<_, ()>);
+            if platform != CanonicalPlatform::Other {
+                assert_eq!(
+                    observed,
+                    Err(CheckedManifestReadError::NamespaceQualificationRequired)
+                );
+                continue;
+            }
             assert!(matches!(
-                observed,
+                observed.expect("guarded read-only present Session"),
                 ManifestLoadOutcome::Present(manifest)
                     if manifest.transition.idempotency_id == "present-head"
             ));
@@ -5696,56 +5731,138 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn cc9a_native_windows_qualified_existing_root_refuses_before_manifest_coordination_or_temp_mutation()
-     {
-        fn root_entries(root: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
-            let mut entries = std::fs::read_dir(root)
-                .expect("read fixture root")
-                .map(|entry| {
-                    let entry = entry.expect("read fixture entry");
-                    (
-                        entry.file_name(),
-                        std::fs::read(entry.path()).expect("read fixture entry bytes"),
-                    )
-                })
+    fn cc9a_native_windows_manifest_requires_qualification_for_install_replacement_and_unlink() {
+        let root = root("native-ntfs-qualified-manifest");
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let entries = || {
+            let mut names = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            entries
-        }
-
-        let root = root("cc9a-native-windows-production-refusal");
-        std::fs::write(root.join("sentinel.bin"), b"entry-identical").expect("write root sentinel");
-        let before_entries = root_entries(&root);
-        let error = match SessionArtifactManifestStore::qualified_existing_root(&root) {
-            Err(error) => error,
-            Ok(_) => panic!("Windows production qualification unexpectedly succeeded"),
+            names.sort();
+            names
         };
-
-        assert_eq!(
-            error,
-            ManifestStoreError::Qualification(
-                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
-                    platform: CanonicalPlatform::Windows,
-                },
-            )
-        );
-        let after_entries = root_entries(&root);
+        let before_entries = entries();
+        let unqualified = SessionArtifactManifestStore::new(&root);
+        assert!(matches!(
+            unqualified.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
+        ));
+        let after_entries = entries();
         assert_eq!(after_entries, before_entries);
-        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
         assert!(!root.join(COORDINATION_FILE_NAME).exists());
         assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
-        assert!(!manifest_path.exists());
+        assert!(!unqualified.manifest_path().exists());
+
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root)
+            .expect("fixture requires writable fixed local NTFS");
+        let mut transaction = store.begin_write().expect("qualified transaction");
+        for (generation, id, digit, mutation) in [
+            (
+                0,
+                "ntfs-initial",
+                'a',
+                CanonicalMutation::InitialSnapshotInstall,
+            ),
+            (
+                1,
+                "ntfs-replacement",
+                'b',
+                CanonicalMutation::SnapshotReplacement,
+            ),
+        ] {
+            let outcome = transaction.compare_and_swap(generation, basic_candidate(id, digit));
+            let ManifestCasOutcome::Accepted {
+                manifest,
+                durability,
+            } = outcome
+            else {
+                panic!("qualified manifest install failed: {outcome:?}");
+            };
+            assert_eq!(manifest.generation, generation + 1);
+            assert_eq!(manifest.transition.idempotency_id, id);
+            assert_eq!(
+                durability,
+                CanonicalDurabilityReceipt {
+                    mutation,
+                    barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush,
+                }
+            );
+        }
+        // Abandon unlinks only the Session's staged temporary.
+        std::fs::write(store.temporary_path(), b"orphan").unwrap();
+        assert_eq!(
+            transaction.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::WindowsNtfsParentFlush
+            })
+        );
+        assert!(!store.temporary_path().exists());
+        drop(transaction);
+        assert!(
+            matches!(store.load().unwrap(), ManifestLoadOutcome::Present(head)
+            if head.generation == 2 && head.transition.idempotency_id == "ntfs-replacement")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_ntfs_replacement_retry_requires_the_validated_head() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+        let root = root("ntfs-replacement-retry");
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root).unwrap();
+        let mut writer = store.begin_write().unwrap();
+        assert!(matches!(
+            writer.compare_and_swap(0, basic_candidate("old", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        std::fs::write(store.temporary_path(), b"orphan").unwrap();
+        let replacement = basic_candidate("new", 'b');
+        assert_eq!(
+            writer.compare_and_swap(1, replacement.clone()),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists
+            ))
+        );
+        assert!(matches!(
+            writer.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(_)
+        ));
+
+        // The same writer can retry after the pre-mutation refusal. Cut after
+        // the retry's rename, when the old head has actually been released.
+        assert!(matches!(
+            writer.compare_and_swap_recovery_with_fault(
+                1,
+                replacement,
+                CanonicalDurabilityStage::ParentSync
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::ParentSync,
+                ..
+            })
+        ));
+        assert_eq!(
+            writer.compare_and_swap(1, basic_candidate("stale", 'c')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged
+            ))
+        );
+        assert!(!store.temporary_path().exists());
+        drop(writer);
+        assert!(
+            matches!(store.load().unwrap(), ManifestLoadOutcome::Present(head)
+            if head.generation == 2 && head.transition.idempotency_id == "new")
+        );
     }
 
     /// Keep the substrate contract that seed audio-graph-a58b closed.
     ///
-    /// `qualified_for_test` and `qualified_for_test_session` demand real
-    /// volume and object identity, which `filesystem_identity` can only report
-    /// on `unix`. An ungated call site therefore compiles everywhere and
-    /// panics `Coordination(IdentityUnavailable)` on a host nobody ran here —
-    /// exactly how four tests reached a real Windows run before failing. This
-    /// converts that class back into a local failure by requiring an exact
-    /// platform gate on the enclosing test of every such call site.
+    /// Keep the historical Unix fixture gates explicit. Native Windows tests
+    /// must exercise production qualification on the actual filesystem.
     #[test]
     fn real_filesystem_qualified_fixtures_stay_platform_gated() {
         // Built at runtime so this test does not match its own source.
@@ -5855,7 +5972,7 @@ mod tests {
             &windows_root,
             CanonicalPlatform::Windows,
         );
-        assert!(windows_store.qualification.is_none());
+        assert!(windows_store.qualification.is_err());
         assert!(matches!(
             windows_store.begin_write(),
             Err(ManifestStoreError::NamespaceQualificationRequired)
@@ -6987,7 +7104,11 @@ mod tests {
             adopting.abandon_staged_transition(),
             CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::Unlink,
-                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+                barrier: if cfg!(windows) {
+                    CanonicalDurabilityBarrier::WindowsNtfsParentFlush
+                } else {
+                    CanonicalDurabilityBarrier::ParentNamespace
+                },
             })
         );
         assert!(!temporary_path.exists());

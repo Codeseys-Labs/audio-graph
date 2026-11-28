@@ -1647,17 +1647,14 @@ mod tests {
     }
 
     fn guarded_control_plane_read_supported(root: &Path, id: &str) -> bool {
-        use crate::persistence::canonical_durability::CanonicalFilesystemQualificationError;
         use crate::persistence::session_artifact_manifest::{
             ManifestStoreError, SessionArtifactManifestStore,
         };
-
         match SessionArtifactManifestStore::qualified_existing_session(root, id) {
-            Ok(_)
-            | Err(ManifestStoreError::Qualification(
-                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { .. },
-            )) => true,
-            Err(ManifestStoreError::Qualification(_)) => false,
+            Ok(_) => true,
+            Err(ManifestStoreError::Qualification(error)) => {
+                SessionArtifactManifestStore::after_qualification_refusal(root, id, error).is_ok()
+            }
             Err(error) => panic!("fixture store could not be opened: {error:?}"),
         }
     }

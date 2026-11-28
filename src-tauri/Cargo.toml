@@ -116,11 +116,14 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_windows", "hotplug-recovery"] }
 # SID-native owner-only ACL hardening (seed 403d). Direct dep so `fs_util` can
-# resolve the current process token SID and call SetNamedSecurityInfoW without
+# resolve the current process token SID and apply owner-only DACLs without
 # shelling out to `icacls`/`%USERNAME%`. Pinned to 0.62.2 — the exact version
-# already used by rsac and wasapi, so the ACL code adds no `windows` version.
+# already used by rsac and wasapi, so this adds no `windows` version.
 # Windows-target-only: never compiled on Linux/macOS.
-# Credential-v2 adds only feature gates on this same crate: direct
+# Canonical durability adds feature gates on this same crate for qualified NTFS
+# volume, identity, and namespace operations (`Win32_Storage_FileSystem`,
+# `Win32_System_SystemServices`, `Win32_System_WindowsProgramming`).
+# Credential-v2 adds only feature gates as well: direct
 # CredReadW/CredWriteW/CredDeleteW types (`Win32_Security_Credentials`) and the
 # volume/cloud-root probes behind the dormant filesystem policy.
 windows = { version = "0.62.2", features = [
