@@ -77,6 +77,22 @@ pub(super) const fn engine_not_loaded() -> RuntimeDiagnostic {
     ))
 }
 
+/// Run a model load so that a panic inside the binding cannot carry the model
+/// path past this frame. llama-cpp-2 asserts in debug builds that the path
+/// exists and puts the path in the message, and the file can go away after
+/// `engine_loop` looked. Inside the scope the crash hook records the operation
+/// code alone and prints nothing; the payload is dropped here.
+#[cfg(any(test, feature = "llm-llama"))]
+fn load_redacted<T>(load: impl FnOnce() -> Option<T>) -> Result<T, RuntimeDiagnostic> {
+    crate::crash_handler::catch_redacted_panic(
+        crate::crash_handler::RedactedPanicOp::LlmModelLoad,
+        load,
+    )
+    .ok()
+    .flatten()
+    .ok_or_else(engine_not_loaded)
+}
+
 /// Parse a local model's extraction output. A parse failure is classified
 /// here so neither the output nor the parser's quote of it leaves the engine.
 #[cfg(any(test, feature = "llm-llama"))]
@@ -450,18 +466,20 @@ fn engine_loop(
         }
     };
 
-    // llama-cpp-2 asserts in debug builds that the path exists, and that panic
-    // message carries the path. A missing file is an ordinary load failure.
+    // The binding's debug assertion on a missing path would name the path. A
+    // missing file is an ordinary load failure; `load_redacted` covers the file
+    // going away after this check.
     if !std::path::Path::new(model_path).is_file() {
         let _ = ready.send(Err(engine_not_loaded()));
         return;
     }
 
-    let model = match LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
-    {
+    let model = match load_redacted(|| {
+        LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default()).ok()
+    }) {
         Ok(m) => m,
-        Err(_) => {
-            let _ = ready.send(Err(engine_not_loaded()));
+        Err(diagnostic) => {
+            let _ = ready.send(Err(diagnostic));
             return;
         }
     };
@@ -1088,5 +1106,68 @@ mod tests {
         let result = parse_extraction(r#"Sure: {"entities":[],"relations":[]} Done."#)
             .expect("the JSON object inside the prose");
         assert!(result.entities.is_empty() && result.relations.is_empty());
+    }
+
+    const LOAD_PANIC_CHILD: &str = "AUDIOGRAPH_TEST_LLM_LOAD_PANIC";
+    const MODEL_PATH_CANARY: &str = "marmot-private-model-dir";
+
+    #[test]
+    #[ignore = "invoked in isolation by a_load_panic_reaches_no_error_log_or_crash_report"]
+    fn load_panic_child() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        if std::env::var_os(LOAD_PANIC_CHILD).is_none() {
+            return;
+        }
+        crate::crash_handler::install();
+        let capture = ThreadLogCapture::start();
+        // What llama-cpp-2's debug assertion says when the file is gone.
+        let result = load_redacted::<()>(|| {
+            panic!("\"/home/{MODEL_PATH_CANARY}/model.gguf\" does not exist")
+        });
+        let logs = render(&capture.finish());
+
+        assert_eq!(result, Err(engine_not_loaded()));
+        let observed = format!("{result:?}\n{logs}");
+        assert!(!observed.contains(MODEL_PATH_CANARY), "{observed}");
+    }
+
+    #[test]
+    fn a_load_panic_reaches_no_error_log_or_crash_report() {
+        let root =
+            std::env::temp_dir().join(format!("audiograph-llm-load-{}", uuid::Uuid::new_v4()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "llm::engine::tests::load_panic_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env(LOAD_PANIC_CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child status {}", output.status);
+        let reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+
+        // The hook ran, and recorded the operation and nothing else.
+        assert_eq!(
+            reports,
+            ["AudioGraph crash report\n\nPayload:\n[redacted panic payload: llm.model_load]\n"]
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !printed.contains(MODEL_PATH_CANARY),
+            "model path in child output"
+        );
     }
 }
