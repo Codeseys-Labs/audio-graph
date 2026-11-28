@@ -103,7 +103,10 @@ function mockLoadSession(later: () => Promise<unknown>): void {
   });
 }
 
-async function exportJson(): Promise<Record<string, unknown>> {
+async function exportJson(): Promise<{
+  segments: Array<Record<string, unknown>>;
+  filename: string;
+}> {
   mockedDownload.mockClear();
   await act(async () => {
     fireEvent.click(
@@ -111,7 +114,10 @@ async function exportJson(): Promise<Record<string, unknown>> {
     );
   });
   await waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(1));
-  return JSON.parse(mockedDownload.mock.calls[0][0] as string);
+  return {
+    segments: JSON.parse(mockedDownload.mock.calls[0][0] as string),
+    filename: mockedDownload.mock.calls[0][1] as string,
+  };
 }
 
 async function exportTxt(): Promise<{ text: string; filename: string }> {
@@ -185,8 +191,13 @@ describe("SessionsBrowser: Review across the Stop handoff", () => {
 
     mockedInvoke.mockClear();
     const json = await exportJson();
-    expect(json.session_id).toBe("session-a");
-    expect(JSON.stringify(json)).not.toContain(B_TEXT);
+    // Same shape as the backend `export_transcript`: a TranscriptSegment[].
+    expect(Array.isArray(json.segments)).toBe(true);
+    expect(json.segments).toMatchObject([
+      { text: A_TEXT, speaker_label: "Alice" },
+    ]);
+    expect(json.filename).toMatch(/^transcript-session-a-/);
+    expect(JSON.stringify(json.segments)).not.toContain(B_TEXT);
     expect(
       useAudioGraphStore.getState().exportTranscript,
     ).not.toHaveBeenCalled();

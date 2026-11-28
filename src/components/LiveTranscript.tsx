@@ -134,20 +134,15 @@ function LiveTranscript() {
     setIsExporting(true);
     setExportError(null);
     try {
-      // `export_transcript` exports the LIVE session; a reviewed session is
-      // serialized from its own snapshot so no backend command is issued.
+      // `export_transcript` exports the LIVE session's buffer; a reviewed
+      // session is serialized from its own snapshot (speaker attribution
+      // joined from its persisted ledger) so no backend command is issued.
+      // Same shape as the backend export, a pretty-printed
+      // `TranscriptSegment[]`, so consumers of the JSON see one format; the
+      // session id is in the filename.
       const json =
         reviewSessionId !== null
-          ? JSON.stringify(
-              {
-                session_id: reviewSessionId,
-                segments,
-                events: sessionTranscriptEvents,
-                diarization_events: diarizationSpanRevisions,
-              },
-              null,
-              2,
-            )
+          ? JSON.stringify(segments, null, 2)
           : await exportTranscript();
       const filename = await buildFilename("json");
       downloadAsFile(json, filename, "application/json");
@@ -156,14 +151,7 @@ function LiveTranscript() {
     } finally {
       setIsExporting(false);
     }
-  }, [
-    exportTranscript,
-    buildFilename,
-    reviewSessionId,
-    segments,
-    sessionTranscriptEvents,
-    diarizationSpanRevisions,
-  ]);
+  }, [exportTranscript, buildFilename, reviewSessionId, segments]);
 
   const handleExportTxt = useCallback(async () => {
     setIsExporting(true);

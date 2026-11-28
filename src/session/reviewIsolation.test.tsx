@@ -305,10 +305,11 @@ describe("Review pane isolation from Live (issue #140)", () => {
     const [json, filename] = mockedDownload.mock.calls[0];
     expect(filename).toMatch(/^transcript-past-session-7-/);
     expect(filename).not.toContain("live-session-id");
-    expect(JSON.parse(json)).toMatchObject({
-      session_id: "past-session-7",
-      segments: [{ text: "historical line", speaker_label: "Alice" }],
-    });
+    // Same shape as the backend export (a TranscriptSegment[]), with the
+    // persisted speaker attribution joined in.
+    expect(JSON.parse(json)).toMatchObject([
+      { text: "historical line", speaker_label: "Alice" },
+    ]);
     expect(
       useAudioGraphStore.getState().exportTranscript,
     ).not.toHaveBeenCalled();
