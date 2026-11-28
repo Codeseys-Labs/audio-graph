@@ -639,7 +639,7 @@ fn spawn_audio_forwarder(
             >,
             source_id_hint: &Arc<RwLock<Option<String>>>,
             chunk: ProcessedAudioChunk,
-        ) -> Result<(), ProcessedAudioChunk> {
+        ) -> Result<(), Box<ProcessedAudioChunk>> {
             if let Ok(mut hint) = source_id_hint.write() {
                 // Boundary: the hint is a persisted String, so materialize
                 // the chunk's Arc<str> id here (FA-4b).
@@ -652,7 +652,7 @@ fn spawn_audio_forwarder(
                 .build();
             audio_tx
                 .blocking_send(Ok(AudioStream::AudioEvent(audio_event)))
-                .map_err(|_| chunk)
+                .map_err(|_| Box::new(chunk))
         }
 
         // Drain carryover from the previous connection FIRST so audio pulled
@@ -676,7 +676,7 @@ fn spawn_audio_forwarder(
                 let mut queue = carryover
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                queue.push_front(chunk);
+                queue.push_front(*chunk);
                 return;
             }
         }
@@ -711,7 +711,7 @@ fn spawn_audio_forwarder(
                         // emptied the queue before this loop started, so this
                         // chunk can only be the newest item.
                         log::info!("AWS Transcribe: audio channel closed");
-                        push_carryover(&carryover, chunk);
+                        push_carryover(&carryover, *chunk);
                         break;
                     }
                 }

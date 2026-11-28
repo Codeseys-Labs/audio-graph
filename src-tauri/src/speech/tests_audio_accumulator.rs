@@ -326,9 +326,7 @@ fn multi_segment_invariant_total_frames_match_fed_plus_overlap() {
 
     let mut segments = Vec::new();
     for i in 0..num_chunks {
-        if let Some(seg) = acc.feed(&chunk("src", chunk_size, 0.5, Some((i * 60) as u64))) {
-            segments.push(seg);
-        }
+        segments.extend(acc.feed(&chunk("src", chunk_size, 0.5, Some((i * 60) as u64))));
     }
     if let Some(seg) = acc.flush() {
         segments.push(seg);
@@ -378,4 +376,74 @@ fn emission_triggers_only_on_the_chunk_that_crosses_the_threshold() {
     assert_eq!(seg.num_frames, (needed + 1) * chunk_size);
     assert!(seg.num_frames >= TARGET_FRAMES);
     assert_eq!(seg.end_time, Duration::from_millis(9_999));
+}
+
+#[test]
+fn clock_reset_flushes_pending_window_without_overlap_or_reversed_timestamps() {
+    use crate::audio::pipeline::{AudioDiscontinuity, AudioSegmentBoundary};
+
+    let mut acc = AudioAccumulator::new();
+    assert!(acc.feed(&chunk("src", 1_024, 0.25, Some(1_000))).is_none());
+    assert!(acc.feed(&chunk("src", 1_024, 0.25, Some(1_064))).is_none());
+
+    let mut post_reset = chunk("src", 512, 0.75, Some(5));
+    post_reset.metadata.clock_generation = 1;
+    post_reset.metadata.boundaries.push(AudioSegmentBoundary {
+        clock_generation: 1,
+        timestamp: post_reset.timestamp,
+        discontinuities: vec![AudioDiscontinuity::ClockReset {
+            previous_expected: Duration::from_millis(1_128),
+            observed: Duration::from_millis(5),
+        }],
+        previous_input_rate_hz: Some(16_000),
+        discarded_input_frames: 0,
+    });
+
+    let flushed = acc
+        .feed(&post_reset)
+        .expect("pending pre-reset window must flush before new clock generation");
+    assert_eq!(flushed.num_frames, 2_048);
+    assert_eq!(flushed.start_time, Duration::from_millis(1_000));
+    assert_eq!(flushed.end_time, Duration::from_millis(1_064));
+    assert!(flushed.end_time >= flushed.start_time);
+    assert!(flushed.audio.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+
+    // New generation starts cleanly with zero retained overlap from generation 0.
+    let next = acc
+        .flush()
+        .expect("post-reset chunk remains buffered in new clock window");
+    assert_eq!(next.num_frames, 512);
+    assert_eq!(next.start_time, Duration::from_millis(5));
+    assert_eq!(next.end_time, Duration::from_millis(5));
+    assert!(next.audio.iter().all(|s| (*s - 0.75).abs() < 1e-6));
+}
+
+#[test]
+fn clock_reset_after_emit_discards_retained_overlap_and_can_emit_both_windows() {
+    let mut acc = AudioAccumulator::new();
+    let _ = acc
+        .feed(&chunk("src", TARGET_FRAMES, 0.4, Some(2_000)))
+        .expect("initial full segment emitted");
+
+    // Immediately reset the clock with only retained overlap buffered: must NOT
+    // re-emit the 0.5 s overlap stub, and must clear it before accumulating new PCM.
+    let mut reset_small = chunk("src", 1_000, 0.8, Some(10));
+    reset_small.metadata.clock_generation = 1;
+    assert!(acc.feed(&reset_small).is_none());
+
+    // Now reset again into an oversized chunk so both the pending 1_000-frame
+    // generation-1 window AND the full generation-2 window emit in order.
+    let mut reset_full = chunk("src", TARGET_FRAMES, 0.9, Some(3));
+    reset_full.metadata.clock_generation = 2;
+    let emitted: Vec<_> = acc.feed(&reset_full).into_iter().collect();
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].num_frames, 1_000);
+    assert_eq!(emitted[0].start_time, Duration::from_millis(10));
+    assert_eq!(emitted[0].end_time, Duration::from_millis(10));
+    assert!(emitted[0].audio.iter().all(|s| (*s - 0.8).abs() < 1e-6));
+
+    assert_eq!(emitted[1].num_frames, TARGET_FRAMES);
+    assert_eq!(emitted[1].start_time, Duration::from_millis(3));
+    assert_eq!(emitted[1].end_time, Duration::from_millis(3));
+    assert!(emitted[1].audio.iter().all(|s| (*s - 0.9).abs() < 1e-6));
 }

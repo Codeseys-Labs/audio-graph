@@ -81,6 +81,23 @@ pub struct CaptureBufferDrops {
     pub pipeline_input_frames: u64,
 }
 
+impl CaptureBufferDrops {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn saturating_accumulate(&mut self, other: Self) {
+        self.ring_buffers = self.ring_buffers.saturating_add(other.ring_buffers);
+        self.subscriber_buffers = self
+            .subscriber_buffers
+            .saturating_add(other.subscriber_buffers);
+        self.pipeline_buffers = self.pipeline_buffers.saturating_add(other.pipeline_buffers);
+        self.pipeline_input_frames = self
+            .pipeline_input_frames
+            .saturating_add(other.pipeline_input_frames);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CaptureAudioMetadata {
     pub timestamp_origin: CaptureTimestampOrigin,

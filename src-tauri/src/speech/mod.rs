@@ -5032,13 +5032,58 @@ pub(crate) fn spawn_extraction_task(
 // Audio accumulation helper
 // ---------------------------------------------------------------------------
 
+/// Zero-allocation 0..=2 segment output from [`AudioAccumulator::feed`].
+///
+/// A clock-generation boundary can flush one pending segment from the outgoing
+/// clock and also emit a full segment from the incoming chunk on the new clock.
+#[derive(Debug)]
+struct AccumulatorFeedOutput {
+    first: Option<AccumulatedSegment>,
+    second: Option<AccumulatedSegment>,
+}
+
+impl AccumulatorFeedOutput {
+    #[cfg(test)]
+    fn is_none(&self) -> bool {
+        self.first.is_none() && self.second.is_none()
+    }
+
+    #[cfg(test)]
+    fn expect(self, msg: &str) -> AccumulatedSegment {
+        match (self.first, self.second) {
+            (Some(seg), None) => seg,
+            (None, Some(seg)) => seg,
+            (None, None) => panic!("{msg}"),
+            (Some(_), Some(_)) => {
+                panic!(
+                    "{msg}: expected a single segment, but feed emitted two across a clock reset"
+                )
+            }
+        }
+    }
+}
+
+impl IntoIterator for AccumulatorFeedOutput {
+    type Item = AccumulatedSegment;
+    type IntoIter = std::iter::Chain<
+        std::option::IntoIter<AccumulatedSegment>,
+        std::option::IntoIter<AccumulatedSegment>,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.first.into_iter().chain(self.second)
+    }
+}
+
 /// Accumulator that collects `ProcessedAudioChunk`s into `AccumulatedSegment`s
-/// of approximately `TARGET_FRAMES` length.
+/// of approximately `TARGET_FRAMES` length within a single source clock generation.
 struct AudioAccumulator {
     audio: Vec<f32>,
     source_id: String,
     segment_start: Option<Duration>,
     segment_end: Duration,
+    clock_generation: Option<u64>,
+    has_unemitted_audio: bool,
 }
 
 impl AudioAccumulator {
@@ -5048,47 +5093,130 @@ impl AudioAccumulator {
             source_id: String::new(),
             segment_start: None,
             segment_end: Duration::ZERO,
+            clock_generation: None,
+            has_unemitted_audio: false,
         }
     }
 
-    /// Feed a chunk. Returns `Some(AccumulatedSegment)` if the accumulator
-    /// has reached the target size, otherwise `None`.
-    fn feed(&mut self, chunk: &ProcessedAudioChunk) -> Option<AccumulatedSegment> {
+    fn chunk_crosses_clock_boundary(&self, chunk: &ProcessedAudioChunk) -> bool {
+        let generation_changed = self
+            .clock_generation
+            .is_some_and(|prev| prev != chunk.metadata.clock_generation);
+        let boundary_reset = chunk
+            .metadata
+            .boundaries
+            .iter()
+            .flat_map(|b| &b.discontinuities)
+            .any(|d| {
+                matches!(
+                    d,
+                    crate::audio::pipeline::AudioDiscontinuity::ClockReset { .. }
+                        | crate::audio::pipeline::AudioDiscontinuity::RateChange { .. }
+                        | crate::audio::pipeline::AudioDiscontinuity::StreamGenerationChange { .. }
+                        | crate::audio::pipeline::AudioDiscontinuity::TimestampOriginChange { .. }
+                )
+            });
+        let timestamp_regressed = !self.audio.is_empty()
+            && chunk.timestamp.is_some_and(|observed| {
+                let reference = if self.has_unemitted_audio {
+                    self.segment_end
+                } else {
+                    self.segment_start.unwrap_or(Duration::ZERO)
+                };
+                observed < reference
+            });
+        generation_changed || boundary_reset || timestamp_regressed
+    }
+
+    fn reset_clock_window(&mut self) {
+        self.audio.clear();
+        self.segment_start = None;
+        self.segment_end = Duration::ZERO;
+        self.has_unemitted_audio = false;
+    }
+
+    fn take_without_overlap(&mut self) -> AccumulatedSegment {
+        let full_audio = std::mem::replace(&mut self.audio, Vec::with_capacity(TARGET_FRAMES));
+        let num_frames = full_audio.len();
+        let seg_start = self.segment_start.unwrap_or(Duration::ZERO);
+        let seg_end = self.segment_end.max(seg_start);
+        self.segment_start = None;
+        self.segment_end = Duration::ZERO;
+        self.has_unemitted_audio = false;
+        AccumulatedSegment {
+            source_id: self.source_id.clone(),
+            audio: full_audio,
+            start_time: seg_start,
+            end_time: seg_end,
+            num_frames,
+        }
+    }
+
+    /// Feed a chunk. Flushes any pending unemitted window (clearing retained
+    /// overlap) if `chunk` starts a new clock generation, then accumulates
+    /// `chunk` and emits if `TARGET_FRAMES` is reached.
+    fn feed(&mut self, chunk: &ProcessedAudioChunk) -> AccumulatorFeedOutput {
         if self.source_id.is_empty() {
             // Boundary: AccumulatedSegment.source_id is a persisted/serialized
             // String, so materialize the chunk's Arc<str> id here (FA-4b).
             self.source_id = chunk.source_id.to_string();
         }
-        if self.segment_start.is_none() {
-            self.segment_start = chunk.timestamp;
-        }
-        self.segment_end = chunk.timestamp.unwrap_or(Duration::ZERO);
-        self.audio.extend_from_slice(&chunk.data);
+        let first = if self.chunk_crosses_clock_boundary(chunk) {
+            if self.has_unemitted_audio {
+                Some(self.take_without_overlap())
+            } else {
+                // Only retained overlap from an already-emitted segment is
+                // buffered; discard it rather than re-emitting or mixing clocks.
+                self.reset_clock_window();
+                None
+            }
+        } else {
+            None
+        };
+        self.clock_generation = Some(chunk.metadata.clock_generation);
 
-        if self.audio.len() >= TARGET_FRAMES {
+        if !chunk.data.is_empty() {
+            if self.segment_start.is_none() {
+                self.segment_start = chunk.timestamp;
+            }
+            if let Some(ts) = chunk.timestamp {
+                self.segment_end = ts;
+            } else if self.segment_start.is_none() {
+                self.segment_end = Duration::ZERO;
+            }
+            self.audio.extend_from_slice(&chunk.data);
+            self.has_unemitted_audio = true;
+        }
+
+        let second = if self.audio.len() >= TARGET_FRAMES {
             Some(self.take())
         } else {
             None
-        }
+        };
+
+        AccumulatorFeedOutput { first, second }
     }
 
     /// Take the current accumulated audio as a segment, retaining the last
-    /// `OVERLAP_FRAMES` samples for continuity with the next segment.
+    /// `OVERLAP_FRAMES` samples for continuity with the next segment in the
+    /// same clock generation.
     fn take(&mut self) -> AccumulatedSegment {
         let full_audio = std::mem::replace(&mut self.audio, Vec::with_capacity(TARGET_FRAMES));
         let num_frames = full_audio.len();
         let seg_start = self.segment_start.unwrap_or(Duration::ZERO);
-        let seg_end = self.segment_end;
+        let seg_end = self.segment_end.max(seg_start);
 
         // Retain the last OVERLAP_FRAMES samples for the next segment
         let overlap_start = num_frames.saturating_sub(OVERLAP_FRAMES);
         self.audio.extend_from_slice(&full_audio[overlap_start..]);
+        self.has_unemitted_audio = false;
 
         // Compute overlap duration so the next segment's start time is set correctly
         let overlap_duration =
             Duration::from_secs_f64((num_frames - overlap_start) as f64 / 16_000.0);
         // The next segment starts at (end_time - overlap_duration)
         self.segment_start = Some(seg_end.saturating_sub(overlap_duration));
+        self.segment_end = seg_end;
 
         AccumulatedSegment {
             source_id: self.source_id.clone(),
@@ -5112,7 +5240,7 @@ impl AudioAccumulator {
 fn feed_source_accumulator(
     accumulators: &mut HashMap<String, AudioAccumulator>,
     chunk: &ProcessedAudioChunk,
-) -> Option<AccumulatedSegment> {
+) -> AccumulatorFeedOutput {
     accumulators
         .entry(chunk.source_id.to_string())
         .or_insert_with(AudioAccumulator::new)
@@ -5672,8 +5800,8 @@ pub(crate) fn run_speech_processor(
             break;
         }
 
-        // Accumulate chunks into ~2s segments
-        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk) {
+        // Accumulate chunks into ~2s segments (0..=2 across clock resets)
+        for segment in feed_source_accumulator(&mut accumulators, &chunk) {
             // Send to ASR worker; if channel full, log and drop (ASR can't keep up)
             if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
                 log::warn!(
@@ -6271,227 +6399,224 @@ pub(crate) fn run_speech_processor_diarization_only(
             break;
         }
 
-        let segment = match feed_source_accumulator(&mut accumulators, &chunk) {
-            Some(seg) => seg,
-            None => continue,
-        };
+        for segment in feed_source_accumulator(&mut accumulators, &chunk) {
+            // Feed the live clustering diarizer (if active) the 16 kHz mono audio.
+            #[cfg(feature = "diarization-clustering")]
+            clustering.push(&segment.source_id, &segment.audio);
 
-        // Feed the live clustering diarizer (if active) the 16 kHz mono audio.
-        #[cfg(feature = "diarization-clustering")]
-        clustering.push(&segment.source_id, &segment.audio);
+            count += 1;
 
-        count += 1;
+            // Create a placeholder transcript segment (no ASR)
+            let placeholder_transcript = TranscriptSegment {
+                id: uuid::Uuid::new_v4().to_string(),
+                source_id: segment.source_id.clone(),
+                speaker_id: None,
+                speaker_label: None,
+                text: "[speech]".to_string(),
+                start_time: segment.start_time.as_secs_f64(),
+                end_time: segment.end_time.as_secs_f64(),
+                confidence: 0.0,
+            };
 
-        // Create a placeholder transcript segment (no ASR)
-        let placeholder_transcript = TranscriptSegment {
-            id: uuid::Uuid::new_v4().to_string(),
-            source_id: segment.source_id.clone(),
-            speaker_id: None,
-            speaker_label: None,
-            text: "[speech]".to_string(),
-            start_time: segment.start_time.as_secs_f64(),
-            end_time: segment.end_time.as_secs_f64(),
-            confidence: 0.0,
-        };
+            // FA-5: move the audio in (no clone). The Simple backend only computes
+            // RMS/ZCR/MAD from it (never retains it) and the clustering path was
+            // already fed `&segment.audio` above; `segment.audio` is unused after
+            // this, so the per-segment ~64 KB clone was pure waste.
+            let input = DiarizationInput {
+                transcript: placeholder_transcript,
+                speech_audio: segment.audio,
+                speech_start_time: segment.start_time,
+                speech_end_time: segment.end_time,
+            };
+            let diarization_start = Instant::now();
+            let diarized = diarization_worker.process_input(input);
+            emit_stage_latency(
+                &shared.app_handle,
+                "diarization",
+                Some(&segment.source_id),
+                Some(&diarized.segment.id),
+                diarization_start.elapsed(),
+            );
 
-        // FA-5: move the audio in (no clone). The Simple backend only computes
-        // RMS/ZCR/MAD from it (never retains it) and the clustering path was
-        // already fed `&segment.audio` above; `segment.audio` is unused after
-        // this, so the per-segment ~64 KB clone was pure waste.
-        let input = DiarizationInput {
-            transcript: placeholder_transcript,
-            speech_audio: segment.audio,
-            speech_start_time: segment.start_time,
-            speech_end_time: segment.end_time,
-        };
-        let diarization_start = Instant::now();
-        let diarized = diarization_worker.process_input(input);
-        emit_stage_latency(
-            &shared.app_handle,
-            "diarization",
-            Some(&segment.source_id),
-            Some(&diarized.segment.id),
-            diarization_start.elapsed(),
-        );
+            // `mut` is only exercised under the clustering feature (the relabel
+            // branch); other builds rebind it unchanged.
+            #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
+            let mut final_segment = diarized.segment;
 
-        // `mut` is only exercised under the clustering feature (the relabel
-        // branch); other builds rebind it unchanged.
-        #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
-        let mut final_segment = diarized.segment;
-
-        // ADR-0017 / B16: override the Simple-fallback label with the clustering
-        // backend's overlap-mapped speaker when the live diarizer has covered
-        // this time. The clustering consumer thread owns the SPEAKER_DETECTED
-        // emission for relabeled segments, so suppress the Simple one then.
-        #[cfg(feature = "diarization-clustering")]
-        let emit_simple_speaker = match clustering.get(&final_segment.source_id) {
-            Some(handle) => {
-                match handle.label_segment(final_segment.start_time, final_segment.end_time) {
-                    Some((id, label)) => {
-                        final_segment.speaker_id = Some(id);
-                        final_segment.speaker_label = Some(label);
-                        false
+            // ADR-0017 / B16: override the Simple-fallback label with the clustering
+            // backend's overlap-mapped speaker when the live diarizer has covered
+            // this time. The clustering consumer thread owns the SPEAKER_DETECTED
+            // emission for relabeled segments, so suppress the Simple one then.
+            #[cfg(feature = "diarization-clustering")]
+            let emit_simple_speaker = match clustering.get(&final_segment.source_id) {
+                Some(handle) => {
+                    match handle.label_segment(final_segment.start_time, final_segment.end_time) {
+                        Some((id, label)) => {
+                            final_segment.speaker_id = Some(id);
+                            final_segment.speaker_label = Some(label);
+                            false
+                        }
+                        None => true,
                     }
-                    None => true,
+                }
+                None => true,
+            };
+            #[cfg(not(feature = "diarization-clustering"))]
+            let emit_simple_speaker = true;
+
+            emit_turn_event(
+                &shared.app_handle,
+                TurnEventInput {
+                    provider: "local_diarization",
+                    source_id: final_segment.source_id.clone(),
+                    kind: events::TurnEventKind::LocalWindow,
+                    text: Some(final_segment.text.clone()),
+                    start_time: Some(final_segment.start_time),
+                    end_time: Some(final_segment.end_time),
+                    confidence: Some(final_segment.confidence),
+                    turn_index: Some(count),
+                },
+            );
+
+            if let Ok(mut buffer) = shared.transcript_buffer.write() {
+                buffer.push_back(final_segment.clone());
+                if buffer.len() > 500 {
+                    buffer.pop_front();
                 }
             }
-            None => true,
-        };
-        #[cfg(not(feature = "diarization-clustering"))]
-        let emit_simple_speaker = true;
+            // Persist transcript segment asynchronously. This is a second,
+            // independent display-write site (local diarization-in-place ASR),
+            // not routed through `emit_transcript_and_extract_with_meta`'s shared
+            // tail, so it shares `persist_display_transcript_segment` rather than
+            // duplicating the miss-counting logic (audio-graph-64e3).
+            persist_display_transcript_segment(
+                &shared.transcript_writer,
+                &shared.display_transcript_write_misses,
+                &final_segment,
+            );
 
-        emit_turn_event(
-            &shared.app_handle,
-            TurnEventInput {
-                provider: "local_diarization",
+            let final_meta = final_only_revision_meta(
+                "local_diarization",
+                &final_segment.source_id,
+                final_segment.start_time,
+                final_segment.end_time,
+            );
+            let final_span_id = final_meta
+                .span_id
+                .unwrap_or_else(|| final_segment.id.clone());
+            let final_provider_item_id = final_meta.provider_item_id;
+            let asr_payload = events::AsrSpanRevisionPayload {
+                span_id: final_span_id.clone(),
+                provider: "local_diarization".to_string(),
                 source_id: final_segment.source_id.clone(),
-                kind: events::TurnEventKind::LocalWindow,
-                text: Some(final_segment.text.clone()),
-                start_time: Some(final_segment.start_time),
-                end_time: Some(final_segment.end_time),
-                confidence: Some(final_segment.confidence),
-                turn_index: Some(count),
-            },
-        );
-
-        if let Ok(mut buffer) = shared.transcript_buffer.write() {
-            buffer.push_back(final_segment.clone());
-            if buffer.len() > 500 {
-                buffer.pop_front();
+                provider_item_id: final_provider_item_id,
+                transcript_segment_id: Some(final_segment.id.clone()),
+                speaker_id: final_segment.speaker_id.clone(),
+                speaker_label: final_segment.speaker_label.clone(),
+                channel: None,
+                text: final_segment.text.clone(),
+                start_time: final_segment.start_time,
+                end_time: final_segment.end_time,
+                confidence: final_segment.confidence,
+                is_final: true,
+                stability: events::AsrSpanStability::Final,
+                revision_number: 1,
+                supersedes: None,
+                turn_id: None,
+                end_of_turn: true,
+                raw_event_ref: None,
+                capture_latency_ms: None,
+                asr_latency_ms: None,
+                received_at_ms: current_unix_millis(),
+            };
+            if record_asr_span_revision_event_and_observe_projection(
+                &shared.transcript_ledger,
+                &shared.transcript_event_writer,
+                &shared.projection_schedulers,
+                Some(&projection_dispatch),
+                &asr_payload,
+            ) {
+                emit_asr_span_revision(&shared.app_handle, asr_payload);
             }
-        }
-        // Persist transcript segment asynchronously. This is a second,
-        // independent display-write site (local diarization-in-place ASR),
-        // not routed through `emit_transcript_and_extract_with_meta`'s shared
-        // tail, so it shares `persist_display_transcript_segment` rather than
-        // duplicating the miss-counting logic (audio-graph-64e3).
-        persist_display_transcript_segment(
-            &shared.transcript_writer,
-            &shared.display_transcript_write_misses,
-            &final_segment,
-        );
-
-        let final_meta = final_only_revision_meta(
-            "local_diarization",
-            &final_segment.source_id,
-            final_segment.start_time,
-            final_segment.end_time,
-        );
-        let final_span_id = final_meta
-            .span_id
-            .unwrap_or_else(|| final_segment.id.clone());
-        let final_provider_item_id = final_meta.provider_item_id;
-        let asr_payload = events::AsrSpanRevisionPayload {
-            span_id: final_span_id.clone(),
-            provider: "local_diarization".to_string(),
-            source_id: final_segment.source_id.clone(),
-            provider_item_id: final_provider_item_id,
-            transcript_segment_id: Some(final_segment.id.clone()),
-            speaker_id: final_segment.speaker_id.clone(),
-            speaker_label: final_segment.speaker_label.clone(),
-            channel: None,
-            text: final_segment.text.clone(),
-            start_time: final_segment.start_time,
-            end_time: final_segment.end_time,
-            confidence: final_segment.confidence,
-            is_final: true,
-            stability: events::AsrSpanStability::Final,
-            revision_number: 1,
-            supersedes: None,
-            turn_id: None,
-            end_of_turn: true,
-            raw_event_ref: None,
-            capture_latency_ms: None,
-            asr_latency_ms: None,
-            received_at_ms: current_unix_millis(),
-        };
-        if record_asr_span_revision_event_and_observe_projection(
-            &shared.transcript_ledger,
-            &shared.transcript_event_writer,
-            &shared.projection_schedulers,
-            Some(&projection_dispatch),
-            &asr_payload,
-        ) {
-            emit_asr_span_revision(&shared.app_handle, asr_payload);
-        }
-        let event_sink = TauriDiarizationEventSink {
-            app_handle: &shared.app_handle,
-        };
-        let diarization_session_id = shared.projection_runtime.current_session_id();
-        let diarization_dispatch = DiarizationDispatchContext {
-            event_sink: &event_sink,
-            speaker_timeline: &shared.speaker_timeline,
-            knowledge_graph: &shared.knowledge_graph,
-            graph_snapshot: &shared.graph_snapshot,
-            transcript_ledger: &shared.transcript_ledger,
-            session_id: &diarization_session_id,
-        };
-        emit_diarization_span_revision_for_transcript(
-            &diarization_dispatch,
-            "local_diarization",
-            &final_segment,
-            &final_span_id,
-            None,
-            None,
-        );
-        let _ = shared
-            .app_handle
-            .emit(events::TRANSCRIPT_UPDATE, &final_segment);
-        if emit_simple_speaker && let Some(info) = diarized.speaker_info {
-            let _ = shared.app_handle.emit(events::SPEAKER_DETECTED, &info);
-        }
-        spawn_agent_proposal_task(
-            final_segment.clone(),
-            active_session_id_snapshot(&shared.active_session_id),
-            final_segment.id.clone(),
-            shared.app_handle.clone(),
-            shared.pending_agent_proposals.clone(),
-            shared.active_session_id.clone(),
-            shared.transcript_ledger.clone(),
-        );
-
-        if let Ok(mut status) = shared.pipeline_status.write() {
-            // audio-graph-586b: see the identical guard's comment in
-            // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
-            // worker startup must survive every per-segment count update.
-            if !matches!(status.diarization, StageStatus::Degraded { .. }) {
-                status.diarization = StageStatus::Running {
-                    processed_count: count,
-                };
-            }
-        }
-
-        // Knowledge Graph Extraction — fire-and-forget
-        let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
-        spawn_extraction_task(
-            final_segment.text.clone(),
-            final_segment
-                .speaker_label
-                .clone()
-                .unwrap_or_else(|| "Unknown".to_string()),
-            String::new(),
-            final_segment.id.clone(),
-            final_segment.start_time,
-            &ExtractionDeps {
-                active_session_id: &shared.active_session_id,
-                transcript_ledger: &shared.transcript_ledger,
-                turn_speaker_timeline: Some(&shared.speaker_timeline),
-                expected_session_id: &expected_session_id,
-                llm_engine: &shared.llm_engine,
-                api_client: &shared.api_client,
-                mistralrs_engine: &shared.mistralrs_engine,
-                llm_executor: &shared.llm_executor,
-                llm_provider: &config.llm_provider,
-                llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
-                graph_extractor: &shared.graph_extractor,
+            let event_sink = TauriDiarizationEventSink {
+                app_handle: &shared.app_handle,
+            };
+            let diarization_session_id = shared.projection_runtime.current_session_id();
+            let diarization_dispatch = DiarizationDispatchContext {
+                event_sink: &event_sink,
+                speaker_timeline: &shared.speaker_timeline,
                 knowledge_graph: &shared.knowledge_graph,
                 graph_snapshot: &shared.graph_snapshot,
-                pipeline_status: &shared.pipeline_status,
-                app_handle: &shared.app_handle,
-            },
-            &extraction_count,
-            &graph_update_count,
-        );
+                transcript_ledger: &shared.transcript_ledger,
+                session_id: &diarization_session_id,
+            };
+            emit_diarization_span_revision_for_transcript(
+                &diarization_dispatch,
+                "local_diarization",
+                &final_segment,
+                &final_span_id,
+                None,
+                None,
+            );
+            let _ = shared
+                .app_handle
+                .emit(events::TRANSCRIPT_UPDATE, &final_segment);
+            if emit_simple_speaker && let Some(info) = diarized.speaker_info {
+                let _ = shared.app_handle.emit(events::SPEAKER_DETECTED, &info);
+            }
+            spawn_agent_proposal_task(
+                final_segment.clone(),
+                active_session_id_snapshot(&shared.active_session_id),
+                final_segment.id.clone(),
+                shared.app_handle.clone(),
+                shared.pending_agent_proposals.clone(),
+                shared.active_session_id.clone(),
+                shared.transcript_ledger.clone(),
+            );
+
+            if let Ok(mut status) = shared.pipeline_status.write() {
+                // audio-graph-586b: see the identical guard's comment in
+                // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
+                // worker startup must survive every per-segment count update.
+                if !matches!(status.diarization, StageStatus::Degraded { .. }) {
+                    status.diarization = StageStatus::Running {
+                        processed_count: count,
+                    };
+                }
+            }
+
+            // Knowledge Graph Extraction — fire-and-forget
+            let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
+            spawn_extraction_task(
+                final_segment.text.clone(),
+                final_segment
+                    .speaker_label
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                String::new(),
+                final_segment.id.clone(),
+                final_segment.start_time,
+                &ExtractionDeps {
+                    active_session_id: &shared.active_session_id,
+                    transcript_ledger: &shared.transcript_ledger,
+                    turn_speaker_timeline: Some(&shared.speaker_timeline),
+                    expected_session_id: &expected_session_id,
+                    llm_engine: &shared.llm_engine,
+                    api_client: &shared.api_client,
+                    mistralrs_engine: &shared.mistralrs_engine,
+                    llm_executor: &shared.llm_executor,
+                    llm_provider: &config.llm_provider,
+                    llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
+                    graph_extractor: &shared.graph_extractor,
+                    knowledge_graph: &shared.knowledge_graph,
+                    graph_snapshot: &shared.graph_snapshot,
+                    pipeline_status: &shared.pipeline_status,
+                    app_handle: &shared.app_handle,
+                },
+                &extraction_count,
+                &graph_update_count,
+            );
+        }
     }
 
     // Stop the live clustering diarizer (drains once more, emits, exits).
@@ -6572,13 +6697,13 @@ pub(crate) fn run_cloud_asr_speech_processor(
             break;
         }
 
-        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk)
-            && let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment)
-        {
-            log::warn!(
-                "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
-                seg.num_frames as f64 / 16_000.0
-            );
+        for segment in feed_source_accumulator(&mut accumulators, &chunk) {
+            if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
+                log::warn!(
+                    "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
+                    seg.num_frames as f64 / 16_000.0
+                );
+            }
         }
     }
 

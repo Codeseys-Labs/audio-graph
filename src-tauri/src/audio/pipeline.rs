@@ -76,7 +76,6 @@ pub enum AudioDiscontinuity {
         current: CaptureTimestampOrigin,
     },
     TimestampEstablished,
-    DroppedBuffers(CaptureBufferDrops),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +96,9 @@ pub struct ProcessedAudioMetadata {
     pub stream_generation: u64,
     /// Timestamp domain for chunks that carry a timestamp.
     pub timestamp_origin: CaptureTimestampOrigin,
+    /// Newly observed capture buffer drops delivered once on the next emitted
+    /// PCM without cutting contiguous audio when timing shows no gap.
+    pub drops: CaptureBufferDrops,
     /// Boundaries preceding this PCM, delivered once, in input order.
     pub boundaries: Vec<AudioSegmentBoundary>,
 }
@@ -365,9 +367,6 @@ impl AudioPipeline {
                 }
             }
         }
-        if chunk.metadata.drops != CaptureBufferDrops::default() {
-            boundaries.push(AudioDiscontinuity::DroppedBuffers(chunk.metadata.drops));
-        }
 
         let input_timestamp = if clock_changed {
             chunk.timestamp
@@ -410,6 +409,12 @@ impl AudioPipeline {
                 });
             }
         }
+        // Attach observed capture drops after draining any prior segment,
+        // without cutting contiguous PCM when timestamps show no gap.
+        state
+            .metadata
+            .drops
+            .saturating_accumulate(chunk.metadata.drops);
         // Derive the expectation from the segment's total frame count. This
         // prevents per-buffer timestamp rounding from accumulating as drift.
         state.segment_input_frames += chunk.num_frames;
@@ -512,6 +517,7 @@ impl AudioPipeline {
                 sample_rate: TARGET_SAMPLE_RATE,
                 timestamp: Self::next_processed_timestamp(state, frames),
                 metadata: ProcessedAudioMetadata {
+                    drops: std::mem::take(&mut state.metadata.drops),
                     boundaries: std::mem::take(&mut state.metadata.boundaries),
                     ..state.metadata
                 },
@@ -790,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_drop_deltas_are_forwarded_once_even_with_contiguous_timestamps() {
+    fn capture_drop_deltas_are_forwarded_once_without_cutting_contiguous_pcm() {
         let drops = CaptureBufferDrops {
             ring_buffers: 2,
             subscriber_buffers: 3,
@@ -805,15 +811,46 @@ mod tests {
         ]);
 
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].data, vec![0.25; 256]);
+        assert_eq!(chunks[0].timestamp, Some(Duration::ZERO));
+        assert_eq!(chunks[0].num_frames, 512);
+        assert_eq!(&chunks[0].data[..256], &[0.25; 256]);
+        assert_eq!(&chunks[0].data[256..], &[0.5; 256]);
         assert!(chunks[0].metadata.boundaries.is_empty());
-        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(16)));
+        assert_eq!(chunks[0].metadata.drops, drops);
+
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(32)));
         assert_eq!(chunks[1].data, vec![0.5; 512]);
-        assert_eq!(
-            chunks[1].metadata.boundaries[0].discontinuities,
-            [AudioDiscontinuity::DroppedBuffers(drops)]
-        );
+        assert!(chunks[1].metadata.boundaries.is_empty());
+        assert_eq!(chunks[1].metadata.drops, CaptureBufferDrops::default());
+
+        assert_eq!(chunks[2].timestamp, Some(Duration::from_millis(64)));
+        assert_eq!(chunks[2].data, vec![0.5; 256]);
         assert!(chunks[2].metadata.boundaries.is_empty());
+        assert_eq!(chunks[2].metadata.drops, CaptureBufferDrops::default());
+
+        // Also prove 44.1 kHz resampling does not cut or discard native frames
+        // when drop counters advance on a contiguous buffer.
+        let step_44k = Duration::from_secs_f64(512.0 / 44_100.0);
+        let mut second_44k = timed_input("mic44", 44_100, 512, step_44k, 0.0);
+        second_44k.metadata.drops = drops;
+        let resampled = process_inputs([
+            timed_input("mic44", 44_100, 512, Duration::ZERO, 0.0),
+            second_44k,
+            timed_input("mic44", 44_100, 1024, step_44k * 2, 0.0),
+        ]);
+        assert!(!resampled.is_empty());
+        assert!(
+            resampled
+                .iter()
+                .all(|chunk| chunk.metadata.boundaries.is_empty()),
+            "observed drop count without timestamp gap must not cut 44.1 kHz PCM"
+        );
+        assert_eq!(resampled[0].metadata.drops, drops);
+        assert!(
+            resampled[1..]
+                .iter()
+                .all(|chunk| chunk.metadata.drops.is_empty())
+        );
     }
 
     #[test]
