@@ -2358,7 +2358,10 @@ mod rotation_tests {
                 Err(std::fs::TryLockError::WouldBlock)
             ));
         }
-        assert_eq!(repo.load_transcript_events(&old).unwrap(), [seed.clone()]);
+        assert_eq!(
+            repo.load_transcript_events(&old).unwrap().as_slice(),
+            std::slice::from_ref(&seed)
+        );
         writer.shutdown();
         resume.send(()).unwrap();
         drop(writer_slot);
