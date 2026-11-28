@@ -3,12 +3,16 @@
 //! One recovery thread services all such streams, with backoff per lease.
 use super::*;
 use crate::persistence::RecoveryBackoff;
-use std::{collections::VecDeque, sync::Mutex, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 struct Retired {
     resolve: Box<dyn FnMut() -> Result<(), TranscriptCommitError> + Send>,
     retry: RecoveryBackoff,
-    remaining_io_retries: u8,
+    first_ambiguous_failure: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -22,47 +26,76 @@ fn queue() -> &'static Mutex<Queue> {
     QUEUE.get_or_init(Default::default)
 }
 
-// A retained lease cannot fix corrupt data or an unsupported floor. If the
-// probe instead failed to observe the filesystem, allow seven backed-off
-// retries (eight failed probes in total) before releasing the lease.
-const AMBIGUOUS_RETRIES: u8 = 7;
+// Leave time for a disconnected volume or delete-pending file to return.
+// All ambiguous observations of one lease share the same elapsed-time budget.
+const AMBIGUOUS_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-fn retryable(error: &TranscriptCommitError, remaining: &mut u8) -> bool {
+fn retryable(
+    error: &TranscriptCommitError,
+    first_ambiguous: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
     use CanonicalCoordinationError as Coordination;
+    use CanonicalDurabilityRejection as Rejection;
     use CanonicalFilesystemQualificationError as Qualification;
     use TranscriptCommitError as Error;
-    match error {
-        // A cooperating owner can finish independently of this job.
-        Error::Coordination(Coordination::Contended) | Error::ConflictingAttempt => true,
-        Error::Io { .. }
-        | Error::Indeterminate(_)
+    let io_cause = match error {
+        Error::Coordination(Coordination::Contended)
+        | Error::ConflictingAttempt
         | Error::FrameWriteStorageFull
-        | Error::StorageFullConfirmationPending
-        | Error::Coordination(
-            Coordination::Io { .. } | Coordination::IdentityUnavailable | Coordination::Missing,
-        )
+        | Error::StorageFullConfirmationPending => return true,
+        Error::Io { kind, code, .. }
+        | Error::Rejected(Rejection::IoFailedBeforeMutation {
+            kind,
+            raw_os_error: code,
+            ..
+        })
+        | Error::Coordination(Coordination::Io {
+            kind,
+            raw_os_error: code,
+            ..
+        })
+        | Error::Qualification(Qualification::Io {
+            kind,
+            raw_os_error: code,
+            ..
+        })
+        | Error::Coordination(Coordination::QualificationRefused(Qualification::Io {
+            kind,
+            raw_os_error: code,
+            ..
+        })) => Some((*kind, *code)),
+        Error::Indeterminate(error) => Some((error.kind, error.raw_os_error)),
+        Error::Coordination(Coordination::IdentityUnavailable | Coordination::Missing)
         | Error::Qualification(
-            Qualification::Io { .. }
-            | Qualification::IdentityUnavailable
-            | Qualification::NoMatchingMount,
+            Qualification::IdentityUnavailable | Qualification::NoMatchingMount,
         )
         | Error::Coordination(Coordination::QualificationRefused(
-            Qualification::Io { .. }
-            | Qualification::IdentityUnavailable
-            | Qualification::NoMatchingMount,
+            Qualification::IdentityUnavailable | Qualification::NoMatchingMount,
         ))
-        | Error::Rejected(
-            CanonicalDurabilityRejection::IoFailedBeforeMutation { .. }
-            | CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable,
-        ) => {
-            if *remaining == 0 {
-                return false;
-            }
-            *remaining -= 1;
-            true
+        | Error::Rejected(Rejection::QualifiedDescendantVolumeUnavailable) => None,
+        _ => return false,
+    };
+    if let Some((kind, code)) = io_cause {
+        // Sharing/lock violations are actionable once the other handle closes.
+        if cfg!(windows) && matches!(code, Some(32 | 33)) {
+            return true;
         }
-        _ => false,
+        if !matches!(
+            kind,
+            io::ErrorKind::PermissionDenied
+                | io::ErrorKind::InvalidInput
+                | io::ErrorKind::InvalidData
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::Unsupported
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::IsADirectory
+                | io::ErrorKind::ReadOnlyFilesystem
+        ) {
+            return true;
+        }
     }
+    now.duration_since(*first_ambiguous.get_or_insert(now)) < AMBIGUOUS_WINDOW
 }
 
 struct Running<'a>(Option<&'a Mutex<Queue>>);
@@ -76,17 +109,21 @@ impl Drop for Running<'_> {
 }
 
 fn run(queue: &Mutex<Queue>) {
+    run_with_clock(queue, Instant::now, std::thread::sleep);
+}
+
+fn run_with_clock(queue: &Mutex<Queue>, clock: impl Fn() -> Instant, sleep: impl Fn(Duration)) {
     let mut running = Running(Some(queue));
     loop {
         let mut queue_guard = queue.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
+        let now = clock();
         if let Some(index) = queue_guard.jobs.iter().position(|j| j.retry.next <= now) {
             let mut job = queue_guard.jobs.remove(index).unwrap();
             drop(queue_guard);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut job.resolve)) {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) if retryable(&error, &mut job.remaining_io_retries) => {
-                    job.retry.record(Instant::now(), false);
+                Ok(Err(error)) if retryable(&error, &mut job.first_ambiguous_failure, clock()) => {
+                    job.retry.record(clock(), false);
                     queue
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -98,7 +135,7 @@ fn run(queue: &Mutex<Queue>) {
             }
         } else if let Some(next) = queue_guard.jobs.iter().map(|j| j.retry.next).min() {
             drop(queue_guard);
-            std::thread::sleep(next.saturating_duration_since(now));
+            sleep(next.saturating_duration_since(now));
         } else {
             // Release ownership atomically with the empty-queue check.
             queue_guard.running = false;
@@ -165,7 +202,7 @@ impl<E: CommitPayload> PreparedStorage<E> {
         Some(Retired {
             resolve: Box::new(resolve),
             retry: RecoveryBackoff::new(),
-            remaining_io_retries: AMBIGUOUS_RETRIES,
+            first_ambiguous_failure: None,
         })
     }
 
@@ -212,12 +249,96 @@ mod tests {
             ),
             TranscriptCommitError::Coordination(CanonicalCoordinationError::IdentityUnavailable),
         ];
-        let mut remaining = AMBIGUOUS_RETRIES;
-        for error in errors.iter().cycle().take(usize::from(AMBIGUOUS_RETRIES)) {
-            assert!(retryable(error, &mut remaining));
+        let start = Instant::now();
+        let mut first_ambiguous = None;
+        for (i, error) in errors.iter().cycle().take(16).enumerate() {
+            assert!(retryable(
+                error,
+                &mut first_ambiguous,
+                start + Duration::from_secs(10 * i as u64)
+            ));
         }
         for error in &errors {
-            assert!(!retryable(error, &mut remaining));
+            assert!(!retryable(
+                error,
+                &mut first_ambiguous,
+                start + AMBIGUOUS_WINDOW
+            ));
+        }
+    }
+
+    #[test]
+    fn prolonged_storage_full_settles_while_an_expired_ambiguous_lease_is_released() {
+        for full_disk in [true, false] {
+            let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            let path = root.join("transcripts").join("orchard.events.jsonl");
+            let storage = PreparedTranscriptStorage::open(&path, "orchard").unwrap();
+            CUT.set(Some(Cut::Sync));
+            assert!(
+                storage
+                    .commit_after(&transcript_event("seed", "leaf"), Some(0))
+                    .is_err()
+            );
+            let mut job = storage.retired_job().unwrap();
+            let start = job.retry.next;
+            let clock = std::cell::Cell::new(start);
+            let mut probes = 0;
+            let mut settle = job.resolve;
+            job.resolve = Box::new(move || {
+                probes += 1;
+                if !full_disk {
+                    return Err(TranscriptCommitError::Coordination(
+                        CanonicalCoordinationError::IdentityUnavailable,
+                    ));
+                }
+                // Eighty backed-off probes span more than five minutes.
+                match probes {
+                    1..=40 => Err(TranscriptCommitError::FrameWriteStorageFull),
+                    41..=80 => Err(TranscriptCommitError::StorageFullConfirmationPending),
+                    _ => settle(),
+                }
+            });
+            let queue = Mutex::new(Queue {
+                jobs: [job].into(),
+                running: true,
+            });
+            let capture = ThreadLogCapture::start();
+            run_with_clock(
+                &queue,
+                || clock.get(),
+                |delay| {
+                    let next = clock.get() + delay;
+                    assert!(
+                        next - start < AMBIGUOUS_WINDOW * 2,
+                        "unbounded ambiguous retry"
+                    );
+                    assert!(matches!(
+                        lock_transcript_removal(&path, || Ok(true)),
+                        Err(CanonicalCoordinationError::Contended)
+                    ));
+                    clock.set(next);
+                },
+            );
+            let logs = test_log_capture::render(&capture.finish());
+            assert_eq!(
+                logs.matches("canonical_log.retired_attempt_requires_recovery")
+                    .count(),
+                usize::from(!full_disk)
+            );
+            assert!(clock.get() - start >= AMBIGUOUS_WINDOW);
+            assert_eq!(path.with_added_extension("attempt").exists(), !full_disk);
+            if full_disk {
+                assert_eq!(
+                    read_committed::<TranscriptEvent>(&path, "orchard")
+                        .unwrap()
+                        .head
+                        .unwrap()
+                        .sequence,
+                    1
+                );
+            }
+            drop(lock_transcript_removal(&path, || Ok(true)).unwrap());
+            fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -296,11 +417,25 @@ mod tests {
             running: true,
         });
         run(&queue);
-        for (dir, count) in [("transcripts", 2), ("projections", 1)] {
-            let source = path(dir);
-            assert!(!source.with_added_extension("attempt").exists());
-            assert_eq!(fs::read_to_string(source).unwrap().lines().count(), count);
+        for dir in ["transcripts", "projections"] {
+            assert!(!path(dir).with_added_extension("attempt").exists());
         }
+        assert_eq!(
+            read_committed::<TranscriptEvent>(&path("transcripts"), session)
+                .unwrap()
+                .head
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert_eq!(
+            read_committed_projection::<ProjectionPatch>(&path("projections"), session)
+                .unwrap()
+                .head
+                .unwrap()
+                .sequence,
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -390,7 +525,7 @@ mod tests {
                 Retired {
                     resolve: Box::new(|| panic!("reed")),
                     retry: RecoveryBackoff::new(),
-                    remaining_io_retries: AMBIGUOUS_RETRIES,
+                    first_ambiguous_failure: None,
                 },
                 Retired {
                     resolve: Box::new(move || {
@@ -398,7 +533,7 @@ mod tests {
                         Ok(())
                     }),
                     retry: RecoveryBackoff::new(),
-                    remaining_io_retries: AMBIGUOUS_RETRIES,
+                    first_ambiguous_failure: None,
                 },
             ]
             .into(),
