@@ -122,16 +122,19 @@ process only observed in the authority journal, emits one content-free
 signal with no receipt and no set, in epoch order with local events, once
 per observed range; so does every reopen that adopts a journal past the last
 epoch the runtime reported, whichever route started it. A consumer that
-receives it must drop every use it resolved and take a fresh snapshot. The
-sink runs on the worker before admission is released, so a slow sink holds
-admission; a sink that fails latches a terminal stall, and the signals that
-would have followed are never delivered or replayed. A consumer can rely on
-every signal it receives being in order and on a stalled runtime meaning
-that some may be missing: after a stall it takes a fresh snapshot once the
-process restarts. An unverified commit is not success and emits no commit
-event. An unhandled dispatch panic latches a terminal stall; dispatch enters
-the crash handler's credential redaction scope before `catch_unwind` so the
-panic hook sees the same boundary as the caller.
+receives it must drop every use it resolved and take a fresh snapshot. A
+publication of this process whose outcome was unknown, and which an adopted
+journal later records, is this process's own commit: it gets its local event
+with its receipt, never the external signal. The sink runs on the worker
+before admission is released, so a slow sink holds admission; a sink that
+fails latches a terminal stall, and the signals that would have followed are
+never delivered or replayed. A consumer can rely on every signal it receives
+being in order and on a stalled runtime meaning that some may be missing:
+after a stall it takes a fresh snapshot once the process restarts. An
+unverified commit is not success and emits no commit event when it fails.
+An unhandled dispatch panic latches a terminal stall; dispatch enters the
+crash handler's credential redaction scope before `catch_unwind` so the panic
+hook sees the same boundary as the caller.
 
 ## Cutover and Consequences
 

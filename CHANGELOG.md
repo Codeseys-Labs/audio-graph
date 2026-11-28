@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime as it was. A commit observed from another process, including one
   found by a reopen through diagnosis or an ownership repair, now emits a
   content-free signal telling consumers to drop resolved uses and take a
-  fresh snapshot.
+  fresh snapshot; a commit of this process whose outcome was unknown is
+  reported as its own once the journal shows it. An activation commit
+  refuses a set whose record changed before any setting changes.
 
 ### Fixed
 
