@@ -36,6 +36,8 @@ mod canonical_crash_harness;
 pub mod canonical_durability;
 pub mod canonical_log;
 mod projection_history;
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) mod projection_profile;
 pub(crate) use projection_history::{MAX_PROJECTION_EVENTS_BYTES, ProjectionHistory};
 
 pub(crate) struct VerifiedCaptureCoverage {
@@ -1063,7 +1065,12 @@ impl FileMemoryRepository {
         ),
         String,
     > {
-        self.read_projection_history_with_limit(session_id, portable, MAX_PROJECTION_EVENTS_BYTES)
+        self.read_projection_history_with_limit(
+            session_id,
+            portable,
+            MAX_PROJECTION_EVENTS_BYTES,
+            || Ok(()),
+        )
     }
 
     fn read_projection_history_with_limit(
@@ -1071,6 +1078,7 @@ impl FileMemoryRepository {
         session_id: &str,
         portable: bool,
         byte_limit: u64,
+        check_active: impl Fn() -> Result<(), String>,
     ) -> Result<
         (
             ProjectionHistory,
@@ -1088,10 +1096,12 @@ impl FileMemoryRepository {
             },
             portable,
         )?;
+        check_active()?;
         let snapshot = captured
             .map(|source| source.verify(session_id))
             .transpose()
             .map_err(|error| error.to_string())?;
+        check_active()?;
         let evidence = snapshot
             .as_ref()
             .map(|s| canonical_log::receipt_evidence(&path, &s.records))
@@ -1106,22 +1116,37 @@ impl FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<projection_history::ProjectionCaptureCoverage, String> {
-        Ok(self.verify_capture_coverage(session_id)?.coverage)
+        Ok(self
+            .verify_capture_coverage(session_id, || Ok(()))?
+            .coverage)
     }
 
     pub(crate) fn verify_capture_coverage(
         &self,
         session_id: &str,
+        check_active: impl Fn() -> Result<(), String>,
     ) -> Result<VerifiedCaptureCoverage, String> {
+        check_active()?;
         #[cfg(test)]
         crate::speech::test_probe::record_read();
-        let (history, _) = self.read_projection_history_with_limit(session_id, false, u64::MAX)?;
+        let (history, _) =
+            self.read_projection_history_with_limit(session_id, false, u64::MAX, &check_active)?;
+        #[cfg(test)]
+        crate::speech::test_probe::before_transcript();
+        check_active()?;
+        #[cfg(test)]
+        crate::speech::test_probe::record_read();
         let transcript = self.load_transcript_event_stream(session_id)?;
+        check_active()?;
         history.verify_source("transcript_revisions", transcript.records())?;
+        check_active()?;
+        #[cfg(test)]
+        crate::speech::test_probe::record_read();
         history.verify_source(
             "speaker_revisions",
             self.load_speaker_revision_stream(session_id)?.records(),
         )?;
+        check_active()?;
         let ledger =
             TranscriptLedger::replay_source_prefix(session_id, &transcript.into_payloads())
                 .map_err(|_| "unverified transcript coverage")?;
@@ -2117,6 +2142,8 @@ impl TranscriptEventWriteMsg {
 pub(crate) enum ProjectionEventWriteMsg {
     #[cfg(test)]
     FailSync,
+    #[cfg(test)]
+    DiskFull,
 
     /// Validate and materialize this patch on its canonical receipt.
     Apply(Box<crate::state::ProjectionApplyCommand>),
@@ -2296,17 +2323,23 @@ fn projection_worker(
             #[cfg(test)]
             Ok(ProjectionEventWriteMsg::FailSync) => canonical_log::simulate_failed_sync(),
             #[cfg(test)]
+            Ok(ProjectionEventWriteMsg::DiskFull) => canonical_log::simulate_disk_full(),
+            #[cfg(test)]
             Ok(ProjectionEventWriteMsg::Append(patch, reply)) => {
                 let result = storage.commit_after(&patch, None);
                 let _ = reply.send(result);
             }
             Ok(ProjectionEventWriteMsg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return;
+                break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) if shutdown.load(Ordering::SeqCst) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) if shutdown.load(Ordering::SeqCst) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    // The outgoing lane's candidate, reply and model context end here.
+    // Its verified canonical patch remains available to historical replay.
+    drop(pending);
+    storage.retire_pending();
 }
 
 /// Open a session writer's append target before its worker thread is spawned.
@@ -2815,7 +2848,10 @@ impl TranscriptEventWriter {
         let flag = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
             .name("transcript-commit".into())
-            .spawn(move || transcript_batch::run(rx, &storage, &path, &session_id, &flag))
+            .spawn(move || {
+                transcript_batch::run(rx, &storage, &path, &session_id, &flag);
+                storage.retire_pending();
+            })
             .ok()?;
         Some(Self {
             unqualified,
@@ -3059,6 +3095,12 @@ impl ProjectionEventWriter {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_projection_write_disk_full(&self) {
+        self.enqueue(ProjectionEventWriteMsg::DiskFull)
+            .expect("projection fault channel");
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit(
         &self,
         patch: &ProjectionPatch,
@@ -3128,6 +3170,11 @@ impl ProjectionEventWriter {
 // Knowledge graph persistence
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SNAPSHOT_BEFORE_RENAME: std::cell::Cell<Option<fn() -> !>> = const { std::cell::Cell::new(None) };
+}
+
 /// Save a serializable value as pretty-printed JSON to a file.
 ///
 /// Uses an atomic write (tmp file + rename) so a partial write never replaces
@@ -3188,6 +3235,10 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
     // excerpts of transcribed speech that should not be world-readable.
     crate::fs_util::set_owner_only(&tmp_path);
 
+    #[cfg(test)]
+    if let Some(stop) = SNAPSHOT_BEFORE_RENAME.take() {
+        stop();
+    }
     fs::rename(&tmp_path, path)
         .map_err(|e| format!("Failed to rename {:?} → {:?}: {}", tmp_path, path, e))?;
 

@@ -211,6 +211,9 @@ fn interrupted_writer_child() {
         return;
     };
     let checkpoint = std::env::var(CHILD_CUT).unwrap();
+    if checkpoint == "snapshot-replace" {
+        crate::state::snapshot_replace_child(Path::new(&path), wait_for_kill);
+    }
     if let Some(projection_cut) = checkpoint.strip_prefix("projection-") {
         super::projection_tests::interrupt_patch(Path::new(&path), projection_cut);
     }
@@ -283,7 +286,7 @@ fn interrupted_writer_child() {
 
 /// The child signals from between the write and its durability barrier. The
 /// deadline bounds a broken handshake; scheduling never selects a crash cut.
-pub(super) fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
+pub(crate) fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
         .env(CHILD_PATH, path)

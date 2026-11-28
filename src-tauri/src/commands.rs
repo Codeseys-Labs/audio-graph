@@ -3054,9 +3054,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // reconciliation is still waiting for this command to release the lock.
     acknowledged_transcription_sources(state.inner())?;
 
-    // Start both lanes behind. After ASR starts, a worker verifies this capture's
-    // coverage and submits any eligible repair through the normal executor.
-    let coverage_check = crate::persistence::begin_projection_capture(state.inner());
+    // Install new coverage only after every fallible start step succeeds.
+    // A freshly spawned processor waits for that installation before admitting ASR.
+    let (admit_speech, admitted) = std::sync::mpsc::channel();
 
     // 1. Start speech processor thread (ASR + Diarization orchestrator).
     //    The speech processor reads directly from the processed audio channel,
@@ -3204,6 +3204,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
                 .spawn(move || {
+                    if admitted.recv().is_err() {
+                        return;
+                    }
                     let channels = speech::SpeechChannels {
                         processed_rx: speech_rx,
                         is_transcribing,
@@ -3256,7 +3259,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     }
 
     // 3. Update state flags.
+    let coverage_check = crate::persistence::begin_projection_capture(state.inner());
     state.is_transcribing.store(true, Ordering::SeqCst);
+    let _ = admit_speech.send(());
     speech::spawn_capture_verification(state.inner(), &app, &settings, coverage_check);
     // `projection_lane_stopping` is reset earlier in this function now
     // (audio-graph-1609 ordering fix — see the comment there), strictly
@@ -15719,13 +15724,10 @@ mod tests {
     /// (`ProjectionSchedulers::clear_orphaned_deferred_retries`), not merely
     /// that the method exists and behaves correctly in isolation
     /// (`clear_orphaned_deferred_retries_sweeps_both_lanes_without_touching_failed_basis_identity`
-    /// in `projection_scheduler.rs` covers that half). Also before the
-    /// speech thread spawns, for the same reason the flag-clear must be:
-    /// nothing that could dispatch a projection decision for this run
-    /// exists yet at that point, so there is nothing left for the sweep to
-    /// race.
+    /// in `projection_scheduler.rs` covers that half). The sweep runs after
+    /// a successful spawn and before the worker may process any speech.
     #[test]
-    fn start_transcribe_sweeps_orphaned_deferred_retries_before_the_speech_thread_spawns() {
+    fn start_transcribe_sweeps_orphaned_deferred_retries_before_admitting_speech() {
         let body = start_transcribe_body_whitespace_stripped();
 
         let sweep_marker =
@@ -15736,24 +15738,11 @@ mod tests {
             "start_transcribe (orphaned-deferral sweep call)",
         );
 
-        // Same real-spawn anchor as the test above — see its comment for
-        // why the trailing `log::info!` line is the wrong anchor.
-        let spawn_marker = strip_whitespace(
-            "let handle = std::thread::Builder::new()\
-             .name(\"speech-processor\".to_string())",
-        );
-        let spawn_pos = find_unique_occurrence(
-            &body,
-            &spawn_marker,
-            "start_transcribe (speech processor thread spawn)",
-        );
-
-        assert!(
-            sweep_pos < spawn_pos,
-            "the orphaned-deferral sweep must run BEFORE the speech processor thread spawns \
-             (audio-graph-1609) — same ordering reasoning as the projection_lane_stopping \
-             clear above"
-        );
+        let marker = |s| find_unique_occurrence(&body, &strip_whitespace(s), "speech admission");
+        let wait = marker("if admitted.recv().is_err() { return; }");
+        assert!(wait < marker("speech::run_speech_processor("));
+        assert!(marker("*sp_handle = Some(handle);") < sweep_pos);
+        assert!(sweep_pos < marker("admit_speech.send(())"));
     }
 
     /// audio-graph-64e3: pins that `start_transcribe` — the ONE production
@@ -25224,6 +25213,95 @@ mod tests {
         }
     }
 
+    #[cfg(not(debug_assertions))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "manual release measurement with framed projection history"]
+    #[allow(clippy::await_holding_lock)]
+    async fn release_start_to_first_projection_job() {
+        use crate::persistence::canonical_log::{
+            CanonicalAppendOutcome, CanonicalAppender, CanonicalBasisHead, CanonicalEventMetadata,
+            CanonicalTailRecovery,
+        };
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for count in [1_000, 10_000] {
+            let dir = unique_tempdir("capture-start-benchmark");
+            let _home = HomeGuard::set(&dir);
+            let manager = tauri::test::mock_app();
+            manager.manage(AppState::new());
+            let state = manager.state::<AppState>();
+            let app = crate::speech::shared_test_app_handle();
+            prepare_projection_capture_source(&state);
+            seed_projection_basis(&state, projection_status_test_event("elm"));
+            let basis = state.transcript_ledger.lock().unwrap().current_basis();
+            let session = state.current_session_id();
+            let source = FileMemoryRepository::user_data()
+                .load_transcript_event_stream(&session)
+                .unwrap();
+            let source = &source.records()[0];
+            let mut meta = CanonicalEventMetadata::new("leaf");
+            meta.basis_heads.insert(
+                "transcript_revisions".into(),
+                CanonicalBasisHead {
+                    sequence: source.sequence,
+                    event_id: source.event_id.clone(),
+                    record_hash: source.record_hash.clone(),
+                },
+            );
+            let path = crate::user_data::projection_events_path(&session).unwrap();
+            std::fs::write(&path, []).unwrap();
+            let mut appender = CanonicalAppender::open(
+                &path,
+                &session,
+                "projection_patches",
+                1,
+                CanonicalTailRecovery::Strict,
+            )
+            .unwrap();
+            for sequence in 1..=count {
+                meta.event_id = format!("leaf-{sequence}");
+                assert!(matches!(
+                    appender.append(&meta, &report_note_patch(sequence, basis.clone(), "oak")),
+                    CanonicalAppendOutcome::Accepted(_)
+                ));
+            }
+            let head = appender.head().unwrap();
+            let gap = serde_json::json!({"stream":"projection_patches", "projection_lanes":["notes"], "after":{"sequence":head.sequence,"record_hash":head.record_hash}, "suffix_quarantined":true});
+            let id = uuid::Uuid::new_v4();
+            std::fs::write(
+                path.with_added_extension(format!("{id}.gap")),
+                serde_json::to_vec(&gap).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                path.with_added_extension(format!("{id}.quarantine")),
+                b"oak",
+            )
+            .unwrap();
+            drop(appender);
+            let mut samples = vec![];
+            for _ in 0..5 {
+                *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+                let ready = crate::speech::test_probe::measure_first_job();
+                let start = std::time::Instant::now();
+                start_transcribe(manager.state(), app.clone())
+                    .await
+                    .unwrap();
+                let job = ready.recv_timeout(Duration::from_secs(90)).unwrap();
+                samples.push(job.duration_since(start).as_micros());
+                stop_transcribe_impl(&state, &app).await.unwrap();
+            }
+            samples.sort_unstable();
+            println!(
+                "start_to_first_projection_job projection_frames={count} transcript_frames=1 samples_us={samples:?} median_us={}",
+                samples[2]
+            );
+            drain_test_writers(&state);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
         target_os = "macos",
@@ -25340,7 +25418,7 @@ mod tests {
             control.resume();
             control.wait(phase);
         }
-        assert_eq!(control.reads(), 1, "one background verification");
+        assert_eq!(control.reads(), if fork { 2 } else { 3 });
         let diagnostics: Vec<_> = control
             .logs()
             .into_iter()
@@ -25402,15 +25480,22 @@ mod tests {
         let state = manager.state::<AppState>();
         let app = crate::speech::shared_test_app_handle();
         prepare_projection_capture_source(&state);
-        for rotate in [false, true] {
+        for (phase, rotate, expected_reads) in [
+            (Phase::BeforeRead, false, 0),
+            (Phase::BeforeTranscript, false, 1),
+            (Phase::BeforeInstall, false, 3),
+            (Phase::BeforeInstall, true, 3),
+        ] {
             *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
-            let old = Control::arm();
+            let old = Control::arm_for(phase == Phase::BeforeTranscript);
             start_transcribe(manager.state(), app.clone())
                 .await
                 .unwrap();
             old.wait(Phase::BeforeRead);
-            old.resume();
-            old.wait(Phase::BeforeInstall);
+            if phase != Phase::BeforeRead {
+                old.resume();
+                old.wait(phase);
+            }
             stop_transcribe_impl(&state, &app).await.unwrap();
             if rotate {
                 state.rotate_session("capture-verification-new");
@@ -25425,6 +25510,7 @@ mod tests {
             new.wait(Phase::BeforeRead);
             old.resume();
             old.wait(Phase::Done);
+            assert_eq!(old.reads(), expected_reads);
             {
                 // This empty history would mark both lanes current if installed.
                 let view = state.materialized_projection_state.lock().unwrap();
@@ -25442,6 +25528,61 @@ mod tests {
                 assert_eq!(view.graph.transcript_coverage, None);
             }
             stop_transcribe_impl(&state, &app).await.unwrap();
+        }
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction requires the main thread"
+    )]
+    #[allow(clippy::await_holding_lock)]
+    async fn failed_transcription_start_preserves_lane_coverage_and_job_admission() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("failed-speech-start");
+        let _home = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        prepare_projection_capture_source(&state);
+        seed_projection_basis(&state, projection_status_test_event("elm"));
+        // Exercise a real failure acquiring the worker slot after provider preflight.
+        std::thread::scope(|s| {
+            let slot = &state.speech_processor_thread;
+            assert!(
+                s.spawn(move || {
+                    let _slot = slot.lock().unwrap();
+                    panic!("unavailable slot")
+                })
+                .join()
+                .is_err()
+            );
+        });
+        let result =
+            start_transcribe(manager.state(), crate::speech::shared_test_app_handle()).await;
+        state.speech_processor_thread.clear_poison();
+        assert!(
+            matches!(result, Err(AppError::Unknown(reason)) if reason.starts_with("Lock error:"))
+        );
+        assert!(!state.is_transcribing.load(Ordering::SeqCst));
+        {
+            let view = state.materialized_projection_state.lock().unwrap();
+            assert!(view.notes.transcript_coverage.is_none());
+            assert!(view.graph.transcript_coverage.is_none());
+        }
+        {
+            let ledger = state.transcript_ledger.lock().unwrap();
+            let obs = state
+                .projection_schedulers
+                .lock()
+                .unwrap()
+                .observe_ledger(&ledger, 1);
+            projection_start_job(obs.notes);
+            projection_start_job(obs.graph);
         }
         drain_test_writers(&state);
         std::fs::remove_dir_all(dir).unwrap();

@@ -358,9 +358,13 @@ pub(super) fn run(
             }
         }
     }
-    if recovery.needs_resolution {
-        // One last resolution while the outgoing session still owns its sink.
-        // A failed barrier leaves the descriptor for startup recovery.
-        let _ = recovery.resolve(storage, &mut live_index, path, session);
+    if storage.has_pending_attempt()
+        && recovery
+            .resolve(storage, &mut live_index, path, session)
+            .is_err()
+    {
+        // Historical replay owns any later publication. Release the capture
+        // context before handing the outstanding storage lease to its retry.
+        crate::speech::retire_transcript_publications(session, &recovery.outstanding);
     }
 }

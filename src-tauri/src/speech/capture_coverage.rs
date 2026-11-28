@@ -30,6 +30,8 @@ pub(crate) fn spawn_capture_verification(
             .allows_session_cloud_content_transfer(),
         data_movement_sink: Arc::new(FileProjectionDataMovementSink),
     };
+    #[cfg(all(test, not(debug_assertions)))]
+    let dispatch = test_probe::with_timing_generator(dispatch);
     launch(state, check, dispatch);
 }
 
@@ -62,7 +64,21 @@ pub(super) fn launch(
         let _probe = test_probe::enter(probe);
         #[cfg(test)]
         test_probe::point(test_probe::Phase::BeforeRead);
-        let verified = FileMemoryRepository::user_data().verify_capture_coverage(&session);
+        let still_active = || {
+            dispatch
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .owns_coverage_check(&session, &check)
+        };
+        let verified = FileMemoryRepository::user_data().verify_capture_coverage(&session, || {
+            still_active()
+                .then_some(())
+                .ok_or_else(|| "capture verification cancelled".into())
+        });
+        if !still_active() {
+            return;
+        }
         #[cfg(test)]
         test_probe::point(test_probe::Phase::BeforeInstall);
 
@@ -144,6 +160,7 @@ pub(crate) mod test_probe {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub(crate) enum Phase {
         BeforeRead,
+        BeforeTranscript,
         BeforeInstall,
         Done,
     }
@@ -151,6 +168,7 @@ pub(crate) mod test_probe {
         arrived: mpsc::Sender<Phase>,
         resume: mpsc::Receiver<()>,
         reads: Arc<AtomicUsize>,
+        stop_before_transcript: bool,
         logs: Arc<std::sync::Mutex<Vec<crate::test_log_capture::CapturedLog>>>,
     }
     thread_local! {
@@ -165,6 +183,9 @@ pub(crate) mod test_probe {
     }
     impl Control {
         pub(crate) fn arm() -> Self {
+            Self::arm_for(false)
+        }
+        pub(crate) fn arm_for(stop_before_transcript: bool) -> Self {
             let (arrived, events) = mpsc::channel();
             let (next, resume) = mpsc::channel();
             let reads = Arc::new(AtomicUsize::new(0));
@@ -174,6 +195,7 @@ pub(crate) mod test_probe {
                 arrived,
                 resume,
                 reads: reads.clone(),
+                stop_before_transcript,
                 logs: logs.clone(),
             }));
             Self {
@@ -239,5 +261,51 @@ pub(crate) mod test_probe {
                 n.fetch_add(1, Ordering::SeqCst);
             }
         });
+    }
+    pub(crate) fn before_transcript() {
+        if PROBE.with_borrow(|p| p.as_ref().is_some_and(|p| p.stop_before_transcript)) {
+            point(Phase::BeforeTranscript);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    thread_local! {
+        static TIMING: RefCell<Option<mpsc::Sender<std::time::Instant>>> = const { RefCell::new(None) };
+    }
+
+    // Replace only the model invocation. Start, verification, policy dispatch and
+    // entry into the live projection job worker all run on their normal path.
+    #[cfg(not(debug_assertions))]
+    pub(crate) fn measure_first_job() -> mpsc::Receiver<std::time::Instant> {
+        let (sender, receiver) = mpsc::channel();
+        TIMING.replace(Some(sender));
+        receiver
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(super) fn with_timing_generator(
+        mut dispatch: super::ProjectionDispatchContext,
+    ) -> super::ProjectionDispatchContext {
+        struct FirstJob(mpsc::Sender<std::time::Instant>);
+        impl super::ProjectionPatchGenerator for FirstJob {
+            fn generate_projection_patch(
+                &self,
+                _: super::ProjectionJob,
+                _: super::TranscriptLedger,
+                _: crate::projection_llm::ProjectionSnapshots,
+                _: u64,
+                _: u64,
+            ) -> super::ProjectionPatchAttempt {
+                let _ = self.0.send(std::time::Instant::now());
+                super::ProjectionPatchAttempt {
+                    outcome: Err("measurement complete".into()),
+                    attempted_route: None,
+                }
+            }
+        }
+        if let Some(sender) = TIMING.take() {
+            dispatch.patch_generator = Arc::new(FirstJob(sender));
+        }
+        dispatch
     }
 }

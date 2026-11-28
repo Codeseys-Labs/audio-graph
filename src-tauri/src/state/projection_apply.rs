@@ -153,6 +153,9 @@ impl ProjectionApplyCommand {
             savers,
             reply,
         } = self;
+        // Use the same projection in the live view, pending receipt and replay,
+        // including the model interpretation of records without placement.
+        patch.provenance.normalize_stored_model();
         let (mut candidate, observed_count) = {
             let _epoch = target.publication.read().unwrap_or_else(|p| p.into_inner());
             if !target.current() {
@@ -241,6 +244,8 @@ impl ProjectionApplyCommand {
             let _ = reply.send(Err(ProjectionRuntimeApplyError::Apply { error }));
             return None;
         }
+        #[cfg(all(test, not(debug_assertions)))]
+        crate::persistence::projection_profile::reset();
         let proof = match storage.live_basis(&patch, observed_count) {
             Ok(proof) => proof,
             Err(error) => {
@@ -248,6 +253,8 @@ impl ProjectionApplyCommand {
                 return None;
             }
         };
+        #[cfg(all(test, not(debug_assertions)))]
+        crate::persistence::projection_profile::record(|s| s.basis = started.elapsed());
         let currency = match proof.currency() {
             Ok(currency) => currency,
             Err(error) => {
@@ -266,6 +273,8 @@ impl ProjectionApplyCommand {
         patch
             .apply_latency_ms
             .get_or_insert(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        #[cfg(all(test, not(debug_assertions)))]
+        let commit_start = std::time::Instant::now();
         let mut result = storage.commit_at_lane(
             &patch,
             Some(observed_count),
@@ -273,6 +282,8 @@ impl ProjectionApplyCommand {
             Some(last),
             Some(proof.heads()),
         );
+        #[cfg(all(test, not(debug_assertions)))]
+        crate::persistence::projection_profile::record(|s| s.commit = commit_start.elapsed());
         if matches!(
             result,
             Err(TranscriptCommitError::Frame(
@@ -296,16 +307,23 @@ impl ProjectionApplyCommand {
             outcome,
             currency,
             savers: Some(savers),
-            reply,
+            reply: Some(reply),
         };
         match result {
             Ok(receipt) => {
                 waiting.publish(receipt);
                 None
             }
-            Err(_) if storage.has_pending_attempt() => Some(waiting),
+            Err(error) if storage.has_pending_attempt() => {
+                if error == TranscriptCommitError::FrameWriteStorageFull {
+                    // The first write accepted zero bytes. Settle the caller
+                    // now; the actor still owns the empty descriptor and gap.
+                    waiting.respond(Err(failed(error)));
+                }
+                Some(waiting)
+            }
             Err(error) => {
-                let _ = waiting.reply.send(Err(failed(error)));
+                waiting.respond(Err(failed(error)));
                 None
             }
         }
@@ -320,9 +338,15 @@ pub(crate) struct PendingProjectionApply {
     outcome: MaterializedProjectionApplyOutcome,
     currency: AppliedBasisCurrency,
     savers: Option<Savers>,
-    reply: mpsc::Sender<ApplyResult>,
+    reply: Option<mpsc::Sender<ApplyResult>>,
 }
 impl PendingProjectionApply {
+    fn respond(&mut self, result: ApplyResult) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(result);
+        }
+    }
+
     pub(crate) fn resolve(&mut self, storage: &PreparedProjectionStorage) -> bool {
         if storage.resolve_pending().is_err() {
             return false;
@@ -341,9 +365,7 @@ impl PendingProjectionApply {
                 barrier: frame.receipt.barrier,
             });
         } else {
-            let _ = self
-                .reply
-                .send(Err(failed(TranscriptCommitError::UncommittedAttempt)));
+            self.respond(Err(failed(TranscriptCommitError::UncommittedAttempt)));
         }
         true
     }
@@ -403,7 +425,7 @@ impl PendingProjectionApply {
         } else {
             false
         };
-        let _ = self.reply.send(Ok(ProjectionRuntimeApplyResult {
+        self.respond(Ok(ProjectionRuntimeApplyResult {
             session_id: self.target.session.clone(),
             outcome: self.outcome.clone(),
             already_accepted: false,
