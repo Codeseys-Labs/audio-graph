@@ -1296,22 +1296,24 @@ mod windows_held {
     /// Opens the entry `name` of `directory` for an ownership repair and
     /// qualifies it on that handle before anything changes: a regular file,
     /// neither a reparse point nor a directory, with no other name, and,
-    /// where its refusal was recorded, the very object refused. The handle
-    /// shares no delete, so nobody can rename or delete that object, or
-    /// give its name to another one, while the repair holds it. It also
-    /// asks for read access: a handle with only attribute or security
-    /// access takes no part in sharing, so its share mode would bind
-    /// nobody.
+    /// where its refusal was recorded, the very object refused. An entry
+    /// the repair will change (`access` not empty) is held with read access
+    /// and no delete sharing, so nobody can rename or delete it, or give its
+    /// name to another one, until it is changed; a handle with only
+    /// attribute or security access takes no part in sharing, so its share
+    /// mode would bind nobody. An entry only qualified, a staged file, asks
+    /// for no read access the repair does not need.
     fn qualify_repair_entry(
         directory: &File,
         name: &str,
         access: u32,
         refused: Option<ObjectIdentity>,
     ) -> Result<Option<File>, CredentialStoreFailure> {
+        let pinning = if access == 0 { 0 } else { FILE_READ_DATA.0 };
         let file = match open_relative(
             directory,
             name,
-            access | FILE_READ_DATA.0,
+            access | pinning,
             ChildOpen::OpenExisting,
             NO_DELETE_SHARE,
         ) {
