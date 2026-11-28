@@ -11,6 +11,7 @@ use crate::credentials::adapters::native_interaction::{
     latch_forbid_uncertainty,
 };
 use crate::credentials::domain::CredentialStoreFailure;
+use audio_graph_ipc_contract::credential_contract::PORTABLE_ENCODED_RECORD_MAX_BYTES;
 use zeroize::Zeroizing;
 
 trait MacKeychainApi: Send + Sync {
@@ -25,6 +26,7 @@ trait MacKeychainApi: Send + Sync {
         keychain: &Self::Keychain,
         service: &str,
         account: &str,
+        max_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>, NativeStatus>;
     fn find_item(
         &self,
@@ -67,8 +69,9 @@ impl MacKeychainApi for SecurityFrameworkCore {
         keychain: &Self::Keychain,
         service: &str,
         account: &str,
+        max_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>, NativeStatus> {
-        SecurityFrameworkCore::read_secret(self, keychain, service, account)
+        SecurityFrameworkCore::read_secret(self, keychain, service, account, max_bytes)
     }
 
     fn find_item(
@@ -254,7 +257,9 @@ fn map_open_status(status: NativeStatus) -> CredentialStoreFailure {
 fn map_read_status(status: NativeStatus) -> CredentialStoreFailure {
     if status == NativeStatus::ITEM_NOT_FOUND {
         CredentialStoreFailure::Missing
-    } else if status == NativeStatus::DECODE {
+    } else if status == NativeStatus::DECODE || status == NativeStatus::DATA_TOO_LARGE {
+        // A stored password longer than the portable record limit can never
+        // decode, so it is corrupt rather than a recoverable size error.
         CredentialStoreFailure::CorruptRecord
     } else {
         known_credential_status(status).unwrap_or(CredentialStoreFailure::Internal)
@@ -318,8 +323,13 @@ impl<Api: MacKeychainApi> KeyringBoundary for MacOsKeychainBoundary<Api> {
         ensure_forbid_prompt(prompt)?;
         match with_interaction_suppressed(&self.api, prompt, |api| {
             let keychain = api.default_user_keychain().map_err(map_open_status)?;
-            api.read_secret(&keychain, locator.service(), locator.account())
-                .map_err(map_read_status)
+            api.read_secret(
+                &keychain,
+                locator.service(),
+                locator.account(),
+                PORTABLE_ENCODED_RECORD_MAX_BYTES,
+            )
+            .map_err(map_read_status)
         }) {
             Ok(secret) => Ok(secret),
             Err(GuardFailure::Control) => Err(CredentialStoreFailure::Internal),
@@ -490,6 +500,7 @@ mod tests {
         CancellationToken, NativeInteractionGate, RecoveryOutcome, RecoveryTarget,
     };
     use crate::credentials::domain::CredentialStoreFailure;
+    use audio_graph_ipc_contract::credential_contract::PORTABLE_ENCODED_RECORD_MAX_BYTES;
     use std::collections::VecDeque;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Mutex};
@@ -658,6 +669,7 @@ mod tests {
             _keychain: &Self::Keychain,
             _service: &str,
             _account: &str,
+            max_bytes: usize,
         ) -> Result<Zeroizing<Vec<u8>>, NativeStatus> {
             self.record(Call::Read);
             let step = self
@@ -668,6 +680,10 @@ mod tests {
                 .pop_front()
                 .unwrap_or(ReadStep::Failure(NativeStatus::for_test(-1)));
             match step {
+                // Mirrors the raw core, which refuses before copying.
+                ReadStep::Secret(secret) if secret.len() > max_bytes => {
+                    Err(NativeStatus::DATA_TOO_LARGE)
+                }
                 ReadStep::Secret(secret) => Ok(Zeroizing::new(secret)),
                 ReadStep::Failure(status) => Err(status),
                 ReadStep::Panic => panic!("scripted macOS read panic"),
@@ -798,6 +814,33 @@ mod tests {
             .expect("guarded read");
 
         assert_eq!(secret.as_slice(), b"opaque-record");
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                Call::GetInteraction,
+                Call::SetInteraction(false),
+                Call::Read,
+                Call::SetInteraction(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_native_password_is_refused_as_corrupt_and_restores_interaction() {
+        let mut plan = FakePlan::default();
+        plan.read.push_back(ReadStep::Secret(vec![
+            0xa5;
+            PORTABLE_ENCODED_RECORD_MAX_BYTES + 1
+        ]));
+        let (api, trace) = ScriptedApi::new(plan);
+        let boundary = MacOsKeychainBoundary::new(api);
+        let gate = NativeInteractionGate::isolated_for_test();
+        let lease = gate.acquire().expect("isolated native lease");
+
+        assert_eq!(
+            boundary.get_secret(lease.forbid_prompt(), &EntryLocator::authority()),
+            Err(CredentialStoreFailure::CorruptRecord)
+        );
         assert_eq!(
             trace.snapshot(),
             vec![

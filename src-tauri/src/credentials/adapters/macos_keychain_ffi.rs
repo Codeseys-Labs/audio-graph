@@ -121,10 +121,16 @@ impl NativePasswordBuffer {
         }
     }
 
-    fn copy_and_release(mut self) -> Result<Zeroizing<Vec<u8>>, NativeStatus> {
+    /// Refuses a password longer than `max_bytes` before copying it, leaving
+    /// the native buffer armed so it is still scrubbed and freed.
+    fn copy_and_release(mut self, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>, NativeStatus> {
         if self.length > 0 && self.data.is_null() {
             self.armed = false;
             return Err(NativeStatus::INTERNAL_COMPONENT);
+        }
+        if self.length > max_bytes {
+            self.release_checked()?;
+            return Err(NativeStatus::DATA_TOO_LARGE);
         }
         let secret = if self.length == 0 {
             Zeroizing::new(Vec::new())
@@ -214,6 +220,7 @@ impl SecurityFrameworkCore {
         keychain: &UserKeychain,
         service: &str,
         account: &str,
+        max_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>, NativeStatus> {
         let service_length = Self::checked_length(service.len())?;
         let account_length = Self::checked_length(account.len())?;
@@ -251,7 +258,7 @@ impl SecurityFrameworkCore {
             password.release_checked()?;
             return Err(NativeStatus::INTERNAL_COMPONENT);
         };
-        password.copy_and_release()
+        password.copy_and_release(max_bytes)
     }
 
     pub(in crate::credentials::adapters) fn find_item(
