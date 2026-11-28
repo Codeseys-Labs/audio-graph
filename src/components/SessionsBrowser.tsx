@@ -753,20 +753,30 @@ function SessionDetail({
   // ONE predicate decides whether anything that reads the global store, or
   // asks the backend about its current buffers (Notes, Timeline and Graph
   // lenses, Ask, "Generate prose summary"), may be shown for this row: the
-  // global store holds THIS session (`loadedSessionId`, store truth, cleared by
-  // `startCapture` before it awaits anything) and nothing is capturing or
-  // transcribing. Two exceptions hold the global store by construction: sample
-  // preview, and the optimistic just-stopped row, whose data IS the resident
-  // live session (`pendingFinalizingSession`, also cleared by `startCapture`).
-  // When it is false the lens shows a gated or placeholder state with an
-  // explicit "Load" action; nothing here ever loads the global store on the
-  // user's behalf.
+  // global store holds THIS session's data and nothing is capturing or
+  // transcribing. "Holds this session" is store truth, two ways:
+  //   - `loadedSessionId === row.id` (a session loaded by explicit action), or
+  //   - `loadedSessionId === null && pendingFinalizingSession?.id === row.id`:
+  //     the just-stopped session's resident live data. `stopCapture` writes
+  //     the slot, and `startCapture`, `loadSession` (of any other session),
+  //     `resetSessionView`, `clearTranscript`, `loadSessionTranscript` and
+  //     sample-preview enter/exit clear it, so it names the session whose data
+  //     is resident (see the invariant at the slot's declaration). It covers
+  //     the row both while optimistic and after it is indexed, and is false
+  //     after an unresolved Stop (null slot).
+  // Sample preview holds the store by construction. When the predicate is
+  // false the lens shows a gated or placeholder state with an explicit "Load"
+  // action; nothing here ever loads the global store on the user's behalf.
+  const pendingFinalizingSession = useAudioGraphStore(
+    (s) => s.pendingFinalizingSession,
+  );
   const loadSession = useAudioGraphStore((s) => s.loadSession);
   const globalHoldsRow =
     samplePreviewActive ||
     (!liveRunning &&
       row !== null &&
-      (loadedSessionId === row.id || row.optimistic === true));
+      (loadedSessionId === row.id ||
+        (loadedSessionId === null && pendingFinalizingSession?.id === row.id)));
   const [loadState, setLoadState] = useState<"idle" | "loading" | "failed">(
     "idle",
   );
