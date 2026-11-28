@@ -38,8 +38,8 @@ The script accepts any `X.Y.Z[-prerelease]` string:
 git tag v0.2.0-rc.1
 ```
 
-tauri-action still treats these as draft releases — you have to publish
-them by hand from the GitHub Releases page.
+The release workflow creates a draft for pre-releases. Publish it by hand from
+the GitHub Releases page.
 
 Windows release builds ship NSIS plus the standalone executable. MSI is not a
 bundle target, so pre-release tags no longer depend on an MSI packaging path.
@@ -60,6 +60,8 @@ Still prefer a clean `vX.Y.Z` tag for the first GA.
    stack, matching `ci.yml`.
 4. **Bundle targets** are pinned in `tauri.conf.json` → `bundle.targets` =
    `["app", "dmg", "nsis", "appimage", "deb"]` (no implicit "all", no MSI/RPM).
+   Both build modes use a release-only config overlay that enables packaging
+   and uses the existing app icons, including the PNG required by AppImage.
 
 ### Artifact taxonomy — standalone primary, installer secondary
 
@@ -80,28 +82,38 @@ The Windows standalone is unsigned until Authenticode is procured (§3), so
 SmartScreen will warn.
 
 5. **Non-dry runs** (tag push, or manual dispatch with `dry_run: false`) create a
-   GitHub Release draft, upload the bundled artifacts, attach the Cargo-resolved
-   rsac revision manifests, and attach the standalone Windows/Linux binaries.
+   GitHub Release draft after verifying the downloaded platform artifacts.
+   The draft includes bundles, standalone Windows/Linux binaries, and the
+   Cargo-resolved rsac revision manifests and SHA-256 inventories.
 6. **Dry runs** (manual dispatch with `dry_run: true`) skip GitHub Release
-   creation and every `gh release upload`/tauri-action publishing step. They run
-   `bun run tauri build --ci --no-sign [target args] -- --locked` and upload
-   Actions artifacts named `release-dry-run-macos`, `release-dry-run-linux`,
-   and `release-dry-run-windows`.
+   creation and release uploads. They run `tauri build --ci --no-sign` with the
+   release packaging config and locked Cargo dependencies, then upload Actions
+   artifacts named `release-dry-run-macos`, `release-dry-run-linux`, and
+   `release-dry-run-windows`.
 7. Non-dry workflow runs leave the release **as a draft** — you review the
    files, polish the release notes, and hit "Publish release" by hand.
+
+Each platform's Actions artifact in either mode requires the raw executable,
+every configured bundle for that platform, and a non-empty
+`rsac-<platform>.txt`. The macOS dry run packages the `.app` as a
+`.app.tar.gz`, matching the release build. The accompanying
+`artifacts-<platform>.sha256` lists SHA-256, byte count, and path relative to
+the Actions artifact root as tab-separated fields, sorted by path. The publish
+job recomputes the inventory for every downloaded platform and requires at least
+one complete platform before creating the draft.
 
 ### Manual dispatch
 
 You can also trigger the workflow from the Actions UI (`workflow_dispatch`).
-Use this for clean-ref release evidence before pushing a tag: select the branch
-or commit to prove and set `dry_run: true`. The rsac identity is not an input;
-the workflow derives it from the committed manifest and lockfile. Dry runs do
-not create tags, GitHub Releases, or release uploads.
+For release evidence before pushing a tag, select the ref to test and keep the
+default `dry_run: true`. The job reports the nearest reachable `v*` tag or
+`v0.0.0-dev` when there is none. It derives rsac identity from the committed
+Cargo manifest and lockfile and uploads unsigned packages as Actions artifacts.
 
-Manual non-dry dispatch (`dry_run: false`) has the same publishing behavior as a
-tag push and should be treated as approval-gated: it creates a draft GitHub
-Release for the latest reachable tag on the selected ref and uploads release
-artifacts to it.
+For an approved manual release, set `dry_run: false` and enter an existing
+version tag such as `v0.2.0` in `release_tag`. The tag must point to the
+selected commit. The workflow reserves `v0.0.0-dev` for dry runs and rechecks
+the tag on GitHub before creating the draft.
 
 ## 3. Code signing + notarization (optional)
 
@@ -215,8 +227,9 @@ matrix entry from the Actions UI.
 - [ ] `./scripts/bump-version.sh X.Y.Z` run and diff reviewed.
 - [ ] CHANGELOG entries written under the new version section.
 - [ ] Release workflow dry-run dispatched from a clean release-prep ref with
-      `dry_run: true`; the Cargo-resolved rsac revision and all three
-      `release-dry-run-*` Actions artifacts reviewed.
+      the default `dry_run: true`; the Cargo-resolved rsac revision,
+      SHA-256 inventories, and all three `release-dry-run-*` Actions
+      artifacts reviewed.
 - [ ] `git tag -a vX.Y.Z -m "Release X.Y.Z"`.
 - [ ] `git push origin master vX.Y.Z`.
 - [ ] Watch the Release workflow finish (typically 20–30 minutes).
