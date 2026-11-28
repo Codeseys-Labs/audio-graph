@@ -114,11 +114,7 @@ describe("PipelineStatusBar", () => {
       "write_failed",
       "A transcrição não está sendo salva porque houve uma falha na gravação",
     ],
-    [
-      "en",
-      "confirmation_delayed",
-      "Transcript save confirmation pending",
-    ],
+    ["en", "confirmation_delayed", "Transcript save confirmation pending"],
     [
       "pt",
       "confirmation_delayed",
