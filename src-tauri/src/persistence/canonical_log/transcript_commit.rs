@@ -18,6 +18,12 @@ pub enum TranscriptCommitError {
     QueueFull,
     ReplyLost,
     AckTimeout,
+    ConfirmationPending,
+    /// Storage filled after bytes might have been written. Resolution is still owed.
+    StorageFullConfirmationPending,
+    /// The first write of a new frame returned ENOSPC and wrote no bytes.
+    FrameWriteStorageFull,
+    UncommittedAttempt,
     UnsupportedRepository,
     InvalidAddress,
     SessionFloorUnavailable,
@@ -40,6 +46,7 @@ pub enum TranscriptCommitError {
 impl TranscriptCommitError {
     pub(crate) fn is_storage_full(&self) -> bool {
         let (kind, code) = match self {
+            Self::FrameWriteStorageFull | Self::StorageFullConfirmationPending => return true,
             Self::Io { kind, code, .. } => (*kind, *code),
             Self::Indeterminate(e) => (e.kind, e.raw_os_error),
             Self::Rejected(CanonicalDurabilityRejection::IoFailedBeforeMutation {
@@ -151,19 +158,25 @@ fn checked_bytes_bounded(
     Ok(Some(bytes))
 }
 
-// Keep the owner lock and the exact attempted bytes across an uncertain
+// Keep the owner lock and any receipts awaiting intent retirement across an uncertain
 // return. A different live process must not treat a temporarily idle writer
 // as a crashed writer. Kernel lock release on exit is the restart witness.
 struct LiveAttempt {
     file: File,
-    frame: RetainedFrame,
+    frame: PendingPublication,
 }
-struct RetainedFrame {
-    bytes: Vec<u8>,
-    payload: String,
-    revision_id: String,
-    group_members: Vec<(String, String)>,
-    synced: bool,
+#[derive(Default)]
+struct PendingPublication {
+    // An unlink may remove the intent and still fail its parent barrier.
+    // Keep the confirmed data until that visibility barrier can be retried.
+    retiring: Option<Vec<RecoveredTranscript>>,
+}
+
+/// A frame published while resolving an earlier, unconfirmed attempt.
+#[derive(Clone)]
+pub(crate) struct RecoveredTranscript {
+    pub(crate) event: TranscriptEvent,
+    pub(crate) receipt: TranscriptReceipt,
 }
 type Attempts = std::sync::Mutex<HashMap<PathBuf, LiveAttempt>>;
 fn attempts() -> &'static Attempts {
@@ -173,7 +186,7 @@ fn attempts() -> &'static Attempts {
 struct Lease {
     path: PathBuf,
     file: Option<File>,
-    pending: Option<RetainedFrame>,
+    pending: Option<PendingPublication>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -257,6 +270,7 @@ struct Commit<'a> {
     session: &'a str,
     guard: TranscriptGuard<'a>,
     key: CanonicalRecoveryKey,
+    recovered: &'a std::cell::RefCell<Vec<RecoveredTranscript>>,
 }
 
 fn barrier(
@@ -290,6 +304,7 @@ impl<'a> Commit<'a> {
             None => TranscriptGuard::Unqualified(lock),
         };
         Ok(Self {
+            recovered: &storage.recovered,
             path: &storage.path,
             session: &storage.session,
             guard,
@@ -323,13 +338,36 @@ impl<'a> Commit<'a> {
             }
         }
     }
+    fn publish_intent(
+        &self,
+        lease: &mut Lease,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), TranscriptCommitError> {
+        let result = self.publish(path, bytes);
+        // No transcript byte has been written yet. A failed staging write
+        // with a provably absent intent is a refusal, not a pending save.
+        if result.is_ok() || !matches!(path.try_exists(), Ok(false)) {
+            lease.pending = Some(PendingPublication::default());
+        }
+        result
+    }
+
     fn publish(&self, path: &Path, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
         #[cfg(test)]
-        let fault = if CUT.get() == Some(Cut::IntentPublish)
-            && path.extension() == Some(std::ffi::OsStr::new("attempt"))
-        {
-            CUT.set(None);
-            Some(super::super::canonical_durability::CanonicalDurabilityStage::ParentSync)
+        let fault = if path.extension() == Some(std::ffi::OsStr::new("attempt")) {
+            use super::super::canonical_durability::CanonicalDurabilityStage;
+            match CUT.get() {
+                Some(Cut::IntentStageWrite) => {
+                    CUT.set(None);
+                    Some(CanonicalDurabilityStage::Write)
+                }
+                Some(Cut::IntentPublish) => {
+                    CUT.set(None);
+                    Some(CanonicalDurabilityStage::ParentSync)
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -369,6 +407,18 @@ impl<'a> Commit<'a> {
                             &staging, true,
                         )
                         .map_err(TranscriptCommitError::Rejected)?;
+                    #[cfg(test)]
+                    if fault
+                        == Some(super::super::canonical_durability::CanonicalDurabilityStage::Write)
+                    {
+                        temporary
+                            .write_all(&bytes[..bytes.len() / 2])
+                            .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                        return Err(io_failure(
+                            CanonicalAppendPhase::Write,
+                            io::ErrorKind::WriteZero.into(),
+                        ));
+                    }
                     temporary
                         .write_all(bytes)
                         .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
@@ -397,6 +447,14 @@ impl<'a> Commit<'a> {
     fn cache(
         &self,
         bytes: &[u8],
+    ) -> Result<(CachedStreamState, HashMap<String, u64>), TranscriptCommitError> {
+        self.cache_and_visit(bytes, |_, _| {})
+    }
+
+    fn cache_and_visit(
+        &self,
+        bytes: &[u8],
+        mut visit: impl FnMut(u64, &TranscriptEvent),
     ) -> Result<(CachedStreamState, HashMap<String, u64>), TranscriptCommitError> {
         #[cfg(test)]
         PREFIX_SCANS.set(PREFIX_SCANS.get() + 1);
@@ -445,6 +503,7 @@ impl<'a> Commit<'a> {
             {
                 return Err(TranscriptCommitError::InvalidHistory);
             }
+            visit(row.sequence, &event);
             previous_rows.insert(event.span_id.clone(), event);
         }
         Ok((cache, revisions))
@@ -499,47 +558,8 @@ impl<'a> Commit<'a> {
         verified: &std::cell::RefCell<Option<VerifiedPrefix>>,
     ) -> Result<Option<TranscriptReceipt>, TranscriptCommitError> {
         let mut lease = self.acquire_lease()?;
-        let payload_digest = event
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|_| TranscriptCommitError::InvalidHistory)?
-            .map(|bytes| digest(&bytes));
-        let intent_path = self.path.with_added_extension("attempt");
-        let mut intent: Option<Intent> = checked_bytes_bounded(&intent_path, 4096)?
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .transpose()
-            .map_err(|_| TranscriptCommitError::InvalidHistory)?;
-        if intent.is_some() {
-            self.sync_existing_intent(&intent_path)?;
-        }
-        if let Some(group) = intent.as_ref().filter(|intent| !intent.members.is_empty()) {
-            self.resolve_group_for_request(group, &mut lease, event, payload_digest.as_deref())?;
+        if self.resolve_lease(&mut lease)? {
             *verified.borrow_mut() = None;
-            lease.pending = None;
-            intent = None;
-        }
-        if intent.is_none()
-            && let Some(retained) = &lease.pending
-        {
-            // The final unlink may have taken effect before its parent barrier
-            // failed. This frame can already be visible to readers. Fence its
-            // published absence and keep the canonical sequence for live catch-up.
-            if retained.synced {
-                self.unlink(&intent_path)?;
-            }
-            lease.pending = None;
-        }
-        let mut superseded = false;
-        if let Some(retained) = &lease.pending {
-            let next = event.ok_or(TranscriptCommitError::ConflictingAttempt)?;
-            if Some(&retained.payload) != payload_digest.as_ref() {
-                if revision_id(next)? == retained.revision_id {
-                    return Err(TranscriptCommitError::ConflictingAttempt);
-                }
-                // A synced frame only needs final namespace publication. For a
-                // different live revision, abandon an uncertain, hidden frame.
-                superseded = !retained.synced;
-            }
         }
         let mut source = match self.guard.open_recovery_source(self.path) {
             Ok(file) => Some(file),
@@ -553,9 +573,7 @@ impl<'a> Commit<'a> {
         let stamp = source
             .as_ref()
             .and_then(|file| SourceStamp::read(file).ok());
-        let reusable = intent.is_none()
-            && lease.pending.is_none()
-            && stamp.is_some()
+        let reusable = stamp.is_some()
             && verified
                 .as_ref()
                 .is_some_and(|cached| cached.stamp == stamp);
@@ -564,99 +582,8 @@ impl<'a> Commit<'a> {
             file.read_to_end(&mut bytes)
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
         }
-        let mut live_attempt = None;
-        let mut superseded_attempt = None;
-        if let Some(intent) = intent {
-            let index = usize::try_from(intent.base_len)
-                .map_err(|_| TranscriptCommitError::InvalidHistory)?;
-            let (prefix, suffix) = bytes
-                .split_at_checked(index)
-                .ok_or(TranscriptCommitError::InvalidHistory)?;
-            let (base, _) = self.cache(prefix)?;
-            if (!intent.source_was_absent && source.is_none())
-                || (intent.source_was_absent && intent.base_len != 0)
-                || head(&base) != intent.after
-                || !valid_attempt(&intent.attempt)
-                || !valid_attempt(&intent.owner)
-                || !valid_hash(&intent.frame_hash)
-                || intent.frame_len == 0
-            {
-                return Err(TranscriptCommitError::InvalidHistory);
-            }
-            if suffix.len() as u64 > intent.frame_len {
-                return Err(TranscriptCommitError::InvalidHistory);
-            }
-            let matches =
-                suffix.len() as u64 == intent.frame_len && digest(suffix) == intent.frame_hash;
-            // Publishing quarantine is the durable decision to abandon. A
-            // restart before truncation must honor that decision even if the
-            // abandoned suffix still looks like an entire matching frame.
-            let evidence = self
-                .path
-                .with_added_extension(format!("{}.quarantine", intent.attempt));
-            let quarantine_published = evidence
-                .try_exists()
-                .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
-            if matches && !superseded && !quarantine_published {
-                let (end, _) = self.cache(&bytes)?;
-                if end.head.as_ref().map(|h| h.sequence)
-                    != Some(
-                        base.head
-                            .as_ref()
-                            .map_or(0, |h| h.sequence)
-                            .checked_add(1)
-                            .ok_or(TranscriptCommitError::InvalidHistory)?,
-                    )
-                {
-                    return Err(TranscriptCommitError::InvalidHistory);
-                }
-
-                // A failed fsync can clear dirty state while the page cache
-                // still returns the full frame. A second fsync alone cannot
-                // prove a subsequent writeback; dirty the entire frame again.
-                let file = source
-                    .as_mut()
-                    .ok_or(TranscriptCommitError::InvalidHistory)?;
-                self.guard
-                    .revalidate_recovery_source(self.path, file)
-                    .map_err(TranscriptCommitError::Rejected)?;
-                file.seek(SeekFrom::Start(intent.base_len))
-                    .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
-                write_frame(file, suffix)?;
-                self.sync_namespace()?;
-                if let Some(retained) = &mut lease.pending {
-                    retained.synced = true;
-                }
-                self.finish_intent(&intent_path)?;
-                lease.pending = None;
-            } else if (suffix.len() as u64) < intent.frame_len
-                && suffix
-                    .strip_prefix(b"\n")
-                    .unwrap_or(suffix)
-                    .contains(&b'\n')
-            {
-                return Err(TranscriptCommitError::InvalidHistory);
-            } else if superseded && !quarantine_published {
-                // Validate the new receipt's domain, identity and expected
-                // sequence before sacrificing a retryable live attempt.
-                superseded_attempt = Some(intent);
-            } else if intent.owner == owner && !quarantine_published {
-                if event.is_none() {
-                    return Err(TranscriptCommitError::ConflictingAttempt);
-                }
-                live_attempt = Some(intent);
-            } else {
-                self.abandon_attempt(&intent, suffix, &mut source)?;
-                bytes.truncate(index);
-                lease.pending = None;
-            }
-        }
-        let base_len = live_attempt
-            .as_ref()
-            .or(superseded_attempt.as_ref())
-            .map_or(bytes.len(), |i| i.base_len as usize);
         if !reusable {
-            let (stream, revisions) = self.cache(&bytes[..base_len])?;
+            let (stream, revisions) = self.cache(&bytes)?;
             *verified = Some(VerifiedPrefix {
                 stamp,
                 stream,
@@ -705,7 +632,7 @@ impl<'a> Commit<'a> {
                 }
                 frame
             }
-            PlannedAppend::Already(r) if live_attempt.is_none() => {
+            PlannedAppend::Already(r) => {
                 if expected_head.is_some_and(|previous| r.sequence > previous.saturating_add(1)) {
                     return Err(TranscriptCommitError::LiveHeadChanged);
                 }
@@ -724,26 +651,9 @@ impl<'a> Commit<'a> {
             _ => return Err(TranscriptCommitError::ConflictingAttempt),
         };
         let frame_hash = digest(&frame.frame);
-        if let Some(intent) = superseded_attempt {
-            self.abandon_attempt(&intent, &bytes[base_len..], &mut source)?;
-            lease.pending = None;
-        }
-        // A failed first append may have installed an empty source. Its retry
-        // still owns the first-create namespace obligation recorded in the intent.
-        let first_create = source.is_none()
-            || live_attempt
-                .as_ref()
-                .is_some_and(|intent| intent.source_was_absent);
-        if let Some(intent) = live_attempt {
-            if intent.frame_hash != frame_hash
-                || lease
-                    .pending
-                    .as_ref()
-                    .is_none_or(|original| original.bytes != frame.frame)
-            {
-                return Err(TranscriptCommitError::ConflictingAttempt);
-            }
-        } else {
+        let first_create = source.is_none();
+        let intent_path = self.path.with_added_extension("attempt");
+        {
             let intent = Intent {
                 attempt: Uuid::new_v4().to_string(),
                 owner: owner.to_owned(),
@@ -756,14 +666,7 @@ impl<'a> Commit<'a> {
             };
             let descriptor =
                 serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
-            lease.pending = Some(RetainedFrame {
-                bytes: frame.frame.clone(),
-                payload: payload_digest.ok_or(TranscriptCommitError::InvalidHistory)?,
-                revision_id: metadata.event_id.clone(),
-                group_members: Vec::new(),
-                synced: false,
-            });
-            self.publish(&intent_path, &descriptor)?;
+            self.publish_intent(&mut lease, &intent_path, &descriptor)?;
             #[cfg(test)]
             kill_at(Cut::KillIntent);
         }
@@ -781,7 +684,7 @@ impl<'a> Commit<'a> {
             .map_err(TranscriptCommitError::Rejected)?;
         file.seek(SeekFrom::Start(frame.base_byte_len))
             .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
-        write_frame(&mut file, &frame.frame)?;
+        write_new_frame(&mut file, &frame.frame)?;
         let namespace = if first_create {
             self.sync_namespace()?
         } else {
@@ -790,12 +693,17 @@ impl<'a> Commit<'a> {
                 TranscriptGuard::Unqualified(_) => CanonicalDurabilityBarrier::SyncedUnqualified,
             }
         };
-        if let Some(retained) = &mut lease.pending {
-            retained.synced = true;
+        if let Err(error) = self.finish_intent(&intent_path) {
+            lease.pending.as_mut().unwrap().retiring = Some(vec![RecoveredTranscript {
+                event: event.clone(),
+                receipt: TranscriptReceipt {
+                    sequence: frame.sequence,
+                    already_accepted: false,
+                    barrier: namespace,
+                },
+            }]);
+            return Err(error);
         }
-        // Readers fence an outstanding intent. Report success only once the
-        // verified frame can also be observed by a fresh reader.
-        self.finish_intent(&intent_path)?;
         lease.pending = None;
         cache.byte_len = frame.base_byte_len + frame.frame.len() as u64;
         cache.ends_with_newline = true;
@@ -853,7 +761,14 @@ impl<'a> Commit<'a> {
                 io::ErrorKind::Other.into(),
             ));
         }
-        self.sync_entry(path).map(|_| ())
+        #[cfg(test)]
+        let before = super::super::canonical_durability::completed_parent_flushes();
+        let result = self.sync_entry(path).map(|_| ());
+        #[cfg(test)]
+        LAST_INTENT_PARENT_FLUSHES.set(Some(
+            super::super::canonical_durability::completed_parent_flushes() - before,
+        ));
+        result
     }
 
     fn sync_entry(&self, path: &Path) -> Result<CanonicalDurabilityBarrier, TranscriptCommitError> {
@@ -906,20 +821,6 @@ impl<'a> Commit<'a> {
         #[cfg(test)]
         kill_at(Cut::KillRetired);
         Ok(())
-    }
-
-    fn abandon_attempt(
-        &self,
-        intent: &Intent,
-        suffix: &[u8],
-        source: &mut Option<File>,
-    ) -> Result<(), TranscriptCommitError> {
-        self.recover_gap(intent, suffix, source.as_ref())?;
-        if intent.source_was_absent {
-            drop(source.take());
-            self.unlink(self.path)?;
-        }
-        self.finish_intent(&self.path.with_added_extension("attempt"))
     }
 
     fn recover_gap(
@@ -994,6 +895,7 @@ enum Cut {
     KillComplete,
     KillGroupTorn,
     KillGroupMember,
+    IntentStageWrite,
     IntentPublish,
     IntentResync,
     KillIntent,
@@ -1006,6 +908,16 @@ enum Cut {
 }
 #[cfg(test)]
 thread_local! { static CUT: std::cell::Cell<Option<Cut>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+thread_local! { static LAST_INTENT_PARENT_FLUSHES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(in crate::persistence) fn simulate_failed_sync() {
+    CUT.set(Some(Cut::Sync));
+}
+#[cfg(test)]
+pub(in crate::persistence) fn simulate_failed_recovery_sync() {
+    CUT.set(Some(Cut::RecoverySync));
+}
 #[cfg(test)]
 pub(in crate::persistence) fn simulate_disk_full() {
     CUT.set(Some(Cut::Full));
@@ -1025,6 +937,18 @@ fn kill_at(cut: Cut) {
         wait_for_kill();
     }
 }
+// An error from the single File::write call wrote zero bytes. This proves
+// refusal only for a fresh append. During a rewrite the old bytes may match.
+fn write_new_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
+    write_frame(file, bytes).map_err(|error| match &error {
+        TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::Write,
+            ..
+        } if error.is_storage_full() => TranscriptCommitError::FrameWriteStorageFull,
+        _ => error,
+    })
+}
+
 fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
     #[cfg(test)]
     let cut = match CUT.get() {
@@ -1096,6 +1020,8 @@ fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitErro
             io::ErrorKind::Other.into(),
         ));
     }
+    #[cfg(test)]
+    tests::pause_before_frame_sync_if_armed();
     file.sync_all()
         .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))
 }
@@ -1187,6 +1113,7 @@ pub(crate) struct PreparedTranscriptStorage {
     store: SessionArtifactManifestStore,
     tier: Option<QualifiedStorage>,
     cache: std::cell::RefCell<Option<VerifiedPrefix>>,
+    recovered: std::cell::RefCell<Vec<RecoveredTranscript>>,
 }
 
 impl PreparedTranscriptStorage {
@@ -1221,10 +1148,32 @@ impl PreparedTranscriptStorage {
             store,
             tier,
             cache: Default::default(),
+            recovered: Default::default(),
         })
     }
     pub(crate) fn is_unqualified(&self) -> bool {
         self.tier.is_none()
+    }
+    pub(crate) fn take_recovered(&self) -> Vec<RecoveredTranscript> {
+        self.recovered.take()
+    }
+
+    pub(crate) fn has_pending_attempt(&self) -> bool {
+        attempts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&self.path.with_added_extension("attempt-lock"))
+    }
+
+    pub(crate) fn resolve_pending(&self) -> Result<(), TranscriptCommitError> {
+        with_writable_v1(&self.root, &self.store, || {
+            let commit = Commit::open(self)?;
+            let mut lease = commit.acquire_lease()?;
+            if commit.resolve_lease(&mut lease)? {
+                self.cache.take();
+            }
+            Ok(())
+        })
     }
     pub(crate) fn ready(&self) -> Result<(), TranscriptCommitError> {
         with_writable_v1(&self.root, &self.store, || {
@@ -1233,7 +1182,10 @@ impl PreparedTranscriptStorage {
                 path.try_exists()
                     .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))
             };
-            if exists(&self.path)? || exists(&self.path.with_added_extension("attempt"))? {
+            if exists(&self.path)?
+                || exists(&self.path.with_added_extension("attempt"))?
+                || self.has_pending_attempt()
+            {
                 commit.run(None, None, process_owner(), &self.cache)?;
             }
             // Exercise this directory's create, sync, and unlink permissions
@@ -1267,6 +1219,7 @@ impl PreparedTranscriptStorage {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ready(path: &Path, session: &str) -> Result<(), TranscriptCommitError> {
     PreparedTranscriptStorage::open(path, session)?.ready()
 }
@@ -1285,35 +1238,6 @@ pub(crate) fn commit_transcript(
     event: &TranscriptEvent,
 ) -> Result<TranscriptReceipt, TranscriptCommitError> {
     PreparedTranscriptStorage::open(path, session)?.commit_after(event, None)
-}
-
-/// Capture starts a fresh session on restart. Reconcile outstanding attempts for
-/// older sessions as well. A busy or damaged stream cannot block another one.
-pub(crate) fn recover_previous_sessions(
-    directory: &Path,
-    current_session: &str,
-) -> Result<(), TranscriptCommitError> {
-    let entries =
-        fs::read_dir(directory).map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
-    for entry in entries {
-        let name = entry
-            .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
-            .file_name();
-        let Some(session) = name
-            .to_str()
-            .and_then(|n| n.strip_suffix(".events.jsonl.attempt"))
-        else {
-            continue;
-        };
-        if session == current_session || crate::sessions::validate_session_id(session).is_err() {
-            continue;
-        }
-        let source = directory.join(format!("{session}.events.jsonl"));
-        if let Err(error) = ready(&source, session) {
-            log::warn!("transcript recovery pending: {error:?}");
-        }
-    }
-    Ok(())
 }
 
 /// A reader may overlap a write or run before startup recovery. The persistent
@@ -1544,9 +1468,10 @@ pub fn transcript_gaps(path: &Path) -> Result<Vec<TranscriptGap>, TranscriptComm
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(test)]
 mod domain_tests;
 
 mod group;
+mod recovery;

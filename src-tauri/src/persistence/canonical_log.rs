@@ -1846,18 +1846,21 @@ struct PendingAppend {
 }
 
 mod transcript_commit;
+#[cfg(test)]
+pub(crate) use transcript_commit::tests::interrupted_historical_caption;
 pub(crate) mod transcript_export;
 pub(crate) use transcript_commit::CapturedTranscript;
-#[cfg(test)]
-pub(super) use transcript_commit::simulate_disk_full;
 pub(crate) use transcript_commit::{
-    PreparedTranscriptStorage, commit_transcript, recover_previous_sessions,
-    transcript_recovery_artifacts,
+    PreparedTranscriptStorage, commit_transcript, transcript_recovery_artifacts,
 };
 pub use transcript_commit::{
     TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
 };
 pub(super) use transcript_commit::{capture_committed, read_committed};
+#[cfg(test)]
+pub(super) use transcript_commit::{
+    simulate_disk_full, simulate_failed_recovery_sync, simulate_failed_sync,
+};
 
 struct FrameBasis<'a> {
     session_id: &'a str,

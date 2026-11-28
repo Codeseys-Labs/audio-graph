@@ -53,7 +53,7 @@ fn a_stale_live_ledger_cannot_append_past_a_committed_sequence() {
 }
 
 #[test]
-fn invalid_stale_or_already_accepted_callbacks_do_not_abandon_an_uncertain_live_revision() {
+fn a_torn_attempt_is_resolved_before_admission_even_for_invalid_or_stale_callbacks() {
     let session = Session::new();
     let commit = |revision: &TranscriptEvent, head| {
         commit_after(&session.log, SESSION, revision, Some(head))
@@ -75,10 +75,14 @@ fn invalid_stale_or_already_accepted_callbacks_do_not_abandon_an_uncertain_live_
         Err(TranscriptCommitError::LiveHeadChanged)
     );
     assert!(commit(&event(1), 1).unwrap().already_accepted);
-    assert_eq!(fs::read(&session.log).unwrap(), pending);
-    assert!(session.log.with_added_extension("attempt").is_file());
+    let valid = fs::read(&session.log).unwrap();
+    assert!(pending.starts_with(&valid) && pending.len() > valid.len());
+    assert!(!session.log.with_added_extension("attempt").exists());
     assert_eq!(commit(&event(2), 1).unwrap().sequence, 2);
-    assert!(transcript_gaps(&session.log).unwrap().is_empty());
+    let gaps = transcript_gaps(&session.log).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].suffix_quarantined);
+    assert_eq!(gaps[0].after.as_ref().unwrap().sequence, 1);
 }
 
 #[test]
@@ -100,10 +104,19 @@ fn a_synced_frame_survives_failure_on_either_side_of_descriptor_removal() {
         );
         // A caller still at sequence one must first publish the verified second
         // event in live memory before trying to advance with a third revision.
+        let prepared = PreparedTranscriptStorage::open(&session.log, SESSION).unwrap();
+        assert!(prepared.has_pending_attempt());
         assert_eq!(
-            commit_after(&session.log, SESSION, &event(3), Some(1)),
+            prepared.commit_after(&event(3), Some(1)),
             Err(TranscriptCommitError::LiveHeadChanged)
         );
+        let receipts = prepared.take_recovered();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].event, event(2));
+        assert_eq!(receipts[0].receipt.sequence, 2);
+        prepared.resolve_pending().unwrap();
+        assert!(prepared.take_recovered().is_empty());
+        assert!(!prepared.has_pending_attempt());
         let recovered = read_committed::<TranscriptEvent>(&session.log, SESSION).unwrap();
         assert_eq!(recovered.records.len(), 2);
         assert_eq!(recovered.records[1].payload.revision_number, 2);
@@ -225,4 +238,111 @@ fn steady_state_appends_reuse_the_verified_generation() {
             .unwrap();
     }
     assert_eq!(PREFIX_SCANS.get(), initial);
+}
+
+#[test]
+fn idle_resolution_delivers_each_kept_member_after_its_own_recovery_barrier() {
+    for count in [1, 3] {
+        let session = Session::new();
+        let mut storage = PreparedTranscriptStorage::open(&session.log, SESSION).unwrap();
+        storage.tier = None;
+        storage.commit_after(&event(1), Some(0)).unwrap();
+        let pending: Vec<_> = (2..2 + count).map(event).collect();
+        CUT.set(Some(Cut::Sync));
+        let err = if count == 1 {
+            storage.commit_after(&pending[0], Some(1)).unwrap_err()
+        } else {
+            storage.commit_group_after(&pending, 1).unwrap_err()
+        };
+        assert_eq!(
+            err,
+            io_failure(CanonicalAppendPhase::Sync, io::ErrorKind::Other.into())
+        );
+        CUT.set(Some(Cut::RecoverySync));
+        assert_eq!(
+            storage.resolve_pending(),
+            Err(io_failure(
+                CanonicalAppendPhase::RecoverySync,
+                io::ErrorKind::Other.into()
+            ))
+        );
+        assert!(storage.take_recovered().is_empty());
+        assert!(storage.has_pending_attempt());
+        assert_eq!(
+            read_committed::<TranscriptEvent>(&session.log, SESSION)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        storage.resolve_pending().unwrap();
+        let recovered = storage.take_recovered();
+        assert_eq!(recovered.len(), pending.len());
+        for (saved, original) in recovered.into_iter().zip(pending) {
+            assert_eq!(saved.event, original);
+            assert_eq!(saved.receipt.sequence, original.revision_number);
+            assert_eq!(
+                saved.receipt.barrier,
+                CanonicalDurabilityBarrier::SyncedUnqualified
+            );
+            assert!(
+                storage
+                    .commit_after(&original, None)
+                    .unwrap()
+                    .already_accepted
+            );
+        }
+        storage.resolve_pending().unwrap();
+        assert!(storage.take_recovered().is_empty());
+        assert!(transcript_gaps(&session.log).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn upgrade_finishes_an_already_quarantined_matching_singleton() {
+    // Old builds could publish quarantine for a superseded, complete frame.
+    // A process death before the truncate leaves both copies of that frame.
+    let session = Session::new();
+    let storage = PreparedTranscriptStorage::open(&session.log, SESSION).unwrap();
+    storage.commit_after(&event(1), None).unwrap();
+    CUT.set(Some(Cut::Sync));
+    assert!(storage.commit_after(&event(2), None).is_err());
+    let intent: Intent =
+        serde_json::from_slice(&fs::read(session.log.with_added_extension("attempt")).unwrap())
+            .unwrap();
+    let bytes = fs::read(&session.log).unwrap();
+    let suffix = &bytes[intent.base_len as usize..];
+    assert_eq!(digest(suffix), intent.frame_hash);
+    let evidence = session
+        .log
+        .with_added_extension(format!("{}.quarantine", intent.attempt));
+    fs::write(&evidence, suffix).unwrap();
+    storage.resolve_pending().unwrap();
+    assert!(storage.take_recovered().is_empty());
+    assert_eq!(fs::read(evidence).unwrap(), suffix);
+    assert_eq!(
+        read_committed::<TranscriptEvent>(&session.log, SESSION)
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    let gaps = transcript_gaps(&session.log).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].suffix_quarantined);
+    assert_eq!(gaps[0].after.as_ref().unwrap().sequence, 1);
+}
+
+#[test]
+fn failed_staging_without_a_published_descriptor_is_a_definite_refusal() {
+    let session = Session::new();
+    let storage = PreparedTranscriptStorage::open(&session.log, SESSION).unwrap();
+    storage.commit_after(&event(1), None).unwrap();
+    fs::create_dir(session.log.with_added_extension("attempt-stage")).unwrap();
+    let before = fs::read(&session.log).unwrap();
+    assert!(storage.commit_after(&event(2), Some(1)).is_err());
+    assert!(!storage.has_pending_attempt());
+    assert!(!session.log.with_added_extension("attempt").exists());
+    assert_eq!(fs::read(&session.log).unwrap(), before);
+    assert!(storage.take_recovered().is_empty());
 }

@@ -44,6 +44,7 @@ export function computeCompositeHealth({
 }: CompositeHealthInput): CompositeHealth {
   const {
     transcript_not_saving,
+    transcript_captions_lost,
     transcript_crash_safety_unverified,
     ...stageStatuses
   } = pipelineStatus;
@@ -57,6 +58,7 @@ export function computeCompositeHealth({
   );
   if (
     transcript_crash_safety_unverified ||
+    transcript_captions_lost ||
     stages.some((stage) => stage.type === "Degraded") ||
     consumerDroppedChunks > 0 ||
     persistenceDropped > 0 ||

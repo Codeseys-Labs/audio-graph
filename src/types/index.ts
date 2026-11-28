@@ -681,6 +681,7 @@ export interface PipelineStatus extends PipelineStages {
     | "write_failed"
     | "confirmation_delayed";
   transcript_crash_safety_unverified?: boolean;
+  transcript_captions_lost?: boolean;
 }
 
 /**
