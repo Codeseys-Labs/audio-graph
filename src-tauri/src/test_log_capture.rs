@@ -34,8 +34,8 @@ impl log::Log for TestLogger {
             target: record.target().to_owned(),
             message: record.args().to_string(),
         };
-        THREAD.with_borrow_mut(|buffer| {
-            if let Some(buffer) = buffer {
+        let _ = THREAD.try_with(|buffer| {
+            if let Some(buffer) = buffer.borrow_mut().as_mut() {
                 buffer.push(captured.clone());
             }
         });
@@ -117,6 +117,25 @@ pub(crate) fn render(records: &[CapturedLog]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captures_logs_during_thread_local_destruction() {
+        struct LogOnDrop;
+        impl Drop for LogOnDrop {
+            fn drop(&mut self) {
+                log::warn!(target: "audio_graph::test", "tls-drop-marker-83c7");
+            }
+        }
+        thread_local! { static LOG_ON_DROP: LogOnDrop = const { LogOnDrop }; }
+        install();
+        std::thread::spawn(|| {
+            LOG_ON_DROP.with(|_| {});
+            drop(ThreadLogCapture::start());
+        })
+        .join()
+        .expect("thread-local destructor must not panic");
+        assert!(process_logs_contain("tls-drop-marker-83c7"));
+    }
 
     #[test]
     fn captures_threads_and_filters_dependencies() {
