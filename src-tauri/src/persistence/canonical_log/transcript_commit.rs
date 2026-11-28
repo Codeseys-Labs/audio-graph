@@ -1,11 +1,11 @@
 //! Receipt-bearing commits for the legacy-v1 transcript payload.
 use super::*;
 use crate::persistence::canonical_durability::{
-    CanonicalCoordinationError, CanonicalDurabilityBarrier, CanonicalExclusiveGuard,
-    CanonicalFilesystemQualification, CanonicalFilesystemQualificationError,
-    CanonicalSnapshotExpectation, CanonicalUnlinkOutcome,
+    CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityBarrier,
+    CanonicalExclusiveGuard, CanonicalFilesystemQualification,
+    CanonicalFilesystemQualificationError, CanonicalSnapshotExpectation, CanonicalUnlinkOutcome,
 };
-use crate::projections::{TranscriptEvent, TranscriptLedger};
+use crate::projections::TranscriptEvent;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -17,6 +17,7 @@ pub enum TranscriptCommitError {
     WriterAbsent,
     QueueFull,
     ReplyLost,
+    AckTimeout,
     UnsupportedRepository,
     InvalidAddress,
     SessionFloorUnavailable,
@@ -153,8 +154,13 @@ fn checked_bytes_bounded(
 // as a crashed writer. Kernel lock release on exit is the restart witness.
 struct LiveAttempt {
     file: File,
-    frame: Vec<u8>,
+    frame: RetainedFrame,
+}
+struct RetainedFrame {
+    bytes: Vec<u8>,
     payload: String,
+    revision_id: String,
+    synced: bool,
 }
 type Attempts = std::sync::Mutex<HashMap<PathBuf, LiveAttempt>>;
 fn attempts() -> &'static Attempts {
@@ -164,27 +170,89 @@ fn attempts() -> &'static Attempts {
 struct Lease {
     path: PathBuf,
     file: Option<File>,
-    pending: Option<(Vec<u8>, String)>,
+    pending: Option<RetainedFrame>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let (Some(file), Some((frame, payload))) = (self.file.take(), self.pending.take()) {
-            attempts().lock().unwrap_or_else(|p| p.into_inner()).insert(
-                self.path.clone(),
-                LiveAttempt {
-                    file,
-                    frame,
-                    payload,
-                },
-            );
+        if let (Some(file), Some(frame)) = (self.file.take(), self.pending.take()) {
+            attempts()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(self.path.clone(), LiveAttempt { file, frame });
         }
     }
 }
+/// A worker may reuse an index only under the stream lock and for the same
+/// file generation. Cooperative writers append or replace the file and leave
+/// an intent whenever a tail is mutable.
+#[derive(PartialEq, Eq)]
+struct SourceStamp {
+    identity: super::super::canonical_durability::FilesystemIdentity,
+    length: u64,
+    modified: std::time::SystemTime,
+}
+impl SourceStamp {
+    fn read(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            identity: super::super::canonical_durability::handle_identity(file, &metadata)?,
+            length: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! { static PREFIX_SCANS: std::cell::Cell<u64> = const {std::cell::Cell::new(0)}; }
+
+struct VerifiedPrefix {
+    stamp: Option<SourceStamp>,
+    stream: CachedStreamState,
+    revisions: HashMap<String, u64>,
+}
+enum TranscriptGuard<'a> {
+    Qualified(
+        CanonicalExclusiveGuard,
+        &'a CanonicalFilesystemQualification,
+    ),
+    Unqualified(File),
+}
+
+impl TranscriptGuard<'_> {
+    fn open_recovery_source(&self, path: &Path) -> Result<File, CanonicalDurabilityRejection> {
+        match self {
+            Self::Qualified(guard, _) => guard.open_recovery_source(path),
+            Self::Unqualified(_) => {
+                super::super::canonical_durability::open_unqualified_transcript_file(path, false)
+            }
+        }
+    }
+    fn revalidate_recovery_source(
+        &self,
+        path: &Path,
+        file: &File,
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        match self {
+            Self::Qualified(guard, _) => guard.revalidate_recovery_source(path, file),
+            Self::Unqualified(_) => {
+                super::super::canonical_durability::validate_unqualified_transcript_file(path, file)
+            }
+        }
+    }
+}
+
+impl Drop for TranscriptGuard<'_> {
+    fn drop(&mut self) {
+        if let Self::Unqualified(file) = self {
+            let _ = file.unlock();
+        }
+    }
+}
+
 struct Commit<'a> {
     path: &'a Path,
     session: &'a str,
-    guard: CanonicalExclusiveGuard,
-    qualification: CanonicalFilesystemQualification,
+    guard: TranscriptGuard<'a>,
     key: CanonicalRecoveryKey,
 }
 
@@ -201,27 +269,47 @@ fn barrier(
 }
 
 impl<'a> Commit<'a> {
-    fn open(path: &'a Path, session: &'a str) -> Result<Self, TranscriptCommitError> {
-        let dir = path.parent().ok_or(TranscriptCommitError::InvalidAddress)?;
-        let (qualification, durability) =
-            CanonicalFilesystemQualification::for_existing_managed_root(dir)
-                .map_err(TranscriptCommitError::Qualification)?;
-        let guard = durability
-            .try_lock_exclusive_qualified(dir, &qualification)
-            .map_err(TranscriptCommitError::Coordination)?;
+    fn open(storage: &'a PreparedTranscriptStorage) -> Result<Self, TranscriptCommitError> {
+        use super::super::canonical_durability::{
+            transcript_coordination_path, wait_for_transcript_lock,
+        };
+        let lock =
+            wait_for_transcript_lock(&transcript_coordination_path(&storage.path), false, true)
+                .map_err(TranscriptCommitError::Coordination)?;
+        let guard = match &storage.tier {
+            Some((qualification, durability)) => TranscriptGuard::Qualified(
+                durability
+                    .transcript_guard(qualification, lock)
+                    .map_err(TranscriptCommitError::Rejected)?,
+                qualification,
+            ),
+            None => TranscriptGuard::Unqualified(lock),
+        };
         Ok(Self {
-            path,
-            session,
+            path: &storage.path,
+            session: &storage.session,
             guard,
-            qualification,
             key: CanonicalRecoveryKey::from_opaque_bytes(*Uuid::new_v4().as_bytes()),
         })
     }
+    fn weak_parent_barrier(&self) -> Result<(), TranscriptCommitError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or(TranscriptCommitError::InvalidAddress)?;
+        super::super::canonical_durability::sync_unqualified_transcript_parent(parent)
+            .map_err(|e| io_failure(CanonicalAppendPhase::RecoverySync, e))
+    }
     fn unlink(&self, path: &Path) -> Result<(), TranscriptCommitError> {
-        match self
-            .guard
-            .unlink_canonical_entry(path, Some(&self.qualification), self.key)
-        {
+        let TranscriptGuard::Qualified(guard, qualification) = &self.guard else {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_failure(CanonicalAppendPhase::Write, e)),
+            }
+            return self.weak_parent_barrier();
+        };
+        match guard.unlink_canonical_entry(path, Some(qualification), self.key) {
             CanonicalUnlinkOutcome::Unlinked(_) | CanonicalUnlinkOutcome::AlreadyAbsent(_) => {
                 Ok(())
             }
@@ -245,34 +333,56 @@ impl<'a> Commit<'a> {
             if existing != bytes {
                 return Err(TranscriptCommitError::InvalidHistory);
             }
-            barrier(self.guard.sync_recovery_namespace_entry(
-                path,
-                Some(&self.qualification),
-                self.key,
-            ))?;
+            self.sync_entry(path)?;
         } else {
-            barrier(self.guard.install_manifest_snapshot(
-                &staging,
-                path,
-                bytes,
-                &mut CanonicalSnapshotExpectation::Absent,
-                Some(&self.qualification),
-                self.key,
-                false,
-                None,
-            ))?;
+            match &self.guard {
+                TranscriptGuard::Qualified(guard, qualification) => {
+                    barrier(guard.install_manifest_snapshot(
+                        &staging,
+                        path,
+                        bytes,
+                        &mut CanonicalSnapshotExpectation::Absent,
+                        Some(qualification),
+                        self.key,
+                        false,
+                        None,
+                    ))?;
+                }
+                TranscriptGuard::Unqualified(_) => {
+                    let mut temporary =
+                        super::super::canonical_durability::open_unqualified_transcript_file(
+                            &staging, true,
+                        )
+                        .map_err(TranscriptCommitError::Rejected)?;
+                    temporary
+                        .write_all(bytes)
+                        .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                    temporary
+                        .flush()
+                        .map_err(|e| io_failure(CanonicalAppendPhase::Flush, e))?;
+                    temporary
+                        .sync_all()
+                        .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))?;
+                    drop(temporary);
+                    fs::rename(&staging, path)
+                        .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                    self.weak_parent_barrier()?;
+                }
+            }
         }
         Ok(())
     }
     fn cache(
         &self,
         bytes: &[u8],
-    ) -> Result<(CachedStreamState, TranscriptLedger), TranscriptCommitError> {
+    ) -> Result<(CachedStreamState, HashMap<String, u64>), TranscriptCommitError> {
+        #[cfg(test)]
+        PREFIX_SCANS.set(PREFIX_SCANS.get() + 1);
         let raw = parse_structural_records(bytes, self.session, STREAM, 1)
             .map_err(|_| TranscriptCommitError::InvalidHistory)?;
-        let mut cache = cache_from_raw::<TranscriptEvent>(&raw)
-            .map_err(|_| TranscriptCommitError::InvalidHistory)?;
-        let mut ledger = TranscriptLedger::new(self.session);
+        let mut cache = index_raw(&raw);
+        let mut revisions = HashMap::new();
+        let mut previous_rows: HashMap<String, TranscriptEvent> = HashMap::new();
         for row in raw.records {
             let event: TranscriptEvent = serde_json::from_value(row.payload)
                 .map_err(|_| TranscriptCommitError::InvalidHistory)?;
@@ -296,24 +406,33 @@ impl<'a> Commit<'a> {
                     &hash,
                 )
                 .map_err(|_| TranscriptCommitError::InvalidHistory)?;
-                cache.events.entry(id).or_insert_with(|| CachedEvent {
-                    sequence: row.sequence,
-                    record_hash: row.record_hash,
-                    payload_hash: hash,
-                    commitment_hash: commitment,
-                });
+                cache
+                    .events
+                    .entry(id.clone())
+                    .or_insert_with(|| CachedEvent {
+                        sequence: row.sequence,
+                        record_hash: row.record_hash,
+                        payload_hash: hash,
+                        commitment_hash: commitment,
+                    });
             }
-            ledger
-                .apply_event(event)
-                .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+            if let Some(previous) = revisions.insert(event.span_id.clone(), event.revision_number)
+                && (previous > event.revision_number
+                    || (previous == event.revision_number
+                        && previous_rows.get(&event.span_id) != Some(&event)))
+            {
+                return Err(TranscriptCommitError::InvalidHistory);
+            }
+            previous_rows.insert(event.span_id.clone(), event);
         }
-        Ok((cache, ledger))
+        Ok((cache, revisions))
     }
     fn run(
         &self,
         event: Option<&TranscriptEvent>,
         expected_head: Option<u64>,
         owner: &str,
+        verified: &std::cell::RefCell<Option<VerifiedPrefix>>,
     ) -> Result<Option<TranscriptReceipt>, TranscriptCommitError> {
         let lock = self.path.with_added_extension("attempt-lock");
         let lock_key =
@@ -331,17 +450,14 @@ impl<'a> Commit<'a> {
             Lease {
                 path: lock_key,
                 file: Some(attempt.file),
-                pending: Some((attempt.frame, attempt.payload)),
+                pending: Some(attempt.frame),
             }
         } else {
             if !lock
                 .try_exists()
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
             {
-                barrier(
-                    self.guard
-                        .append(&lock, b"", Some(&self.qualification), self.key),
-                )?;
+                self.publish(&lock, b"")?;
             }
             let file = self
                 .guard
@@ -362,16 +478,34 @@ impl<'a> Commit<'a> {
             .transpose()
             .map_err(|_| TranscriptCommitError::InvalidHistory)?
             .map(|bytes| digest(&bytes));
-        if let Some((_, previous)) = &lease.pending
-            && Some(previous) != payload_digest.as_ref()
-        {
-            return Err(TranscriptCommitError::ConflictingAttempt);
-        }
         let intent_path = self.path.with_added_extension("attempt");
         let intent: Option<Intent> = checked_bytes_bounded(&intent_path, 4096)?
             .map(|bytes| serde_json::from_slice(&bytes))
             .transpose()
             .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+        if intent.is_none()
+            && let Some(retained) = &lease.pending
+        {
+            // The final unlink may have taken effect before its parent barrier
+            // failed. This frame can already be visible to readers. Fence its
+            // published absence and keep the canonical sequence for live catch-up.
+            if retained.synced {
+                self.unlink(&intent_path)?;
+            }
+            lease.pending = None;
+        }
+        let mut superseded = false;
+        if let Some(retained) = &lease.pending {
+            let next = event.ok_or(TranscriptCommitError::ConflictingAttempt)?;
+            if Some(&retained.payload) != payload_digest.as_ref() {
+                if revision_id(next)? == retained.revision_id {
+                    return Err(TranscriptCommitError::ConflictingAttempt);
+                }
+                // A synced frame only needs final namespace publication. For a
+                // different live revision, abandon an uncertain, hidden frame.
+                superseded = !retained.synced;
+            }
+        }
         let mut source = match self.guard.open_recovery_source(self.path) {
             Ok(file) => Some(file),
             Err(CanonicalDurabilityRejection::IoFailedBeforeMutation {
@@ -380,12 +514,23 @@ impl<'a> Commit<'a> {
             }) => None,
             Err(e) => return Err(TranscriptCommitError::Rejected(e)),
         };
+        let mut verified = verified.borrow_mut();
+        let stamp = source
+            .as_ref()
+            .and_then(|file| SourceStamp::read(file).ok());
+        let reusable = intent.is_none()
+            && lease.pending.is_none()
+            && stamp.is_some()
+            && verified
+                .as_ref()
+                .is_some_and(|cached| cached.stamp == stamp);
         let mut bytes = Vec::new();
-        if let Some(file) = &mut source {
+        if !reusable && let Some(file) = &mut source {
             file.read_to_end(&mut bytes)
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
         }
         let mut live_attempt = None;
+        let mut superseded_attempt = None;
         if let Some(intent) = intent {
             let index = usize::try_from(intent.base_len)
                 .map_err(|_| TranscriptCommitError::InvalidHistory)?;
@@ -403,7 +548,21 @@ impl<'a> Commit<'a> {
             {
                 return Err(TranscriptCommitError::InvalidHistory);
             }
-            if suffix.len() as u64 == intent.frame_len && digest(suffix) == intent.frame_hash {
+            if suffix.len() as u64 > intent.frame_len {
+                return Err(TranscriptCommitError::InvalidHistory);
+            }
+            let matches =
+                suffix.len() as u64 == intent.frame_len && digest(suffix) == intent.frame_hash;
+            // Publishing quarantine is the durable decision to abandon. A
+            // restart before truncation must honor that decision even if the
+            // abandoned suffix still looks like an entire matching frame.
+            let evidence = self
+                .path
+                .with_added_extension(format!("{}.quarantine", intent.attempt));
+            let quarantine_published = evidence
+                .try_exists()
+                .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
+            if matches && !superseded && !quarantine_published {
                 let (end, _) = self.cache(&bytes)?;
                 if end.head.as_ref().map(|h| h.sequence)
                     != Some(
@@ -417,47 +576,62 @@ impl<'a> Commit<'a> {
                     return Err(TranscriptCommitError::InvalidHistory);
                 }
 
-                #[cfg(test)]
-                if CUT.get() == Some(Cut::RecoverySync) {
-                    CUT.set(None);
-                    return Err(io_failure(
-                        CanonicalAppendPhase::RecoverySync,
-                        io::ErrorKind::Other.into(),
-                    ));
+                // A failed fsync can clear dirty state while the page cache
+                // still returns the full frame. A second fsync alone cannot
+                // prove a subsequent writeback; dirty the entire frame again.
+                let file = source
+                    .as_mut()
+                    .ok_or(TranscriptCommitError::InvalidHistory)?;
+                self.guard
+                    .revalidate_recovery_source(self.path, file)
+                    .map_err(TranscriptCommitError::Rejected)?;
+                file.seek(SeekFrom::Start(intent.base_len))
+                    .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                write_frame(file, suffix)?;
+                self.sync_namespace()?;
+                if let Some(retained) = &mut lease.pending {
+                    retained.synced = true;
                 }
-                self.sync_source(
-                    source
-                        .as_ref()
-                        .ok_or(TranscriptCommitError::InvalidHistory)?,
-                )?;
-                self.unlink(&intent_path)?;
+                self.finish_intent(&intent_path)?;
                 lease.pending = None;
-            } else if suffix.len() as u64 >= intent.frame_len
-                || suffix
+            } else if (suffix.len() as u64) < intent.frame_len
+                && suffix
                     .strip_prefix(b"\n")
                     .unwrap_or(suffix)
                     .contains(&b'\n')
             {
                 return Err(TranscriptCommitError::InvalidHistory);
-            } else if intent.owner == owner {
+            } else if superseded && !quarantine_published {
+                // Validate the new receipt's domain, identity and expected
+                // sequence before sacrificing a retryable live attempt.
+                superseded_attempt = Some(intent);
+            } else if intent.owner == owner && !quarantine_published {
                 if event.is_none() {
                     return Err(TranscriptCommitError::ConflictingAttempt);
                 }
                 live_attempt = Some(intent);
             } else {
-                self.recover_gap(&intent, suffix, source.as_ref())?;
-                if intent.source_was_absent {
-                    drop(source.take());
-                    self.unlink(self.path)?;
-                }
+                self.abandon_attempt(&intent, suffix, &mut source)?;
                 bytes.truncate(index);
-                self.unlink(&intent_path)?;
+                lease.pending = None;
             }
         }
         let base_len = live_attempt
             .as_ref()
+            .or(superseded_attempt.as_ref())
             .map_or(bytes.len(), |i| i.base_len as usize);
-        let (cache, mut ledger) = self.cache(&bytes[..base_len])?;
+        if !reusable {
+            let (stream, revisions) = self.cache(&bytes[..base_len])?;
+            *verified = Some(VerifiedPrefix {
+                stamp,
+                stream,
+                revisions,
+            });
+        }
+        let prefix = verified
+            .as_mut()
+            .expect("verified prefix is initialized above");
+        let cache = &mut prefix.stream;
         let Some(event) = event else {
             return Ok(None);
         };
@@ -487,9 +661,13 @@ impl<'a> Commit<'a> {
                 {
                     return Err(TranscriptCommitError::LiveHeadChanged);
                 }
-                ledger
-                    .apply_event(event.clone())
-                    .map_err(|_| TranscriptCommitError::InvalidRevision)?;
+                if prefix
+                    .revisions
+                    .get(&event.span_id)
+                    .is_some_and(|&previous| previous >= event.revision_number)
+                {
+                    return Err(TranscriptCommitError::InvalidRevision);
+                }
                 frame
             }
             PlannedAppend::Already(r) if live_attempt.is_none() => {
@@ -501,7 +679,6 @@ impl<'a> Commit<'a> {
                         .as_ref()
                         .ok_or(TranscriptCommitError::InvalidHistory)?,
                 )?;
-                lease.pending = None;
                 return Ok(Some(TranscriptReceipt {
                     sequence: r.sequence,
                     already_accepted: true,
@@ -512,14 +689,16 @@ impl<'a> Commit<'a> {
             _ => return Err(TranscriptCommitError::ConflictingAttempt),
         };
         let frame_hash = digest(&frame.frame);
-        let suffix = &bytes[base_len..];
+        if let Some(intent) = superseded_attempt {
+            self.abandon_attempt(&intent, &bytes[base_len..], &mut source)?;
+            lease.pending = None;
+        }
         if let Some(intent) = live_attempt {
             if intent.frame_hash != frame_hash
-                || !frame.frame.starts_with(suffix)
                 || lease
                     .pending
                     .as_ref()
-                    .is_some_and(|(original, _)| original != &frame.frame)
+                    .is_none_or(|original| original.bytes != frame.frame)
             {
                 return Err(TranscriptCommitError::ConflictingAttempt);
             }
@@ -527,7 +706,7 @@ impl<'a> Commit<'a> {
             let intent = Intent {
                 attempt: Uuid::new_v4().to_string(),
                 owner: owner.to_owned(),
-                after: head(&cache),
+                after: head(cache),
                 source_was_absent: source.is_none(),
                 base_len: cache.byte_len,
                 frame_len: frame.frame.len() as u64,
@@ -535,12 +714,17 @@ impl<'a> Commit<'a> {
             };
             let descriptor =
                 serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
-            lease.pending = Some((
-                frame.frame.clone(),
-                payload_digest.ok_or(TranscriptCommitError::InvalidHistory)?,
-            ));
+            lease.pending = Some(RetainedFrame {
+                bytes: frame.frame.clone(),
+                payload: payload_digest.ok_or(TranscriptCommitError::InvalidHistory)?,
+                revision_id: metadata.event_id.clone(),
+                synced: false,
+            });
             self.publish(&intent_path, &descriptor)?;
+            #[cfg(test)]
+            kill_at(Cut::KillIntent);
         }
+        let first_create = source.is_none();
         let mut file = match source {
             Some(file) => file,
             None => {
@@ -553,15 +737,48 @@ impl<'a> Commit<'a> {
         self.guard
             .revalidate_recovery_source(self.path, &file)
             .map_err(TranscriptCommitError::Rejected)?;
-        let remaining = &frame.frame[suffix.len()..];
-        file.seek(SeekFrom::End(0))
+        file.seek(SeekFrom::Start(frame.base_byte_len))
             .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
-        write_frame(&mut file, remaining)?;
-        let namespace = self.sync_namespace()?;
+        write_frame(&mut file, &frame.frame)?;
+        let namespace = if first_create {
+            self.sync_namespace()?
+        } else {
+            match self.guard {
+                TranscriptGuard::Qualified(..) => CanonicalDurabilityBarrier::FileDataAndMetadata,
+                TranscriptGuard::Unqualified(_) => CanonicalDurabilityBarrier::SyncedUnqualified,
+            }
+        };
+        if let Some(retained) = &mut lease.pending {
+            retained.synced = true;
+        }
         // Readers fence an outstanding intent. Report success only once the
         // verified frame can also be observed by a fresh reader.
-        self.unlink(&intent_path)?;
+        self.finish_intent(&intent_path)?;
         lease.pending = None;
+        cache.byte_len = frame.base_byte_len + frame.frame.len() as u64;
+        cache.ends_with_newline = true;
+        cache.head = Some(CanonicalStreamHead {
+            sequence: frame.sequence,
+            event_id: frame.event_id.clone(),
+            record_hash: frame.record_hash.clone(),
+        });
+        cache.events.insert(
+            frame.event_id,
+            CachedEvent {
+                sequence: frame.sequence,
+                record_hash: frame.record_hash,
+                payload_hash: frame.payload_hash,
+                commitment_hash: frame.commitment_hash,
+            },
+        );
+        prefix
+            .revisions
+            .insert(event.span_id.clone(), event.revision_number);
+        // NTFS publishes its last-write timestamp when the writer handle closes.
+        drop(file);
+        prefix.stamp = File::open(self.path)
+            .ok()
+            .and_then(|file| SourceStamp::read(&file).ok());
         Ok(Some(TranscriptReceipt {
             sequence: frame.sequence,
             already_accepted: false,
@@ -579,11 +796,73 @@ impl<'a> Commit<'a> {
     }
 
     fn sync_namespace(&self) -> Result<CanonicalDurabilityBarrier, TranscriptCommitError> {
-        barrier(self.guard.sync_recovery_namespace_entry(
-            self.path,
-            Some(&self.qualification),
-            self.key,
-        ))
+        self.sync_entry(self.path)
+    }
+
+    fn sync_entry(&self, path: &Path) -> Result<CanonicalDurabilityBarrier, TranscriptCommitError> {
+        match &self.guard {
+            TranscriptGuard::Qualified(guard, qualification) => {
+                barrier(guard.sync_recovery_namespace_entry(path, Some(qualification), self.key))
+            }
+            TranscriptGuard::Unqualified(_) => {
+                let file = self
+                    .guard
+                    .open_recovery_source(path)
+                    .map_err(TranscriptCommitError::Rejected)?;
+                file.sync_all()
+                    .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))?;
+                self.weak_parent_barrier()?;
+                Ok(CanonicalDurabilityBarrier::SyncedUnqualified)
+            }
+        }
+    }
+
+    fn finish_intent(&self, path: &Path) -> Result<(), TranscriptCommitError> {
+        #[cfg(test)]
+        if CUT.get() == Some(Cut::RemovedWithoutBarrier) {
+            CUT.set(None);
+            fs::remove_file(path).unwrap();
+            return Err(io_failure(
+                CanonicalAppendPhase::RecoverySync,
+                io::ErrorKind::Other.into(),
+            ));
+        }
+        #[cfg(test)]
+        if CUT.get() == Some(Cut::Retire) {
+            CUT.set(None);
+            return Err(io_failure(
+                CanonicalAppendPhase::RecoverySync,
+                io::ErrorKind::Other.into(),
+            ));
+        }
+        if let Err(error) = self.unlink(path) {
+            if path
+                .try_exists()
+                .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
+            {
+                return Err(error);
+            }
+            // The removal occurred; an AlreadyAbsent retry obtains the same
+            // parent barrier. Keep the lease if that barrier still fails.
+            self.unlink(path)?;
+        }
+        #[cfg(test)]
+        kill_at(Cut::KillRetired);
+        Ok(())
+    }
+
+    fn abandon_attempt(
+        &self,
+        intent: &Intent,
+        suffix: &[u8],
+        source: &mut Option<File>,
+    ) -> Result<(), TranscriptCommitError> {
+        self.recover_gap(intent, suffix, source.as_ref())?;
+        if intent.source_was_absent {
+            drop(source.take());
+            self.unlink(self.path)?;
+        }
+        self.finish_intent(&self.path.with_added_extension("attempt"))
     }
 
     fn recover_gap(
@@ -602,12 +881,16 @@ impl<'a> Commit<'a> {
             checked_bytes(&evidence)?.is_some()
         } else {
             self.publish(&evidence, suffix)?;
+            #[cfg(test)]
+            kill_at(Cut::KillQuarantine);
             let file = file.ok_or(TranscriptCommitError::InvalidHistory)?;
             self.guard
                 .revalidate_recovery_source(self.path, file)
                 .map_err(TranscriptCommitError::Rejected)?;
             file.set_len(intent.base_len)
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryTruncate, e))?;
+            #[cfg(test)]
+            kill_at(Cut::KillTruncated);
             true
         };
         if let Some(file) = file {
@@ -622,7 +905,10 @@ impl<'a> Commit<'a> {
         self.publish(
             &gap,
             &serde_json::to_vec(&record).map_err(|_| TranscriptCommitError::InvalidHistory)?,
-        )
+        )?;
+        #[cfg(test)]
+        kill_at(Cut::KillGap);
+        Ok(())
     }
 }
 
@@ -649,6 +935,13 @@ enum Cut {
     RecoverySync,
     KillPartial,
     KillComplete,
+    KillIntent,
+    KillQuarantine,
+    KillTruncated,
+    KillGap,
+    KillRetired,
+    Retire,
+    RemovedWithoutBarrier,
 }
 #[cfg(test)]
 thread_local! { static CUT: std::cell::Cell<Option<Cut>> = const { std::cell::Cell::new(None) }; }
@@ -660,9 +953,26 @@ fn wait_for_kill() -> ! {
         std::thread::park();
     }
 }
+#[cfg(test)]
+fn kill_at(cut: Cut) {
+    if CUT.get() == Some(cut) {
+        wait_for_kill();
+    }
+}
 fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
     #[cfg(test)]
-    let cut = CUT.take();
+    let cut = match CUT.get() {
+        Some(
+            Cut::Full
+            | Cut::Short
+            | Cut::KillPartial
+            | Cut::KillComplete
+            | Cut::Flush
+            | Cut::Sync
+            | Cut::RecoverySync,
+        ) => CUT.take(),
+        _ => None,
+    };
     #[cfg(test)]
     match cut {
         Some(Cut::Full) => {
@@ -713,83 +1023,202 @@ fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitErro
             io::ErrorKind::Other.into(),
         ));
     }
+    #[cfg(test)]
+    if cut == Some(Cut::RecoverySync) {
+        return Err(io_failure(
+            CanonicalAppendPhase::RecoverySync,
+            io::ErrorKind::Other.into(),
+        ));
+    }
     file.sync_all()
         .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))
 }
 
-pub(crate) fn provision_directory(path: &Path) -> Result<(), TranscriptCommitError> {
-    let root = path.parent().ok_or(TranscriptCommitError::InvalidAddress)?;
-    fs::create_dir_all(root).map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
-    let (qualification, _) = CanonicalFilesystemQualification::for_existing_managed_root(root)
-        .map_err(TranscriptCommitError::Qualification)?;
-    let key = CanonicalRecoveryKey::from_opaque_bytes(*Uuid::new_v4().as_bytes());
-    barrier(qualification.provision_child_directory(path, key)).map(|_| ())
+type QualifiedStorage = (CanonicalFilesystemQualification, CanonicalDurability);
+
+fn qualify(path: &Path) -> Result<Option<QualifiedStorage>, TranscriptCommitError> {
+    use CanonicalFilesystemQualificationError as Refusal;
+    match CanonicalFilesystemQualification::for_existing_managed_root(path) {
+        Ok(pair) => Ok(Some(pair)),
+        Err(
+            reason @ (Refusal::ParentProvisioningRequired
+            | Refusal::ManagedRootNotDirectory
+            | Refusal::ReadOnlyFilesystem { .. }),
+        ) => Err(TranscriptCommitError::Qualification(reason)),
+        Err(_) => Ok(None),
+    }
 }
 
-/// Hold floor admission across source and recovery mutations. Lock order is
-/// the Session store first, then its transcript directory.
+fn provision_directory(path: &Path) -> Result<Option<QualifiedStorage>, TranscriptCommitError> {
+    let root = path.parent().ok_or(TranscriptCommitError::InvalidAddress)?;
+    if let Some((parent, _)) = qualify(root)? {
+        let key = CanonicalRecoveryKey::from_opaque_bytes(*Uuid::new_v4().as_bytes());
+        match barrier(parent.provision_child_directory(path, key)) {
+            Ok(_) => return qualify(path),
+            Err(TranscriptCommitError::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported { .. },
+            )) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io_failure(CanonicalAppendPhase::Write, e)),
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+    if !metadata.is_dir() || crate::sessions::is_reparse_point(&metadata) {
+        return Err(TranscriptCommitError::InvalidAddress);
+    }
+    super::super::canonical_durability::sync_unqualified_transcript_parent(root)
+        .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))?;
+    Ok(None)
+}
+
+use super::super::session_artifact_manifest::{ManifestLoadOutcome, SessionArtifactManifestStore};
+
+/// Global shared floor admission precedes the per-session transcript lock.
+/// Its writer peer is the unchanged, qualified manifest CAS.
 fn with_writable_v1<T>(
-    path: &Path,
-    session: &str,
+    root: &Path,
+    store: &SessionArtifactManifestStore,
     operation: impl FnOnce() -> Result<T, TranscriptCommitError>,
 ) -> Result<T, TranscriptCommitError> {
-    use crate::persistence::session_artifact_manifest::SessionArtifactManifestStore;
-    use crate::persistence::session_semantics::{
-        GuardedSessionOpenError, SessionSemanticsVersion, guarded_session_open,
-    };
-    let root = path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or(TranscriptCommitError::InvalidAddress)?;
-    let store = SessionArtifactManifestStore::qualified_existing_session(root, session)
-        .map_err(|_| TranscriptCommitError::SessionFloorUnavailable)?;
-    guarded_session_open(&store, SessionSemanticsVersion::V1, |_| operation()).map_err(|error| {
-        match error {
-            GuardedSessionOpenError::ContentReader(error) => error,
-            _ => TranscriptCommitError::SessionFloorUnavailable,
+    use super::super::canonical_durability::transcript_floor_lock;
+    use super::super::session_semantics::{SessionSemanticsVersion, checked_session_open};
+    let _floor = match transcript_floor_lock(root, false) {
+        Err(CanonicalCoordinationError::Missing) => {
+            let ids = store.control_identities();
+            for id in [&ids.manifest, &ids.temporary, &ids.provenance] {
+                match fs::symlink_metadata(root.join(id.as_str())) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    _ => return Err(TranscriptCommitError::SessionFloorUnavailable),
+                }
+            }
+            transcript_floor_lock(root, true)
         }
-    })
+        result => result,
+    }
+    .map_err(TranscriptCommitError::Coordination)?;
+    match store
+        .load_selected_manifest()
+        .map_err(|_| TranscriptCommitError::SessionFloorUnavailable)?
+    {
+        ManifestLoadOutcome::Absent => operation(),
+        ManifestLoadOutcome::Present(manifest) => {
+            checked_session_open(&manifest, SessionSemanticsVersion::V1, || Ok::<_, ()>(()))
+                .map_err(|_| TranscriptCommitError::SessionFloorUnavailable)?;
+            operation()
+        }
+    }
+}
+
+pub(crate) struct PreparedTranscriptStorage {
+    path: PathBuf,
+    root: PathBuf,
+    session: String,
+    store: SessionArtifactManifestStore,
+    tier: Option<QualifiedStorage>,
+    cache: std::cell::RefCell<Option<VerifiedPrefix>>,
+}
+
+impl PreparedTranscriptStorage {
+    pub(crate) fn open(path: &Path, session: &str) -> Result<Self, TranscriptCommitError> {
+        let dir = path.parent().ok_or(TranscriptCommitError::InvalidAddress)?;
+        let root = dir.parent().ok_or(TranscriptCommitError::InvalidAddress)?;
+        crate::sessions::validate_session_id(session)
+            .map_err(|_| TranscriptCommitError::InvalidAddress)?;
+        let filename = format!("{session}.events.jsonl");
+        if path.file_name() != Some(std::ffi::OsStr::new(&filename))
+            || dir.file_name() != Some(std::ffi::OsStr::new("transcripts"))
+        {
+            return Err(TranscriptCommitError::InvalidAddress);
+        }
+        fs::create_dir_all(root).map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+        // Preserve the configured spelling for qualification (including SUBST)
+        // and bind all later floor/stream operations to the resolved directory.
+        let root = fs::canonicalize(root)
+            .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
+        let store = SessionArtifactManifestStore::for_session(&root, session)
+            .map_err(|_| TranscriptCommitError::InvalidAddress)?;
+        let tier = with_writable_v1(&root, &store, || provision_directory(dir))?;
+        let directory =
+            fs::canonicalize(dir).map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
+        if directory.parent() != Some(root.as_path()) {
+            return Err(TranscriptCommitError::InvalidAddress);
+        }
+        Ok(Self {
+            path: directory.join(filename),
+            root,
+            session: session.into(),
+            store,
+            tier,
+            cache: Default::default(),
+        })
+    }
+    pub(crate) fn is_unqualified(&self) -> bool {
+        self.tier.is_none()
+    }
+    pub(crate) fn ready(&self) -> Result<(), TranscriptCommitError> {
+        with_writable_v1(&self.root, &self.store, || {
+            let commit = Commit::open(self)?;
+            let exists = |path: &Path| {
+                path.try_exists()
+                    .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))
+            };
+            if exists(&self.path)? || exists(&self.path.with_added_extension("attempt"))? {
+                commit.run(None, None, process_owner(), &self.cache)?;
+            }
+            // Exercise this directory's create, sync, and unlink permissions
+            // without materializing an empty canonical event log over legacy rows.
+            let stage = self.path.with_added_extension("attempt-stage");
+            if stage
+                .try_exists()
+                .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?
+            {
+                commit.unlink(&stage)?;
+            }
+            let file =
+                super::super::canonical_durability::open_unqualified_transcript_file(&stage, true)
+                    .map_err(TranscriptCommitError::Rejected)?;
+            file.sync_all()
+                .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))?;
+            drop(file);
+            commit.unlink(&stage)
+        })
+    }
+    pub(crate) fn commit_after(
+        &self,
+        event: &TranscriptEvent,
+        expected_head: Option<u64>,
+    ) -> Result<TranscriptReceipt, TranscriptCommitError> {
+        with_writable_v1(&self.root, &self.store, || {
+            Commit::open(self)?
+                .run(Some(event), expected_head, process_owner(), &self.cache)?
+                .ok_or(TranscriptCommitError::InvalidHistory)
+        })
+    }
 }
 
 pub(crate) fn ready(path: &Path, session: &str) -> Result<(), TranscriptCommitError> {
-    if !path
-        .with_added_extension("attempt")
-        .try_exists()
-        .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
-    {
-        // A missing event log means a legacy segment log can still be authoritative.
-        // Preparing the writer must preserve that distinction.
-        CanonicalFilesystemQualification::for_existing_managed_root(
-            path.parent().ok_or(TranscriptCommitError::InvalidAddress)?,
-        )
-        .map_err(TranscriptCommitError::Qualification)?;
-        return Ok(());
-    }
-    with_writable_v1(path, session, || {
-        Commit::open(path, session)?
-            .run(None, None, process_owner())
-            .map(|_| ())
-    })
+    PreparedTranscriptStorage::open(path, session)?.ready()
+}
+#[cfg(test)]
+fn commit_after(
+    path: &Path,
+    session: &str,
+    event: &TranscriptEvent,
+    expected_head: Option<u64>,
+) -> Result<TranscriptReceipt, TranscriptCommitError> {
+    PreparedTranscriptStorage::open(path, session)?.commit_after(event, expected_head)
 }
 pub(crate) fn commit_transcript(
     path: &Path,
     session: &str,
     event: &TranscriptEvent,
 ) -> Result<TranscriptReceipt, TranscriptCommitError> {
-    commit_after(path, session, event, None)
-}
-
-pub(crate) fn commit_after(
-    path: &Path,
-    session: &str,
-    event: &TranscriptEvent,
-    expected_head: Option<u64>,
-) -> Result<TranscriptReceipt, TranscriptCommitError> {
-    with_writable_v1(path, session, || {
-        Commit::open(path, session)?
-            .run(Some(event), expected_head, process_owner())?
-            .ok_or(TranscriptCommitError::InvalidHistory)
-    })
+    PreparedTranscriptStorage::open(path, session)?.commit_after(event, None)
 }
 
 /// Capture starts a fresh session on restart. Reconcile outstanding attempts for
@@ -844,20 +1273,18 @@ pub(in crate::persistence) fn read_committed<T: DeserializeOwned>(
     };
     validate_stream_context(session, STREAM, 1)?;
     let before = pending()?;
-    let directory = path
-        .parent()
-        .ok_or(CanonicalReaderError::TranscriptAttemptUnreadable)?;
-    let acquire =
-        || super::super::canonical_durability::CanonicalSharedGuard::open_existing(directory);
+    use super::super::canonical_durability::{
+        transcript_coordination_path, wait_for_transcript_lock,
+    };
+    let lock_path = transcript_coordination_path(path);
+    let acquire = || wait_for_transcript_lock(&lock_path, true, false);
     // The first attempt can create a source and later restore absence. A
     // before/after check of the intent alone cannot distinguish that ABA.
     // Hold the existing namespace lock for an ordinary published snapshot.
     let guard = if before.is_none() {
         match acquire() {
             Ok(guard) => Some(guard),
-            Err(CanonicalCoordinationError::Missing | CanonicalCoordinationError::Contended) => {
-                None
-            }
+            Err(CanonicalCoordinationError::Missing) => None,
             Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
         }
     } else {
@@ -962,6 +1389,15 @@ pub(super) fn decode_gap(bytes: &[u8]) -> Result<TranscriptGap, TranscriptCommit
 
 /// Closed, content-free gaps ordered by their preceding canonical sequence.
 pub fn transcript_gaps(path: &Path) -> Result<Vec<TranscriptGap>, TranscriptCommitError> {
+    use super::super::canonical_durability::{
+        transcript_coordination_path, wait_for_transcript_lock,
+    };
+    let lock = transcript_coordination_path(path);
+    let guard = match wait_for_transcript_lock(&lock, true, false) {
+        Ok(file) => Some(file),
+        Err(CanonicalCoordinationError::Missing) => None,
+        Err(error) => return Err(TranscriptCommitError::Coordination(error)),
+    };
     let mut gaps: Vec<TranscriptGap> = Vec::new();
     for file in transcript_recovery_artifacts(path)
         .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
@@ -974,6 +1410,14 @@ pub fn transcript_gaps(path: &Path) -> Result<Vec<TranscriptGap>, TranscriptComm
         }
     }
     gaps.sort_by_key(|gap| gap.after.as_ref().map(|h| h.sequence));
+    if guard.is_none()
+        && !matches!(
+            wait_for_transcript_lock(&lock, true, false),
+            Err(CanonicalCoordinationError::Missing)
+        )
+    {
+        return Err(TranscriptCommitError::ConflictingAttempt);
+    }
     Ok(gaps)
 }
 

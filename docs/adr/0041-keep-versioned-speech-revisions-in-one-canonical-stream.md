@@ -337,3 +337,14 @@ cheapest vertical probes are in
 `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-48de-report.md`.
 This accepted record does not authorize code, Seed, provider, or workflow
 changes; those effects require separately authorized work.
+
+### V1 transcript recording on unqualified filesystems
+
+A writable session can record framed v1 revisions with the named
+`SyncedUnqualified` receipt. The backend flushes and synchronizes the event
+file before acknowledging it, and attempts parent-directory synchronization
+where the filesystem supports it. The UI keeps the crash-safety warning
+visible for this tier. Qualified local filesystems retain their existing
+first-create namespace barriers. Recording still requires a writable source,
+a usable lock, successful synchronization and admission at the v1 floor.
+A v2 floor continues to require the qualified transition protocol.

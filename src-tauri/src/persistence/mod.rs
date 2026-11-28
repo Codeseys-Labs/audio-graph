@@ -550,11 +550,9 @@ pub(crate) fn lock_transcript_for_removal(path: &Path) -> Result<[Option<fs::Fil
             }
         }
     }
-    canonical_durability::lock_transcript_removal(
-        parent,
-        &path.with_added_extension("attempt-lock"),
-        || canonical_log::transcript_recovery_artifacts(path).map(|paths| !paths.is_empty()),
-    )
+    canonical_durability::lock_transcript_removal(path, || {
+        canonical_log::transcript_recovery_artifacts(path).map(|paths| !paths.is_empty())
+    })
     .map_err(|error| format!("Transcript cleanup unavailable: {error:?}"))
 }
 
@@ -1495,10 +1493,6 @@ impl LocalMemoryRepository for FileMemoryRepository {
         let path = self
             .resolve_transcript_events_path(session_id)
             .map_err(|_| canonical_log::TranscriptCommitError::InvalidAddress)?;
-        canonical_log::provision_directory(
-            path.parent()
-                .ok_or(canonical_log::TranscriptCommitError::InvalidAddress)?,
-        )?;
         Ok(path)
     }
     fn append_transcript_event(
@@ -1910,6 +1904,11 @@ pub enum TranscriptWriteMsg {
 // through every send and match site for negligible benefit.
 #[allow(clippy::large_enum_variant)]
 pub enum TranscriptEventWriteMsg {
+    Live(
+        TranscriptEvent,
+        Arc<Mutex<TranscriptLedger>>,
+        mpsc::Sender<LiveTranscriptResult>,
+    ),
     /// Append a framed revision and return its durability receipt.
     Append(
         TranscriptEvent,
@@ -2320,8 +2319,131 @@ impl TranscriptWriter {
     }
 }
 
+type LiveTranscriptResult =
+    Result<(bool, canonical_log::TranscriptReceipt), canonical_log::TranscriptCommitError>;
+
+#[derive(Clone)]
+pub(crate) struct TranscriptCommitClient {
+    tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
+    dropped_event_count: Arc<AtomicU64>,
+    queue_full_active: Arc<AtomicBool>,
+}
+
+impl TranscriptCommitClient {
+    pub(crate) fn append_live(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+    ) -> LiveTranscriptResult {
+        self.request(|reply| TranscriptEventWriteMsg::Live(event.clone(), ledger, reply))
+    }
+
+    fn request<T>(
+        &self,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<T, canonical_log::TranscriptCommitError> {
+        self.request_with_timeout(std::time::Duration::from_secs(5), message)
+    }
+
+    fn request_with_timeout<T>(
+        &self,
+        timeout: std::time::Duration,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<T, canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        let (reply, ack) = mpsc::channel();
+        match self.tx.try_send(message(reply)) {
+            Ok(()) => {
+                note_event_writer_enqueue_success(
+                    "transcript_event",
+                    EVENT_WRITER_QUEUE_CAPACITY,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                ack.recv_timeout(timeout).map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => Error::AckTimeout,
+                    mpsc::RecvTimeoutError::Disconnected => Error::ReplyLost,
+                })?
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                note_event_writer_queue_full(
+                    "transcript_event",
+                    EVENT_WRITER_QUEUE_CAPACITY,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                Err(Error::QueueFull)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(Error::WriterAbsent),
+        }
+    }
+}
+
+// The worker owns commit ordering, including publication after a caller timed out.
+// Never hold a live-state guard across the filesystem transaction.
+fn commit_to_live_ledger(
+    index: &mut crate::projections::TranscriptLiveIndex,
+    storage: &canonical_log::PreparedTranscriptStorage,
+    path: &Path,
+    session: &str,
+    event: TranscriptEvent,
+    live: &Mutex<TranscriptLedger>,
+) -> LiveTranscriptResult {
+    use canonical_log::TranscriptCommitError as Error;
+    let before = {
+        let ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.session_id != session {
+            return Err(Error::LiveHeadChanged);
+        }
+        ledger.accepted_event_count
+    };
+    let receipt = match storage.commit_after(&event, Some(before)) {
+        Err(Error::LiveHeadChanged) => {
+            // An earlier frame can already be visible after an uncertain
+            // descriptor retirement. Reconcile from the verified published log.
+            let snapshot = canonical_log::read_committed::<TranscriptEvent>(path, session)
+                .map_err(|_| Error::InvalidHistory)?;
+            let recovered =
+                TranscriptLedger::replay(session, snapshot.records.into_iter().map(|r| r.payload))
+                    .map_err(|_| Error::InvalidHistory)?;
+            let count = recovered.accepted_event_count;
+            if count <= before {
+                return Err(Error::LiveHeadChanged);
+            }
+            {
+                let mut ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+                if ledger.session_id != session || ledger.accepted_event_count != before {
+                    return Err(Error::LiveHeadChanged);
+                }
+                *ledger = recovered;
+            }
+            storage.commit_after(&event, Some(count))?
+        }
+        other => other?,
+    };
+    let mut ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+    if ledger.session_id != session {
+        return Err(Error::LiveHeadChanged);
+    }
+    if receipt.sequence <= ledger.accepted_event_count && receipt.already_accepted {
+        return Ok((false, receipt));
+    }
+    if ledger.accepted_event_count.checked_add(1) != Some(receipt.sequence) {
+        return Err(Error::LiveHeadChanged);
+    }
+    index
+        .apply(&mut ledger, event)
+        .map_err(|_| Error::InvalidRevision)?;
+    Ok((true, receipt))
+}
+
 /// Handle to the immutable transcript event-log writer thread.
 pub struct TranscriptEventWriter {
+    unqualified: bool,
     tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown_requested: Arc<AtomicBool>,
@@ -2346,6 +2468,7 @@ impl TranscriptEventWriter {
         .expect("pre-fill transcript event queue");
         std::mem::forget(rx);
         Self {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -2367,21 +2490,33 @@ impl TranscriptEventWriter {
         if let Err(error) = canonical_log::recover_previous_sessions(path.parent()?, &session_id) {
             log::warn!("transcript recovery scan unavailable: {error:?}");
         }
-        canonical_log::transcript_ready(&path, &session_id).ok()?;
+        let storage = canonical_log::PreparedTranscriptStorage::open(&path, &session_id).ok()?;
+        storage.ready().ok()?;
+        let unqualified = storage.is_unqualified();
         let (tx, rx) = mpsc::sync_channel(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let flag = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
             .name("transcript-commit".into())
             .spawn(move || {
+                let mut live_index = crate::projections::TranscriptLiveIndex::default();
                 loop {
                     match rx.recv_timeout(POLL_INTERVAL) {
                         Ok(TranscriptEventWriteMsg::Append(event, expected_head, reply)) => {
-                            let result = canonical_log::commit_after(
+                            let result = storage.commit_after(&event, expected_head);
+                            if result.as_ref().is_err_and(|e| e.is_storage_full()) {
+                                io::notify_transcript_storage_full(app_handle());
+                            }
+                            let _ = reply.send(result);
+                        }
+                        Ok(TranscriptEventWriteMsg::Live(event, ledger, reply)) => {
+                            let result = commit_to_live_ledger(
+                                &mut live_index,
+                                &storage,
                                 &path,
                                 &session_id,
-                                &event,
-                                expected_head,
+                                event,
+                                &ledger,
                             );
                             if result.as_ref().is_err_and(|e| e.is_storage_full()) {
                                 io::notify_transcript_storage_full(app_handle());
@@ -2399,6 +2534,7 @@ impl TranscriptEventWriter {
             })
             .ok()?;
         Some(Self {
+            unqualified,
             tx,
             handle: Some(handle),
             shutdown_requested,
@@ -2415,39 +2551,27 @@ impl TranscriptEventWriter {
         self.append_after(event, None)
     }
 
+    pub(crate) fn client(&self) -> TranscriptCommitClient {
+        TranscriptCommitClient {
+            tx: self.tx.clone(),
+            dropped_event_count: self.dropped_event_count.clone(),
+            queue_full_active: self.queue_full_active.clone(),
+        }
+    }
+
+    pub(crate) fn is_unqualified(&self) -> bool {
+        self.unqualified
+    }
+
     pub(crate) fn append_after(
         &self,
         event: &TranscriptEvent,
         expected_head: Option<u64>,
     ) -> Result<canonical_log::TranscriptReceipt, canonical_log::TranscriptCommitError> {
-        use canonical_log::TranscriptCommitError as Error;
-        let (reply, ack) = mpsc::channel();
-        match self.tx.try_send(TranscriptEventWriteMsg::Append(
-            event.clone(),
-            expected_head,
-            reply,
-        )) {
-            Ok(()) => {
-                note_event_writer_enqueue_success(
-                    "transcript_event",
-                    EVENT_WRITER_QUEUE_CAPACITY,
-                    &self.dropped_event_count,
-                    &self.queue_full_active,
-                );
-                ack.recv().map_err(|_| Error::ReplyLost)?
-            }
-            Err(mpsc::TrySendError::Full(_)) => {
-                note_event_writer_queue_full(
-                    "transcript_event",
-                    EVENT_WRITER_QUEUE_CAPACITY,
-                    &self.dropped_event_count,
-                    &self.queue_full_active,
-                );
-                Err(Error::QueueFull)
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(Error::WriterAbsent),
-        }
+        self.client()
+            .request(|reply| TranscriptEventWriteMsg::Append(event.clone(), expected_head, reply))
     }
+
     pub fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         let _ = self.tx.try_send(TranscriptEventWriteMsg::Shutdown);
@@ -3397,6 +3521,7 @@ mod shutdown_tests {
     fn lost_transcript_reply_is_uncertain() {
         let (tx, rx) = mpsc::sync_channel(1);
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: Arc::default(),
@@ -3516,6 +3641,7 @@ mod shutdown_tests {
         let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
         let flag = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: flag.clone(),
@@ -3556,6 +3682,7 @@ mod shutdown_tests {
         let dropped_event_count = Arc::new(AtomicU64::new(0));
         let queue_full_active = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -3610,6 +3737,7 @@ mod shutdown_tests {
         .expect("pre-fill bounded queue");
         let flag = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: flag.clone(),

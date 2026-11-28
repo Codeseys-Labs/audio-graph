@@ -18377,6 +18377,58 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn writable_subst_storage_admits_capture_with_unverified_crash_safety() {
+        use std::process::Command;
+        struct Mapping(String);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                let _ = Command::new("subst.exe").args([&self.0, "/D"]).output();
+            }
+        }
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let real = unique_tempdir("capture-subst");
+        let mapping = (b'D'..=b'Z')
+            .rev()
+            .find_map(|letter| {
+                let drive = format!("{}:", char::from(letter));
+                if std::path::Path::new(&format!("{drive}\\")).exists() {
+                    return None;
+                }
+                Command::new("subst.exe")
+                    .arg(&drive)
+                    .arg(&real)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+                    .then(|| Mapping(drive))
+            })
+            .expect("available drive for SUBST capture fixture");
+        let root = std::path::PathBuf::from(format!("{}\\", mapping.0));
+        let home = HomeGuard::set(&root);
+        let state = AppState::new();
+        assert!(
+            state
+                .transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_unqualified()
+        );
+        ensure_session_writers_ready(&state).expect("synced unqualified writer admits capture");
+        assert!(!*state.is_capturing.read().unwrap());
+        drain_test_writers(&state);
+        drop(state);
+        drop(home);
+        drop(mapping);
+        std::fs::remove_dir_all(real).unwrap();
+    }
+
     #[test]
     fn missing_canonical_writer_blocks_capture_preflight() {
         let state = AppState::new();

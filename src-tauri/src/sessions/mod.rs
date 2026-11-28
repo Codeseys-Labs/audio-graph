@@ -2115,7 +2115,8 @@ mod tests {
             save_index(&[metadata]).unwrap();
 
             let source = crate::user_data::transcript_events_path(session).unwrap();
-            let directory_lock = source.parent().unwrap().join(".audio-graph-canonical.lock");
+            let directory_lock =
+                crate::persistence::canonical_durability::transcript_coordination_path(&source);
             let lease = source.with_added_extension("attempt-lock");
             let evidence =
                 source.with_added_extension(format!("{}.quarantine", uuid::Uuid::new_v4()));

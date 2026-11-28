@@ -437,6 +437,8 @@ pub enum CanonicalMutation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityBarrier {
+    /// A v1 transcript file crossed sync_all on a filesystem without a qualified namespace guarantee.
+    SyncedUnqualified,
     FileDataAndMetadata,
     FileAndParentNamespace,
     /// Only the qualified parent-directory namespace barrier was crossed. A
@@ -653,7 +655,7 @@ enum ObjectIdentity {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct FilesystemIdentity {
+pub(super) struct FilesystemIdentity {
     volume: Option<VolumeIdentity>,
     object: Option<ObjectIdentity>,
 }
@@ -1097,7 +1099,35 @@ impl CanonicalDurability {
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         let file = open_writer_coordination(&lock_path)?;
         let file = try_lock_exclusive(file)?;
-        Ok(CanonicalExclusiveGuard {
+        Ok(self.guard_for_namespace(namespace, file))
+    }
+
+    /// A transcript owns its own cooperative lock. The writer already qualified
+    /// its directory at startup; verify the bound directory identity on reuse.
+    pub(super) fn transcript_guard(
+        &self,
+        qualification: &CanonicalFilesystemQualification,
+        lock: File,
+    ) -> Result<CanonicalExclusiveGuard, CanonicalDurabilityRejection> {
+        let binding = self
+            .production_binding
+            .as_ref()
+            .ok_or(CanonicalDurabilityRejection::QualificationBindingMismatch)?;
+        if qualification.token != Some(binding.token)
+            || qualification.namespace != binding.namespace
+        {
+            return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
+        }
+        binding.namespace.validate_current()?;
+        Ok(self.guard_for_namespace(binding.namespace.clone(), lock))
+    }
+
+    fn guard_for_namespace(
+        &self,
+        namespace: ManagedNamespace,
+        file: File,
+    ) -> CanonicalExclusiveGuard {
+        CanonicalExclusiveGuard {
             namespace,
             qualification_token: self
                 .production_binding
@@ -1119,7 +1149,7 @@ impl CanonicalDurability {
             injected_rename_fault: self.injected_rename_fault.clone(),
             #[cfg(test)]
             algorithm_test: self.algorithm_test.clone(),
-        })
+        }
     }
 
     #[cfg(all(test, windows))]
@@ -3413,54 +3443,200 @@ fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationEr
     }
 }
 
-/// Hold cooperative ownership during cleanup without minting a mutation receipt.
-/// A restored protocol session can have evidence but no directory lock. Recreate
-/// that lock before deletion when the filesystem could admit a new writer.
-pub(super) fn lock_transcript_removal(
+/// The unqualified v1 tier still attempts a directory flush when supported.
+pub(super) fn sync_unqualified_transcript_parent(path: &Path) -> io::Result<()> {
+    fn unsupported(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+        ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50)))
+    }
+    #[cfg(windows)]
+    let opened = windows_ntfs::open_directory_for_flush(path);
+    #[cfg(not(windows))]
+    let opened = File::open(path);
+    let directory = match opened {
+        Ok(file) => file,
+        Err(error) if unsupported(&error) || error.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match directory.sync_all() {
+        Err(error) if unsupported(&error) => Ok(()),
+        result => result,
+    }
+}
+
+pub(super) fn open_unqualified_transcript_file(
+    path: &Path,
+    create: bool,
+) -> Result<File, CanonicalDurabilityRejection> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    if create {
+        configure_owner_only_creation(&mut options);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let file = open_plain_existing(path, &mut options)
+        .map_err(|e| durability_io(CanonicalDurabilityStage::OpenExisting, &e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| durability_io(CanonicalDurabilityStage::InspectEntry, &e))?;
+    if !metadata.is_file() || crate::sessions::is_reparse_point(&metadata) {
+        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+    }
+    Ok(file)
+}
+
+pub(super) fn validate_unqualified_transcript_file(
+    path: &Path,
+    file: &File,
+) -> Result<(), CanonicalDurabilityRejection> {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|e| durability_io(CanonicalDurabilityStage::InspectEntry, &e))?;
+    if !named.is_file() || crate::sessions::is_reparse_point(&named) {
+        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+    }
+    let observed = file
+        .metadata()
+        .and_then(|metadata| handle_identity(file, &metadata));
+    match observed.and_then(|a| path_identity(path, &named).map(|b| a == b)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(CanonicalDurabilityRejection::IdentityChanged),
+        Err(error)
+            if error.kind() == io::ErrorKind::Unsupported
+                || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50))) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(durability_io(
+            CanonicalDurabilityStage::InspectEntry,
+            &error,
+        )),
+    }
+}
+
+/// The name stays stable across deletion. Removing a lock while another
+/// process waits on its open handle would split ownership across two inodes.
+pub(crate) fn transcript_coordination_path(source: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let name = source
+        .file_name()
+        .unwrap_or_default()
+        .as_encoded_bytes()
+        .to_ascii_lowercase();
+    source.with_file_name(format!(
+        ".audio-graph-transcript-{:x}.lock",
+        Sha256::digest(name)
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_WAITER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn observe_next_transcript_lock_wait(sender: std::sync::mpsc::Sender<()>) {
+    TRANSCRIPT_WAITER.replace(Some(sender));
+}
+
+pub(super) fn wait_for_transcript_lock(
+    path: &Path,
+    shared: bool,
+    create: bool,
+) -> Result<File, CanonicalCoordinationError> {
+    open_transcript_lock(path, shared, create, true)
+}
+
+fn open_transcript_lock(
+    path: &Path,
+    shared: bool,
+    create: bool,
+    wait: bool,
+) -> Result<File, CanonicalCoordinationError> {
+    let file = if create {
+        open_writer_coordination(path)?
+    } else {
+        ensure_regular_lock_entry(path)?;
+        open_plain_existing(path, OpenOptions::new().read(true))
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?
+    };
+    // Bound a stuck peer while allowing ordinary readers and writers to finish.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let result = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if wait && std::time::Instant::now() < deadline => {
+                #[cfg(test)]
+                if let Some(sender) = TRANSCRIPT_WAITER.take() {
+                    let _ = sender.send(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(TryLockError::WouldBlock) => return Err(CanonicalCoordinationError::Contended),
+            Err(TryLockError::Error(error)) => {
+                return Err(coordination_io(CanonicalCoordinationStage::Lock, &error));
+            }
+        }
+    }
+}
+
+pub(super) fn transcript_floor_lock(
     root: &Path,
-    lease_path: &Path,
+    allow_create: bool,
+) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+    let path = root.join(COORDINATION_FILE_NAME);
+    match wait_for_transcript_lock(&path, true, false) {
+        Err(CanonicalCoordinationError::Missing) if allow_create => {
+            wait_for_transcript_lock(&path, true, true)
+        }
+        other => other,
+    }
+    .map(|file| CanonicalSharedGuard { _lock_file: file })
+}
+
+pub(super) fn lock_transcript_removal(
+    source: &Path,
     has_recovery_artifacts: impl Fn() -> io::Result<bool>,
 ) -> Result<[Option<File>; 2], CanonicalCoordinationError> {
-    fn lock_existing(path: &Path) -> Result<Option<File>, CanonicalCoordinationError> {
-        match ensure_regular_lock_entry(path) {
-            Ok(()) => {
-                let file = open_plain_existing(path, OpenOptions::new().read(true))
-                    .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
-                try_lock_exclusive(file).map(Some)
-            }
-            Err(CanonicalCoordinationError::Missing) => Ok(None),
-            Err(error) => Err(error),
+    let lock_path = transcript_coordination_path(source);
+    let session = match open_transcript_lock(&lock_path, false, true, false) {
+        Ok(file) => Some(file),
+        Err(CanonicalCoordinationError::Io {
+            kind: io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem,
+            ..
+        }) if !has_recovery_artifacts()
+            .map_err(|e| coordination_io(CanonicalCoordinationStage::InspectLock, &e))? =>
+        {
+            None
         }
-    }
-    let lock_path = root.join(COORDINATION_FILE_NAME);
-    let mut directory = lock_existing(&lock_path)?;
-    if directory.is_none() {
-        use CanonicalFilesystemQualificationError as Refusal;
-        let permanently_unqualified = matches!(
-            CanonicalFilesystemQualification::for_existing_managed_root(root),
-            Err(Refusal::NamespaceDurabilityUnsupported { .. }
-                | Refusal::FilesystemUnsupported { .. }
-                | Refusal::ReadOnlyFilesystem { .. }
-                | Refusal::RemovableFilesystem { .. })
-        );
-        if !permanently_unqualified {
-            // Serialize even the first writer on a writable volume. An older
-            // ACL may allow deletion but deny adding a lock; this is safe for
-            // legacy-only contents because the writer also cannot create one.
-            match open_writer_coordination(&lock_path) {
-                Ok(file) => directory = Some(try_lock_exclusive(file)?),
-                Err(CanonicalCoordinationError::Io {
-                    kind: io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem,
-                    ..
-                }) if !has_recovery_artifacts().map_err(|error| {
-                    coordination_io(CanonicalCoordinationStage::InspectLock, &error)
-                })? => {}
-                Err(error) => return Err(error),
-            }
+        Err(error) => return Err(error),
+    };
+    // A live, uncertain attempt retains this second lock even between commits.
+    let lease_path = source.with_added_extension("attempt-lock");
+    let lease = match ensure_regular_lock_entry(&lease_path) {
+        Ok(()) => {
+            let file = open_plain_existing(&lease_path, OpenOptions::new().read(true))
+                .map_err(|e| coordination_io(CanonicalCoordinationStage::Open, &e))?;
+            Some(try_lock_exclusive(file)?)
         }
-    }
-    let lease = lock_existing(lease_path)?;
-    Ok([directory, lease])
+        Err(CanonicalCoordinationError::Missing) => None,
+        Err(error) => return Err(error),
+    };
+    Ok([lease, session])
 }
 
 impl CanonicalSharedGuard {
@@ -4398,7 +4574,10 @@ fn path_identity(_path: &Path, _metadata: &Metadata) -> io::Result<FilesystemIde
     }
 }
 
-fn handle_identity(_file: &File, _metadata: &Metadata) -> io::Result<FilesystemIdentity> {
+pub(super) fn handle_identity(
+    _file: &File,
+    _metadata: &Metadata,
+) -> io::Result<FilesystemIdentity> {
     #[cfg(windows)]
     {
         windows_ntfs::identity(_file)

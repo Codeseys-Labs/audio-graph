@@ -760,10 +760,9 @@ impl SessionArtifactManifestStore {
         let read_only = matches!(
             refusal,
             Error::NamespaceDurabilityUnsupported { .. }
-                | Error::FilesystemUnsupported {
-                    platform: super::canonical_durability::CanonicalPlatform::Windows,
-                    ..
-                }
+                | Error::FilesystemUnsupported { .. }
+                | Error::ReadOnlyFilesystem { .. }
+                | Error::RemovableFilesystem { .. }
         ) || (cfg!(windows)
             && !matches!(
                 refusal,
@@ -950,7 +949,7 @@ impl SessionArtifactManifestStore {
         self.checked_read_inner(reader, after_establishment)
     }
 
-    fn load_selected_manifest(&self) -> Result<ManifestLoadOutcome, ManifestLoadError> {
+    pub(super) fn load_selected_manifest(&self) -> Result<ManifestLoadOutcome, ManifestLoadError> {
         let manifest_path = self.manifest_path();
         if !entry_exists(&manifest_path)? {
             return Ok(ManifestLoadOutcome::Absent);

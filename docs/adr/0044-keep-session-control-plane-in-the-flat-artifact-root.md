@@ -385,3 +385,23 @@ per-Session locks or directory capsules with new durability evidence.
   `src-tauri/src/persistence/session_artifact_manifest.rs`,
   `src-tauri/src/persistence/session_semantics.rs`, and
   `src-tauri/src/persistence/canonical_durability.rs`.
+
+### Coordination for v1 transcript recording
+
+A v1 transcript writer holds the shared store lock while checking the
+session manifest and committing the revision. Floor advancement takes the
+exclusive store lock. The transcript writer can establish a missing store
+lock for a session with no control-plane residue. An unqualified filesystem
+may support these ordinary file locks and file synchronization even when
+its namespace durability is unverified. The resulting v1 receipt is
+`SyncedUnqualified`. A missing lock alongside control-plane residue,
+a malformed manifest, or a v2 floor refuses v1 recording.
+
+Writers and deletion take an exclusive session-specific transcript lock.
+Readers and portable export share that lock. Ordinary lock contention waits
+for a bounded interval. The store retains the content-free lock named
+`.audio-graph-transcript-<digest>.lock` across deletion so waiters on the old
+file and new openers always address the same lock. The digest covers the
+case-folded transcript filename. The separate attempt lease is session-owned
+and holds off a second live writer while an uncertain frame awaits exact
+retry. Readers can still observe the verified prefix of that attempt.

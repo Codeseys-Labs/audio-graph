@@ -8,7 +8,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 
 use super::transcript_commit::{TranscriptGap, decode_gap, transcript_recovery_artifacts};
-use crate::persistence::canonical_durability::{CanonicalCoordinationError, CanonicalSharedGuard};
+use crate::persistence::canonical_durability::{
+    CanonicalCoordinationError, transcript_coordination_path, wait_for_transcript_lock,
+};
 
 #[derive(Serialize)]
 pub(crate) struct TranscriptRecoveryExport {
@@ -114,24 +116,24 @@ pub(crate) fn read_for_export<T>(
     ceiling: u64,
     read_transcript: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<TranscriptRecoveryExport>), String> {
-    let observed = inventory(path)?;
-    if observed.is_empty() {
-        let transcript = read_transcript()?;
-        if !inventory(path)?.is_empty() {
-            return Err("Transcript recovery evidence changed during export".into());
-        }
-        return Ok((transcript, None));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| evidence_io(io::ErrorKind::InvalidInput.into()))?;
-    let guard = match CanonicalSharedGuard::open_existing(parent) {
-        Ok(guard) => Some(guard),
-        Err(CanonicalCoordinationError::Missing) => None, // A restored, offline session.
+    let lock = transcript_coordination_path(path);
+    let acquire = || wait_for_transcript_lock(&lock, true, false);
+    let guard = match acquire() {
+        Ok(file) => Some(file),
+        Err(CanonicalCoordinationError::Missing) => None,
         Err(error) => return Err(format!("Transcript recovery coordination: {error:?}")),
     };
     let paths = inventory(path)?;
     let transcript = read_transcript()?;
+    if paths.is_empty() {
+        if guard.is_none()
+            && (!inventory(path)?.is_empty()
+                || !matches!(acquire(), Err(CanonicalCoordinationError::Missing)))
+        {
+            return Err("Transcript recovery evidence changed during export".into());
+        }
+        return Ok((transcript, None));
+    }
     let mut evidence = Vec::new();
     let mut gaps = Vec::new();
     let source_bytes = match fs::symlink_metadata(path) {
@@ -160,10 +162,7 @@ pub(crate) fn read_for_export<T>(
     }
     if guard.is_none()
         && (inventory(path)? != paths
-            || !matches!(
-                CanonicalSharedGuard::open_existing(parent),
-                Err(CanonicalCoordinationError::Missing)
-            ))
+            || !matches!(acquire(), Err(CanonicalCoordinationError::Missing)))
     {
         return Err("Transcript recovery evidence changed during export".into());
     }

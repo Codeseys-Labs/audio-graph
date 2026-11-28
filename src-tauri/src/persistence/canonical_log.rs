@@ -1848,12 +1848,12 @@ struct PendingAppend {
 mod transcript_commit;
 pub(crate) mod transcript_export;
 pub(super) use transcript_commit::read_committed;
+pub(crate) use transcript_commit::{
+    PreparedTranscriptStorage, commit_transcript, recover_previous_sessions,
+    transcript_recovery_artifacts,
+};
 pub use transcript_commit::{
     TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
-};
-pub(crate) use transcript_commit::{
-    commit_after, commit_transcript, provision_directory, ready as transcript_ready,
-    recover_previous_sessions, transcript_recovery_artifacts,
 };
 
 struct FrameBasis<'a> {
@@ -2629,6 +2629,10 @@ fn cache_from_raw<T: DeserializeOwned>(
     raw: &RawSnapshot,
 ) -> Result<CachedStreamState, CanonicalLogError> {
     validate_payload_schema::<T>(&raw.records)?;
+    Ok(index_raw(raw))
+}
+
+fn index_raw(raw: &RawSnapshot) -> CachedStreamState {
     let mut events = HashMap::with_capacity(raw.records.len());
     for record in &raw.records {
         events.insert(
@@ -2646,12 +2650,12 @@ fn cache_from_raw<T: DeserializeOwned>(
         event_id: record.event_id.clone(),
         record_hash: record.record_hash.clone(),
     });
-    Ok(CachedStreamState {
+    CachedStreamState {
         head,
         events,
         byte_len: raw.byte_len,
         ends_with_newline: raw.ends_with_newline,
-    })
+    }
 }
 
 fn mixed_speaker_versions(stream_id: &str, version: u32) -> bool {
@@ -3011,6 +3015,9 @@ fn restore_float_values(
         }
         Value::Array(items) => {
             let children: Vec<&RawValue> = serde_json::from_str(raw.get()).map_err(|_| invalid)?;
+            if children.len() != items.len() {
+                return Err(invalid);
+            }
             for (item, child) in items.iter_mut().zip(children) {
                 restore_float_values(item, child)?;
             }
