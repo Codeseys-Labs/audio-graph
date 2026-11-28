@@ -42,7 +42,7 @@ macro_rules! closed_vocabulary {
 }
 
 closed_vocabulary! {
-    /// Structural category for a non-credential runtime failure.
+    /// Structural category for a runtime failure outside the local credential store.
     pub enum RuntimeErrorCode => RUNTIME_ERROR_CODES {
         RateLimited => "rate_limited",
         NetworkUnreachable => "network_unreachable",
@@ -51,6 +51,10 @@ closed_vocabulary! {
         ProtocolError => "protocol_error",
         InvalidResponse => "invalid_response",
         RequestRejected => "request_rejected",
+        CredentialRejected => "credential_rejected",
+        CredentialExpired => "credential_expired",
+        PermissionDenied => "permission_denied",
+        InvalidConfiguration => "invalid_configuration",
         CapacityExhausted => "capacity_exhausted",
         PolicyBlocked => "policy_blocked",
         Unsupported => "unsupported",
@@ -67,6 +71,8 @@ closed_vocabulary! {
         RetryAfterDelay => "retry_after_delay",
         CheckNetwork => "check_network",
         ReviewConfiguration => "review_configuration",
+        ReenterCredential => "reenter_credential",
+        RefreshCredential => "refresh_credential",
         ChooseSupportedProvider => "choose_supported_provider",
         ReviewPolicy => "review_policy",
         RestartApplication => "restart_application",
@@ -171,7 +177,7 @@ impl RuntimeDiagnosticContext {
     }
 }
 
-/// Content-free tuple for a non-credential runtime failure.
+/// Content-free tuple for a runtime failure outside the local credential store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeErrorDiagnostic {
     pub code: RuntimeErrorCode,
@@ -195,6 +201,80 @@ impl RuntimeErrorDiagnostic {
         }
     }
 
+    pub const fn credential_rejected(context: RuntimeDiagnosticContext) -> Self {
+        Self::new(
+            RuntimeErrorCode::CredentialRejected,
+            false,
+            RuntimeSafeRecoveryAction::ReenterCredential,
+            context,
+        )
+    }
+
+    pub const fn credential_expired(context: RuntimeDiagnosticContext) -> Self {
+        Self::new(
+            RuntimeErrorCode::CredentialExpired,
+            false,
+            RuntimeSafeRecoveryAction::RefreshCredential,
+            context,
+        )
+    }
+
+    pub const fn permission_denied(context: RuntimeDiagnosticContext) -> Self {
+        Self::new(
+            RuntimeErrorCode::PermissionDenied,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
+            context,
+        )
+    }
+
+    pub const fn invalid_configuration(context: RuntimeDiagnosticContext) -> Self {
+        Self::new(
+            RuntimeErrorCode::InvalidConfiguration,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
+            context,
+        )
+    }
+
+    /// Classify an HTTP failure using only the status and whether the outgoing
+    /// request carried a credential. A 401 rejects a credential only when one
+    /// was sent. Otherwise it is a request rejection. A 403 is permission
+    /// denied. A 408 is a retryable timeout, not a configuration problem.
+    /// Never parse provider prose. Only the coarse status class is retained
+    /// in the diagnostic.
+    pub const fn from_http_status(
+        status: u16,
+        credential_sent: bool,
+        context: RuntimeDiagnosticContext,
+    ) -> Self {
+        use RuntimeErrorCode as Code;
+        use RuntimeSafeRecoveryAction as Action;
+        use RuntimeStatusClass as Status;
+
+        let status_class = match status {
+            300..=399 => Status::Redirect,
+            400..=499 => Status::ClientError,
+            500..=599 => Status::ServerError,
+            _ => return Self::internal(context),
+        };
+        let context = context.with_status_class(status_class);
+
+        match status {
+            401 if credential_sent => Self::credential_rejected(context),
+            403 => Self::permission_denied(context),
+            408 => Self::new(Code::Timeout, true, Action::Retry, context),
+            429 => Self::new(Code::RateLimited, true, Action::RetryAfterDelay, context),
+            500..=599 => Self::new(Code::ProviderUnavailable, true, Action::Retry, context),
+            _ => Self::new(
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                context,
+            ),
+        }
+    }
+
     /// Safe default for a native/provider failure that has no recognized
     /// structural classification. The private source is discarded by the
     /// caller; this tuple has nowhere to retain it.
@@ -208,8 +288,8 @@ impl RuntimeErrorDiagnostic {
     }
 }
 
-/// One public diagnostic envelope for credential and non-credential runtime
-/// failures. Credential failures embed the accepted e11c tuple unchanged.
+/// One public diagnostic envelope for local credential-service and runtime
+/// failures. The credential arm embeds the accepted e11c tuple unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum RuntimeDiagnostic {
@@ -359,6 +439,10 @@ mod tests {
                 "protocol_error",
                 "invalid_response",
                 "request_rejected",
+                "credential_rejected",
+                "credential_expired",
+                "permission_denied",
+                "invalid_configuration",
                 "capacity_exhausted",
                 "policy_blocked",
                 "unsupported",
@@ -375,6 +459,8 @@ mod tests {
                 "retry_after_delay",
                 "check_network",
                 "review_configuration",
+                "reenter_credential",
+                "refresh_credential",
                 "choose_supported_provider",
                 "review_policy",
                 "restart_application",
@@ -450,6 +536,156 @@ mod tests {
         assert!(serde_json::from_str::<RuntimeTransport>(unknown).is_err());
         assert!(serde_json::from_str::<RuntimeStatusClass>(unknown).is_err());
         assert!(serde_json::from_str::<RuntimeRetryDelayBucket>(unknown).is_err());
+    }
+
+    #[test]
+    fn provider_failure_constructors_emit_fixed_wire_tuples() {
+        let context = RuntimeDiagnosticContext::new(RuntimeOperation::ProviderRequest);
+        for (diagnostic, code, recovery_action) in [
+            (
+                RuntimeErrorDiagnostic::credential_rejected(context),
+                "credential_rejected",
+                "reenter_credential",
+            ),
+            (
+                RuntimeErrorDiagnostic::credential_expired(context),
+                "credential_expired",
+                "refresh_credential",
+            ),
+            (
+                RuntimeErrorDiagnostic::permission_denied(context),
+                "permission_denied",
+                "review_configuration",
+            ),
+            (
+                RuntimeErrorDiagnostic::invalid_configuration(context),
+                "invalid_configuration",
+                "review_configuration",
+            ),
+            (
+                RuntimeErrorDiagnostic::internal(context),
+                "internal",
+                "none",
+            ),
+        ] {
+            let diagnostic = RuntimeDiagnostic::from(diagnostic);
+            let wire = serde_json::to_value(&diagnostic).expect("runtime diagnostic JSON");
+            assert_eq!(
+                wire,
+                json!({
+                    "kind": "runtime",
+                    "detail": {
+                        "code": code,
+                        "retryable": false,
+                        "recovery_action": recovery_action,
+                        "context": { "operation": "provider_request" },
+                    },
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<RuntimeDiagnostic>(wire).expect("wire round trip"),
+                diagnostic,
+            );
+        }
+    }
+
+    #[test]
+    fn http_failure_classification_uses_only_status_and_credential_presence() {
+        use RuntimeErrorCode as Code;
+        use RuntimeSafeRecoveryAction as Action;
+        use RuntimeStatusClass as Status;
+
+        let context = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+            .with_transport(RuntimeTransport::Websocket);
+        for (status, credential_sent, code, retryable, action, status_class) in [
+            (
+                302,
+                true,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Status::Redirect,
+            ),
+            (
+                401,
+                true,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Status::ClientError,
+            ),
+            (
+                401,
+                false,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                403,
+                true,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                403,
+                false,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                404,
+                true,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                408,
+                true,
+                Code::Timeout,
+                true,
+                Action::Retry,
+                Status::ClientError,
+            ),
+            (
+                429,
+                true,
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Status::ClientError,
+            ),
+            (
+                503,
+                true,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Status::ServerError,
+            ),
+        ] {
+            let diagnostic =
+                RuntimeErrorDiagnostic::from_http_status(status, credential_sent, context);
+            assert_eq!(
+                diagnostic.code, code,
+                "HTTP {status}, credential_sent={credential_sent}"
+            );
+            assert_eq!(diagnostic.retryable, retryable, "HTTP {status}");
+            assert_eq!(diagnostic.recovery_action, action, "HTTP {status}");
+            assert_eq!(diagnostic.context, context.with_status_class(status_class));
+        }
+
+        assert_eq!(
+            RuntimeErrorDiagnostic::from_http_status(200, true, context),
+            RuntimeErrorDiagnostic::internal(context),
+        );
     }
 
     #[test]

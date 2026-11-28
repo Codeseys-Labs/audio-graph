@@ -1586,11 +1586,19 @@
       "protocol_error": "O aplicativo não conseguiu se comunicar com o provedor.",
       "invalid_response": "O provedor retornou uma resposta inválida.",
       "request_rejected": "O provedor rejeitou a solicitação.",
+      "credential_rejected": "O provedor rejeitou a credencial. Insira-a novamente em Configurações.",
+      "credential_expired": "A credencial do provedor expirou. Renove-a antes de tentar novamente.",
+      "permission_denied": "O provedor negou o acesso a esta operação. Verifique as permissões ou o plano da sua conta.",
+      "invalid_configuration": "A configuração do provedor é inválida. Verifique o modelo, a região ou o endpoint em Configurações.",
       "capacity_exhausted": "O provedor atingiu seu limite de capacidade. Tente novamente mais tarde.",
       "policy_blocked": "A política atual bloqueia esta operação.",
       "unsupported": "O provedor não oferece suporte a esta operação.",
       "cancelled": "A operação foi cancelada.",
       "internal": "A operação falhou inesperadamente."
+    },
+    "recovery": {
+      "reenter_credential": "Insira a credencial novamente em Configurações.",
+      "refresh_credential": "Renove a credencial do provedor."
     }
   },
   "errors": {

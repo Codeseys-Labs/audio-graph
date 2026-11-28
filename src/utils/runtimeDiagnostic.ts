@@ -225,11 +225,15 @@ export type RuntimeDiagnosticTranslationKey =
   | `runtimeDiagnostics.credential.${CredentialErrorCode}`
   | `runtimeDiagnostics.runtime.${RuntimeErrorCode}`;
 
+export type RuntimeRecoveryTranslationKey =
+  `runtimeDiagnostics.recovery.${Extract<RuntimeSafeRecoveryAction, "reenter_credential" | "refresh_credential">}`;
+
 export interface RuntimeDiagnosticPresentation {
   diagnostic: RuntimeDiagnostic;
   translationKey: RuntimeDiagnosticTranslationKey;
   retryable: boolean;
   recoveryAction: CredentialSafeRecoveryAction | RuntimeSafeRecoveryAction;
+  recoveryTranslationKey?: RuntimeRecoveryTranslationKey;
   operation?: RuntimeOperation;
 }
 
@@ -249,11 +253,19 @@ export function runtimeDiagnosticPresentation(
       recoveryAction: diagnostic.detail.recovery_action,
     };
   }
-  return {
+  const recoveryAction = diagnostic.detail.recovery_action;
+  const presentation: RuntimeDiagnosticPresentation = {
     diagnostic,
     translationKey: `runtimeDiagnostics.runtime.${diagnostic.detail.code}`,
     retryable: diagnostic.detail.retryable,
-    recoveryAction: diagnostic.detail.recovery_action,
+    recoveryAction,
     operation: diagnostic.detail.context.operation,
   };
+  if (
+    recoveryAction === "reenter_credential" ||
+    recoveryAction === "refresh_credential"
+  ) {
+    presentation.recoveryTranslationKey = `runtimeDiagnostics.recovery.${recoveryAction}`;
+  }
+  return presentation;
 }
