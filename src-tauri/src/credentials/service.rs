@@ -62,6 +62,7 @@ pub(crate) trait CredentialMutationSession {
 /// persisted intent or a restored older journal from being missed.
 pub(crate) struct AuthoritativeActiveRead {
     pub(crate) journal: AuthorityJournal,
+    /// `None` when the record is absent or the journal refused the read.
     pub(crate) record: Option<EncodedCredentialRecord>,
 }
 
@@ -69,11 +70,13 @@ pub(crate) struct AuthoritativeActiveRead {
 /// operations. Every write lives on the opaque session, so a concrete adapter
 /// must retain its cooperating-process lock until that session is dropped.
 pub(crate) trait CredentialEntryStore: Send + Sync {
-    /// Reads the authoritative journal and `set_id`'s active record under one
-    /// lock.
+    /// Reads the authoritative journal and, only if `may_read` admits that
+    /// journal, `set_id`'s active record, both under one lock. A read the
+    /// journal refuses requests no record bytes.
     fn read_active(
         &self,
         set_id: &CredentialSetId,
+        may_read: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure>;
 
     fn begin_mutation(
@@ -928,11 +931,20 @@ impl CredentialService {
         // The decision is made on the journal read under the same lock as the
         // record, never on the cache alone: the cache may predate another
         // process's persisted intent, or still hold pending state that
-        // process has since recovered from. An older journal of the same
-        // authority is refused by its epoch.
+        // process has since recovered from. A journal that refuses the read,
+        // or is older than the one this service observed, is decided before
+        // the record is requested.
         let read = self
             .store
-            .read_active(&request.set_id)
+            .read_active(&request.set_id, &|journal| {
+                journal.global_epoch
+                    >= self
+                        .journal
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .global_epoch
+                    && Self::journal_allows_entry_read(journal, &request.set_id)
+            })
             .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
         let journal = read.journal;
         self.reconcile_authoritative_journal(&journal, &request.set_id)?;
@@ -2228,8 +2240,9 @@ mod tests {
         fn read_active(
             &self,
             set_id: &CredentialSetId,
+            may_read: &dyn Fn(&AuthorityJournal) -> bool,
         ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
-            self.inner.read_active(set_id)
+            self.inner.read_active(set_id, may_read)
         }
 
         fn begin_mutation(

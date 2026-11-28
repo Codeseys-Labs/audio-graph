@@ -171,6 +171,7 @@ impl CredentialEntryStore for FakeCredentialStore {
     fn read_active(
         &self,
         set_id: &CredentialSetId,
+        may_read: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         self.entry_reads.fetch_add(1, Ordering::SeqCst);
         let mut state = self
@@ -178,17 +179,19 @@ impl CredentialEntryStore for FakeCredentialStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeStoreCall::ReadActive)?;
-        let record = state
-            .active
-            .iter()
-            .find(|(candidate, _)| candidate == set_id)
-            .map(|(_, bytes)| {
-                EncodedCredentialRecord::from_boundary_bytes(bytes.as_slice().to_vec())
-            });
-        Ok(AuthoritativeActiveRead {
-            journal: state.journal.clone(),
-            record,
-        })
+        let journal = state.journal.clone();
+        let record = if may_read(&journal) {
+            state
+                .active
+                .iter()
+                .find(|(candidate, _)| candidate == set_id)
+                .map(|(_, bytes)| {
+                    EncodedCredentialRecord::from_boundary_bytes(bytes.as_slice().to_vec())
+                })
+        } else {
+            None
+        };
+        Ok(AuthoritativeActiveRead { journal, record })
     }
 
     fn begin_mutation(

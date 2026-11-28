@@ -363,15 +363,17 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
     fn read_active(
         &self,
         set_id: &CredentialSetId,
+        may_read: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         let mut interaction = self.interaction_gate.acquire()?;
         let _mutation_lock = self.journal.acquire_mutation_lock()?;
-        let journal = self.require_bound_authority_unlocked(&mut interaction)?;
-        let record = self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))?;
-        Ok(AuthoritativeActiveRead {
-            journal: *journal,
-            record,
-        })
+        let journal = *self.require_bound_authority_unlocked(&mut interaction)?;
+        let record = if may_read(&journal) {
+            self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))?
+        } else {
+            None
+        };
+        Ok(AuthoritativeActiveRead { journal, record })
     }
 
     fn begin_mutation(
@@ -674,16 +676,16 @@ mod tests {
         StoredSecretBundle,
     };
     use crate::credentials::service::{
-        AuthoritativeActiveRead, CredentialEntryStore, CredentialService, DeleteCredentialSet,
-        ReplaceCredentialSet,
+        AuthoritativeActiveRead, CredentialEntryStore, CredentialService, CredentialUseRequest,
+        DeleteCredentialSet, ReplaceCredentialSet,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
         AuthMethodId, BUILT_IN_CREDENTIAL_SET_IDS, BuiltInCredentialSetId,
-        CredentialActivationStage, CredentialBackendKind, CredentialErrorCode,
-        CredentialIdempotencyToken, CredentialOperationId, CredentialRevision,
+        CredentialActivationStage, CredentialAudience, CredentialBackendKind, CredentialErrorCode,
+        CredentialIdempotencyToken, CredentialOperationId, CredentialPurpose, CredentialRevision,
         CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecoveryState,
-        PORTABLE_ENCODED_RECORD_MAX_BYTES,
+        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -1960,7 +1962,7 @@ mod tests {
         let active_journal_writes = active_journal.writes.load(Ordering::SeqCst);
         drop(active_session);
         assert!(matches!(
-            active_store.read_active(&active_set),
+            active_store.read_active(&active_set, &|_| true),
             Err(CredentialStoreFailure::StalledWorker)
         ));
         assert_eq!(active_keyring.reads.load(Ordering::SeqCst), active_reads);
@@ -2007,7 +2009,7 @@ mod tests {
         let staging_journal_writes = staging_journal.writes.load(Ordering::SeqCst);
         drop(staging_session);
         assert!(matches!(
-            staging_store.read_active(&staging_set),
+            staging_store.read_active(&staging_set, &|_| true),
             Err(CredentialStoreFailure::StalledWorker)
         ));
         assert_eq!(staging_keyring.reads.load(Ordering::SeqCst), staging_reads);
@@ -2063,7 +2065,7 @@ mod tests {
         drop(verified_session);
         let verified_reads = verified_keyring.reads.load(Ordering::SeqCst);
         assert!(matches!(
-            verified_store.read_active(&verified_set),
+            verified_store.read_active(&verified_set, &|_| true),
             Ok(AuthoritativeActiveRead {
                 record: Some(_),
                 ..
@@ -2164,7 +2166,7 @@ mod tests {
         );
         drop(active_session);
         assert!(matches!(
-            active_store.read_active(&active_set),
+            active_store.read_active(&active_set, &|_| true),
             Err(CredentialStoreFailure::StalledWorker)
         ));
         assert_eq!(active_keyring.reads.load(Ordering::SeqCst), active_reads);
@@ -2244,7 +2246,7 @@ mod tests {
         );
         drop(staging_session);
         assert!(matches!(
-            staging_store.read_active(&staging_set),
+            staging_store.read_active(&staging_set, &|_| true),
             Err(CredentialStoreFailure::StalledWorker)
         ));
         assert_eq!(staging_keyring.reads.load(Ordering::SeqCst), staging_reads);
@@ -2319,7 +2321,7 @@ mod tests {
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
         assert!(
             store
-                .read_active(&set_id)
+                .read_active(&set_id, &|_| true)
                 .expect("provider-shaped active read")
                 .record
                 .is_none()
@@ -2478,6 +2480,85 @@ mod tests {
         ));
     }
 
+    /// A lease the journal forbids is refused on the journal alone, read
+    /// under the lock: the record's secret bytes are never requested, and no
+    /// failure reading them can mask the refusal.
+    #[test]
+    fn a_lease_the_journal_forbids_requests_no_record_bytes() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let journal_boundary = Arc::new(MemoryJournalBoundary::default());
+        let (store, journal) = match NativeKeyringCredentialStore::open_with_boundaries(
+            keyring.clone(),
+            journal_boundary,
+        )
+        .expect("open absent authority")
+        {
+            NativeCredentialStoreOpen::Uninitialized(store) => match store
+                .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+                .expect("initialize native authority")
+            {
+                NativeCredentialStoreOpen::Ready { store, journal } => (Arc::new(store), *journal),
+                _ => panic!("expected ready authority"),
+            },
+            _ => panic!("expected uninitialized authority"),
+        };
+        let service = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("forbidden-lease-canary").expect("API key"),
+                expected_revision: None,
+                idempotency_token: CredentialIdempotencyToken::parse(
+                    "6a6a6a6a-6a6a-4a6a-8a6a-6a6a6a6a6a6a",
+                )
+                .expect("canonical idempotency token"),
+            })
+            .expect("configure Deepgram");
+        // Another process marks the set for reconciliation.
+        let operation_id = CredentialOperationId::parse("6b6b6b6b-6b6b-4b6b-8b6b-6b6b6b6b6b6b")
+            .expect("canonical operation id");
+        let mut session = store
+            .begin_mutation(&operation_id, &set_id)
+            .expect("begin mutation");
+        let mut marked = session.load_journal().expect("load journal");
+        marked
+            .set_state_mut(&set_id)
+            .expect("Deepgram state")
+            .recovery_state = CredentialSetRecoveryState::RecordJournalMismatch;
+        session
+            .persist_intent(&marked)
+            .expect("persist marked journal");
+        drop(session);
+        let native_reads = keyring.reads.load(Ordering::SeqCst);
+
+        let error = service
+            .resolve_for_use(CredentialUseRequest {
+                set_id,
+                consumer_id: "asr.deepgram",
+                auth_method_id: AuthMethodId::ApiKey,
+                purpose: CredentialPurpose::Asr,
+                audience: CredentialAudience::SecureNetworkOrigin {
+                    scheme: SecureTransportScheme::Wss,
+                    canonical_host: "api.deepgram.com".to_string(),
+                    effective_port: 443,
+                },
+            })
+            .expect_err("the journal forbids a lease");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            keyring.reads.load(Ordering::SeqCst),
+            native_reads + 1,
+            "only the authority marker is read"
+        );
+    }
+
     #[test]
     fn opaque_mutation_session_owns_the_file_lock_until_drop() {
         let root = std::env::temp_dir().join(format!(
@@ -2555,7 +2636,7 @@ mod tests {
         let reader_set_id = set_id.clone();
         let reader = std::thread::spawn(move || {
             started_tx.send(()).expect("announce blocked read");
-            let result = reader_store.read_active(&reader_set_id);
+            let result = reader_store.read_active(&reader_set_id, &|_| true);
             finished_tx
                 .send(result.is_ok())
                 .expect("report read result");
@@ -2605,7 +2686,7 @@ mod tests {
         drop(before_session);
         let before_reads = before_keyring.reads.load(Ordering::SeqCst);
         assert!(matches!(
-            before_store.read_active(&before_set),
+            before_store.read_active(&before_set, &|_| true),
             Ok(AuthoritativeActiveRead { record: None, .. })
         ));
         assert_eq!(
@@ -2671,7 +2752,7 @@ mod tests {
         let after_keyring_reads = after_keyring.reads.load(Ordering::SeqCst);
         let after_journal_reads = after_journal.reads.load(Ordering::SeqCst);
         assert!(matches!(
-            after_store.read_active(&after_set),
+            after_store.read_active(&after_set, &|_| true),
             Err(CredentialStoreFailure::StalledWorker)
         ));
         assert_eq!(
@@ -2712,7 +2793,7 @@ mod tests {
         let reader_set_id = set_id.clone();
         let reader = std::thread::spawn(move || {
             started_tx.send(()).expect("announce second-store read");
-            let result = reader_store.read_active(&reader_set_id);
+            let result = reader_store.read_active(&reader_set_id, &|_| true);
             finished_tx
                 .send(result)
                 .expect("report second-store read result");
@@ -2766,7 +2847,7 @@ mod tests {
         journal.lock_contended.store(true, Ordering::SeqCst);
 
         assert!(matches!(
-            store.read_active(&set_id),
+            store.read_active(&set_id, &|_| true),
             Err(CredentialStoreFailure::OperationInProgress)
         ));
         assert_eq!(keyring.reads.load(Ordering::SeqCst), native_reads);
@@ -2774,7 +2855,7 @@ mod tests {
 
         journal.lock_contended.store(false, Ordering::SeqCst);
         assert!(matches!(
-            store.read_active(&set_id),
+            store.read_active(&set_id, &|_| true),
             Ok(AuthoritativeActiveRead { record: None, .. })
         ));
     }
@@ -2790,14 +2871,14 @@ mod tests {
         let original = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
         assert!(matches!(
-            original.read_active(&set_id),
+            original.read_active(&set_id, &|_| true),
             Ok(AuthoritativeActiveRead { record: None, .. })
         ));
 
         journal.bytes.lock().expect("memory journal lock").take();
         let native_reads = keyring.reads.load(Ordering::SeqCst);
         assert!(matches!(
-            original.read_active(&set_id),
+            original.read_active(&set_id, &|_| true),
             Err(CredentialStoreFailure::CorruptRecord)
         ));
         // Only the authority marker was read; the record never was.
@@ -2810,11 +2891,11 @@ mod tests {
             .retain(|(account, _)| account != "v2/_authority");
         let replacement = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
         assert!(matches!(
-            replacement.read_active(&set_id),
+            replacement.read_active(&set_id, &|_| true),
             Ok(AuthoritativeActiveRead { record: None, .. })
         ));
         assert!(matches!(
-            original.read_active(&set_id),
+            original.read_active(&set_id, &|_| true),
             Err(CredentialStoreFailure::CorruptRecord)
         ));
     }
