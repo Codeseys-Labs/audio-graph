@@ -4533,15 +4533,16 @@ pub(crate) fn resolve_claim_evidence_basis_events(
         .resolve_covered_events(&ledger.latest_spans)
         .into_iter()
         .map(|mut event| {
-            if let Some(attribution) = attribution.as_ref() {
-                let keys = crate::timeline::candidate_keys(
+            if let Some(winners) = attribution.as_ref()
+                && let Some(winner) = crate::timeline::resolve_speaker(
+                    event.source_id.as_str(),
                     event.transcript_segment_id.as_deref(),
                     event.span_id.as_str(),
-                );
-                if let Some(winner) = keys.iter().find_map(|key| attribution.get(key.as_str())) {
-                    event.speaker_id = winner.speaker_id.clone();
-                    event.speaker_label = winner.speaker_label.clone();
-                }
+                    winners,
+                )
+            {
+                event.speaker_id = winner.speaker_id.clone();
+                event.speaker_label = winner.speaker_label.clone();
             }
             event
         })

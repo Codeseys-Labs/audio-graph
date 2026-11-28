@@ -148,8 +148,16 @@ pub fn build_session_timeline(
             );
 
             // Speaker: latest-wins diarization attribution overrides the inline
-            // ASR label; an unattributed span keeps its inline speaker.
-            let attribution = keys.iter().find_map(|key| attribution.get(key.as_str()));
+            // ASR label; an unattributed span keeps its inline speaker. The
+            // winner is filtered by source (`timeline::resolve_speaker`, #498)
+            // so a shared display segment id (`turn-0@final` reused across mic
+            // and system) cannot pull in another source's correction.
+            let attribution = resolve_speaker(
+                event.source_id.as_str(),
+                event.transcript_segment_id.as_deref(),
+                event.span_id.as_str(),
+                &attribution,
+            );
             let (speaker_id, speaker_label) = attribution
                 .map(|s| (s.speaker_id.clone(), s.speaker_label.clone()))
                 .unwrap_or_else(|| (event.speaker_id.clone(), event.speaker_label.clone()));
@@ -259,6 +267,65 @@ pub(crate) fn speaker_attribution_index(
         }
     }
     winners
+}
+
+/// Resolve ONE transcript event's winning diarization attribution from
+/// `winners` ([`speaker_attribution_index`]'s latest-wins map) — the ONE
+/// source-aware speaker join shared by every backend consumer that overlays
+/// a [`SpeakerTimeline`] onto transcript events (#498):
+/// - `build_session_timeline` (this module — session timeline reconstruction,
+///   the join the reloaded-session fold exercises), and
+/// - `projections::resolve_claim_evidence_basis_events` (apply-time
+///   claim-evidence speaker resolution, ADR-0037), and
+/// - `projection_llm::resolve_prompt_speakers` (generation-prompt speaker
+///   resolution, PR #495).
+///
+/// Keys are tried in [`candidate_keys`]' order: the provider
+/// `transcript_segment_id` (the DISPLAY id, e.g. `turn-0@final`) first, then
+/// the immutable ASR `span_id`. A winner is only accepted when BOTH of these
+/// hold:
+///
+/// 1. **Same source.** The winning diarization span's `source_id` is `None`
+///    (legacy session-level attribution, source-agnostic) or equals the
+///    event's `source_id`. THIS is the fix: multiple sources reuse the same
+///    display segment id (`turn-0@final` on mic AND system — providers like
+///    AssemblyAI qualify their ASR span ids by source but NOT their segment
+///    ids), so an unfiltered `winners.get(display_id)` happily returns
+///    ANOTHER source's speaker and a correction on one source bleeds onto a
+///    different source's turn.
+/// 2. **Exact span, but only for a source-scoped winner.** A winner that
+///    carries a `source_id` is the multi-source capture shape, and its
+///    `basis_asr_span_ids` are the source-qualified ASR span ids
+///    (`assemblyai:mic:turn-0`, globally unique) — when such a span cites
+///    any, the event's `span_id` must be one of them, so a span citing ONLY
+///    `basis_transcript_segment_ids` (the reuse-prone display id) cannot
+///    claim the key. A session-level (`source_id: None`) LEGACY span skips
+///    this pin: its segment/display key has always been authoritative on
+///    its own (pre-#498 behavior in every consumer), and legacy logs carry
+///    provider-local ASR-basis id conventions (`{span}-asr`) that never
+///    equal the ASR span id — pinning those would silently drop every
+///    legacy attribution (`apply_validated_patch_stamps_the_canonical_
+///    speaker_not_the_inline_asr_label`'s fixture pins exactly this).
+///
+/// Falls back to `None` — caller policy then keeps the event's inline ASR
+/// speaker — when the timeline attributes nothing matching this event.
+pub(crate) fn resolve_speaker<'a>(
+    event_source_id: &str,
+    event_transcript_segment_id: Option<&str>,
+    event_span_id: &str,
+    winners: &HashMap<String, &'a DiarizationSpanRevision>,
+) -> Option<&'a DiarizationSpanRevision> {
+    candidate_keys(event_transcript_segment_id, event_span_id)
+        .into_iter()
+        .filter_map(|key| winners.get(key.as_str()).copied())
+        .find(|span| {
+            span.source_id
+                .as_deref()
+                .is_none_or(|source| source == event_source_id)
+                && (span.source_id.is_none()
+                    || span.basis_asr_span_ids.is_empty()
+                    || span.basis_asr_span_ids.iter().any(|id| id == event_span_id))
+        })
 }
 
 #[cfg(test)]
@@ -652,5 +719,277 @@ mod tests {
         // Stable, non-content identity fields still surface for debugging.
         assert!(debug.contains("span-a"));
         assert!(debug.contains("spk-1"));
+    }
+
+    /// A diarization span revision carrying source provenance and an ASR-span
+    /// basis — the post-#498 capture shape (AssemblyAI-style source-qualified
+    /// ASR ids). `source_id: None` / empty `basis_asr_span_ids` reproduce the
+    /// legacy shapes directly.
+    fn source_scoped_diarization_event(
+        span_id: &str,
+        source_id: Option<&str>,
+        asr_span_id: &str,
+        segment_id: &str,
+        speaker_id: &str,
+        speaker_label: &str,
+    ) -> DiarizationSpanRevision {
+        let mut revision = diarization_event(
+            span_id,
+            segment_id,
+            1,
+            speaker_id,
+            speaker_label,
+            DiarizationSpanStability::Final,
+        );
+        revision.source_id = source_id.map(str::to_string);
+        revision.basis_asr_span_ids = vec![asr_span_id.to_string()];
+        revision
+    }
+
+    /// #498: two sources reuse the SAME display segment id (`turn-0@final`)
+    /// with distinct source-qualified ASR span ids (the AssemblyAI shape).
+    /// A diarization correction on one source must NOT bleed onto the other
+    /// source's turn: the pre-fix join (`winners.get(display_id)`, unfiltered)
+    /// resolved BOTH entries to whichever span won the shared key.
+    #[test]
+    fn shared_display_segment_ids_do_not_bleed_speakers_across_sources() {
+        let mut mic = transcript_event(
+            "assemblyai:mic:turn-0",
+            "turn-0@final",
+            2,
+            "asr-mic",
+            "Mic Inline",
+            "mic words",
+            1.0,
+            "turn-0",
+        );
+        mic.source_id = "mic".into();
+        let mut system = transcript_event(
+            "assemblyai:system:turn-0",
+            "turn-0@final",
+            2,
+            "asr-system",
+            "System Inline",
+            "system words",
+            5.0,
+            "turn-0",
+        );
+        system.source_id = "system".into();
+        let ledger = ledger_from(vec![mic, system]);
+        let speakers = speakers_from(vec![
+            source_scoped_diarization_event(
+                "dia-mic",
+                Some("mic"),
+                "assemblyai:mic:turn-0",
+                "turn-0@final",
+                "spk-mic",
+                "Mic Speaker",
+            ),
+            source_scoped_diarization_event(
+                "dia-system",
+                Some("system"),
+                "assemblyai:system:turn-0",
+                "turn-0@final",
+                "spk-system",
+                "System Speaker",
+            ),
+        ]);
+        let graph = TemporalKnowledgeGraph::new();
+
+        let timeline = build_session_timeline(&ledger, &speakers, &graph);
+
+        let mic_entry = timeline
+            .iter()
+            .find(|e| e.span_id == "assemblyai:mic:turn-0")
+            .expect("mic entry survives");
+        let system_entry = timeline
+            .iter()
+            .find(|e| e.span_id == "assemblyai:system:turn-0")
+            .expect("system entry survives");
+        assert_eq!(mic_entry.speaker_id.as_deref(), Some("spk-mic"));
+        assert_eq!(mic_entry.speaker_label.as_deref(), Some("Mic Speaker"));
+        assert_eq!(system_entry.speaker_id.as_deref(), Some("spk-system"));
+        assert_eq!(
+            system_entry.speaker_label.as_deref(),
+            Some("System Speaker"),
+            "system's turn must resolve its OWN source's speaker, not the mic \
+             correction sharing the display segment id `turn-0@final`"
+        );
+    }
+
+    /// #498, the acceptance's "ONLY ONE source has a speaker correction"
+    /// case: with the system attribution absent, the shared `turn-0@final`
+    /// key maps to the mic span alone — the system event must keep its
+    /// INLINE ASR speaker, never the mic correction. The pre-fix join bled
+    /// the mic winner onto the system turn here too.
+    #[test]
+    fn a_correction_on_one_source_leaves_the_other_sources_inline_speaker_intact() {
+        let mut mic = transcript_event(
+            "assemblyai:mic:turn-0",
+            "turn-0@final",
+            2,
+            "asr-mic",
+            "Mic Inline",
+            "mic words",
+            1.0,
+            "turn-0",
+        );
+        mic.source_id = "mic".into();
+        let mut system = transcript_event(
+            "assemblyai:system:turn-0",
+            "turn-0@final",
+            2,
+            "asr-system",
+            "System Inline",
+            "system words",
+            5.0,
+            "turn-0",
+        );
+        system.source_id = "system".into();
+        let ledger = ledger_from(vec![mic, system]);
+        // ONLY the mic source is attributed.
+        let speakers = speakers_from(vec![source_scoped_diarization_event(
+            "dia-mic",
+            Some("mic"),
+            "assemblyai:mic:turn-0",
+            "turn-0@final",
+            "spk-mic",
+            "Mic Speaker",
+        )]);
+        let graph = TemporalKnowledgeGraph::new();
+
+        let timeline = build_session_timeline(&ledger, &speakers, &graph);
+
+        let mic_entry = timeline
+            .iter()
+            .find(|e| e.span_id == "assemblyai:mic:turn-0")
+            .expect("mic entry survives");
+        let system_entry = timeline
+            .iter()
+            .find(|e| e.span_id == "assemblyai:system:turn-0")
+            .expect("system entry survives");
+        assert_eq!(mic_entry.speaker_id.as_deref(), Some("spk-mic"));
+        assert_eq!(mic_entry.speaker_label.as_deref(), Some("Mic Speaker"));
+        // Zero cross-source bleed: the system turn keeps its INLINE speaker.
+        assert_eq!(system_entry.speaker_id.as_deref(), Some("asr-system"));
+        assert_eq!(
+            system_entry.speaker_label.as_deref(),
+            Some("System Inline"),
+            "the unattributed source must fall back to its inline ASR speaker, \
+             not the mic source's correction on the shared display segment id"
+        );
+    }
+
+    /// #498 legacy anchors: a session-level (`source_id: None`) diarization
+    /// span with NO ASR-span basis — the pre-multi-source capture shape —
+    /// still resolves by its segment id alone, and stays source-agnostic so
+    /// a legacy single-source session replays exactly as before.
+    #[test]
+    fn legacy_segment_only_anchors_still_resolve_by_display_segment_id() {
+        let mut legacy = transcript_event(
+            "asr-span-legacy",
+            "turn-0@final",
+            2,
+            "asr-inline",
+            "Inline Speaker",
+            "legacy words",
+            1.0,
+            "turn-0",
+        );
+        legacy.source_id = "mic".into();
+        let ledger = ledger_from(vec![legacy]);
+        let legacy_span = diarization_event(
+            "dia-legacy",
+            "turn-0@final",
+            1,
+            "spk-legacy",
+            "Legacy Speaker",
+            DiarizationSpanStability::Final,
+        );
+        // Legacy shape: no source provenance and no ASR-span pin — the
+        // winner is accepted on the segment id alone.
+        assert_eq!(legacy_span.source_id, None);
+        assert!(legacy_span.basis_asr_span_ids.is_empty());
+        let speakers = speakers_from(vec![legacy_span]);
+        let graph = TemporalKnowledgeGraph::new();
+
+        let timeline = build_session_timeline(&ledger, &speakers, &graph);
+
+        assert_eq!(timeline[0].speaker_id.as_deref(), Some("spk-legacy"));
+        assert_eq!(timeline[0].speaker_label.as_deref(), Some("Legacy Speaker"));
+    }
+
+    /// #498 latest-revision tie breaking on one basis key: the higher
+    /// `revision_number` wins regardless of arrival order, and an exact
+    /// revision tie is broken by the later `received_at_ms` — the same
+    /// winner rule `speaker_attribution_index` has always applied.
+    #[test]
+    fn latest_revision_then_received_at_tie_break_on_a_shared_basis_key() {
+        let mut event = transcript_event(
+            "asr-span-tie",
+            "turn-0@final",
+            2,
+            "asr-inline",
+            "Inline Speaker",
+            "tie words",
+            1.0,
+            "turn-0",
+        );
+        event.source_id = "mic".into();
+        let ledger = ledger_from(vec![event]);
+        let graph = TemporalKnowledgeGraph::new();
+
+        // revision 2 beats revision 1 even though the older span is
+        // iterated first (span_id "dia-a" sorts before "dia-b").
+        let rev2 = diarization_event(
+            "dia-a",
+            "turn-0@final",
+            2,
+            "spk-two",
+            "Latest Revision",
+            DiarizationSpanStability::Final,
+        );
+        let rev1 = diarization_event(
+            "dia-b",
+            "turn-0@final",
+            1,
+            "spk-one",
+            "Older Revision",
+            DiarizationSpanStability::Final,
+        );
+        let speakers = speakers_from(vec![rev2, rev1]);
+        let timeline = build_session_timeline(&ledger, &speakers, &graph);
+        assert_eq!(
+            timeline[0].speaker_label.as_deref(),
+            Some("Latest Revision")
+        );
+
+        // Exact revision tie: the later `received_at_ms` wins ("dia-d"
+        // sorts after "dia-c", so the loser is iterated and inserted first).
+        let mut early = diarization_event(
+            "dia-c",
+            "turn-0@final",
+            3,
+            "spk-early",
+            "Earlier Received",
+            DiarizationSpanStability::Final,
+        );
+        early.received_at_ms = 100;
+        let mut late = diarization_event(
+            "dia-d",
+            "turn-0@final",
+            3,
+            "spk-late",
+            "Later Received",
+            DiarizationSpanStability::Final,
+        );
+        late.received_at_ms = 200;
+        let speakers = speakers_from(vec![early, late]);
+        let timeline = build_session_timeline(&ledger, &speakers, &graph);
+        assert_eq!(
+            timeline[0].speaker_label.as_deref(),
+            Some("Later Received"),
+            "an exact revision tie must be broken by the later received_at_ms"
+        );
     }
 }
