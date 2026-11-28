@@ -785,8 +785,11 @@ export type UiAwsError =
 
 /**
  * Payload for the `aws-error` event (ag#13). `error` is the structured
- * classification; `raw_message` is the original aws-sdk error string,
- * retained for debugging / disclosure when the category is `unknown`.
+ * classification. `raw_message` is NOT provider text on the Transcribe path:
+ * it is the `Display` of a closed diagnostic (`runtime/<code>` or
+ * `credential/<code>`), and `UiAwsError`'s `unknown.message` carries the same
+ * token. An older producer can still send provider text in either field
+ * (#148), so the UI never renders them verbatim — see `awsErrorToMessage`.
  */
 export interface AwsErrorPayload {
   error: UiAwsError;
@@ -1626,10 +1629,8 @@ export interface ProviderReadiness {
 }
 
 /**
- * Normalized TTS event emitted by the backend `TtsSession::events()` stream
- * (mirrors Rust `crate::tts::TtsEvent`). The audio playback subsystem
- * (Wave B) consumes `audio_chunk`; the UI consumes `status` for connection
- * indicators and `error` for toast surfaces.
+ * Normalized TTS event from the backend session's playback stream
+ * (mirrors Rust `crate::tts::TtsEvent`).
  */
 export type TtsEvent =
   | {
@@ -1639,15 +1640,15 @@ export type TtsEvent =
       /** Hz, e.g. 24000 for Aura linear16 default. */
       sample_rate: number;
     }
-  | { type: "status"; kind: TtsStatusKind & Record<string, unknown> }
-  | { type: "error"; kind: TtsErrorKind; message: string };
+  | ({ type: "status" } & TtsStatusKind)
+  | { type: "error"; kind: TtsErrorKind; diagnostic: RuntimeDiagnostic };
 
 /** TTS lifecycle / acknowledgement signals (matches Rust `TtsStatus`). */
 export type TtsStatusKind =
   | { kind: "connected" }
   | { kind: "flushed"; sequence: number }
   | { kind: "cleared" }
-  | { kind: "metadata"; json: string }
+  | { kind: "metadata" }
   | { kind: "disconnected" }
   | { kind: "reconnecting"; attempt: number; backoff_secs: number }
   | { kind: "reconnected" };

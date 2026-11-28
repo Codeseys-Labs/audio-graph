@@ -824,6 +824,20 @@
     "trashCount": "Trash ({{count}})",
     "load": "Load",
     "reviewLockedWhileLive": "Stop the live capture before opening a past session. Historical Review is locked so session data cannot mix.",
+    "reviewNeedsCompletedWhileLive": "Only completed sessions can be opened while capture is running.",
+    "reviewLensLockedWhileLive": "Stop the live capture to use this view.",
+    "review": {
+      "transcriptTitle": "Session transcript",
+      "transcriptLabel": "Session transcript",
+      "loading": "Loading session transcript…",
+      "unavailable": "This session's transcript is missing or could not be read.",
+      "retry": "Try again",
+      "stale": "This transcript may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "needsLoad": "This view needs the session loaded first.",
+      "loadSession": "Load session",
+      "viewUnavailable": "This session could not be loaded.",
+      "emptyTranscript": "This session has no transcript."
+    },
     "delete": "Delete",
     "activeDeleteLocked": "The active session cannot be deleted. Start a new session first.",
     "restore": "Restore",
@@ -980,7 +994,8 @@
       "accessDenied": "AWS credentials are valid but lack permission for {{permission}}. Ask an administrator to attach this action to your IAM policy, then try again.",
       "regionNotSupported": "AWS Transcribe is not enabled in region '{{region}}'. Try us-east-1, us-west-2, or eu-west-1 in Settings → AWS.",
       "networkUnreachable": "Cannot reach the AWS Transcribe endpoint — check your internet connection, proxy settings, or VPN.",
-      "unknown": "Unexpected AWS error: {{message}}"
+      "unknown": "Unexpected AWS error: {{message}}",
+      "unknownGeneric": "Unexpected AWS error. Check Settings → AWS and try again."
     }
   },
   "storage": {
@@ -1580,6 +1595,10 @@
       "commit_unknown": "The app could not confirm whether the credential change was saved.",
       "internal": "The credential operation failed unexpectedly."
     },
+    "native": {
+      "invalid_configuration": "Check your audio output settings and choose a supported device.",
+      "provider_unavailable": "No audio output device is available. Connect or enable one, then try again."
+    },
     "runtime": {
       "rate_limited": "The provider is rate limiting requests. Try again later.",
       "network_unreachable": "The app could not reach the provider. Check your connection.",
@@ -1592,7 +1611,7 @@
       "credential_expired": "The provider credential expired. Refresh it before trying again.",
       "permission_denied": "The provider denied access to this operation. Check your account permissions or plan.",
       "invalid_configuration": "The provider configuration is invalid. Check the model, region, or endpoint in Settings.",
-      "capacity_exhausted": "The provider is at capacity. Try again later.",
+      "capacity_exhausted": "The provider is at capacity, or your account's quota or balance is used up. Check your plan and balance, or try again later.",
       "policy_blocked": "The current policy blocks this operation.",
       "unsupported": "The provider does not support this operation.",
       "cancelled": "The operation was cancelled.",

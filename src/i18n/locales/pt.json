@@ -824,6 +824,20 @@
     "trashCount": "Lixeira ({{count}})",
     "load": "Carregar",
     "reviewLockedWhileLive": "Pare a captura ao vivo antes de abrir uma sessão anterior. A revisão do histórico fica bloqueada para não misturar dados entre sessões.",
+    "reviewNeedsCompletedWhileLive": "Só é possível abrir sessões concluídas enquanto a captura está em andamento.",
+    "reviewLensLockedWhileLive": "Pare a captura ao vivo para usar esta visualização.",
+    "review": {
+      "transcriptTitle": "Transcrição da sessão",
+      "transcriptLabel": "Transcrição da sessão",
+      "loading": "Carregando a transcrição da sessão…",
+      "unavailable": "A transcrição desta sessão está ausente ou não pôde ser lida.",
+      "retry": "Tentar novamente",
+      "stale": "Esta transcrição pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
+      "loadSession": "Carregar sessão",
+      "viewUnavailable": "Não foi possível carregar esta sessão.",
+      "emptyTranscript": "Esta sessão não tem transcrição."
+    },
     "delete": "Excluir",
     "activeDeleteLocked": "A sessão ativa não pode ser excluída. Inicie uma nova sessão primeiro.",
     "restore": "Restaurar",
@@ -980,7 +994,8 @@
       "accessDenied": "Credenciais AWS válidas, mas sem permissão para {{permission}}. Peça a um administrador para anexar esta ação à sua política IAM e tente novamente.",
       "regionNotSupported": "AWS Transcribe não está habilitado na região '{{region}}'. Tente us-east-1, us-west-2 ou eu-west-1 em Configurações → AWS.",
       "networkUnreachable": "Não foi possível acessar o endpoint do AWS Transcribe — verifique sua conexão com a internet, configurações de proxy ou VPN.",
-      "unknown": "Erro inesperado da AWS: {{message}}"
+      "unknown": "Erro inesperado da AWS: {{message}}",
+      "unknownGeneric": "Erro inesperado da AWS. Verifique Configurações → AWS e tente novamente."
     }
   },
   "storage": {
@@ -1580,6 +1595,10 @@
       "commit_unknown": "O aplicativo não conseguiu confirmar se a alteração na credencial foi salva.",
       "internal": "A operação com a credencial falhou inesperadamente."
     },
+    "native": {
+      "invalid_configuration": "Verifique as configurações de saída de áudio e escolha um dispositivo compatível.",
+      "provider_unavailable": "Nenhum dispositivo de saída de áudio está disponível. Conecte ou ative um dispositivo e tente novamente."
+    },
     "runtime": {
       "rate_limited": "O provedor está limitando as solicitações. Tente novamente mais tarde.",
       "network_unreachable": "O aplicativo não conseguiu acessar o provedor. Verifique sua conexão.",
@@ -1592,7 +1611,7 @@
       "credential_expired": "A credencial do provedor expirou. Renove-a antes de tentar novamente.",
       "permission_denied": "O provedor negou o acesso a esta operação. Verifique as permissões ou o plano da sua conta.",
       "invalid_configuration": "A configuração do provedor é inválida. Verifique o modelo, a região ou o endpoint em Configurações.",
-      "capacity_exhausted": "O provedor atingiu seu limite de capacidade. Tente novamente mais tarde.",
+      "capacity_exhausted": "O provedor atingiu seu limite de capacidade, ou a cota ou o saldo da sua conta se esgotou. Verifique seu plano e saldo, ou tente novamente mais tarde.",
       "policy_blocked": "A política atual bloqueia esta operação.",
       "unsupported": "O provedor não oferece suporte a esta operação.",
       "cancelled": "A operação foi cancelada.",

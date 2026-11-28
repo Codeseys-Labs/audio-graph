@@ -240,7 +240,9 @@ impl RuntimeErrorDiagnostic {
     /// Classify an HTTP failure using only the status and whether the outgoing
     /// request carried a credential. A 401 rejects a credential only when one
     /// was sent. Otherwise it is a request rejection. A 403 is permission
-    /// denied. A 408 is a retryable timeout, not a configuration problem.
+    /// denied. A 402 is exhausted quota or balance: not retryable, so a
+    /// reconnect ladder stops on it instead of spending its budget. A 408 is a
+    /// retryable timeout, not a configuration problem.
     /// Never parse provider prose. Only the coarse status class is retained
     /// in the diagnostic.
     pub const fn from_http_status(
@@ -262,6 +264,12 @@ impl RuntimeErrorDiagnostic {
 
         match status {
             401 if credential_sent => Self::credential_rejected(context),
+            402 => Self::new(
+                Code::CapacityExhausted,
+                false,
+                Action::ReviewConfiguration,
+                context,
+            ),
             403 => Self::permission_denied(context),
             408 => Self::new(Code::Timeout, true, Action::Retry, context),
             429 => Self::new(Code::RateLimited, true, Action::RetryAfterDelay, context),
@@ -634,6 +642,22 @@ mod tests {
                 403,
                 false,
                 Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                402,
+                true,
+                Code::CapacityExhausted,
+                false,
+                Action::ReviewConfiguration,
+                Status::ClientError,
+            ),
+            (
+                402,
+                false,
+                Code::CapacityExhausted,
                 false,
                 Action::ReviewConfiguration,
                 Status::ClientError,

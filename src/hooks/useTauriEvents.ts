@@ -55,7 +55,11 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { publishStorageFull } from "../components/StorageBanner";
-import type { RuntimeErrorCode } from "../generated/runtimeDiagnostic";
+import { CREDENTIAL_CONTRACT } from "../generated/credentialContract";
+import {
+  RUNTIME_DIAGNOSTIC_CONTRACT,
+  type RuntimeErrorCode,
+} from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type {
@@ -197,6 +201,29 @@ const AWS_ERROR = "aws-error";
  * any future in-app diagnostics panel can share the exact same mapping
  * without duplicating the switch.
  */
+/**
+ * Localize the detail of an `unknown` AWS error, or return `null`.
+ *
+ * On the Transcribe path the backend fills `UiAwsError::Unknown.message` with
+ * the `Display` of a closed diagnostic — `runtime/<code>` or
+ * `credential/<code>`. Only that exact shape, with a code from the generated
+ * contract vocabulary, is translated. Anything else is untrusted: an older
+ * producer can still put provider text there (#148), so it is never rendered
+ * and the caller falls back to fixed copy.
+ */
+function awsUnknownDetail(message: string): string | null {
+  const match = /^(runtime|credential)\/([a-z_]+)$/.exec(message);
+  if (match === null) return null;
+  const [, kind, code] = match;
+  const codes: readonly string[] =
+    kind === "runtime"
+      ? RUNTIME_DIAGNOSTIC_CONTRACT.error_codes
+      : CREDENTIAL_CONTRACT.vocabulary.error_codes;
+  if (!codes.includes(code)) return null;
+  const key = `runtimeDiagnostics.${kind}.${code}`;
+  return i18n.exists(key) ? i18n.t(key) : null;
+}
+
 export function awsErrorToMessage(payload: AwsErrorPayload): string {
   const { error } = payload;
   switch (error.category) {
@@ -219,8 +246,12 @@ export function awsErrorToMessage(payload: AwsErrorPayload): string {
       });
     case "network_unreachable":
       return i18n.t("aws.error.networkUnreachable");
-    case "unknown":
-      return i18n.t("aws.error.unknown", { message: error.message });
+    case "unknown": {
+      const detail = awsUnknownDetail(error.message);
+      return detail === null
+        ? i18n.t("aws.error.unknownGeneric")
+        : i18n.t("aws.error.unknown", { message: detail });
+    }
   }
 }
 

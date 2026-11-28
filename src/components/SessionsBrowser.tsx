@@ -11,9 +11,10 @@
  * `SessionMetadata`) on the left, a detail pane on the right. Selecting a
  * row sets `nav.sessionId` (`useAudioGraphStore`'s `setNavSessionId`) and, for
  * any row that ISN'T the session that just finished recording, calls
- * `loadSession` — the existing `sessions.reviewLockedWhileLive` guard inside
- * it still applies. The just-stopped session's row is a special case: see
- * `isResidentLiveSession` below.
+ * `loadSession` when no capture is running (while it runs, the Transcript lens
+ * is a query-backed Review pane instead and Notes/Timeline/Graph are gated —
+ * see `globalHoldsRow` in `SessionDetail`). The just-stopped session's row is
+ * a special case: see `handleSelect` below.
  *
  * Source of truth is still the backend `sessions.json` index —
  * `list_sessions` returns all known sessions, `load_session` hydrates the
@@ -40,6 +41,7 @@
  */
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { SessionViewProvider } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
@@ -87,6 +89,11 @@ const SORT_MODES: SessionSortMode[] = [
 
 /** localStorage key for the sort preference. */
 const SORT_STORAGE_KEY = "audiograph:sessionsBrowser:sort";
+
+/** Id of the visible "only completed sessions" rule in the rail, referenced by
+ * disabled rows via `aria-describedby` (a `title` on a native disabled button
+ * is unreachable by keyboard). */
+const LIVE_REVIEW_RULE_ID = "sessions-live-review-rule";
 
 function loadSortPreference(): SessionSortMode {
   try {
@@ -228,6 +235,17 @@ function askAvailable(lens: DetailLens): boolean {
   return lens === "notes" || lens === "graph";
 }
 
+/**
+ * While capture or transcription runs, only a completed, indexed row can be
+ * opened: it is reviewed through the query-backed Review store
+ * (`session/reviewStore.ts`), never hydrated into the Live global fields. The
+ * live session's own row (`active`) and the optimistic "finalizing" row (its
+ * data is still resident in the Live store) stay locked.
+ */
+function reviewableWhileLive(row: SessionRow): boolean {
+  return row.status === "complete" && row.optimistic !== true;
+}
+
 function SessionsBrowser() {
   const { t, i18n } = useTranslation();
   const sessions = useAudioGraphStore((s) => s.sessions);
@@ -239,7 +257,6 @@ function SessionsBrowser() {
     (s) => s.pendingFinalizingSession,
   );
   const listSessions = useAudioGraphStore((s) => s.listSessions);
-  const loadSession = useAudioGraphStore((s) => s.loadSession);
   const deleteSession = useAudioGraphStore((s) => s.deleteSession);
   const restoreSession = useAudioGraphStore((s) => s.restoreSession);
   const deleteSessionPermanently = useAudioGraphStore(
@@ -251,6 +268,7 @@ function SessionsBrowser() {
   const exportSessionBundle = useAudioGraphStore((s) => s.exportSessionBundle);
   const navSessionId = useAudioGraphStore((s) => s.nav.sessionId);
   const setNavSessionId = useAudioGraphStore((s) => s.setNavSessionId);
+  const loadSession = useAudioGraphStore((s) => s.loadSession);
 
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SessionSortMode>(() =>
@@ -261,7 +279,7 @@ function SessionsBrowser() {
   const [exportingIds, setExportingIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const reviewLocked = isCapturing || isTranscribing;
+  const liveRunning = isCapturing || isTranscribing;
 
   // Refresh on mount — match the v2 store's own larger fetch (200) so the
   // rail's search can actually find old entries, not just the 10 most recent
@@ -299,27 +317,20 @@ function SessionsBrowser() {
     saveSortPreference(mode);
   };
 
-  // The just-stopped session's data is already resident in the global store
-  // (it WAS the live session) — re-fetching via `loadSession` would race the
-  // same finalize-on-disk gap `pendingFinalizingSession` exists to route
-  // around, and could momentarily clobber good in-memory data with a
-  // not-yet-fully-flushed read. Any OTHER row still goes through
-  // `loadSession` as before.
-  //
-  // Keyed to THIS row's own `optimistic` flag, not `pendingFinalizingSession`
-  // directly. `pendingFinalizingSession` is a write-only store slot in
-  // production — nothing cleared it here once set, so matching on
-  // `pendingFinalizingSession?.id === row.id` kept skipping `loadSession`
-  // for that id forever, even long after `mergeSessionRows` stopped
-  // injecting the optimistic row for it (i.e. after `sessions.json` caught
-  // up and the store had since loaded a completely different session's
-  // data over it). `row.optimistic` self-clears in lockstep with the merge
-  // (see `mergeSessionRows`), so the skip only applies during the exact
-  // unreconciled window the resident-data premise is actually true for.
+  // Choosing a row is an explicit user action, so (as on master) it is what
+  // loads the global store, and only when no capture or transcription is
+  // running: while capture runs NOTHING is written to the global store, the
+  // Transcript lens is a Review pane that queries `load_session` itself keyed
+  // by the row's id, whatever the capture flags say. The optimistic
+  // just-stopped row is skipped: its data is already resident (it WAS the live
+  // session) and re-reading it could race the finalize-on-disk gap
+  // `pendingFinalizingSession` exists to route around. `row.optimistic` (not
+  // the write-only `pendingFinalizingSession` slot) is the key because it
+  // self-clears with `mergeSessionRows`.
   const handleSelect = (row: SessionRow) => {
     setNavSessionId(row.id);
-    const isResidentLiveSession = row.optimistic === true;
-    if (isResidentLiveSession) return;
+    if (row.optimistic === true) return;
+    if (liveRunning) return;
     void loadSession(row.id);
   };
 
@@ -439,6 +450,15 @@ function SessionsBrowser() {
               {recoverySummary}
             </p>
           )}
+          {liveRunning && (
+            <p
+              id={LIVE_REVIEW_RULE_ID}
+              className="m-0 text-xs text-text-muted"
+              data-testid="sessions-live-review-rule"
+            >
+              {t("sessions.reviewNeedsCompletedWhileLive")}
+            </p>
+          )}
         </div>
 
         <div className="flex-1 min-h-0 overflow-y-auto px-(--space-4) pb-(--space-4)">
@@ -471,7 +491,8 @@ function SessionsBrowser() {
                   row={row}
                   selected={row.id === selectedId}
                   exporting={exportingIds.has(row.id)}
-                  reviewLocked={reviewLocked}
+                  reviewLocked={liveRunning}
+                  selectLocked={liveRunning && !reviewableWhileLive(row)}
                   locale={i18n.resolvedLanguage ?? i18n.language}
                   onSelect={() => handleSelect(row)}
                   onExport={() => handleExport(row.id)}
@@ -489,7 +510,7 @@ function SessionsBrowser() {
         key={samplePreviewActive ? "sample" : (selectedId ?? "none")}
         row={selectedRow}
         samplePreviewActive={samplePreviewActive}
-        reviewLocked={reviewLocked}
+        liveRunning={liveRunning}
       />
     </div>
   );
@@ -500,6 +521,8 @@ interface SessionRowItemProps {
   selected: boolean;
   exporting: boolean;
   reviewLocked: boolean;
+  /** Row cannot be opened right now (live run + not a completed row). */
+  selectLocked: boolean;
   locale: string;
   onSelect: () => void;
   onExport: () => void;
@@ -513,6 +536,7 @@ function SessionRowItem({
   selected,
   exporting,
   reviewLocked,
+  selectLocked,
   locale,
   onSelect,
   onExport,
@@ -540,8 +564,8 @@ function SessionRowItem({
         aria-label={title}
         onClick={onSelect}
         aria-current={selected ? "true" : undefined}
-        disabled={reviewLocked}
-        title={reviewLocked ? t("sessions.reviewLockedWhileLive") : undefined}
+        disabled={selectLocked}
+        aria-describedby={selectLocked ? LIVE_REVIEW_RULE_ID : undefined}
       >
         <div className="flex items-baseline justify-between gap-(--space-3)">
           <strong
@@ -647,20 +671,39 @@ function SessionRowItem({
   );
 }
 
+/** Localized notice for a pane that cannot be used right now. */
+function ReviewLockedNotice({ message }: { message: string }) {
+  return (
+    <div className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center">
+      <Icon name="warning" size={22} className="text-text-muted opacity-40" />
+      <p
+        className="m-0 max-w-[360px] text-sm text-text-secondary"
+        role="status"
+      >
+        {message}
+      </p>
+    </div>
+  );
+}
+
 interface SessionDetailProps {
   row: SessionRow | null;
   samplePreviewActive: boolean;
-  reviewLocked: boolean;
+  liveRunning: boolean;
 }
 
 function SessionDetail({
   row,
   samplePreviewActive,
-  reviewLocked,
+  liveRunning,
 }: SessionDetailProps) {
   const { t } = useTranslation();
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
-  const [lens, setLens] = useState<DetailLens>("notes");
+  // While capture runs the Transcript lens is the only migrated one, so open
+  // there instead of landing on a gated Notes lens.
+  const [lens, setLens] = useState<DetailLens>(
+    liveRunning ? "transcript" : "notes",
+  );
   const [askOpen, setAskOpen] = useState(false);
   const synthesis = useNotesSynthesis();
 
@@ -686,6 +729,9 @@ function SessionDetail({
   );
   const activeSessionId = samplePreviewActive ? null : (row?.id ?? null);
   useEffect(() => {
+    // While live, Notes/Graph are gated: their fetch actions hydrate the
+    // Live global fields, which a Review selection must never touch.
+    if (liveRunning) return;
     if (!activeSessionId || loadedSessionId !== activeSessionId) return;
     if (lens === "notes" && notesLensStatus.type === "idle") {
       void loadSessionNotesArtifacts(activeSessionId);
@@ -694,6 +740,7 @@ function SessionDetail({
       void loadSessionGraphArtifact(activeSessionId);
     }
   }, [
+    liveRunning,
     activeSessionId,
     loadedSessionId,
     lens,
@@ -703,22 +750,61 @@ function SessionDetail({
     loadSessionGraphArtifact,
   ]);
 
-  // While live, concurrent Live+Review is not delivered (plan §R2, ADR-0046) —
-  // reuses `sessions.reviewLockedWhileLive` verbatim (en.json:778), the same
-  // copy `loadSession`'s own guard has always shown.
-  if (reviewLocked) {
+  // ONE predicate decides whether anything that reads the global store, or
+  // asks the backend about its current buffers (Notes, Timeline and Graph
+  // lenses, Ask, "Generate prose summary"), may be shown for this row: the
+  // global store holds THIS session's data and nothing is capturing or
+  // transcribing. "Holds this session" is store truth, two ways:
+  //   - `loadedSessionId === row.id` (a session loaded by explicit action), or
+  //   - `loadedSessionId === null && pendingFinalizingSession?.id === row.id`:
+  //     the just-stopped session's resident live data. `stopCapture` writes
+  //     the slot, and `startCapture`, `loadSession` (of any other session),
+  //     `resetSessionView`, `clearTranscript`, `loadSessionTranscript` and
+  //     sample-preview enter/exit clear it, so it names the session whose data
+  //     is resident (see the invariant at the slot's declaration). It covers
+  //     the row both while optimistic and after it is indexed, and is false
+  //     after an unresolved Stop (null slot).
+  // Sample preview holds the store by construction. When the predicate is
+  // false the lens shows a gated or placeholder state with an explicit "Load"
+  // action; nothing here ever loads the global store on the user's behalf.
+  const pendingFinalizingSession = useAudioGraphStore(
+    (s) => s.pendingFinalizingSession,
+  );
+  const loadSession = useAudioGraphStore((s) => s.loadSession);
+  const globalHoldsRow =
+    samplePreviewActive ||
+    (!liveRunning &&
+      row !== null &&
+      (loadedSessionId === row.id ||
+        (loadedSessionId === null && pendingFinalizingSession?.id === row.id)));
+  const [loadState, setLoadState] = useState<"idle" | "loading" | "failed">(
+    "idle",
+  );
+  const handleLoadClick = () => {
+    if (activeSessionId === null || liveRunning) return;
+    setLoadState("loading");
+    void loadSession(activeSessionId).then((loaded) => {
+      setLoadState(loaded === null ? "failed" : "idle");
+    });
+  };
+
+  // Concurrent Live + Review (ADR-0028): the Transcript lens is a Review pane
+  // keyed by the row's own id, for every row except the optimistic just-stopped
+  // one (its data is resident in the global store). It does not depend on the
+  // capture flags, so Start/Stop never swaps what a reviewed session shows or
+  // exports. While capture runs a row that is not completed (the live session
+  // itself) stays locked.
+  const reviewSessionId =
+    !samplePreviewActive && row && row.optimistic !== true ? row.id : null;
+  if (liveRunning && row && !samplePreviewActive && !reviewableWhileLive(row)) {
     return (
       <section
         aria-label={t("sessions.detail")}
-        className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center"
+        className="flex flex-1 min-w-0 flex-col"
       >
-        <Icon name="warning" size={22} className="text-text-muted opacity-40" />
-        <p
-          className="m-0 max-w-[360px] text-sm text-text-secondary"
-          role="status"
-        >
-          {t("sessions.reviewLockedWhileLive")}
-        </p>
+        <ReviewLockedNotice
+          message={t("sessions.reviewNeedsCompletedWhileLive")}
+        />
       </section>
     );
   }
@@ -757,7 +843,15 @@ function SessionDetail({
     tabs?.[nextIndex]?.focus();
   };
 
-  const canAsk = askAvailable(lens);
+  // Ask/Chat and the overflow actions read the global store or the backend's
+  // current buffers, so they follow the same predicate as the lenses.
+  const canAsk = askAvailable(lens) && globalHoldsRow;
+  // Notes, Graph and Timeline still read the global store (slice 2 of #140
+  // migrates them).
+  const lensUsesGlobalStore =
+    lens === "notes" || lens === "graph" || lens === "timeline";
+  const lensBlocked = lensUsesGlobalStore && !globalHoldsRow;
+  const lensGatedWhileLive = lensBlocked && liveRunning;
   const sessionIdForRoute = samplePreviewActive ? null : (row?.id ?? null);
 
   return (
@@ -789,7 +883,7 @@ function SessionDetail({
           >
             <Icon name="chat" size={14} /> {t("sessions.ask")}
           </button>
-          {!loadedSessionId && (
+          {globalHoldsRow && !loadedSessionId && (
             <Popover
               trigger={
                 <IconButton
@@ -849,7 +943,45 @@ function SessionDetail({
           aria-labelledby={`sessions-lens-tab-${lens}`}
           className="flex-1 min-w-0 min-h-0 overflow-hidden flex flex-col"
         >
-          {lens === "notes" &&
+          {lensGatedWhileLive && (
+            <ReviewLockedNotice
+              message={t("sessions.reviewLensLockedWhileLive")}
+            />
+          )}
+          {lensBlocked && !liveRunning && (
+            <div className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center">
+              {loadState === "failed" ? (
+                <p
+                  className="m-0 max-w-[360px] text-sm text-text-secondary"
+                  role="alert"
+                >
+                  {t("sessions.review.viewUnavailable")}
+                </p>
+              ) : (
+                <p
+                  className="m-0 max-w-[360px] text-sm text-text-secondary"
+                  role="status"
+                >
+                  {loadState === "loading"
+                    ? t("common.loading")
+                    : t("sessions.review.needsLoad")}
+                </p>
+              )}
+              <button
+                type="button"
+                className="ag-btn-micro"
+                onClick={handleLoadClick}
+                disabled={loadState === "loading"}
+              >
+                <Icon name="refresh" size={14} />{" "}
+                {loadState === "failed"
+                  ? t("sessions.review.retry")
+                  : t("sessions.review.loadSession")}
+              </button>
+            </div>
+          )}
+          {!lensBlocked &&
+            lens === "notes" &&
             (notesLensStatus.type === "refused" ? (
               <ArtifactRefusalNotice status={notesLensStatus} />
             ) : notesLensStatus.type === "error" ? (
@@ -857,9 +989,17 @@ function SessionDetail({
             ) : (
               <NotesPanel synthesis={synthesis} headerActions={false} />
             ))}
-          {lens === "transcript" && <LiveTranscript />}
-          {lens === "timeline" && <SeekTimeline />}
-          {lens === "graph" &&
+          {lens === "transcript" &&
+            (reviewSessionId !== null ? (
+              <SessionViewProvider reviewSessionId={reviewSessionId}>
+                <LiveTranscript />
+              </SessionViewProvider>
+            ) : (
+              <LiveTranscript />
+            ))}
+          {!lensBlocked && lens === "timeline" && <SeekTimeline />}
+          {!lensBlocked &&
+            lens === "graph" &&
             (graphLensStatus.type === "refused" ? (
               <ArtifactRefusalNotice status={graphLensStatus} />
             ) : graphLensStatus.type === "error" ? (
