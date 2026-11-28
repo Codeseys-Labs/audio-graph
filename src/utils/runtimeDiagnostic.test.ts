@@ -1,3 +1,4 @@
+import i18next from "i18next";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { CREDENTIAL_CONTRACT } from "../generated/credentialContract";
 import {
@@ -7,8 +8,8 @@ import {
   type RuntimeErrorCode,
   type RuntimeSafeRecoveryAction,
 } from "../generated/runtimeDiagnostic";
-import type en from "../i18n/locales/en.json";
-import type pt from "../i18n/locales/pt.json";
+import en from "../i18n/locales/en.json";
+import pt from "../i18n/locales/pt.json";
 import {
   normalizeRuntimeDiagnostic,
   parseRuntimeDiagnostic,
@@ -314,6 +315,56 @@ describe("runtime diagnostic trust boundary", () => {
     });
     for (const canary of CANARIES) {
       expect(JSON.stringify(presentation)).not.toContain(canary);
+    }
+  });
+
+  it("localizes playback command errors and fails closed on malformed detail", async () => {
+    const i18n = i18next.createInstance();
+    await i18n.init({
+      lng: "en",
+      resources: {
+        en: { translation: en },
+        pt: { translation: pt },
+      },
+    });
+    const error = (
+      code: string,
+      recovery_action: RuntimeSafeRecoveryAction,
+    ) => ({
+      code: "runtime_diagnostic",
+      diagnostic: {
+        kind: "runtime",
+        detail: {
+          code,
+          retryable: false,
+          recovery_action,
+          context: { operation: "speech_synthesis", transport: "native" },
+        },
+      },
+    });
+    const driverProse = "driver says device no longer available in violet room";
+    for (const [payload, expectedCode, recoveryAction] of [
+      [
+        error("invalid_configuration", "review_configuration"),
+        "invalid_configuration",
+        "review_configuration",
+      ],
+      [error("internal", "none"), "internal", "none"],
+      [error(driverProse, "none"), "internal", "none"],
+    ] as const) {
+      const presentation = runtimeDiagnosticPresentation(payload);
+      expect(presentation).toMatchObject({
+        translationKey: `runtimeDiagnostics.runtime.${expectedCode}`,
+        retryable: false,
+        recoveryAction,
+      });
+      expect(i18n.t(presentation.translationKey, { lng: "en" })).toBe(
+        en.runtimeDiagnostics.runtime[expectedCode],
+      );
+      expect(i18n.t(presentation.translationKey, { lng: "pt" })).toBe(
+        pt.runtimeDiagnostics.runtime[expectedCode],
+      );
+      expect(JSON.stringify(presentation)).not.toContain(driverProse);
     }
   });
 });

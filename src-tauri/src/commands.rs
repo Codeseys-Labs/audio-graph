@@ -8158,7 +8158,12 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
             source_sample_rate: 24_000,
             source_channels: 1,
         })
-        .map_err(|e| log::warn!("converse: failed to open playback stream: {e}"));
+        .map_err(|error| {
+            log::warn!(
+                "converse: failed to open playback stream: {}",
+                error.to_runtime_diagnostic()
+            );
+        });
 
     match state.is_converse_active.write() {
         Ok(mut active) => {
@@ -8731,7 +8736,12 @@ pub async fn start_openai_realtime(
             source_sample_rate: 24_000,
             source_channels: 1,
         })
-        .map_err(|e| log::warn!("openai-realtime: failed to open playback stream: {e}"));
+        .map_err(|error| {
+            log::warn!(
+                "openai-realtime: failed to open playback stream: {}",
+                error.to_runtime_diagnostic()
+            );
+        });
 
     match state.is_openai_realtime_active.write() {
         Ok(mut active) => {
@@ -14056,7 +14066,7 @@ pub async fn start_audio_playback_cmd(
         None => state.audio_player.open_default(config),
         Some(name) => state.audio_player.open_named(name, config),
     };
-    result.map_err(|e| AppError::Unknown(e.to_string()))
+    result.map_err(|e| AppError::RuntimeDiagnostic(e.to_runtime_diagnostic()))
 }
 
 /// Stop the active playback stream. Subsequent `push_samples` calls return
@@ -14066,7 +14076,7 @@ pub async fn stop_audio_playback_cmd(state: State<'_, AppState>) -> AppResult<()
     state
         .audio_player
         .stop()
-        .map_err(|e| AppError::Unknown(e.to_string()))
+        .map_err(|e| AppError::RuntimeDiagnostic(e.to_runtime_diagnostic()))
 }
 
 // ---------------------------------------------------------------------------
@@ -14077,6 +14087,63 @@ pub async fn stop_audio_playback_cmd(state: State<'_, AppState>) -> AppResult<()
 mod tests {
     use super::*;
     use tauri::Listener;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn playback_commands_serialize_closed_diagnostics() {
+        use crate::playback::tests::{DEVICE_CANARY, DRIVER_CANARY, command_canary_player};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("playback-command-diagnostics");
+        let _guard = HomeGuard::set(&dir);
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let (player, worker) = command_canary_player();
+        let mut state = AppState::new();
+        state.audio_player = player;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let missing = start_audio_playback_cmd(app.state(), Some(DEVICE_CANARY.to_owned()), None)
+            .await
+            .unwrap_err();
+        let driver = start_audio_playback_cmd(app.state(), None, None)
+            .await
+            .unwrap_err();
+        worker.join().unwrap();
+        let stopped = stop_audio_playback_cmd(app.state()).await.unwrap_err();
+
+        for (error, code, recovery) in [
+            (missing, "invalid_configuration", "review_configuration"),
+            (driver, "internal", "none"),
+            (stopped, "internal", "none"),
+        ] {
+            let wire = serde_json::to_value(&error).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({
+                    "code": "runtime_diagnostic",
+                    "diagnostic": {
+                        "kind": "runtime",
+                        "detail": {
+                            "code": code,
+                            "retryable": false,
+                            "recovery_action": recovery,
+                            "context": {"operation": "speech_synthesis", "transport": "native"}
+                        }
+                    }
+                }),
+            );
+            for rendered in [wire.to_string(), error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains(DEVICE_CANARY));
+                assert!(!rendered.contains(DRIVER_CANARY));
+            }
+        }
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(!logs.contains(DEVICE_CANARY));
+        assert!(!logs.contains(DRIVER_CANARY));
+    }
 
     /// Issue #145: all six realtime worker-spawn failures return this closed
     /// diagnostic instead of a formatted `io::Error` in `AppError::Unknown`.

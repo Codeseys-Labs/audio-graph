@@ -197,33 +197,241 @@ fn playback_producer_resamples_before_ring_buffer() {
     assert!(drained.iter().all(|sample| *sample == 0));
 }
 
-/// Wave B intentionally constructs a fresh HeapRb per stream-open. This
-/// test checks the contract surface: open_default returns NoDefaultDevice
-/// on a headless CI runner without panicking.
-///
-/// Skipped on Windows because Blacksmith Windows VMs ship without an audio
-/// service (Audiosrv absent). cpal's WASAPI default_output_device probe
-/// then segfaults inside MMDeviceEnumerator::GetDefaultAudioEndpoint
-/// before we can return our NoDefaultDevice error. This is the same
-/// limitation rsac ran into on the same runners — see their
-/// .github/workflows/ci-audio-tests.yml for the workaround pattern.
+/// Smoke test for hosts with working audio services.
 #[cfg(not(target_os = "windows"))]
 #[test]
+#[ignore = "opens the host output stream and requires a working audio service"]
 fn open_default_handles_missing_device_gracefully() {
     let player = AudioPlayer::new();
-    let result = player.open_default(PlaybackConfig::default());
-    // On headless CI: NoDefaultDevice (or similar BuildStream error wrapped
-    // in PlaybackError). On a real machine: Ok. Either way we should not
-    // panic.
-    match result {
-        Ok(()) => {
-            // Real machine — push some samples and verify they fit in the
-            // ringbuf.
-            assert!(player.free_samples() > 0);
-        }
-        Err(PlaybackError::NoDefaultDevice) | Err(PlaybackError::BuildStream(_)) => {
-            // Acceptable on headless CI.
-        }
+    match player.open_default(PlaybackConfig::default()) {
+        Ok(()) => assert!(player.free_samples() > 0),
+        Err(
+            PlaybackError::NoDefaultDevice
+            | PlaybackError::DeviceUnavailable
+            | PlaybackError::NoSupportedFormat
+            | PlaybackError::BuildStream
+            | PlaybackError::PlayStream,
+        ) => {}
         Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+pub(crate) const DEVICE_CANARY: &str = "private violet conference speaker";
+pub(crate) const DRIVER_CANARY: &str = "driver says device no longer available in violet room";
+
+fn backend_error() -> cpal::BackendSpecificError {
+    cpal::BackendSpecificError {
+        description: DRIVER_CANARY.into(),
+    }
+}
+
+/// Exercise the same typed reply channel as the CPAL worker without opening a device.
+pub(crate) fn command_canary_player() -> (AudioPlayer, std::thread::JoinHandle<()>) {
+    let (cmd_tx, cmd_rx) = unbounded();
+    let worker = std::thread::spawn(move || {
+        let Ok(AudioCommand::OpenStream {
+            device_name, reply, ..
+        }) = cmd_rx.recv()
+        else {
+            panic!("expected named device request");
+        };
+        assert_eq!(device_name.as_deref(), Some(DEVICE_CANARY));
+        let missing =
+            find_named_output(["different output"].into_iter(), DEVICE_CANARY, |device| {
+                Ok((*device).to_owned())
+            })
+            .unwrap_err();
+        reply.send(Err(missing)).unwrap();
+
+        let Ok(AudioCommand::OpenStream {
+            device_name, reply, ..
+        }) = cmd_rx.recv()
+        else {
+            panic!("expected default device request");
+        };
+        assert!(device_name.is_none());
+        reply
+            .send(Err(BuildStreamError::from(backend_error()).into()))
+            .unwrap();
+    });
+    (
+        AudioPlayer {
+            cmd_tx,
+            producer: Arc::default(),
+            cancel: Arc::default(),
+            capacity: DEFAULT_CAPACITY,
+        },
+        worker,
+    )
+}
+
+#[test]
+fn playback_diagnostic_mapping_uses_closed_native_codes() {
+    use audio_graph_ipc_contract::runtime_diagnostic::{
+        RuntimeErrorCode as Code, RuntimeSafeRecoveryAction as Action,
+    };
+
+    for (error, code, retryable, recovery_action) in [
+        (
+            PlaybackError::NoDefaultDevice,
+            Code::InvalidConfiguration,
+            false,
+            Action::ReviewConfiguration,
+        ),
+        (
+            PlaybackError::DeviceNotFound,
+            Code::InvalidConfiguration,
+            false,
+            Action::ReviewConfiguration,
+        ),
+        (
+            PlaybackError::DeviceUnavailable,
+            Code::InvalidConfiguration,
+            false,
+            Action::ReviewConfiguration,
+        ),
+        (
+            PlaybackError::NoSupportedFormat,
+            Code::InvalidConfiguration,
+            false,
+            Action::ReviewConfiguration,
+        ),
+        (
+            PlaybackError::InvalidConfiguration,
+            Code::InvalidConfiguration,
+            false,
+            Action::ReviewConfiguration,
+        ),
+        (
+            PlaybackError::BuildStream,
+            Code::Internal,
+            false,
+            Action::None,
+        ),
+        (
+            PlaybackError::PlayStream,
+            Code::Internal,
+            false,
+            Action::None,
+        ),
+        (PlaybackError::Stream, Code::Internal, false, Action::None),
+        (
+            PlaybackError::Resampler,
+            Code::Internal,
+            false,
+            Action::None,
+        ),
+        (
+            PlaybackError::ThreadDead,
+            Code::Internal,
+            false,
+            Action::None,
+        ),
+    ] {
+        let RuntimeDiagnostic::Runtime(diagnostic) = error.to_runtime_diagnostic() else {
+            panic!("expected runtime diagnostic");
+        };
+        assert_eq!(diagnostic.code, code, "{error:?}");
+        assert_eq!(diagnostic.retryable, retryable, "{error:?}");
+        assert_eq!(diagnostic.recovery_action, recovery_action, "{error:?}");
+        assert_eq!(
+            diagnostic.context.operation,
+            RuntimeOperation::SpeechSynthesis
+        );
+        assert_eq!(diagnostic.context.transport, Some(RuntimeTransport::Native));
+        assert_eq!(diagnostic.context.status_class, None);
+        assert_eq!(diagnostic.context.retry_delay, None);
+    }
+}
+
+#[test]
+fn classifies_cpal_kinds_without_reading_backend_prose() {
+    assert_eq!(
+        PlaybackError::from(DefaultStreamConfigError::DeviceNotAvailable),
+        PlaybackError::DeviceUnavailable,
+    );
+    assert_eq!(
+        PlaybackError::from(BuildStreamError::DeviceNotAvailable),
+        PlaybackError::DeviceUnavailable,
+    );
+    assert_eq!(
+        PlaybackError::from(PlayStreamError::DeviceNotAvailable),
+        PlaybackError::DeviceUnavailable,
+    );
+    assert_eq!(
+        PlaybackError::from(DefaultStreamConfigError::from(backend_error())),
+        PlaybackError::BuildStream,
+    );
+    assert_eq!(
+        PlaybackError::from(BuildStreamError::from(backend_error())),
+        PlaybackError::BuildStream,
+    );
+    assert_eq!(
+        PlaybackError::from(PlayStreamError::from(backend_error())),
+        PlaybackError::PlayStream,
+    );
+    assert_eq!(
+        find_named_output([()].into_iter(), DEVICE_CANARY, |_| Err(
+            backend_error().into()
+        )),
+        Err(PlaybackError::BuildStream),
+    );
+    let named = find_named_output([0, 1].into_iter(), DEVICE_CANARY, |device| match device {
+        0 => Err(backend_error().into()),
+        _ => Ok(DEVICE_CANARY.to_owned()),
+    });
+    assert_eq!(named, Ok(1));
+}
+
+#[test]
+fn stream_callback_and_resampler_logs_export_only_codes() {
+    use crate::test_log_capture::ThreadLogCapture;
+    use rubato::PolynomialDegree;
+
+    let capture = ThreadLogCapture::start();
+    // CPAL registers this function directly as the stream error callback.
+    log_stream_error(backend_error().into());
+    log_stream_error(StreamError::DeviceNotAvailable);
+
+    let (prod, mut cons) = HeapRb::<i16>::new(8_192).split();
+    let mut producer = PlaybackProducer::new(prod, 24_000, 48_000).unwrap();
+    let resampler = producer.resampler.as_mut().unwrap();
+    // The playback adapter is mono, so a two-channel resampler yields a real
+    // rubato WrongNumberOfInputChannels error before writing any samples.
+    resampler.resampler = Async::new_poly(
+        2.0,
+        2.0,
+        PolynomialDegree::Linear,
+        PLAYBACK_RESAMPLER_CHUNK_SIZE,
+        2,
+        FixedAsync::Input,
+    )
+    .unwrap();
+    assert_eq!(
+        producer.push_source_samples(&[0; PLAYBACK_RESAMPLER_CHUNK_SIZE]),
+        0
+    );
+    assert_eq!(producer.push_source_samples(&[1]), 0);
+    assert_eq!(producer.flush(), 0);
+    assert_eq!(cons.pop_slice(&mut [0; 16]), 0);
+
+    let records = capture.finish();
+    let playback: Vec<_> = records
+        .iter()
+        .filter(|record| record.target == module_path!().trim_end_matches("::tests"))
+        .map(|record| record.message.as_str())
+        .collect();
+    assert_eq!(
+        playback,
+        [
+            "cpal stream error: runtime/internal",
+            "cpal stream error: runtime/invalid_configuration",
+            "playback resampling failed: runtime/internal",
+            "playback resampler flush failed: runtime/internal",
+        ],
+    );
+    let captured = crate::test_log_capture::render(&records);
+    for canary in [DEVICE_CANARY, DRIVER_CANARY, "Wrong number of channels"] {
+        assert!(!captured.contains(canary));
     }
 }
