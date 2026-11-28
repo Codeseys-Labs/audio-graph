@@ -74,8 +74,9 @@ pub(super) enum SendError {
     InvalidUrl,
     /// More same-origin redirects than one chain may hold.
     TooManyRedirects,
-    /// The chain's time ran out between two hops.
-    DeadlineExceeded,
+    /// The chain's time ran out before a send. `sent` is whether any request
+    /// of the chain had gone out by then.
+    DeadlineExceeded { sent: bool },
 }
 
 impl SendError {
@@ -85,7 +86,10 @@ impl SendError {
             Self::Transport(error) => HttpFailure::request(&error, INFERENCE),
             Self::InvalidUrl => HttpFailure::new(Code::RequestRejected, INFERENCE),
             Self::TooManyRedirects => HttpFailure::new(Code::ProtocolError, INFERENCE),
-            Self::DeadlineExceeded => HttpFailure::new(Code::Timeout, INFERENCE),
+            // Classified as a timeout after a send is in
+            // `HttpFailure::request`: the remote effect is unknown.
+            Self::DeadlineExceeded { sent: true } => HttpFailure::sent_timeout(INFERENCE),
+            Self::DeadlineExceeded { sent: false } => HttpFailure::new(Code::Timeout, INFERENCE),
         }
     }
 }
@@ -103,11 +107,15 @@ impl SendError {
 /// not followed: they turn a POST into a GET without its body.
 ///
 /// The whole chain, connection to the last response body, shares one
-/// `budget`: each hop is given the time that remains, as the client's
-/// request timeout bounded the chain when reqwest followed redirects itself.
-/// A retry by the caller starts a new chain. As under reqwest's policy, at
-/// most `MAX_REDIRECTS` requests are sent, the first and nine hops; a tenth
-/// redirect ends the chain as too many.
+/// `budget`: each hop is given the time that remains once leave is given and
+/// its request is built, as the client's request timeout bounded the chain
+/// when reqwest followed redirects itself. A retry by the caller starts a new
+/// chain. As under reqwest's policy, at most `MAX_REDIRECTS` requests are
+/// sent, the first and nine hops; a tenth redirect ends the chain as too many.
+///
+/// A hop that an HTTP/2 server refuses unprocessed (see [`is_refused_stream`])
+/// is sent again in place, once, after asking leave again and within the same
+/// budget; reqwest's own resend stays off. A second refusal is returned.
 pub(super) fn send_admitted(
     url: &str,
     budget: std::time::Duration,
@@ -115,22 +123,38 @@ pub(super) fn send_admitted(
     request: impl Fn(&str) -> reqwest::blocking::RequestBuilder,
 ) -> Result<reqwest::blocking::Response, SendError> {
     let deadline = std::time::Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
     let mut current = url::Url::parse(url).map_err(|_| SendError::InvalidUrl)?;
     let origin = current.origin();
     let userinfo = (
         current.username().to_owned(),
         current.password().map(str::to_owned),
     );
+    let mut sent = false;
     for _ in 0..MAX_REDIRECTS {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(SendError::DeadlineExceeded);
-        }
-        leave().map_err(SendError::Refused)?;
-        let response = request(current.as_str())
-            .timeout(remaining)
-            .send()
-            .map_err(SendError::Transport)?;
+        let mut resent = false;
+        let response = loop {
+            if remaining().is_zero() {
+                return Err(SendError::DeadlineExceeded { sent });
+            }
+            leave().map_err(SendError::Refused)?;
+            let builder = request(current.as_str());
+            // Leave can wait on the slot's mutex: what is left is measured
+            // after it, just before the send.
+            let left = remaining();
+            if left.is_zero() {
+                return Err(SendError::DeadlineExceeded { sent });
+            }
+            let outcome = builder.timeout(left).send();
+            sent = true;
+            #[cfg(test)]
+            after_send::run();
+            match outcome {
+                Ok(response) => break response,
+                Err(error) if !resent && is_refused_stream(&error) => resent = true,
+                Err(error) => return Err(SendError::Transport(error)),
+            }
+        };
         if !matches!(response.status().as_u16(), 307 | 308) {
             return Ok(response);
         }
@@ -151,6 +175,29 @@ pub(super) fn send_admitted(
         }
     }
     Err(SendError::TooManyRedirects)
+}
+
+/// A hook a test runs on the sending thread after each send, to unwind a
+/// dial after its request went out.
+#[cfg(test)]
+pub(crate) mod after_send {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: impl FnMut() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+        }
+    }
 }
 
 /// Whether an HTTP/2 server refused the request before processing it: a
@@ -260,13 +307,20 @@ impl HttpFailure {
         } else {
             Code::Internal
         };
-        let mut failure = Self::new(code, context);
-        // A pre-header timeout may already have incurred a remote effect.
         if code == Code::Timeout {
-            failure.diagnostic =
-                RuntimeErrorDiagnostic::new(code, false, Action::None, context).into();
+            return Self::sent_timeout(context);
         }
-        failure
+        Self::new(code, context)
+    }
+
+    /// A timeout once a request was sent: a remote effect may already have
+    /// happened, so it is not offered as safe to retry.
+    pub(super) fn sent_timeout(context: RuntimeDiagnosticContext) -> Self {
+        Self {
+            diagnostic: RuntimeErrorDiagnostic::new(Code::Timeout, false, Action::None, context)
+                .into(),
+            schema_rejection: None,
+        }
     }
 
     pub(super) fn response(error: &reqwest::Error, context: RuntimeDiagnosticContext) -> Self {
@@ -574,5 +628,206 @@ mod tests {
         assert!(matches!(error, SendError::TooManyRedirects));
         // The first request and nine hops, as reqwest's policy allowed.
         assert_eq!(heads.lock().unwrap().len(), 10);
+    }
+
+    /// What [`spawn_scripted_h2`] does with one stream.
+    #[derive(Clone, Copy)]
+    enum H2Answer {
+        Refuse,
+        Status(u16, Option<&'static str>),
+    }
+
+    /// An HTTP/2 server (prior knowledge, no TLS) that answers its streams by
+    /// `script`, in order, and keeps each stream's path.
+    async fn spawn_scripted_h2(
+        script: Vec<H2Answer>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 mock");
+        let addr = listener.local_addr().expect("local addr");
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = paths.clone();
+        let script = std::sync::Arc::new(std::sync::Mutex::new(script.into_iter()));
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (kept, script) = (kept.clone(), script.clone());
+                tokio::spawn(async move {
+                    let Ok(mut connection) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        kept.lock().unwrap().push(request.uri().path().to_string());
+                        let answer = script.lock().unwrap().next();
+                        match answer {
+                            Some(H2Answer::Status(status, location)) => {
+                                let mut response = tauri::http::Response::builder().status(status);
+                                if let Some(location) = location {
+                                    response = response.header("location", location);
+                                }
+                                let _ = respond.send_response(response.body(()).unwrap(), true);
+                            }
+                            Some(H2Answer::Refuse) | None => {
+                                respond.send_reset(h2::Reason::REFUSED_STREAM);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/v1/chat/completions"), paths)
+    }
+
+    /// Send `url` from an HTTP/2 job client through [`send_admitted`], with
+    /// `leave` answering each ask by its number (0 first).
+    fn send_h2(
+        url: String,
+        leave: impl Fn(usize) -> Result<(), crate::llm::admission::SendRefused> + Send + 'static,
+    ) -> (Result<u16, SendError>, usize) {
+        std::thread::spawn(move || {
+            let client = job_client_builder()
+                .http2_prior_knowledge()
+                .build()
+                .expect("build client");
+            let asked = std::cell::Cell::new(0);
+            let result = send_admitted(
+                &url,
+                std::time::Duration::from_secs(10),
+                || {
+                    let ask = asked.get();
+                    asked.set(ask + 1);
+                    leave(ask)
+                },
+                |url| client.post(url).body("{}"),
+            )
+            .map(|response| response.status().as_u16());
+            (result, asked.get())
+        })
+        .join()
+        .expect("client thread")
+    }
+
+    #[test]
+    fn a_refused_stream_is_sent_again_once_after_asking_leave() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+
+        // Refused, then accepted: two streams, two asks.
+        let (url, paths) = rt.block_on(spawn_scripted_h2(vec![
+            H2Answer::Refuse,
+            H2Answer::Status(200, None),
+        ]));
+        let (result, asked) = send_h2(url, |_| Ok(()));
+        assert_eq!(result.expect("the resend is answered"), 200);
+        assert_eq!(asked, 2);
+        assert_eq!(paths.lock().unwrap().len(), 2);
+
+        // Refused twice: the second refusal is returned, as before.
+        let (url, paths) = rt.block_on(spawn_scripted_h2(vec![H2Answer::Refuse; 3]));
+        let (result, asked) = send_h2(url, |_| Ok(()));
+        let Err(SendError::Transport(error)) = result else {
+            panic!("a second refusal is returned");
+        };
+        assert!(is_refused_stream(&error));
+        assert_eq!((asked, paths.lock().unwrap().len()), (2, 2));
+
+        // A save between the refusal and the resend stops the resend.
+        let (url, paths) = rt.block_on(spawn_scripted_h2(vec![
+            H2Answer::Refuse,
+            H2Answer::Status(200, None),
+        ]));
+        let (result, asked) = send_h2(url, |ask| match ask {
+            0 => Ok(()),
+            _ => Err(crate::llm::admission::SendRefused::Replaced),
+        });
+        let error = result.expect_err("the resend is refused");
+        assert_eq!(error.into_failure().to_string(), "runtime/policy_blocked");
+        assert_eq!((asked, paths.lock().unwrap().len()), (2, 1));
+    }
+
+    #[test]
+    fn a_refused_redirect_hop_is_sent_again_not_the_original_request() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (url, paths) = rt.block_on(spawn_scripted_h2(vec![
+            H2Answer::Status(307, Some("/moved/chat/completions")),
+            H2Answer::Refuse,
+            H2Answer::Status(200, None),
+        ]));
+        let (result, asked) = send_h2(url, |_| Ok(()));
+        assert_eq!(result.expect("the resent hop is answered"), 200);
+        assert_eq!(asked, 3);
+        assert_eq!(
+            *paths.lock().unwrap(),
+            [
+                "/v1/chat/completions",
+                "/moved/chat/completions",
+                "/moved/chat/completions"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_expired_chain_is_safe_to_retry_only_if_nothing_was_sent() {
+        let retryable = |error: SendError| match error.into_failure().diagnostic {
+            RuntimeDiagnostic::Runtime(detail) => {
+                assert_eq!(detail.code, Code::Timeout);
+                detail.retryable
+            }
+            other => panic!("{other:?}"),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let budget = std::time::Duration::from_millis(200);
+        let slow_leave = || std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The first ask outlasts the budget: measured after leave, nothing sent.
+        let (addr, heads) = rt.block_on(spawn_redirect_mock(
+            vec![(200, None)],
+            std::time::Duration::ZERO,
+        ));
+        let error = std::thread::spawn(move || {
+            let client = job_client_builder().build().expect("build client");
+            send_admitted(
+                &format!("http://{addr}/v1/chat/completions"),
+                budget,
+                || {
+                    slow_leave();
+                    Ok(())
+                },
+                |url| client.post(url),
+            )
+            .expect_err("no time is left to send")
+        })
+        .join()
+        .expect("client thread");
+        assert!(matches!(error, SendError::DeadlineExceeded { sent: false }));
+        assert!(retryable(error));
+        assert!(heads.lock().unwrap().is_empty());
+
+        // The POST was answered with a redirect, then the hop's ask outlasts
+        // the budget: something was sent, so it is not offered as safe to retry.
+        let (addr, heads) = rt.block_on(spawn_redirect_mock(
+            vec![(307, Some("/moved")), (200, None)],
+            std::time::Duration::ZERO,
+        ));
+        let error = std::thread::spawn(move || {
+            let client = job_client_builder().build().expect("build client");
+            let asked = std::cell::Cell::new(0);
+            send_admitted(
+                &format!("http://{addr}/v1/chat/completions"),
+                budget,
+                || {
+                    if asked.replace(asked.get() + 1) > 0 {
+                        slow_leave();
+                    }
+                    Ok(())
+                },
+                |url| client.post(url),
+            )
+            .expect_err("no time is left for the hop")
+        })
+        .join()
+        .expect("client thread");
+        assert!(matches!(error, SendError::DeadlineExceeded { sent: true }));
+        assert!(!retryable(error));
+        assert_eq!(heads.lock().unwrap().len(), 1);
     }
 }

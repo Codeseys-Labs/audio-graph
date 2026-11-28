@@ -26,8 +26,8 @@ use std::time::Duration;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::admission::{ClientSlot, SendRefused, leave_to_send};
 use crate::llm::http_diag::{
-    HttpFailure, INFERENCE, SendError, diagnostic, http_context, is_refused_stream,
-    job_client_builder, same_origin_redirects, send_admitted,
+    HttpFailure, INFERENCE, SendError, diagnostic, http_context, job_client_builder,
+    same_origin_redirects, send_admitted,
 };
 use crate::llm::route::{
     ConstrainedDecodingGrade, RequestOutputForm, TerminalStatus, WireOutcome,
@@ -2173,10 +2173,12 @@ fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
 /// idempotency proof plus cost/egress authorization. Narrowing this reduces
 /// auto-retry, which is the safe direction (M4 / audio-graph-7060 originally
 /// retried both).
+///
+/// An HTTP/2 refusal is not retried here: `send_admitted` already resent the
+/// refused hop in place, and a second refusal of a redirected hop must not
+/// replay the original request.
 fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
-    // An HTTP/2 refusal says the request was not processed; the resend goes
-    // back through this loop, so it asks leave first.
-    error.is_connect() || is_refused_stream(error)
+    error.is_connect()
 }
 
 /// Whether a **body-decode** failure on an otherwise-successful (2xx) response
@@ -4512,6 +4514,11 @@ mod tests {
     fn a_save_between_a_post_and_its_redirect_stops_the_hop() {
         use std::sync::atomic::Ordering::SeqCst;
 
+        // The answered chat records a completion in the global accounting
+        // sink, which the accounting tests read exactly.
+        let _accounting = ACCOUNTING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let allow = crate::asr::ProviderContentEgressPolicy::allow;
         for save in [true, false] {

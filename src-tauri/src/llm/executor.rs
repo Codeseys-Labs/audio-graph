@@ -1403,12 +1403,29 @@ fn projection_api(
     // session-start snapshot `route` was minted from (seeds audio-graph-862c /
     // audio-graph-7da4). An attempt that admission refused dialled nothing,
     // and stamps nothing.
-    let identity = AttemptedRouteIdentity::for_route(live, Some(&client.config().endpoint));
-    let output = projection_api_dial(route, live, client, messages, cache);
-    if client.attempt_was_admitted() {
-        stamp_attempted_route(attempted_route, identity);
+    let _stamp = StampOnAdmission {
+        attempted_route,
+        identity: AttemptedRouteIdentity::for_route(live, Some(&client.config().endpoint)),
+        admitted: &|| client.attempt_was_admitted(),
+    };
+    projection_api_dial(route, live, client, messages, cache)
+}
+
+/// Writes a dial's route stamp when the dial ends, by returning or by
+/// unwinding, if a transport attempt from the job's client passed admission
+/// by then: content may have left the machine even if the dial never returns.
+struct StampOnAdmission<'a> {
+    attempted_route: &'a mut Option<AttemptedRouteIdentity>,
+    identity: AttemptedRouteIdentity,
+    admitted: &'a dyn Fn() -> bool,
+}
+
+impl Drop for StampOnAdmission<'_> {
+    fn drop(&mut self) {
+        if (self.admitted)() {
+            stamp_attempted_route(self.attempted_route, self.identity);
+        }
     }
-    output
 }
 
 fn projection_api_dial(
@@ -1494,13 +1511,13 @@ fn projection_openrouter(
     let live = openrouter_route_for_client(route, client)?;
     // OpenRouter has no loopback deployment, so unlike the API route above no
     // endpoint string is needed to know this is remote. Stamped as there:
-    // once a transport attempt passed admission.
-    let identity = AttemptedRouteIdentity::for_route(live, None);
-    let output = projection_openrouter_dial(route, live, client, messages, cache);
-    if client.attempt_was_admitted() {
-        stamp_attempted_route(attempted_route, identity);
-    }
-    output
+    // once a transport attempt passed admission, on return or unwind.
+    let _stamp = StampOnAdmission {
+        attempted_route,
+        identity: AttemptedRouteIdentity::for_route(live, None),
+        admitted: &|| client.attempt_was_admitted(),
+    };
+    projection_openrouter_dial(route, live, client, messages, cache)
 }
 
 fn projection_openrouter_dial(
@@ -1747,9 +1764,12 @@ fn extraction_client<T: JobClient>(client: &AdmittedClient<T>) -> Option<&T> {
             log::warn!("LLM extraction falling back: the backend slot is poisoned");
             None
         }
-        Err(SendRefused::Replaced) => {
+        Err(refused @ SendRefused::Replaced) => {
+            // The same closed code a refusal at the send reports, and no
+            // detail of either client.
             log::warn!(
-                "LLM extraction falling back: its client was replaced after the job was queued"
+                "LLM extraction falling back: {}",
+                executor_failure(refused.report())
             );
             None
         }
@@ -4964,5 +4984,80 @@ mod tests {
             "runtime/internal"
         );
         assert_eq!(never_started.attempted_route, None);
+    }
+
+    #[test]
+    fn a_projection_whose_dial_unwinds_after_its_request_was_sent_names_its_route() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (base, requests) = rt.block_on(spawn_counting_mock(vec![unusable_patch_reply()]));
+        let shared = SharedBackends {
+            api_client: Arc::new(Mutex::new(Some(probe_api_client(&base)))),
+            ..empty_shared()
+        };
+        // The dial unwinds inside the client, after its first request passed
+        // admission and was answered, before the dial returns.
+        let executor = LlmExecutor::with_runner(
+            shared,
+            Arc::new(move |job| {
+                let LlmJob::ProjectionPatch {
+                    job,
+                    ledger,
+                    snapshots,
+                    sequence,
+                    created_at_ms,
+                    provider,
+                    backends,
+                    attempted_route,
+                    response_tx,
+                } = job
+                else {
+                    unreachable!("only projections are queued");
+                };
+                let _response_tx = response_tx;
+                crate::llm::http_diag::after_send::set(|| panic!("the dial unwinds"));
+                let _ = run_projection_patch(
+                    &backends,
+                    &provider,
+                    &job,
+                    &ledger,
+                    snapshots.view(),
+                    sequence,
+                    created_at_ms,
+                    &attempted_route,
+                );
+                unreachable!("the dial unwound");
+            }),
+        );
+        let provider = LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+        let outcome = spawn_caller(move || {
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+            executor.generate_projection_patch(
+                job,
+                ledger,
+                None::<crate::projections::MaterializedNotes>,
+                provider,
+                1,
+                100,
+            )
+        })
+        .recv_timeout(JOB_WAIT)
+        .expect("the projection's caller");
+
+        assert_eq!(
+            outcome.outcome.expect_err("its worker ended"),
+            "runtime/internal"
+        );
+        assert_eq!(
+            outcome.attempted_route,
+            Some(AttemptedRouteIdentity::for_route(
+                route_for_api_endpoint(&base),
+                Some(&base)
+            ))
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
