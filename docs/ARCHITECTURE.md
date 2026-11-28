@@ -797,15 +797,19 @@ sequenceDiagram
     participant Graph as Knowledge Graph
     participant Audit as Movement Ledger
 
-    UI->>Main: start_capture(source_id)
+    UI->>Main: start_capture(sources[])
     Main->>Pipe: ResetSession barrier
     Pipe->>Disp: ordered processed reset
     Disp-->>Main: outgoing prefix handled
-    Main->>Cap: prepare capture thread
-    Cap->>Cap: rsac build/start/subscribe
-    Cap-->>Main: Ready (audio gated)
-    Main->>Audit: flush/sync first-source CaptureStarted (not ADR-0027 Accepted)
-    Main->>Cap: Commit / release receive loop
+    loop Each requested source, in order
+        Main->>Cap: prepare capture thread
+        Cap->>Cap: rsac build/start/subscribe
+        Cap-->>Main: Ready (audio gated) or closed failure reason
+    end
+    Note over Main,Cap: Any failure or Stop: stop and join every prepared worker; nothing published
+    Main->>Audit: flush/sync CaptureStarted (not ADR-0027 Accepted)
+    Main->>Cap: Commit every source / release receive loops
+    Main-->>UI: acknowledged generation; capture Running
 
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)

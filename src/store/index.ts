@@ -77,6 +77,7 @@ import type {
   AsrSpanRevisionEvent,
   AudioGraphStore,
   AudioSourceInfo,
+  CaptureStartAck,
   ChatMessage,
   ChatResponse,
   ChatStreamEvent,
@@ -120,6 +121,7 @@ import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import {
   artifactTooLargeDetails,
   errorToMessage,
+  isAppErrorPayload,
   notifyCredentialWarning,
 } from "../utils/errorToMessage";
 import { fuzzyEntityNameMatch } from "../utils/materializedGraph";
@@ -139,6 +141,42 @@ const idleStage: StageStatus = { type: "Idle" };
 // historical request invalidates older async Review responses before they can
 // overwrite the current workspace.
 let historicalLoadGeneration = 0;
+
+/**
+ * A failed capture start names its failing source with the user's own label
+ * for it: the backend identifies sources only by request position.
+ */
+function captureStartErrorMessage(
+  e: unknown,
+  sourceAt: (index: number) => AudioSourceInfo | undefined,
+): string {
+  const message = errorToMessage(e);
+  if (!isAppErrorPayload(e) || e.code !== "capture_start_failed") {
+    return message;
+  }
+  const index = e.message?.source_index;
+  const source = typeof index === "number" ? sourceAt(index) : undefined;
+  return source
+    ? i18n.t("errors.captureStart.forSource", {
+        source: source.name,
+        reason: message,
+      })
+    : message;
+}
+
+/**
+ * Whether the global store belongs to live capture: running, transcribing,
+ * or starting (Start pressed, not yet acknowledged). A historical load must
+ * neither begin nor land meanwhile.
+ */
+function liveCaptureHoldsStore(
+  state: Pick<
+    AudioGraphStore,
+    "isCapturing" | "isTranscribing" | "captureStarting"
+  >,
+): boolean {
+  return state.isCapturing || state.isTranscribing || state.captureStarting;
+}
 
 const PROVIDER_DESCRIPTOR_BY_ID = new Map(
   GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),
@@ -2952,6 +2990,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
   // ── Capture state ────────────────────────────────────────────────────
   isCapturing: false,
+  captureStarting: false,
+  captureSourceIds: [],
   captureStartTime: null,
   setIsCapturing: (capturing) =>
     set((state) => ({
@@ -2978,6 +3018,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }),
   startCapture: async () => {
     const { selectedSourceIds, audioSources } = get();
+    // One start at a time: a second press (or shortcut) before the backend
+    // answers would be refused anyway, and must not reset the view again.
+    if (get().captureStarting) return;
     if (selectedSourceIds.length === 0) {
       set({ error: "No audio source selected" });
       return;
@@ -2996,6 +3039,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // premise is void — clear the pending row rather than let it outlive
       // the data it described.
       pendingFinalizingSession: null,
+      // Held until the backend acknowledges every source or the start fails:
+      // session loaders refuse meanwhile, so no historical session can land
+      // in the store the capture is about to open into.
+      captureStarting: true,
       // Historical Review and Live currently share one frontend view store.
       // Clear every session-scoped projection before live listeners resume so
       // the first new event cannot append to or overwrite historical data.
@@ -3032,28 +3079,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       if (source.capture_target)
         sourcesBySelectionId.set(source.capture_target, source);
     }
-    const startedSourceIds: string[] = [];
+    const sources = selectedSourceIds.map((sourceId) => {
+      const source = sourcesBySelectionId.get(sourceId);
+      return source ? { sourceId, source } : { sourceId };
+    });
     try {
-      for (const sourceId of selectedSourceIds) {
-        const source = sourcesBySelectionId.get(sourceId);
-        await invoke(
-          "start_capture",
-          source ? { sourceId, source } : { sourceId },
-        );
-        startedSourceIds.push(sourceId);
-      }
+      // One aggregate start: the backend acknowledges every source or rolls
+      // all of them back, so there is nothing to undo here on failure.
+      const ack = await invoke<CaptureStartAck | null>("start_capture", {
+        sources,
+      });
       set({
+        captureStarting: false,
         isCapturing: true,
+        captureSourceIds: ack?.sources ?? selectedSourceIds,
         captureStartTime: Date.now(),
         error: null,
       });
     } catch (e) {
-      await Promise.allSettled(
-        startedSourceIds.map((sourceId) =>
-          invoke("stop_capture", { sourceId }),
-        ),
-      );
-      set({ error: errorToMessage(e) });
+      set({
+        captureStarting: false,
+        error: captureStartErrorMessage(e, (index) => {
+          const id = selectedSourceIds[index];
+          return id === undefined ? undefined : sourcesBySelectionId.get(id);
+        }),
+      });
     }
   },
   // ONE START (SHELL-R3, plan §R3, ADR-0046): the NOW STRIP's Start button
@@ -3105,8 +3155,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // still degrades to "stay put, stop capture as before" rather than
   // crashing the stop flow.
   stopCapture: async () => {
-    const { selectedSourceIds, getSessionId } = get();
-    if (selectedSourceIds.length === 0) return;
+    const { selectedSourceIds, captureSourceIds, getSessionId } = get();
+    // The acknowledged capture's canonical ids, which are what the backend
+    // owns; the selection can name a source by another alias.
+    const sourceIds =
+      captureSourceIds.length > 0 ? captureSourceIds : selectedSourceIds;
+    if (sourceIds.length === 0) return;
     let sessionId: string | null = null;
     try {
       const id = await getSessionId();
@@ -3115,11 +3169,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionId = null;
     }
     try {
-      for (const sourceId of selectedSourceIds) {
+      for (const sourceId of sourceIds) {
         await invoke("stop_capture", { sourceId });
       }
       set((state) => ({
         isCapturing: false,
+        captureSourceIds: [],
         isTranscribing: false,
         isGeminiActive: false,
         activeGeminiCommand: null,
@@ -3979,16 +4034,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   loadSessionTranscript: async (sessionId: string) => {
-    const { isCapturing, isTranscribing } = get();
-    if (isCapturing || isTranscribing) {
+    if (liveCaptureHoldsStore(get())) {
       set({ error: i18n.t("sessions.reviewLockedWhileLive") });
       return [];
     }
     const requestGeneration = ++historicalLoadGeneration;
     const isStale = () =>
       requestGeneration !== historicalLoadGeneration ||
-      get().isCapturing ||
-      get().isTranscribing;
+      liveCaptureHoldsStore(get());
     try {
       const segments = await invoke<TranscriptSegment[]>(
         "load_session_transcript",
@@ -4026,16 +4079,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   loadSession: async (sessionId: string) => {
-    const { isCapturing, isTranscribing } = get();
-    if (isCapturing || isTranscribing) {
+    if (liveCaptureHoldsStore(get())) {
       set({ error: i18n.t("sessions.reviewLockedWhileLive") });
       return null;
     }
     const requestGeneration = ++historicalLoadGeneration;
     const isStale = () =>
       requestGeneration !== historicalLoadGeneration ||
-      get().isCapturing ||
-      get().isTranscribing;
+      liveCaptureHoldsStore(get());
     try {
       const loaded = await invoke<LoadedSession>("load_session", { sessionId });
       if (isStale()) return null;

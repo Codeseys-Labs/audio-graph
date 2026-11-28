@@ -197,6 +197,8 @@ describe("AudioGraphStore", () => {
       streamingChatRequestId: null,
       chatReplyTurnId: null,
       isCapturing: false,
+      captureStarting: false,
+      captureSourceIds: [],
       isTranscribing: false,
       captureStartTime: null,
       loadedSessionId: null,
@@ -3443,33 +3445,170 @@ describe("AudioGraphStore", () => {
     ]);
   });
 
-  it("rolls back already-started capture sources if a later source fails", async () => {
+  it("starts every selected source in one call and leaves rollback to the backend", async () => {
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default", "device:mic"],
+      audioSources: [
+        {
+          id: "device:mic",
+          name: "Desk Mic",
+          source_type: { type: "Device", device_id: "mic" },
+          capture_target: "device:mic",
+          is_active: false,
+        },
+      ],
     });
-    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd === "start_capture") {
-        const sourceId = (args as { sourceId: string }).sourceId;
-        if (sourceId === "device:mic") {
-          throw new Error("device unavailable");
-        }
+        throw {
+          code: "capture_start_failed",
+          message: {
+            reason: "device_unavailable",
+            source_index: 1,
+            sources: [
+              { status: "rolled_back" },
+              { status: "failed", reason: "device_unavailable" },
+            ],
+          },
+        };
       }
       return undefined;
     });
 
     await useAudioGraphStore.getState().startCapture();
 
-    expect(invoke).toHaveBeenCalledWith("start_capture", {
-      sourceId: "system-default",
+    const startCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter(([cmd]) => cmd === "start_capture");
+    expect(startCalls).toEqual([
+      [
+        "start_capture",
+        {
+          sources: [
+            { sourceId: "system-default" },
+            {
+              sourceId: "device:mic",
+              source: useAudioGraphStore.getState().audioSources[0],
+            },
+          ],
+        },
+      ],
+    ]);
+    expect(invoke).not.toHaveBeenCalledWith("stop_capture", expect.anything());
+    const state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureStarting).toBe(false);
+    expect(state.error).toBe(
+      i18n.t("errors.captureStart.forSource", {
+        source: "Desk Mic",
+        reason: i18n.t("errors.captureStart.device_unavailable"),
+      }),
+    );
+  });
+
+  it("holds captureStarting until the acknowledgement, refusing a session load meanwhile", async () => {
+    let acknowledge: (ack: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_capture") {
+        return new Promise((resolve) => {
+          acknowledge = resolve;
+        });
+      }
+      return undefined;
     });
-    expect(invoke).toHaveBeenCalledWith("start_capture", {
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["mic-row"],
+      captureSourceIds: [],
+    });
+
+    const start = useAudioGraphStore.getState().startCapture();
+    expect(useAudioGraphStore.getState().captureStarting).toBe(true);
+    // A second press before the answer does not start or reset again.
+    await useAudioGraphStore.getState().startCapture();
+    expect(
+      vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "start_capture"),
+    ).toHaveLength(1);
+
+    expect(
+      await useAudioGraphStore.getState().loadSession("historical"),
+    ).toBeNull();
+    expect(
+      await useAudioGraphStore.getState().loadSessionTranscript("historical"),
+    ).toEqual([]);
+    expect(invoke).not.toHaveBeenCalledWith("load_session", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith(
+      "load_session_transcript",
+      expect.anything(),
+    );
+
+    acknowledge({ generation: 1, sources: ["device:mic"] });
+    await start;
+    let state = useAudioGraphStore.getState();
+    expect(state.captureStarting).toBe(false);
+    expect(state.isCapturing).toBe(true);
+    expect(state.loadedSessionId).toBeNull();
+    expect(state.captureSourceIds).toEqual(["device:mic"]);
+
+    // Stop names the acknowledged canonical id, not the selection alias.
+    await useAudioGraphStore.getState().stopCapture();
+    expect(invoke).toHaveBeenCalledWith("stop_capture", {
       sourceId: "device:mic",
     });
-    expect(invoke).toHaveBeenCalledWith("stop_capture", {
-      sourceId: "system-default",
+    expect(invoke).not.toHaveBeenCalledWith("stop_capture", {
+      sourceId: "mic-row",
     });
-    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
-    expect(useAudioGraphStore.getState().error).toMatch(/device unavailable/i);
+    state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureSourceIds).toEqual([]);
+  });
+
+  it("drops a session load that was in flight when Start was pressed", async () => {
+    let finishLoad: (loaded: unknown) => void = () => {};
+    let acknowledge: (ack: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "load_session") {
+        return new Promise((resolve) => {
+          finishLoad = resolve;
+        });
+      }
+      if (cmd === "start_capture") {
+        return new Promise((resolve) => {
+          acknowledge = resolve;
+        });
+      }
+      return undefined;
+    });
+    useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
+
+    const load = useAudioGraphStore.getState().loadSession("historical");
+    const start = useAudioGraphStore.getState().startCapture();
+    finishLoad({
+      transcript: [
+        {
+          id: "historical-segment",
+          source_id: "stored",
+          speaker_id: null,
+          speaker_label: null,
+          text: "historical text",
+          start_time: 0,
+          end_time: 1,
+          confidence: 0.9,
+        },
+      ],
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+    });
+    expect(await load).toBeNull();
+    acknowledge({ generation: 1, sources: ["system-default"] });
+    await start;
+
+    const state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(true);
+    expect(state.loadedSessionId).toBeNull();
+    expect(state.transcriptSegments).toEqual([]);
   });
 
   it("passes the selected backend source descriptor when starting capture", async () => {
@@ -3506,6 +3645,7 @@ describe("AudioGraphStore", () => {
       },
       is_active: false,
     };
+    vi.mocked(invoke).mockResolvedValue(undefined);
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:mic-1"],
       audioSources: [source],
@@ -3514,8 +3654,7 @@ describe("AudioGraphStore", () => {
     await useAudioGraphStore.getState().startCapture();
 
     expect(invoke).toHaveBeenCalledWith("start_capture", {
-      sourceId: "device:mic-1",
-      source,
+      sources: [{ sourceId: "device:mic-1", source }],
     });
   });
 
@@ -3604,6 +3743,7 @@ describe("AudioGraphStore", () => {
   });
 
   it("keeps legacy start_capture arguments when no descriptor matches", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:stale"],
       audioSources: [
@@ -3620,7 +3760,7 @@ describe("AudioGraphStore", () => {
     await useAudioGraphStore.getState().startCapture();
 
     expect(invoke).toHaveBeenCalledWith("start_capture", {
-      sourceId: "device:stale",
+      sources: [{ sourceId: "device:stale" }],
     });
   });
 

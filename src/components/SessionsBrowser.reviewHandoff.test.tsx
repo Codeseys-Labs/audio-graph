@@ -208,6 +208,8 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
+      captureStarting: false,
+      captureSourceIds: [],
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -419,5 +421,55 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     expect(after.loadedSessionId).toBeNull();
     expect(after.transcriptSegments).toEqual([]);
     expect(after.graphSnapshot.nodes).toEqual([]);
+  });
+
+  it("keeps a row click during an unacknowledged Start from loading history", async () => {
+    mockBackend();
+    const startAck = deferred<unknown>();
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_sessions") return [SESSION_A];
+      if (cmd === "load_session") return payloadA();
+      if (cmd === "start_capture") return startAck.promise;
+      if (cmd === "purge_expired_sessions") return [];
+      return null;
+    });
+    useAudioGraphStore.setState({
+      sessions: [SESSION_A],
+      sessionsLoading: false,
+      selectedSourceIds: ["system-default"],
+      isCapturing: false,
+      isTranscribing: false,
+      loadedSessionId: null,
+    });
+    render(
+      <>
+        <NowStrip />
+        <SessionsBrowser />
+      </>,
+    );
+    const row = await screen.findByTestId("session-select-session-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStarting).toBe(true),
+    );
+    // Start is pending: choosing a row may open A's own Review pane, but must
+    // not load A into the global store the capture is about to open into.
+    fireEvent.click(row);
+    await act(async () => {});
+    expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
+
+    await act(async () => {
+      startAck.resolve({ generation: 1, sources: ["system-default"] });
+    });
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().isCapturing).toBe(true),
+    );
+    await act(async () => {});
+    const after = useAudioGraphStore.getState();
+    expect(after.captureStarting).toBe(false);
+    expect(after.loadedSessionId).toBeNull();
+    expect(after.transcriptSegments).toEqual([]);
   });
 });

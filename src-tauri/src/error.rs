@@ -135,6 +135,9 @@ pub enum AppError {
         size_bytes: u64,
         ceiling_bytes: u64,
     },
+    /// A capture start was refused or failed and nothing was left running.
+    /// Closed and content-free: sources are identified by request position.
+    CaptureStartFailed(crate::audio::capture::CaptureStartFailure),
     /// Catch-all for errors not yet migrated to a typed variant.
     Unknown(String),
 }
@@ -170,6 +173,7 @@ enum LegacyAppErrorWire<'a> {
         size_bytes: u64,
         ceiling_bytes: u64,
     },
+    CaptureStartFailed(&'a crate::audio::capture::CaptureStartFailure),
     PrivacyPolicyBlocked {
         mode: &'a str,
         action: &'a str,
@@ -236,6 +240,7 @@ impl serde::Serialize for AppError {
                 size_bytes: *size_bytes,
                 ceiling_bytes: *ceiling_bytes,
             },
+            Self::CaptureStartFailed(failure) => LegacyAppErrorWire::CaptureStartFailed(failure),
             Self::PrivacyPolicyBlocked {
                 mode,
                 action,
@@ -318,6 +323,15 @@ impl fmt::Display for AppError {
                 "{} artifact is {} bytes, exceeding the {}-byte ceiling; this session predates the artifact-size fix",
                 artifact_class, size_bytes, ceiling_bytes
             ),
+            AppError::CaptureStartFailed(failure) => match failure.source_index {
+                Some(index) => write!(
+                    f,
+                    "Capture start failed: {} (source {})",
+                    failure.reason,
+                    index + 1
+                ),
+                None => write!(f, "Capture start failed: {}", failure.reason),
+            },
             AppError::Unknown(msg) => write!(f, "{}", msg),
         }
     }

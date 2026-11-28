@@ -2940,7 +2940,46 @@ export type AppErrorPayload =
         ceiling_bytes: number;
       };
     }
+  | {
+      code: "capture_start_failed";
+      message: {
+        reason: CaptureFailureReason;
+        source_index: number | null;
+        sources: CaptureSourceOutcome[];
+      };
+    }
   | { code: "unknown"; message: string };
+
+/** Closed reason a capture start failed (`audio::capture::CaptureFailureReason`). */
+export const CAPTURE_FAILURE_REASONS = [
+  "invalid_source",
+  "permission_denied",
+  "device_unavailable",
+  "unsupported",
+  "backend_unavailable",
+  "startup_timeout",
+  "worker_exited",
+  "cancelled",
+  "already_running",
+  "previous_capture_stopping",
+  "previous_capture_reconciling",
+] as const;
+export type CaptureFailureReason = (typeof CAPTURE_FAILURE_REASONS)[number];
+
+/** What became of one requested source when a capture start failed. */
+export type CaptureSourceOutcome =
+  | { status: "rolled_back" }
+  | { status: "failed"; reason: CaptureFailureReason }
+  | { status: "not_attempted" };
+
+/**
+ * `start_capture`'s acknowledgement: every requested source acknowledged.
+ * `sources` are the canonical ids Stop must name, in request order.
+ */
+export interface CaptureStartAck {
+  generation: number;
+  sources: string[];
+}
 
 /**
  * Canonical list of credential keys accepted by the `save_credential` and
@@ -3435,6 +3474,14 @@ export interface AudioGraphStore {
 
   // Capture state
   isCapturing: boolean;
+  /**
+   * True from Start until the backend acknowledges the capture or the start
+   * fails. Session loaders and the Sessions browser refuse to load a
+   * historical session meanwhile, so capture never opens over old data.
+   */
+  captureStarting: boolean;
+  /** Canonical ids of the running capture's sources, from its acknowledgement. */
+  captureSourceIds: string[];
   captureStartTime: number | null;
   setIsCapturing: (capturing: boolean) => void;
   startCapture: () => Promise<void>;

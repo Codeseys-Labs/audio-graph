@@ -252,6 +252,7 @@ function SessionsBrowser() {
   const sessionsLoading = useAudioGraphStore((s) => s.sessionsLoading);
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const isTranscribing = useAudioGraphStore((s) => s.isTranscribing);
+  const captureStarting = useAudioGraphStore((s) => s.captureStarting);
   const samplePreviewActive = useAudioGraphStore((s) => s.samplePreviewActive);
   const pendingFinalizingSession = useAudioGraphStore(
     (s) => s.pendingFinalizingSession,
@@ -279,7 +280,9 @@ function SessionsBrowser() {
   const [exportingIds, setExportingIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const liveRunning = isCapturing || isTranscribing;
+  // A capture that is starting already owns the global store: a row click
+  // must not load a historical session into it before the acknowledgement.
+  const liveRunning = isCapturing || isTranscribing || captureStarting;
 
   // Refresh on mount — match the v2 store's own larger fetch (200) so the
   // rail's search can actually find old entries, not just the 10 most recent

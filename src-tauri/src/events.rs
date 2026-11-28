@@ -1002,32 +1002,6 @@ where
     }
 }
 
-/// Heuristic classifier for capture errors into recoverable vs fatal.
-///
-/// Used at capture-error emit sites to populate `CaptureErrorPayload.recoverable`.
-/// Fatal errors indicate the source cannot be used again without user action
-/// (permission, device disconnection). Recoverable errors may succeed on retry.
-pub fn classify_capture_error(err: &str) -> bool {
-    let lower = err.to_lowercase();
-    let fatal_markers = [
-        "permission denied",
-        "not permitted",
-        "unauthorized",
-        "disconnected",
-        "device not found",
-        "no such device",
-        "device removed",
-        "access denied",
-        "not supported",
-        "unsupported",
-    ];
-    if fatal_markers.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-    // Default to recoverable for unclassified errors — user can retry.
-    true
-}
-
 /// Returns `true` if this I/O error indicates the underlying storage is full
 /// (ENOSPC on Unix, ERROR_DISK_FULL on Windows).
 ///
