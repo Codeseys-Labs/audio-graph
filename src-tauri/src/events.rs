@@ -279,9 +279,31 @@ pub enum StageStatus {
     },
 }
 
+/// Reason the canonical transcript writer could not acknowledge the current revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptSavingFailure {
+    WriterAbsent,
+    StorageFull,
+    ConfirmationDelayed,
+    WriteFailed,
+}
+
 /// Overall pipeline status, combining all stages.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_not_saving: Option<TranscriptSavingFailure>,
+    /// At least one caption was refused in this session. Rotation resets the flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript_captions_lost: bool,
+    #[serde(skip)]
+    pub(crate) pending_transcript_saves: std::collections::BTreeMap<u64, TranscriptSavingFailure>,
+    #[serde(skip)]
+    pub(crate) latest_transcript_save: (u64, Option<TranscriptSavingFailure>),
+    /// File sync succeeded on storage without a qualified crash-durability tier.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript_crash_safety_unverified: bool,
     pub capture: StageStatus,
     pub pipeline: StageStatus,
     pub asr: StageStatus,

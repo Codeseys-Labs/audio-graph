@@ -194,9 +194,11 @@ pub struct AppState {
     /// session's writer) is not detected here at all.
     pub display_transcript_write_misses: Arc<AtomicU64>,
 
-    /// Async transcript event writer (appends immutable span revisions to JSONL).
+    /// Writes framed span revisions and returns a receipt after synchronization.
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
+    /// Fence caption side effects against replacement of the active session.
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     /// Canonical transcript span ledger for projection-basis checks.
     pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 
@@ -577,6 +579,7 @@ pub enum ProjectionRuntimeApplyError {
 pub struct ProjectionRuntimeHandle {
     session_id: Arc<RwLock<String>>,
     rotation_in_progress: Arc<AtomicBool>,
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
     projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
@@ -589,6 +592,7 @@ impl ProjectionRuntimeHandle {
         Self {
             session_id: Arc::new(RwLock::new(session_id.clone())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone()))),
             materialized_projection_state: Arc::new(Mutex::new(MaterializedProjectionState::new(
                 session_id,
@@ -926,6 +930,15 @@ impl AppState {
         // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
+        let pipeline_status = PipelineStatus {
+            transcript_crash_safety_unverified: transcript_event_writer
+                .as_ref()
+                .is_some_and(TranscriptEventWriter::is_unqualified),
+            transcript_not_saving: transcript_event_writer
+                .is_none()
+                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent),
+            ..Default::default()
+        };
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
         let speaker_timeline = SpeakerTimeline::new(session_id.clone());
@@ -971,6 +984,7 @@ impl AppState {
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
             display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
             transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
             speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),
             materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
@@ -980,7 +994,7 @@ impl AppState {
             projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
-            pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
+            pipeline_status: Arc::new(RwLock::new(pipeline_status)),
             is_capturing: Arc::new(RwLock::new(false)),
             is_transcribing,
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
@@ -1046,6 +1060,7 @@ impl AppState {
         ProjectionRuntimeHandle {
             session_id: self.session_id.clone(),
             rotation_in_progress: self.rotation_in_progress.clone(),
+            transcript_publication: self.transcript_publication.clone(),
             transcript_ledger: self.transcript_ledger.clone(),
             materialized_projection_state: self.materialized_projection_state.clone(),
             projection_event_writer: self.projection_event_writer.clone(),
@@ -1176,6 +1191,10 @@ impl AppState {
         // Keep the old id published until every session-scoped aggregate and
         // canonical writer has been reset. The graph autosave loop also sees
         // `rotation_in_progress` and skips this entire transition.
+        let publication = self
+            .transcript_publication
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = self.current_session_id();
 
         {
@@ -1271,7 +1290,10 @@ impl AppState {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *status = PipelineStatus::default();
+            *status = PipelineStatus {
+                transcript_crash_safety_unverified: new_transcript_event_writer.is_unqualified(),
+                ..PipelineStatus::default()
+            };
         }
 
         // No producer can enter while `session_lifecycle` is held by the
@@ -1281,89 +1303,23 @@ impl AppState {
         while self.processed_rx.try_recv().is_ok() {}
         while self.speech_audio_rx.try_recv().is_ok() {}
 
-        // Respawn transcript writers for the new session. The old writers are
-        // asked to shut down gracefully; their joins are bounded by
-        // TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT so a stuck disk cannot block the
-        // IPC caller. If a new writer fails to spawn (e.g. base dir not
-        // resolvable), we leave its slot empty — transcript persistence is
-        // best-effort and already handles None elsewhere.
-        let mut writer_slot = match self.transcript_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = writer_slot.take()
-            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
-        {
-            log::warn!(
-                "Transcript writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
-        }
-        *writer_slot = Some(new_transcript_writer);
-
-        let mut event_writer_slot = match self.transcript_event_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = event_writer_slot.take()
-            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
-        {
-            log::warn!(
-                "Transcript event writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
-        }
-        *event_writer_slot = Some(new_transcript_event_writer);
-        let mut projection_writer_slot = match self.projection_event_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = projection_writer_slot.take()
-            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
-        {
-            log::warn!(
-                "Projection event writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
-        }
-        *projection_writer_slot = Some(new_projection_event_writer);
-        if writer_slot.is_some() {
-            log::info!("Rotated transcript writer to session {}", new_session_id);
-        } else {
-            log::warn!(
-                "Failed to spawn transcript writer for rotated session {}",
-                new_session_id
-            );
-        }
-        if event_writer_slot.is_some() {
-            log::info!(
-                "Rotated transcript event writer to session {}",
-                new_session_id
-            );
-        } else {
-            log::warn!(
-                "Failed to spawn transcript event writer for rotated session {}",
-                new_session_id
-            );
-        }
-        if projection_writer_slot.is_some() {
-            log::info!(
-                "Rotated projection event writer to session {}",
-                new_session_id
-            );
-        } else {
-            log::warn!(
-                "Failed to spawn projection event writer for rotated session {}",
-                new_session_id
-            );
-        }
-
+        // Swap each prepared writer before draining its predecessor. Readers
+        // can still acquire a writer slot while shutdown waits for storage.
+        let old_display = self
+            .transcript_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_transcript_writer);
+        let old_events = self
+            .transcript_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_transcript_event_writer);
+        let old_projections = self
+            .projection_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_projection_event_writer);
         // Publish the new ownership epoch last. Readers can observe either the
         // complete old session or the complete new session, never a new id with
         // old writers/graphs/buffers.
@@ -1373,6 +1329,23 @@ impl AppState {
                 Err(poisoned) => poisoned.into_inner(),
             };
             *guard = new_session_id.to_string();
+        }
+
+        drop(publication);
+        if let Some(old) = old_display
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!("Previous transcript display writer has not finished shutdown");
+        }
+        if let Some(old) = old_events
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!("Previous transcript event writer has not finished shutdown");
+        }
+        if let Some(old) = old_projections
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!("Previous projection event writer has not finished shutdown");
         }
 
         RotateOutcome::Rotated(prev)
@@ -1595,10 +1568,11 @@ mod rotation_tests {
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -1625,10 +1599,11 @@ mod rotation_tests {
             confidence: 0.87,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "graph-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -2287,6 +2262,11 @@ mod rotation_tests {
 
     #[test]
     fn rotate_session_resets_projection_schedulers() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("scheduler-rotation");
+        let _home = HomeGuard::set(&dir);
         let app = AppState::new();
         {
             let mut ledger = app.transcript_ledger.lock().unwrap();
@@ -2327,6 +2307,7 @@ mod rotation_tests {
         }
 
         drain_writers(&app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

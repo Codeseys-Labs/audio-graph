@@ -13,30 +13,32 @@ use tokio::sync::oneshot;
 use zbus::message::{Flags, Type};
 use zbus::{Message, MessageStream};
 
-const GUARD: Duration = Duration::from_secs(15);
-const ITEM_PATH: &str = "/org/freedesktop/secrets/collection/locator_canary/first";
+pub(in crate::credentials::adapters) const GUARD: Duration = Duration::from_secs(15);
+pub(in crate::credentials::adapters) const ITEM_PATH: &str =
+    "/org/freedesktop/secrets/collection/locator_canary/first";
 const OTHER_ITEM: &str = "/org/freedesktop/secrets/collection/locator_canary/other";
-const COLLECTION: &str = "/org/freedesktop/secrets/collection/locator_canary";
+pub(in crate::credentials::adapters) const COLLECTION: &str =
+    "/org/freedesktop/secrets/collection/locator_canary";
 const SESSION: &str = "/org/freedesktop/secrets/session/locator_canary";
-const SECRET: &str = "secret canary marmalade";
-const ATTRIBUTE: &str = "attribute canary thyme";
-const LOCATOR: &str = "locator_canary";
+pub(in crate::credentials::adapters) const SECRET: &str = "secret canary marmalade";
+pub(in crate::credentials::adapters) const ATTRIBUTE: &str = "attribute canary thyme";
+pub(in crate::credentials::adapters) const LOCATOR: &str = "locator_canary";
 
-fn wanted() -> Attributes {
-    Attributes::from([("slot".to_owned(), ATTRIBUTE.to_owned())])
+pub(in crate::credentials::adapters) fn wanted() -> Attributes {
+    attributes_for(&crate::credentials::adapters::keyring_entry::EntryLocator::authority())
 }
 
-struct Bus {
+pub(in crate::credentials::adapters) struct Bus {
     root: PathBuf,
     daemon: Option<Child>,
     address: String,
 }
 
 impl Bus {
-    fn start() -> Self {
+    fn configure() -> Self {
         let root = std::env::temp_dir().join(format!("ag-bus-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).expect("create private bus directory");
-        let mut bus = Self {
+        let bus = Self {
             root,
             daemon: None,
             address: String::new(),
@@ -70,10 +72,15 @@ impl Bus {
             ),
         )
         .unwrap();
+        bus
+    }
+
+    pub(in crate::credentials::adapters) fn start() -> Self {
+        let mut bus = Self::configure();
         bus.daemon = Some(
             Command::new("dbus-daemon")
                 .arg("--config-file")
-                .arg(config)
+                .arg(bus.root.join("session.conf"))
                 .args(["--nofork", "--print-address=1"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -97,8 +104,12 @@ impl Bus {
         bus
     }
 
-    fn address(&self) -> Address {
+    pub(in crate::credentials::adapters) fn address(&self) -> Address {
         self.address.parse().expect("private bus address")
+    }
+
+    pub(in crate::credentials::adapters) fn activation_attempted(&self) -> bool {
+        self.root.join("started").exists()
     }
 }
 
@@ -113,7 +124,7 @@ impl Drop for Bus {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Scenario {
+pub(in crate::credentials::adapters) enum Scenario {
     Found,
     Absent,
     Superset,
@@ -131,18 +142,26 @@ enum Scenario {
     UnlockedItemMissing,
     Disconnect,
     Silent,
+    SilentAtGet,
+    CloseFails,
     Denied,
     UnknownError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Call {
+pub(in crate::credentials::adapters) enum Call {
     Alias,
     Search,
     Attributes,
     Locked,
+    CollectionLocked,
     Session,
     Secret,
+    Close,
+    Create,
+    SetSecret,
+    Delete,
+    Dismiss,
 }
 
 struct Peer {
@@ -217,11 +236,9 @@ impl Drop for Peer {
     }
 }
 
-fn inspect_call(message: &Message) -> Call {
+pub(in crate::credentials::adapters) fn inspect_call(message: &Message) -> Call {
+    assert_flags(message);
     let header = message.header();
-    let flags = header.primary().flags();
-    assert!(flags.contains(Flags::NO_AUTO_START));
-    assert!(!flags.contains(Flags::ALLOW_INTERACTIVE_AUTH));
     match (
         header.interface().map(|i| i.as_str()),
         header.member().map(|m| m.as_str()),
@@ -230,17 +247,43 @@ fn inspect_call(message: &Message) -> Call {
         (Some(SERVICE), Some("SearchItems")) => Call::Search,
         (Some(SERVICE), Some("OpenSession")) => Call::Session,
         (Some(ITEM), Some("GetSecret")) => Call::Secret,
+        (Some(SESSION_INTERFACE), Some("Close")) => Call::Close,
+        (Some("org.freedesktop.Secret.Collection"), Some("CreateItem")) => Call::Create,
+        (Some(ITEM), Some("SetSecret")) => Call::SetSecret,
+        (Some(ITEM), Some("Delete")) => Call::Delete,
+        (Some("org.freedesktop.Secret.Prompt"), Some("Dismiss")) => Call::Dismiss,
         (Some(PROPERTIES), Some("Get")) => {
             let (interface, property): (String, String) = message.body().deserialize().unwrap();
-            assert!(interface == ITEM);
-            match property.as_str() {
-                "Attributes" => Call::Attributes,
-                "Locked" => Call::Locked,
+            match (interface.as_str(), property.as_str()) {
+                (ITEM, "Attributes") => Call::Attributes,
+                (ITEM, "Locked") => Call::Locked,
+                ("org.freedesktop.Secret.Collection", "Locked") => Call::CollectionLocked,
                 _ => panic!("unexpected scripted property"),
             }
         }
         // This fails on Unlock, Prompt, or any unexpected message.
         _ => panic!("unexpected method received by Secret Service"),
+    }
+}
+
+pub(in crate::credentials::adapters) fn assert_flags(message: &Message) {
+    let flags = message.header().primary().flags();
+    assert!(flags.contains(Flags::NO_AUTO_START));
+    assert!(!flags.contains(Flags::ALLOW_INTERACTIVE_AUTH));
+}
+
+#[derive(Default)]
+pub(in crate::credentials::adapters) struct ScriptSession(Option<super::super::crypto::SessionKey>);
+
+impl ScriptSession {
+    pub(in crate::credentials::adapters) async fn respond(
+        &mut self,
+        connection: &Connection,
+        message: &Message,
+        call: Call,
+        scenario: Scenario,
+    ) {
+        serve(connection, message, call, scenario, &mut self.0, &[]).await;
     }
 }
 
@@ -351,6 +394,9 @@ async fn serve(
         Call::Secret => {
             let session: OwnedObjectPath = message.body().deserialize().unwrap();
             assert!(session == path(SESSION));
+            if scenario == Scenario::SilentAtGet {
+                return;
+            }
             if scenario == Scenario::RelockAtGet {
                 return reply_error(connection, message, "org.freedesktop.Secret.Error.IsLocked")
                     .await;
@@ -372,6 +418,14 @@ async fn serve(
                 )
                 .await
         }
+        Call::Close => {
+            assert_eq!(header.path().map(|path| path.as_str()), Some(SESSION));
+            if scenario == Scenario::CloseFails {
+                return reply_error(connection, message, "org.freedesktop.DBus.Error.Failed").await;
+            }
+            connection.reply(&header, &()).await
+        }
+        _ => panic!("unexpected mutation call in read test"),
     };
     replied.expect("reply on private test bus");
 }
@@ -384,7 +438,7 @@ async fn reply_error(connection: &Connection, message: &Message, name: &str) {
         .expect("scripted error reply");
 }
 
-fn assert_redacted(rendered: &str) {
+pub(in crate::credentials::adapters) fn assert_redacted(rendered: &str) {
     for canary in [SECRET, ATTRIBUTE, LOCATOR] {
         assert!(!rendered.contains(canary), "private canary escaped");
     }
@@ -403,6 +457,7 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         Session,
         Secret,
         Attributes,
+        Close,
     ];
     for (scenario, expected, calls) in [
         (Found, Ok(true), success_calls),
@@ -426,7 +481,7 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         (
             RelockAtGet,
             Err(Failure::Locked),
-            &[Search, Attributes, Call::Locked, Session, Secret],
+            &[Search, Attributes, Call::Locked, Session, Secret, Close],
         ),
         (
             PlainOnly,
@@ -436,18 +491,19 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         (
             PlainReply,
             Err(Failure::Unsupported),
-            &[Search, Attributes, Call::Locked, Session],
+            &[Search, Attributes, Call::Locked, Session, Close],
         ),
         (
             WrongSession,
             Err(Failure::CorruptRecord),
-            &[Search, Attributes, Call::Locked, Session, Secret],
+            &[Search, Attributes, Call::Locked, Session, Secret, Close],
         ),
         (
             AttributesChanged,
             Err(Failure::RevisionConflict),
             success_calls,
         ),
+        (CloseFails, Ok(true), success_calls),
         (Disconnect, Err(Failure::Unavailable), &[Search]),
         (Denied, Err(Failure::AccessDenied), &[Search]),
         (UnknownError, Err(Failure::Internal), &[Search]),
@@ -517,6 +573,7 @@ fn missing_unlocked_item_at_get_secret_is_absent() {
             Call::Locked,
             Call::Session,
             Call::Secret,
+            Call::Close,
         ],
     );
 }
@@ -600,6 +657,29 @@ fn unresponsive_peer_hits_deadline() {
 }
 
 #[test]
+fn read_timeout_closes_a_negotiated_session() {
+    let bus = Bus::start();
+    let peer = Peer::start(&bus, Scenario::SilentAtGet);
+    assert_eq!(
+        read_at(bus.address(), &wanted(), Duration::from_secs(2))
+            .unwrap_err()
+            .0,
+        Failure::Unavailable
+    );
+    assert_eq!(
+        peer.finish(),
+        [
+            Call::Search,
+            Call::Attributes,
+            Call::Locked,
+            Call::Session,
+            Call::Secret,
+            Call::Close
+        ]
+    );
+}
+
+#[test]
 fn unresponsive_bus_handshake_hits_deadline() {
     use std::os::unix::net::UnixListener;
 
@@ -646,28 +726,50 @@ fn plain_worker_thread_can_read_while_tokio_is_running() {
         worker.join().unwrap();
         assert!(read.unwrap().is_some());
     });
-    assert_eq!(peer.finish().last(), Some(&Call::Attributes));
+    assert_eq!(peer.finish().last(), Some(&Call::Close));
 }
 
 #[test]
-fn current_thread_tokio_keeps_running_during_spawn_blocking_read() {
+fn runtime_contexts_refuse_blocking_facades_without_sending_messages() {
     let bus = Bus::start();
     let peer = Peer::start(&bus, Scenario::Found);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
-    let address = bus.address();
-    let read = runtime.block_on(async {
+    let read = |context| {
+        read_at(bus.address(), &wanted(), DEADLINE)
+            .expect_err(context)
+            .0
+    };
+    runtime.block_on(async {
+        assert_eq!(read("Tokio task"), Failure::Unsupported);
+        let address = bus.address();
         let worker = tokio::task::spawn_blocking(move || read_at(address, &wanted(), DEADLINE));
-        tokio::time::timeout(GUARD, worker).await
+        let read = tokio::time::timeout(GUARD, worker).await.unwrap().unwrap();
+        assert_eq!(read.unwrap_err().0, Failure::Unsupported);
     });
     runtime.shutdown_timeout(GUARD);
-    assert!(
-        read.expect("runtime deadline")
-            .expect("blocking worker")
+    let address = bus.address();
+    let code = zbus::block_on(async {
+        zruntime::spawn(async move { read_at(address, &wanted(), DEADLINE).unwrap_err().0 })
+            .await
             .unwrap()
-            .is_some()
-    );
-    assert_eq!(peer.finish().last(), Some(&Call::Attributes));
+    });
+    assert_eq!(code, Failure::Unsupported);
+    let local = zruntime::LocalRuntime::new().unwrap();
+    let address = bus.address();
+    let task = local.spawn("test runtime guard", async move {
+        read_at(address, &wanted(), DEADLINE)
+            .expect_err("zruntime local task")
+            .0
+    });
+    assert_eq!(local.block_on(task).unwrap(), Failure::Unsupported);
+    assert!(peer.finish().is_empty());
 }
+
+#[path = "linux_secret_service_mutations_tests.rs"]
+mod mutation_tests;
+
+#[path = "linux_secret_service_qualification_tests.rs"]
+mod qualification_tests;

@@ -42,7 +42,14 @@ export function computeCompositeHealth({
   persistenceQueueBackpressure,
   backpressuredSourceCount,
 }: CompositeHealthInput): CompositeHealth {
-  const stages = Object.values(pipelineStatus);
+  const {
+    transcript_not_saving,
+    transcript_captions_lost,
+    transcript_crash_safety_unverified,
+    ...stageStatuses
+  } = pipelineStatus;
+  if (transcript_not_saving) return "error";
+  const stages = Object.values(stageStatuses);
   if (stages.some((stage) => stage.type === "Error")) return "error";
 
   const persistenceDropped = Object.values(persistenceQueueBackpressure).reduce(
@@ -50,6 +57,8 @@ export function computeCompositeHealth({
     0,
   );
   if (
+    transcript_crash_safety_unverified ||
+    transcript_captions_lost ||
     stages.some((stage) => stage.type === "Degraded") ||
     consumerDroppedChunks > 0 ||
     persistenceDropped > 0 ||

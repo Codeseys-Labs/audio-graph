@@ -61,7 +61,6 @@ use crate::asr::moonshine::{
     MoonshineSpanRevision, MoonshineStreamingAdapter, MoonshineStreamingWorker,
     MoonshineWorkerError,
 };
-use crate::asr::soniox::SonioxParsedRevision;
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
@@ -75,7 +74,7 @@ use crate::llm::{
 };
 #[cfg(not(feature = "diarization-clustering"))]
 use crate::models::SORTFORMER_MODEL_FILENAME;
-use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
+use crate::persistence::{FileMemoryRepository, LocalMemoryRepository, MAX_TRANSCRIPT_GROUP};
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulersObservation};
 use crate::projections::{
     AppliedBasisCurrency, DiarizationSpanRevision, MaterializedGraph, MaterializedNotes,
@@ -819,6 +818,9 @@ pub(crate) fn emit_and_dispatch_speaker_relabel_batch(
 
 #[derive(Default)]
 struct AsrRevisionMeta {
+    recovery_turn: Option<TurnEventInput>,
+    initial_speaker: Option<InitialTurnSpeaker>,
+    split_turn: Option<Arc<Mutex<SplitTurnPublication>>>,
     /// The segment was finalized locally from retained provider interim data.
     promoted_interim: bool,
     span_id: Option<String>,
@@ -941,6 +943,8 @@ fn mark_websocket_disconnected(app: &AppHandle, pipeline: &Arc<RwLock<PipelineSt
 }
 
 fn emit_asr_span_revision(app_handle: &AppHandle, payload: events::AsrSpanRevisionPayload) {
+    #[cfg(test)]
+    tests_status::observe_publication(events::ASR_SPAN_REVISION, &payload.source_id, &payload.text);
     events::emit_or_log(app_handle, events::ASR_SPAN_REVISION, payload);
 }
 
@@ -1052,8 +1056,7 @@ fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallbac
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_asr_partial_with_meta(
-    ctx: &TranscriptProcessingContext,
+fn asr_partial_payload(
     provider: &str,
     source_id: impl Into<String>,
     text: impl Into<String>,
@@ -1061,10 +1064,10 @@ fn emit_asr_partial_with_meta(
     end_time: f64,
     confidence: f32,
     meta: AsrRevisionMeta,
-) {
+) -> Option<events::AsrSpanRevisionPayload> {
     let text = text.into();
     if text.trim().is_empty() {
-        return;
+        return None;
     }
 
     let source_id = source_id.into();
@@ -1072,16 +1075,16 @@ fn emit_asr_partial_with_meta(
         .span_id
         .unwrap_or_else(|| time_based_span_id(provider, &source_id, start_time, end_time));
     let received_at_ms = current_unix_millis();
-    let asr_payload = events::AsrSpanRevisionPayload {
+    Some(events::AsrSpanRevisionPayload {
         span_id,
         provider: provider.to_string(),
-        source_id: source_id.clone(),
+        source_id,
         provider_item_id: meta.provider_item_id,
         transcript_segment_id: None,
         speaker_id: meta.speaker_id,
         speaker_label: meta.speaker_label,
         channel: meta.channel,
-        text: text.clone(),
+        text,
         start_time,
         end_time,
         confidence,
@@ -1095,31 +1098,28 @@ fn emit_asr_partial_with_meta(
         capture_latency_ms: meta.capture_latency_ms,
         asr_latency_ms: meta.asr_latency_ms,
         received_at_ms,
-    };
-    if !record_asr_span_revision_event_and_observe_projection(
-        &ctx.transcript_ledger,
-        &ctx.transcript_event_writer,
-        &ctx.projection_schedulers,
-        Some(&ctx.projection_dispatch_context()),
-        &asr_payload,
-    ) {
-        return;
-    }
-    emit_asr_span_revision(&ctx.app_handle, asr_payload);
+    })
+}
 
-    events::emit_or_log(
-        &ctx.app_handle,
-        events::ASR_PARTIAL,
-        events::AsrPartialPayload {
-            provider: provider.to_string(),
-            source_id,
-            text,
-            start_time,
-            end_time,
-            confidence,
-            timestamp_ms: received_at_ms,
-        },
-    );
+#[allow(clippy::too_many_arguments)]
+fn emit_asr_partial_with_meta(
+    ctx: &TranscriptProcessingContext,
+    provider: &str,
+    source_id: impl Into<String>,
+    text: impl Into<String>,
+    start_time: f64,
+    end_time: f64,
+    confidence: f32,
+    meta: AsrRevisionMeta,
+) -> bool {
+    let Some(payload) = asr_partial_payload(
+        provider, source_id, text, start_time, end_time, confidence, meta,
+    ) else {
+        return false;
+    };
+    ctx.commit_and_publish(payload, |ctx, payload, _| {
+        publish_accepted_partial(ctx, payload)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1134,8 +1134,54 @@ struct TurnEventInput {
     turn_index: Option<u64>,
 }
 
+/// A split Deepgram final has one text-bearing turn marker. It can be
+/// recovered only when every speaker run in that marker has its own receipt.
+struct SplitTurnPublication {
+    remaining: usize,
+    recovered_member: bool,
+    turn: Option<TurnEventInput>,
+}
+
+impl SplitTurnPublication {
+    fn accepted(&mut self, recovered: bool) -> Option<TurnEventInput> {
+        self.recovered_member |= recovered;
+        self.remaining -= 1;
+        if self.remaining == 0 && self.recovered_member {
+            self.turn.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// Capture a provider turn marker before the revision is normalized and
+/// consumed. Callers publish this content-bearing marker after receipt.
+fn revision_end_of_turn(
+    provider: &'static str,
+    payload: &events::AsrSpanRevisionPayload,
+) -> Option<TurnEventInput> {
+    payload.end_of_turn.then(|| TurnEventInput {
+        provider,
+        source_id: payload.source_id.clone(),
+        kind: events::TurnEventKind::EndOfTurn,
+        text: Some(payload.text.clone()),
+        start_time: Some(payload.start_time),
+        end_time: Some(payload.end_time),
+        confidence: Some(payload.confidence),
+        turn_index: payload
+            .turn_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("turn-"))
+            .and_then(|number| number.parse().ok()),
+    })
+}
+
 /// Emit a provider-neutral speech turn lifecycle event.
 fn emit_turn_event(app_handle: &AppHandle, input: TurnEventInput) {
+    #[cfg(test)]
+    if let Some(text) = &input.text {
+        tests_status::observe_publication(events::TURN_EVENT, &input.source_id, text);
+    }
     events::emit_or_log(
         app_handle,
         events::TURN_EVENT,
@@ -2842,83 +2888,410 @@ fn shared_to_transcript_context(
     }
 }
 
+/// True means the caller should publish this revision's live side effects once.
+#[cfg(test)]
 fn record_asr_span_revision_event(
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     payload: &events::AsrSpanRevisionPayload,
 ) -> bool {
-    let transcript_event = crate::projections::TranscriptEvent::from(payload.clone());
-    let mut ledger = match transcript_ledger.lock() {
-        Ok(ledger) => ledger,
-        Err(poisoned) => {
-            log::warn!("Transcript ledger lock poisoned; recovering");
-            poisoned.into_inner()
-        }
-    };
-    let mut next_ledger = ledger.clone();
-    match next_ledger.apply_event(transcript_event.clone()) {
-        Ok(()) => {}
-        Err(_) => {
-            log::warn!("Transcript ledger rejected span revision");
-            return false;
-        }
-    }
-    match transcript_event_writer.lock() {
-        Ok(writer_guard) => {
-            let Some(writer) = writer_guard.as_ref() else {
-                log::warn!(
-                    "Transcript event writer unavailable for span_id={} revision={}; ledger was not advanced",
-                    transcript_event.span_id,
-                    transcript_event.revision_number
-                );
-                return false;
-            };
-            if !writer.append(&transcript_event) {
-                log::warn!(
-                    "Transcript event writer rejected span revision span_id={} revision={}; ledger was not advanced",
-                    transcript_event.span_id,
-                    transcript_event.revision_number
-                );
-                return false;
-            }
-        }
-        Err(poisoned) => {
-            log::warn!("Transcript event writer lock poisoned; recovering before ledger advance");
-            let writer_guard = poisoned.into_inner();
-            match writer_guard.as_ref() {
-                Some(writer) => {
-                    if !writer.append(&transcript_event) {
-                        log::warn!(
-                            "Transcript event writer rejected span revision span_id={} revision={} after poisoned-lock recovery; ledger was not advanced",
-                            transcript_event.span_id,
-                            transcript_event.revision_number
-                        );
-                        return false;
-                    }
-                }
-                None => {
-                    log::warn!(
-                        "Transcript event writer lock poisoned with no recoverable writer for span_id={} revision={}; ledger was not advanced",
-                        transcript_event.span_id,
-                        transcript_event.revision_number
-                    );
-                    return false;
-                }
-            }
-        }
-    }
-    *ledger = next_ledger;
-    true
+    report_transcript_commit(commit_asr_span_revision(
+        transcript_ledger,
+        transcript_event_writer,
+        payload,
+    ))
 }
 
+type LiveTranscriptResult = Result<
+    (bool, crate::persistence::canonical_log::TranscriptReceipt),
+    crate::persistence::canonical_log::TranscriptCommitError,
+>;
+
+/// A receipt can arrive on the provider thread or, after an ambiguous result,
+/// on the writer's recovery path. Keep the capture's publication context until
+/// one of them claims the outcome. In particular, the recovery worker must not
+/// infer provider turn markers or re-read current LLM settings for this event.
+type PublishRevision = Box<dyn Fn(LiveTranscriptResult, bool, u64) -> bool + Send + Sync>;
+
+// Local ticket order distinguishes a late receipt from the outcome of a newer revision.
+fn next_publication_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+struct PendingPublication {
+    id: u64,
+    session: String,
+    event: crate::projections::TranscriptEvent,
+    action: Mutex<Option<PublishRevision>>,
+}
+
+fn publications() -> &'static Mutex<Vec<Arc<PendingPublication>>> {
+    static PENDING: OnceLock<Mutex<Vec<Arc<PendingPublication>>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+impl PendingPublication {
+    fn register(
+        session: String,
+        payload: &events::AsrSpanRevisionPayload,
+        publish: impl Fn(LiveTranscriptResult, bool, u64) -> bool + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let publication = Arc::new(Self {
+            id: next_publication_id(),
+            session,
+            event: payload.clone().into(),
+            action: Mutex::new(Some(Box::new(publish))),
+        });
+        publications()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(publication.clone());
+        publication
+    }
+
+    fn submit(
+        self: &Arc<Self>,
+        client: &crate::persistence::TranscriptCommitClient,
+        ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
+    ) -> Result<
+        crate::persistence::PendingLiveTranscript,
+        crate::persistence::canonical_log::TranscriptCommitError,
+    > {
+        let owner = self.clone();
+        client.submit_live_with_publication(
+            &self.event,
+            ledger.clone(),
+            Arc::new(move |result| {
+                owner.observe(result, true);
+            }),
+        )
+    }
+
+    fn commit(
+        self: &Arc<Self>,
+        slot: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
+        ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
+    ) -> bool {
+        let client = slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|writer| writer.client());
+        let reply = client
+            .ok_or(crate::persistence::canonical_log::TranscriptCommitError::WriterAbsent)
+            .and_then(|client| self.submit(&client, ledger))
+            .and_then(|pending| pending.wait());
+        self.observe(reply, false)
+    }
+
+    fn observe(&self, receipt: LiveTranscriptResult, recovered: bool) -> bool {
+        let uncertain = receipt.as_ref().is_err_and(save_confirmation_pending);
+        let mut slot = self.action.lock().unwrap_or_else(|p| p.into_inner());
+        if uncertain {
+            // Serialize the pending status with resolution of this exact ticket.
+            return slot
+                .as_ref()
+                .is_some_and(|publish| publish(receipt, recovered, self.id));
+        }
+        let action = slot.take();
+        drop(slot);
+        publications()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|p| !std::ptr::eq(p.as_ref(), self));
+        action.is_some_and(|publish| publish(receipt, recovered, self.id))
+    }
+}
+
+pub(crate) fn resolve_recovery_publication(
+    session: &str,
+    event: &crate::projections::TranscriptEvent,
+    result: LiveTranscriptResult,
+) {
+    // No capture owns historical records discovered on startup. Review loads
+    // those from the recovered log. Never emit their text into a new session.
+    let entries: Vec<_> = publications()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|p| p.session == session && &p.event == event)
+        .cloned()
+        .collect();
+    let mut published = false;
+    for entry in entries {
+        let receipt = result
+            .clone()
+            .map(|(accepted, receipt)| (accepted && !published, receipt));
+        published |= entry.observe(receipt, true);
+    }
+}
+
+pub(crate) fn publish_recovered_transcript(
+    session: &str,
+    event: &crate::projections::TranscriptEvent,
+    receipt: crate::persistence::canonical_log::TranscriptReceipt,
+) {
+    resolve_recovery_publication(session, event, Ok((true, receipt)));
+}
+
+pub(crate) fn discard_recovery_publication(
+    session: &str,
+    event: &crate::projections::TranscriptEvent,
+) {
+    resolve_recovery_publication(
+        session,
+        event,
+        Err(crate::persistence::canonical_log::TranscriptCommitError::UncommittedAttempt),
+    );
+}
+
+impl TranscriptProcessingContext {
+    fn publication(
+        &self,
+        session: String,
+        payload: &events::AsrSpanRevisionPayload,
+        publish: impl Fn(&Self, events::AsrSpanRevisionPayload, bool) + Send + Sync + 'static,
+    ) -> Arc<PendingPublication> {
+        let ctx = self.clone();
+        let revision = payload.clone();
+        PendingPublication::register(session.clone(), payload, move |receipt, recovered, id| {
+            // Rotation swaps the display writer, scheduler and buffers together.
+            // Finish this generation's publication before it can reset any of them.
+            let _publication = ctx
+                .projection_runtime
+                .transcript_publication
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            if observe_transcript_receipt(
+                Some((&ctx.app_handle, &ctx.pipeline_status)),
+                &ctx.transcript_ledger,
+                &ctx.projection_schedulers,
+                Some(&ctx.projection_dispatch_context()),
+                &revision,
+                &session,
+                id,
+                receipt,
+            ) {
+                publish(&ctx, revision.clone(), recovered);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    fn commit_and_publish(
+        &self,
+        payload: events::AsrSpanRevisionPayload,
+        publish: impl Fn(&Self, events::AsrSpanRevisionPayload, bool) + Send + Sync + 'static,
+    ) -> bool {
+        let publication = self.publication(
+            active_session_id_snapshot(&self.active_session_id),
+            &payload,
+            publish,
+        );
+        publication.commit(&self.transcript_event_writer, &self.transcript_ledger)
+    }
+}
+
+fn save_confirmation_pending(
+    error: &crate::persistence::canonical_log::TranscriptCommitError,
+) -> bool {
+    use crate::persistence::canonical_log::TranscriptCommitError as Error;
+    matches!(
+        error,
+        Error::AckTimeout
+            | Error::ReplyLost
+            | Error::ConfirmationPending
+            | Error::StorageFullConfirmationPending
+    )
+}
+
+fn transcript_saving_failure(
+    error: &crate::persistence::canonical_log::TranscriptCommitError,
+) -> Option<events::TranscriptSavingFailure> {
+    use crate::persistence::canonical_log::TranscriptCommitError as Error;
+    use events::TranscriptSavingFailure as Saving;
+    match error {
+        Error::InvalidAddress
+        | Error::InvalidRevision
+        | Error::LiveHeadChanged
+        | Error::ConflictingAttempt
+        | Error::Frame(_) => None,
+        Error::AckTimeout | Error::ReplyLost | Error::ConfirmationPending => {
+            Some(Saving::ConfirmationDelayed)
+        }
+        Error::WriterAbsent => Some(Saving::WriterAbsent),
+        Error::FrameWriteStorageFull | Error::StorageFullConfirmationPending => {
+            Some(Saving::StorageFull)
+        }
+        _ if error.is_storage_full() => Some(Saving::StorageFull),
+        Error::QueueFull
+        | Error::UncommittedAttempt
+        | Error::UnsupportedRepository
+        | Error::SessionFloorUnavailable
+        | Error::InvalidHistory
+        | Error::Qualification(_)
+        | Error::Coordination(_)
+        | Error::Rejected(_)
+        | Error::Indeterminate(_)
+        | Error::Io { .. } => Some(Saving::WriteFailed),
+    }
+}
+
+/// Returns true when the visible storage status changed.
+fn update_transcript_saving_status(
+    status: &mut PipelineStatus,
+    id: u64,
+    result: &LiveTranscriptResult,
+) -> bool {
+    use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+    use events::TranscriptSavingFailure::{ConfirmationDelayed, StorageFull};
+
+    let was = (
+        status.transcript_not_saving,
+        status.transcript_captions_lost,
+        status.transcript_crash_safety_unverified,
+    );
+    match result {
+        Ok((_, receipt)) => {
+            status.pending_transcript_saves.remove(&id);
+            if id >= status.latest_transcript_save.0 {
+                status.latest_transcript_save = (id, None);
+            }
+            status.transcript_crash_safety_unverified =
+                receipt.barrier == CanonicalDurabilityBarrier::SyncedUnqualified;
+        }
+        Err(error) => {
+            if let Some(reason) = transcript_saving_failure(error) {
+                if save_confirmation_pending(error) {
+                    // A waiter can report its timeout after the resolver has
+                    // already identified ENOSPC for this same ticket.
+                    let pending = status.pending_transcript_saves.entry(id).or_insert(reason);
+                    if reason == StorageFull {
+                        *pending = StorageFull;
+                    }
+                } else {
+                    status.pending_transcript_saves.remove(&id);
+                    status.transcript_captions_lost = true;
+                    if id >= status.latest_transcript_save.0 {
+                        status.latest_transcript_save = (id, Some(reason));
+                    }
+                }
+            } else if status.pending_transcript_saves.remove(&id).is_none() {
+                return false;
+            }
+        }
+    }
+    status.transcript_not_saving = if status
+        .pending_transcript_saves
+        .values()
+        .any(|v| *v == StorageFull)
+    {
+        Some(StorageFull)
+    } else {
+        status.latest_transcript_save.1.or_else(|| {
+            (!status.pending_transcript_saves.is_empty()).then_some(ConfirmationDelayed)
+        })
+    };
+    was != (
+        status.transcript_not_saving,
+        status.transcript_captions_lost,
+        status.transcript_crash_safety_unverified,
+    )
+}
+
+fn report_transcript_commit(result: LiveTranscriptResult) -> bool {
+    match result {
+        Ok((publish, _)) => publish,
+        Err(error) if save_confirmation_pending(&error) => {
+            log::warn!("transcript save confirmation pending");
+            false
+        }
+        Err(error) if transcript_saving_failure(&error).is_none() => {
+            log::debug!("transcript revision declined: {error:?}");
+            false
+        }
+        Err(error) => {
+            log::warn!("transcript commit refused: {error:?}");
+            false
+        }
+    }
+}
+
+/// The worker serializes head checks and live publication around the file
+/// operation. Only take the writer-slot lock to copy its submit handle.
+#[cfg(test)]
+fn commit_asr_span_revision(
+    transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
+    transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
+    payload: &events::AsrSpanRevisionPayload,
+) -> LiveTranscriptResult {
+    use crate::persistence::canonical_log::TranscriptCommitError;
+
+    let client = transcript_event_writer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .ok_or(TranscriptCommitError::WriterAbsent)?
+        .client();
+    client.append_live(&payload.clone().into(), transcript_ledger.clone())
+}
+
+#[cfg(test)]
 fn record_asr_span_revision_event_and_observe_projection(
+    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     projection_schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     projection_dispatch: Option<&ProjectionDispatchContext>,
     payload: &events::AsrSpanRevisionPayload,
 ) -> bool {
-    if !record_asr_span_revision_event(transcript_ledger, transcript_event_writer, payload) {
+    let expected_session = transcript_ledger
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .session_id
+        .clone();
+    let receipt = commit_asr_span_revision(transcript_ledger, transcript_event_writer, payload);
+    observe_transcript_receipt(
+        status,
+        transcript_ledger,
+        projection_schedulers,
+        projection_dispatch,
+        payload,
+        &expected_session,
+        next_publication_id(),
+        receipt,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_transcript_receipt(
+    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
+    transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
+    projection_schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
+    projection_dispatch: Option<&ProjectionDispatchContext>,
+    payload: &events::AsrSpanRevisionPayload,
+    expected_session: &str,
+    publication_id: u64,
+    receipt: LiveTranscriptResult,
+) -> bool {
+    let changed = {
+        let ledger = transcript_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if ledger.session_id != expected_session {
+            return false;
+        }
+        status.and_then(|(app, status)| {
+            let mut status = status.write().unwrap_or_else(|p| p.into_inner());
+            update_transcript_saving_status(&mut status, publication_id, &receipt)
+                .then(|| (app, status.clone()))
+        })
+    };
+    if let Some((app, status)) = changed {
+        let _ = app.emit(events::PIPELINE_STATUS_EVENT, &status);
+    }
+    if !report_transcript_commit(receipt) {
         return false;
     }
     observe_projection_schedulers_for_asr_revision(
@@ -2961,13 +3334,6 @@ fn observe_projection_schedulers_for_asr_revision(
             }
         };
         let observation = schedulers.observe_ledger(&ledger, current_unix_millis());
-        log::debug!(
-            "projection_schedulers.observe_asr_revision span_id={} revision={} notes={:?} graph={:?}",
-            payload.span_id,
-            payload.revision_number,
-            observation.notes,
-            observation.graph
-        );
         log_attempt_budget_exhausted(
             &observation.notes,
             schedulers.notes().metrics().attempts_exhausted,
@@ -3568,6 +3934,12 @@ fn projection_movement_facts(
     backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
     let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, snapshot);
+    // Only an accepted patch names a model, and its provenance says where the
+    // model ran.
+    let model_placement = match &backend {
+        ProjectionLedgerBackend::Actual(provenance, _) => provenance.model_placement,
+        _ => None,
+    };
     let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
         ProjectionLedgerBackend::Actual(provenance, attempted_route) => {
             let (provider_id, cloud, prefix) =
@@ -3616,6 +3988,7 @@ fn projection_movement_facts(
         session_id: job.session_id.clone(),
         provider_id,
         model_id,
+        model_placement,
         requires_cloud_transfer,
         cloud_transfer_allowed: dispatch.llm_allow_cloud_fallbacks,
         projection_sequence: sequence,
@@ -4139,14 +4512,14 @@ fn emit_transcript_and_extract_with_meta(
     let asr_latency_ms = asr_meta.asr_latency_ms;
     let received_at_ms = asr_meta.received_at_ms.unwrap_or_else(current_unix_millis);
     let asr_payload = events::AsrSpanRevisionPayload {
-        span_id: span_id.clone(),
+        span_id,
         provider: ctx.asr_provider.to_string(),
         source_id: segment.source_id.clone(),
         provider_item_id,
         transcript_segment_id: Some(segment.id.clone()),
         speaker_id,
         speaker_label,
-        channel: channel.clone(),
+        channel,
         text: segment.text.clone(),
         start_time: segment.start_time,
         end_time: segment.end_time,
@@ -4157,21 +4530,63 @@ fn emit_transcript_and_extract_with_meta(
         supersedes,
         turn_id,
         end_of_turn: true,
-        raw_event_ref: raw_event_ref.clone(),
+        raw_event_ref,
         capture_latency_ms,
         asr_latency_ms,
         received_at_ms,
     };
-    if !record_asr_span_revision_event_and_observe_projection(
-        &ctx.transcript_ledger,
-        &ctx.transcript_event_writer,
-        &ctx.projection_schedulers,
-        Some(&ctx.projection_dispatch_context()),
-        &asr_payload,
-    ) {
-        return false;
-    }
+    let extraction_count = extraction_count.clone();
+    let graph_update_count = graph_update_count.clone();
+    ctx.commit_and_publish(asr_payload, move |ctx, payload, recovered| {
+        publish_accepted_final(
+            ctx,
+            segment.clone(),
+            speaker_info.clone(),
+            payload,
+            asr_count,
+            diarization_count,
+            &extraction_count,
+            &graph_update_count,
+            asr_meta.promoted_interim,
+        );
+        if let Some(initial) = &asr_meta.initial_speaker {
+            initial.publish(ctx);
+        }
+        if let Some(split) = &asr_meta.split_turn {
+            let accepted_turn = split
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .accepted(recovered);
+            if let Some(turn) = accepted_turn {
+                emit_turn_event(&ctx.app_handle, turn);
+            }
+        }
+        if recovered {
+            if let Some(turn) = asr_meta.recovery_turn.clone() {
+                emit_turn_event(&ctx.app_handle, turn);
+            }
+            // The receiver may already be stopped: its idle heartbeat cannot
+            // be relied on to drain extraction work queued by a late receipt.
+            flush_pending_now(ctx, &extraction_count, &graph_update_count);
+        }
+    })
+}
 
+#[allow(clippy::too_many_arguments)]
+fn publish_accepted_final(
+    ctx: &TranscriptProcessingContext,
+    segment: TranscriptSegment,
+    speaker_info: Option<SpeakerInfo>,
+    asr_payload: events::AsrSpanRevisionPayload,
+    asr_count: u64,
+    diarization_count: u64,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+    promoted_interim: bool,
+) {
+    let span_id = asr_payload.span_id.clone();
+    let channel = asr_payload.channel.clone();
+    let raw_event_ref = asr_payload.raw_event_ref.clone();
     // 1. Store in transcript buffer (ring-buffered at 500 items).
     if let Ok(mut buffer) = ctx.transcript_buffer.write() {
         buffer.push_back(segment.clone());
@@ -4243,7 +4658,7 @@ fn emit_transcript_and_extract_with_meta(
     if let Ok(mut status) = ctx.pipeline_status.write() {
         // A local promotion advances a healthy count, but provides no evidence
         // that a disconnected or failed provider has recovered.
-        if !asr_meta.promoted_interim || matches!(status.asr, StageStatus::Running { .. }) {
+        if !promoted_interim || matches!(status.asr, StageStatus::Running { .. }) {
             status.asr = StageStatus::Running {
                 processed_count: asr_count,
             };
@@ -4304,7 +4719,6 @@ fn emit_transcript_and_extract_with_meta(
         extraction_count,
         graph_update_count,
     );
-    true
 }
 
 #[allow(dead_code)]
@@ -4341,30 +4755,9 @@ fn emit_moonshine_span_revision(
         );
     }
 
-    if !record_asr_span_revision_event_and_observe_projection(
-        &ctx.transcript_ledger,
-        &ctx.transcript_event_writer,
-        &ctx.projection_schedulers,
-        Some(&ctx.projection_dispatch_context()),
-        &revision.payload,
-    ) {
-        return false;
-    }
-    emit_asr_span_revision(&ctx.app_handle, revision.payload.clone());
-    events::emit_or_log(
-        &ctx.app_handle,
-        events::ASR_PARTIAL,
-        events::AsrPartialPayload {
-            provider: revision.payload.provider.clone(),
-            source_id: revision.payload.source_id.clone(),
-            text: revision.payload.text.clone(),
-            start_time: revision.payload.start_time,
-            end_time: revision.payload.end_time,
-            confidence: revision.payload.confidence,
-            timestamp_ms: revision.payload.received_at_ms,
-        },
-    );
-    true
+    ctx.commit_and_publish(revision.payload, |ctx, payload, _| {
+        publish_accepted_partial(ctx, payload)
+    })
 }
 
 fn moonshine_final_transcript_segment(
@@ -4395,6 +4788,9 @@ fn moonshine_final_transcript_segment(
 fn moonshine_revision_meta(revision: &MoonshineSpanRevision) -> AsrRevisionMeta {
     let payload = &revision.payload;
     AsrRevisionMeta {
+        recovery_turn: None,
+        initial_speaker: None,
+        split_turn: None,
         promoted_interim: false,
         span_id: Some(payload.span_id.clone()),
         provider_item_id: payload.provider_item_id.clone(),
@@ -4413,6 +4809,8 @@ fn moonshine_revision_meta(revision: &MoonshineSpanRevision) -> AsrRevisionMeta 
 
 fn emit_provider_span_revision_payload(
     payload: events::AsrSpanRevisionPayload,
+    recovery_turn: Option<TurnEventInput>,
+    initial_speaker: Option<InitialTurnSpeaker>,
     ctx: &TranscriptProcessingContext,
     asr_count: u64,
     extraction_count: &Arc<AtomicU64>,
@@ -4430,34 +4828,40 @@ fn emit_provider_span_revision_payload(
             0,
             extraction_count,
             graph_update_count,
-            asr_payload_revision_meta(&payload),
+            AsrRevisionMeta {
+                recovery_turn,
+                initial_speaker,
+                ..asr_payload_revision_meta(&payload)
+            },
         );
     }
 
-    if !record_asr_span_revision_event_and_observe_projection(
-        &ctx.transcript_ledger,
-        &ctx.transcript_event_writer,
-        &ctx.projection_schedulers,
-        Some(&ctx.projection_dispatch_context()),
-        &payload,
-    ) {
-        return false;
-    }
+    ctx.commit_and_publish(payload, move |ctx, payload, recovered| {
+        publish_accepted_partial(ctx, payload);
+        if recovered && let Some(turn) = recovery_turn.clone() {
+            emit_turn_event(&ctx.app_handle, turn);
+        }
+    })
+}
+
+fn publish_accepted_partial(
+    ctx: &TranscriptProcessingContext,
+    payload: events::AsrSpanRevisionPayload,
+) {
     emit_asr_span_revision(&ctx.app_handle, payload.clone());
     events::emit_or_log(
         &ctx.app_handle,
         events::ASR_PARTIAL,
         events::AsrPartialPayload {
-            provider: payload.provider.clone(),
-            source_id: payload.source_id.clone(),
-            text: payload.text.clone(),
+            provider: payload.provider,
+            source_id: payload.source_id,
+            text: payload.text,
             start_time: payload.start_time,
             end_time: payload.end_time,
             confidence: payload.confidence,
             timestamp_ms: payload.received_at_ms,
         },
     );
-    true
 }
 
 fn final_transcript_segment_from_asr_payload(
@@ -4484,6 +4888,9 @@ fn final_transcript_segment_from_asr_payload(
 
 fn asr_payload_revision_meta(payload: &events::AsrSpanRevisionPayload) -> AsrRevisionMeta {
     AsrRevisionMeta {
+        recovery_turn: None,
+        initial_speaker: None,
+        split_turn: None,
         promoted_interim: false,
         span_id: Some(payload.span_id.clone()),
         provider_item_id: payload.provider_item_id.clone(),
@@ -4515,32 +4922,118 @@ fn normalize_assemblyai_v3_revision_for_side_effects(
     }
 }
 
-fn emit_soniox_span_revision(
-    revision: SonioxParsedRevision,
-    ctx: &TranscriptProcessingContext,
-    asr_count: u64,
-    extraction_count: &Arc<AtomicU64>,
-    graph_update_count: &Arc<AtomicU64>,
-) -> bool {
-    if let Some(latency_ms) = revision
-        .final_audio_proc_ms
-        .or(revision.total_audio_proc_ms)
-    {
-        emit_stage_latency(
-            &ctx.app_handle,
-            "asr.soniox",
-            Some(&revision.payload.source_id),
-            Some(&revision.payload.span_id),
-            Duration::from_millis(latency_ms),
-        );
+/// The receiver drains pending revisions in provider order at control events,
+/// idle, shutdown, or the writer's group limit.
+struct ProviderReceipts {
+    session: String,
+    client: Option<crate::persistence::TranscriptCommitClient>,
+    pending: Vec<PendingProviderRevision>,
+    extractions: Arc<AtomicU64>,
+    graph_updates: Arc<AtomicU64>,
+}
+
+struct PendingProviderRevision {
+    publication: Arc<PendingPublication>,
+    receipt: Result<
+        crate::persistence::PendingLiveTranscript,
+        crate::persistence::canonical_log::TranscriptCommitError,
+    >,
+}
+
+impl ProviderReceipts {
+    fn new(
+        ctx: &TranscriptProcessingContext,
+        extractions: &Arc<AtomicU64>,
+        graph_updates: &Arc<AtomicU64>,
+    ) -> Self {
+        // Bind an ingress to one writer for its lifetime. A rotated worker
+        // refuses this client even if queued provider data arrives late.
+        let ledger = ctx
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let client = ctx
+            .transcript_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|writer| writer.client());
+        Self {
+            session: ledger.session_id.clone(),
+            extractions: extractions.clone(),
+            graph_updates: graph_updates.clone(),
+            client,
+            pending: Vec::with_capacity(MAX_TRANSCRIPT_GROUP),
+        }
     }
-    emit_provider_span_revision_payload(
-        revision.payload,
-        ctx,
-        asr_count,
-        extraction_count,
-        graph_update_count,
-    )
+
+    fn submit(
+        &mut self,
+        ctx: &TranscriptProcessingContext,
+        mut payload: events::AsrSpanRevisionPayload,
+        count: u64,
+        turn: Option<TurnEventInput>,
+    ) {
+        use crate::persistence::canonical_log::TranscriptCommitError;
+        let segment = if payload.is_final {
+            let Some(segment) = final_transcript_segment_from_asr_payload(&payload) else {
+                return;
+            };
+            // Match final normalization in emit_transcript_and_extract_with_meta.
+            payload.transcript_segment_id = Some(segment.id.clone());
+            payload.stability = events::AsrSpanStability::Final;
+            payload.end_of_turn = true;
+            Some(segment)
+        } else {
+            None
+        };
+        let extractions = self.extractions.clone();
+        let graph_updates = self.graph_updates.clone();
+        let publication = ctx.publication(
+            self.session.clone(),
+            &payload,
+            move |ctx, payload, recovered| {
+                if let Some(segment) = segment.clone() {
+                    publish_accepted_final(
+                        ctx,
+                        segment,
+                        None,
+                        payload,
+                        count,
+                        0,
+                        &extractions,
+                        &graph_updates,
+                        false,
+                    );
+                    if recovered {
+                        flush_pending_now(ctx, &extractions, &graph_updates);
+                    }
+                } else {
+                    publish_accepted_partial(ctx, payload);
+                }
+                if let Some(turn) = turn.clone() {
+                    emit_turn_event(&ctx.app_handle, turn);
+                }
+            },
+        );
+        let receipt = self
+            .client
+            .as_ref()
+            .ok_or(TranscriptCommitError::WriterAbsent)
+            .and_then(|client| publication.submit(client, &ctx.transcript_ledger));
+        self.pending.push(PendingProviderRevision {
+            publication,
+            receipt,
+        });
+    }
+
+    fn publish(&mut self) {
+        for pending in self.pending.drain(..) {
+            pending
+                .publication
+                .observe(pending.receipt.and_then(|reply| reply.wait()), false);
+        }
+    }
 }
 
 fn assemblyai_source_id_from_span_id(span_id: &str) -> String {
@@ -4550,6 +5043,37 @@ fn assemblyai_source_id_from_span_id(span_id: &str) -> String {
         .filter(|source| !source.trim().is_empty())
         .unwrap_or("assemblyai-stream")
         .to_string()
+}
+
+/// Provider corrections and a recovered inline final share the same speaker
+/// revision counter. A correction admitted while confirmation was pending wins.
+struct InitialTurnSpeaker {
+    revision: events::DiarizationSpanRevisionPayload,
+    numbers: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl InitialTurnSpeaker {
+    fn publish(&self, ctx: &TranscriptProcessingContext) {
+        let mut numbers = self.numbers.lock().unwrap_or_else(|p| p.into_inner());
+        if numbers.contains_key(&self.revision.span_id) {
+            return;
+        }
+        let event_sink = TauriDiarizationEventSink {
+            app_handle: &ctx.app_handle,
+        };
+        let session_id = ctx.projection_runtime.current_session_id();
+        let dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &ctx.speaker_timeline,
+            knowledge_graph: &ctx.knowledge_graph,
+            graph_snapshot: &ctx.graph_snapshot,
+            transcript_ledger: &ctx.transcript_ledger,
+            session_id: &session_id,
+        };
+        if emit_and_dispatch_diarization_span_revision(&dispatch, self.revision.clone()).accepted {
+            numbers.insert(self.revision.span_id.clone(), 1);
+        }
+    }
 }
 
 fn assemblyai_turn_speaker_span_id(asr_span_id: &str) -> String {
@@ -6075,23 +6599,20 @@ fn run_asr_worker(
                         &final_meta,
                     );
 
-                    emit_turn_event(
-                        &ctx.app_handle,
-                        TurnEventInput {
-                            provider: "local_whisper",
-                            source_id: final_segment.source_id.clone(),
-                            kind: events::TurnEventKind::LocalWindow,
-                            text: Some(final_segment.text.clone()),
-                            start_time: Some(final_segment.start_time),
-                            end_time: Some(final_segment.end_time),
-                            confidence: Some(final_segment.confidence),
-                            turn_index: Some(asr_count),
-                        },
-                    );
+                    let turn = TurnEventInput {
+                        provider: "local_whisper",
+                        source_id: final_segment.source_id.clone(),
+                        kind: events::TurnEventKind::LocalWindow,
+                        text: Some(final_segment.text.clone()),
+                        start_time: Some(final_segment.start_time),
+                        end_time: Some(final_segment.end_time),
+                        confidence: Some(final_segment.confidence),
+                        turn_index: Some(asr_count),
+                    };
 
                     // 3–6. Buffer, persist, emit, update status, and spawn
                     //      extraction in the shared tail helper.
-                    emit_transcript_and_extract_with_meta(
+                    if emit_transcript_and_extract_with_meta(
                         final_segment,
                         speaker_info_to_emit,
                         &ctx,
@@ -6099,8 +6620,13 @@ fn run_asr_worker(
                         diarization_count,
                         &extraction_count,
                         &graph_update_count,
-                        final_meta,
-                    );
+                        AsrRevisionMeta {
+                            recovery_turn: Some(turn.clone()),
+                            ..final_meta
+                        },
+                    ) {
+                        emit_turn_event(&ctx.app_handle, turn);
+                    }
                 }
             }
             Err(_) => {
@@ -6330,37 +6856,6 @@ pub(crate) fn run_speech_processor_diarization_only(
             #[cfg(not(feature = "diarization-clustering"))]
             let emit_simple_speaker = true;
 
-            emit_turn_event(
-                &shared.app_handle,
-                TurnEventInput {
-                    provider: "local_diarization",
-                    source_id: final_segment.source_id.clone(),
-                    kind: events::TurnEventKind::LocalWindow,
-                    text: Some(final_segment.text.clone()),
-                    start_time: Some(final_segment.start_time),
-                    end_time: Some(final_segment.end_time),
-                    confidence: Some(final_segment.confidence),
-                    turn_index: Some(count),
-                },
-            );
-
-            if let Ok(mut buffer) = shared.transcript_buffer.write() {
-                buffer.push_back(final_segment.clone());
-                if buffer.len() > 500 {
-                    buffer.pop_front();
-                }
-            }
-            // Persist transcript segment asynchronously. This is a second,
-            // independent display-write site (local diarization-in-place ASR),
-            // not routed through `emit_transcript_and_extract_with_meta`'s shared
-            // tail, so it shares `persist_display_transcript_segment` rather than
-            // duplicating the miss-counting logic (audio-graph-64e3).
-            persist_display_transcript_segment(
-                &shared.transcript_writer,
-                &shared.display_transcript_write_misses,
-                &final_segment,
-            );
-
             let final_meta = final_only_revision_meta(
                 "local_diarization",
                 &final_segment.source_id,
@@ -6395,93 +6890,148 @@ pub(crate) fn run_speech_processor_diarization_only(
                 asr_latency_ms: None,
                 received_at_ms: current_unix_millis(),
             };
-            if record_asr_span_revision_event_and_observe_projection(
-                &shared.transcript_ledger,
-                &shared.transcript_event_writer,
-                &shared.projection_schedulers,
-                Some(&projection_dispatch),
-                &asr_payload,
-            ) {
-                emit_asr_span_revision(&shared.app_handle, asr_payload);
-            }
-            let event_sink = TauriDiarizationEventSink {
-                app_handle: &shared.app_handle,
-            };
-            let diarization_session_id = shared.projection_runtime.current_session_id();
-            let diarization_dispatch = DiarizationDispatchContext {
-                event_sink: &event_sink,
-                speaker_timeline: &shared.speaker_timeline,
-                knowledge_graph: &shared.knowledge_graph,
-                graph_snapshot: &shared.graph_snapshot,
-                transcript_ledger: &shared.transcript_ledger,
-                session_id: &diarization_session_id,
-            };
-            emit_diarization_span_revision_for_transcript(
-                &diarization_dispatch,
-                "local_diarization",
-                &final_segment,
-                &final_span_id,
-                None,
-                None,
-            );
-            let _ = shared
-                .app_handle
-                .emit(events::TRANSCRIPT_UPDATE, &final_segment);
-            if emit_simple_speaker && let Some(info) = diarized.speaker_info {
-                let _ = shared.app_handle.emit(events::SPEAKER_DETECTED, &info);
-            }
-            spawn_agent_proposal_task(
-                final_segment.clone(),
-                active_session_id_snapshot(&shared.active_session_id),
-                final_segment.id.clone(),
-                shared.app_handle.clone(),
-                shared.pending_agent_proposals.clone(),
-                shared.active_session_id.clone(),
-                shared.transcript_ledger.clone(),
-            );
+            let publication = {
+                let shared = shared.clone();
+                let config = config.clone();
+                let extraction_count = extraction_count.clone();
+                let graph_update_count = graph_update_count.clone();
+                let projection_dispatch = projection_dispatch.clone();
+                let speaker_info = diarized.speaker_info;
+                let session = active_session_id_snapshot(&shared.active_session_id);
+                let owner = session.clone();
+                let revision = asr_payload.clone();
+                PendingPublication::register(owner, &asr_payload, move |receipt, _, id| {
+                    let _publication = shared
+                        .projection_runtime
+                        .transcript_publication
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if !observe_transcript_receipt(
+                        Some((&shared.app_handle, &shared.pipeline_status)),
+                        &shared.transcript_ledger,
+                        &shared.projection_schedulers,
+                        Some(&projection_dispatch),
+                        &revision,
+                        &session,
+                        id,
+                        receipt,
+                    ) {
+                        return false;
+                    }
+                    emit_turn_event(
+                        &shared.app_handle,
+                        TurnEventInput {
+                            provider: "local_diarization",
+                            source_id: final_segment.source_id.clone(),
+                            kind: events::TurnEventKind::LocalWindow,
+                            text: Some(final_segment.text.clone()),
+                            start_time: Some(final_segment.start_time),
+                            end_time: Some(final_segment.end_time),
+                            confidence: Some(final_segment.confidence),
+                            turn_index: Some(count),
+                        },
+                    );
 
-            if let Ok(mut status) = shared.pipeline_status.write() {
-                // audio-graph-586b: see the identical guard's comment in
-                // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
-                // worker startup must survive every per-segment count update.
-                if !matches!(status.diarization, StageStatus::Degraded { .. }) {
-                    status.diarization = StageStatus::Running {
-                        processed_count: count,
+                    if let Ok(mut buffer) = shared.transcript_buffer.write() {
+                        buffer.push_back(final_segment.clone());
+                        if buffer.len() > 500 {
+                            buffer.pop_front();
+                        }
+                    }
+                    // Persist transcript segment asynchronously. This is a second,
+                    // independent display-write site (local diarization-in-place ASR),
+                    // not routed through `emit_transcript_and_extract_with_meta`'s shared
+                    // tail, so it shares `persist_display_transcript_segment` rather than
+                    // duplicating the miss-counting logic (audio-graph-64e3).
+                    persist_display_transcript_segment(
+                        &shared.transcript_writer,
+                        &shared.display_transcript_write_misses,
+                        &final_segment,
+                    );
+
+                    emit_asr_span_revision(&shared.app_handle, revision.clone());
+                    let event_sink = TauriDiarizationEventSink {
+                        app_handle: &shared.app_handle,
                     };
-                }
-            }
+                    let diarization_session_id = shared.projection_runtime.current_session_id();
+                    let diarization_dispatch = DiarizationDispatchContext {
+                        event_sink: &event_sink,
+                        speaker_timeline: &shared.speaker_timeline,
+                        knowledge_graph: &shared.knowledge_graph,
+                        graph_snapshot: &shared.graph_snapshot,
+                        transcript_ledger: &shared.transcript_ledger,
+                        session_id: &diarization_session_id,
+                    };
+                    emit_diarization_span_revision_for_transcript(
+                        &diarization_dispatch,
+                        "local_diarization",
+                        &final_segment,
+                        &final_span_id,
+                        None,
+                        None,
+                    );
+                    let _ = shared
+                        .app_handle
+                        .emit(events::TRANSCRIPT_UPDATE, &final_segment);
+                    if emit_simple_speaker && let Some(info) = &speaker_info {
+                        let _ = shared.app_handle.emit(events::SPEAKER_DETECTED, info);
+                    }
+                    spawn_agent_proposal_task(
+                        final_segment.clone(),
+                        active_session_id_snapshot(&shared.active_session_id),
+                        final_segment.id.clone(),
+                        shared.app_handle.clone(),
+                        shared.pending_agent_proposals.clone(),
+                        shared.active_session_id.clone(),
+                        shared.transcript_ledger.clone(),
+                    );
 
-            // Knowledge Graph Extraction — fire-and-forget
-            let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
-            spawn_extraction_task(
-                final_segment.text.clone(),
-                final_segment
-                    .speaker_label
-                    .clone()
-                    .unwrap_or_else(|| "Unknown".to_string()),
-                String::new(),
-                final_segment.id.clone(),
-                final_segment.start_time,
-                &ExtractionDeps {
-                    active_session_id: &shared.active_session_id,
-                    transcript_ledger: &shared.transcript_ledger,
-                    turn_speaker_timeline: Some(&shared.speaker_timeline),
-                    expected_session_id: &expected_session_id,
-                    llm_engine: &shared.llm_engine,
-                    api_client: &shared.api_client,
-                    mistralrs_engine: &shared.mistralrs_engine,
-                    llm_executor: &shared.llm_executor,
-                    llm_provider: &config.llm_provider,
-                    llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
-                    graph_extractor: &shared.graph_extractor,
-                    knowledge_graph: &shared.knowledge_graph,
-                    graph_snapshot: &shared.graph_snapshot,
-                    pipeline_status: &shared.pipeline_status,
-                    app_handle: &shared.app_handle,
-                },
-                &extraction_count,
-                &graph_update_count,
-            );
+                    if let Ok(mut status) = shared.pipeline_status.write() {
+                        // audio-graph-586b: see the identical guard's comment in
+                        // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
+                        // worker startup must survive every per-segment count update.
+                        if !matches!(status.diarization, StageStatus::Degraded { .. }) {
+                            status.diarization = StageStatus::Running {
+                                processed_count: count,
+                            };
+                        }
+                    }
+
+                    // Knowledge Graph Extraction — fire-and-forget
+                    let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
+                    spawn_extraction_task(
+                        final_segment.text.clone(),
+                        final_segment
+                            .speaker_label
+                            .clone()
+                            .unwrap_or_else(|| "Unknown".to_string()),
+                        String::new(),
+                        final_segment.id.clone(),
+                        final_segment.start_time,
+                        &ExtractionDeps {
+                            active_session_id: &shared.active_session_id,
+                            transcript_ledger: &shared.transcript_ledger,
+                            turn_speaker_timeline: Some(&shared.speaker_timeline),
+                            expected_session_id: &expected_session_id,
+                            llm_engine: &shared.llm_engine,
+                            api_client: &shared.api_client,
+                            mistralrs_engine: &shared.mistralrs_engine,
+                            llm_executor: &shared.llm_executor,
+                            llm_provider: &config.llm_provider,
+                            llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
+                            graph_extractor: &shared.graph_extractor,
+                            knowledge_graph: &shared.knowledge_graph,
+                            graph_snapshot: &shared.graph_snapshot,
+                            pipeline_status: &shared.pipeline_status,
+                            app_handle: &shared.app_handle,
+                        },
+                        &extraction_count,
+                        &graph_update_count,
+                    );
+                    true
+                })
+            };
+            publication.commit(&shared.transcript_event_writer, &shared.transcript_ledger);
         }
     }
 
@@ -7366,6 +7916,122 @@ fn promote_pending_interim(
     }
 }
 
+/// Flux lifecycle messages can be the only source of transcript text. Track
+/// an observed turn for messages without provider identity or audio offsets.
+struct FluxTurnClock {
+    origin: Instant,
+    connection: uuid::Uuid,
+    active: HashMap<String, FluxSpan>,
+}
+
+struct FluxSpan {
+    id: String,
+    turn_index: Option<u64>,
+    start: f64,
+}
+impl Default for FluxTurnClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            connection: uuid::Uuid::new_v4(),
+            active: HashMap::new(),
+        }
+    }
+}
+impl FluxTurnClock {
+    fn disconnect(&mut self) {
+        self.active.clear();
+        self.connection = uuid::Uuid::new_v4();
+    }
+
+    fn revision(
+        &mut self,
+        turn: &TurnEventInput,
+        revisions: &mut HashMap<String, u64>,
+    ) -> Option<events::AsrSpanRevisionPayload> {
+        if matches!(
+            turn.kind,
+            events::TurnEventKind::UtteranceEnd | events::TurnEventKind::SpeechFinal
+        ) {
+            return None;
+        }
+        if matches!(turn.kind, events::TurnEventKind::TurnResumed) && turn.text.is_none() {
+            return None;
+        }
+        let now = self.origin.elapsed().as_secs_f64();
+        // A provider index identifies a turn only within this connection. Late
+        // index/offset metadata cannot change the ID of an already published span.
+        if matches!(turn.kind, events::TurnEventKind::SpeechStarted)
+            || self
+                .active
+                .get(&turn.source_id)
+                .and_then(|span| span.turn_index.zip(turn.turn_index))
+                .is_some_and(|(old, new)| old != new)
+        {
+            self.active.remove(&turn.source_id);
+        }
+        let active = self
+            .active
+            .entry(turn.source_id.clone())
+            .or_insert_with(|| {
+                let source = format!("{}:{}", turn.source_id, self.connection);
+                let id = match (turn.turn_index, turn.start_time) {
+                    (Some(i), _) => provider_sequence_span_id("deepgram", &source, "turn", i),
+                    (None, Some(t)) => provider_start_span_id("deepgram", &source, t),
+                    (None, None) => provider_item_span_id(
+                        "deepgram",
+                        &source,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                };
+                FluxSpan {
+                    id,
+                    turn_index: turn.turn_index,
+                    start: turn.start_time.unwrap_or(now),
+                }
+            });
+        if turn.turn_index.is_some() {
+            active.turn_index = turn.turn_index;
+        }
+        let start_time = turn.start_time.unwrap_or(active.start);
+        let span_id = active.id.clone();
+        let is_final = matches!(turn.kind, events::TurnEventKind::EndOfTurn);
+        if is_final {
+            self.active.remove(&turn.source_id);
+        }
+        let text = turn.text.clone()?;
+        let (revision_number, supersedes) = next_span_revision(revisions, &span_id);
+        Some(events::AsrSpanRevisionPayload {
+            provider: "deepgram".into(),
+            source_id: turn.source_id.clone(),
+            provider_item_id: turn.turn_index.map(|i| format!("turn-{i}")),
+            transcript_segment_id: is_final.then(|| format!("{span_id}@final")),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text,
+            start_time,
+            end_time: turn.end_time.unwrap_or(now.max(start_time)),
+            confidence: turn.confidence.unwrap_or_default(),
+            is_final,
+            stability: if is_final {
+                events::AsrSpanStability::Final
+            } else {
+                events::AsrSpanStability::Partial
+            },
+            revision_number,
+            supersedes,
+            turn_id: turn.turn_index.map(|i| format!("turn-{i}")),
+            end_of_turn: is_final,
+            raw_event_ref: Some("deepgram.flux.turn".into()),
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: current_unix_millis(),
+            span_id,
+        })
+    }
+}
+
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
@@ -7427,6 +8093,9 @@ fn run_deepgram_event_receiver(
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
+    let mut saved_speech_final: Option<TurnEventInput> = None;
+    let mut flux = FluxTurnClock::default();
+
     let ctx = shared_to_transcript_context(
         shared,
         config.llm_provider,
@@ -7436,7 +8105,11 @@ fn run_deepgram_event_receiver(
 
     log::info!("Deepgram event receiver: entering processing loop");
 
+    let mut receipts = ProviderReceipts::new(&ctx, &extraction_count, &graph_update_count);
     loop {
+        if receipts.pending.len() == MAX_TRANSCRIPT_GROUP || event_rx.is_empty() {
+            receipts.publish();
+        }
         // This loop's lifecycle is driven entirely by the event channel
         // actually disconnecting (below) -- NOT by `is_transcribing`.
         // `is_transcribing` clears on the stop path BEFORE the Deepgram
@@ -7495,12 +8168,23 @@ fn run_deepgram_event_receiver(
             }
         };
 
+        if !matches!(
+            &event,
+            DeepgramEvent::Transcript {
+                is_final: false,
+                speech_final: false,
+                ..
+            }
+        ) {
+            receipts.publish();
+        }
+
         match event {
             DeepgramEvent::Transcript {
                 text,
                 confidence,
                 is_final,
-                speech_final: _,
+                speech_final,
                 start,
                 duration,
                 words,
@@ -7509,6 +8193,17 @@ fn run_deepgram_event_receiver(
                 let end_time = start + duration;
                 let span_id = provider_start_span_id("deepgram", &source_id, start);
 
+                saved_speech_final = None;
+                let paired_turn = speech_final.then(|| TurnEventInput {
+                    provider: "deepgram",
+                    source_id: source_id.clone(),
+                    kind: events::TurnEventKind::SpeechFinal,
+                    text: Some(text.clone()),
+                    start_time: Some(start),
+                    end_time: Some(end_time),
+                    confidence: Some(confidence),
+                    turn_index: None,
+                });
                 // Only process final transcripts to avoid duplicates.
                 if !is_final {
                     let (revision_number, supersedes) =
@@ -7551,8 +8246,7 @@ fn run_deepgram_event_receiver(
                             retained_at: std::time::Instant::now(),
                         },
                     );
-                    emit_asr_partial_with_meta(
-                        &ctx,
+                    if let Some(payload) = asr_partial_payload(
                         "deepgram",
                         source_id,
                         text,
@@ -7567,7 +8261,23 @@ fn run_deepgram_event_receiver(
                             raw_event_ref: Some("deepgram.results.interim".to_string()),
                             ..AsrRevisionMeta::default()
                         },
-                    );
+                    ) {
+                        if let Some(pair) = paired_turn {
+                            if emit_provider_span_revision_payload(
+                                payload,
+                                Some(pair.clone()),
+                                None,
+                                &ctx,
+                                asr_count,
+                                &extraction_count,
+                                &graph_update_count,
+                            ) {
+                                saved_speech_final = Some(pair);
+                            }
+                        } else {
+                            receipts.submit(&ctx, payload, asr_count, None);
+                        }
+                    }
                     continue;
                 }
 
@@ -7659,7 +8369,7 @@ fn run_deepgram_event_receiver(
                         final_segment.speaker_label.is_some(),
                     );
 
-                    emit_transcript_and_extract_with_meta(
+                    if emit_transcript_and_extract_with_meta(
                         final_segment,
                         None,
                         &ctx,
@@ -7671,10 +8381,13 @@ fn run_deepgram_event_receiver(
                             span_id: Some(span_id),
                             revision_number: Some(final_revision_number),
                             supersedes,
+                            recovery_turn: paired_turn.clone(),
                             raw_event_ref: Some("deepgram.results.final".to_string()),
                             ..AsrRevisionMeta::default()
                         },
-                    );
+                    ) {
+                        saved_speech_final = paired_turn;
+                    }
                 } else {
                     // Multi-speaker final: emit one TranscriptSegment per
                     // same-speaker run. Run 0 keeps the final's own `span_id`
@@ -7702,7 +8415,25 @@ fn run_deepgram_event_receiver(
                     // of within one span. Left as a follow-up; reconciling it
                     // needs tracking which span_ids a given final `start` has
                     // previously emitted, not just per-span revision counters.
+                    let mut all_committed = true;
                     let run_count = runs.len();
+                    let split_turn = paired_turn
+                        .as_ref()
+                        .filter(|_| {
+                            words
+                                .iter()
+                                .map(|w| w.display_word())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                == text
+                        })
+                        .map(|turn| {
+                            Arc::new(Mutex::new(SplitTurnPublication {
+                                remaining: run_count,
+                                recovered_member: false,
+                                turn: Some(turn.clone()),
+                            }))
+                        });
                     let mut used_span_ids: std::collections::HashSet<String> =
                         std::collections::HashSet::with_capacity(run_count);
                     used_span_ids.insert(span_id.clone());
@@ -7790,7 +8521,7 @@ fn run_deepgram_event_receiver(
                             run_count,
                         );
 
-                        emit_transcript_and_extract_with_meta(
+                        all_committed &= emit_transcript_and_extract_with_meta(
                             final_run_segment,
                             None,
                             &ctx,
@@ -7802,12 +8533,16 @@ fn run_deepgram_event_receiver(
                                 span_id: Some(run_span_id),
                                 revision_number: Some(run_revision_number),
                                 supersedes: run_supersedes,
+                                split_turn: split_turn.clone(),
                                 raw_event_ref: Some(format!(
                                     "deepgram.results.final:run{run_index}"
                                 )),
                                 ..AsrRevisionMeta::default()
                             },
                         );
+                    }
+                    if all_committed && split_turn.is_some() {
+                        saved_speech_final = paired_turn;
                     }
                 }
             }
@@ -7830,19 +8565,52 @@ fn run_deepgram_event_receiver(
                     DeepgramTurnKind::TurnResumed => events::TurnEventKind::TurnResumed,
                 };
                 let source_id = source_hint_or_fallback(&source_id_hint, "deepgram-stream");
-                emit_turn_event(
-                    &ctx.app_handle,
-                    TurnEventInput {
-                        provider: "deepgram",
-                        source_id,
-                        kind: normalized_kind,
-                        text,
-                        start_time: start,
-                        end_time: end,
-                        confidence,
-                        turn_index,
-                    },
-                );
+                let mut turn = TurnEventInput {
+                    provider: "deepgram",
+                    source_id,
+                    kind: normalized_kind,
+                    text,
+                    start_time: start,
+                    end_time: end,
+                    confidence,
+                    turn_index,
+                };
+                if matches!(turn.kind, events::TurnEventKind::SpeechFinal) {
+                    // Nova emits the transcript first, then its lifecycle event.
+                    // Never pass through text from a different or refused result.
+                    let accepted = saved_speech_final.take().is_some_and(|saved| {
+                        saved.source_id == turn.source_id
+                            && saved.start_time == start
+                            && saved.end_time == end
+                            && saved.text == turn.text
+                    });
+                    if !accepted {
+                        turn.text = None;
+                    }
+                } else {
+                    let accepted = flux
+                        .revision(&turn, &mut revision_numbers_by_span)
+                        .is_some_and(|revision| {
+                            let final_count = u64::from(revision.is_final);
+                            let accepted = emit_provider_span_revision_payload(
+                                revision,
+                                Some(turn.clone()),
+                                None,
+                                &ctx,
+                                asr_count + final_count,
+                                &extraction_count,
+                                &graph_update_count,
+                            );
+                            if accepted {
+                                asr_count += final_count;
+                            }
+                            accepted
+                        });
+                    if !accepted {
+                        turn.text = None;
+                    }
+                }
+                emit_turn_event(&ctx.app_handle, turn);
             }
             DeepgramEvent::Error {
                 message: diagnostic,
@@ -7857,6 +8625,8 @@ fn run_deepgram_event_receiver(
                 );
             }
             DeepgramEvent::Disconnected => {
+                flux.disconnect();
+                saved_speech_final = None;
                 log::info!("Deepgram event receiver: disconnected; waiting for reconnect or stop");
                 mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
@@ -7898,6 +8668,8 @@ fn run_deepgram_event_receiver(
             }
         }
     }
+
+    receipts.publish();
 
     // audio-graph-e70e: the event channel has disconnected (session end) —
     // promote every span still waiting on a final that will now never
@@ -8090,7 +8862,7 @@ fn run_assemblyai_event_receiver(
     // provider's own `speaker_label`/`SpeakerRevision` messages, so no local
     // diarization worker or turn-index bookkeeping is needed here.
     let mut v3_parser: Option<crate::asr::assemblyai::AssemblyAiV3Parser> = None;
-    let mut speaker_revision_numbers_by_span: HashMap<String, u64> = HashMap::new();
+    let speaker_revision_numbers_by_span = Arc::new(Mutex::new(HashMap::new()));
 
     let ctx = shared_to_transcript_context(
         shared,
@@ -8170,32 +8942,15 @@ fn run_assemblyai_event_receiver(
                     emit_assemblyai_speaker_revision(
                         &speaker_revision,
                         &ctx,
-                        &mut speaker_revision_numbers_by_span,
+                        &mut speaker_revision_numbers_by_span
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
                         received_at_ms,
                     );
                 }
 
                 for mut revision in parsed.revisions {
-                    if revision.payload.end_of_turn {
-                        emit_turn_event(
-                            &ctx.app_handle,
-                            TurnEventInput {
-                                provider: "assemblyai",
-                                source_id: revision.payload.source_id.clone(),
-                                kind: events::TurnEventKind::EndOfTurn,
-                                text: Some(revision.payload.text.clone()),
-                                start_time: Some(revision.payload.start_time),
-                                end_time: Some(revision.payload.end_time),
-                                confidence: Some(revision.payload.confidence),
-                                turn_index: revision
-                                    .payload
-                                    .turn_id
-                                    .as_deref()
-                                    .and_then(|turn_id| turn_id.strip_prefix("turn-"))
-                                    .and_then(|turn| turn.parse::<u64>().ok()),
-                            },
-                        );
-                    }
+                    let turn = revision_end_of_turn("assemblyai", &revision.payload);
 
                     normalize_assemblyai_v3_revision_for_side_effects(&mut revision);
 
@@ -8204,30 +8959,27 @@ fn run_assemblyai_event_receiver(
                     }
                     let initial_speaker = assemblyai_initial_turn_speaker(
                         &revision.payload,
-                        &speaker_revision_numbers_by_span,
-                    );
-                    if emit_provider_span_revision_payload(
+                        &speaker_revision_numbers_by_span
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
+                    )
+                    .map(|revision| InitialTurnSpeaker {
+                        revision,
+                        numbers: speaker_revision_numbers_by_span.clone(),
+                    });
+                    if !emit_provider_span_revision_payload(
                         revision.payload,
+                        turn.clone(),
+                        initial_speaker,
                         &ctx,
                         asr_count,
                         &extraction_count,
                         &graph_update_count,
-                    ) && let Some(initial_speaker) = initial_speaker
-                    {
-                        let event_sink = TauriDiarizationEventSink {
-                            app_handle: &ctx.app_handle,
-                        };
-                        let session_id = ctx.projection_runtime.current_session_id();
-                        let dispatch = DiarizationDispatchContext {
-                            event_sink: &event_sink,
-                            speaker_timeline: &ctx.speaker_timeline,
-                            knowledge_graph: &ctx.knowledge_graph,
-                            graph_snapshot: &ctx.graph_snapshot,
-                            transcript_ledger: &ctx.transcript_ledger,
-                            session_id: &session_id,
-                        };
-                        speaker_revision_numbers_by_span.insert(initial_speaker.span_id.clone(), 1);
-                        emit_and_dispatch_diarization_span_revision(&dispatch, initial_speaker);
+                    ) {
+                        continue;
+                    }
+                    if let Some(turn) = turn {
+                        emit_turn_event(&ctx.app_handle, turn);
                     }
                 }
 
@@ -8438,7 +9190,11 @@ fn run_soniox_event_receiver(
 
     log::info!("Soniox event receiver: entering processing loop");
 
+    let mut receipts = ProviderReceipts::new(&ctx, &extraction_count, &graph_update_count);
     loop {
+        if receipts.pending.len() == MAX_TRANSCRIPT_GROUP || event_rx.is_empty() {
+            receipts.publish();
+        }
         let event = match event_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => ev,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -8460,6 +9216,10 @@ fn run_soniox_event_receiver(
             break;
         }
 
+        if !matches!(&event, SonioxEvent::Revision(_)) {
+            receipts.publish();
+        }
+
         match event {
             SonioxEvent::Revision(mut revision) => {
                 if let Some(raw_speaker) = revision.payload.speaker_id.clone() {
@@ -8473,37 +9233,24 @@ fn run_soniox_event_receiver(
                     revision.payload.speaker_label = Some(format!("Speaker {speaker_id}"));
                 }
 
-                if revision.payload.end_of_turn {
-                    emit_turn_event(
-                        &ctx.app_handle,
-                        TurnEventInput {
-                            provider: "soniox",
-                            source_id: revision.payload.source_id.clone(),
-                            kind: events::TurnEventKind::EndOfTurn,
-                            text: Some(revision.payload.text.clone()),
-                            start_time: Some(revision.payload.start_time),
-                            end_time: Some(revision.payload.end_time),
-                            confidence: Some(revision.payload.confidence),
-                            turn_index: revision
-                                .payload
-                                .turn_id
-                                .as_deref()
-                                .and_then(|turn_id| turn_id.strip_prefix("turn-"))
-                                .and_then(|turn| turn.parse::<u64>().ok()),
-                        },
-                    );
-                }
+                let turn = revision_end_of_turn("soniox", &revision.payload);
 
                 if revision.payload.is_final {
                     asr_count += 1;
                 }
-                let _ = emit_soniox_span_revision(
-                    revision,
-                    &ctx,
-                    asr_count,
-                    &extraction_count,
-                    &graph_update_count,
-                );
+                if let Some(ms) = revision
+                    .final_audio_proc_ms
+                    .or(revision.total_audio_proc_ms)
+                {
+                    emit_stage_latency(
+                        &ctx.app_handle,
+                        "asr.soniox",
+                        Some(&revision.payload.source_id),
+                        Some(&revision.payload.span_id),
+                        Duration::from_millis(ms),
+                    );
+                }
+                receipts.submit(&ctx, revision.payload, asr_count, turn);
             }
             SonioxEvent::Finished => {
                 log::info!("Soniox event receiver: session finished");
@@ -8557,6 +9304,7 @@ fn run_soniox_event_receiver(
         }
     }
 
+    receipts.publish();
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     log::info!("Soniox event receiver: exiting. ASR segments={}", asr_count,);
@@ -9675,6 +10423,55 @@ mod tests_status {
 
     // ── audio-graph-586b: diarization backend-selection honesty ─────────
 
+    // The process-wide native Tauri handle can defer delivery of an event
+    // until a later event with a listener. Observe the actual emit boundary
+    // for this source only, including callbacks on the recovery worker.
+    #[derive(Default)]
+    struct PublicationObserver {
+        channel: &'static str,
+        source: String,
+        sender: Option<std::sync::mpsc::Sender<String>>,
+    }
+    static PUBLICATION_OBSERVER: std::sync::LazyLock<Mutex<PublicationObserver>> =
+        std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn observe_publication(channel: &str, source: &str, text: &str) {
+        let observer = PUBLICATION_OBSERVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if observer.channel == channel
+            && observer.source == source
+            && let Some(sender) = &observer.sender
+        {
+            let _ = sender.send(text.to_owned());
+        }
+    }
+
+    struct PublicationCapture {
+        received: std::sync::mpsc::Receiver<String>,
+    }
+    impl PublicationCapture {
+        // Both callers hold TEST_HOME_LOCK throughout this observation.
+        fn start(channel: &'static str, source: &str) -> Self {
+            let (sender, received) = std::sync::mpsc::channel();
+            *PUBLICATION_OBSERVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = PublicationObserver {
+                channel,
+                source: source.to_owned(),
+                sender: Some(sender),
+            };
+            Self { received }
+        }
+    }
+    impl Drop for PublicationCapture {
+        fn drop(&mut self) {
+            *PUBLICATION_OBSERVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = PublicationObserver::default();
+        }
+    }
+
     #[test]
     fn diarization_mode_off_skips_asset_probing_and_never_degrades() {
         // A user who explicitly turned diarization off must get Simple with
@@ -10370,6 +11167,7 @@ mod tests_status {
                 prompt_id: "projection_patch_v1_test".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -12445,6 +13243,208 @@ mod tests_status {
     }
 
     #[test]
+    fn deepgram_split_turn_recovery_requires_all_receipts() {
+        let mut group = super::SplitTurnPublication {
+            remaining: 3,
+            recovered_member: false,
+            turn: Some(super::TurnEventInput {
+                provider: "deepgram",
+                source_id: "oak".into(),
+                kind: events::TurnEventKind::SpeechFinal,
+                text: Some("reed fern leaf".into()),
+                start_time: None,
+                end_time: None,
+                confidence: None,
+                turn_index: None,
+            }),
+        };
+        assert!(group.accepted(false).is_none());
+        assert!(group.accepted(true).is_none());
+        assert_eq!(
+            group.accepted(false).unwrap().text.as_deref(),
+            Some("reed fern leaf")
+        );
+    }
+
+    #[test]
+    fn standalone_flux_revisions_keep_the_turn_identity_until_reconnect() {
+        use super::{FluxTurnClock, TurnEventInput};
+        let mut clock = FluxTurnClock::default();
+        let mut revisions = std::collections::HashMap::new();
+        let mut turn = TurnEventInput {
+            provider: "deepgram",
+            source_id: "mic".into(),
+            kind: events::TurnEventKind::SpeechStarted,
+            text: Some("leaf".into()),
+            start_time: Some(1.0),
+            end_time: None,
+            confidence: None,
+            turn_index: None,
+        };
+        let start = clock.revision(&turn, &mut revisions).unwrap();
+        turn.kind = events::TurnEventKind::EagerEndOfTurn;
+        turn.turn_index = Some(0);
+        let partial = clock.revision(&turn, &mut revisions).unwrap();
+        assert_eq!(partial.span_id, start.span_id);
+        assert_eq!(partial.revision_number, 2);
+        turn.kind = events::TurnEventKind::EndOfTurn;
+        turn.turn_index = None;
+        turn.start_time = None;
+        let end = clock.revision(&turn, &mut revisions).unwrap();
+        assert_eq!(end.span_id, start.span_id);
+        assert_eq!(end.start_time, start.start_time);
+        assert!(end.is_final);
+        clock.disconnect();
+        turn.turn_index = Some(0);
+        turn.kind = events::TurnEventKind::SpeechStarted;
+        let next = clock.revision(&turn, &mut revisions).unwrap();
+        assert_ne!(next.span_id, start.span_id);
+        assert_eq!(next.revision_number, 1);
+    }
+
+    #[test]
+    fn transcript_admission_rejections_preserve_saving_status() {
+        use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+        use crate::persistence::canonical_log::{
+            CanonicalAppendRejection, TranscriptCommitError as Error, TranscriptReceipt,
+        };
+        let mut status = PipelineStatus::default();
+        for previous in [None, Some(events::TranscriptSavingFailure::StorageFull)] {
+            status.transcript_not_saving = previous;
+            for error in [
+                Error::InvalidRevision,
+                Error::InvalidAddress,
+                Error::LiveHeadChanged,
+                Error::ConflictingAttempt,
+                Error::Frame(CanonicalAppendRejection::EventIdConflict),
+            ] {
+                assert!(!super::update_transcript_saving_status(
+                    &mut status,
+                    1,
+                    &Err(error)
+                ));
+                assert_eq!(status.transcript_not_saving, previous);
+            }
+        }
+        let receipt = TranscriptReceipt {
+            sequence: 1,
+            already_accepted: false,
+            barrier: CanonicalDurabilityBarrier::SyncedUnqualified,
+        };
+        assert!(super::update_transcript_saving_status(
+            &mut status,
+            1,
+            &Ok((true, receipt))
+        ));
+        assert!(status.transcript_crash_safety_unverified);
+        assert_eq!(status.transcript_not_saving, None);
+        assert!(!super::update_transcript_saving_status(
+            &mut status,
+            1,
+            &Ok((true, receipt))
+        ));
+        assert!(super::update_transcript_saving_status(
+            &mut status,
+            2,
+            &Err(Error::AckTimeout)
+        ));
+        assert_eq!(
+            status.transcript_not_saving,
+            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+        );
+        // An unrelated success and a second pending revision must each
+        // leave the first ticket's warning intact.
+        super::update_transcript_saving_status(&mut status, 3, &Ok((true, receipt)));
+        super::update_transcript_saving_status(&mut status, 4, &Err(Error::ConfirmationPending));
+        super::update_transcript_saving_status(&mut status, 4, &Ok((true, receipt)));
+        assert_eq!(
+            status.transcript_not_saving,
+            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+        );
+        super::update_transcript_saving_status(&mut status, 2, &Ok((true, receipt)));
+        assert_eq!(status.transcript_not_saving, None);
+        assert!(!status.transcript_captions_lost);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
+    fn deepgram_nova_and_flux_turn_text_reach_the_listener_only_after_a_receipt() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("flux-receipt");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let app_handle = super::shared_test_app_handle();
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let observed = turns.clone();
+        let listener = app_handle.listen_any(events::TURN_EVENT, move |e| {
+            let turn: events::TurnEventPayload = serde_json::from_str(e.payload()).unwrap();
+            if turn.source_id == "flux-receipt-source" {
+                observed.lock().unwrap().push(turn.text);
+            }
+        });
+        let run = |flux_word: &str, nova_word: &str, turn: u64| {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            crate::asr::deepgram::handle_server_message(&serde_json::json!({
+                "type":"TurnInfo","event":"EagerEndOfTurn","transcript":flux_word,"turn_index":turn,"start":1.0,"end":2.0
+            }).to_string(), &tx);
+            // Both plain interims can be outstanding. The following Nova final
+            // must drain them before its paired lifecycle event is published.
+            for interim in ["tree", "reed"] {
+                crate::asr::deepgram::handle_server_message(&serde_json::json!({
+                    "type":"Results","is_final":false,"speech_final":false,"start":3.0,"duration":1.0,
+                    "channel":{"alternatives":[{"transcript":interim,"confidence":0.9,"words":[]}]}
+                }).to_string(), &tx);
+            }
+            crate::asr::deepgram::handle_server_message(&serde_json::json!({
+                "type":"Results", "is_final":true,"speech_final":true,"start":3.0,"duration":1.0,
+                "channel":{"alternatives":[{"transcript":nova_word,"confidence":0.9,"words":[]}]}
+            }).to_string(), &tx);
+            drop(tx);
+            super::run_deepgram_event_receiver(
+                rx,
+                moonshine_shared_for_app(&app, app_handle.clone()),
+                moonshine_speech_config(dir.clone()),
+                Arc::new(RwLock::new(Some("flux-receipt-source".into()))),
+                0,
+                false,
+            );
+        };
+        run("pond", "leaf", 1);
+        assert_eq!(
+            load_transcript_events(&app.current_session_id())
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            turns.lock().unwrap().as_slice(),
+            &[Some("pond".to_owned()), Some("leaf".to_owned())]
+        );
+        let writer = app.transcript_event_writer.lock().unwrap().take().unwrap();
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(5)));
+        run("branch", "fern", 2);
+        assert_eq!(
+            turns.lock().unwrap().as_slice(),
+            &[Some("pond".to_owned()), Some("leaf".to_owned()), None, None]
+        );
+        let events = load_transcript_events(&app.current_session_id()).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.text.as_str(), e.revision_number))
+                .collect::<Vec<_>>(),
+            [("pond", 1), ("tree", 1), ("reed", 2), ("leaf", 3)]
+        );
+        app_handle.unlisten(listener);
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
     fn deepgram_receiver_updates_stage_across_disconnects_and_recovery() {
         use crate::asr::deepgram::DeepgramEvent as Event;
@@ -13019,6 +14019,131 @@ mod tests_status {
     }
 
     #[test]
+    fn normal_pipeline_status_omits_transcript_saving_failure() {
+        let status = serde_json::to_value(crate::events::PipelineStatus::default()).unwrap();
+        assert!(status.get("transcript_not_saving").is_none());
+    }
+
+    #[test]
+    fn transcript_live_snapshot_and_scheduled_basis_follow_the_durable_log() {
+        use crate::persistence::canonical_durability::transcript_coordination_path;
+
+        let session = "session-receipts";
+        let fixture = AcceptingTranscriptEventWriterFixture::new(session);
+        let writer = fixture.writer();
+        let repo = FileMemoryRepository::with_data_root(&fixture.root);
+        let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session)));
+        let schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session)));
+        let partial = projection_asr_payload("orchard path", 1, "quiet pond", false);
+        let final_revision = projection_asr_payload("orchard path", 2, "quiet pond birds", true);
+        let publish = |payload| {
+            record_asr_span_revision_event_and_observe_projection(
+                None,
+                &ledger,
+                &writer,
+                &schedulers,
+                None,
+                payload,
+            )
+        };
+        let replay = || {
+            TranscriptLedger::replay(session, repo.load_transcript_events(session).unwrap())
+                .unwrap()
+        };
+
+        assert!(publish(&partial));
+        assert_eq!(*ledger.lock().unwrap(), replay());
+
+        // Fail inside the real writer after queue admission. A final cannot
+        // publish to the ledger, schedule a snapshot, or disclose its input.
+        let source = fixture
+            .root
+            .join("transcripts")
+            .join(format!("{session}.events.jsonl"));
+        let lock = transcript_coordination_path(&source);
+        let saved_lock = lock.with_added_extension("held");
+        std::fs::rename(&lock, &saved_lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let logs = crate::test_log_capture::ThreadLogCapture::start();
+        assert!(!publish(&final_revision));
+        let refusal = crate::test_log_capture::render(&logs.finish());
+        assert!(refusal.contains("Coordination("), "{refusal}");
+        for canary in ["orchard path", "quiet pond", fixture.root.to_str().unwrap()] {
+            assert!(!refusal.contains(canary));
+        }
+        std::fs::remove_dir(&lock).unwrap();
+        std::fs::rename(saved_lock, &lock).unwrap();
+        assert_eq!(ledger.lock().unwrap().accepted_event_count, 1);
+        assert_eq!(*ledger.lock().unwrap(), replay());
+        assert!(schedulers.lock().unwrap().notes().in_flight_job().is_none());
+
+        assert!(publish(&final_revision));
+        let durable = replay();
+        assert_eq!(*ledger.lock().unwrap(), durable);
+        assert_eq!(
+            schedulers
+                .lock()
+                .unwrap()
+                .notes()
+                .in_flight_job()
+                .unwrap()
+                .basis,
+            durable.current_basis(),
+            "the scheduled materialization's basis must exist on disk at acknowledgement"
+        );
+        let display_segments = crate::projections::derive_legacy_transcript_segments(&durable);
+        let misses = Arc::new(AtomicU64::new(0));
+        assert!(!super::persist_display_transcript_segment(
+            &Arc::new(Mutex::new(None)),
+            &misses,
+            &display_segments[0],
+        ));
+        assert_eq!(misses.load(Ordering::SeqCst), 1);
+        let restored = crate::projections::derive_legacy_transcript_segments(&replay());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, display_segments[0].id);
+        assert_eq!(restored[0].text, final_revision.text);
+        assert!(
+            !publish(&final_revision),
+            "an exact retry needs no live delivery"
+        );
+        assert!(
+            !publish(&partial),
+            "an older retry must not regress the live snapshot"
+        );
+        assert_eq!(replay(), durable);
+        assert_eq!(*ledger.lock().unwrap(), durable);
+        let schedulers = schedulers.lock().unwrap();
+        assert_eq!(schedulers.notes().metrics().coalesced_updates, 0);
+        assert_eq!(schedulers.graph().metrics().coalesced_updates, 0);
+    }
+
+    #[test]
+    fn previous_writer_cannot_publish_into_the_rotated_ledger() {
+        use crate::persistence::canonical_log::TranscriptCommitError;
+        let old = AcceptingTranscriptEventWriterFixture::new("session-before");
+        let new = AcceptingTranscriptEventWriterFixture::new("session-after");
+        let live = Arc::new(Mutex::new(TranscriptLedger::new("session-after")));
+        let payload = projection_asr_payload("reed", 1, "leaf", false);
+        assert_eq!(
+            super::commit_asr_span_revision(&live, &old.writer(), &payload),
+            Err(TranscriptCommitError::LiveHeadChanged),
+        );
+        assert_eq!(live.lock().unwrap().accepted_event_count, 0);
+        assert!(
+            !old.root
+                .join("transcripts/session-before.events.jsonl")
+                .exists()
+        );
+        assert!(
+            super::commit_asr_span_revision(&live, &new.writer(), &payload)
+                .unwrap()
+                .0
+        );
+        assert_eq!(live.lock().unwrap().accepted_event_count, 1);
+    }
+
+    #[test]
     fn asr_partial_revision_queue_full_does_not_advance_ledger() {
         let session_id = "session-asr-queue-full";
         let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
@@ -13117,6 +14242,540 @@ mod tests_status {
         assert_eq!(loaded[0].text, payload.text);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn provider_burst_submits_before_io_then_publishes_in_order_and_fences_rotation() {
+        use crate::persistence::canonical_durability::transcript_coordination_path;
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("provider-burst");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let handle = super::shared_test_app_handle();
+        let observed = PublicationCapture::start(events::ASR_SPAN_REVISION, "burst-source");
+        let ctx = super::shared_to_transcript_context(
+            moonshine_shared_for_app(&app, handle.clone()),
+            LlmProvider::default(),
+            false,
+            "soniox",
+        );
+        let extractions = Arc::new(AtomicU64::new(0));
+        let updates = Arc::new(AtomicU64::new(0));
+        let mut receipts = super::ProviderReceipts::new(&ctx, &extractions, &updates);
+        let session = app.current_session_id();
+        let source = dir
+            .join("transcripts")
+            .join(format!("{session}.events.jsonl"));
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(transcript_coordination_path(&source))
+            .unwrap();
+        guard.try_lock().unwrap();
+        let payload = |span, n, text, final_revision| {
+            let mut p = projection_asr_payload(span, n, text, final_revision);
+            p.source_id = "burst-source".to_owned();
+            p.provider = "soniox".to_owned();
+            p
+        };
+        receipts.submit(&ctx, payload("reed", 1, "leaf", false), 0, None);
+        receipts.submit(&ctx, payload("reed", 2, "fern", true), 1, None);
+        assert_eq!(receipts.pending.len(), 2);
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        assert!(observed.received.try_recv().is_err());
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        drop(guard);
+        receipts.publish();
+        assert_eq!(
+            observed.received.try_iter().collect::<Vec<_>>(),
+            ["leaf", "fern"]
+        );
+        let disk = load_transcript_events(&session).unwrap();
+        assert_eq!(disk.len(), 2);
+        assert_eq!(
+            *app.transcript_ledger.lock().unwrap(),
+            TranscriptLedger::replay(&session, disk).unwrap()
+        );
+        assert_eq!(
+            app.transcript_buffer.read().unwrap().back().unwrap().text,
+            "fern"
+        );
+        receipts.submit(&ctx, payload("branch", 1, "pond", false), 1, None);
+        assert!(matches!(
+            app.rotate_session("rotated-burst"),
+            crate::state::RotateOutcome::Rotated(_)
+        ));
+        receipts.publish();
+        assert!(observed.received.try_recv().is_err());
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        drain_app_writers(&app);
+        drop(ctx);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn idle_recovery_publishes_uncertain_members_once_in_order_and_clears_pending() {
+        use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+        use crate::persistence::canonical_log::{TranscriptCommitError, TranscriptReceipt};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for members in [1, 3] {
+            let dir = unique_tempdir("idle-receipt-publication");
+            let _guard = DataDirGuard::set(&dir);
+            let app = AppState::new();
+            let session = app.current_session_id();
+            app.projection_lane_stopping.store(true, Ordering::SeqCst);
+            let handle = super::shared_test_app_handle();
+            let marker = format!("recovery-{session}");
+            let turns = PublicationCapture::start(events::TURN_EVENT, &marker);
+            let ctx = super::shared_to_transcript_context(
+                moonshine_shared_for_app(&app, handle.clone()),
+                LlmProvider::default(),
+                false,
+                "soniox",
+            );
+            let count = Arc::new(AtomicU64::new(0));
+            let mut group = super::ProviderReceipts::new(&ctx, &count, &count);
+            // Groups append to a verified existing stream. First creation
+            // intentionally runs as a singleton with its namespace barrier.
+            let seed = projection_asr_payload("starter", 1, "pond", false);
+            let client = app
+                .transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .client();
+            client
+                .append_live(&seed.into(), app.transcript_ledger.clone())
+                .unwrap();
+            let (begin, failed, resume) = app
+                .transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pause_recovery_after_next_sync_failure();
+            let words = &["reed", "fern", "leaf"][..members];
+            for (n, word) in words.iter().enumerate() {
+                let mut row = projection_asr_payload(word, 1, word, true);
+                row.provider = "soniox".into();
+                row.source_id = marker.clone();
+                row.start_time = n as f64;
+                row.end_time = n as f64 + 0.5;
+                row.end_of_turn = true;
+                row.speaker_id = Some("oak".into());
+                row.speaker_label = Some("oak".into());
+                let turn = super::revision_end_of_turn("soniox", &row);
+                group.submit(&ctx, row, n as u64 + 1, turn);
+            }
+            let last = group.pending.last().unwrap().publication.clone();
+            begin.send(()).unwrap();
+            failed.recv_timeout(Duration::from_secs(60)).unwrap();
+            group.publish();
+            assert_eq!(
+                app.pipeline_status.read().unwrap().transcript_not_saving,
+                Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+            );
+            assert!(app.transcript_buffer.read().unwrap().is_empty());
+            assert!(turns.received.try_recv().is_err());
+            resume.send(()).unwrap();
+            for word in words {
+                assert_eq!(
+                    turns
+                        .received
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap(),
+                    *word
+                );
+            }
+            let disk = load_transcript_events(&session).unwrap();
+            assert_eq!(disk.len(), members + 1);
+            assert_eq!(
+                app.transcript_ledger.lock().unwrap().accepted_event_count,
+                members as u64 + 1
+            );
+            assert_eq!(
+                app.transcript_buffer
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<Vec<_>>(),
+                words
+            );
+            assert_eq!(
+                app.speaker_timeline.lock().unwrap().accepted_event_count,
+                members as u64
+            );
+            assert_eq!(
+                app.pipeline_status.read().unwrap().transcript_not_saving,
+                None
+            );
+            // A delayed provider error or repeated recovery delivery cannot
+            // overwrite the confirmation or publish a second turn.
+            assert!(!last.observe(Err(TranscriptCommitError::ConfirmationPending), false));
+            super::publish_recovered_transcript(
+                &session,
+                &last.event,
+                TranscriptReceipt {
+                    sequence: members as u64 + 1,
+                    already_accepted: true,
+                    barrier: CanonicalDurabilityBarrier::SyncedUnqualified,
+                },
+            );
+            assert_eq!(
+                app.pipeline_status.read().unwrap().transcript_not_saving,
+                None
+            );
+            assert!(turns.received.try_recv().is_err());
+            drain_app_writers(&app);
+            drop(ctx);
+            drop(app);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn recovered_singleton_publishes_its_caption_and_turn_before_the_superseding_revision() {
+        exercise_superseding_live_revision(false);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn an_older_recovery_receipt_preserves_the_loss_of_the_refused_newer_caption() {
+        exercise_superseding_live_revision(true);
+    }
+
+    fn exercise_superseding_live_revision(refuse_newer: bool) {
+        use events::TranscriptSavingFailure::{ConfirmationDelayed, WriteFailed};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("live-supersession");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let session = app.current_session_id();
+        let source = format!("worker-{session}");
+        let ctx = super::shared_to_transcript_context(
+            moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+            LlmProvider::default(),
+            false,
+            "soniox",
+        );
+        let count = Arc::new(AtomicU64::new(0));
+        let mut receipts = super::ProviderReceipts::new(&ctx, &count, &count);
+        let turns = PublicationCapture::start(events::TURN_EVENT, &source);
+        let submit = |receipts: &mut super::ProviderReceipts, word: &str, index: u64| {
+            let mut row = projection_asr_payload(word, 1, word, true);
+            row.provider = "soniox".into();
+            row.source_id = source.clone();
+            row.start_time = index as f64;
+            row.end_time = row.start_time + 0.5;
+            row.end_of_turn = true;
+            row.speaker_id = Some("oak".into());
+            row.speaker_label = Some("oak".into());
+            let turn = super::revision_end_of_turn("soniox", &row);
+            receipts.submit(&ctx, row, index, turn);
+        };
+        let status = || {
+            let status = app.pipeline_status.read().unwrap();
+            (
+                status.transcript_not_saving,
+                status.transcript_captions_lost,
+            )
+        };
+        let captions = || {
+            app.transcript_buffer
+                .read()
+                .unwrap()
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let bound = Duration::from_secs(60);
+        let _ack_bound = crate::persistence::TestLiveAckBound::set(bound);
+        let (begin, failed, resume) = app
+            .transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pause_recovery_after_next_sync_failure();
+        submit(&mut receipts, "reed", 1);
+        begin.send(()).unwrap();
+        failed.recv_timeout(bound).unwrap();
+        receipts.publish();
+        assert_eq!(status(), (Some(ConfirmationDelayed), false));
+        assert!(captions().is_empty());
+        assert!(turns.received.try_recv().is_err());
+
+        // Queue the second revision before releasing the first fault. Its
+        // own request, rather than an idle tick, must reverify the older frame.
+        let second_fault = refuse_newer.then(|| {
+            app.transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pause_after_next_recovery_sync_failure()
+        });
+        submit(&mut receipts, "fern", 2);
+        resume.send(()).unwrap();
+        if let Some((begin, failed, resume)) = second_fault {
+            begin.send(()).unwrap();
+            failed.recv_timeout(bound).unwrap();
+            receipts.publish();
+            assert_eq!(status(), (Some(WriteFailed), true));
+            assert!(captions().is_empty());
+            assert!(turns.received.try_recv().is_err());
+            resume.send(()).unwrap();
+        }
+        assert_eq!(turns.received.recv_timeout(bound).unwrap(), "reed");
+        assert_eq!(captions(), ["reed"]);
+        assert_eq!(app.speaker_timeline.lock().unwrap().accepted_event_count, 1);
+        if refuse_newer {
+            assert_eq!(status(), (Some(WriteFailed), true));
+            submit(&mut receipts, "leaf", 3);
+        } else {
+            // The worker has delivered the recovered first receipt. The
+            // provider still owns the unobserved second ticket.
+            assert_eq!(status(), (None, false));
+        }
+        receipts.publish();
+        let last = if refuse_newer { "leaf" } else { "fern" };
+        assert_eq!(turns.received.recv_timeout(bound).unwrap(), last);
+        assert!(turns.received.try_recv().is_err());
+        assert_eq!(captions(), ["reed", last]);
+        assert_eq!(app.speaker_timeline.lock().unwrap().accepted_event_count, 2);
+        let disk = load_transcript_events(&session).unwrap();
+        assert_eq!(
+            disk.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            ["reed", last]
+        );
+        assert_eq!(
+            *app.transcript_ledger.lock().unwrap(),
+            TranscriptLedger::replay(&session, disk).unwrap()
+        );
+        assert_eq!(status(), (None, refuse_newer));
+        if refuse_newer {
+            assert!(matches!(
+                app.rotate_session("renewed-session"),
+                crate::state::RotateOutcome::Rotated(_)
+            ));
+            assert_eq!(status(), (None, false));
+        }
+        drain_app_writers(&app);
+        drop(ctx);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn next_distinct_revision_restores_live_recording_after_a_transient_full_disk() {
+        let _ack_bound = crate::persistence::TestLiveAckBound::set(Duration::from_secs(60));
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("transient-full-disk");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let ctx = super::shared_to_transcript_context(
+            moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+            LlmProvider::default(),
+            false,
+            "projection-test",
+        );
+        let extractions = Arc::new(AtomicU64::new(0));
+        let graph_updates = Arc::new(AtomicU64::new(0));
+        let mut receipts = super::ProviderReceipts::new(&ctx, &extractions, &graph_updates);
+        let (begin, failed, resume) = app
+            .transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pause_recovery_after_next_disk_full();
+        begin.send(()).unwrap();
+        receipts.submit(
+            &ctx,
+            projection_asr_payload("reed", 1, "pond", true),
+            1,
+            None,
+        );
+        failed.recv_timeout(Duration::from_secs(60)).unwrap();
+        receipts.publish();
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            Some(events::TranscriptSavingFailure::StorageFull)
+        );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+
+        receipts.submit(
+            &ctx,
+            projection_asr_payload("branch", 1, "fern", true),
+            2,
+            None,
+        );
+        resume.send(()).unwrap();
+        // This FIFO control returns after cleanup and the second commit,
+        // while the provider still owns the second, unobserved receipt.
+        app.transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .group_counts();
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            Some(events::TranscriptSavingFailure::StorageFull)
+        );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        receipts.publish();
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            None
+        );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        let session = app.current_session_id();
+        let disk = load_transcript_events(&session).unwrap();
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].text, "fern");
+        assert_eq!(
+            *app.transcript_ledger.lock().unwrap(),
+            TranscriptLedger::replay(&session, disk).unwrap()
+        );
+        assert_eq!(
+            app.transcript_buffer.read().unwrap().back().unwrap().text,
+            "fern"
+        );
+        drain_app_writers(&app);
+        drop(ctx);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn diarization_observation_without_a_canonical_writer_cannot_publish_a_transcript() {
+        use crate::persistence::canonical_log::TranscriptCommitError;
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("missing-transcript-writer");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let writer = app.transcript_event_writer.lock().unwrap().take().unwrap();
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(5)));
+        let payload = projection_asr_payload("reed", 1, "pond", true);
+        assert_eq!(
+            super::commit_asr_span_revision(
+                &app.transcript_ledger,
+                &app.transcript_event_writer,
+                &payload
+            ),
+            Err(TranscriptCommitError::WriterAbsent)
+        );
+
+        let (tx, processed_rx) = crossbeam_channel::unbounded();
+        tx.send(ProcessedAudioChunk {
+            data: vec![0.25; super::TARGET_FRAMES],
+            num_frames: super::TARGET_FRAMES,
+            ..processed_audio_chunk("reed", 0.25)
+        })
+        .unwrap();
+        drop(tx);
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        super::run_speech_processor_diarization_only(
+            SpeechChannels {
+                processed_rx,
+                is_transcribing: Arc::new(AtomicBool::new(true)),
+            },
+            moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+            SpeechConfig {
+                models_dir: dir.clone(),
+                llm_provider: LlmProvider::default(),
+                llm_allow_cloud_fallbacks: false,
+                provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                    "local_only",
+                ),
+                diarization_mode: crate::settings::DiarizationMode::default(),
+            },
+        );
+        assert!(
+            capture
+                .finish()
+                .iter()
+                .any(|record| record.message == "transcript commit refused: WriterAbsent")
+        );
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            Some(events::TranscriptSavingFailure::WriterAbsent)
+        );
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        let ledger = app.transcript_ledger.lock().unwrap();
+        assert_eq!(ledger.accepted_event_count, 0);
+        assert!(ledger.latest_spans.is_empty());
+        drop(ledger);
+        assert!(
+            load_transcript_events(&app.current_session_id())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.projection_schedulers
+                .lock()
+                .unwrap()
+                .notes()
+                .in_flight_job()
+                .is_none()
+        );
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13438,6 +15097,99 @@ mod tests_status {
     }
 
     #[test]
+    fn startup_recovers_a_historical_caption_for_review_and_export_without_live_dispatch() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("historical-caption");
+        let _guard = DataDirGuard::set(&dir);
+        let (historical, revision) =
+            crate::persistence::canonical_log::interrupted_historical_caption(&dir);
+        let app = AppState::new();
+        let active = app.current_session_id();
+        assert_ne!(active, historical);
+        let (generator, model_calls) = FnProjectionPatchGenerator::new(|_, _, _, _, _| {
+            panic!("historical text reached a model")
+        });
+        let (dispatch, sink) = projection_dispatch_for_app(&app, generator);
+        let live_publications = Arc::new(AtomicUsize::new(0));
+        let calls = live_publications.clone();
+        let ledger = app.transcript_ledger.clone();
+        let schedulers = app.projection_schedulers.clone();
+        let payload: events::AsrSpanRevisionPayload =
+            serde_json::from_value(serde_json::to_value(&revision).unwrap()).unwrap();
+        let observed_payload = payload.clone();
+        // Make even the event identity and content identical. Only the session
+        // distinguishes this waiting live publication from the crashed one.
+        let publication =
+            super::PendingPublication::register(active.clone(), &payload, move |receipt, _, id| {
+                if receipt.is_ok() {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    return super::observe_transcript_receipt(
+                        None,
+                        &ledger,
+                        &schedulers,
+                        Some(&dispatch),
+                        &observed_payload,
+                        &active,
+                        id,
+                        receipt,
+                    );
+                }
+                false
+            });
+        // Plugin initialization finishes during build. The first load can run
+        // even before Tauri's application setup callback and see the receipt.
+        let _runtime = tauri::test::mock_builder()
+            .plugin(crate::persistence::transcript_startup::plugin(
+                app.current_session_id(),
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (review, portable) = tauri::async_runtime::block_on(async {
+            let review = crate::commands::load_session(historical.into())
+                .await
+                .unwrap();
+            let portable = crate::commands::export_session_bundle(historical.into())
+                .await
+                .unwrap();
+            (review, portable)
+        });
+        assert_eq!(
+            review.transcript_events.as_slice(),
+            std::slice::from_ref(&revision)
+        );
+        assert_eq!(portable.session_id, historical);
+        assert_eq!(
+            portable.transcript_events.as_slice(),
+            std::slice::from_ref(&revision)
+        );
+        assert_eq!(review.transcript.len(), 1);
+        assert_eq!(review.transcript[0].text, revision.text);
+        assert_eq!(portable.transcript.len(), 1);
+        assert_eq!(portable.transcript[0].text, revision.text);
+        assert!(portable.diarization_events.is_empty() && portable.projection_events.is_empty());
+        assert!(portable.notes.is_none() && portable.materialized_graph.is_none());
+        assert!(portable.graph.is_none());
+        assert!(review.graph.nodes.is_empty() && review.graph.links.is_empty());
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        assert_eq!(live_publications.load(Ordering::SeqCst), 0);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.patch_count(), 0);
+        publication.observe(
+            Err(crate::persistence::canonical_log::TranscriptCommitError::WriterAbsent),
+            false,
+        );
+        drain_app_writers(&app);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn runtime_projection_dispatch_applies_fake_notes_and_graph_patches() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -13461,6 +15213,7 @@ mod tests_status {
             projection_asr_payload("projection-success-span", 1, "Alice met Bob.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -13564,6 +15317,7 @@ mod tests_status {
             projection_asr_payload("projection-basis-currency-span", 1, "Alice met Bob.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -13695,6 +15449,7 @@ mod tests_status {
         );
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -15479,6 +17234,7 @@ mod tests_status {
                             prompt_id: "race".to_string(),
                             route_id: None,
                             model_source: crate::llm::route::ModelIdentitySource::Requested,
+                            model_placement: None,
                         },
                         route: None,
                         queued_at_ms: None,
@@ -16480,6 +18236,7 @@ mod tests_status {
             projection_asr_payload("projection-failure-span", 1, "No backend works.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -16695,6 +18452,7 @@ mod tests_status {
         let partial = projection_asr_payload("projection-partial-span", 1, "still partial", false);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -16810,6 +18568,7 @@ mod tests_status {
         };
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16817,6 +18576,7 @@ mod tests_status {
             &first_partial
         ));
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16830,6 +18590,7 @@ mod tests_status {
         }
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16845,6 +18606,7 @@ mod tests_status {
         }
 
         assert!(!record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16866,6 +18628,7 @@ mod tests_status {
         }
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,

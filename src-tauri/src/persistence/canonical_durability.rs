@@ -114,6 +114,61 @@ impl CanonicalFilesystemQualification {
         Ok((qualification, durability))
     }
 
+    /// Publish the transcript directory under the provisioned data root. An
+    /// earlier boot or another repository adapter may already have created it.
+    /// Repeat the parent barrier in either case before using it for receipts.
+    pub(crate) fn provision_child_directory(
+        &self,
+        child: &Path,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        let platform = current_platform();
+        let parent = match self.namespace.bind_parent(child, platform) {
+            Ok(parent) => parent,
+            Err(error) => return CanonicalDurabilityOutcome::Rejected(error),
+        };
+        if !parent.barrier.is_available() {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform,
+                    operation: CanonicalNamespaceOperation::FirstCreate,
+                },
+            );
+        }
+        match std::fs::create_dir(child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::CreateNew,
+                    &error,
+                ));
+            }
+        }
+        match std::fs::symlink_metadata(child) {
+            Ok(meta) if meta.is_dir() && !crate::sessions::is_reparse_point(&meta) => {}
+            Ok(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::NonRegularCanonicalEntry,
+                );
+            }
+            Err(error) => {
+                return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
+            }
+        }
+        if let Err(error) = parent.barrier.sync_all() {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation: CanonicalMutation::EnsureDirectory,
+            barrier: if platform == CanonicalPlatform::Windows {
+                CanonicalDurabilityBarrier::WindowsNtfsParentFlush
+            } else {
+                CanonicalDurabilityBarrier::ParentNamespace
+            },
+        })
+    }
+
     /// Bind real directory identity (Unix device/inode or Windows volume/file ID).
     /// Test evidence skips the live production filesystem capability probe.
     #[cfg(test)]
@@ -368,6 +423,7 @@ pub enum CanonicalNamespaceOperation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalMutation {
+    EnsureDirectory,
     ExistingAppend,
     FirstCreate,
     ImmutableExactCreate,
@@ -381,6 +437,8 @@ pub enum CanonicalMutation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalDurabilityBarrier {
+    /// A v1 transcript file crossed sync_all on a filesystem without a qualified namespace guarantee.
+    SyncedUnqualified,
     FileDataAndMetadata,
     FileAndParentNamespace,
     /// Only the qualified parent-directory namespace barrier was crossed. A
@@ -388,7 +446,7 @@ pub enum CanonicalDurabilityBarrier {
     ParentNamespace,
     /// The file was flushed, its name verified, and the held NTFS parent flushed.
     FileAndWindowsNtfsParentFlush,
-    /// The name was absent under the cooperative lock and the NTFS parent was flushed.
+    /// The held NTFS parent was flushed and its directory identity rechecked.
     WindowsNtfsParentFlush,
 }
 
@@ -597,7 +655,7 @@ enum ObjectIdentity {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct FilesystemIdentity {
+pub(super) struct FilesystemIdentity {
     volume: Option<VolumeIdentity>,
     object: Option<ObjectIdentity>,
 }
@@ -697,11 +755,18 @@ impl ManagedNamespace {
         platform: CanonicalPlatform,
         allow_descendant: bool,
     ) -> Result<BoundParent, CanonicalDurabilityRejection> {
-        self.validate_current()?;
         if target.file_name().is_none() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
         let parent = parent_directory(target);
+        // For a direct child of the exact Windows root, its flush handle below
+        // also proves the qualified root identity. An alias or a descendant
+        // must independently validate both the root and the target parent.
+        let direct_windows_root =
+            cfg!(windows) && parent.as_os_str() == self.canonical_root.as_os_str();
+        if !direct_windows_root {
+            self.validate_current()?;
+        }
         #[cfg(windows)]
         windows_ntfs::check_directory_chain(&parent).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -710,26 +775,34 @@ impl ManagedNamespace {
                 durability_io(CanonicalDurabilityStage::OpenParent, &error)
             }
         })?;
-        let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CanonicalDurabilityRejection::ParentProvisioningRequired
-            } else {
-                durability_io(CanonicalDurabilityStage::OpenParent, &error)
-            }
-        })?;
+        let canonical_parent = if direct_windows_root {
+            parent
+        } else {
+            std::fs::canonicalize(&parent).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    CanonicalDurabilityRejection::ParentProvisioningRequired
+                } else {
+                    durability_io(CanonicalDurabilityStage::OpenParent, &error)
+                }
+            })?
+        };
         let is_root = canonical_parent == self.canonical_root;
         if !(is_root || allow_descendant && canonical_parent.starts_with(&self.canonical_root)) {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
-        let metadata = std::fs::metadata(&canonical_parent)
-            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
-        if !metadata.is_dir() {
-            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
-        }
-        let identity = self.observed_identity(
-            path_identity(&canonical_parent, &metadata)
-                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?,
-        );
+        let identity = if direct_windows_root {
+            self.identity.clone()
+        } else {
+            let metadata = std::fs::metadata(&canonical_parent)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            if !metadata.is_dir() {
+                return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+            }
+            self.observed_identity(
+                path_identity(&canonical_parent, &metadata)
+                    .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?,
+            )
+        };
         if is_root && identity_is_available(&self.identity) && identity != self.identity {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
@@ -738,6 +811,9 @@ impl ManagedNamespace {
             let opened_metadata = directory
                 .metadata()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            if !opened_metadata.is_dir() {
+                return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+            }
             if identity_is_available(&identity)
                 && self.observed_identity(
                     handle_identity(directory, &opened_metadata).map_err(|error| {
@@ -778,6 +854,16 @@ struct ParentDurabilityBarrier {
     algorithm_test: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARENT_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn completed_parent_flushes() -> u64 {
+    PARENT_FLUSHES.get()
+}
+
 impl ParentDurabilityBarrier {
     fn is_available(&self) -> bool {
         #[cfg(test)]
@@ -798,6 +884,8 @@ impl ParentDurabilityBarrier {
             .as_ref()
             .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?;
         directory.sync_all()?;
+        #[cfg(test)]
+        PARENT_FLUSHES.set(PARENT_FLUSHES.get() + 1);
         #[cfg(windows)]
         {
             let reopened = windows_ntfs::open_attributes(&self.path)?;
@@ -1041,7 +1129,35 @@ impl CanonicalDurability {
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         let file = open_writer_coordination(&lock_path)?;
         let file = try_lock_exclusive(file)?;
-        Ok(CanonicalExclusiveGuard {
+        Ok(self.guard_for_namespace(namespace, file))
+    }
+
+    /// A transcript owns its own cooperative lock. The writer already qualified
+    /// its directory at startup; verify the bound directory identity on reuse.
+    pub(super) fn transcript_guard(
+        &self,
+        qualification: &CanonicalFilesystemQualification,
+        lock: File,
+    ) -> Result<CanonicalExclusiveGuard, CanonicalDurabilityRejection> {
+        let binding = self
+            .production_binding
+            .as_ref()
+            .ok_or(CanonicalDurabilityRejection::QualificationBindingMismatch)?;
+        if qualification.token != Some(binding.token)
+            || qualification.namespace != binding.namespace
+        {
+            return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
+        }
+        binding.namespace.validate_current()?;
+        Ok(self.guard_for_namespace(binding.namespace.clone(), lock))
+    }
+
+    fn guard_for_namespace(
+        &self,
+        namespace: ManagedNamespace,
+        file: File,
+    ) -> CanonicalExclusiveGuard {
+        CanonicalExclusiveGuard {
             namespace,
             qualification_token: self
                 .production_binding
@@ -1063,7 +1179,7 @@ impl CanonicalDurability {
             injected_rename_fault: self.injected_rename_fault.clone(),
             #[cfg(test)]
             algorithm_test: self.algorithm_test.clone(),
-        })
+        }
     }
 
     #[cfg(all(test, windows))]
@@ -2538,14 +2654,20 @@ impl CanonicalExclusiveGuard {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
-        let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
-            Ok(parent) => parent,
-            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
-        };
-        if temporary_parent.canonical_path != destination_parent.canonical_path {
-            return CanonicalDurabilityOutcome::Rejected(
-                CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
-            );
+        // Two direct sibling names share the same held parent barrier. Resolve
+        // distinct parent spellings independently before accepting an alias.
+        if destination.file_name().is_none()
+            || temporary.parent().map(Path::as_os_str) != destination.parent().map(Path::as_os_str)
+        {
+            let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
+                Ok(parent) => parent,
+                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+            };
+            if temporary_parent.canonical_path != destination_parent.canonical_path {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
+                );
+            }
         }
         if snapshot_basenames_overlap(temporary, destination) {
             return CanonicalDurabilityOutcome::Rejected(
@@ -3357,6 +3479,211 @@ fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationEr
     }
 }
 
+/// The unqualified v1 tier still attempts a directory flush when supported.
+pub(super) fn sync_unqualified_transcript_parent(path: &Path) -> io::Result<()> {
+    fn unsupported(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+        ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50)))
+    }
+    #[cfg(windows)]
+    let opened = windows_ntfs::open_directory_for_flush(path);
+    #[cfg(not(windows))]
+    let opened = File::open(path);
+    let directory = match opened {
+        Ok(file) => file,
+        Err(error) if unsupported(&error) || error.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match directory.sync_all() {
+        #[cfg(test)]
+        Ok(()) => {
+            PARENT_FLUSHES.set(PARENT_FLUSHES.get() + 1);
+            Ok(())
+        }
+        Err(error) if unsupported(&error) => Ok(()),
+        result => result,
+    }
+}
+
+pub(super) fn open_unqualified_transcript_file(
+    path: &Path,
+    create: bool,
+) -> Result<File, CanonicalDurabilityRejection> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    if create {
+        configure_owner_only_creation(&mut options);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let file = open_plain_existing(path, &mut options)
+        .map_err(|e| durability_io(CanonicalDurabilityStage::OpenExisting, &e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| durability_io(CanonicalDurabilityStage::InspectEntry, &e))?;
+    if !metadata.is_file() || crate::sessions::is_reparse_point(&metadata) {
+        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+    }
+    Ok(file)
+}
+
+pub(super) fn validate_unqualified_transcript_file(
+    path: &Path,
+    file: &File,
+) -> Result<(), CanonicalDurabilityRejection> {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|e| durability_io(CanonicalDurabilityStage::InspectEntry, &e))?;
+    if !named.is_file() || crate::sessions::is_reparse_point(&named) {
+        return Err(CanonicalDurabilityRejection::NonRegularCanonicalEntry);
+    }
+    let observed = file
+        .metadata()
+        .and_then(|metadata| handle_identity(file, &metadata));
+    match observed.and_then(|a| path_identity(path, &named).map(|b| a == b)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(CanonicalDurabilityRejection::IdentityChanged),
+        Err(error)
+            if error.kind() == io::ErrorKind::Unsupported
+                || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50))) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(durability_io(
+            CanonicalDurabilityStage::InspectEntry,
+            &error,
+        )),
+    }
+}
+
+/// The name stays stable across deletion. Removing a lock while another
+/// process waits on its open handle would split ownership across two inodes.
+pub(crate) fn transcript_coordination_path(source: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let name = source
+        .file_name()
+        .unwrap_or_default()
+        .as_encoded_bytes()
+        .to_ascii_lowercase();
+    source.with_file_name(format!(
+        ".audio-graph-transcript-{:x}.lock",
+        Sha256::digest(name)
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_WAITER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn observe_next_transcript_lock_wait(sender: std::sync::mpsc::Sender<()>) {
+    TRANSCRIPT_WAITER.replace(Some(sender));
+}
+
+pub(super) fn try_shared_transcript_lock(path: &Path) -> Result<File, CanonicalCoordinationError> {
+    open_transcript_lock(path, true, false, false)
+}
+
+pub(super) fn wait_for_transcript_lock(
+    path: &Path,
+    shared: bool,
+    create: bool,
+) -> Result<File, CanonicalCoordinationError> {
+    open_transcript_lock(path, shared, create, true)
+}
+
+fn open_transcript_lock(
+    path: &Path,
+    shared: bool,
+    create: bool,
+    wait: bool,
+) -> Result<File, CanonicalCoordinationError> {
+    let file = if create {
+        open_writer_coordination(path)?
+    } else {
+        ensure_regular_lock_entry(path)?;
+        open_plain_existing(path, OpenOptions::new().read(true))
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?
+    };
+    // Bound a stuck peer while allowing ordinary readers and writers to finish.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let result = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if wait && std::time::Instant::now() < deadline => {
+                #[cfg(test)]
+                if let Some(sender) = TRANSCRIPT_WAITER.take() {
+                    let _ = sender.send(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(TryLockError::WouldBlock) => return Err(CanonicalCoordinationError::Contended),
+            Err(TryLockError::Error(error)) => {
+                return Err(coordination_io(CanonicalCoordinationStage::Lock, &error));
+            }
+        }
+    }
+}
+
+pub(super) fn transcript_floor_lock(
+    root: &Path,
+    allow_create: bool,
+) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
+    let path = root.join(COORDINATION_FILE_NAME);
+    match wait_for_transcript_lock(&path, true, false) {
+        Err(CanonicalCoordinationError::Missing) if allow_create => {
+            wait_for_transcript_lock(&path, true, true)
+        }
+        other => other,
+    }
+    .map(|file| CanonicalSharedGuard { _lock_file: file })
+}
+
+pub(super) fn lock_transcript_removal(
+    source: &Path,
+    has_recovery_artifacts: impl Fn() -> io::Result<bool>,
+) -> Result<[Option<File>; 2], CanonicalCoordinationError> {
+    let lock_path = transcript_coordination_path(source);
+    let session = match open_transcript_lock(&lock_path, false, true, false) {
+        Ok(file) => Some(file),
+        Err(CanonicalCoordinationError::Io {
+            kind: io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem,
+            ..
+        }) if !has_recovery_artifacts()
+            .map_err(|e| coordination_io(CanonicalCoordinationStage::InspectLock, &e))? =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    // A live, uncertain attempt retains this second lock even between commits.
+    let lease_path = source.with_added_extension("attempt-lock");
+    let lease = match ensure_regular_lock_entry(&lease_path) {
+        Ok(()) => {
+            let file = open_plain_existing(&lease_path, OpenOptions::new().read(true))
+                .map_err(|e| coordination_io(CanonicalCoordinationStage::Open, &e))?;
+            Some(try_lock_exclusive(file)?)
+        }
+        Err(CanonicalCoordinationError::Missing) => None,
+        Err(error) => return Err(error),
+    };
+    Ok([lease, session])
+}
+
 impl CanonicalSharedGuard {
     /// Acquire only the existing reader lock in the caller's bound root.
     pub(super) fn open_existing(root: &Path) -> Result<Self, CanonicalCoordinationError> {
@@ -4039,6 +4366,7 @@ mod windows_ntfs {
     }
 
     pub(super) fn check_directory_chain(path: &Path) -> io::Result<()> {
+        use windows::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
         let absolute = std::path::absolute(path)?;
         match absolute.components().next() {
             Some(Component::Prefix(prefix))
@@ -4046,8 +4374,24 @@ mod windows_ntfs {
             _ => return Err(io::ErrorKind::Unsupported.into()),
         }
         // canonicalize follows junctions, so inspect the caller's chain first.
+        let mut wide = Vec::new();
         for ancestor in absolute.ancestors() {
-            require_plain(&std::fs::symlink_metadata(ancestor)?)?;
+            // Query the attributes of the named entry itself, including on
+            // symlinks and mounted folders. No handle or full metadata is needed.
+            wide.clear();
+            wide.extend(ancestor.as_os_str().encode_wide());
+            if wide.contains(&0) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            wide.push(0);
+            // SAFETY: the path is NUL-terminated and live through the call.
+            let attributes = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+            if attributes == INVALID_FILE_ATTRIBUTES {
+                // The std path also supports long non-verbatim caller spellings.
+                require_plain(&std::fs::symlink_metadata(ancestor)?)?;
+            } else if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
         }
         Ok(())
     }
@@ -4292,7 +4636,10 @@ fn path_identity(_path: &Path, _metadata: &Metadata) -> io::Result<FilesystemIde
     }
 }
 
-fn handle_identity(_file: &File, _metadata: &Metadata) -> io::Result<FilesystemIdentity> {
+pub(super) fn handle_identity(
+    _file: &File,
+    _metadata: &Metadata,
+) -> io::Result<FilesystemIdentity> {
     #[cfg(windows)]
     {
         windows_ntfs::identity(_file)
@@ -6768,9 +7115,10 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let (proof, _) =
             CanonicalFilesystemQualification::for_existing_managed_root(&parent).unwrap();
+        let target = proof.namespace.canonical_root.join("entry");
         let bound = proof
             .namespace
-            .bind_parent(&parent.join("entry"), CanonicalPlatform::Windows)
+            .bind_parent(&target, CanonicalPlatform::Windows)
             .unwrap();
         fs::rename(&parent, root.join("original")).unwrap();
         fs::create_dir(&parent).unwrap();
@@ -6778,6 +7126,12 @@ mod tests {
             bound.barrier.sync_all().unwrap_err().kind(),
             io::ErrorKind::Other
         );
+        assert!(matches!(
+            proof
+                .namespace
+                .bind_parent(&target, CanonicalPlatform::Windows),
+            Err(CanonicalDurabilityRejection::IdentityChanged)
+        ));
         drop(bound);
         fs::remove_dir_all(root).unwrap();
     }

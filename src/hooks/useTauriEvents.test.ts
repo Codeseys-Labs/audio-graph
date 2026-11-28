@@ -1,6 +1,7 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { Event } from "@tauri-apps/api/event";
 import { listen } from "@tauri-apps/api/event";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   RUNTIME_DIAGNOSTIC_CONTRACT,
@@ -144,6 +145,42 @@ describe("useTauriEvents", () => {
       expect(handlers.has(name)).toBe(true);
     }
     expect(handlers.size).toBe(expected.length);
+    unmount();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("restores startup storage status while respecting newer events (%s)", async (newerEvent) => {
+    const snapshot = {
+      ...useAudioGraphStore.getState().pipelineStatus,
+      transcript_crash_safety_unverified: true,
+    };
+    let finishRead!: (value: typeof snapshot) => void;
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    vi.mocked(invoke).mockImplementationOnce(async () => {
+      readStarted();
+      return new Promise<typeof snapshot>((resolve) => {
+        finishRead = resolve;
+      });
+    });
+    const { unmount } = renderHook(() => useTauriEvents());
+    await started;
+    const newer = { ...snapshot, transcript_crash_safety_unverified: false };
+    if (newerEvent) {
+      act(() =>
+        handlers.get("pipeline-status")?.(makeEvent("pipeline-status", newer)),
+      );
+    }
+    await act(async () => {
+      finishRead(snapshot);
+    });
+    expect(useAudioGraphStore.getState().pipelineStatus).toEqual(
+      newerEvent ? newer : snapshot,
+    );
     unmount();
   });
 

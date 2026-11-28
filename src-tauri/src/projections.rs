@@ -1176,39 +1176,19 @@ impl TranscriptLedger {
     }
 
     pub fn apply_event(&mut self, event: TranscriptEvent) -> Result<(), TranscriptLedgerError> {
-        match self
+        if let Some(current) = self
             .latest_spans
             .iter_mut()
             .find(|span| span.span_id == event.span_id)
         {
-            Some(current) if event.revision_number < current.revision_number => {
-                Err(TranscriptLedgerError::StaleTranscriptRevision {
-                    span_id: event.span_id,
-                    current_revision: current.revision_number,
-                    incoming_revision: event.revision_number,
-                })
-            }
-            Some(current)
-                if event.revision_number == current.revision_number && event != *current =>
-            {
-                Err(TranscriptLedgerError::ConflictingTranscriptRevision {
-                    span_id: event.span_id,
-                    revision_number: event.revision_number,
-                })
-            }
-            Some(current) => {
-                *current = event;
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(())
-            }
-            None => {
-                self.latest_spans.push(event);
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(())
-            }
+            validate_transcript_replacement(current, &event)?;
+            *current = event;
+        } else {
+            self.latest_spans.push(event);
         }
+        self.accepted_event_count += 1;
+        self.sort_latest_spans();
+        Ok(())
     }
 
     pub fn current_basis(&self) -> ProjectionBasis {
@@ -1570,12 +1550,96 @@ impl TranscriptLedger {
     }
 
     fn sort_latest_spans(&mut self) {
-        self.latest_spans.sort_by(|a, b| {
-            millis(a.start_time)
-                .cmp(&millis(b.start_time))
-                .then(millis(a.end_time).cmp(&millis(b.end_time)))
-                .then(a.span_id.cmp(&b.span_id))
+        self.latest_spans.sort_by(transcript_span_order);
+    }
+}
+
+fn transcript_span_order(a: &TranscriptEvent, b: &TranscriptEvent) -> std::cmp::Ordering {
+    millis(a.start_time)
+        .cmp(&millis(b.start_time))
+        .then(millis(a.end_time).cmp(&millis(b.end_time)))
+        .then(a.span_id.cmp(&b.span_id))
+}
+
+fn validate_transcript_replacement(
+    current: &TranscriptEvent,
+    event: &TranscriptEvent,
+) -> Result<(), TranscriptLedgerError> {
+    if event.revision_number < current.revision_number {
+        return Err(TranscriptLedgerError::StaleTranscriptRevision {
+            span_id: event.span_id.clone(),
+            current_revision: current.revision_number,
+            incoming_revision: event.revision_number,
         });
+    }
+    if event.revision_number == current.revision_number && event != current {
+        return Err(TranscriptLedgerError::ConflictingTranscriptRevision {
+            span_id: event.span_id.clone(),
+            revision_number: event.revision_number,
+        });
+    }
+    Ok(())
+}
+
+/// The single committing worker owns this index. The serializable ledger stays
+/// in timeline order; chronological appends and in-place revisions avoid a scan.
+#[derive(Default)]
+pub(crate) struct TranscriptLiveIndex {
+    session: String,
+    sequence: u64,
+    positions: std::collections::HashMap<String, usize>,
+}
+
+impl TranscriptLiveIndex {
+    pub(crate) fn apply(
+        &mut self,
+        ledger: &mut TranscriptLedger,
+        event: TranscriptEvent,
+    ) -> Result<(), TranscriptLedgerError> {
+        if self.session != ledger.session_id || self.sequence != ledger.accepted_event_count {
+            self.session.clone_from(&ledger.session_id);
+            self.positions.clear();
+            self.reindex(&ledger.latest_spans, 0);
+        }
+        let spans = &mut ledger.latest_spans;
+        let mut changed_from = spans.len();
+        let old = self.positions.get(&event.span_id).copied();
+        if let Some(i) = old {
+            validate_transcript_replacement(&spans[i], &event)?;
+            changed_from = i;
+            let fits = i
+                .checked_sub(1)
+                .is_none_or(|j| !transcript_span_order(&spans[j], &event).is_gt())
+                && spans
+                    .get(i + 1)
+                    .is_none_or(|next| !transcript_span_order(&event, next).is_gt());
+            if fits {
+                spans[i] = event;
+                ledger.accepted_event_count += 1;
+                self.sequence = ledger.accepted_event_count;
+                return Ok(());
+            }
+            spans.remove(i);
+        }
+        let at = if spans
+            .last()
+            .is_none_or(|last| !transcript_span_order(last, &event).is_gt())
+        {
+            spans.len()
+        } else {
+            spans.partition_point(|row| transcript_span_order(row, &event).is_lt())
+        };
+        spans.insert(at, event);
+        self.reindex(spans, changed_from.min(at));
+        ledger.accepted_event_count += 1;
+        self.sequence = ledger.accepted_event_count;
+        Ok(())
+    }
+
+    fn reindex(&mut self, spans: &[TranscriptEvent], from: usize) {
+        for (i, span) in spans.iter().enumerate().skip(from) {
+            self.positions.insert(span.span_id.clone(), i);
+        }
     }
 }
 
@@ -2004,7 +2068,11 @@ impl fmt::Debug for DebugGraphNodeDraft<'_> {
 
 /// Per-item LLM provenance, cloned into every materialized note / node / edge and
 /// persisted, so per-item byte cost governs what may live here (ADR-0038).
+///
+/// Decoded through [`StoredProjectionProvenance`], so a stored model id is read
+/// by where the record says the model ran.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(from = "StoredProjectionProvenance")]
 pub struct ProjectionProvenance {
     /// The REGISTRY provider id the route was authorized against (`llm.openrouter`,
     /// `llm.cerebras`, …). Before ADR-0038 this carried a fourth ad-hoc naming
@@ -2013,6 +2081,10 @@ pub struct ProjectionProvenance {
     /// The SERVED model when the response reported one; see
     /// [`model_source`](Self::model_source), which says which it is rather than
     /// leaving a reader to assume.
+    ///
+    /// A hosted identifier for a model that ran at a remote endpoint, and a
+    /// display name for a local one: never a filesystem path (see
+    /// `ipc_contract::model_id`).
     pub model: String,
     pub prompt_id: String,
     /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records
@@ -2024,6 +2096,50 @@ pub struct ProjectionProvenance {
     /// mistaken for served identity.
     #[serde(default)]
     pub model_source: crate::llm::route::ModelIdentitySource,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint the client dialled. `None` on records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+/// A [`ProjectionProvenance`] as a patch, note or graph item stores it.
+///
+/// Records written before the model rule can hold a local model's path, or
+/// what the old character filter left of a Windows path, and carry no
+/// `model_placement`. Building the typed value from this one applies the rule
+/// on every read: a marked record is read by its placement, and an unmarked
+/// one by what its provider and route say. Nothing loaded, exported or
+/// written again carries the path, and the stored record is not rewritten.
+#[derive(serde::Deserialize)]
+struct StoredProjectionProvenance {
+    provider: String,
+    model: String,
+    prompt_id: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    model_source: crate::llm::route::ModelIdentitySource,
+    #[serde(default)]
+    model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+impl From<StoredProjectionProvenance> for ProjectionProvenance {
+    fn from(stored: StoredProjectionProvenance) -> Self {
+        let legacy_remote =
+            crate::llm::route::recorded_as_remote(&stored.provider, stored.route_id.as_deref());
+        Self {
+            model: audio_graph_ipc_contract::model_id::stored_for_place(
+                stored.model,
+                stored.model_placement,
+                legacy_remote,
+            ),
+            provider: stored.provider,
+            prompt_id: stored.prompt_id,
+            route_id: stored.route_id,
+            model_source: stored.model_source,
+            model_placement: stored.model_placement,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
@@ -4945,6 +5061,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn indexed_live_delivery_matches_replay_across_moves_and_session_rotation() {
+        let mut index = TranscriptLiveIndex::default();
+        for session in ["first", "next"] {
+            let mut live = TranscriptLedger::new(session);
+            let mut replay = live.clone();
+            for (span, revision, start) in [
+                ("reed", 1, 1.0),
+                ("pond", 1, 3.0),
+                ("tree", 1, 2.0),
+                ("pond", 2, 0.0),
+                ("pond", 3, 4.0),
+                ("tree", 2, 2.0),
+                ("tree", 2, 2.0),
+                ("tree", 1, 2.0),
+                ("tree", 2, 3.0),
+            ] {
+                let mut payload = asr_payload(span, revision, "leaf");
+                payload.start_time = start;
+                payload.end_time = start + 0.5;
+                let event: TranscriptEvent = payload.into();
+                assert_eq!(
+                    index.apply(&mut live, event.clone()),
+                    replay.apply_event(event),
+                );
+                assert_eq!(live, replay);
+            }
+        }
+    }
+
     fn provider_payload(
         provider: &str,
         source_id: &str,
@@ -6002,10 +6148,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6082,6 +6229,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6211,10 +6359,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7094,10 +7243,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7140,10 +7290,11 @@ mod tests {
             confidence: 0.81,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7554,6 +7705,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -9279,6 +9431,7 @@ mod tests {
                     prompt_id: "complexity_v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: Some(created_at_ms),
                 generation_latency_ms: Some(5),
@@ -11625,10 +11778,11 @@ mod tests {
                 confidence: 0.9,
                 provenance: ProjectionProvenance {
                     provider: "openrouter".to_string(),
-                    model: "anthropic/claude-sonnet-4".to_string(),
+                    model: "claude-sonnet-4".to_string(),
                     prompt_id: "graph-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: None,
                 generation_latency_ms: None,
@@ -11747,10 +11901,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -11803,10 +11958,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

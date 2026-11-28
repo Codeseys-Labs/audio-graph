@@ -7,16 +7,43 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { loadedSession, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { preloadGraphLens } from "../test/lazyChunks";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
 
+// react-force-graph-2d draws to a canvas jsdom cannot drive, and importing it
+// is slow under whole-suite load: stub it (the Graph lens is lazy-loaded).
+vi.mock("react-force-graph-2d", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    default: React.forwardRef((_props: unknown, ref: React.Ref<unknown>) => {
+      React.useImperativeHandle(ref, () => ({
+        zoomToFit: () => {},
+        d3ReheatSimulation: () => {},
+        d3Force: () => ({ strength: () => {}, distance: () => {} }),
+      }));
+      return React.createElement("div", { "data-testid": "force-graph" });
+    }),
+  };
+});
+
 const mockedInvoke = vi.mocked(invoke);
+
+beforeAll(preloadGraphLens);
 
 /**
  * The just-stopped session B's data stays resident in the global store after
@@ -83,15 +110,29 @@ async function expectResident(): Promise<void> {
   expect(
     within(pane).queryByText(/this view needs the session loaded/i),
   ).not.toBeInTheDocument();
-  // The Graph lens is a lazy chunk, so allow it a moment to mount.
+  // The Graph lens is a lazy chunk (preloaded in `beforeAll`), so it mounts
+  // after a tick rather than synchronously.
   await waitFor(() => expect(pane).not.toBeEmptyDOMElement());
 }
 
-function expectGated(): void {
-  const pane = screen.getByRole("tabpanel");
+/**
+ * B is no longer resident, so its lenses are Review panes: the Transcript lens
+ * shows B's OWN transcript read from disk (never the sample's, nothing empty
+ * passed off as B's), and the global-store-only actions are withheld.
+ */
+async function expectReviewOwnData(): Promise<void> {
+  fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
   expect(
-    within(pane).getByRole("button", { name: /load session/i }),
+    await within(screen.getByRole("tabpanel")).findByText("text of session-b"),
   ).toBeVisible();
+  for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
+    fireEvent.click(screen.getByRole("tab", { name: lens }));
+    const pane = screen.getByRole("tabpanel");
+    expect(
+      within(pane).queryByRole("button", { name: /load session/i }),
+    ).not.toBeInTheDocument();
+    expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+  }
 }
 
 /** Resident B just stopped: capture off, slot names B, nav routed to B. */
@@ -217,7 +258,7 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     await waitFor(() =>
       expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
     );
-    expect(loadSessionIds()).toEqual(["session-a"]);
+    expect(new Set(loadSessionIds())).toEqual(new Set(["session-a"]));
     expect(useAudioGraphStore.getState().pendingFinalizingSession).toBeNull();
     // A is loaded: its lenses show, but the summary (backend buffers) is not
     // offered for a loaded historical session.
@@ -228,11 +269,13 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     await waitFor(() =>
       expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-b"),
     );
-    expect(loadSessionIds()).toEqual(["session-a", "session-b"]);
+    expect(new Set(loadSessionIds())).toEqual(
+      new Set(["session-a", "session-b"]),
+    );
     expect(moreActions()).toBeNull();
   });
 
-  it("gates B's row after a sample preview is entered and left, never showing sample or empty data as B's", async () => {
+  it("shows B's own data from Review after a sample preview is entered and left, never the sample's or an empty resident view", async () => {
     seedJustStoppedB([SESSION_B]);
     render(<SessionsBrowser />);
     await screen.findByTestId("session-session-b");
@@ -252,15 +295,14 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     });
     expect(useAudioGraphStore.getState().samplePreviewActive).toBe(false);
     await screen.findByRole("heading", { name: "Session B" });
-    for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
-      fireEvent.click(screen.getByRole("tab", { name: lens }));
-      expectGated();
-    }
+    await expectReviewOwnData();
     expect(moreActions()).toBeNull();
-    expect(loadSessionIds()).toEqual([]);
+    expect(mockedInvoke).toHaveBeenCalledWith("load_session", {
+      sessionId: "session-b",
+    });
   });
 
-  it("gates B's row after New session resets the view, with the summary withheld", async () => {
+  it("shows B's own data from Review after New session resets the view, with the summary withheld", async () => {
     seedJustStoppedB([SESSION_B]);
     render(<SessionsBrowser />);
     await screen.findByTestId("session-session-b");
@@ -272,12 +314,8 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
       useAudioGraphStore.getState().resetSessionView();
     });
 
-    for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
-      fireEvent.click(screen.getByRole("tab", { name: lens }));
-      expectGated();
-    }
+    await expectReviewOwnData();
     expect(moreActions()).toBeNull();
-    expect(loadSessionIds()).toEqual([]);
     expect(mockedInvoke).not.toHaveBeenCalledWith("synthesize_notes");
   });
 });

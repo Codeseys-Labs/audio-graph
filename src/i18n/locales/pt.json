@@ -835,6 +835,8 @@
       "stale": "Esta transcrição pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
+      "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "emptyNotes": "Esta sessão não tem notas.",
       "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
     },
@@ -873,7 +875,11 @@
       "classLabel": {
         "materialized_graph": "grafo de conhecimento",
         "materialized_notes": "notas",
-        "projection_events": "registro de projeção"
+        "projection_events": "registro de projeção",
+        "transcript_events": "transcrição",
+        "diarization_events": "registro de falantes",
+        "live_graph": "grafo ao vivo",
+        "other": "dados"
       }
     },
     "lensFetchError": {
@@ -1441,6 +1447,14 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Não foi possível salvar algumas legendas desta sessão.",
+    "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
+    "transcriptNotSaving": {
+      "confirmation_delayed": "Aguardando confirmação do salvamento da transcrição",
+      "writer_absent": "A transcrição não está sendo salva",
+      "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
+      "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"
+    },
     "stageDiarization": "Diarização",
     "stageExtraction": "Extração",
     "stageGraph": "Grafo",
@@ -1615,7 +1629,7 @@
       "credential_expired": "A credencial do provedor expirou. Renove-a antes de tentar novamente.",
       "permission_denied": "O provedor negou o acesso a esta operação. Verifique as permissões ou o plano da sua conta.",
       "invalid_configuration": "A configuração do provedor é inválida. Verifique o modelo, a região ou o endpoint em Configurações.",
-      "capacity_exhausted": "O provedor atingiu seu limite de capacidade, ou a cota ou o saldo da sua conta se esgotou. Verifique seu plano e saldo, ou tente novamente mais tarde.",
+      "capacity_exhausted": "Sua conta atingiu um limite de cota ou de uso simultâneo, ou o saldo se esgotou. Verifique seu plano e saldo, ou tente novamente mais tarde.",
       "policy_blocked": "A política atual bloqueia esta operação.",
       "unsupported": "O provedor não oferece suporte a esta operação.",
       "cancelled": "A operação foi cancelada.",

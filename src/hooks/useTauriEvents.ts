@@ -54,6 +54,7 @@
 
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
+import { safeInvoke } from "../analytics/safeInvoke";
 import { publishStorageFull } from "../components/StorageBanner";
 import { CREDENTIAL_CONTRACT } from "../generated/credentialContract";
 import {
@@ -305,6 +306,7 @@ export function useTauriEvents(): void {
     // flag so listeners that resolve after unmount are unlistened instead of
     // leaking (the sync cleanup below would otherwise iterate an empty array).
     let cancelled = false;
+    let sawPipelineStatus = false;
 
     // H5: coalesce high-frequency REPLACE-semantics events (latest wins) so
     // a flood triggers ~10fps store updates instead of one per event. Only
@@ -415,6 +417,7 @@ export function useTauriEvents(): void {
           setMaterializedProjectionGraph(event.payload);
         }),
         safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
+          sawPipelineStatus = true;
           setPipelineStatus(event.payload);
         }),
         safeListen<ProcessedAudioConsumerHealthPayload>(
@@ -571,6 +574,19 @@ export function useTauriEvents(): void {
         return;
       }
       unlisten = handles;
+      // The startup storage probe may have finished before the renderer mounted.
+      // Subscribe first so a slow initial read cannot overwrite a newer event.
+      if (!sawPipelineStatus) {
+        try {
+          const status = await safeInvoke<PipelineStatus>(
+            "get_pipeline_status",
+          );
+          if (!cancelled && !sawPipelineStatus && status)
+            setPipelineStatus(status);
+        } catch {
+          // The event subscription will publish the next observed status.
+        }
+      }
     }
 
     setup();

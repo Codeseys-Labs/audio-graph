@@ -22,6 +22,22 @@ import { downloadAsFile } from "../utils/download";
 import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
 
+// react-force-graph-2d draws to a canvas jsdom cannot drive, and importing it
+// is slow under whole-suite load: stub it (the Graph lens is lazy-loaded).
+vi.mock("react-force-graph-2d", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    default: React.forwardRef((_props: unknown, ref: React.Ref<unknown>) => {
+      React.useImperativeHandle(ref, () => ({
+        zoomToFit: () => {},
+        d3ReheatSimulation: () => {},
+        d3Force: () => ({ strength: () => {}, distance: () => {} }),
+      }));
+      return React.createElement("div", { "data-testid": "force-graph" });
+    }),
+  };
+});
+
 vi.mock("../utils/download", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   downloadAsFile: vi.fn(),
@@ -90,35 +106,33 @@ function stopCaptureWithoutReroute(): void {
   useAudioGraphStore.setState({ isCapturing: false, isTranscribing: false });
 }
 
-interface LoadControl {
-  /** The next `load_session` call is answered by `answer()` instead. */
-  armGlobalLoad: (answer: () => Promise<unknown>) => void;
+interface BackendControl {
+  /** Make the next notes-artifact query fail (a first-load failure). */
+  failNotesOnce: () => void;
 }
 
-/**
- * `load_session` answers A's payload (the Review query) unless a test armed the
- * next call, which is how a click on "Load session" is told apart from Review.
- */
-function mockBackend(): LoadControl {
-  let armed: (() => Promise<unknown>) | null = null;
+/** `load_session` and the lens artifact commands answer A's data. */
+function mockBackend(): BackendControl {
+  let failNotes = false;
   mockedInvoke.mockImplementation(async (cmd: string) => {
     if (cmd === "list_sessions") return [SESSION_A];
-    if (cmd === "load_session") {
-      if (armed) {
-        const answer = armed;
-        armed = null;
-        return answer();
+    if (cmd === "load_session") return payloadA();
+    if (cmd === "load_session_notes_artifacts_cmd") {
+      if (failNotes) {
+        failNotes = false;
+        throw { code: "io", message: "disk gone: C:\\secret" };
       }
-      return payloadA();
+      return { notes: null, projection_events: [] };
     }
+    if (cmd === "load_session_graph_artifact_cmd") return null;
     if (cmd === "purge_expired_sessions") return [];
     if (cmd === "build_session_timeline_cmd")
       return { entries: [], total_count: 0 };
     return null;
   });
   return {
-    armGlobalLoad: (answer) => {
-      armed = answer;
+    failNotesOnce: () => {
+      failNotes = true;
     },
   };
 }
@@ -186,13 +200,36 @@ async function openSessionAWhileLive(): Promise<void> {
   expect(await screen.findByText(A_TEXT)).toBeVisible();
 }
 
-function notesGated(): void {
-  fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-  const pane = screen.getByRole("tabpanel");
-  expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
-  expect(
-    within(pane).getByRole("button", { name: /load session/i }),
-  ).toBeVisible();
+/**
+ * Notes, Timeline and Graph read A's Review data after the run ended: B's
+ * resident data never shows, no Load step is needed, and the global store was
+ * not loaded (B's resident data is untouched).
+ */
+async function expectLensesShowAOnly(): Promise<void> {
+  for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
+    fireEvent.click(screen.getByRole("tab", { name: lens }));
+    const pane = screen.getByRole("tabpanel");
+    await waitFor(() =>
+      expect(within(pane).queryByText(/^loading/i)).not.toBeInTheDocument(),
+    );
+    expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+    expect(
+      within(pane).queryByRole("button", { name: /load session/i }),
+    ).not.toBeInTheDocument();
+  }
+  expect(mockedInvoke).toHaveBeenCalledWith(
+    "load_session_notes_artifacts_cmd",
+    { sessionId: "session-a" },
+  );
+  expect(mockedInvoke).toHaveBeenCalledWith("load_session_graph_artifact_cmd", {
+    sessionId: "session-a",
+  });
+  expect(mockedInvoke).toHaveBeenCalledWith("build_session_timeline_cmd", {
+    sessionId: "session-a",
+    limit: expect.any(Number),
+  });
+  expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+  expect(useAudioGraphStore.getState().transcriptSegments[0].text).toBe(B_TEXT);
 }
 
 describe("SessionsBrowser: Review across Start and Stop", () => {
@@ -220,92 +257,58 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
   describe("unresolved Stop of B while A is reviewed", () => {
     beforeEach(() => startLiveSessionB());
 
-    it("never loads the global store by itself; A stays bound, B's data and the summary action are gated, and an explicit Load works", async () => {
-      const backend = mockBackend();
+    it("keeps every lens and both exports on A, loads nothing into the global store, and offers no summary", async () => {
+      mockBackend();
       render(<SessionsBrowser />);
       await openSessionAWhileLive();
-      const callsWhileLive = loadSessionCalls();
 
       act(() => stopCaptureWithoutReroute());
-      // Let any effect that could (wrongly) start a load run.
       await act(async () => {});
 
-      // Rule A: nothing loaded the global store.
-      expect(loadSessionCalls()).toBe(callsWhileLive);
+      // Rule A: nothing wrote the global store; B's resident data is intact.
       expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
       expect(useAudioGraphStore.getState().transcriptSegments[0].text).toBe(
         B_TEXT,
       );
-
-      // Rule B: lenses gated with an explicit action, summary not offered.
-      notesGated();
+      // Only what needs the backend's current buffers stays unavailable.
       expect(moreActions()).toBeNull();
-      fireEvent.click(screen.getByRole("tab", { name: /^graph$/i }));
-      expect(
-        within(screen.getByRole("tabpanel")).getByRole("button", {
-          name: /load session/i,
-        }),
-      ).toBeVisible();
 
-      // Transcript and both exports: A.
+      await expectLensesShowAOnly();
       await expectBothExportsBoundToA();
-
-      // Explicit Load, answered slowly: still gated, still no summary.
-      const reload = deferred<unknown>();
-      backend.armGlobalLoad(() => reload.promise);
-      fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-      const callsBeforeLoad = loadSessionCalls();
-      fireEvent.click(screen.getByRole("button", { name: /load session/i }));
-      await waitFor(() => expect(loadSessionCalls()).toBe(callsBeforeLoad + 1));
-      expect(
-        within(screen.getByRole("tabpanel")).getByRole("status"),
-      ).toHaveTextContent(/loading/i);
       expect(moreActions()).toBeNull();
-      await expectBothExportsBoundToA();
-
-      // It lands: the lens is released.
-      fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-      await act(async () => {
-        reload.resolve(payloadA());
-      });
-      await waitFor(() =>
-        expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
-      );
-      expect(
-        screen.queryByRole("button", { name: /load session/i }),
-      ).not.toBeInTheDocument();
       expectNoBackendBufferCommand();
     });
 
-    it("shows a closed localized error with retry when the explicit Load fails, with exports still A's and no summary", async () => {
+    it("shows a closed localized error with retry when a lens query fails, never backend text, with exports still A's", async () => {
       const backend = mockBackend();
       render(<SessionsBrowser />);
       await openSessionAWhileLive();
       act(() => stopCaptureWithoutReroute());
       await act(async () => {});
 
+      backend.failNotesOnce();
       fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-      backend.armGlobalLoad(() =>
-        Promise.reject({ code: "io", message: "disk gone" }),
-      );
-      fireEvent.click(screen.getByRole("button", { name: /load session/i }));
-
       const pane = screen.getByRole("tabpanel");
       expect(await within(pane).findByRole("alert")).toHaveTextContent(
         "This session could not be loaded.",
       );
       expect(pane.textContent).not.toContain("disk gone");
+      expect(pane.textContent).not.toContain("secret");
       expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
-      expect(
-        within(pane).getByRole("button", { name: /try again/i }),
-      ).toBeVisible();
       expect(moreActions()).toBeNull();
 
+      // Retry recovers the lens; the transcript exports are still A's.
+      fireEvent.click(within(pane).getByRole("button", { name: /try again/i }));
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("review-lens-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
       await expectBothExportsBoundToA();
       expectNoBackendBufferCommand();
     });
 
-    it("after leaving Sessions before Stop and returning, loads nothing by itself and keeps A bound", async () => {
+    it("after leaving Sessions before Stop and returning, still shows A on every lens and loads nothing globally", async () => {
       mockBackend();
       const first = render(<SessionsBrowser />);
       await openSessionAWhileLive();
@@ -317,15 +320,14 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       await screen.findByRole("tabpanel");
       await act(async () => {});
 
-      notesGated();
       expect(moreActions()).toBeNull();
-      expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+      await expectLensesShowAOnly();
       await expectBothExportsBoundToA();
       expectNoBackendBufferCommand();
     });
   });
 
-  it("gates Notes, Timeline and Graph for an auto-selected A after an unresolved Stop of a later B", async () => {
+  it("shows A's own data on Notes, Timeline and Graph for an auto-selected A after an unresolved Stop of a later B", async () => {
     // An earlier successful Stop routed `nav` to A (its row has reconciled, so
     // it is no longer the optimistic row) and the user never clicked A. B then
     // ran and its unresolved Stop left `nav` on A; the global store holds B.
@@ -342,16 +344,11 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     render(<SessionsBrowser />);
     await screen.findByRole("tabpanel");
 
-    for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
-      fireEvent.click(screen.getByRole("tab", { name: lens }));
-      const pane = screen.getByRole("tabpanel");
-      expect(
-        within(pane).getByRole("button", { name: /load session/i }),
-      ).toBeVisible();
-      expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
-    }
+    await expectLensesShowAOnly();
     expect(moreActions()).toBeNull();
-    expect(loadSessionCalls()).toBe(0);
+    // Only Review's own reads ran: the global loader never did.
+    expect(loadSessionCalls()).toBeGreaterThan(0);
+    expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
   });
 
   it("does not reload history into the Live store when Start is pressed on a hydrated A", async () => {

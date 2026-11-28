@@ -56,10 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Transcript recovery retains each complete, verified revision after an interrupted save, including a revision followed by newer speech. A pending save confirmation is shown while the outcome is uncertain. Recovery restores prior sessions before their first historical load (#139, #559).
 - A panic inside one LLM executor job no longer leaves other jobs waiting
   forever. That job and the jobs queued behind it end at once (notes synthesis
   and projection with an error, entity extraction with its rule-based
   fallback), and the next job starts a new worker (#539).
+- Soniox duration rollovers emit the standard reconnect events without a
+  separate adapter error event. The ASR stage still uses its standard reconnect
+  display. Deepgram, AssemblyAI, Soniox, and OpenAI report a stalled audio
+  backlog as a timeout. Aura uses request and protocol diagnostics for text and
+  WebSocket size limits.
 - ASR sessions that fail soon after readiness now consume the reconnect budget.
   Deepgram preserves an intentional stop during final transcript drain. Soniox
   stops replaced connections and opens a fresh session after a duration limit.
@@ -67,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
+- Notes, graph items, Live Assist decisions and the data-movement view no
+  longer record the file path of a local model. A model that runs on this
+  machine or at a local endpoint is recorded by its name alone (for example
+  `private.gguf` for `/home/name/private.gguf`); a model at a remote endpoint
+  keeps its provider's identifier. Sessions saved before this fix are read and
+  exported the same way, and a local model whose stored path cannot be reduced
+  to a name shows as `local-model`; their files are not rewritten (#540).
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw

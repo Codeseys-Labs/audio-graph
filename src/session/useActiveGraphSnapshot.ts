@@ -23,7 +23,6 @@
  * materialized shape, not just the snapshot).
  */
 import { useMemo, useRef } from "react";
-import { useAudioGraphStore } from "../store";
 import type { GraphNode, GraphSnapshot, MaterializedGraph } from "../types";
 import { materializedGraphToSnapshot } from "../utils/materializedGraph";
 import { useSessionView } from "./SessionViewProvider";
@@ -40,10 +39,9 @@ export interface ActiveGraphView {
 }
 
 export function useActiveGraphSnapshot(): ActiveGraphView {
-  const { graphSnapshot } = useSessionView();
-  const materializedProjectionGraph = useAudioGraphStore(
-    (s) => s.materializedProjectionGraph,
-  );
+  // Both graph lanes come through the session view, so a Review subtree reads
+  // its own session's graph and holds no subscription to the Live store.
+  const { graphSnapshot, materializedProjectionGraph } = useSessionView();
   // `materializedGraphToSnapshot` is a pure function with no memory of its
   // own: it allocates a brand-new `GraphNode` object for every node on
   // EVERY call. The legacy lane's own store actions (`setGraphSnapshot`,

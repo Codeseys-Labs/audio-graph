@@ -40,10 +40,15 @@ pub(crate) mod speaker_log;
 pub(crate) const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
 pub mod data_movement;
 pub mod io;
+mod live_receipt;
 pub mod session_artifact_manifest;
 pub mod session_semantics;
 #[cfg(feature = "surrealdb-embedded")]
 pub mod surreal;
+mod transcript_batch;
+use live_receipt::LiveReply;
+pub(crate) use live_receipt::PendingLiveTranscript;
+pub(crate) mod transcript_startup;
 pub use data_movement::{DataMovementLedgerBuilder, hash_artifact_path};
 pub use io::write_or_emit_storage_full;
 
@@ -532,6 +537,50 @@ impl SessionArtifactDeleteReport {
     }
 }
 
+/// Writers acquire the directory guard before this Session's attempt lease.
+pub(crate) fn lock_transcript_for_removal(path: &Path) -> Result<[Option<fs::File>; 2], String> {
+    let parent = path.parent().ok_or("Invalid transcript location")?;
+    // Validate the same managed parent as the inventory before opening any lock.
+    for directory in [
+        parent.parent().ok_or("Invalid transcript location")?,
+        parent,
+    ] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() && !crate::sessions::is_reparse_point(&metadata) => {}
+            Ok(_) => return Err("Invalid transcript directory".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok([None, None]),
+            Err(error) => {
+                return Err(format!(
+                    "Transcript cleanup unavailable: {:?}",
+                    error.kind()
+                ));
+            }
+        }
+    }
+    canonical_durability::lock_transcript_removal(path, || {
+        canonical_log::transcript_recovery_artifacts(path).map(|paths| !paths.is_empty())
+    })
+    .map_err(|error| format!("Transcript cleanup unavailable: {error:?}"))
+}
+
+fn remove_repository_files(session_id: &str, paths: Vec<PathBuf>) -> SessionArtifactDeleteReport {
+    let mut report = SessionArtifactDeleteReport::new(session_id);
+    for path in paths {
+        match fs::remove_file(&path) {
+            Ok(_) => report.deleted_files.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.missing_files.push(path);
+            }
+            Err(error) => {
+                report
+                    .failed_files
+                    .push(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    report
+}
+
 /// Backend-owned repository boundary for local session memory artifacts.
 ///
 /// The first implementation is [`FileMemoryRepository`]. Future adapters
@@ -566,21 +615,17 @@ pub trait LocalMemoryRepository: Send + Sync {
         session_id: &str,
     ) -> Result<SessionArtifactDeleteReport, String> {
         crate::sessions::validate_session_id(session_id)?;
-        let mut report = SessionArtifactDeleteReport::new(session_id);
-        for path in self.session_artifact_paths(session_id)? {
-            match fs::remove_file(&path) {
-                Ok(_) => report.deleted_files.push(path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    report.missing_files.push(path);
-                }
-                Err(error) => {
-                    report
-                        .failed_files
-                        .push(format!("{}: {error}", path.display()));
-                }
-            }
-        }
-        Ok(report)
+        Ok(remove_repository_files(
+            session_id,
+            self.session_artifact_paths(session_id)?,
+        ))
+    }
+
+    fn transcript_commit_path(
+        &self,
+        _session_id: &str,
+    ) -> Result<PathBuf, canonical_log::TranscriptCommitError> {
+        Err(canonical_log::TranscriptCommitError::UnsupportedRepository)
     }
 
     fn append_transcript_event(
@@ -917,6 +962,25 @@ impl FileMemoryRepository {
             .join(format!("{session_id}.current.json")))
     }
 
+    /// Content-free recovery gaps for load, timeline and portable export.
+    pub fn transcript_recovery_gaps(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<canonical_log::TranscriptGap>, canonical_log::TranscriptCommitError> {
+        let path = self
+            .resolve_transcript_events_path(session_id)
+            .map_err(|_| canonical_log::TranscriptCommitError::InvalidAddress)?;
+        canonical_log::transcript_gaps(&path)
+    }
+
+    pub(crate) fn capture_transcript(
+        &self,
+        session: &str,
+    ) -> Result<Option<canonical_log::CapturedTranscript>, String> {
+        canonical_log::capture_committed(&self.resolve_transcript_events_path(session)?, session)
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn load_transcript_event_stream(
         &self,
         session_id: &str,
@@ -1170,11 +1234,22 @@ impl FileMemoryRepository {
             "Legacy transcript JSONL",
             self.transcript_path(session_id)?,
         );
+        let transcript_events = self.transcript_events_path(session_id)?;
+        for path in canonical_log::transcript_recovery_artifacts(&transcript_events)
+            .map_err(|error| format!("transcript recovery inventory: {:?}", error.kind()))?
+        {
+            push_unique_file_artifact(
+                &mut artifacts,
+                SessionArtifactKind::TranscriptEvents,
+                "Transcript recovery artifact",
+                path,
+            );
+        }
         push_unique_file_artifact(
             &mut artifacts,
             SessionArtifactKind::TranscriptEvents,
             "Transcript revision event log",
-            self.transcript_events_path(session_id)?,
+            transcript_events,
         );
         push_unique_file_artifact(
             &mut artifacts,
@@ -1414,16 +1489,41 @@ impl LocalMemoryRepository for FileMemoryRepository {
         }
     }
 
+    fn delete_session_artifacts(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionArtifactDeleteReport, String> {
+        let _locks =
+            lock_transcript_for_removal(&self.resolve_transcript_events_path(session_id)?)?;
+        Ok(remove_repository_files(
+            session_id,
+            self.session_artifact_paths(session_id)?,
+        ))
+    }
+
+    fn transcript_commit_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, canonical_log::TranscriptCommitError> {
+        let path = self
+            .resolve_transcript_events_path(session_id)
+            .map_err(|_| canonical_log::TranscriptCommitError::InvalidAddress)?;
+        Ok(path)
+    }
     fn append_transcript_event(
         &self,
         session_id: &str,
         event: &TranscriptEvent,
     ) -> Result<(), String> {
-        append_jsonl(
+        canonical_log::commit_transcript(
+            &self
+                .transcript_commit_path(session_id)
+                .map_err(|error| format!("{error:?}"))?,
+            session_id,
             event,
-            &self.transcript_events_path(session_id)?,
-            "transcript event",
         )
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
     }
 
     fn load_transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>, String> {
@@ -1818,11 +1918,36 @@ pub enum TranscriptWriteMsg {
 // Channel message enum: boxing the large `Append` variant would ripple
 // through every send and match site for negligible benefit.
 #[allow(clippy::large_enum_variant)]
-pub enum TranscriptEventWriteMsg {
-    /// Append an immutable transcript span revision as a JSON line.
-    Append(TranscriptEvent),
+pub(crate) enum TranscriptEventWriteMsg {
+    #[cfg(test)]
+    PauseAfterFault(
+        fn(),
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ),
+    #[cfg(test)]
+    GroupCounts(mpsc::Sender<Result<(usize, usize), canonical_log::TranscriptCommitError>>),
+    Live(TranscriptEvent, Arc<Mutex<TranscriptLedger>>, LiveReply),
+    /// Append a framed revision and return its durability receipt.
+    Append(
+        TranscriptEvent,
+        Option<u64>,
+        mpsc::Sender<
+            Result<canonical_log::TranscriptReceipt, canonical_log::TranscriptCommitError>,
+        >,
+    ),
     /// Flush the writer and shut down.
     Shutdown,
+}
+
+impl TranscriptEventWriteMsg {
+    fn suppress_unqueued_publication(&mut self) {
+        // A refused send is reported by its caller. No late receipt is owed.
+        if let Self::Live(_, _, reply) = self {
+            reply.suppress_unqueued_publication();
+        }
+    }
 }
 
 /// Messages sent to the projection event writer thread.
@@ -1930,24 +2055,6 @@ fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, 
     }
 }
 
-fn write_transcript_event(
-    writer: &mut BufWriter<fs::File>,
-    event: &TranscriptEvent,
-    file_path: &Path,
-) {
-    match serde_json::to_string(event) {
-        Ok(json) => {
-            let bytes_lost = json.len() as u64 + 1;
-            if let Err(e) = writeln!(writer, "{}", json) {
-                io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
-            }
-        }
-        Err(e) => {
-            log::warn!("Transcript event writer: serialize error: {}", e);
-        }
-    }
-}
-
 fn write_projection_event(
     writer: &mut BufWriter<fs::File>,
     patch: &ProjectionPatch,
@@ -1984,21 +2091,6 @@ fn drain_remaining(
     }
 }
 
-fn drain_remaining_events(
-    rx: &mpsc::Receiver<TranscriptEventWriteMsg>,
-    writer: &mut BufWriter<fs::File>,
-    file_path: &Path,
-) {
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            TranscriptEventWriteMsg::Append(event) => {
-                write_transcript_event(writer, &event, file_path);
-            }
-            TranscriptEventWriteMsg::Shutdown => break,
-        }
-    }
-}
-
 fn drain_remaining_projection_events(
     rx: &mpsc::Receiver<ProjectionEventWriteMsg>,
     writer: &mut BufWriter<fs::File>,
@@ -2010,23 +2102,6 @@ fn drain_remaining_projection_events(
                 write_projection_event(writer, &patch, file_path);
             }
             ProjectionEventWriteMsg::Shutdown => break,
-        }
-    }
-}
-
-fn drain_remaining_repository_transcript_events(
-    rx: &mpsc::Receiver<TranscriptEventWriteMsg>,
-    session_id: &str,
-    repository: &dyn LocalMemoryRepository,
-) {
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            TranscriptEventWriteMsg::Append(event) => {
-                if let Err(e) = repository.append_transcript_event(session_id, &event) {
-                    log::warn!("Transcript event repository writer: failed to append event: {e}");
-                }
-            }
-            TranscriptEventWriteMsg::Shutdown => break,
         }
     }
 }
@@ -2273,12 +2348,236 @@ impl TranscriptWriter {
     }
 }
 
+pub(crate) type LiveTranscriptResult =
+    Result<(bool, canonical_log::TranscriptReceipt), canonical_log::TranscriptCommitError>;
+
+pub(crate) const MAX_TRANSCRIPT_GROUP: usize = 16;
+const TRANSCRIPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_ACK_BOUND: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(TRANSCRIPT_ACK_TIMEOUT) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestLiveAckBound(std::time::Duration);
+
+#[cfg(test)]
+impl TestLiveAckBound {
+    pub(crate) fn set(bound: std::time::Duration) -> Self {
+        Self(LIVE_ACK_BOUND.replace(bound))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLiveAckBound {
+    fn drop(&mut self) {
+        LIVE_ACK_BOUND.set(self.0);
+    }
+}
+
+pub(crate) struct PendingTranscriptReceipt<T> {
+    reply: mpsc::Receiver<Result<T, canonical_log::TranscriptCommitError>>,
+    deadline: std::time::Instant,
+}
+
+impl<T> PendingTranscriptReceipt<T> {
+    pub(crate) fn wait(self) -> Result<T, canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        self.reply
+            .recv_timeout(
+                self.deadline
+                    .saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Error::AckTimeout,
+                mpsc::RecvTimeoutError::Disconnected => Error::ReplyLost,
+            })?
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TranscriptCommitClient {
+    tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
+    dropped_event_count: Arc<AtomicU64>,
+    queue_full_active: Arc<AtomicBool>,
+}
+
+impl TranscriptCommitClient {
+    #[cfg(test)]
+    pub(crate) fn append_live(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+    ) -> LiveTranscriptResult {
+        self.submit_live(event, ledger)?.wait()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_live(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        self.submit_live_observed(event, ledger, TRANSCRIPT_ACK_TIMEOUT, None)
+    }
+
+    pub(crate) fn submit_live_with_publication(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        publication: live_receipt::LatePublication,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        #[cfg(not(test))]
+        let timeout = TRANSCRIPT_ACK_TIMEOUT;
+        #[cfg(test)]
+        let timeout = LIVE_ACK_BOUND.get();
+        self.submit_live_observed(event, ledger, timeout, Some(publication))
+    }
+
+    pub(crate) fn submit_live_observed(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        timeout: std::time::Duration,
+        publication: Option<live_receipt::LatePublication>,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        let (reply, ticket) = live_receipt::channel(timeout, publication);
+        self.send(TranscriptEventWriteMsg::Live(event.clone(), ledger, reply))?;
+        Ok(ticket)
+    }
+
+    fn request<T>(
+        &self,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<T, canonical_log::TranscriptCommitError> {
+        self.request_with_timeout(TRANSCRIPT_ACK_TIMEOUT, message)
+    }
+
+    fn request_with_timeout<T>(
+        &self,
+        timeout: std::time::Duration,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<T, canonical_log::TranscriptCommitError> {
+        self.enqueue(timeout, message)?.wait()
+    }
+
+    fn enqueue<T>(
+        &self,
+        timeout: std::time::Duration,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<PendingTranscriptReceipt<T>, canonical_log::TranscriptCommitError> {
+        let (reply, ack) = mpsc::channel();
+        self.send(message(reply))?;
+        Ok(PendingTranscriptReceipt {
+            reply: ack,
+            deadline: std::time::Instant::now() + timeout,
+        })
+    }
+
+    fn send(
+        &self,
+        message: TranscriptEventWriteMsg,
+    ) -> Result<(), canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        match self.tx.try_send(message) {
+            Ok(()) => {
+                note_event_writer_enqueue_success(
+                    "transcript_event",
+                    EVENT_WRITER_QUEUE_CAPACITY,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(mut message)) => {
+                message.suppress_unqueued_publication();
+                note_event_writer_queue_full(
+                    "transcript_event",
+                    EVENT_WRITER_QUEUE_CAPACITY,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                Err(Error::QueueFull)
+            }
+            Err(mpsc::TrySendError::Disconnected(mut message)) => {
+                message.suppress_unqueued_publication();
+                Err(Error::WriterAbsent)
+            }
+        }
+    }
+}
+
+// The worker owns commit ordering, including publication after a caller timed out.
+// Never hold a live-state guard across the filesystem transaction.
+fn commit_to_live_ledger(
+    index: &mut crate::projections::TranscriptLiveIndex,
+    storage: &canonical_log::PreparedTranscriptStorage,
+    path: &Path,
+    session: &str,
+    event: TranscriptEvent,
+    live: &Mutex<TranscriptLedger>,
+) -> LiveTranscriptResult {
+    use canonical_log::TranscriptCommitError as Error;
+    let before = {
+        let ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.session_id != session {
+            return Err(Error::LiveHeadChanged);
+        }
+        ledger.accepted_event_count
+    };
+    let receipt = match storage.commit_after(&event, Some(before)) {
+        Err(Error::LiveHeadChanged) => {
+            // An earlier frame can already be visible after an uncertain
+            // descriptor retirement. Reconcile from the verified published log.
+            let snapshot = canonical_log::read_committed::<TranscriptEvent>(path, session)
+                .map_err(|_| Error::InvalidHistory)?;
+            let recovered =
+                TranscriptLedger::replay(session, snapshot.records.into_iter().map(|r| r.payload))
+                    .map_err(|_| Error::InvalidHistory)?;
+            let count = recovered.accepted_event_count;
+            if count <= before {
+                return Err(Error::LiveHeadChanged);
+            }
+            {
+                let mut ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+                if ledger.session_id != session || ledger.accepted_event_count != before {
+                    return Err(Error::LiveHeadChanged);
+                }
+                *ledger = recovered;
+            }
+            storage.commit_after(&event, Some(count))?
+        }
+        other => other?,
+    };
+    let mut ledger = live.lock().unwrap_or_else(|e| e.into_inner());
+    if ledger.session_id != session {
+        return Err(Error::LiveHeadChanged);
+    }
+    if receipt.sequence <= ledger.accepted_event_count && receipt.already_accepted {
+        return Ok((false, receipt));
+    }
+    if ledger.accepted_event_count.checked_add(1) != Some(receipt.sequence) {
+        return Err(Error::LiveHeadChanged);
+    }
+    index
+        .apply(&mut ledger, event)
+        .map_err(|_| Error::InvalidRevision)?;
+    Ok((true, receipt))
+}
+
 /// Handle to the immutable transcript event-log writer thread.
 pub struct TranscriptEventWriter {
+    unqualified: bool,
     tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown_requested: Arc<AtomicBool>,
-    queue_capacity: usize,
     dropped_event_count: Arc<AtomicU64>,
     queue_full_active: Arc<AtomicBool>,
 }
@@ -2286,87 +2585,24 @@ pub struct TranscriptEventWriter {
 impl TranscriptEventWriter {
     /// Spawn a new transcript event writer thread for the given session.
     pub fn spawn(session_id: &str) -> Option<Self> {
-        let file_path = transcript_events_path(session_id)?;
-        if let Some(parent) = file_path.parent()
-            && let Err(e) = ensure_dir(parent)
-        {
-            log::warn!("Transcript event persistence disabled: {}", e);
-            return None;
-        }
-
-        let file = open_session_writer_file(&file_path, "Transcript event writer")?;
-        let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let shutdown_flag = shutdown_requested.clone();
-        let thread_path = file_path.clone();
-
-        let handle = std::thread::Builder::new()
-            .name("transcript-event-writer".to_string())
-            .spawn(move || {
-                let mut writer = BufWriter::new(file);
-
-                'outer: loop {
-                    match rx.recv_timeout(POLL_INTERVAL) {
-                        Ok(TranscriptEventWriteMsg::Append(event)) => {
-                            write_transcript_event(&mut writer, &event, &thread_path);
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_events(&rx, &mut writer, &thread_path);
-                                break 'outer;
-                            }
-                        }
-                        Ok(TranscriptEventWriteMsg::Shutdown) => break 'outer,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_events(&rx, &mut writer, &thread_path);
-                                break 'outer;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-                    }
-                }
-
-                let flush_start = std::time::Instant::now();
-                let flush_result = writer.flush();
-                let flush_elapsed = flush_start.elapsed();
-                if let Err(e) = flush_result {
-                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                    log::info!(
-                        "transcript_event_writer.final_flush file={:?} elapsed_ms={} outcome=error",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                } else {
-                    log::info!(
-                        "transcript_event_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                }
-                log::info!("Transcript event writer: shut down for {:?}", thread_path);
-            })
-            .ok()?;
-
-        Some(Self {
-            tx,
-            handle: Some(handle),
-            shutdown_requested,
-            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
-            dropped_event_count: Arc::new(AtomicU64::new(0)),
-            queue_full_active: Arc::new(AtomicBool::new(false)),
-        })
+        Self::repository(session_id, Arc::new(FileMemoryRepository::user_data()))
     }
 
     #[cfg(test)]
     pub(crate) fn saturated_for_tests(event: TranscriptEvent) -> Self {
         let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
-        tx.try_send(TranscriptEventWriteMsg::Append(event))
-            .expect("pre-fill transcript event queue");
+        tx.try_send(TranscriptEventWriteMsg::Append(
+            event,
+            None,
+            mpsc::channel().0,
+        ))
+        .expect("pre-fill transcript event queue");
         std::mem::forget(rx);
         Self {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
-            queue_capacity: 1,
             dropped_event_count: Arc::new(AtomicU64::new(0)),
             queue_full_active: Arc::new(AtomicBool::new(false)),
         }
@@ -2374,106 +2610,105 @@ impl TranscriptEventWriter {
 
     /// Build a repository-backed transcript event writer.
     ///
-    /// This keeps the runtime writer contract available for DB-backed adapters
-    /// without changing the default file-backed writer path.
+    /// The repository must expose a session-scoped canonical file. Capture
+    /// preflight probes its selected receipt tier before starting the worker.
     pub fn repository(
         session_id: impl Into<String>,
         repository: Arc<dyn LocalMemoryRepository>,
     ) -> Option<Self> {
         let session_id = session_id.into();
-        if let Err(e) = crate::sessions::validate_session_id(&session_id) {
-            log::warn!("Transcript event repository writer disabled: {e}");
-            return None;
-        }
-
-        let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let path = repository.transcript_commit_path(&session_id).ok()?;
+        let storage = canonical_log::PreparedTranscriptStorage::open(&path, &session_id).ok()?;
+        storage.ready().ok()?;
+        let unqualified = storage.is_unqualified();
+        let (tx, rx) = mpsc::sync_channel(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let shutdown_flag = shutdown_requested.clone();
-        let thread_session_id = session_id.clone();
-        let thread_repository = repository.clone();
-
+        let flag = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
-            .name("transcript-event-repository-writer".to_string())
-            .spawn(move || {
-                'outer: loop {
-                    match rx.recv_timeout(POLL_INTERVAL) {
-                        Ok(TranscriptEventWriteMsg::Append(event)) => {
-                            if let Err(e) =
-                                thread_repository.append_transcript_event(&thread_session_id, &event)
-                            {
-                                log::warn!(
-                                    "Transcript event repository writer: failed to append event: {e}"
-                                );
-                            }
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_repository_transcript_events(
-                                    &rx,
-                                    &thread_session_id,
-                                    thread_repository.as_ref(),
-                                );
-                                break 'outer;
-                            }
-                        }
-                        Ok(TranscriptEventWriteMsg::Shutdown) => break 'outer,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_repository_transcript_events(
-                                    &rx,
-                                    &thread_session_id,
-                                    thread_repository.as_ref(),
-                                );
-                                break 'outer;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-                    }
-                }
-                log::info!(
-                    "Transcript event repository writer: shut down for {}",
-                    thread_session_id
-                );
-            })
+            .name("transcript-commit".into())
+            .spawn(move || transcript_batch::run(rx, &storage, &path, &session_id, &flag))
             .ok()?;
-
         Some(Self {
+            unqualified,
             tx,
             handle: Some(handle),
             shutdown_requested,
-            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
             dropped_event_count: Arc::new(AtomicU64::new(0)),
             queue_full_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Enqueue a transcript event for writing. Non-blocking.
-    pub fn append(&self, event: &TranscriptEvent) -> bool {
-        match self
-            .tx
-            .try_send(TranscriptEventWriteMsg::Append(event.clone()))
-        {
-            Ok(()) => {
-                note_event_writer_enqueue_success(
-                    "transcript_event",
-                    self.queue_capacity,
-                    &self.dropped_event_count,
-                    &self.queue_full_active,
-                );
-                true
-            }
-            Err(mpsc::TrySendError::Full(_)) => {
-                note_event_writer_queue_full(
-                    "transcript_event",
-                    self.queue_capacity,
-                    &self.dropped_event_count,
-                    &self.queue_full_active,
-                );
-                false
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                note_event_writer_disconnected("transcript_event");
-                false
-            }
+    /// Queue admission is pending until the worker confirms the selected storage tier.
+    pub fn append(
+        &self,
+        event: &TranscriptEvent,
+    ) -> Result<canonical_log::TranscriptReceipt, canonical_log::TranscriptCommitError> {
+        self.append_after(event, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_counts(&self) -> (usize, usize) {
+        self.client()
+            .request(TranscriptEventWriteMsg::GroupCounts)
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_recovery_after_next_sync_failure(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_failed_sync)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_recovery_sync_failure(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_failed_recovery_sync)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_recovery_after_next_disk_full(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_disk_full)
+    }
+
+    #[cfg(test)]
+    fn pause_recovery_after_fault(
+        &self,
+        fault: fn(),
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (start, started) = mpsc::channel();
+        let (failed, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        self.tx
+            .send(TranscriptEventWriteMsg::PauseAfterFault(
+                fault, started, failed, resumed,
+            ))
+            .unwrap();
+        (start, observed, resume)
+    }
+
+    pub(crate) fn client(&self) -> TranscriptCommitClient {
+        TranscriptCommitClient {
+            tx: self.tx.clone(),
+            dropped_event_count: self.dropped_event_count.clone(),
+            queue_full_active: self.queue_full_active.clone(),
         }
+    }
+
+    pub(crate) fn is_unqualified(&self) -> bool {
+        self.unqualified
+    }
+
+    pub(crate) fn append_after(
+        &self,
+        event: &TranscriptEvent,
+        expected_head: Option<u64>,
+    ) -> Result<canonical_log::TranscriptReceipt, canonical_log::TranscriptCommitError> {
+        self.client()
+            .request(|reply| TranscriptEventWriteMsg::Append(event.clone(), expected_head, reply))
     }
 
     pub fn shutdown(&self) {
@@ -3311,7 +3546,7 @@ mod shutdown_tests {
         }
     }
 
-    fn transcript_event(span_id: &str, text: &str) -> TranscriptEvent {
+    pub(super) fn transcript_event(span_id: &str, text: &str) -> TranscriptEvent {
         TranscriptEvent {
             span_id: span_id.into(),
             provider: "test".into(),
@@ -3369,6 +3604,7 @@ mod shutdown_tests {
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -3422,45 +3658,22 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn drain_remaining_events_writes_pending_appends_then_stops() {
-        let path = unique_tempfile("drain-event-pending");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("open temp file");
-        let mut writer = BufWriter::new(file);
-
-        let (tx, rx) = mpsc::channel::<TranscriptEventWriteMsg>();
-        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
-            "a", "first",
-        )))
-        .unwrap();
-        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
-            "b", "second",
-        )))
-        .unwrap();
-        tx.send(TranscriptEventWriteMsg::Shutdown).unwrap();
-        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
-            "c",
-            "after-sentinel",
-        )))
-        .unwrap();
-
-        drain_remaining_events(&rx, &mut writer, &path);
-        writer.flush().unwrap();
-
-        let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("\"span_id\":\"a\""));
-        assert!(contents.contains("\"span_id\":\"b\""));
-        assert!(
-            !contents.contains("after-sentinel"),
-            "event drain must stop at Shutdown sentinel, got: {:?}",
-            contents
+    fn lost_transcript_reply_is_uncertain() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let writer = TranscriptEventWriter {
+            unqualified: false,
+            tx,
+            handle: None,
+            shutdown_requested: Arc::default(),
+            dropped_event_count: Arc::default(),
+            queue_full_active: Arc::default(),
+        };
+        let worker = std::thread::spawn(move || drop(rx.recv().unwrap()));
+        assert_eq!(
+            writer.append(&transcript_event("plain", "word")),
+            Err(canonical_log::TranscriptCommitError::ReplyLost)
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        worker.join().unwrap();
     }
 
     #[test]
@@ -3568,10 +3781,10 @@ mod shutdown_tests {
         let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
         let flag = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: flag.clone(),
-            queue_capacity: 1,
             dropped_event_count: Arc::new(AtomicU64::new(0)),
             queue_full_active: Arc::new(AtomicBool::new(false)),
         };
@@ -3609,16 +3822,26 @@ mod shutdown_tests {
         let dropped_event_count = Arc::new(AtomicU64::new(0));
         let queue_full_active = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
-            queue_capacity: 1,
             dropped_event_count: dropped_event_count.clone(),
             queue_full_active: queue_full_active.clone(),
         };
 
-        assert!(writer.append(&transcript_event("queued", "first")));
-        assert!(!writer.append(&transcript_event("dropped", "second")));
+        writer
+            .tx
+            .try_send(TranscriptEventWriteMsg::Append(
+                transcript_event("queued", "first"),
+                None,
+                mpsc::channel().0,
+            ))
+            .unwrap();
+        assert_eq!(
+            writer.append(&transcript_event("dropped", "second")),
+            Err(canonical_log::TranscriptCommitError::QueueFull)
+        );
         assert_eq!(dropped_event_count.load(Ordering::SeqCst), 1);
         assert!(queue_full_active.load(Ordering::SeqCst));
     }
@@ -3646,16 +3869,18 @@ mod shutdown_tests {
     #[test]
     fn event_shutdown_does_not_block_when_bounded_queue_is_full() {
         let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
-        tx.try_send(TranscriptEventWriteMsg::Append(transcript_event(
-            "queued", "first",
-        )))
+        tx.try_send(TranscriptEventWriteMsg::Append(
+            transcript_event("queued", "first"),
+            None,
+            mpsc::channel().0,
+        ))
         .expect("pre-fill bounded queue");
         let flag = Arc::new(AtomicBool::new(false));
         let writer = TranscriptEventWriter {
+            unqualified: false,
             tx,
             handle: None,
             shutdown_requested: flag.clone(),
-            queue_capacity: 1,
             dropped_event_count: Arc::new(AtomicU64::new(0)),
             queue_full_active: Arc::new(AtomicBool::new(false)),
         };
@@ -3802,6 +4027,7 @@ mod local_memory_repository_tests {
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(120),
@@ -3836,6 +4062,7 @@ mod local_memory_repository_tests {
                 prompt_id: "graph-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(140),
@@ -3866,6 +4093,7 @@ mod local_memory_repository_tests {
                 prompt_id: "repository-replay-parity".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(25)),
             generation_latency_ms: Some(50),
@@ -4084,10 +4312,22 @@ mod local_memory_repository_tests {
         let stale_session_id = format!("{session_id}-stale");
         let latest = transcript_event("span-stale", 2, "Latest transcript text.", 2_000);
         let stale = transcript_event("span-stale", 1, "Stale transcript text.", 3_000);
-        repo.append_transcript_event(&stale_session_id, &latest)
-            .expect("append latest stale-session revision");
-        repo.append_transcript_event(&stale_session_id, &stale)
-            .expect("append stale stale-session revision");
+        match repo.transcript_commit_path(&stale_session_id) {
+            Ok(path) => {
+                // Seed historical corruption directly. The file writer now
+                // rejects the stale second row before issuing a receipt.
+                for row in [&latest, &stale] {
+                    append_jsonl(row, &path, "legacy transcript").expect("seed stale history");
+                }
+            }
+            Err(canonical_log::TranscriptCommitError::UnsupportedRepository) => {
+                for row in [&latest, &stale] {
+                    repo.append_transcript_event(&stale_session_id, row)
+                        .expect("seed repository replay fixture");
+                }
+            }
+            Err(error) => panic!("resolve replay fixture: {error:?}"),
+        }
         let error = repo
             .replay_transcript_ledger(&stale_session_id)
             .expect_err("stale transcript replay must fail");
@@ -4236,6 +4476,7 @@ mod local_memory_repository_tests {
                     prompt_id: "projection-v1".into(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 }),
                 confidence: Some(0.91),
                 created_at_ms: 1_700_000_000_000,
@@ -4917,8 +5158,8 @@ mod local_memory_repository_tests {
         let writer =
             TranscriptEventWriter::repository(session_id, repository).expect("repository writer");
 
-        writer.append(&first);
-        writer.append(&second);
+        writer.append(&first).unwrap();
+        writer.append(&second).unwrap();
         assert!(
             writer.shutdown_with_timeout(std::time::Duration::from_secs(2)),
             "repository writer should drain and join"
@@ -6025,13 +6266,13 @@ mod local_memory_repository_tests {
     /// RAII guard that points `AUDIOGRAPH_DATA_DIR` at an isolated tempdir and
     /// restores the previous value on drop. Mutating process env requires the
     /// `crate::sessions::TEST_HOME_LOCK` to be held by the caller.
-    struct DataDirGuard {
+    pub(super) struct DataDirGuard {
         prev: Option<std::ffi::OsString>,
     }
 
     impl DataDirGuard {
         #[allow(unsafe_code)]
-        fn set(path: &Path) -> Self {
+        pub(super) fn set(path: &Path) -> Self {
             let prev = std::env::var_os(crate::user_data::DATA_DIR_ENV);
             // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
             unsafe {
@@ -6054,7 +6295,7 @@ mod local_memory_repository_tests {
         }
     }
 
-    fn legacy_segment(
+    pub(super) fn legacy_segment(
         id: &str,
         source_id: &str,
         text: &str,
@@ -6229,6 +6470,11 @@ mod local_memory_repository_tests {
             append_jsonl(row, &legacy_path, "legacy transcript segment").expect("write legacy row");
         }
 
+        let idle_writer = TranscriptEventWriter::spawn(session_id).expect("prepare idle writer");
+        assert!(matches!(
+            load_transcript_event_stream(session_id).expect("read idle transcript"),
+            canonical_reader::StrictCanonicalRead::Missing
+        ));
         let segments = load_transcript_segments_preferring_ledger(session_id)
             .expect("load legacy-only session");
 
@@ -6242,7 +6488,8 @@ mod local_memory_repository_tests {
         assert_eq!(segments[1].source_id, "mic-1");
         assert_eq!(segments[1].text, "second utterance");
 
-        // No event log should have been created by the read path.
+        assert!(idle_writer.shutdown_with_timeout(std::time::Duration::from_secs(60)));
+        // Preparing and stopping a writer without events preserves legacy authority.
         let events_path =
             crate::user_data::transcript_events_path(session_id).expect("events path");
         assert!(
@@ -6556,6 +6803,7 @@ mod autosave_shutdown_tests {
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
             model_id: Some("anthropic/claude-sonnet-4".to_string()),
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Remote),
         })
         .counts(MovementCounts {
             audio_ms: None,

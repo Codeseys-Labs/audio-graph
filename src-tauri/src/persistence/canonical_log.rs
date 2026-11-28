@@ -1845,6 +1845,182 @@ struct PendingAppend {
     base_ends_with_newline: bool,
 }
 
+mod transcript_commit;
+#[cfg(test)]
+pub(crate) use transcript_commit::tests::interrupted_historical_caption;
+pub(crate) mod transcript_export;
+pub(crate) use transcript_commit::CapturedTranscript;
+pub(crate) use transcript_commit::{
+    PreparedTranscriptStorage, commit_transcript, transcript_recovery_artifacts,
+};
+pub use transcript_commit::{
+    TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
+};
+pub(super) use transcript_commit::{capture_committed, read_committed};
+#[cfg(test)]
+pub(super) use transcript_commit::{
+    simulate_disk_full, simulate_failed_recovery_sync, simulate_failed_sync,
+};
+
+struct FrameBasis<'a> {
+    session_id: &'a str,
+    stream_id: &'a str,
+    domain_schema_version: u32,
+    head: Option<&'a CanonicalStreamHead>,
+    events: &'a HashMap<String, CachedEvent>,
+    byte_len: u64,
+    ends_with_newline: bool,
+    poisoned: Option<&'a PendingAppend>,
+}
+enum PlannedAppend {
+    New(PendingAppend),
+    Already(CanonicalAppendDurabilityReceipt),
+    Rejected(CanonicalAppendRejection),
+    Retry,
+}
+impl FrameBasis<'_> {
+    fn plan(&self, metadata: &CanonicalEventMetadata, payload: &impl Serialize) -> PlannedAppend {
+        let normalized = match normalize_event_metadata(metadata) {
+            Ok(metadata) => metadata,
+            Err(rejection) => return PlannedAppend::Rejected(rejection),
+        };
+        let payload = match serde_json::to_value(payload) {
+            Ok(payload) => canonicalize_json_value(payload),
+            Err(_) => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::PayloadSerialization);
+            }
+        };
+        let payload_hash = match payload_digest(&payload) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::PayloadSerialization);
+            }
+        };
+        let commitment_hash = match event_commitment_hash(
+            self.session_id,
+            self.stream_id,
+            self.domain_schema_version,
+            &normalized.event_id,
+            &normalized.causal_event_ids,
+            &normalized.basis_heads,
+            &payload_hash,
+        ) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::PayloadSerialization);
+            }
+        };
+
+        if let Some(poisoned) = self.poisoned {
+            if poisoned.event_id != normalized.event_id {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::AppenderPoisoned);
+            }
+            if poisoned.commitment_hash != commitment_hash {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::EventIdConflict);
+            }
+            return PlannedAppend::Retry;
+        }
+
+        if let Some(existing) = self.events.get(&normalized.event_id) {
+            if existing.commitment_hash != commitment_hash {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::EventIdConflict);
+            }
+            return PlannedAppend::Already(CanonicalAppendDurabilityReceipt {
+                sequence: existing.sequence,
+                record_hash: existing.record_hash.clone(),
+                payload_hash: existing.payload_hash.clone(),
+                appended_bytes: 0,
+                durability: CanonicalDurability::ValidatedExistingRecord,
+            });
+        }
+
+        let sequence = match self
+            .head
+            .as_ref()
+            .map_or(Some(1), |head| head.sequence.checked_add(1))
+        {
+            Some(sequence) => sequence,
+            None => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::SequenceExhausted);
+            }
+        };
+        let previous_hash = self
+            .head
+            .as_ref()
+            .map_or_else(|| ZERO_HASH.to_string(), |head| head.record_hash.clone());
+        let record_hash = match framed_record_hash(
+            self.session_id,
+            self.stream_id,
+            self.domain_schema_version,
+            sequence,
+            &normalized.event_id,
+            &normalized.causal_event_ids,
+            &normalized.basis_heads,
+            &previous_hash,
+            &payload_hash,
+        ) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::PayloadSerialization);
+            }
+        };
+        let wire = WireRecordV1 {
+            format_version: CANONICAL_LOG_FORMAT_VERSION,
+            session_id: self.session_id.to_owned(),
+            stream_id: self.stream_id.to_owned(),
+            domain_schema_version: self.domain_schema_version,
+            sequence,
+            event_id: normalized.event_id.clone(),
+            causal_event_ids: normalized.causal_event_ids,
+            basis_heads: normalized.basis_heads,
+            previous_hash,
+            payload_hash: payload_hash.clone(),
+            record_hash: record_hash.clone(),
+            payload,
+        };
+        let json = match serde_json::to_vec(&wire) {
+            Ok(json) if json.len() <= MAX_FRAME_JSON_BYTES => json,
+            _ => {
+                return PlannedAppend::Rejected(CanonicalAppendRejection::PayloadSerialization);
+            }
+        };
+        let mut frame = Vec::with_capacity(
+            usize::from(!self.ends_with_newline && self.byte_len > 0)
+                + FRAME_PREFIX_V1.len()
+                + FRAME_LENGTH_HEX_BYTES
+                + 1
+                + json.len()
+                + 1,
+        );
+        if !self.ends_with_newline && self.byte_len > 0 {
+            frame.push(b'\n');
+        }
+        frame.extend_from_slice(FRAME_PREFIX_V1);
+        frame.extend_from_slice(format!("{:016x}", json.len()).as_bytes());
+        frame.push(b' ');
+        frame.extend_from_slice(&json);
+        frame.push(b'\n');
+        if self.stream_id == "speaker_revisions"
+            && self.byte_len.saturating_add(frame.len() as u64)
+                > super::MAX_DIARIZATION_EVENTS_BYTES
+        {
+            return PlannedAppend::Rejected(CanonicalAppendRejection::ArtifactTooLarge);
+        }
+
+        PlannedAppend::New(PendingAppend {
+            event_id: wire.event_id,
+            sequence,
+            record_hash,
+            payload_hash,
+            commitment_hash,
+            frame,
+            base_byte_len: self.byte_len,
+            base_head: self.head.cloned(),
+            base_ends_with_newline: self.ends_with_newline,
+        })
+    }
+}
+
 /// A typed, long-lived, exclusively locked canonical stream appender.
 ///
 /// Opening performs one complete structural and `T` schema validation, builds
@@ -2036,158 +2212,23 @@ where
         metadata: &CanonicalEventMetadata,
         payload: &impl Serialize,
     ) -> CanonicalAppendOutcome {
-        let normalized = match normalize_event_metadata(metadata) {
-            Ok(metadata) => metadata,
-            Err(rejection) => return CanonicalAppendOutcome::Rejected(rejection),
-        };
-        let payload = match serde_json::to_value(payload) {
-            Ok(payload) => canonicalize_json_value(payload),
-            Err(_) => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::PayloadSerialization,
-                );
-            }
-        };
-        let payload_hash = match payload_digest(&payload) {
-            Ok(hash) => hash,
-            Err(_) => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::PayloadSerialization,
-                );
-            }
-        };
-        let commitment_hash = match event_commitment_hash(
-            &self.session_id,
-            &self.stream_id,
-            self.domain_schema_version,
-            &normalized.event_id,
-            &normalized.causal_event_ids,
-            &normalized.basis_heads,
-            &payload_hash,
-        ) {
-            Ok(hash) => hash,
-            Err(_) => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::PayloadSerialization,
-                );
-            }
-        };
-
-        if let Some(poisoned) = &self.poisoned {
-            if poisoned.event_id != normalized.event_id {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::AppenderPoisoned,
-                );
-            }
-            if poisoned.commitment_hash != commitment_hash {
-                return CanonicalAppendOutcome::Rejected(CanonicalAppendRejection::EventIdConflict);
-            }
-            return self.recover_poisoned();
-        }
-
-        if let Some(existing) = self.events.get(&normalized.event_id) {
-            if existing.commitment_hash != commitment_hash {
-                return CanonicalAppendOutcome::Rejected(CanonicalAppendRejection::EventIdConflict);
-            }
-            return CanonicalAppendOutcome::AlreadyAccepted(CanonicalAppendDurabilityReceipt {
-                sequence: existing.sequence,
-                record_hash: existing.record_hash.clone(),
-                payload_hash: existing.payload_hash.clone(),
-                appended_bytes: 0,
-                durability: CanonicalDurability::ValidatedExistingRecord,
-            });
-        }
-
-        let sequence = match self
-            .head
-            .as_ref()
-            .map_or(Some(1), |head| head.sequence.checked_add(1))
-        {
-            Some(sequence) => sequence,
-            None => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::SequenceExhausted,
-                );
-            }
-        };
-        let previous_hash = self
-            .head
-            .as_ref()
-            .map_or_else(|| ZERO_HASH.to_string(), |head| head.record_hash.clone());
-        let record_hash = match framed_record_hash(
-            &self.session_id,
-            &self.stream_id,
-            self.domain_schema_version,
-            sequence,
-            &normalized.event_id,
-            &normalized.causal_event_ids,
-            &normalized.basis_heads,
-            &previous_hash,
-            &payload_hash,
-        ) {
-            Ok(hash) => hash,
-            Err(_) => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::PayloadSerialization,
-                );
-            }
-        };
-        let wire = WireRecordV1 {
-            format_version: CANONICAL_LOG_FORMAT_VERSION,
-            session_id: self.session_id.clone(),
-            stream_id: self.stream_id.clone(),
+        match (FrameBasis {
+            session_id: &self.session_id,
+            stream_id: &self.stream_id,
             domain_schema_version: self.domain_schema_version,
-            sequence,
-            event_id: normalized.event_id.clone(),
-            causal_event_ids: normalized.causal_event_ids,
-            basis_heads: normalized.basis_heads,
-            previous_hash,
-            payload_hash: payload_hash.clone(),
-            record_hash: record_hash.clone(),
-            payload,
-        };
-        let json = match serde_json::to_vec(&wire) {
-            Ok(json) if json.len() <= MAX_FRAME_JSON_BYTES => json,
-            _ => {
-                return CanonicalAppendOutcome::Rejected(
-                    CanonicalAppendRejection::PayloadSerialization,
-                );
-            }
-        };
-        let mut frame = Vec::with_capacity(
-            usize::from(!self.ends_with_newline && self.byte_len > 0)
-                + FRAME_PREFIX_V1.len()
-                + FRAME_LENGTH_HEX_BYTES
-                + 1
-                + json.len()
-                + 1,
-        );
-        if !self.ends_with_newline && self.byte_len > 0 {
-            frame.push(b'\n');
-        }
-        frame.extend_from_slice(FRAME_PREFIX_V1);
-        frame.extend_from_slice(format!("{:016x}", json.len()).as_bytes());
-        frame.push(b' ');
-        frame.extend_from_slice(&json);
-        frame.push(b'\n');
-        if self.stream_id == "speaker_revisions"
-            && self.byte_len.saturating_add(frame.len() as u64)
-                > super::MAX_DIARIZATION_EVENTS_BYTES
-        {
-            return CanonicalAppendOutcome::Rejected(CanonicalAppendRejection::ArtifactTooLarge);
-        }
-
-        self.attempt_pending(PendingAppend {
-            event_id: wire.event_id,
-            sequence,
-            record_hash,
-            payload_hash,
-            commitment_hash,
-            frame,
-            base_byte_len: self.byte_len,
-            base_head: self.head.clone(),
-            base_ends_with_newline: self.ends_with_newline,
+            head: self.head.as_ref(),
+            events: &self.events,
+            byte_len: self.byte_len,
+            ends_with_newline: self.ends_with_newline,
+            poisoned: self.poisoned.as_ref(),
         })
+        .plan(metadata, payload)
+        {
+            PlannedAppend::New(frame) => self.attempt_pending(frame),
+            PlannedAppend::Already(receipt) => CanonicalAppendOutcome::AlreadyAccepted(receipt),
+            PlannedAppend::Rejected(error) => CanonicalAppendOutcome::Rejected(error),
+            PlannedAppend::Retry => self.recover_poisoned(),
+        }
     }
 
     fn attempt_pending(&mut self, pending: PendingAppend) -> CanonicalAppendOutcome {
@@ -2594,6 +2635,10 @@ fn cache_from_raw<T: DeserializeOwned>(
     raw: &RawSnapshot,
 ) -> Result<CachedStreamState, CanonicalLogError> {
     validate_payload_schema::<T>(&raw.records)?;
+    Ok(index_raw(raw))
+}
+
+fn index_raw(raw: &RawSnapshot) -> CachedStreamState {
     let mut events = HashMap::with_capacity(raw.records.len());
     for record in &raw.records {
         events.insert(
@@ -2611,12 +2656,12 @@ fn cache_from_raw<T: DeserializeOwned>(
         event_id: record.event_id.clone(),
         record_hash: record.record_hash.clone(),
     });
-    Ok(CachedStreamState {
+    CachedStreamState {
         head,
         events,
         byte_len: raw.byte_len,
         ends_with_newline: raw.ends_with_newline,
-    })
+    }
 }
 
 fn mixed_speaker_versions(stream_id: &str, version: u32) -> bool {
@@ -2976,6 +3021,9 @@ fn restore_float_values(
         }
         Value::Array(items) => {
             let children: Vec<&RawValue> = serde_json::from_str(raw.get()).map_err(|_| invalid)?;
+            if children.len() != items.len() {
+                return Err(invalid);
+            }
             for (item, child) in items.iter_mut().zip(children) {
                 restore_float_values(item, child)?;
             }

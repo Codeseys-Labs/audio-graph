@@ -5,7 +5,6 @@ import {
   render,
   screen,
   waitFor,
-  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
@@ -609,9 +608,12 @@ describe("SessionsBrowser component", () => {
 
     fireEvent.click(await screen.findByTestId("session-select-corrupt-replay"));
 
-    const notice = await screen.findByTestId("lens-fetch-error-notice");
+    // A Review lens fails closed: a localized notice with a retry, and the
+    // backend's message text is never stored or rendered.
+    const notice = await screen.findByTestId("review-lens-unavailable");
     expect(notice).toBeInTheDocument();
-    expect(notice).toHaveTextContent(/rejected 2 patch/i);
+    expect(notice).toHaveTextContent("This session could not be loaded.");
+    expect(notice).not.toHaveTextContent(/rejected 2 patch/i);
     expect(
       screen.queryByTestId("artifact-refusal-notice"),
     ).not.toBeInTheDocument();
@@ -620,7 +622,7 @@ describe("SessionsBrowser component", () => {
     // still works.
     fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
     expect(
-      screen.queryByTestId("lens-fetch-error-notice"),
+      screen.queryByTestId("review-lens-unavailable"),
     ).not.toBeInTheDocument();
   });
 
@@ -836,40 +838,6 @@ describe("SessionsBrowser component", () => {
           sourceId: "system-default",
         }),
       );
-    });
-
-    it("keeps Notes, Timeline and Graph gated with the stop-the-live-capture-to-use-this-view message, for those lenses only", async () => {
-      seed([makeSession({ id: "past-session", title: "Past Session" })]);
-      startLiveCapture();
-      render(<SessionsBrowser />);
-      fireEvent.click(await screen.findByTestId("session-select-past-session"));
-      await screen.findByText("historical transcript");
-
-      for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
-        fireEvent.click(screen.getByRole("tab", { name: lens }));
-        const panel = screen.getByRole("tabpanel");
-        expect(
-          within(panel).getByText(/stop the live capture to use this view/i),
-        ).toBeInTheDocument();
-      }
-      // The gated lenses did not fetch (their actions hydrate Live fields).
-      expect(invokedCommands()).not.toContain(
-        "load_session_notes_artifacts_cmd",
-      );
-      expect(invokedCommands()).not.toContain(
-        "load_session_graph_artifact_cmd",
-      );
-      expect(invokedCommands()).not.toContain("build_session_timeline_cmd");
-
-      // Transcript is not gated.
-      fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
-      const panel = screen.getByRole("tabpanel");
-      expect(
-        within(panel).queryByText(/stop the live capture/i),
-      ).not.toBeInTheDocument();
-      expect(
-        await within(panel).findByText("historical transcript"),
-      ).toBeVisible();
     });
 
     it("keeps the live session's own row (active) disabled, with the completed-only message", async () => {

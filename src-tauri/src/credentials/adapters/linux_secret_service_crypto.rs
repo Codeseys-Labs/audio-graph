@@ -1,7 +1,7 @@
-//! The Secret Service DH session algorithm. This module performs no I/O.
+//! The Secret Service DH session algorithm.
 
 use aes::Aes128;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use crypto_bigint::{U256, U1024, const_monty_params, modular::ConstMontyForm};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -29,6 +29,8 @@ type GroupElement = ConstMontyForm<OakleyGroupTwo, { U1024::LIMBS }>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CryptoError {
+    #[cfg(target_os = "linux")]
+    EntropyUnavailable,
     InvalidPrivateKey,
     InvalidPeerKey,
     Derivation,
@@ -40,6 +42,13 @@ pub(super) struct Exchange {
 }
 
 impl Exchange {
+    #[cfg(target_os = "linux")]
+    pub(super) fn generate() -> Result<Self, CryptoError> {
+        let mut bytes = Zeroizing::new([0; 32]);
+        fill_random(bytes.as_mut())?;
+        Self::new(&bytes)
+    }
+
     /// The caller supplies 256 uniform bits from the operating system CSPRNG.
     pub(super) fn new(bytes: &Zeroizing<[u8; 32]>) -> Result<Self, CryptoError> {
         let exponent = Zeroizing::new(U256::from_be_slice(bytes.as_ref()));
@@ -107,6 +116,29 @@ fn derive_key(
 pub(super) struct SessionKey(Zeroizing<[u8; AES_BYTES]>);
 
 impl SessionKey {
+    #[cfg(target_os = "linux")]
+    pub(super) fn encrypt(&self, data: &[u8]) -> Result<([u8; AES_BYTES], Vec<u8>), CryptoError> {
+        let mut iv = [0; AES_BYTES];
+        fill_random(&mut iv)?;
+        Ok((iv, self.encrypt_with_iv(&iv, data)?))
+    }
+
+    fn encrypt_with_iv(&self, iv: &[u8; AES_BYTES], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let size = data
+            .len()
+            .checked_add(AES_BYTES)
+            .ok_or(CryptoError::InvalidCiphertext)?;
+        let mut buf = Zeroizing::new(vec![0; size]);
+        buf[..data.len()].copy_from_slice(data);
+        let cipher = cbc::Encryptor::<Aes128>::new_from_slices(self.0.as_ref(), iv)
+            .map_err(|_| CryptoError::InvalidCiphertext)?;
+        let len = cipher
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, data.len())
+            .map_err(|_| CryptoError::InvalidCiphertext)?
+            .len();
+        Ok(buf[..len].to_vec())
+    }
+
     pub(super) fn decrypt(
         &self,
         iv: &[u8],
@@ -125,15 +157,14 @@ impl SessionKey {
 
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn encrypt_for_test(&self, iv: &[u8; AES_BYTES], data: &[u8]) -> Vec<u8> {
-        use cbc::cipher::BlockEncryptMut;
-        let mut buf = Zeroizing::new(vec![0; data.len() + AES_BYTES]);
-        buf[..data.len()].copy_from_slice(data);
-        cbc::Encryptor::<Aes128>::new_from_slices(self.0.as_ref(), iv)
-            .expect("fixed AES key and IV")
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, data.len())
-            .expect("one full padding block reserved")
-            .to_vec()
+        self.encrypt_with_iv(iv, data)
+            .expect("test fixture fits a padded buffer")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn fill_random(bytes: &mut [u8]) -> Result<(), CryptoError> {
+    getrandom::fill(bytes).map_err(|_| CryptoError::EntropyUnavailable)
 }
 
 #[cfg(test)]

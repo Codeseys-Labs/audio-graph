@@ -1678,6 +1678,7 @@ mod tests {
                     prompt_id: "projection-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 }),
                 confidence: Some(0.91),
                 created_at_ms: 1_700_000_000_000,

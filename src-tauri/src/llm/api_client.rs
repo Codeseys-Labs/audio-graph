@@ -12,7 +12,8 @@ use crate::graph::entities::ExtractionResult;
 use crate::llm::admission::{ClientSlot, SendRefused, leave_to_send};
 use crate::llm::http_diag::{HttpFailure, INFERENCE, SchemaRejection, same_origin_redirects};
 use crate::llm::route::{
-    RequestOutputForm, WireOutcome, sanitize_route_metadata, terminal_status_from_finish_reason,
+    RequestOutputForm, WireOutcome, route_for_api_endpoint, sanitize_model_id,
+    terminal_status_from_finish_reason,
 };
 
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -452,10 +453,13 @@ impl ApiClient {
         // The strongest grade this endpoint can be credited with, read from the
         // route table rather than assumed: only the direct-Cerebras row declares
         // `GuaranteedConstrained`.
-        let constrained_decoding_ceiling =
-            crate::llm::route::route_for_api_endpoint(&self.config.endpoint)
-                .capability
-                .constrained_decoding;
+        let route = route_for_api_endpoint(&self.config.endpoint);
+        let constrained_decoding_ceiling = route.capability.constrained_decoding;
+        // Where this client's model runs: whether its endpoint could be on
+        // the user's own machine or network. Not the egress classification,
+        // which calls a LAN server remote.
+        let ran_remotely =
+            !crate::llm::route::endpoint_may_be_on_users_network(&self.config.endpoint);
 
         let mut req = client.post(&url).json(&request);
 
@@ -491,13 +495,14 @@ impl ApiClient {
         // A missing `usage` block (or a provider that omits `total_tokens`)
         // reports 0 — never fabricated.
         let total_tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
-        // Sanitized through the same three guards the OpenRouter telemetry path
-        // uses, so a hostile upstream that echoes a key into `model` cannot
-        // smuggle it into persisted provenance.
+        // A local model's id is cut to its display name; either way the id is
+        // sanitized through the same three guards the OpenRouter telemetry
+        // path uses. Neither a local server's model path nor a key a hostile
+        // upstream echoes into `model` can reach persisted provenance.
         let served_model = completion
             .model
             .as_deref()
-            .and_then(sanitize_route_metadata);
+            .and_then(|served| sanitize_model_id(served, ran_remotely));
 
         let choice = completion
             .choices

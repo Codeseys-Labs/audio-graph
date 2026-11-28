@@ -13,122 +13,30 @@
  *      conversation ontology (ADR-0008): the graph's typed nodes
  *      (Question / Task / Decision / Topic / Person …) become readable chips.
  */
-// `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
-// relays a command-name-only failure diagnostic to analytics then rethrows, so
-// this call site's error handling is unchanged (audio-graph-3e71).
-
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { safeInvoke as invoke } from "../analytics/safeInvoke";
-import { useSessionView } from "../session/SessionViewProvider";
+import {
+  useReviewSessionId,
+  useSessionView,
+} from "../session/SessionViewProvider";
 import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
-import { deferredProviderForLlmStart, useAudioGraphStore } from "../store";
-import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
-import { errorToMessage } from "../utils/errorToMessage";
+import { useAudioGraphStore } from "../store";
+import type {
+  GraphNode,
+  GraphSnapshot,
+  MaterializedNote,
+  ProjectionPatch,
+} from "../types";
 import Button from "./Button";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
+import {
+  type NotesSynthesisController,
+  useNotesSynthesis,
+} from "./useNotesSynthesis";
 
 function byMention(a: GraphNode, b: GraphNode): number {
   return (b.mention_count ?? 0) - (a.mention_count ?? 0);
-}
-
-/**
- * A point-in-time fingerprint of the inputs to a synthesis run. We capture it
- * when synthesis succeeds, then compare against the live store to surface a
- * lightweight "may be out of date" hint when the graph or transcript grows.
- */
-interface SynthesisResult {
-  markdown: string;
-  at: number;
-  nodeCount: number;
-  segmentCount: number;
-}
-
-/**
- * Manual whole-session synthesis, extracted from NotesPanel's body (SHELL-R2,
- * plan §R2, ADR-0046) so its trigger can live somewhere other than NotesPanel's own
- * header without forking the state two renderers would otherwise disagree
- * about. In the Capture/During workspace NotesPanel calls this itself
- * (uncontrolled — see the `synthesis` prop below); in the Sessions detail's
- * Notes lens, the detail chrome that owns the "Generate prose summary"
- * overflow item calls it and hands the SAME controller instance to
- * `<NotesPanel synthesis={...} headerActions={false} />` so the result/error
- * NotesPanel renders is the run the overflow item actually triggered.
- */
-export interface NotesSynthesisController {
-  loading: boolean;
-  error: string | null;
-  result: SynthesisResult | null;
-  handleSynthesize: () => Promise<void>;
-  clearError: () => void;
-}
-
-export function useNotesSynthesis(): NotesSynthesisController {
-  const { t } = useTranslation();
-  const { transcriptSegments: segments } = useSessionView();
-  // The merged snapshot (materialized graph when the Graph lens has loaded
-  // one, live graph otherwise) — the same seam `KnowledgeGraphViewer` reads,
-  // so the "is this synthesis stale" node-count comparison below agrees with
-  // what the Notes lens's own entity chips (`NotesPanel`'s main body, below)
-  // are actually showing (fix-round finding: reading raw `graphSnapshot`
-  // here silently degraded to the live graph's `MAX_NODES`/`MAX_EDGES`-capped,
-  // retraction-unaware view for any historical session).
-  const { snapshot: graph } = useActiveGraphSnapshot();
-  const settings = useAudioGraphStore((s) => s.settings);
-  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
-
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SynthesisResult | null>(null);
-
-  const handleSynthesize = useCallback(async () => {
-    if (loading) return;
-    if (loadedSessionId) {
-      setError(t("notes.reviewSynthesisBlocked"));
-      return;
-    }
-    if (!settings) {
-      setError(t("errors.providerSettingsLoading"));
-      return;
-    }
-    const deferredProvider = deferredProviderForLlmStart(settings);
-    if (deferredProvider) {
-      setError(
-        errorToMessage({
-          code: "provider_deferred",
-          message: {
-            provider_id: deferredProvider.id,
-            display_name: deferredProvider.display_name,
-          },
-        }),
-      );
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const markdown = await invoke<string>("synthesize_notes");
-      setResult({
-        markdown,
-        at: Date.now(),
-        nodeCount: graph.nodes?.length ?? 0,
-        segmentCount: segments.length,
-      });
-    } catch (e) {
-      setError(errorToMessage(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [graph, loadedSessionId, loading, segments, settings, t]);
-
-  return {
-    loading,
-    error,
-    result,
-    handleSynthesize,
-    clearError: () => setError(null),
-  };
 }
 
 export interface NotesPanelProps {
@@ -150,10 +58,60 @@ export interface NotesPanelProps {
   headerActions?: boolean;
 }
 
+/** The graph a Review Notes pane derives chips from: none (see below). */
+const NO_GRAPH_IN_REVIEW: GraphSnapshot = {
+  nodes: [],
+  links: [],
+  stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+};
+
+/** Stand-in controller for a pane that offers no synthesis (Review). */
+const NO_SYNTHESIS: NotesSynthesisController = {
+  loading: false,
+  error: null,
+  result: null,
+  handleSynthesize: async () => {},
+  clearError: () => {},
+};
+
+/**
+ * The Notes lens. Synthesis (`synthesize_notes`) reads the backend's CURRENT
+ * buffers, so a Review pane never gets a controller: it does not call
+ * `useNotesSynthesis` at all, renders no trigger, result or error, and does
+ * not offer the sample preview (`loadSampleSessionPreview` replaces the LIVE
+ * session's content in the global store).
+ */
 export default function NotesPanel({
-  synthesis: externalSynthesis,
+  synthesis,
   headerActions = true,
 }: NotesPanelProps = {}) {
+  const reviewing = useReviewSessionId() !== null;
+  if (reviewing) {
+    return <NotesPanelView synthesis={null} headerActions={false} reviewing />;
+  }
+  if (synthesis) {
+    return (
+      <NotesPanelView synthesis={synthesis} headerActions={headerActions} />
+    );
+  }
+  return <OwnSynthesisNotesPanel headerActions={headerActions} />;
+}
+
+/** Uncontrolled: owns its own controller (Capture/During usage). */
+function OwnSynthesisNotesPanel({ headerActions }: { headerActions: boolean }) {
+  const synthesis = useNotesSynthesis();
+  return <NotesPanelView synthesis={synthesis} headerActions={headerActions} />;
+}
+
+function NotesPanelView({
+  synthesis,
+  headerActions,
+  reviewing = false,
+}: {
+  synthesis: NotesSynthesisController | null;
+  headerActions: boolean;
+  reviewing?: boolean;
+}) {
   const { t, i18n } = useTranslation();
   const {
     transcriptSegments: segments,
@@ -161,21 +119,30 @@ export default function NotesPanel({
     sessionProjectionEvents: projectionEvents,
   } = useSessionView();
   // Merged snapshot, not raw `graphSnapshot` — see the comment in
-  // `useNotesSynthesis` above. Entity chips (Questions/Tasks/Decisions/
+  // `useNotesSynthesis`. Entity chips (Questions/Tasks/Decisions/
   // Topics) and the Person-node participant fallback below must read the
   // same graph the Graph lens shows, once it's loaded one.
-  const { snapshot: graph } = useActiveGraphSnapshot();
-  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  const { snapshot: activeGraph, materialized } = useActiveGraphSnapshot();
+  // In Review the entity chips (and the Person-node participant fallback)
+  // would come from the saved snapshot's live-lane graph, which is not
+  // retraction-aware: it can still hold an item the materialized graph (what
+  // the Graph lens shows) retracted. The Notes round does not read the
+  // materialized graph, so a Review pane shows no graph-derived chips rather
+  // than possibly-retracted ones; notes and transcript-derived participants
+  // are unaffected.
+  const graph =
+    reviewing && materialized === null ? NO_GRAPH_IN_REVIEW : activeGraph;
+  // Synthesis reads the backend's current buffers, so it is blocked while a
+  // historical session is loaded into the global store. A Review pane shows
+  // its own session, offers no synthesis, and holds no subscription to it.
+  const loadedSessionId = useAudioGraphStore((s) =>
+    reviewing ? null : s.loadedSessionId,
+  );
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
   );
-
-  // Rules-of-hooks-safe: always call the internal controller (mirrors
-  // `useSessionView`'s own "unconditionally call, conditionally prefer"
-  // convention) and pick whichever the caller actually wants rendered.
-  const internalSynthesis = useNotesSynthesis();
   const { loading, error, result, handleSynthesize, clearError } =
-    externalSynthesis ?? internalSynthesis;
+    synthesis ?? NO_SYNTHESIS;
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Stale when the graph or transcript has grown since the captured snapshot.
@@ -262,7 +229,7 @@ export default function NotesPanel({
         <span className="ag-panel-head__title inline-flex items-center gap-(--space-2)">
           <Icon name="notes" size={16} /> {t("notes.title")}
         </span>
-        {headerActions && (
+        {headerActions && synthesis !== null && (
           <Button
             variant="secondary"
             size="sm"
@@ -347,22 +314,32 @@ export default function NotesPanel({
             </span>
             <div className="flex flex-col gap-(--space-2) max-w-[320px]">
               <p className="m-0 text-text-secondary text-md font-medium">
-                {t("notes.emptyTitle")}
+                {reviewing
+                  ? t("sessions.review.emptyNotes")
+                  : t("notes.emptyTitle")}
               </p>
-              <p className="m-0 text-text-muted text-sm leading-normal">
-                {t("notes.empty")}
-              </p>
+              {!reviewing && (
+                <p className="m-0 text-text-muted text-sm leading-normal">
+                  {t("notes.empty")}
+                </p>
+              )}
             </div>
-            <button
-              type="button"
-              className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
-              onClick={() =>
-                loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language)
-              }
-            >
-              <Icon name="start" size={16} />
-              {t("notes.emptyPreviewSample")}
-            </button>
+            {/* The sample preview replaces the LIVE session's content in the
+                global store, so a reviewed (historical) session never offers it. */}
+            {!reviewing && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
+                onClick={() =>
+                  loadSampleSessionPreview(
+                    i18n.resolvedLanguage ?? i18n.language,
+                  )
+                }
+              >
+                <Icon name="start" size={16} />
+                {t("notes.emptyPreviewSample")}
+              </button>
+            )}
           </div>
         ) : (
           <div className="flex flex-col gap-(--space-5)">

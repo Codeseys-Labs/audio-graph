@@ -194,19 +194,33 @@ This boundary is reversible until the first release is published: if a build
 that predates the precise reader turns out to have been distributed, it must
 be reconsidered first. Release qualification is tracked in #176.
 
-The following disposition of interrupted writes is decided here ahead of the
-durable-receipt writer that implements it (#139); it does not describe the
-reader-only change that carries this amendment. While a writer is alive it
-retains the exact attempted frame for retry. After restart, recovery verifies
-the preceding head. A complete matching frame crosses a fresh durability
-barrier and replays once. An interrupted attempt with only a torn suffix
-preserves those bytes as evidence outside replay. Recovery restores the
-verified prefix (including original absence), durably records a typed gap,
-and admits the next event at the sequence following that prefix. Presenting
-that gap in load, timeline and export is tracked on #139. Exact provider
-redelivery after process death cannot be required because the provider
-connection and source audio may both be gone. Conflicting history remains a
-typed refusal.
+Whenever a writer resolves an interrupted attempt, in-process or after
+restart, recovery verifies the descriptor's preceding head. It walks the
+members in order and keeps the longest contiguous prefix matching their
+recorded lengths and hashes. A singleton has one member. A caller error,
+timeout or supersession never revokes a complete matching frame; every
+resolution applies the same verification.
+
+Recovery rewrites the complete matching members and crosses a fresh storage
+barrier. Each receives its original sequence and a recovery receipt at the
+barrier tier actually reached. An unresolved barrier leaves the attempt
+pending. At the first incomplete or mismatched member, recovery preserves
+the remaining bytes outside replay and records a typed gap after the last
+kept member. Previously published quarantine stays authoritative on retry.
+An empty attempt restores the verified prefix, including original absence.
+The next event follows the verified sequence. A final refusal and a pending
+save confirmation have distinct user-visible statuses. A kept revision can
+appear late in its span's position. Exact provider redelivery after process
+death cannot be required because the provider connection and source audio
+may both be gone. Conflicting history remains a typed refusal.
+
+Startup resolves an earlier session's attempt before Review or export reads
+it. Recovered captions belong to that session's history. Only an outstanding
+publication owned by the same live capture can emit a caption or turn and
+schedule derived work. After a restart those publications are gone. Startup
+does not send historical content to a provider or generate speaker, extraction
+or graph updates from it. The canonical log supplies Review and export without
+a persisted publication queue.
 
 ## Consequences
 
@@ -337,3 +351,31 @@ cheapest vertical probes are in
 `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-48de-report.md`.
 This accepted record does not authorize code, Seed, provider, or workflow
 changes; those effects require separately authorized work.
+
+### V1 transcript recording on unqualified filesystems
+
+A writable session can record framed v1 revisions with the named
+`SyncedUnqualified` receipt. The backend flushes and synchronizes the event
+file before acknowledging it, and attempts parent-directory synchronization
+where the filesystem supports it. The UI keeps the crash-safety warning
+visible for this tier. Qualified local filesystems retain their existing
+first-create namespace barriers. Recording still requires a writable source,
+a usable lock, successful synchronization and admission at the v1 floor.
+A v2 floor continues to require the qualified transition protocol.
+
+### Receipt timing for v1 transcript revisions
+
+Each revision owns its own frame, sequence and payload commitment. An idle
+writer begins the next append immediately. Under load, the writer can collect
+up to 16 queued revisions for the same live ledger within an eight-millisecond
+window. The attempt descriptor identifies each member in order. One file
+synchronization covers the contiguous frames. The writer publishes receipts
+and advances the live ledger after the storage tier's barriers complete and
+the attempt descriptor is retired. Acknowledged loss remains zero within the
+qualified tier's guarantees. The unqualified tier retains its disk warning.
+
+On interruption, recovery starts at the descriptor's verified preceding head.
+It rewrites and synchronizes complete matching members, preserves an
+uncommitted suffix as evidence, and records its gap after the last verified
+member. Consumers can replay the recovered prefix exactly once. An expired
+caller wait cannot revoke a frame whose commit completes later.

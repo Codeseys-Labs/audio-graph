@@ -90,6 +90,11 @@ fn nist_sp800_38a_aes128_cbc_and_pkcs7() {
         "30c81c46a35ce411e5fbc1191a0a52ef",
         "f69f2445df4f9b17ad2b417be66c3710",
     ));
+    assert_eq!(
+        key.encrypt_with_iv(iv.as_slice().try_into().unwrap(), &expected)
+            .unwrap(),
+        ciphertext
+    );
     let decrypted = key
         .decrypt(&iv, ciphertext.clone())
         .expect("known padded ciphertext");
@@ -111,6 +116,19 @@ fn nist_sp800_38a_aes128_cbc_and_pkcs7() {
             Err(CryptoError::InvalidCiphertext)
         ));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn encryption_draws_a_fresh_iv_for_each_secret() {
+    let key = exchange(2).finish(&[4]).unwrap();
+    let secret = b"credential canary pear";
+    let (first_iv, first) = key.encrypt(secret).unwrap();
+    let (second_iv, second) = key.encrypt(secret).unwrap();
+    assert_ne!(first_iv, second_iv);
+    assert_ne!(first, second);
+    assert!(key.decrypt(&first_iv, first).unwrap().as_slice() == secret);
+    assert!(key.decrypt(&second_iv, second).unwrap().as_slice() == secret);
 }
 
 #[test]
