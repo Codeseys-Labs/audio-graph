@@ -15,6 +15,31 @@ pub(super) const fn http_context(operation: RuntimeOperation) -> RuntimeDiagnost
     RuntimeDiagnosticContext::new(operation).with_transport(RuntimeTransport::Http)
 }
 
+/// reqwest's own default bound on one redirect chain.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follow a redirect only within the origin the request was addressed to.
+///
+/// reqwest drops `Authorization` on a cross-origin hop, so a status from there
+/// says nothing about the credential this client sent, and a 307 or 308 would
+/// carry the prompt to a host the egress policy never authorized. Stopping
+/// hands the 3xx back to the caller, which reports a rejected request.
+pub(super) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|origin| origin.origin() == attempt.url().origin());
+        if !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 pub(super) const fn diagnostic(code: Code, context: RuntimeDiagnosticContext) -> RuntimeDiagnostic {
     let (retryable, action) = match code {
         Code::NetworkUnreachable => (true, Action::CheckNetwork),
@@ -143,6 +168,27 @@ pub(super) mod canary {
         for canary in canaries {
             assert!(!output.contains(canary), "leaked {canary}: {output}");
         }
+    }
+}
+
+/// Lets a test fail the next HTTP client builds on its thread, which reqwest
+/// gives no way to provoke.
+#[cfg(test)]
+pub(crate) mod client_build {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAILURES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn fail_next(count: u32) {
+        FAILURES.set(count);
+    }
+
+    pub(in crate::llm) fn take_failure() -> bool {
+        let pending = FAILURES.get();
+        FAILURES.set(pending.saturating_sub(1));
+        pending > 0
     }
 }
 

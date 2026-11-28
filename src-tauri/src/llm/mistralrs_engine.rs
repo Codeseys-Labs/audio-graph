@@ -24,6 +24,8 @@ use crate::llm::engine::{ChatMessage, engine_failure};
 #[cfg(feature = "llm-mistralrs")]
 use crate::llm::engine::{LlmChatParams, LlmStreamEvent};
 #[cfg(feature = "llm-mistralrs")]
+use crate::llm::stream_contract::FinishReason;
+#[cfg(feature = "llm-mistralrs")]
 use crate::projection_llm::ProjectionPatchDraft;
 #[cfg(feature = "llm-mistralrs")]
 use mistralrs::Response;
@@ -52,14 +54,16 @@ fn usage_total_to_u32(total_tokens: usize) -> u32 {
 ///
 /// mistral.rs 0.8 streams content as `Chunk` frames; the final chunk also sets
 /// `choices[0].finish_reason` and the request `usage`. `content` is the delta to
-/// forward (possibly empty); `terminal_usage` is `Some((prompt, completion,
-/// total))` exactly on the terminal chunk (the token counts already cast to
-/// `u32` via [`usage_total_to_u32`]), and `None` on intermediate chunks. Pure +
+/// forward (possibly empty); `finish_reason` is the chunk's reason, normalized,
+/// when it carries one; `terminal_usage` is `Some((prompt, completion, total))`
+/// exactly on the terminal chunk (the token counts already cast to `u32` via
+/// [`usage_total_to_u32`]), and `None` on intermediate chunks. Pure +
 /// model-free so the drain logic is unit-tested without a loaded GGUF.
 #[cfg(feature = "llm-mistralrs")]
 #[derive(Debug, PartialEq, Eq)]
 struct StreamChunkStep {
     content: String,
+    finish_reason: Option<FinishReason>,
     terminal_usage: Option<(u32, u32, u32)>,
 }
 
@@ -73,7 +77,10 @@ struct StreamChunkStep {
 fn interpret_stream_chunk(chunk: mistralrs::ChatCompletionChunkResponse) -> StreamChunkStep {
     let usage = chunk.usage;
     let choice = chunk.choices.into_iter().next();
-    let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
+    let finish_reason = choice
+        .as_ref()
+        .and_then(|c| c.finish_reason.as_deref())
+        .map(FinishReason::from_provider);
     let content = choice.and_then(|c| c.delta.content).unwrap_or_default();
 
     let terminal_usage = if finish_reason.is_some() || usage.is_some() {
@@ -90,6 +97,7 @@ fn interpret_stream_chunk(chunk: mistralrs::ChatCompletionChunkResponse) -> Stre
 
     StreamChunkStep {
         content,
+        finish_reason,
         terminal_usage,
     }
 }
@@ -134,14 +142,16 @@ fn mistralrs_response_to_event(resp: Response) -> LlmStreamEvent {
             let prompt_tokens = usage_total_to_u32(response.usage.prompt_tokens);
             let completion_tokens = usage_total_to_u32(response.usage.completion_tokens);
             let total_tokens = usage_total_to_u32(response.usage.total_tokens);
-            let full_text = response
-                .choices
-                .into_iter()
-                .next()
+            let choice = response.choices.into_iter().next();
+            let finish_reason = choice.as_ref().map_or(FinishReason::Stop, |choice| {
+                FinishReason::from_provider(&choice.finish_reason)
+            });
+            let full_text = choice
                 .and_then(|choice| choice.message.content)
                 .unwrap_or_default();
             LlmStreamEvent::Done {
                 full_text,
+                finish_reason,
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
@@ -219,11 +229,7 @@ impl MistralRsEngine {
             .block_on(GgufModelBuilder::new(model_dir, vec![model_filename.to_string()]).build())
             .map_err(|_| engine_not_loaded().to_string())?;
 
-        log::info!(
-            "mistral.rs model loaded from: {}/{}",
-            model_dir,
-            model_filename
-        );
+        log::info!("mistral.rs model loaded");
 
         Ok(Self {
             model,
@@ -501,6 +507,7 @@ Output JSON:"#,
                             Some(Response::Chunk(chunk)) => {
                                 let StreamChunkStep {
                                     content,
+                                    finish_reason,
                                     terminal_usage,
                                 } = interpret_stream_chunk(chunk);
                                 if !content.is_empty() {
@@ -522,6 +529,10 @@ Output JSON:"#,
                                     let _ = events
                                         .send(LlmStreamEvent::Done {
                                             full_text,
+                                            // Usage alone can end the stream; with
+                                            // no reason given that is a plain stop.
+                                            finish_reason: finish_reason
+                                                .unwrap_or(FinishReason::Stop),
                                             prompt_tokens,
                                             completion_tokens,
                                             total_tokens,
@@ -679,6 +690,7 @@ mod tests {
     mod stream_mapping {
         use super::super::{StreamChunkStep, interpret_stream_chunk, mistralrs_response_to_event};
         use crate::llm::engine::{LlmStreamEvent, engine_failure};
+        use crate::llm::stream_contract::FinishReason;
         use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
         use mistralrs::{
             ChatCompletionChunkResponse, ChatCompletionResponse, Choice, ChunkChoice, Delta,
@@ -780,6 +792,7 @@ mod tests {
                 mistralrs_response_to_event(resp),
                 LlmStreamEvent::Done {
                     full_text: "full answer".to_string(),
+                    finish_reason: FinishReason::Stop,
                     prompt_tokens: 11,
                     completion_tokens: 4,
                     total_tokens: 15,
@@ -844,6 +857,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: "Hel".to_string(),
+                    finish_reason: None,
                     terminal_usage: None,
                 }
             );
@@ -862,6 +876,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: "lo".to_string(),
+                    finish_reason: Some(FinishReason::Stop),
                     terminal_usage: Some((8, 5, 13)),
                 }
             );
@@ -876,6 +891,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
                     terminal_usage: Some((0, 0, 0)),
                 }
             );
@@ -887,6 +903,12 @@ mod tests {
             // treat usage presence alone as terminal.
             let step = interpret_stream_chunk(chunk_response(None, None, Some(usage(3, 2, 5))));
             assert_eq!(step.terminal_usage, Some((3, 2, 5)));
+        }
+
+        #[test]
+        fn a_truncated_reply_keeps_its_finish_reason() {
+            let step = interpret_stream_chunk(chunk_response(None, Some("length"), None));
+            assert_eq!(step.finish_reason, Some(FinishReason::Length));
         }
     }
 }

@@ -131,6 +131,9 @@ pub enum LlmPriority {
 #[derive(Clone)]
 pub struct LlmExecutor {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
+    /// False when the worker thread never started. Nothing would take a job,
+    /// so none is queued.
+    has_worker: bool,
 }
 
 struct QueueState {
@@ -245,15 +248,15 @@ impl LlmExecutor {
         };
 
         // The spawn error is OS prose; the failure itself is the whole signal.
-        if std::thread::Builder::new()
+        let has_worker = std::thread::Builder::new()
             .name("llm-executor".to_string())
             .spawn(move || worker_loop(worker_queue, handles))
-            .is_err()
-        {
+            .is_ok();
+        if !has_worker {
             log::error!("Failed to spawn LLM executor thread");
         }
 
-        Self { queue }
+        Self { queue, has_worker }
     }
 
     pub fn extract_entities(
@@ -322,7 +325,7 @@ impl LlmExecutor {
             Ok(LlmJobResult::ProjectionPatch(_)) => {
                 Err("LLM executor returned projection result for chat request".to_string())
             }
-            Err(e) => Err(format!("LLM executor chat response failed: {}", e)),
+            Err(_) => Err(no_worker_reply()),
         }
     }
 
@@ -375,14 +378,19 @@ impl LlmExecutor {
                 outcome: Err("LLM executor returned chat result for projection request".to_string()),
                 attempted_route: None,
             },
-            Err(e) => ProjectionPatchAttempt {
-                outcome: Err(format!("LLM executor projection response failed: {}", e)),
+            Err(_) => ProjectionPatchAttempt {
+                outcome: Err(no_worker_reply()),
                 attempted_route: None,
             },
         }
     }
 
     fn enqueue(&self, priority: LlmPriority, job: LlmJob) {
+        if !self.has_worker {
+            // Dropping the job drops its reply sender, so the caller's `recv`
+            // fails at once instead of waiting on a queue nobody drains.
+            return;
+        }
         let (lock, cvar) = &*self.queue;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         push_job(&mut state, priority, job);
@@ -620,6 +628,16 @@ fn no_blocking_route_error(route: &AuthorizedRoute) -> String {
 fn unusable_reply() -> String {
     diagnostic(
         Code::InvalidResponse,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .to_string()
+}
+
+/// Terminal for a job no worker answered: the worker thread never started, or
+/// it dropped the reply channel.
+fn no_worker_reply() -> String {
+    diagnostic(
+        Code::Internal,
         RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
     )
     .to_string()
@@ -1067,7 +1085,9 @@ fn projection_api(
         Some(form) => match client.chat_completion_with_wire_outcome(prompt_tuples(messages), form)
         {
             Ok(result) => result,
-            Err(error) if error.schema_rejection.is_some() => {
+            // A missing model (404) is not a refused schema; only OpenRouter
+            // reads a 404 as "no provider for this model takes the schema".
+            Err(error) if error.schema_rejection == Some(SchemaRejection::Request) => {
                 // A MODE downgrade on the SAME route, recorded rather than only
                 // logged: the returned `WireOutcome` carries `Unconstrained`.
                 log::warn!(
@@ -3144,7 +3164,7 @@ mod tests {
 
     #[test]
     fn executor_thread_logs_no_reply_content_when_draft_and_repair_both_fail() {
-        use crate::test_log_capture::{assert_process_logs_exclude, install, process_logs_contain};
+        use crate::test_log_capture::{assert_process_logs_exclude, install, process_records};
 
         install();
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -3176,6 +3196,7 @@ mod tests {
             LlmExecutor::new(llm_engine, api_client, openrouter_client, mistralrs_engine);
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
 
+        let logged_before = process_records().len();
         let attempt = executor.generate_projection_patch(
             job,
             ledger,
@@ -3199,9 +3220,49 @@ mod tests {
             "runtime/invalid_response"
         );
         // The worker thread is not this one, so its records are only in the
-        // process log. The fixed label shows the path logged at all.
-        assert!(process_logs_contain("Projection patch route output"));
+        // process log. Those logged since the job started must include the
+        // path's own line.
+        assert!(
+            process_records()[logged_before..]
+                .iter()
+                .any(|record| record.message.contains("Projection patch route output"))
+        );
         assert_process_logs_exclude(&["numbat-draft", "bilby-repair", "quokka-operation"]);
+    }
+
+    #[test]
+    fn an_executor_whose_worker_never_started_fails_at_once() {
+        let executor = LlmExecutor {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    interactive: VecDeque::new(),
+                    background: VecDeque::new(),
+                }),
+                Condvar::new(),
+            )),
+            has_worker: false,
+        };
+        // On its own thread: a regression would block here forever.
+        let (done, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let chat =
+                executor.chat_with_history(Vec::new(), String::new(), LlmProvider::LocalLlama);
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+            let patch = executor.generate_projection_patch(
+                job,
+                ledger,
+                None::<crate::projections::MaterializedNotes>,
+                LlmProvider::LocalLlama,
+                1,
+                100,
+            );
+            let _ = done.send((chat.map(|_| ()), patch.outcome.map(|_| ())));
+        });
+        let (chat, patch) = outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a job nobody will run must not wait for a reply");
+        assert_eq!(chat, Err("runtime/internal".to_string()));
+        assert_eq!(patch, Err("runtime/internal".to_string()));
     }
 
     #[test]

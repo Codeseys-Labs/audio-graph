@@ -55,6 +55,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::http_diag::diagnostic;
+use crate::llm::stream_contract::FinishReason;
 
 const NATIVE: RuntimeDiagnosticContext =
     RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference)
@@ -145,6 +146,7 @@ pub enum LlmStreamEvent {
     },
     Done {
         full_text: String,
+        finish_reason: FinishReason,
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
@@ -360,6 +362,7 @@ impl LlmEngine {
                                 let total_tokens = prompt_tokens.saturating_add(completion_tokens);
                                 let _ = events.blocking_send(LlmStreamEvent::Done {
                                     full_text,
+                                    finish_reason: FinishReason::Stop,
                                     prompt_tokens,
                                     completion_tokens,
                                     total_tokens,
@@ -416,7 +419,13 @@ impl LlmEngine {
 #[cfg(feature = "llm-llama")]
 fn global_backend() -> Result<&'static LlamaBackend, RuntimeDiagnostic> {
     use std::sync::LazyLock;
-    static BACKEND: LazyLock<Option<LlamaBackend>> = LazyLock::new(|| LlamaBackend::init().ok());
+    // llama.cpp logs to stderr by default, and a failed load prints the model
+    // path there before Rust sees the error. Discard its log before any load.
+    static BACKEND: LazyLock<Option<LlamaBackend>> = LazyLock::new(|| {
+        let mut backend = LlamaBackend::init().ok()?;
+        backend.void_logs();
+        Some(backend)
+    });
     BACKEND.as_ref().ok_or(engine_failure(Code::Internal))
 }
 
@@ -459,10 +468,7 @@ fn engine_loop(
         }
     };
 
-    log::info!(
-        "LLM model loaded from: {} (persistent-context actor)",
-        model_path
-    );
+    log::info!("LLM model loaded (persistent-context actor)");
     if ready.send(Ok(())).is_err() {
         return; // Caller gave up; nothing to serve.
     }
@@ -625,6 +631,7 @@ fn do_stream_chat(
         Ok(InferenceRun::Done(outcome)) => {
             let _ = events.blocking_send(LlmStreamEvent::Done {
                 full_text: outcome.text,
+                finish_reason: outcome.finish_reason,
                 prompt_tokens: outcome.prompt_tokens,
                 completion_tokens: outcome.completion_tokens,
                 total_tokens: outcome.total_tokens,
@@ -704,6 +711,7 @@ fn build_chat_generation(
 #[cfg(feature = "llm-llama")]
 struct InferenceOutcome {
     text: String,
+    finish_reason: FinishReason,
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
@@ -836,6 +844,8 @@ fn run_inference_inner(
     // the OpenAI-style `total_tokens` the streaming path reports.
     let mut completion_tokens: u32 = 0;
 
+    // Leaving the loop any way but the stop token means the budget ran out.
+    let mut finish_reason = FinishReason::Length;
     for i in 0..max_tokens as i32 {
         if cancel.is_some_and(|token| token.is_cancelled()) {
             return Ok(InferenceRun::Cancelled { full_text: output });
@@ -847,6 +857,7 @@ fn run_inference_inner(
         sampler.accept(new_token);
 
         if model.is_eog_token(new_token) {
+            finish_reason = FinishReason::Stop;
             break;
         }
 
@@ -876,6 +887,7 @@ fn run_inference_inner(
     let total_tokens = (prompt_len as u32).saturating_add(completion_tokens);
     Ok(InferenceRun::Done(InferenceOutcome {
         text: output,
+        finish_reason,
         prompt_tokens: prompt_len as u32,
         completion_tokens,
         total_tokens,
@@ -977,6 +989,17 @@ mod model_backed_tests {
             "identical extraction after an interleaved call must be unchanged \
              — proves the persistent context's KV cache is reset per call"
         );
+    }
+
+    /// Needs no model. llama.cpp's own log would print this path to stderr,
+    /// which no Rust-side capture can observe, so it is voided before any load.
+    #[test]
+    fn a_failed_load_returns_only_the_closed_token() {
+        let path = std::env::temp_dir().join("marmot-private-model.gguf");
+        let error = LlmEngine::new(&path.to_string_lossy())
+            .err()
+            .expect("there is no such model");
+        assert_eq!(error, "runtime/provider_unavailable");
     }
 }
 

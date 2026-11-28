@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::engine::{
     ChatMessage, LlmChatParams, LlmStreamEvent, engine_failure, engine_not_loaded,
 };
-use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic};
+use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic, same_origin_redirects};
 use crate::llm::openrouter::{
     DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
 };
@@ -158,6 +158,8 @@ fn build_api_request(
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let mut headers = Vec::with_capacity(2);
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    // A whitespace-only key is no key, as in the blocking client.
+    let api_key = api_key.trim();
     let credential_sent = !api_key.is_empty();
     if credential_sent {
         headers.push(("Authorization".to_string(), format!("Bearer {}", api_key)));
@@ -516,7 +518,7 @@ async fn run_local_llama_stream(
         max_tokens: request.params.max_tokens,
         temperature: request.params.temperature,
     };
-    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (event_tx, event_rx) = mpsc::channel(64);
     if let Err(diagnostic) = engine.stream_chat(
         request.history,
         request.graph_context,
@@ -532,58 +534,7 @@ async fn run_local_llama_stream(
         return;
     }
 
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            LlmStreamEvent::Delta { content } => {
-                if tx
-                    .send(TokenDelta::Delta {
-                        content,
-                        finish_reason: None,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            LlmStreamEvent::Done {
-                full_text,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            } => {
-                let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
-                send_terminal(
-                    &tx,
-                    StreamTerminalEvent::done(full_text, usage, FinishReason::Stop, metadata),
-                )
-                .await;
-                return;
-            }
-            LlmStreamEvent::Cancelled { full_text } => {
-                send_terminal(&tx, StreamTerminalEvent::cancelled(full_text, metadata)).await;
-                return;
-            }
-            LlmStreamEvent::Error {
-                diagnostic,
-                full_text,
-            } => {
-                send_terminal(
-                    &tx,
-                    StreamTerminalEvent::failure(diagnostic, full_text, metadata),
-                )
-                .await;
-                return;
-            }
-        }
-    }
-
-    // The engine dropped its sender without a terminal frame.
-    send_terminal(
-        &tx,
-        StreamTerminalEvent::failure(engine_failure(Code::Internal), String::new(), metadata),
-    )
-    .await;
+    drain_engine_stream_events(event_rx, &tx, metadata).await;
 }
 
 /// mistral.rs (Candle GGUF) streaming adapter.
@@ -673,22 +624,26 @@ async fn run_mistralrs_stream(
 
 /// Drain an engine-owned [`LlmStreamEvent`] channel into [`TokenDelta`] frames.
 ///
-/// Shared by the local-engine adapters (mistral.rs today; the llama path keeps
-/// its own inline copy for now). Each `Delta` forwards one content fragment;
-/// the first `Done` / `Cancelled` / `Error` emits exactly one terminal frame and
-/// returns. If the channel closes with no terminal frame (the engine dropped its
-/// sender mid-stream), a single terminal `internal` failure is emitted so the
-/// consumer never blocks waiting for a terminator that never arrives. Sending
-/// stops early (without a terminal) only if the consumer has already dropped
-/// its receiver — there is then no one to deliver to.
+/// Shared by both local-engine adapters. Each `Delta` forwards one content
+/// fragment; the first `Done` / `Cancelled` / `Error` emits exactly one terminal
+/// frame and returns. If the channel closes with no terminal frame (the engine
+/// dropped its sender mid-stream), a single terminal `internal` failure is
+/// emitted so the consumer never blocks waiting for a terminator that never
+/// arrives. Sending stops early (without a terminal) only if the consumer has
+/// already dropped its receiver — there is then no one to deliver to.
+///
+/// The consumer replaces what it showed with the terminal's text, so a failure
+/// that brings no text of its own carries the fragments already forwarded.
 async fn drain_engine_stream_events(
     mut event_rx: mpsc::Receiver<LlmStreamEvent>,
     tx: &mpsc::Sender<TokenDelta>,
     metadata: StreamContextMetadata,
 ) {
+    let mut forwarded = String::new();
     while let Some(event) = event_rx.recv().await {
         match event {
             LlmStreamEvent::Delta { content } => {
+                forwarded.push_str(&content);
                 if tx
                     .send(TokenDelta::Delta {
                         content,
@@ -702,6 +657,7 @@ async fn drain_engine_stream_events(
             }
             LlmStreamEvent::Done {
                 full_text,
+                finish_reason,
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
@@ -709,7 +665,7 @@ async fn drain_engine_stream_events(
                 let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
                 send_terminal(
                     tx,
-                    StreamTerminalEvent::done(full_text, usage, FinishReason::Stop, metadata),
+                    StreamTerminalEvent::done(full_text, usage, finish_reason, metadata),
                 )
                 .await;
                 return;
@@ -722,6 +678,11 @@ async fn drain_engine_stream_events(
                 diagnostic,
                 full_text,
             } => {
+                let full_text = if full_text.is_empty() {
+                    forwarded
+                } else {
+                    full_text
+                };
                 send_terminal(
                     tx,
                     StreamTerminalEvent::failure(diagnostic, full_text, metadata),
@@ -734,7 +695,7 @@ async fn drain_engine_stream_events(
 
     send_terminal(
         tx,
-        StreamTerminalEvent::failure(engine_failure(Code::Internal), String::new(), metadata),
+        StreamTerminalEvent::failure(engine_failure(Code::Internal), forwarded, metadata),
     )
     .await;
 }
@@ -760,6 +721,7 @@ async fn run_sse_stream(
 ) {
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(same_origin_redirects())
         .build()
     {
         Ok(c) => c,
@@ -823,7 +785,7 @@ async fn run_sse_stream(
         return;
     }
 
-    let mut decoder = SseDecoder::new();
+    let mut decoder = SseDecoder::new().with_credential_sent(request.credential_sent);
     let mut full_text = String::new();
     let mut usage: Option<StreamUsage> = None;
     let mut last_finish_reason: Option<FinishReason> = None;
@@ -1455,6 +1417,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_provider_reported_error_finish_is_a_failed_stream() {
+        let base = spawn_sse_mock(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+
+        // A `Done` would persist the answer as complete.
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { message, full_text },
+            ] if content == "partial" && message == "runtime/internal" && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_band_401_is_about_the_key_only_when_one_was_sent() {
+        for (api_key, expected) in [
+            ("sk-stream", "runtime/credential_rejected"),
+            ("   ", "runtime/request_rejected"),
+        ] {
+            let base = spawn_sse_mock("data: {\"error\":{\"code\":401}}\n\n").await;
+            let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+                LlmProvider::Api {
+                    endpoint: base,
+                    api_key: api_key.to_owned(),
+                    model: "test-model".to_owned(),
+                },
+                vec![],
+                String::new(),
+                StreamParams::default(),
+            ));
+            let terminal = rx.recv().await.expect("terminal frame");
+            assert!(
+                matches!(&terminal, TokenDelta::Error { message, .. } if message == expected),
+                "key {api_key:?}: {terminal:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_redirect_is_not_followed_with_the_prompt() {
+        let (elsewhere, connections, probe) = spawn_connection_probe().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                while !total.contains("\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}/chat/completions\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "sensitive question".to_owned(),
+            }],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let terminal = rx.recv().await.expect("terminal frame");
+        assert!(
+            matches!(&terminal, TokenDelta::Error { message, .. }
+                if message == "runtime/request_rejected"),
+            "{terminal:?}"
+        );
+        probe.await.expect("connection probe task should finish");
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn blocked_content_egress_prevents_cloud_stream_request_send() {
         for provider_name in ["llm.api", "llm.openrouter"] {
             let (base, connections, probe) = spawn_connection_probe().await;
@@ -1932,7 +1991,8 @@ mod tests {
     }
 
     /// Drain helper: a run of `Delta`s followed by one `Done` maps to a run of
-    /// `TokenDelta::Delta` then exactly one `TokenDelta::Done` with split usage.
+    /// `TokenDelta::Delta` then exactly one `TokenDelta::Done` carrying the
+    /// engine's finish reason and split usage.
     #[tokio::test]
     async fn drain_engine_stream_events_maps_deltas_then_single_done() {
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -1960,6 +2020,7 @@ mod tests {
         event_tx
             .send(LlmStreamEvent::Done {
                 full_text: "mistral".to_string(),
+                finish_reason: FinishReason::Length,
                 prompt_tokens: 9,
                 completion_tokens: 2,
                 total_tokens: 11,
@@ -1974,8 +2035,11 @@ mod tests {
             match frame {
                 TokenDelta::Delta { content, .. } => deltas.push(content),
                 TokenDelta::Done {
-                    full_text, usage, ..
+                    full_text,
+                    usage,
+                    finish_reason,
                 } => {
+                    assert_eq!(finish_reason, "length");
                     done = Some((full_text, usage));
                     break;
                 }
@@ -2075,30 +2139,56 @@ mod tests {
     }
 
     /// Drain helper: a channel that closes with no terminal event surfaces a
-    /// single defensive `Error` so the consumer never blocks forever.
+    /// single defensive `Error` so the consumer never blocks forever. That
+    /// failure, like one the engine reports without text, keeps the fragments
+    /// already forwarded: the consumer replaces what it showed with them.
     #[tokio::test]
-    async fn drain_engine_stream_events_no_terminal_yields_defensive_error() {
-        let (event_tx, event_rx) = mpsc::channel(8);
-        let (tx, mut rx) = mpsc::channel(8);
-        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
-            model_id: "m".to_string(),
-        });
-        let drain = tokio::spawn(async move {
-            drain_engine_stream_events(event_rx, &tx, metadata).await;
-        });
+    async fn drain_engine_stream_events_keeps_forwarded_text_on_a_textless_failure() {
+        for (forwarded, engine_reports_failure) in [("", false), ("kept", false), ("kept", true)] {
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let (tx, mut rx) = mpsc::channel(8);
+            let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+                model_id: "m".to_string(),
+            });
+            let drain = tokio::spawn(async move {
+                drain_engine_stream_events(event_rx, &tx, metadata).await;
+            });
 
-        // Close the channel immediately with no terminal frame.
-        drop(event_tx);
-
-        match rx.recv().await.expect("defensive error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "runtime/internal");
-                assert!(full_text.is_empty());
+            if !forwarded.is_empty() {
+                event_tx
+                    .send(LlmStreamEvent::Delta {
+                        content: forwarded.to_string(),
+                    })
+                    .await
+                    .unwrap();
             }
-            other => panic!("expected defensive Error terminal, got {other:?}"),
+            if engine_reports_failure {
+                event_tx
+                    .send(LlmStreamEvent::Error {
+                        diagnostic: engine_failure(Code::Internal),
+                        full_text: String::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(event_tx);
+
+            let mut frames = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                frames.push(frame);
+            }
+            drain.await.unwrap();
+            assert!(
+                matches!(frames.last(), Some(TokenDelta::Error { message, full_text })
+                    if message == "runtime/internal" && full_text == forwarded),
+                "forwarded {forwarded:?}, engine reported {engine_reports_failure}: {frames:?}"
+            );
+            assert_eq!(
+                frames.len(),
+                usize::from(!forwarded.is_empty()) + 1,
+                "exactly one terminal frame"
+            );
         }
-        drain.await.unwrap();
-        assert!(rx.recv().await.is_none(), "exactly one terminal frame");
     }
 
     #[test]

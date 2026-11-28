@@ -23,7 +23,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
-use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic, http_context};
+use crate::llm::http_diag::{
+    HttpFailure, INFERENCE, diagnostic, http_context, same_origin_redirects,
+};
 use crate::llm::route::{
     ConstrainedDecodingGrade, RequestOutputForm, TerminalStatus, WireOutcome,
     terminal_status_from_finish_reason,
@@ -96,12 +98,12 @@ impl std::fmt::Debug for OpenRouterConfig {
                 "api_key",
                 &crate::credentials::redacted_secret_presence(Some(&self.api_key)),
             )
-            .field("model", &self.model)
-            // Closed facts only: a custom base URL or attribution header can
-            // carry a host, path, or credential.
+            // Closed facts only: a custom base URL, attribution header, or
+            // routing list can carry a host, path, or free text.
+            .field("has_model", &!self.model.is_empty())
             .field("custom_base_url", &(self.base_url != DEFAULT_BASE_URL))
-            .field("provider_order", &self.provider_order)
-            .field("routing_policy", &self.routing_policy)
+            .field("has_provider_order", &self.provider_order.is_some())
+            .field("has_routing_policy", &self.routing_policy.is_some())
             .field("include_usage_in_stream", &self.include_usage_in_stream)
             .field(
                 "custom_attribution",
@@ -1265,6 +1267,7 @@ async fn get_catalog_response(
     let client = reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
+        .redirect(same_origin_redirects())
         .build()
         .map_err(|_| RuntimeDiagnostic::internal(context))?;
     let response = client
@@ -1382,8 +1385,11 @@ impl OpenRouterClient {
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .default_headers(headers)
+            .redirect(same_origin_redirects())
             .build()
             .ok();
+        #[cfg(test)]
+        let client = client.filter(|_| !crate::llm::http_diag::client_build::take_failure());
         if client.is_none() {
             log::warn!(
                 "OpenRouter HTTP client setup failed: {}",
@@ -1397,6 +1403,17 @@ impl OpenRouterClient {
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
                 "explicit_policy_required",
             ),
+        }
+    }
+
+    /// As [`Self::new`], but refuses a client that could never dispatch. A
+    /// cache must not keep one: the next build may succeed.
+    pub(crate) fn try_new(config: OpenRouterConfig) -> Result<Self, RuntimeDiagnostic> {
+        let client = Self::new(config);
+        if client.client.is_some() {
+            Ok(client)
+        } else {
+            Err(diagnostic(Code::Internal, INFERENCE))
         }
     }
 
@@ -2210,7 +2227,9 @@ mod tests {
 
         assert!(!debug.contains("sk-openrouter-debug-secret"));
         assert!(debug.contains("<present>"));
-        assert!(debug.contains("openai/gpt-5.2"));
+        assert!(debug.contains("has_model: true"));
+        assert!(debug.contains("has_provider_order: false"));
+        assert!(!debug.contains("openai/gpt-5.2"));
         assert!(debug.contains("custom_base_url: false"));
         assert!(debug.contains("custom_attribution: false"));
         assert!(!debug.contains(DEFAULT_BASE_URL) && !debug.contains(DEFAULT_HTTP_REFERER));
@@ -2218,13 +2237,16 @@ mod tests {
         let custom = OpenRouterConfig {
             base_url: "https://private-proxy-canary.example/v1".into(),
             http_referer: "https://private-referer-canary.example".into(),
+            provider_order: Some(vec!["private-order-canary".into()]),
             ..config
         };
         let debug = format!("{custom:?}");
         assert!(debug.contains("custom_base_url: true"));
         assert!(debug.contains("custom_attribution: true"));
+        assert!(debug.contains("has_provider_order: true"));
         assert!(!debug.contains("private-proxy-canary"));
         assert!(!debug.contains("private-referer-canary"));
+        assert!(!debug.contains("private-order-canary"));
     }
 
     fn test_config(provider_order: Option<Vec<String>>) -> OpenRouterConfig {
@@ -4346,6 +4368,60 @@ mod tests {
         );
         assert_absent(&observed, &lengths.each_ref().map(String::as_str));
         assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_redirect_is_followed_only_within_the_origin_that_was_asked() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let chat = |base: String| {
+            std::thread::spawn(move || {
+                OpenRouterClient::new(retry_test_config(base))
+                    .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+                    .chat_completion(vec![("user".into(), "hi".into())], false)
+            })
+            .join()
+            .unwrap()
+        };
+
+        // Another origin. reqwest would resend there without the key, and that
+        // server's 401 would then blame a key it never received.
+        let (elsewhere, elsewhere_requests) = rt.block_on(spawn_scripted_mock(vec![(
+            401,
+            "Unauthorized",
+            "",
+            String::new(),
+        )]));
+        let location: &'static str = format!("Location: {elsewhere}/chat/completions\r\n").leak();
+        let (base, _) = rt.block_on(spawn_scripted_mock(vec![(
+            307,
+            "Temporary Redirect",
+            location,
+            String::new(),
+        )]));
+        let err = chat(base).expect_err("a cross-origin redirect is not followed");
+        assert_eq!(err, "runtime/request_rejected");
+        assert_eq!(elsewhere_requests.load(SeqCst), 0);
+
+        // The same origin.
+        let (base, requests) = rt.block_on(spawn_scripted_mock(vec![
+            (
+                307,
+                "Temporary Redirect",
+                "Location: /moved/chat/completions\r\n",
+                String::new(),
+            ),
+            (
+                200,
+                "OK",
+                "",
+                serde_json::json!({ "choices": [{ "message": { "content": "kept" } }] })
+                    .to_string(),
+            ),
+        ]));
+        assert_eq!(chat(base).as_deref(), Ok("kept"));
+        assert_eq!(requests.load(SeqCst), 2);
     }
 
     #[test]

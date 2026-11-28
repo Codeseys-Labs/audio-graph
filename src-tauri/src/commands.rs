@@ -1524,7 +1524,9 @@ type ClientTarget<C> = Option<(
 trait CachedLlmClient: Sized {
     type Config: Clone + PartialEq;
     const NAME: &'static str;
-    fn build(config: Self::Config, policy: crate::asr::ProviderContentEgressPolicy) -> Self;
+    /// `None` when the client could not be built.
+    fn build(config: Self::Config, policy: crate::asr::ProviderContentEgressPolicy)
+    -> Option<Self>;
     fn is_current(
         &self,
         config: &Self::Config,
@@ -1536,8 +1538,9 @@ impl CachedLlmClient for ApiClient {
     type Config = ApiConfig;
     const NAME: &'static str = "LLM API client";
 
-    fn build(config: ApiConfig, policy: crate::asr::ProviderContentEgressPolicy) -> Self {
-        ApiClient::new(config).with_content_egress_policy(policy)
+    fn build(config: ApiConfig, policy: crate::asr::ProviderContentEgressPolicy) -> Option<Self> {
+        let client = ApiClient::try_new(config).ok()?;
+        Some(client.with_content_egress_policy(policy))
     }
 
     fn is_current(
@@ -1553,8 +1556,12 @@ impl CachedLlmClient for OpenRouterClient {
     type Config = OpenRouterConfig;
     const NAME: &'static str = "OpenRouter client";
 
-    fn build(config: OpenRouterConfig, policy: crate::asr::ProviderContentEgressPolicy) -> Self {
-        OpenRouterClient::new(config).with_content_egress_policy(policy)
+    fn build(
+        config: OpenRouterConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Option<Self> {
+        let client = OpenRouterClient::try_new(config).ok()?;
+        Some(client.with_content_egress_policy(policy))
     }
 
     fn is_current(
@@ -1573,7 +1580,7 @@ enum LlmClientSyncError {
     SettingsLock,
     /// A selected LLM config holds a NaN or infinite number.
     NonFiniteConfig,
-    /// Building a client panicked inside the redacted panic scope.
+    /// Building a client failed, or panicked inside the redacted panic scope.
     ClientBuild,
 }
 
@@ -1730,7 +1737,8 @@ enum Prepared<C> {
     /// No build: the slot already matched, or the target is empty.
     Unneeded,
     Built(C),
-    /// Construction panicked. The slot is cleared rather than left stale.
+    /// Construction failed or panicked. The slot is cleared rather than left
+    /// stale, so the next sync builds again.
     Failed,
 }
 
@@ -1741,10 +1749,14 @@ fn prepare_client<C: CachedLlmClient>(current: bool, target: &ClientTarget<C>) -
     let (config, policy) = (config.clone(), *policy);
     // The redacted scope keeps a constructor's panic payload out of crash
     // reports and stderr; catching the unwind keeps it out of every caller.
+    // A client reported as unbuildable is refused the same way: caching it
+    // would count as current and never be retried.
     crate::crash_handler::with_redacted_panic_scope(
         crate::crash_handler::RedactedPanicOp::LlmClientBuild,
         || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| C::build(config, policy))),
     )
+    .ok()
+    .flatten()
     .map_or(Prepared::Failed, Prepared::Built)
 }
 
@@ -22610,6 +22622,27 @@ mod tests {
         assert!(!state.api_client.is_poisoned());
         assert!(state.api_client.lock().unwrap().is_none());
         assert!(state.openrouter_client.lock().unwrap().take().is_some());
+    }
+
+    #[test]
+    fn llm_client_sync_does_not_cache_a_client_that_failed_to_build() {
+        let state = AppState::new();
+        *state.app_settings.write().unwrap() = openrouter_llm_settings();
+        let sync = || {
+            sync_llm_clients_from_settings_cache(
+                &state.app_settings,
+                &state.api_client,
+                &state.openrouter_client,
+            )
+        };
+
+        crate::llm::http_diag::client_build::fail_next(1);
+        assert_eq!(sync(), Err(LlmClientSyncError::ClientBuild));
+        assert!(state.openrouter_client.lock().unwrap().is_none());
+
+        // The same settings build again instead of counting as current.
+        assert_eq!(sync(), Ok(()));
+        assert!(state.openrouter_client.lock().unwrap().is_some());
     }
 
     fn cerebras_llm_settings(

@@ -7,7 +7,9 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeOperation,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -311,12 +313,19 @@ pub struct StreamTerminalEvent {
 }
 
 impl StreamTerminalEvent {
+    /// A completed turn. A turn the provider ended by reporting its own fault
+    /// is a failure whatever text came before it, classified like any other
+    /// fault that names no code.
     pub fn done(
         full_text: String,
         usage: Option<StreamUsage>,
         finish_reason: FinishReason,
         metadata: StreamContextMetadata,
     ) -> Self {
+        if finish_reason == FinishReason::Error {
+            let context = RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference);
+            return Self::failure(RuntimeDiagnostic::internal(context), full_text, metadata);
+        }
         Self {
             reason: StreamTerminalReason::Done { finish_reason },
             full_text,

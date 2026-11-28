@@ -68,25 +68,11 @@ pub enum BedrockStreamEvent {
     /// A `contentBlockDelta` carrying a chunk of generated text.
     TextDelta(String),
     /// `messageStop` with the raw Bedrock `stopReason` (e.g. `"end_turn"`,
-    /// `"max_tokens"`). Mapped to an OpenAI-style `finish_reason` via
-    /// [`map_stop_reason`].
+    /// `"max_tokens"`), normalized by [`FinishReason::from_provider`]. A reason
+    /// that vocabulary does not know stays `unknown`.
     MessageStop { stop_reason: String },
     /// `metadata` token-usage block.
     Usage(StreamUsage),
-}
-
-/// Map a Bedrock `stopReason` to the OpenAI-style `finish_reason` the rest of
-/// the streaming pipeline (and the frontend) already understands.
-///
-/// Bedrock reasons (`StopReason`): `end_turn`, `tool_use`, `max_tokens`,
-/// `stop_sequence`, `guardrail_intervened`, `content_filtered`. Anything else
-/// (including future SDK additions) falls back to `stop` so the stream still
-/// terminates cleanly.
-pub fn map_stop_reason(stop_reason: &str) -> FinishReason {
-    match FinishReason::from_provider(stop_reason) {
-        FinishReason::Unknown | FinishReason::Error => FinishReason::Stop,
-        known => known,
-    }
 }
 
 /// Build a [`StreamUsage`] from Bedrock metadata token counts.
@@ -177,7 +163,7 @@ async fn drive_bedrock_events<S>(
                     StreamTerminalEvent::done(
                         std::mem::take(&mut full_text),
                         usage.take(),
-                        map_stop_reason(&stop_reason),
+                        FinishReason::from_provider(&stop_reason),
                         metadata,
                     ),
                 )
@@ -736,8 +722,8 @@ mod tests {
         frames
     }
 
-    #[test]
-    fn stop_reason_maps_to_openai_finish_reason() {
+    #[tokio::test]
+    async fn stop_reason_maps_to_the_closed_finish_reason() {
         for (sdk, expected) in [
             ("end_turn", "stop"),
             ("stop_sequence", "stop"),
@@ -745,11 +731,20 @@ mod tests {
             ("tool_use", "tool_calls"),
             ("content_filtered", "content_filter"),
             ("guardrail_intervened", "content_filter"),
-            // Case-insensitive + unknown fallback.
             ("END_TURN", "stop"),
-            ("something_new_from_aws", "stop"),
+            // A reason this app does not know is reported as such, not as a
+            // clean stop.
+            ("something_new_from_aws", "unknown"),
         ] {
-            assert_eq!(map_stop_reason(sdk).as_str(), expected, "{sdk}");
+            let frames = drain(vec![Ok(BedrockStreamEvent::MessageStop {
+                stop_reason: sdk.to_string(),
+            })])
+            .await;
+            assert!(
+                matches!(frames.as_slice(), [TokenDelta::Done { finish_reason, .. }]
+                    if finish_reason == expected),
+                "{sdk}: {frames:?}"
+            );
         }
     }
 

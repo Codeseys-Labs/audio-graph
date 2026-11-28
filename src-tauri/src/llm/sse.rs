@@ -55,6 +55,7 @@ pub const DEFAULT_MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 pub struct SseDecoder {
     buf: Vec<u8>,
     max_frame_bytes: usize,
+    credential_sent: bool,
 }
 
 impl Default for SseDecoder {
@@ -92,7 +93,15 @@ impl SseDecoder {
         Self {
             buf: Vec::new(),
             max_frame_bytes: max_frame_bytes.max(1),
+            credential_sent: false,
         }
+    }
+
+    /// Record whether the request carried a provider credential. An in-band
+    /// 401 is about that credential only when one was sent.
+    pub fn with_credential_sent(mut self, credential_sent: bool) -> Self {
+        self.credential_sent = credential_sent;
+        self
     }
 
     /// Append a chunk of bytes received from the HTTP stream.
@@ -172,7 +181,9 @@ impl SseDecoder {
             // The payload may be a bare error object or an envelope; either
             // way only its structured fields are read.
             let code = serde_json::from_str::<serde_json::Value>(&data)
-                .map_or(Code::Internal, |frame| fault_code(&frame));
+                .map_or(Code::Internal, |frame| {
+                    fault_code(&frame, self.credential_sent)
+                });
             return Some(SseEvent::Error(diagnostic(code, INFERENCE)));
         }
 
@@ -193,7 +204,7 @@ impl SseDecoder {
         // as an error so it isn't deserialized into an empty `StreamChunk` and
         // dropped. A normal token chunk has no top-level `error` field, so this
         // never misclassifies real deltas.
-        if let Some(code) = fault_in_data(&data) {
+        if let Some(code) = fault_in_data(&data, self.credential_sent) {
             return Some(SseEvent::Error(diagnostic(code, INFERENCE)));
         }
 
@@ -203,19 +214,19 @@ impl SseDecoder {
 
 /// `Some` when a `data:` frame is a provider fault rather than a token chunk.
 /// A healthy chunk may carry `"error": null` or `"error": false`.
-fn fault_in_data(data: &str) -> Option<Code> {
+fn fault_in_data(data: &str, credential_sent: bool) -> Option<Code> {
     let frame: serde_json::Value = serde_json::from_str(data).ok()?;
     let has_error = frame
         .get("error")
         .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false));
     let is_error = frame.get("type").and_then(|kind| kind.as_str()) == Some("error");
-    (has_error || is_error).then(|| fault_code(&frame))
+    (has_error || is_error).then(|| fault_code(&frame, credential_sent))
 }
 
 /// Classify a provider fault from its structured code fields. The message is
 /// never read: a fault with no recognized code is `internal`, not a guess from
 /// prose and not an outage worth retrying.
-fn fault_code(frame: &serde_json::Value) -> Code {
+fn fault_code(frame: &serde_json::Value, credential_sent: bool) -> Code {
     let error = frame.get("error").filter(|error| error.is_object());
     [
         error.and_then(|error| error.get("code")),
@@ -227,20 +238,24 @@ fn fault_code(frame: &serde_json::Value) -> Code {
     ]
     .into_iter()
     .flatten()
-    .find_map(structured_code)
+    .find_map(|value| structured_code(value, credential_sent))
     .unwrap_or(Code::Internal)
 }
 
-/// An HTTP status (number or numeric string) or an allowlisted provider token.
-fn structured_code(value: &serde_json::Value) -> Option<Code> {
+/// An HTTP status (a JSON number or its three-digit decimal string) or an
+/// allowlisted provider token. Both match exactly: no case folding and no
+/// lenient number parsing.
+fn structured_code(value: &serde_json::Value, credential_sent: bool) -> Option<Code> {
     if let Some(status) = value.as_u64() {
-        return u16::try_from(status).ok().and_then(status_category);
+        return u16::try_from(status)
+            .ok()
+            .and_then(|status| status_category(status, credential_sent));
     }
     let token = value.as_str()?;
-    if let Ok(status) = token.parse() {
-        return status_category(status);
+    if token.len() == 3 && token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return status_category(token.parse().ok()?, credential_sent);
     }
-    Some(match token.to_ascii_lowercase().as_str() {
+    Some(match token {
         "rate_limit"
         | "rate_limited"
         | "rate_limit_error"
@@ -265,12 +280,11 @@ fn structured_code(value: &serde_json::Value) -> Option<Code> {
 }
 
 /// The contract's category for an HTTP failure status a provider reported in a
-/// structured field. Nothing here says a credential was sent, so a 401 is an
-/// ordinary rejection.
-fn status_category(status: u16) -> Option<Code> {
+/// structured field.
+fn status_category(status: u16, credential_sent: bool) -> Option<Code> {
     (400..=599)
         .contains(&status)
-        .then(|| RuntimeErrorDiagnostic::from_http_status(status, false, INFERENCE).code)
+        .then(|| RuntimeErrorDiagnostic::from_http_status(status, credential_sent, INFERENCE).code)
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Linear scan; for the
@@ -517,7 +531,31 @@ mod tests {
                 Code::Internal,
             ),
         ] {
-            assert_eq!(fault_in_data(frame), Some(code), "{frame}");
+            assert_eq!(fault_in_data(frame, false), Some(code), "{frame}");
+        }
+    }
+
+    #[test]
+    fn codes_match_exactly_and_a_401_follows_the_credential_that_was_sent() {
+        // Neither a shouted token nor a signed or padded number is a code.
+        for frame in [
+            r#"{"error":{"code":"RATE_LIMIT_EXCEEDED"}}"#,
+            r#"{"error":{"code":"+429"}}"#,
+            r#"{"error":{"code":" 429"}}"#,
+        ] {
+            assert_eq!(fault_in_data(frame, false), Some(Code::Internal), "{frame}");
+        }
+
+        for (credential_sent, code) in [
+            (true, Code::CredentialRejected),
+            (false, Code::RequestRejected),
+        ] {
+            let mut dec = SseDecoder::new().with_credential_sent(credential_sent);
+            dec.feed(b"data: {\"error\":{\"code\":401}}\n\n");
+            assert_eq!(
+                dec.next_event(),
+                Some(SseEvent::Error(diagnostic(code, INFERENCE)))
+            );
         }
     }
 
@@ -582,7 +620,10 @@ mod tests {
         // Sibling of 4a72: some gateways use `"error": false` as the "no error"
         // sentinel. It must also fall through to Data, not fabricate an error.
         assert_eq!(
-            fault_in_data(r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#),
+            fault_in_data(
+                r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#,
+                false
+            ),
             None
         );
     }

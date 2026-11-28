@@ -4,12 +4,12 @@
 //! LM Studio, vLLM, OpenRouter, Anthropic via proxy, etc.).
 //! Used as an alternative to the native llama-cpp-2 engine.
 
-use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
-use crate::llm::http_diag::{HttpFailure, INFERENCE};
+use crate::llm::http_diag::{HttpFailure, INFERENCE, SchemaRejection, same_origin_redirects};
 use crate::llm::route::{
     RequestOutputForm, WireOutcome, sanitize_route_metadata, terminal_status_from_finish_reason,
 };
@@ -45,7 +45,8 @@ impl std::fmt::Debug for ApiConfig {
                 "api_key",
                 &crate::credentials::redacted_secret_presence(self.api_key.as_deref()),
             )
-            .field("model", &self.model)
+            // A local server's model id can be a file path.
+            .field("has_model", &!self.model.is_empty())
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .finish()
@@ -246,8 +247,11 @@ impl ApiClient {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
+            .redirect(same_origin_redirects())
             .build()
             .ok();
+        #[cfg(test)]
+        let client = client.filter(|_| !crate::llm::http_diag::client_build::take_failure());
         if client.is_none() {
             log::warn!(
                 "API HTTP client setup failed: {}",
@@ -261,6 +265,17 @@ impl ApiClient {
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
                 "explicit_policy_required",
             ),
+        }
+    }
+
+    /// As [`Self::new`], but refuses a client that could never dispatch. A
+    /// cache must not keep one: the next build may succeed.
+    pub(crate) fn try_new(config: ApiConfig) -> Result<Self, RuntimeDiagnostic> {
+        let client = Self::new(config);
+        if client.client.is_some() {
+            Ok(client)
+        } else {
+            Err(HttpFailure::new(Code::Internal, INFERENCE).diagnostic)
         }
     }
 
@@ -514,10 +529,11 @@ impl ApiClient {
                 RequestOutputForm::VllmStructuredOutputs { schema },
             ) {
                 Ok((raw, _, _)) => raw,
-                // A mode downgrade answers a refused schema and nothing else.
+                // A mode downgrade answers a refused request and nothing else.
                 // Resending after any other failure would repeat a timeout's
-                // unknown remote effect or bury a rate limit under the retry.
-                Err(error) if error.schema_rejection.is_some() => {
+                // unknown remote effect, bury a rate limit under the retry, or
+                // ask a missing model twice.
+                Err(error) if error.schema_rejection == Some(SchemaRejection::Request) => {
                     log::warn!("vLLM structured output failed; falling back to JSON mode: {error}");
                     self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
                         .0
@@ -662,7 +678,8 @@ mod tests {
         assert!(debug.contains("<present>"));
         assert!(debug.contains("has_endpoint: true"));
         assert!(!debug.contains("api.openai.com"));
-        assert!(debug.contains("test-model"));
+        assert!(debug.contains("has_model: true"));
+        assert!(!debug.contains("test-model"));
     }
 
     /// Tiny HTTP/1.1 mock that reads one full request (headers + body),
@@ -1175,18 +1192,23 @@ mod tests {
     }
 
     #[test]
-    fn vllm_extraction_does_not_resend_after_a_rate_limit() {
+    fn vllm_extraction_resends_only_after_a_rejected_request() {
         // The mock answers one request. A JSON-mode resend would fail some
-        // other way and replace the rate limit the cooldown needs to see.
+        // other way and replace the status the caller needs to see.
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", String::new()));
-        let client = ApiClient::new(config(&format!("{base}/vllm/v1"), None))
-            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-        assert!(client.prefers_vllm_structured_outputs());
+        for (status, expected) in [
+            (429, "runtime/rate_limited"),
+            (404, "runtime/request_rejected"),
+        ] {
+            let (base, _) = rt.block_on(spawn_mock(status, "Refused", String::new()));
+            let client = ApiClient::new(config(&format!("{base}/vllm/v1"), None))
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+            assert!(client.prefers_vllm_structured_outputs());
 
-        let err = run_blocking(move || client.extract_entities("Alice met Bob", "Alice", ""))
-            .expect_err("the endpoint is rate limited");
-        assert_eq!(err, "runtime/rate_limited");
+            let err = run_blocking(move || client.extract_entities("Alice met Bob", "Alice", ""))
+                .expect_err("the endpoint refused the request");
+            assert_eq!(err, expected, "status {status}");
+        }
     }
 
     #[test]
