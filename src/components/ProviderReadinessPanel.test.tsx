@@ -373,6 +373,11 @@ describe("ProviderReadinessPanel", () => {
     expect(
       recovery(runtimeFailure("permission_denied", "review_configuration")),
     ).toMatch(/account permissions or plan/i);
+    // A depleted quota or balance (HTTP 402) points at the plan, not at the
+    // model, region or endpoint.
+    expect(
+      recovery(runtimeFailure("capacity_exhausted", "review_configuration")),
+    ).toBe(t("runtimeDiagnostics.runtime.capacity_exhausted"));
     // A rejected request, a rate limit, an outage, a timeout and a network
     // failure are not evidence that the saved key itself is wrong.
     expect(

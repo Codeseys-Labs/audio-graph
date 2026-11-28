@@ -2143,7 +2143,8 @@ fn save_settings_to_path(path: &Path, settings: &AppSettings) -> Result<(), Stri
     // Re-apply after rename in case rename semantics differ across platforms.
     crate::fs_util::set_owner_only(path);
 
-    log::info!("Settings saved to {}", path.display());
+    // Closed text: the path names the user's profile directory.
+    log::info!("Settings saved to config.yaml");
     Ok(())
 }
 

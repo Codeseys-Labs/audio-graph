@@ -609,13 +609,19 @@ function providerFailureRecovery(
     // Replacing the key fixes neither an expired credential...
     case "refresh_credential":
       return t("runtimeDiagnostics.runtime.credential_expired");
-    // ...nor a valid one the provider will not let do this.
+    // ...nor a valid one the provider will not let do this. A depleted quota
+    // or balance (HTTP 402) is not a settings problem either: its own
+    // sentence says to check the plan.
     case "review_configuration": {
       const { diagnostic } = presentation;
-      return diagnostic.kind === "runtime" &&
-        diagnostic.detail.code === "permission_denied"
-        ? t("runtimeDiagnostics.runtime.permission_denied")
-        : recovery("reviewConfiguration");
+      if (
+        diagnostic.kind === "runtime" &&
+        (diagnostic.detail.code === "permission_denied" ||
+          diagnostic.detail.code === "capacity_exhausted")
+      ) {
+        return t(`runtimeDiagnostics.runtime.${diagnostic.detail.code}`);
+      }
+      return recovery("reviewConfiguration");
     }
     case "retry":
     case "retry_after_delay":
