@@ -148,7 +148,7 @@ describe("providerRegistryHelpers", () => {
         "asr.openai_realtime": {
           provider_id: "asr.openai_realtime",
           status: "ready",
-          message: "ready",
+          note: { kind: "verified" },
           stale: false,
           credential_epoch: 1,
           credentials: [],
@@ -179,7 +179,7 @@ describe("providerRegistryHelpers", () => {
         "tts.deepgram_aura": {
           provider_id: "tts.deepgram_aura",
           status: "ready",
-          message: "ready",
+          note: { kind: "verified" },
           stale: false,
           credential_epoch: 1,
           credentials: [],

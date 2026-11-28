@@ -96,7 +96,7 @@ describe("ProviderChooserRow — annotated chooser (settings T3, audio-graph-9d2
     const readiness: ProviderReadiness = {
       provider_id: "asr.deepgram",
       status: "ready",
-      message: "Deepgram key is valid",
+      note: { kind: "verified" },
       checked_at: Date.now(),
       stale: false,
       credential_epoch: 0,
@@ -126,7 +126,7 @@ describe("ProviderChooserRow — annotated chooser (settings T3, audio-graph-9d2
     const staleReadiness: ProviderReadiness = {
       provider_id: "asr.deepgram",
       status: "ready",
-      message: "Deepgram key is valid",
+      note: { kind: "verified" },
       checked_at: Date.now(),
       stale: true,
       credential_epoch: 0,
