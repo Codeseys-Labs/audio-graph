@@ -21,12 +21,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// across 10 attempts, after which the session still surfaces a fatal error
 /// rather than looping forever against a genuinely dead provider.
 ///
-/// The ladder is *resettable*, not just longer: every provider resets
-/// `reconnect_attempts` to 0 after a successful reconnect (Deepgram/AssemblyAI/
-/// Soniox/OpenAI-realtime/Gemini/Aura), and AWS resets only after the stream
-/// stays healthy past `HEALTHY_STREAM_RESET_SECS` — so a capture that recovers
-/// mid-way gets a fresh full budget for the next outage. A flapping link that
-/// never sustains still climbs to give-up (it cannot loop at attempt 1).
+/// Providers define when a reconnect has recovered. AssemblyAI waits for
+/// `Begin`, Soniox waits for a successful response, and OpenAI Realtime ASR
+/// waits for `session.updated` and retains the budget across early expirations.
+/// AWS Transcribe waits for a sustained healthy stream. Deepgram, Gemini,
+/// and Aura reset when the transport reopens.
 pub(crate) const DEFAULT_BACKOFF_SECONDS: [u64; 10] = [1, 2, 5, 10, 20, 30, 60, 60, 60, 60];
 
 /// One step of a reconnect ladder, computed from the number of reconnect

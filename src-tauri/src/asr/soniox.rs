@@ -1030,6 +1030,9 @@ async fn run_io_with_keepalive_interval(
                             &text, event_tx, parser, &mut on_accepted,
                         ) {
                             Ok(finished) => finished,
+                            Err(_) if finishing || user_disconnected.load(Ordering::SeqCst) => {
+                                return DisconnectKind::UserRequested;
+                            }
                             Err(message) => return DisconnectKind::TerminalError(message),
                         };
                         if finished && finishing {
@@ -1241,6 +1244,41 @@ fn is_marker_only(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_frame_after_requested_stop_is_a_clean_disconnect() {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+            ws_fixture::ServerStep::send_text(
+                r#"{"error_code":402,"error_type":"organization_balance_exhausted"}"#,
+            ),
+        ])
+        .await;
+        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+        let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        audio_tx.send(AudioCmd::Stop).unwrap();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session_task(SonioxSessionCtx {
+                writer,
+                reader,
+                config: test_config(),
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(true)),
+                user_disconnected: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reconnect_opener: Some(Arc::new(|_| panic!("a user stop must never reconnect"))),
+                run_io_entries: None,
+            }),
+        )
+        .await
+        .expect("stop must complete after the terminal frame");
+        server.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(matches!(events.as_slice(), [SonioxEvent::Disconnected]));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhausts_fresh_budget_with_last_diagnostic() {
