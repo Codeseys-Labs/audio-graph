@@ -166,10 +166,17 @@ let startCaptureCalls = 0;
 
 function installInvokeMocks() {
   startCaptureCalls = 0;
-  mockedInvoke.mockImplementation(async (cmd: string) => {
+  mockedInvoke.mockImplementation(async (cmd: string, args) => {
     switch (cmd) {
-      case "load_credential_presence_cmd":
-        return credentialPresence("deepgram_api_key", "openrouter_api_key");
+      case "load_credential_presence_cmd": {
+        const presence = credentialPresence(
+          "deepgram_api_key",
+          "openrouter_api_key",
+        );
+        return args && "includeDiagnostics" in args
+          ? { presence, legacy_file_warning: null }
+          : presence;
+      }
       case "load_settings_cmd":
         return SETTINGS;
       case "list_audio_sources":

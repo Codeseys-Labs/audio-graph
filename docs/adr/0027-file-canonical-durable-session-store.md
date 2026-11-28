@@ -89,6 +89,8 @@ Historical review is read-only with respect to that aggregate. Resume is a
 separate transactional lifecycle operation.
 
 A torn final record preserves its valid prefix and quarantines the tail.
+The first-release reader contract, exact framed floats and the disposition
+of interrupted writes are specified in [ADR-0041](./0041-keep-versioned-speech-revisions-in-one-canonical-stream.md#first-published-release-and-interrupted-writes).
 Interior corruption fails loudly and preserves evidence. Legacy transcript and
 graph files remain compatibility derivatives until a versioned, idempotent
 migration retires them.

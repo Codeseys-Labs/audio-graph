@@ -160,6 +160,12 @@ jobs:
         run: bunx @biomejs/biome ci .
       - name: Typecheck
         run: bun run tsc --noEmit
+      # Reads files only (no toolchain, well under a second). It pins the
+      # manifest and workflow lines the native durability evidence depends on.
+      # It had no CI leg, so a merged dependency change left it failing on
+      # master unnoticed.
+      - name: Native durability evidence contract
+        run: bun run check:2df3-labsn-action
       - name: Vitest
         run: bun run test:coverage
       - name: Production build

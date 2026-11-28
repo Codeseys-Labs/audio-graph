@@ -14,10 +14,9 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
 use serde::{Deserialize, Serialize};
 
 use crate::asr::ProviderContentEgressPolicy;
-use crate::llm::api_client::ApiClient;
 use crate::llm::engine::{ChatMessage, LlmEngine};
 use crate::llm::mistralrs_engine::MistralRsEngine;
-use crate::llm::openrouter::OpenRouterClient;
+use crate::llm::openrouter::OpenRouterRoutingPolicy;
 use crate::settings::LlmProvider;
 
 /// Token-usage block reported by any streaming chat provider.
@@ -60,14 +59,14 @@ impl Default for StreamParams {
 
 /// Explicit backend handles available to streaming provider adapters.
 ///
-/// `stream_chat` should receive this bundle from its caller when an adapter
-/// needs runtime engines or clients. Adapters must not recover these handles
-/// from process globals.
+/// A stream adapter receives this bundle from its caller when it needs a
+/// loaded engine. Adapters must not recover these handles from process
+/// globals. There is no handle for an HTTP provider: its endpoint, key, model
+/// and routing policy are request settings and come from the request alone,
+/// never from a client cache that follows the live settings.
 #[derive(Clone, Default)]
 pub struct StreamBackendHandles {
     pub local_llama: Option<Arc<Mutex<Option<LlmEngine>>>>,
-    pub api_client: Option<Arc<Mutex<Option<ApiClient>>>>,
-    pub openrouter_client: Option<Arc<Mutex<Option<OpenRouterClient>>>>,
     pub mistralrs_engine: Option<Arc<Mutex<Option<MistralRsEngine>>>>,
 }
 
@@ -78,25 +77,11 @@ impl StreamBackendHandles {
 
     pub fn new(
         local_llama: Arc<Mutex<Option<LlmEngine>>>,
-        api_client: Arc<Mutex<Option<ApiClient>>>,
-        openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
         mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     ) -> Self {
         Self {
             local_llama: Some(local_llama),
-            api_client: Some(api_client),
-            openrouter_client: Some(openrouter_client),
             mistralrs_engine: Some(mistralrs_engine),
-        }
-    }
-
-    pub fn has_handle_for(&self, provider: &LlmProvider) -> bool {
-        match provider {
-            LlmProvider::LocalLlama => self.local_llama.is_some(),
-            LlmProvider::Api { .. } => self.api_client.is_some(),
-            LlmProvider::OpenRouter { .. } => self.openrouter_client.is_some(),
-            LlmProvider::MistralRs { .. } => self.mistralrs_engine.is_some(),
-            LlmProvider::AwsBedrock { .. } => false,
         }
     }
 }
@@ -105,8 +90,6 @@ impl fmt::Debug for StreamBackendHandles {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamBackendHandles")
             .field("local_llama", &self.local_llama.is_some())
-            .field("api_client", &self.api_client.is_some())
-            .field("openrouter_client", &self.openrouter_client.is_some())
             .field("mistralrs_engine", &self.mistralrs_engine.is_some())
             .finish()
     }
@@ -179,6 +162,11 @@ impl StreamContextMetadata {
 #[derive(Clone)]
 pub struct StreamChatRequest {
     pub provider: LlmProvider,
+    /// OpenRouter routing restrictions (`zdr`, `data_collection`, provider
+    /// pinning) from the same settings snapshot as `provider`. `None` means
+    /// that snapshot set none. [`Self::new`] requires it, so no request exists
+    /// without the caller stating it.
+    pub openrouter_routing_policy: Option<OpenRouterRoutingPolicy>,
     pub history: Vec<ChatMessage>,
     pub graph_context: String,
     pub params: StreamParams,
@@ -188,8 +176,11 @@ pub struct StreamChatRequest {
 }
 
 impl StreamChatRequest {
+    /// `provider` and `openrouter_routing_policy` must be read from one
+    /// settings snapshot, the one the request was admitted under.
     pub fn new(
         provider: LlmProvider,
+        openrouter_routing_policy: Option<OpenRouterRoutingPolicy>,
         history: Vec<ChatMessage>,
         graph_context: String,
         params: StreamParams,
@@ -197,6 +188,7 @@ impl StreamChatRequest {
         let metadata = StreamContextMetadata::from_provider(&provider);
         Self {
             provider,
+            openrouter_routing_policy,
             history,
             graph_context,
             params,
@@ -240,11 +232,16 @@ const fn provider_kind(provider: &LlmProvider) -> &'static str {
 
 impl fmt::Debug for StreamChatRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Presence only: an endpoint or an exact content size is not for logs.
+        // Presence only: an endpoint or an exact content size is not for logs,
+        // and a routing policy's provider list can identify a user's setup.
         f.debug_struct("StreamChatRequest")
             .field(
                 "provider",
                 &format_args!("{}", provider_kind(&self.provider)),
+            )
+            .field(
+                "has_openrouter_routing_policy",
+                &self.openrouter_routing_policy.is_some(),
             )
             .field("has_history", &!self.history.is_empty())
             .field("has_graph_context", &!self.graph_context.is_empty())
@@ -368,6 +365,7 @@ mod tests {
         assert_eq!(graph_context.chars().count(), 7919);
         let request = StreamChatRequest::new(
             LlmProvider::LocalLlama,
+            None,
             vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -392,6 +390,7 @@ mod tests {
         assert!(!debug.contains("SECOND_FAKE_PROMPT_DO_NOT_LOG"));
         assert!(!debug.contains(graph_context));
         assert!(debug.contains("provider: LocalLlama"));
+        assert!(debug.contains("has_openrouter_routing_policy: false"));
         assert!(debug.contains("has_history: true"));
         assert!(debug.contains("has_graph_context: true"));
         assert!(debug.contains("params: StreamParams"));
@@ -407,15 +406,23 @@ mod tests {
                 api_key: "debug-credential-canary".to_string(),
                 model: "test-model".to_string(),
             },
+            Some(OpenRouterRoutingPolicy {
+                only: vec!["routing-provider-canary".to_string()],
+                zdr: Some(true),
+                ..OpenRouterRoutingPolicy::default()
+            }),
             vec![],
             String::new(),
             StreamParams::default(),
         );
         let debug = format!("{remote:?}");
         assert!(debug.contains("provider: Api"));
+        assert!(debug.contains("has_openrouter_routing_policy: true"));
         assert!(debug.contains("has_history: false"));
         assert!(!debug.contains("private-endpoint-canary"));
         assert!(!debug.contains("debug-credential-canary"));
+        assert!(!debug.contains("routing-provider-canary"));
+        assert!(!debug.contains("zdr"));
     }
 
     #[test]

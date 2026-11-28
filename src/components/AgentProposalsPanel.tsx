@@ -50,7 +50,7 @@
  * that component's module doc), and `<AnswerThread>` rendering inside both
  * row types — see those two components' own doc comments.
  */
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
@@ -61,6 +61,7 @@ import type {
   LiveAssistCardRecord,
 } from "../types";
 import Icon from "./Icon";
+import RuntimeDiagnosticText from "./RuntimeDiagnosticText";
 import { AgentComposer } from "./workspace/AgentComposer";
 import { admitToQueue, selectAgentQueue } from "./workspace/agentQueue";
 import { agentOutcomeChipTone } from "./workspace/liveWorkspaceTone";
@@ -396,17 +397,62 @@ function AnswerStreamingDots() {
   );
 }
 
+/** A failed answer thread: the failure alert, any partial answer, and Retry
+ * unless the row is read-only. */
+function FailedAnswer({
+  failure,
+  partialText,
+  onRetry,
+  showRetry,
+}: {
+  failure: ReactNode;
+  partialText: string;
+  onRetry?: () => void;
+  showRetry: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col gap-(--space-2)">
+      <p
+        className="m-0 text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm py-(--space-2) px-(--space-3) [overflow-wrap:anywhere]"
+        role="alert"
+      >
+        {failure}
+      </p>
+      {partialText ? (
+        <p className="m-0 text-sm text-text-secondary leading-[1.4] [overflow-wrap:anywhere]">
+          <span className="block text-xs text-text-muted">
+            {t("agent.answerPartial")}
+          </span>
+          {partialText}
+        </p>
+      ) : null}
+      {showRetry ? (
+        <button
+          type="button"
+          className="self-start border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-xs leading-[20px] py-0 px-(--space-3) hover:text-text-primary hover:border-accent-blue"
+          onClick={onRetry}
+        >
+          {t("agent.answerRetry")}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 /**
  * The threaded answer for one live-assist card (audio-graph-83cc T4,
  * deliverable c). Reads TWO independent sources, in priority order:
  *
  * 1. `draft` (`answerDrafts[proposal.id]`, `store/answerDrafts.ts`) — the
  *    transient in-flight state. `"streaming"` renders the thinking dots;
- *    `"failed"` renders the typed failure text + a Retry affordance.
+ *    `"failed"` renders the closed diagnostic (or the rejected dispatch's
+ *    message), any partial answer, and a Retry affordance.
  * 2. `card.answer` (the durable `CardAnswer`, absent for every legacy
  *    pre-83cc record) — rendered only once there is no active draft, so a
  *    fresh dispatch's progress always wins over a stale durable answer from
- *    a previous turn.
+ *    a previous turn. A failed answer written before `diagnostic` existed
+ *    renders the generic failure copy, never its legacy `finish_reason`.
  *
  * Returns `null` (renders nothing) when neither exists — the exact legacy
  * shape: a card with no `answer`/`origin`/`signal` and no draft renders
@@ -440,23 +486,18 @@ function AnswerThread({
   }
   if (draft?.status === "failed") {
     return (
-      <div className="flex flex-col gap-(--space-2)">
-        <p
-          className="m-0 text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm py-(--space-2) px-(--space-3) [overflow-wrap:anywhere]"
-          role="alert"
-        >
-          {draft.text || t("agent.answerFailedGeneric")}
-        </p>
-        {readOnly ? null : (
-          <button
-            type="button"
-            className="self-start border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-xs leading-[20px] py-0 px-(--space-3) hover:text-text-primary hover:border-accent-blue"
-            onClick={onRetry}
-          >
-            {t("agent.answerRetry")}
-          </button>
-        )}
-      </div>
+      <FailedAnswer
+        failure={
+          draft.failure ? (
+            <RuntimeDiagnosticText diagnostic={draft.failure} />
+          ) : (
+            draft.text || t("agent.answerFailedGeneric")
+          )
+        }
+        partialText={draft.failure ? draft.text : ""}
+        onRetry={onRetry}
+        showRetry={!readOnly}
+      />
     );
   }
 
@@ -464,23 +505,18 @@ function AnswerThread({
 
   if (answer.status === "failed") {
     return (
-      <div className="flex flex-col gap-(--space-2)">
-        <p
-          className="m-0 text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm py-(--space-2) px-(--space-3) [overflow-wrap:anywhere]"
-          role="alert"
-        >
-          {answer.text || t("agent.answerFailedGeneric")}
-        </p>
-        {readOnly ? null : (
-          <button
-            type="button"
-            className="self-start border border-(--edge) rounded-sm bg-transparent text-text-secondary cursor-pointer text-xs leading-[20px] py-0 px-(--space-3) hover:text-text-primary hover:border-accent-blue"
-            onClick={onRetry}
-          >
-            {t("agent.answerRetry")}
-          </button>
-        )}
-      </div>
+      <FailedAnswer
+        failure={
+          answer.diagnostic ? (
+            <RuntimeDiagnosticText diagnostic={answer.diagnostic} />
+          ) : (
+            t("agent.answerFailedGeneric")
+          )
+        }
+        partialText={answer.text}
+        onRetry={onRetry}
+        showRetry={!readOnly}
+      />
     );
   }
 

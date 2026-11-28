@@ -243,8 +243,7 @@ impl BedrockEventSource for VecBedrockEventSource {
 /// Live AWS Bedrock `ConverseStream` adapter.
 ///
 /// Built on demand from the `AwsBedrock` settings — no persistent backend
-/// handle is needed (`StreamBackendHandles::has_handle_for` returning `false`
-/// for `AwsBedrock` is intentional).
+/// handle is needed.
 pub struct BedrockConverseStreamAdapter {
     region: String,
     model_id: String,
