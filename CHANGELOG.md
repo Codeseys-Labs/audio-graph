@@ -58,11 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filesystem evidence gate before the lock file or any native call exists,
   which refuses every root until evidence profiles ship (#210). Windows
   replaces the journal with POSIX rename semantics and flushes the file and
-  directory afterwards; a program holding the journal open without sharing
-  delete now yields a retryable store error instead of a process-wide stall.
-  New directories are synced into their parent. One explicit repair takes
-  ownership of a refused journal root (Windows) and removes staging records
-  and guards the journal does not track.
+  directory afterwards. A program holding the journal open without sharing
+  delete no longer stalls the whole process: a refusal before any native
+  record changed is retryable, and one at the final journal commit leaves
+  that operation for recovery. The roots' directory entries are synced into
+  their parent on every open. One explicit repair takes ownership of a
+  refused journal root (Windows) and removes staging records and guards the
+  journal does not track.
 
 ### Fixed
 

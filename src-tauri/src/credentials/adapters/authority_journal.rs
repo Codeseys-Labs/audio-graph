@@ -1228,6 +1228,12 @@ pub(super) mod tests {
             );
             return;
         }
+        // The permissive umask is in force before the roots are created, so
+        // every path this child creates is created under it.
+        #[cfg(unix)]
+        if mode == "create_owner_only" {
+            rustix::process::umask(rustix::fs::Mode::empty());
+        }
         let path = |name| PathBuf::from(std::env::var_os(name).expect("child path environment"));
         let boundary = FileAuthorityJournalBoundary::open_for_test(
             path(CHILD_ROOT_ENV),
@@ -1258,7 +1264,6 @@ pub(super) mod tests {
             ),
             #[cfg(unix)]
             "create_owner_only" => {
-                rustix::process::umask(rustix::fs::Mode::empty());
                 let guard = boundary
                     .acquire_mutation_lock()
                     .expect("create mutation lock under child umask");

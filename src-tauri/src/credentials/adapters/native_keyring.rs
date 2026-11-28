@@ -415,7 +415,9 @@ impl NativeKeyringCredentialStore {
     /// journal's history records for the set, which also finds staging a
     /// guard in the legacy format stood for when its operation completed.
     /// Staging records go before the guard, so a staging record never
-    /// outlives its guard. An unrecognized guard leaves the set untouched.
+    /// outlives its guard. A legacy guard does not say which staging it
+    /// stands for, so it stays while the set has a pending activation. An
+    /// unrecognized guard leaves the set untouched.
     fn repair_set_unlocked(
         &self,
         interaction: &mut NativeInteractionLease<'_>,
@@ -436,13 +438,14 @@ impl NativeKeyringCredentialStore {
             .filter(|entry| entry.set_id == *set_id)
             .map(|entry| entry.receipt.operation_id.clone())
             .collect();
-        let guard_is_tracked = match &guard {
+        let guard_is_spared = match &guard {
             StagingGuard::Unrecognized => return Ok(UntrackedRecordOutcome::Unrecognized),
             StagingGuard::Names(operation_id) => {
                 candidates.push(operation_id.clone());
                 tracked == Some(operation_id)
             }
-            StagingGuard::Absent | StagingGuard::Legacy => false,
+            StagingGuard::Legacy => tracked.is_some(),
+            StagingGuard::Absent => false,
         };
         candidates.retain(|operation_id| tracked != Some(operation_id));
         candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -457,20 +460,22 @@ impl NativeKeyringCredentialStore {
                 removed = true;
             }
         }
-        if !matches!(guard, StagingGuard::Absent) && !guard_is_tracked {
+        if !matches!(guard, StagingGuard::Absent) && !guard_is_spared {
             self.entries
                 .delete_and_verify_absent(interaction, &guard_locator)?;
             removed = true;
         }
-        Ok(if matches!(guard, StagingGuard::Legacy) {
-            UntrackedRecordOutcome::LegacyGuardRemoved
-        } else if removed {
-            UntrackedRecordOutcome::Removed
-        } else if tracked.is_some() {
-            UntrackedRecordOutcome::Tracked
-        } else {
-            UntrackedRecordOutcome::Clean
-        })
+        Ok(
+            if matches!(guard, StagingGuard::Legacy) && !guard_is_spared {
+                UntrackedRecordOutcome::LegacyGuardRemoved
+            } else if removed {
+                UntrackedRecordOutcome::Removed
+            } else if tracked.is_some() {
+                UntrackedRecordOutcome::Tracked
+            } else {
+                UntrackedRecordOutcome::Clean
+            },
+        )
     }
 }
 
@@ -818,6 +823,7 @@ mod tests {
         EncodedCredentialRecord, PendingCredentialIntent, PendingSettingsActivation,
         StoredSecretBundle,
     };
+    use crate::credentials::fake::FakeSettingsActivationPort;
     use crate::credentials::service::{
         AuthoritativeActiveRead, CredentialEntryStore, CredentialService, CredentialUseRequest,
         DeleteCredentialSet, PrepareCredentialActivation, ReplaceCredentialSet,
@@ -827,9 +833,9 @@ mod tests {
     use audio_graph_ipc_contract::credential_contract::{
         AuthMethodId, BUILT_IN_CREDENTIAL_SET_IDS, BuiltInCredentialSetId,
         CredentialActivationStage, CredentialAudience, CredentialBackendKind, CredentialErrorCode,
-        CredentialIdempotencyToken, CredentialOperationId, CredentialPurpose, CredentialRevision,
-        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecoveryState,
-        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
+        CredentialIdempotencyToken, CredentialMutationResultCode, CredentialOperationId,
+        CredentialPurpose, CredentialRevision, CredentialSafeRecoveryAction, CredentialSetId,
+        CredentialSetRecoveryState, PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -3640,18 +3646,176 @@ mod tests {
         session.read_staging(operation, set_id).map(|_| ())
     }
 
+    /// Every built-in set is reported exactly once, with the expected outcome
+    /// or `Clean`.
     fn repaired_outcomes(
         sets: &[UntrackedRecordRepair],
         expected: &[(BuiltInCredentialSetId, UntrackedRecordOutcome)],
     ) {
         assert_eq!(sets.len(), BUILT_IN_CREDENTIAL_SET_IDS.len());
-        for repaired in sets {
+        for built_in in BUILT_IN_CREDENTIAL_SET_IDS {
+            let set_id = CredentialSetId::from(*built_in);
+            let mut reported = sets.iter().filter(|repaired| repaired.set_id == set_id);
+            let repaired = reported.next().expect("every built-in set is reported");
+            assert!(reported.next().is_none(), "{set_id:?} is reported once");
             let outcome = expected
                 .iter()
-                .find(|(set_id, _)| CredentialSetId::from(*set_id) == repaired.set_id)
+                .find(|(expected_set, _)| expected_set == built_in)
                 .map_or(UntrackedRecordOutcome::Clean, |(_, outcome)| *outcome);
-            assert_eq!(repaired.outcome, outcome, "{:?}", repaired.set_id);
+            assert_eq!(repaired.outcome, outcome, "{set_id:?}");
         }
+    }
+
+    /// A ready native store over `keyring`, and a service over it whose
+    /// settings port lets activations be recovered.
+    fn activation_service(
+        keyring: &Arc<MemoryKeyringBoundary>,
+    ) -> (Arc<NativeKeyringCredentialStore>, CredentialService) {
+        let opened = NativeKeyringCredentialStore::open_with_boundaries(
+            keyring.clone(),
+            Arc::new(MemoryJournalBoundary::default()),
+        )
+        .expect("open absent authority");
+        let NativeCredentialStoreOpen::Uninitialized(store) = opened else {
+            panic!("expected uninitialized authority");
+        };
+        let NativeCredentialStoreOpen::Ready { store, journal } = store
+            .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+            .expect("initialize native authority")
+        else {
+            panic!("expected ready authority");
+        };
+        let store = Arc::new(store);
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            *journal,
+            Arc::new(DeterministicTokenSource::default()),
+            Arc::new(FakeSettingsActivationPort::new(1)),
+        );
+        (store, service)
+    }
+
+    fn deepgram_activation(token: &str) -> PrepareCredentialActivation {
+        PrepareCredentialActivation {
+            set_id: BuiltInCredentialSetId::Deepgram.into(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("guarded-activation-canary").expect("API key"),
+            expected_revision: None,
+            expected_settings_revision: 1,
+            proposed_settings_revision: 2,
+            idempotency_token: CredentialIdempotencyToken::parse(token)
+                .expect("canonical idempotency token"),
+        }
+    }
+
+    /// Through the service: the journal records an activation before its
+    /// staging, so an orphan's guard refuses an activation that stays
+    /// pending. The repair removes the orphan and keeps the refused
+    /// activation tracked; activations stay in progress until that one is
+    /// recovered, which rolls it back, and then the next one stages.
+    #[test]
+    fn an_activation_an_orphan_guard_refused_is_recovered_after_the_explicit_repair() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let (store, service) = activation_service(&keyring);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let orphan = stage_and_leave(&store, "75757575-7575-4575-8575-757575757575", &set_id);
+
+        let refused = service
+            .prepare_settings_activation(deepgram_activation(
+                "76767676-7676-4676-8676-767676767676",
+            ))
+            .expect_err("the orphan's guard refuses staging");
+        assert_eq!(refused.code, CredentialErrorCode::CorruptRecord);
+        let pending = service
+            .snapshot_status()
+            .pending_activation
+            .expect("the journal records the refused activation");
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+        repaired_outcomes(
+            &sets,
+            &[(
+                BuiltInCredentialSetId::Deepgram,
+                UntrackedRecordOutcome::Removed,
+            )],
+        );
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging(&orphan, &set_id).account()),
+            None
+        );
+        assert_eq!(
+            service
+                .prepare_settings_activation(deepgram_activation(
+                    "77777777-7777-4777-8777-777777777777",
+                ))
+                .expect_err("the refused activation is still pending")
+                .code,
+            CredentialErrorCode::OperationInProgress
+        );
+
+        let receipt = service
+            .recover_settings_activation(&pending.operation_id)
+            .expect("recover the refused activation");
+        assert_eq!(receipt.result_code, CredentialMutationResultCode::NoChange);
+        assert!(service.snapshot_status().pending_activation.is_none());
+        service
+            .prepare_settings_activation(deepgram_activation(
+                "78787878-7878-4878-8878-787878787878",
+            ))
+            .expect("the next activation stages");
+    }
+
+    /// A guard in the pre-fix format may stand for the staging of the set's
+    /// pending activation, so the repair keeps it while that activation is
+    /// pending and removes it once the activation is recovered.
+    #[test]
+    fn a_pre_fix_guard_stays_while_its_set_has_a_pending_activation() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let (_store, service) = activation_service(&keyring);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let guard = EntryLocator::staging_guard(&set_id).account().to_owned();
+        plant(&keyring, &guard, super::LEGACY_STAGING_GUARD);
+        service
+            .prepare_settings_activation(deepgram_activation(
+                "79797979-7979-4979-8979-797979797979",
+            ))
+            .expect_err("the pre-fix guard refuses staging");
+        let pending = service
+            .snapshot_status()
+            .pending_activation
+            .expect("the journal records the refused activation");
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+        repaired_outcomes(
+            &sets,
+            &[(
+                BuiltInCredentialSetId::Deepgram,
+                UntrackedRecordOutcome::Tracked,
+            )],
+        );
+        assert_eq!(
+            native_entry(&keyring, &guard).as_deref(),
+            Some(super::LEGACY_STAGING_GUARD)
+        );
+
+        service
+            .recover_settings_activation(&pending.operation_id)
+            .expect("recover the refused activation");
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+        repaired_outcomes(
+            &sets,
+            &[(
+                BuiltInCredentialSetId::Deepgram,
+                UntrackedRecordOutcome::LegacyGuardRemoved,
+            )],
+        );
+        assert_eq!(native_entry(&keyring, &guard), None);
     }
 
     /// The Windows power-loss case: the journal publication that recorded an

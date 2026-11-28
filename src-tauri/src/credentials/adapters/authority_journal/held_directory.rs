@@ -166,28 +166,45 @@ mod unix_held {
         }
     }
 
-    /// Creates the directory `name` inside `parent` and, if this call created
-    /// it, syncs `parent`, so the new entry is durable before anything is
-    /// placed in it.
+    /// Creates the directory `name` inside `parent` unless it exists, then
+    /// syncs `parent` either way: an entry another opener created may not be
+    /// synced yet, or its sync may have failed. The entry is durable before
+    /// anything is placed in it.
     fn create_child_directory(
         parent: &OwnedFd,
         name: &OsStr,
         bits: RawMode,
     ) -> Result<(), CredentialStoreFailure> {
         match mkdirat(parent, name, mode(bits)) {
-            Ok(()) => fsync(parent).map_err(|_| CredentialStoreFailure::Unavailable),
-            Err(Errno::EXIST) => Ok(()),
+            Ok(()) | Err(Errno::EXIST) => {
+                fsync(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+            }
             Err(errno) => Err(open_failure(errno)),
         }
+    }
+
+    /// Syncs the directory containing `path`, so the entry naming `path` is
+    /// durable. A filesystem root has no containing entry to sync.
+    fn sync_parent_of(path: &Path) -> Result<(), CredentialStoreFailure> {
+        let Ok((parent, _)) = split_parent(path) else {
+            return Ok(());
+        };
+        let parent = openat(CWD, parent, DIRECTORY_FLAGS, Mode::empty()).map_err(open_failure)?;
+        fsync(&parent).map_err(|_| CredentialStoreFailure::Unavailable)
     }
 
     /// Opens the directory `path`, first creating it and every missing
     /// ancestor. Each directory this creates is made relative to its open
     /// parent, which is synced, and then opened relative to that parent
-    /// without following a link.
+    /// without following a link. The deepest directory found present has
+    /// its own entry synced too: an earlier open may have created it and
+    /// failed to sync it.
     fn open_or_create_ancestor(path: &Path) -> Result<OwnedFd, CredentialStoreFailure> {
         match openat(CWD, path, DIRECTORY_FLAGS, Mode::empty()) {
-            Ok(fd) => return Ok(fd),
+            Ok(fd) => {
+                sync_parent_of(path)?;
+                return Ok(fd);
+            }
             Err(Errno::NOENT) => {}
             Err(errno) => return Err(open_failure(errno)),
         }
@@ -217,10 +234,15 @@ mod unix_held {
             }
         }
 
+        /// Opens the held root `path`, creating it and its missing ancestors
+        /// first. Whether this open created the root or found it, the entry
+        /// naming it is synced in its parent before it is returned, so no
+        /// opener relies on a sync another open may never have completed.
         pub(in crate::credentials::adapters) fn open_or_create(
             path: &Path,
         ) -> Result<Self, CredentialStoreFailure> {
             if let Some(held) = Self::open_existing(path)? {
+                sync_parent_of(path)?;
                 return Ok(held);
             }
             let (parent, name) = split_parent(path)?;
@@ -668,12 +690,25 @@ mod windows_held {
         flush_directory(&directory)
     }
 
+    /// Flushes the directory containing `path`, so the entry naming `path`
+    /// is as durable as a flush makes it. A volume root has no containing
+    /// entry to flush.
+    fn flush_parent_of(path: &Path) -> Result<(), CredentialStoreFailure> {
+        let Ok((parent, _)) = split_parent(path) else {
+            return Ok(());
+        };
+        flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+    }
+
     /// Creates `path` and every missing ancestor with inherited security, as
-    /// `create_dir_all` would, flushing the parent of each directory this
-    /// creates so the new entry is durable before anything is placed in it.
+    /// `create_dir_all` would. The parent of each directory this creates, or
+    /// finds already created by a concurrent opener, is flushed before
+    /// anything is placed in it, and so is the parent of the deepest
+    /// directory found present: an earlier open may have created it and
+    /// failed to flush.
     fn create_missing_directories(path: &Path) -> Result<(), CredentialStoreFailure> {
         match std::fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(metadata) if metadata.is_dir() => return flush_parent_of(path),
             Ok(_) => return Err(CredentialStoreFailure::Unavailable),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(CredentialStoreFailure::Unavailable),
@@ -682,7 +717,9 @@ mod windows_held {
         create_missing_directories(parent)?;
         match std::fs::create_dir(path) {
             Ok(()) => flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+            }
             Err(_) => Err(CredentialStoreFailure::Unavailable),
         }
     }
@@ -947,10 +984,15 @@ mod windows_held {
             Ok(Some(Self { handle, final_path }))
         }
 
+        /// Opens the held root `path`, creating it and its missing ancestors
+        /// first. Whether this open created the root or found it, its parent
+        /// is flushed before it is returned, so no opener relies on a flush
+        /// another open may never have completed.
         pub(in crate::credentials::adapters) fn open_or_create(
             path: &Path,
         ) -> Result<Self, CredentialStoreFailure> {
             if let Some(held) = Self::open_existing(path)? {
+                flush_parent_of(path)?;
                 return Ok(held);
             }
             let (parent, _) = split_parent(path)?;
@@ -958,12 +1000,11 @@ mod windows_held {
             // Created with its protected owner-only DACL, so no other principal
             // can open it between creation and hardening.
             match crate::fs_util::create_owner_only_directory(path) {
-                Ok(()) => {
-                    flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)?
-                }
+                Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(open_failure(error.kind())),
             }
+            flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)?;
             Self::open_existing(path)?.ok_or(CredentialStoreFailure::Unavailable)
         }
 
@@ -1161,7 +1202,17 @@ mod windows_held {
         /// flush is never refused for want of access.
         pub(in crate::credentials::adapters) fn publish(mut self) -> Result<(), PublishFailure> {
             let file = self.file.as_ref().ok_or(PublishFailure::NotPublished)?;
-            rename_within(file, &self.directory.handle, &self.name)?;
+            match rename_within(file, &self.directory.handle, &self.name) {
+                Ok(()) => {}
+                Err(PublishFailure::Unknown) => {
+                    // The rename may have taken effect, so this handle may now
+                    // be the published file: it is never disposed. A staged
+                    // file left under its staging name goes in the next sweep.
+                    self.published = true;
+                    return Err(PublishFailure::Unknown);
+                }
+                Err(failure) => return Err(failure),
+            }
             self.published = true;
             let flushed = file
                 .sync_all()

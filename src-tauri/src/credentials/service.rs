@@ -77,8 +77,9 @@ pub(crate) enum UntrackedRecordOutcome {
     /// removed.
     Removed,
     /// Nothing untracked was found, and the journal's pending activation of
-    /// this set keeps its own staging record. Repair again once that
-    /// activation completes or is recovered.
+    /// this set keeps its own staging record, and a guard in the pre-fix
+    /// format if there is one, since that guard may stand for it. Repair
+    /// again once that activation completes or is recovered.
     Tracked,
     /// A guard in the pre-fix format was removed, with every staging record
     /// the journal history names for the set. That guard never named its
@@ -644,7 +645,7 @@ impl CredentialService {
         )
     }
 
-    fn with_settings_activation_port(
+    pub(crate) fn with_settings_activation_port(
         store: Arc<dyn CredentialEntryStore>,
         journal: AuthorityJournal,
         token_source: Arc<dyn CredentialTokenSource>,
