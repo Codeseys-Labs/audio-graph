@@ -610,6 +610,7 @@ mod tests {
             sample_rate: 16_000,
             num_frames: 4,
             timestamp: Some(Duration::from_millis(10)),
+            metadata: Default::default(),
         }
     }
 
@@ -702,6 +703,8 @@ mod tests {
 
     #[test]
     fn dispatches_same_chunk_to_multiple_active_consumers() {
+        use crate::audio::pipeline::{AudioDiscontinuity, AudioSegmentBoundary};
+
         let registry = ProcessedAudioConsumerRegistry::new();
         let (speech_tx, speech_rx) = crossbeam_channel::bounded(2);
         let (notes_tx, notes_rx) = crossbeam_channel::bounded(2);
@@ -723,7 +726,18 @@ mod tests {
             })
             .unwrap();
 
-        let summary = registry.dispatch(chunk("mic", 4.0));
+        let mut input = chunk("mic", 4.0);
+        input.metadata.boundaries.push(AudioSegmentBoundary {
+            clock_generation: 0,
+            timestamp: input.timestamp,
+            discontinuities: vec![AudioDiscontinuity::Gap {
+                missing_duration: Duration::from_millis(8),
+            }],
+            previous_input_rate_hz: Some(16_000),
+            discarded_input_frames: 0,
+        });
+        let expected_metadata = input.metadata.clone();
+        let summary = registry.dispatch(input);
 
         assert_eq!(summary.active_consumers, 2);
         assert_eq!(summary.delivered_chunks, 2);
@@ -737,6 +751,8 @@ mod tests {
         assert_eq!(speech.sample_rate, notes.sample_rate);
         assert_eq!(speech.num_frames, notes.num_frames);
         assert_eq!(speech.timestamp, notes.timestamp);
+        assert_eq!(speech.metadata, expected_metadata);
+        assert_eq!(notes.metadata, expected_metadata);
     }
 
     #[test]

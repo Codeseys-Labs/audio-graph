@@ -147,6 +147,7 @@ pub fn spawn_mixer(
                         data,
                         sample_rate: TARGET_SAMPLE_RATE,
                         timestamp: None,
+                        metadata: Default::default(),
                     };
                     out_tx.send(chunk).is_ok()
                 };
@@ -192,6 +193,7 @@ mod tests {
             sample_rate: TARGET_SAMPLE_RATE,
             num_frames: FRAME,
             timestamp: None,
+            metadata: Default::default(),
         });
         assert_eq!(m.sources.len(), 1);
         // Force last_seen into the past and empty the buffer → evicted.

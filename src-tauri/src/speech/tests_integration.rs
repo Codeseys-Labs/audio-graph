@@ -270,6 +270,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             sample_rate: 16_000,
             num_frames: TARGET_FRAMES,
             timestamp: Some(Duration::from_secs(0)),
+            metadata: Default::default(),
         })
         .expect("send synthetic processed audio");
     drop(processed_tx);
