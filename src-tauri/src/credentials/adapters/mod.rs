@@ -1,5 +1,7 @@
 mod authority_journal;
 mod keyring_entry;
+#[cfg(any(target_os = "linux", test))]
+mod linux_secret_service_wire;
 // Capability-blind raw cores. Their policy adapters live under
 // `native_interaction`, which forbids `unsafe`.
 mod macos_acl_ffi;

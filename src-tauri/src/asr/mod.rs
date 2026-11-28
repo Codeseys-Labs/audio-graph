@@ -144,8 +144,11 @@ fn websocket_upgrade_error(error: &tungstenite::Error, credential_sent: bool) ->
         Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Code::Timeout,
         Error::Io(_) | Error::ConnectionClosed | Error::AlreadyClosed => Code::NetworkUnreachable,
         // A failed TLS handshake can indicate a certificate or protocol problem.
-        Error::Protocol(_) | Error::Utf8(_) | Error::Tls(_) => Code::ProtocolError,
-        Error::Capacity(_) | Error::WriteBufferFull(_) => Code::CapacityExhausted,
+        Error::Protocol(_) | Error::Utf8(_) | Error::Tls(_) | Error::Capacity(_) => {
+            Code::ProtocolError
+        }
+        // The local writer has no room to queue this frame.
+        Error::WriteBufferFull(_) => Code::Internal,
         Error::Url(_) => Code::RequestRejected,
         _ => Code::Internal,
     };
@@ -173,11 +176,10 @@ fn websocket_close(frame: Option<&CloseFrame>) -> RuntimeDiagnostic {
             | CloseCode::Error
             | CloseCode::Restart,
         ) => Code::ProviderUnavailable,
-        Some(CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid) => {
-            Code::ProtocolError
-        }
+        Some(
+            CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid | CloseCode::Size,
+        ) => Code::ProtocolError,
         Some(CloseCode::Policy) => Code::PolicyBlocked,
-        Some(CloseCode::Size) => Code::CapacityExhausted,
         Some(CloseCode::Again) => Code::RateLimited,
         _ => Code::Internal,
     };
@@ -321,20 +323,24 @@ mod diagnostic_tests {
         pub(super) rejections: tokio::task::JoinHandle<()>,
     }
 
-    pub(super) async fn close_before_readiness(
-        expect_config: bool,
+    pub(super) fn session_clock(step: Duration) -> impl Fn() -> tokio::time::Instant {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let start = tokio::time::Instant::now();
+        let ticks = AtomicU32::new(0);
+        move || start + step * ticks.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) async fn close_each_attempt(
+        mut steps: Vec<ws_fixture::ServerStep>,
     ) -> Vec<(
         String,
         tokio::task::JoinHandle<Vec<ws_fixture::ClientFrame>>,
     )> {
+        steps.push(ws_fixture::ServerStep::send_close());
         let mut servers = Vec::new();
         for _ in crate::reconnect::DEFAULT_BACKOFF_SECONDS {
-            let mut steps = Vec::new();
-            if expect_config {
-                steps.push(ws_fixture::ServerStep::expect_any_text());
-            }
-            steps.push(ws_fixture::ServerStep::send_close());
-            servers.push(ws_fixture::spawn_scripted_server(steps).await);
+            servers.push(ws_fixture::spawn_scripted_server(steps.clone()).await);
         }
         servers
     }
@@ -492,16 +498,16 @@ mod diagnostic_tests {
                 Some(wire_prose()),
                 64,
                 Duration::from_secs(10),
-                Code::CapacityExhausted,
-                "failed to send audio: runtime/capacity_exhausted",
+                Code::Internal,
+                "failed to send audio: runtime/internal",
             ),
             (
                 Vec::new(),
                 None,
                 1,
                 Duration::from_millis(5),
-                Code::CapacityExhausted,
-                "failed to send keepalive: runtime/capacity_exhausted",
+                Code::Internal,
+                "failed to send keepalive: runtime/internal",
             ),
         ] {
             let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -653,6 +659,11 @@ mod diagnostic_tests {
         let diagnostic = websocket_close(Some(&close));
         assert_diagnostic(&diagnostic, Code::Internal);
         assert!(!format!("{diagnostic:?}").contains("4763"));
+        let size_close = CloseFrame {
+            code: CloseCode::Size,
+            reason: close.reason,
+        };
+        assert_diagnostic(&websocket_close(Some(&size_close)), Code::ProtocolError);
         assert_diagnostic(&websocket_close(None), Code::Internal);
     }
 

@@ -229,7 +229,7 @@ pub async fn build_aws_sdk_config(
             // to pick the right provider shape. The static case still
             // re-uses the key material captured here. The refreshing case
             // throws away the snapshot and re-reads on every SDK call.
-            let store = crate::credentials::load_credentials();
+            let store = crate::credentials::load_credentials()?;
             let access_key = aws_access_key_from_source_or_store(access_key, &store)?;
             let secret = store
                 .aws_secret_key
@@ -304,7 +304,7 @@ pub async fn build_aws_sdk_config_with_draft_credentials(
         return build_aws_sdk_config(region, source).await;
     };
 
-    let store = crate::credentials::load_credentials();
+    let store = crate::credentials::load_credentials()?;
     let access_key = aws_access_key_from_source_or_store(access_key, &store)?;
     let secret = draft_or_saved_secret(
         secret_access_key,
@@ -466,19 +466,16 @@ impl ProvideCredentials for BackendRefreshingCredentialsProvider {
     }
 }
 
-/// Read a `CredentialStore` from an explicit path. Mirrors the logic in
-/// `credentials::load_credentials` but without the fallback-to-default
-/// behavior: if the file is missing or malformed, we surface a real
-/// error so the SDK can report it to the user instead of silently
-/// signing with empty creds.
+/// Load an explicit YAML store using the same typed errors as the default backend.
 fn load_store_from_path(path: &Path) -> Result<CredentialStore, CredentialsError> {
     YamlCredentialBackend::with_path(path.to_path_buf())
         .load()
         .map_err(credential_load_error)
 }
 
-fn credential_load_error(error: String) -> CredentialsError {
-    if error.contains("Failed to parse") {
+fn credential_load_error(error: crate::credentials::LegacyCredentialError) -> CredentialsError {
+    if error.0 == audio_graph_ipc_contract::credential_contract::CredentialErrorCode::CorruptRecord
+    {
         CredentialsError::invalid_configuration(error)
     } else {
         CredentialsError::not_loaded(error)

@@ -16,6 +16,7 @@ describe("createChatStreamCoalescer", () => {
     const coalescer = createChatStreamCoalescer({
       onDelta: () => {},
       onDone: () => {},
+      onFailed: () => {},
     });
     expect(coalescer.channel.onmessage).toBeTypeOf("function");
   });
@@ -27,6 +28,7 @@ describe("createChatStreamCoalescer", () => {
       const coalescer = createChatStreamCoalescer({
         onDelta,
         onDone: () => {},
+        onFailed: () => {},
         throttleMs: 10,
       });
       coalescer.arm("req-1");
@@ -57,7 +59,11 @@ describe("createChatStreamCoalescer", () => {
   it("holds delta and done frames that arrive before arm(), then applies them in order once armed", () => {
     const onDelta = vi.fn();
     const onDone = vi.fn();
-    const coalescer = createChatStreamCoalescer({ onDelta, onDone });
+    const coalescer = createChatStreamCoalescer({
+      onDelta,
+      onDone,
+      onFailed: () => {},
+    });
     const channel = coalescer.channel as unknown as ChannelLike;
 
     channel.onmessage?.({
@@ -90,7 +96,11 @@ describe("createChatStreamCoalescer", () => {
     try {
       const onDelta = vi.fn();
       const onDone = vi.fn();
-      const coalescer = createChatStreamCoalescer({ onDelta, onDone });
+      const coalescer = createChatStreamCoalescer({
+        onDelta,
+        onDone,
+        onFailed: () => {},
+      });
       coalescer.arm("req-1");
       const channel = coalescer.channel as unknown as ChannelLike;
 
@@ -116,10 +126,46 @@ describe("createChatStreamCoalescer", () => {
     }
   });
 
+  it("routes a failed terminal frame to onFailed after draining pending deltas, and only once", () => {
+    const onDelta = vi.fn();
+    const onDone = vi.fn();
+    const onFailed = vi.fn();
+    const coalescer = createChatStreamCoalescer({ onDelta, onDone, onFailed });
+    const channel = coalescer.channel as unknown as ChannelLike;
+    const failed = {
+      request_id: "req-1",
+      full_text: "partial",
+      diagnostic: { kind: "runtime" },
+    };
+
+    channel.onmessage?.({
+      event: "delta",
+      data: { request_id: "req-1", delta: "partial" },
+    });
+    channel.onmessage?.({ event: "failed", data: failed });
+    expect(onFailed).not.toHaveBeenCalled();
+
+    coalescer.arm("req-1");
+    expect(onDelta).toHaveBeenCalledWith("partial", undefined);
+    expect(onFailed).toHaveBeenCalledWith(failed);
+    expect(onDone).not.toHaveBeenCalled();
+
+    channel.onmessage?.({
+      event: "done",
+      data: { request_id: "req-1", full_text: "late", finish_reason: "stop" },
+    });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(onFailed).toHaveBeenCalledTimes(1);
+  });
+
   it("disarm() tears down onmessage so a stray late frame never reaches the handlers", () => {
     const onDelta = vi.fn();
     const onDone = vi.fn();
-    const coalescer = createChatStreamCoalescer({ onDelta, onDone });
+    const coalescer = createChatStreamCoalescer({
+      onDelta,
+      onDone,
+      onFailed: () => {},
+    });
     coalescer.arm("req-1");
     coalescer.disarm();
     const channel = coalescer.channel as unknown as ChannelLike;
@@ -145,6 +191,7 @@ describe("createChatStreamCoalescer", () => {
       const coalescer = createChatStreamCoalescer({
         onDelta,
         onDone,
+        onFailed: () => {},
         throttleMs: 10,
       });
       coalescer.arm("req-1");
@@ -183,6 +230,7 @@ describe("createChatStreamCoalescer", () => {
       const coalescer = createChatStreamCoalescer({
         onDelta,
         onDone: () => {},
+        onFailed: () => {},
         throttleMs: 10,
       });
       coalescer.arm("req-1");

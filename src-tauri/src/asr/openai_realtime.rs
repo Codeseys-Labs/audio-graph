@@ -88,7 +88,6 @@ const OPENAI_REALTIME_ASR_PROVIDER: &str = "asr.openai_realtime_transcription";
 const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
-const HEALTHY_SESSION_RESET_AFTER: Duration = Duration::from_secs(30);
 
 /// Events emitted by the OpenAI Realtime transcription client to downstream
 /// consumers. Mirrors [`crate::asr::deepgram::DeepgramEvent`] in shape so the
@@ -422,7 +421,7 @@ impl OpenAiRealtimeClient {
         if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(websocket_diagnostic(Code::CapacityExhausted).to_string());
+            return Err(websocket_diagnostic(Code::Internal).to_string());
         }
 
         // f32 16 kHz -> 24 kHz -> i16 LE PCM -> base64.
@@ -712,7 +711,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
         ctx,
         Duration::from_secs,
         SESSION_SETUP_TIMEOUT,
-        HEALTHY_SESSION_RESET_AFTER,
+        tokio::time::Instant::now,
     )
     .await;
 }
@@ -721,7 +720,7 @@ async fn session_task_with_timing(
     ctx: OpenAiRealtimeSessionCtx,
     backoff_duration: impl Fn(u64) -> Duration,
     setup_timeout: Duration,
-    healthy_session_reset_after: Duration,
+    now: impl Fn() -> tokio::time::Instant,
 ) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
@@ -777,7 +776,7 @@ async fn session_task_with_timing(
         // A confirmed session only earns a fresh budget after it stays up
         // long enough. An immediate close or expiry still counts as a flap.
         connected.store(false, Ordering::SeqCst);
-        if ready_at.is_some_and(|ready_at| ready_at.elapsed() >= healthy_session_reset_after) {
+        if crate::reconnect::should_reset_reconnect_budget(ready_at, &now) {
             reconnect_attempts = 0;
         }
 
@@ -1483,7 +1482,7 @@ mod tests {
             .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
         assert_eq!(
             client.send_audio(&[0.0]).unwrap_err(),
-            websocket_diagnostic(Code::CapacityExhausted).to_string(),
+            websocket_diagnostic(Code::Internal).to_string(),
         );
         assert!(client.user_disconnected.load(Ordering::SeqCst));
     }
@@ -1612,7 +1611,7 @@ mod tests {
                     } else {
                         SESSION_SETUP_TIMEOUT
                     },
-                    HEALTHY_SESSION_RESET_AFTER,
+                    tokio::time::Instant::now,
                 ),
             )
             .await
@@ -1713,8 +1712,7 @@ mod tests {
                 },
                 |_| Duration::ZERO,
                 SESSION_SETUP_TIMEOUT,
-                // The fixture confirms the stream, then closes it immediately.
-                Duration::ZERO,
+                || tokio::time::Instant::now() + crate::reconnect::HEALTHY_SESSION_RESET_AFTER,
             ),
         )
         .await

@@ -18,7 +18,11 @@
  * factory over hand-rolling the coalescer again.
  */
 import { Channel } from "@tauri-apps/api/core";
-import type { ChatStreamEvent, ChatTokenDoneEvent } from "../types";
+import type {
+  ChatStreamEvent,
+  ChatStreamFailedEvent,
+  ChatTokenDoneEvent,
+} from "../types";
 
 /** Mirrors `store/index.ts`'s `CHAT_DELTA_THROTTLE_MS` (~30fps, below the
  * human flicker threshold, above the observed provider burst rate). Exported
@@ -30,6 +34,8 @@ export const CHAT_STREAM_DELTA_THROTTLE_MS = 33;
 export interface ChatStreamCoalescerHandlers {
   onDelta: (delta: string, finishReason: string | undefined) => void;
   onDone: (event: ChatTokenDoneEvent) => void;
+  /** The stream failed. `event.full_text` is partial model output. */
+  onFailed: (event: ChatStreamFailedEvent) => void;
   /** @default CHAT_STREAM_DELTA_THROTTLE_MS */
   throttleMs?: number;
 }
@@ -39,8 +45,8 @@ export interface ChatStreamCoalescer {
   channel: Channel<ChatStreamEvent>;
   /**
    * Arms `requestId` once the starting `invoke` resolves. Synchronously
-   * drains any delta held while un-armed, then applies a `done` frame if one
-   * already landed (done-before-resolve ordering) — mirrors
+   * drains any delta held while un-armed, then applies a terminal frame if
+   * one already landed (terminal-before-resolve ordering) — mirrors
    * `sendChatMessage`'s own arm-then-drain sequencing exactly.
    */
   arm: (requestId: string) => void;
@@ -62,7 +68,10 @@ export function createChatStreamCoalescer(
 ): ChatStreamCoalescer {
   const throttleMs = handlers.throttleMs ?? CHAT_STREAM_DELTA_THROTTLE_MS;
   let requestId: string | null = null;
-  let doneEvent: ChatTokenDoneEvent | null = null;
+  let terminal:
+    | { event: "done"; data: ChatTokenDoneEvent }
+    | { event: "failed"; data: ChatStreamFailedEvent }
+    | null = null;
   let pendingDelta = "";
   let latestFinishReason: string | undefined;
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -95,11 +104,13 @@ export function createChatStreamCoalescer(
     }
     flush();
   };
-  const applyDone = () => {
-    if (doneEvent === null) return;
+  const applyTerminal = () => {
+    const current = terminal;
+    if (current === null) return;
     drainNow();
     terminated = true;
-    handlers.onDone(doneEvent);
+    if (current.event === "done") handlers.onDone(current.data);
+    else handlers.onFailed(current.data);
   };
 
   const channel = new Channel<ChatStreamEvent>();
@@ -110,8 +121,8 @@ export function createChatStreamCoalescer(
       if (msg.data.finish_reason) latestFinishReason = msg.data.finish_reason;
       scheduleFlush();
     } else {
-      doneEvent = msg.data;
-      if (requestId !== null) applyDone();
+      terminal = msg;
+      if (requestId !== null) applyTerminal();
     }
   };
 
@@ -120,7 +131,7 @@ export function createChatStreamCoalescer(
     arm: (id) => {
       requestId = id;
       drainNow();
-      if (doneEvent !== null) applyDone();
+      if (terminal !== null) applyTerminal();
     },
     disarm: () => {
       if (flushTimer !== null) {
