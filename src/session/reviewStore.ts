@@ -4,29 +4,29 @@
  *
  * Live stays in the global `useAudioGraphStore`, owned by the backend's one
  * live session. Review is deliberately a separate store with no subscription
- * to live content events: it calls the read-only `load_session` command
- * directly and holds the result here, so opening a past session while
- * capture runs can never write a Live field (`transcriptSegments`,
- * `speakers`, `diarizationSpanRevisions`, …) or rotate the live session.
+ * to live content events: it calls the read-only `load_session` command and the
+ * per-lens artifact commands directly and holds the results here, so opening a
+ * past session while capture runs can never write a Live field
+ * (`transcriptSegments`, `speakers`, `diarizationSpanRevisions`, …) or rotate
+ * the live session. Seek and edge-focus targets (the Timeline lens driving the
+ * Transcript and Graph lenses) live here too, for the same reason.
  *
  * Review is refreshable, not immutable: a reviewed session that is still
- * finalizing changes on disk (#169, ADR-0036), so `refresh()` re-queries on
- * open and on window focus (see `useReviewTranscript`).
+ * finalizing changes on disk (#169, ADR-0036). `useReviewTranscript` (the one
+ * owner of fetching) opens the session and re-queries on window focus and tab
+ * visibility; the rules below say what a query does. They are written once, at
+ * `executeRound`, and are the whole story: there is no per-kind sequencing and
+ * no generation counter beyond them. In short:
  *
- * Stale responses: every `select()` / `refresh()` takes a new selection
- * generation, and a response is applied only if its generation is still the
- * latest. That is what rejects the older reply in an A → B → A sequence even
- * though both A requests name the same session id.
- *
- * Heavy artifacts (Notes, Graph, Timeline) are fetched per lens, only when the
- * lens activates (`useReviewArtifact`), into their own slots. Every artifact
- * request is fenced twice: by the selection epoch (bumped whenever the
- * selected session changes, so an A → B → A sequence drops the first A's
- * reply) and by a per-kind sequence (the latest request for a kind wins).
- * A failed re-query keeps the slot's last good data and marks it `stale`.
- *
- * Seek and edge-focus targets (the Timeline lens driving the Transcript and
- * Graph lenses) live here too, so a Review never writes a Live field.
+ *   - the unit of reading is a ROUND: the snapshot and the open lens's artifact
+ *     (Notes, Graph or Timeline; the Transcript lens needs none), together;
+ *   - a round belongs to (selection epoch, lens open at its start) and is
+ *     dropped when the selection changes (the A, B, A case) or an explicit user
+ *     action supersedes it; passive triggers coalesce instead;
+ *   - a pair is replaced only when both reads succeed; a failure keeps the
+ *     previous pair, marked stale, and records itself on the failing lens;
+ *   - a timeline seek for a span the snapshot does not know stays pending until
+ *     a published snapshot maps it to a segment that exists.
  *
  * Errors are a CLOSED set (`ReviewErrorCode`): the backend's message is never
  * stored or rendered, because it can embed paths and artifact names. The one
@@ -294,6 +294,13 @@ interface InFlightRound {
    * its replies are dropped and it queues nothing behind it.
    */
   superseded: boolean;
+  /** The lens whose artifact this round reads (`null` = Transcript). */
+  kind: ArtifactKind | null;
+  /**
+   * What that lens's slot was before this round marked it `loading`, so a
+   * round that is replaced can hand the slot back instead of leaving it loading.
+   */
+  settledSlot: ArtifactSlot<never> | null;
   done: Promise<void>;
 }
 
@@ -311,12 +318,29 @@ export const useReviewStore = create<ReviewState>((set, get) => {
    * the next round that publishes a snapshot containing the span.
    */
   let pendingSeek: { spanId: string; request: number } | null = null;
-  /** The segment behind `spanId` in the published snapshot, if it knows it. */
+  /**
+   * The segment behind `spanId` in the published snapshot, or `null` while the
+   * snapshot cannot say. The transcript is derived from the LATEST revision of
+   * each span (highest `revision_number`; the first of two equal revisions
+   * stands), and the events carry the whole revision history, so the same rule
+   * picks the span's event here. The id is a target only if it is a segment
+   * that exists in the snapshot's transcript.
+   */
   const segmentForSpan = (spanId: string): string | null => {
-    const event = get().snapshot?.transcriptEvents.find(
-      (candidate) => candidate.span_id === spanId,
-    );
-    return event ? (event.transcript_segment_id ?? event.span_id) : null;
+    const snapshot = get().snapshot;
+    if (snapshot === null) return null;
+    let latest: TranscriptEvent | null = null;
+    for (const event of snapshot.transcriptEvents) {
+      if (event.span_id !== spanId) continue;
+      if (latest === null || event.revision_number > latest.revision_number) {
+        latest = event;
+      }
+    }
+    if (latest === null) return null;
+    const segmentId = latest.transcript_segment_id ?? latest.span_id;
+    return snapshot.transcript.some((segment) => segment.id === segmentId)
+      ? segmentId
+      : null;
   };
   const resolvePendingSeek = (): void => {
     const pending = pendingSeek;
@@ -372,6 +396,7 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     const before = get();
     const hadSnapshot = before.snapshot?.sessionId === sessionId;
     const previous = kind === null ? null : before.artifacts[kind];
+    round.settledSlot = previous as ArtifactSlot<never> | null;
     const anyReady = KINDS.some((k) => before.artifacts[k].status === "ready");
     // A consistent pair on screen: the snapshot with a ready artifact, or (for
     // a Transcript round) just the snapshot.
@@ -503,6 +528,37 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     }));
   };
 
+  /** Would `lens` show data that is missing or stale right now? */
+  const lensNeedsRound = (lens: ArtifactKind | null): boolean => {
+    const state = get();
+    if (state.sessionId === null) return false;
+    if (state.snapshot === null || state.stale) return true;
+    if (lens === null) return false;
+    const slot = state.artifacts[lens];
+    return slot.status !== "ready" || slot.stale;
+  };
+
+  /**
+   * A superseded round marked its lens's slot `loading`; if that lens is no
+   * longer the one a replacement reads, hand the slot back to what it was
+   * (idle, or its last good data) instead of leaving it loading.
+   */
+  const releaseAbandonedLens = (
+    old: InFlightRound,
+    replacementKind: ArtifactKind | null,
+  ): void => {
+    const lens = old.kind;
+    if (lens === null || lens === replacementKind || old.settledSlot === null) {
+      return;
+    }
+    const settled = old.settledSlot;
+    set((state) =>
+      state.artifacts[lens].status === "loading"
+        ? { artifacts: { ...state.artifacts, [lens]: settled } }
+        : {},
+    );
+  };
+
   /**
    * Start a round for the lens that is open now.
    *
@@ -522,11 +578,14 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         return inFlight.done;
       }
       inFlight.superseded = true;
+      releaseAbandonedLens(inFlight, activeKind);
     }
     const round: InFlightRound = {
       epoch,
       trailing: false,
       superseded: false,
+      kind: activeKind,
+      settledSlot: null,
       done: Promise.resolve(),
     };
     inFlight = round;
@@ -630,10 +689,11 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     },
     activateLens: (lens) => {
       activeKind = lens;
-      // Opening the Transcript lens needs no artifact, so with no round in
-      // flight there is nothing to do; with one in flight it belongs to the
-      // lens that was just left, so replace it (snapshot alone).
-      if (lens === null && inFlight === null) return Promise.resolve();
+      // With a round in flight it belongs to the lens just left: replace it.
+      // With none in flight, a round starts only if what the lens now open
+      // would show is missing or stale (Transcript: the snapshot alone); a
+      // lens whose data is fresh starts nothing.
+      if (inFlight === null && !lensNeedsRound(lens)) return Promise.resolve();
       return requestRound(true);
     },
     refresh: (options) => requestRound(options?.explicit === true),

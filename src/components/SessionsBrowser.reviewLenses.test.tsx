@@ -588,7 +588,10 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
       expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
         "session-a-1",
       );
-      fireEvent.click(screen.getByTestId("seek-timeline-edge-badge"));
+      const badge = screen.getByTestId("seek-timeline-edge-badge");
+      badge.focus();
+      expect(document.activeElement).toBe(badge);
+      fireEvent.click(badge); // what Enter / Space do on a button
       expect(useReviewStore.getState().graphEdgeFocus?.edgeIds).toEqual([
         "edge-1",
       ]);
@@ -603,6 +606,10 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
         "true",
       );
       await expectLensShows("graph", "session-a");
+      // The badge unmounted with the Timeline lens: focus moved to the Graph tab.
+      expect(document.activeElement).toBe(
+        screen.getByRole("tab", { name: /^graph$/i }),
+      );
 
       // Opening the Transcript lens consumes Review's target.
       await openLens("transcript");
@@ -676,6 +683,9 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
     function snapshotWith(id: string, spans: string[]) {
       return {
         ...loadSessionPayload(id),
+        transcript: spans.map((span) =>
+          segment(span.replace("span", "seg"), `transcript of ${id}`),
+        ),
         transcript_events: spans.map((span) =>
           transcriptEvent(span, span.replace("span", "seg")),
         ),

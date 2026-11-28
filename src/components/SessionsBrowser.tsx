@@ -869,11 +869,25 @@ function SessionDetail({
   // reads only Review's store, never a Live field.
   const edgeFocusNonce = useReviewStore((s) => s.graphEdgeFocus?.nonce ?? null);
   const seenEdgeFocus = useRef(edgeFocusNonce);
+  const focusGraphTab = useRef(false);
   useEffect(() => {
     if (edgeFocusNonce === seenEdgeFocus.current) return;
     seenEdgeFocus.current = edgeFocusNonce;
-    if (edgeFocusNonce !== null && reviewLensId !== null) setLens("graph");
+    if (edgeFocusNonce !== null && reviewLensId !== null) {
+      focusGraphTab.current = true;
+      setLens("graph");
+    }
   }, [edgeFocusNonce, reviewLensId]);
+  // The badge that was activated is gone with the Timeline lens: when focus
+  // fell to the body, move it to the Graph tab (never if the user moved it).
+  useEffect(() => {
+    if (!focusGraphTab.current || lens !== "graph") return;
+    focusGraphTab.current = false;
+    const active = document.activeElement;
+    if (active === null || active === document.body) {
+      document.getElementById("sessions-lens-tab-graph")?.focus();
+    }
+  }, [lens]);
   if (liveRunning && row && !samplePreviewActive && !reviewableWhileLive(row)) {
     return (
       <section

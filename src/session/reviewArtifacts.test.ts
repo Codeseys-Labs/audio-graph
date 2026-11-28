@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type ArtifactKind, useReviewStore } from "./reviewStore";
-import { type Deferred, deferred, loadedSession } from "./reviewTestUtils";
+import {
+  type Deferred,
+  deferred,
+  loadedSession,
+  segment,
+} from "./reviewTestUtils";
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -377,6 +382,61 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       await Promise.resolve();
       await store.refresh({ explicit: true }); // a retry click
       expect(artifacts().notes.status).toBe("ready");
+    });
+
+    it("starts a snapshot-only round when switching to Transcript right after a Notes refresh failed, and only then", async () => {
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          return sessionPayload(id, ["first", "refreshed", "fresh"][nth - 1]);
+        }
+        if (cmd === COMMAND.notes && nth === 2) throw new Error("hiccup");
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+      await store.refresh(); // snapshot succeeds, Notes fails: nothing published
+      expect(useReviewStore.getState().stale).toBe(true);
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "first",
+      );
+      const loadsBefore = countOf("load_session");
+
+      await store.activateLens(null); // no round in flight, Transcript is stale
+
+      expect(countOf("load_session") - loadsBefore).toBe(1);
+      expect(countOf(COMMAND.notes)).toBe(2); // the Transcript round reads no artifact
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "fresh",
+      );
+      expect(useReviewStore.getState().stale).toBe(false);
+    });
+
+    it("starts nothing when switching to a lens whose data is fresh", async () => {
+      backend(standard);
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+      await store.activateLens(null);
+      await store.activateLens("notes");
+      expect(countOf("load_session")).toBe(1);
+      expect(countOf(COMMAND.notes)).toBe(1);
+    });
+
+    it("hands an abandoned lens's slot back to its settled state when its round is replaced and fails", async () => {
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session" && nth >= 3) throw new Error("hiccup");
+        if (cmd === COMMAND.notes) return new Promise(() => {}); // hangs
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a"); // Transcript: a snapshot only
+      void store.activateLens("notes"); // first Notes read: slot is loading
+      await Promise.resolve();
+      expect(artifacts().notes.status).toBe("loading");
+
+      await store.activateLens(null); // replaced by a Transcript round that fails
+
+      expect(artifacts().notes.status).toBe("idle"); // not left "loading"
+      expect(useReviewStore.getState().stale).toBe(true);
     });
 
     it("keeps passive triggers coalescing: focus does not supersede a round in flight", async () => {
@@ -785,9 +845,14 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
         if (cmd === "load_session") {
           const payload = sessionPayload(id);
           return nth === 1
-            ? { ...payload, transcript_events: [eventFor("span-1", "seg-1")] }
+            ? {
+                ...payload,
+                transcript: [segment("seg-1", "one")],
+                transcript_events: [eventFor("span-1", "seg-1")],
+              }
             : {
                 ...payload,
+                transcript: [segment("seg-1", "one"), segment("seg-2", "two")],
                 transcript_events: [
                   eventFor("span-1", "seg-1"),
                   eventFor("span-2", "seg-2"),
@@ -810,6 +875,10 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
     function snapshotWithSpans(id: string, spans: string[]) {
       return {
         ...sessionPayload(id),
+        // The transcript holds the segment each span's latest revision names.
+        transcript: spans.map((span) =>
+          segment(span.replace("span", "seg"), `text of ${span}`),
+        ),
         transcript_events: spans.map((span) =>
           eventFor(span, span.replace("span", "seg")),
         ),
@@ -937,6 +1006,56 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       store.seekTranscriptToSegment(null);
       await store.select("sess-b", "timeline");
       expect(useReviewStore.getState().transcriptSeekTarget).toBeNull();
+    });
+
+    it("resolves a span by its LATEST revision, and never to a segment the transcript lacks", async () => {
+      const partial = {
+        ...eventFor("span-2", "ignored"),
+        transcript_segment_id: null,
+        is_final: false,
+        stability: "partial",
+        revision_number: 1,
+      };
+      const final = {
+        ...eventFor("span-2", "seg-2"),
+        revision_number: 2,
+      };
+      const orphan = {
+        ...eventFor("span-3", "seg-9"), // names a segment the transcript lacks
+        revision_number: 1,
+      };
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          if (nth === 1) return snapshotWithSpans(id, ["span-1"]);
+          const payload = snapshotWithSpans(id, ["span-1"]);
+          return {
+            ...payload,
+            transcript: [segment("seg-1", "one"), segment("seg-2", "two")],
+            // The revision history: the partial (no segment id) comes first.
+            transcript_events: [
+              ...payload.transcript_events,
+              partial,
+              final,
+              orphan,
+            ],
+          };
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "timeline");
+
+      await store.seekToSpan("span-2", null);
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-2",
+      );
+
+      // A span whose latest revision names a segment that does not exist is not
+      // a target: the seek stays pending and the target is unchanged.
+      await store.seekToSpan("span-3", null);
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-2",
+      );
     });
 
     it("does not seek when the selection changed while it refreshed", async () => {
