@@ -980,7 +980,8 @@
       "accessDenied": "Credenciais AWS válidas, mas sem permissão para {{permission}}. Peça a um administrador para anexar esta ação à sua política IAM e tente novamente.",
       "regionNotSupported": "AWS Transcribe não está habilitado na região '{{region}}'. Tente us-east-1, us-west-2 ou eu-west-1 em Configurações → AWS.",
       "networkUnreachable": "Não foi possível acessar o endpoint do AWS Transcribe — verifique sua conexão com a internet, configurações de proxy ou VPN.",
-      "unknown": "Erro inesperado da AWS: {{message}}"
+      "unknown": "Erro inesperado da AWS: {{message}}",
+      "unknownGeneric": "Erro inesperado da AWS. Verifique Configurações → AWS e tente novamente."
     }
   },
   "storage": {

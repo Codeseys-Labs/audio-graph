@@ -980,7 +980,8 @@
       "accessDenied": "AWS credentials are valid but lack permission for {{permission}}. Ask an administrator to attach this action to your IAM policy, then try again.",
       "regionNotSupported": "AWS Transcribe is not enabled in region '{{region}}'. Try us-east-1, us-west-2, or eu-west-1 in Settings → AWS.",
       "networkUnreachable": "Cannot reach the AWS Transcribe endpoint — check your internet connection, proxy settings, or VPN.",
-      "unknown": "Unexpected AWS error: {{message}}"
+      "unknown": "Unexpected AWS error: {{message}}",
+      "unknownGeneric": "Unexpected AWS error. Check Settings → AWS and try again."
     }
   },
   "storage": {
