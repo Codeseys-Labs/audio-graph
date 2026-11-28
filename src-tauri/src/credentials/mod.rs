@@ -2031,7 +2031,7 @@ mod tests {
                 ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
                 PROTECTED_DACL_SECURITY_INFORMATION,
             },
-            Storage::FileSystem::WRITE_DAC,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
         };
         let path =
             std::env::temp_dir().join(format!("canary-birch-path-{}.yaml", uuid::Uuid::new_v4()));
@@ -2039,7 +2039,7 @@ mod tests {
         fs::write(&path, original).unwrap();
         // Hold the right to restore the ACL before denying subsequent read opens.
         let file = fs::OpenOptions::new()
-            .access_mode(WRITE_DAC.0)
+            .access_mode(READ_CONTROL.0 | WRITE_DAC.0)
             .open(&path)
             .unwrap();
         let mut acl = ACL::default();
