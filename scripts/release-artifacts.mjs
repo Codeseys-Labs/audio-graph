@@ -9,7 +9,7 @@ import {
     readFileSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 // Match the active targets in src-tauri/tauri.conf.json. Read only the
 // deliverables directly under their bundle directories, leaving staging trees out.
@@ -34,6 +34,67 @@ const platforms = {
 const metadataName = (platform) => "rsac-" + platform + ".txt";
 const inventoryName = (platform) => "artifacts-" + platform + ".sha256";
 const downloadPrefix = "release-build-";
+const macIcon = "icons/icon.icns";
+const appleIconTypes = new Set(["ic07", "ic08", "ic09", "ic10", "ic11", "ic12", "ic13", "ic14"]);
+const icnsHeaderSize = 8;
+
+function hasAppleIcon(bytes) {
+    if (
+        bytes.length < icnsHeaderSize ||
+        bytes.toString("latin1", 0, 4) !== "icns" ||
+        bytes.readUInt32BE(4) !== bytes.length
+    ) {
+        return false;
+    }
+
+    // ICNS stores a FourCC and a big-endian length (including the header) for each chunk.
+    let hasIcon = false;
+    for (let offset = icnsHeaderSize; offset < bytes.length;) {
+        if (bytes.length - offset < icnsHeaderSize) {
+            return false;
+        }
+        const size = bytes.readUInt32BE(offset + 4);
+        if (size < icnsHeaderSize || size > bytes.length - offset) {
+            return false;
+        }
+        const type = bytes.toString("latin1", offset, offset + 4);
+        if (appleIconTypes.has(type)) {
+            if (size === icnsHeaderSize) {
+                return false;
+            }
+            hasIcon = true;
+        }
+        offset += size;
+    }
+    return hasIcon;
+}
+
+function configure() {
+    const tauri = "src-tauri";
+    const configPath = join(tauri, "tauri.conf.json");
+    const icons = JSON.parse(readFileSync(configPath, "utf8")).bundle?.icon;
+    if (
+        !Array.isArray(icons) ||
+        icons.length === 0 ||
+        icons.some((icon) => typeof icon !== "string" || icon.trim().length === 0)
+    ) {
+        throw new Error(`${configPath} must declare bundle.icon as a non-empty array of paths.`);
+    }
+    const paths = icons.map((icon) => resolve(tauri, icon));
+    const icnsPath = resolve(tauri, macIcon);
+    if (!paths.includes(icnsPath)) {
+        throw new Error(`${configPath} must include ${macIcon} in bundle.icon.`);
+    }
+    for (const path of paths) {
+        requiredSize(path);
+    }
+    if (!hasAppleIcon(readFileSync(icnsPath))) {
+        throw new Error(`${icnsPath} must be an ICNS file with a valid Apple icon type (ic07–ic14).`);
+    }
+
+    // Tauri's config merge preserves bundle.icon and bundle.targets from the base config.
+    process.stdout.write(`${JSON.stringify({ bundle: { active: true } })}\n`);
+}
 
 function deliverables(root, platform) {
     if (!Object.hasOwn(platforms, platform)) {
@@ -132,10 +193,12 @@ async function verifyDownloads() {
 }
 
 const [mode, platform] = process.argv.slice(2);
-if (mode === "stage") {
+if (mode === "configure") {
+    configure();
+} else if (mode === "stage") {
     await stage(platform);
 } else if (mode === "verify") {
     await verifyDownloads();
 } else {
-    throw new Error("Expected stage <platform> or verify.");
+    throw new Error("Expected configure, stage <platform>, or verify.");
 }

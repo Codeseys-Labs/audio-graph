@@ -334,10 +334,7 @@ jobs:
       - name: Configure release packaging
         working-directory: audio-graph
         shell: bash
-        # Tauri skips bundling by default. AppImage also needs a square PNG
-        # declared in bundle.icon. Keep bundle.targets from tauri.conf.json.
-        run: |
-          printf '%s\n' '{"bundle":{"active":true,"icon":["icons/icon.png","icons/icon.ico"]}}' > tauri.release.conf.json
+        run: node scripts/release-artifacts.mjs configure > tauri.release.conf.json
 
       - name: Build + sign via tauri-action
         if: needs.prepare.outputs.publish == 'true'
