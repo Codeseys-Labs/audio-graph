@@ -96,7 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `private.gguf` for `/home/name/private.gguf`); a model at a remote endpoint
   keeps its provider's identifier. Sessions saved before this fix are read and
   exported the same way, and a local model whose stored path cannot be reduced
-  to a name shows as `local-model`; their files are not rewritten (#540).
+  to a name shows as `local-model`; their files are not rewritten (#540). A
+  record that says where its model ran in a form this version does not know
+  is read as one that does not say, instead of failing to load.
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw
@@ -107,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was started under (zero data retention, deny data collection, provider
   pinning) when settings are saved while it starts. A provider switch at that
   moment could send the prompt to OpenRouter without them (#519).
+- Notes synthesis, notes and graph projections, and entity extraction are no
+  longer sent under provider settings saved after the work was queued. Saving
+  looser OpenRouter routing while the work waited, or between a projection's
+  draft and its repair, could send it without the restrictions it was queued
+  under. A later save that changes the provider's endpoint, model, key,
+  routing or privacy setting now stops work that is still queued, and stops a
+  retry, a repair or a redirect that has not been sent yet. A request already
+  on its way is not stopped. The HTTP client no longer resends a request on
+  its own when an HTTP/2 server refuses it; the app's own retry does, after
+  the same check. Notes synthesis is also refused when those settings change
+  between its approval and its start (#551).
+- A projection whose worker ended after its request was sent is now recorded
+  under the destination it was sent to, not the one the session started with
+  (#551).
 
 ## [0.1.0-rc.1] - 2026-05-20
 
