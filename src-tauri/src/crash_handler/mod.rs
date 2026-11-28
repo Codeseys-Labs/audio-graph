@@ -27,6 +27,7 @@ pub enum RedactedPanicOp {
     LegacyFileWrite,
     LegacyStateIo,
     CredentialBoundary,
+    LlmClientBuild,
 }
 
 impl RedactedPanicOp {
@@ -39,6 +40,7 @@ impl RedactedPanicOp {
             Self::LegacyFileWrite => "credential.legacy_file_write",
             Self::LegacyStateIo => "credential.legacy_state_io",
             Self::CredentialBoundary => "credential.boundary",
+            Self::LlmClientBuild => "llm.client_build",
         }
     }
 }
