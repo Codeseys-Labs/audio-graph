@@ -64,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start. A failure names the source and a closed reason, without device or
   driver text. Sessions can't be loaded into the store while a start is
   pending.
+- A panic inside one LLM executor job no longer leaves other jobs waiting
+  forever. That job and the jobs queued behind it end at once (notes synthesis
+  and projection with an error, entity extraction with its rule-based
+  fallback), and the next job starts a new worker (#539).
+- ASR sessions that fail soon after readiness now consume the reconnect budget.
+  Deepgram preserves an intentional stop during final transcript drain. Soniox
+  stops replaced connections and opens a fresh session after a duration limit.
+  WebSocket size and buffer errors no longer report account capacity exhaustion.
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
@@ -73,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WireResponse` bytes plus vendor confidence stay untouched.
 - Updated `cookie` to 0.18.3 to prevent private-cookie nonce reuse after a fork
   ([RUSTSEC-2026-0594](https://rustsec.org/advisories/RUSTSEC-2026-0594)).
+- An OpenRouter chat or question-card answer keeps the routing restrictions it
+  was started under (zero data retention, deny data collection, provider
+  pinning) when settings are saved while it starts. A provider switch at that
+  moment could send the prompt to OpenRouter without them (#519).
 
 ## [0.1.0-rc.1] - 2026-05-20
 

@@ -927,12 +927,13 @@ fn emit_session_terminated_once(
 /// reconnect logic. Mirrors the Deepgram `session_task` structure — see
 /// comments there for full design rationale.
 async fn session_task(ctx: AssemblyAISessionCtx) {
-    session_task_with_backoff(ctx, Duration::from_secs).await;
+    session_task_with_backoff(ctx, Duration::from_secs, tokio::time::Instant::now).await;
 }
 
 async fn session_task_with_backoff(
     ctx: AssemblyAISessionCtx,
     backoff_duration: impl Fn(u64) -> Duration,
+    now: impl Fn() -> tokio::time::Instant,
 ) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
@@ -959,6 +960,7 @@ async fn session_task_with_backoff(
             entries.fetch_add(1, Ordering::SeqCst);
         }
 
+        let mut ready_at = None;
         let disconnect = run_io(
             &mut writer,
             &mut reader,
@@ -968,8 +970,8 @@ async fn session_task_with_backoff(
             &pending_chunks,
             &write_guard,
             Some(|| {
+                ready_at = Some(now());
                 if reconnect_attempts > 0 {
-                    reconnect_attempts = 0;
                     connected.store(true, Ordering::SeqCst);
                     terminated_emitted.store(false, Ordering::SeqCst);
                     let _ = event_tx.send(AssemblyAIEvent::Reconnected);
@@ -979,6 +981,9 @@ async fn session_task_with_backoff(
         .await;
 
         connected.store(false, Ordering::SeqCst);
+        if crate::reconnect::should_reset_reconnect_budget(ready_at, &now) {
+            reconnect_attempts = 0;
+        }
 
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
@@ -1351,14 +1356,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhausts_budget_when_every_socket_closes_before_readiness() {
-        use super::super::diagnostic_tests::close_before_readiness;
+        assert_reconnect_exhausts_when_sockets_flap(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhausts_budget_when_confirmed_sockets_flap() {
+        assert_reconnect_exhausts_when_sockets_flap(true).await;
+    }
+
+    async fn assert_reconnect_exhausts_when_sockets_flap(confirmed: bool) {
+        use super::super::diagnostic_tests::{close_each_attempt, session_clock};
         use std::sync::atomic::AtomicUsize;
 
         let (initial_url, initial) =
             ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
         let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let steps = if confirmed {
+            vec![ws_fixture::ServerStep::send_text(
+                r#"{"type":"Begin","id":"loopback session","expires_at":1800000000}"#,
+            )]
+        } else {
+            Vec::new()
+        };
         let (endpoints, servers): (Vec<_>, Vec<_>) =
-            close_before_readiness(false).await.into_iter().unzip();
+            close_each_attempt(steps).await.into_iter().unzip();
         let budget = endpoints.len();
         let attempts = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&attempts);
@@ -1384,6 +1405,7 @@ mod tests {
                     run_io_entries: None,
                 },
                 |_| Duration::ZERO,
+                session_clock(Duration::from_secs(1)),
             ),
         )
         .await
@@ -1395,7 +1417,23 @@ mod tests {
             server.await.unwrap();
         }
         let events: Vec<_> = event_rx.try_iter().collect();
-        let (retry_events, terminal) = events.split_at(budget);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AssemblyAIEvent::Reconnected))
+                .count(),
+            if confirmed { budget } else { 0 },
+        );
+        let ladder_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    AssemblyAIEvent::Reconnected | AssemblyAIEvent::ServerMessage { .. }
+                )
+            })
+            .collect();
+        let (retry_events, terminal) = ladder_events.split_at(budget);
         assert!(
             retry_events
                 .iter()
@@ -1461,6 +1499,9 @@ mod tests {
                     run_io_entries: None,
                 },
                 |_| Duration::ZERO,
+                super::super::diagnostic_tests::session_clock(
+                    crate::reconnect::HEALTHY_SESSION_RESET_AFTER + Duration::from_secs(1),
+                ),
             ),
         )
         .await

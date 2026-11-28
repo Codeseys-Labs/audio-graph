@@ -3907,8 +3907,6 @@ fn stream_backend_handles_from_state(
 ) -> crate::llm::streaming::StreamBackendHandles {
     crate::llm::streaming::StreamBackendHandles::new(
         state.llm_engine.clone(),
-        state.api_client.clone(),
-        state.openrouter_client.clone(),
         state.mistralrs_engine.clone(),
     )
 }
@@ -3970,7 +3968,7 @@ fn stream_params_from_settings(
 
 /// Spawn the streaming-chat task for `request_id`.
 ///
-/// Drives `crate::llm::streaming::stream_chat` to completion, sending one
+/// Drives `crate::llm::streaming::stream_chat_with_request` to completion, sending one
 /// [`crate::llm::streaming::ChatStreamEvent::Delta`] per
 /// [`crate::llm::streaming::TokenDelta::Delta`] and exactly one terminal
 /// `Done` (completed or cancelled) or `Failed` frame over the per-invocation
@@ -4024,14 +4022,20 @@ fn spawn_stream_task(
         user_turn,
         history_generation,
     } = prepared;
-    let request = StreamChatRequest::new(provider, messages, graph_context, params)
-        .with_content_egress_policy(content_egress_policy)
-        .with_backend_handles(stream_backend_handles_from_state(state))
-        .with_source_metadata(StreamSourceMetadata {
-            session_id: Some(session_id_for_usage.clone()),
-            source_id: None,
-            request_id: Some(request_id.clone()),
-        });
+    let request = StreamChatRequest::new(
+        provider,
+        settings.openrouter_routing_policy.clone(),
+        messages,
+        graph_context,
+        params,
+    )
+    .with_content_egress_policy(content_egress_policy)
+    .with_backend_handles(stream_backend_handles_from_state(state))
+    .with_source_metadata(StreamSourceMetadata {
+        session_id: Some(session_id_for_usage.clone()),
+        source_id: None,
+        request_id: Some(request_id.clone()),
+    });
     let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
 
@@ -4377,14 +4381,20 @@ pub async fn send_chat_message(
             &settings,
             requires_cloud_content_transfer,
         );
-        let request = StreamChatRequest::new(llm_provider, messages, graph_context, params)
-            .with_content_egress_policy(content_egress_policy)
-            .with_backend_handles(stream_backend_handles_from_state(state.inner()))
-            .with_source_metadata(StreamSourceMetadata {
-                session_id: Some(state.current_session_id()),
-                source_id: None,
-                request_id: None,
-            });
+        let request = StreamChatRequest::new(
+            llm_provider,
+            settings.openrouter_routing_policy.clone(),
+            messages,
+            graph_context,
+            params,
+        )
+        .with_content_egress_policy(content_egress_policy)
+        .with_backend_handles(stream_backend_handles_from_state(state.inner()))
+        .with_source_metadata(StreamSourceMetadata {
+            session_id: Some(state.current_session_id()),
+            source_id: None,
+            request_id: None,
+        });
         // This blocking shim drains the stream to completion and does not expose
         // cancellation. Dropping a CancellationToken does not fire it; this
         // binding only keeps the stream infrastructure intact.
@@ -6339,6 +6349,7 @@ fn spawn_card_answer_stream_task(
     );
     let request = crate::llm::streaming::StreamChatRequest::new(
         provider,
+        settings.openrouter_routing_policy.clone(),
         materials.messages,
         materials.graph_context,
         params,
@@ -29137,5 +29148,202 @@ mod tests {
              Busy refusal — got {} card(s)",
             current.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #519: a stream keeps the OpenRouter routing policy it was admitted
+    // under. Each test drives the real caller on a current-thread runtime, so
+    // the hook armed below runs on the stream task, between admission and the
+    // HTTP body being built.
+    // -----------------------------------------------------------------------
+
+    const OPENROUTER_ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+                                     data: [DONE]\n\n";
+
+    /// Select OpenRouter at `base_url` under zero data retention and deny data
+    /// collection, with no legacy provider order.
+    fn select_restricted_openrouter(state: &AppState, base_url: String) {
+        let mut settings = state
+            .app_settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        settings.llm_provider = crate::settings::LlmProvider::OpenRouter {
+            model: "test-model".to_string(),
+            base_url,
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: "sk-test".to_string(),
+        };
+        settings.openrouter_routing_policy = Some(openrouter::OpenRouterRoutingPolicy {
+            data_collection: Some(openrouter::OpenRouterDataCollectionPolicy::Deny),
+            zdr: Some(true),
+            ..Default::default()
+        });
+    }
+
+    /// Arm a settings save that switches provider, to land after the next
+    /// stream request is admitted and before its HTTP body is built. The save
+    /// sets the returned flag if the slot it empties still held the restricted
+    /// client that admission synced.
+    fn save_a_provider_switch_before_the_body_is_built(
+        state: &AppState,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let saved_over_the_admitted_client = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saved_over_the_admitted_client.clone();
+        let settings = state.app_settings.clone();
+        let api_client = state.api_client.clone();
+        let openrouter_client = state.openrouter_client.clone();
+        crate::llm::streaming::before_next_request_build(move || {
+            let admitted_client_was_live = lock_client_cache(&openrouter_client)
+                .as_ref()
+                .is_some_and(|client| client.config().routing_policy.is_some());
+            {
+                let mut saved = settings.write().unwrap_or_else(|e| e.into_inner());
+                saved.llm_provider = crate::settings::LlmProvider::LocalLlama;
+                saved.openrouter_routing_policy = None;
+            }
+            sync_llm_clients_from_settings_cache(&settings, &api_client, &openrouter_client)
+                .expect("sync the client caches after the save");
+            flag.store(
+                admitted_client_was_live,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+        saved_over_the_admitted_client
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime")
+    }
+
+    /// The save ran after admission, and the request still reached the
+    /// original endpoint carrying the restrictions it was admitted under.
+    async fn assert_restrictions_reached_the_endpoint(
+        state: &AppState,
+        saved_over_the_admitted_client: &std::sync::atomic::AtomicBool,
+        request_body: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    ) {
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), request_body)
+            .await
+            .expect("the request must reach the endpoint")
+            .expect("the endpoint captured the request body");
+        assert!(
+            saved_over_the_admitted_client.load(std::sync::atomic::Ordering::SeqCst),
+            "the save must land after admission synced the restricted client"
+        );
+        assert!(
+            lock_client_cache(&state.openrouter_client).is_none(),
+            "the save must have emptied the shared OpenRouter slot"
+        );
+        assert_eq!(
+            body["provider"],
+            serde_json::json!({ "data_collection": "deny", "zdr": true })
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn streaming_chat_keeps_its_admitted_openrouter_routing_policy() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("openrouter-policy-streaming-chat");
+        let _guard = HomeGuard::set(&dir);
+        let app_handle = crate::speech::shared_test_app_handle();
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+
+        current_thread_runtime().block_on(async {
+            let (base_url, request_body) =
+                crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
+            select_restricted_openrouter(&state, base_url);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
+
+            start_streaming_chat(
+                "What changed in the roadmap?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                manager.state::<AppState>(),
+            )
+            .await
+            .expect("the chat is admitted");
+
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn accumulating_chat_keeps_its_admitted_openrouter_routing_policy() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("openrouter-policy-accumulating-chat");
+        let _guard = HomeGuard::set(&dir);
+        let app_handle = crate::speech::shared_test_app_handle();
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+
+        current_thread_runtime().block_on(async {
+            let (base_url, request_body) =
+                crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
+            select_restricted_openrouter(&state, base_url);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
+
+            let reply = send_chat_message(
+                "What changed in the roadmap?".to_string(),
+                app_handle,
+                manager.state::<AppState>(),
+            )
+            .await
+            .expect("the chat completes");
+            assert_eq!(reply.message.content, "ok");
+
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn question_card_answer_keeps_its_admitted_openrouter_routing_policy() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("openrouter-policy-card-answer");
+        let _guard = HomeGuard::set(&dir);
+        let app_handle = crate::speech::shared_test_app_handle();
+        let state = AppState::new();
+
+        current_thread_runtime().block_on(async {
+            let (base_url, request_body) =
+                crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
+            select_restricted_openrouter(&state, base_url);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
+
+            dispatch_ask_question_card(
+                "What changed in the roadmap?".to_string(),
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the question card is minted and its answer dispatched");
+
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
+        });
     }
 }

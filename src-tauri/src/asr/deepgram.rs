@@ -1177,12 +1177,13 @@ fn spawn_session_task(
 }
 
 async fn session_task(ctx: DeepgramSessionCtx) {
-    session_task_with_backoff(ctx, Duration::from_secs).await;
+    session_task_with_backoff(ctx, Duration::from_secs, tokio::time::Instant::now).await;
 }
 
 async fn session_task_with_backoff(
     ctx: DeepgramSessionCtx,
     backoff_duration: impl Fn(u64) -> Duration,
+    now: impl Fn() -> tokio::time::Instant,
 ) {
     let DeepgramSessionCtx {
         writer: initial_writer,
@@ -1211,6 +1212,8 @@ async fn session_task_with_backoff(
             entries.fetch_add(1, Ordering::SeqCst);
         }
 
+        let ready_at = Some(now());
+
         // Drive reader + writer concurrently until one side signals we are
         // done. `run_io` is responsible for pumping audio out and transcripts
         // back until the socket breaks or the caller sends `AudioCmd::Stop`.
@@ -1228,6 +1231,9 @@ async fn session_task_with_backoff(
         // Any fresh disconnect resets to the "actively down" state so
         // `send_audio()` correctly starts rejecting while we recover.
         connected.store(false, Ordering::SeqCst);
+        if crate::reconnect::should_reset_reconnect_budget(ready_at, &now) {
+            reconnect_attempts = 0;
+        }
 
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
@@ -1338,7 +1344,6 @@ async fn session_task_with_backoff(
                             disconnected_emitted.store(false, Ordering::SeqCst);
                             log::info!("Deepgram session: reconnected on attempt {attempt}");
                             let _ = event_tx.send(DeepgramEvent::Reconnected);
-                            reconnect_attempts = 0;
                             break true;
                         }
                         Err(diag) => {
@@ -1369,9 +1374,9 @@ async fn session_task_with_backoff(
 
 /// After we have sent the `Terminal` (empty-binary `CloseStream`) frame,
 /// keep reading through the SAME message-handling path the live loop uses
-/// (`handle_server_message` — transcript parsing, policy
+/// (`process_server_message` — transcript parsing, policy
 /// classification, event emission, all unchanged) until either the server
-/// sends its own WS Close frame or `deadline` elapses.
+/// sends a terminal error or its own WS Close frame, or `deadline` elapses.
 ///
 /// This is a free function — factored out of the `Some(AudioCmd::Stop)` /
 /// `None` arms below — purely so a unit test can drive it directly with a
@@ -1420,7 +1425,9 @@ async fn drain_after_terminal(
                         // Same handling path as the live loop: a final
                         // transcript the server flushes in response to
                         // Terminal lands exactly like a live-phase message.
-                        handle_server_message(&text, event_tx);
+                        if process_server_message(&text, event_tx).is_some() {
+                            return;
+                        }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
                         // Protocol-level frames; nothing to do.
@@ -1605,6 +1612,9 @@ async fn run_io_with_keepalive_interval(
                 match result {
                     Ok(Message::Text(text)) => {
                         if let Some(message) = process_server_message(&text, event_tx) {
+                            if user_disconnected.load(Ordering::SeqCst) {
+                                return DisconnectKind::UserRequested;
+                            }
                             return DisconnectKind::TerminalError(message);
                         }
                     }
@@ -1645,6 +1655,7 @@ async fn run_io_with_keepalive_interval(
 }
 
 /// Parse a single Deepgram server JSON message and emit appropriate events.
+#[cfg(test)]
 pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
     if let Some(message) = process_server_message(text, tx) {
         let _ = tx.send(DeepgramEvent::Error { message });
@@ -3755,6 +3766,50 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_frame_during_user_stop_is_a_clean_disconnect() {
+        for drain_started in [false, true] {
+            let mut steps = Vec::new();
+            if drain_started {
+                steps.push(ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()));
+            }
+            steps.push(ws_fixture::ServerStep::send_text(
+                r#"{"type":"Error","err_code":"INVALID_AUTH","description":"private stop note"}"#,
+            ));
+            if drain_started {
+                steps.push(ws_fixture::ServerStep::expect_close());
+            }
+            let (url, server) = ws_fixture::spawn_scripted_server(steps).await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            if drain_started {
+                audio_tx.send(AudioCmd::Stop).unwrap();
+            }
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                session_task(DeepgramSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config("nova-3"),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(true)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    reconnect_opener: Some(Arc::new(|_| panic!("user stop must not reconnect"))),
+                    run_io_entries: None,
+                }),
+            )
+            .await
+            .expect("stop must complete after the terminal frame");
+            server.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(matches!(events.as_slice(), [DeepgramEvent::Disconnected]));
+        }
+    }
+
     /// (a) + (c) + (d) + (e), Stop arm: `run_io`'s `Some(AudioCmd::Stop)` arm
     /// keeps reading through the normal handler path after `Terminal`, emits
     /// the server's drained final exactly once, resolves fast via the
@@ -4315,6 +4370,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhausts_budget_when_confirmed_sockets_flap() {
+        use super::super::diagnostic_tests::{close_each_attempt, session_clock};
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let (endpoints, peers): (Vec<_>, Vec<_>) =
+            close_each_attempt(Vec::new()).await.into_iter().unzip();
+        let budget = endpoints.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            session_task_with_backoff(
+                DeepgramSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config("nova-3"),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+                session_clock(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("flapping upgrades must exhaust the budget");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), budget);
+        initial.await.unwrap();
+        for peer in peers {
+            peer.await.unwrap();
+        }
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                    _ => None,
+                })
+                .eq(1..=budget as u32)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DeepgramEvent::Reconnected))
+                .count(),
+            budget
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [.., DeepgramEvent::Disconnected, DeepgramEvent::Error { message }]
+                if *message == websocket_diagnostic(Code::ProviderUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhaustion_reports_last_open_error_from_the_current_outage() {
         use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
         use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
@@ -4359,6 +4485,9 @@ mod tests {
                     run_io_entries: None,
                 },
                 |_| Duration::ZERO,
+                super::super::diagnostic_tests::session_clock(
+                    crate::reconnect::HEALTHY_SESSION_RESET_AFTER + Duration::from_secs(1),
+                ),
             ),
         )
         .await
