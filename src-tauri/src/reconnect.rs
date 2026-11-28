@@ -21,12 +21,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// across 10 attempts, after which the session still surfaces a fatal error
 /// rather than looping forever against a genuinely dead provider.
 ///
-/// The ladder is *resettable*, not just longer: every provider resets
-/// `reconnect_attempts` to 0 after a successful reconnect (Deepgram/AssemblyAI/
-/// Soniox/OpenAI-realtime/Gemini/Aura), and AWS resets only after the stream
-/// stays healthy past `HEALTHY_STREAM_RESET_SECS` — so a capture that recovers
-/// mid-way gets a fresh full budget for the next outage. A flapping link that
-/// never sustains still climbs to give-up (it cannot loop at attempt 1).
+/// Providers define when a reconnect has recovered. AssemblyAI waits for
+/// `Begin`, Soniox waits for a successful response, and OpenAI Realtime ASR
+/// waits for `session.updated` and a sustained healthy session.
+/// AWS Transcribe waits for a sustained healthy stream. Deepgram, Gemini,
+/// and Aura reset when the transport reopens.
 pub(crate) const DEFAULT_BACKOFF_SECONDS: [u64; 10] = [1, 2, 5, 10, 20, 30, 60, 60, 60, 60];
 
 /// One step of a reconnect ladder, computed from the number of reconnect
@@ -88,9 +87,19 @@ pub(crate) const fn total_disconnected_budget_secs() -> u64 {
 /// hand-tune this as a constant. `chunk_duration_ms` is passed in (rather than
 /// importing the audio module) so this stays self-contained and unit-testable.
 pub(crate) const fn reconnect_backlog_cap_chunks(chunk_duration_ms: u64) -> usize {
+    reconnect_backlog_cap_chunks_with_setup(chunk_duration_ms, Duration::ZERO)
+}
+
+/// Includes extra time per attempt while a provider's setup holds queued audio
+/// after the WebSocket handshake.
+pub(crate) const fn reconnect_backlog_cap_chunks_with_setup(
+    chunk_duration_ms: u64,
+    setup_per_attempt: Duration,
+) -> usize {
     // Chunks that arrive over the full disconnected budget, rounded up.
-    let budget_ms = total_disconnected_budget_secs() * 1000;
-    let base = budget_ms.div_ceil(chunk_duration_ms);
+    let budget_ms = total_disconnected_budget_secs() as u128 * 1000
+        + DEFAULT_BACKOFF_SECONDS.len() as u128 * setup_per_attempt.as_millis();
+    let base = budget_ms.div_ceil(chunk_duration_ms as u128);
     // +10% headroom for send-scheduling jitter. Handshake time no longer needs
     // headroom — it is budgeted explicitly in the total above.
     (base + base / 10) as usize

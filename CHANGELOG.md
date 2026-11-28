@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Open a completed session's transcript, speaker labels, and speaker timeline from the Sessions browser while capture is running (#140). Review reads a query-backed snapshot (`load_session`) in a separate store, refreshes on open and window focus, and never writes the live session's state; Notes, Timeline, and Graph stay gated until they migrate.
 - rsac 0.5.0 `hotplug-recovery` auto-recovery for `SystemDefault` capture on
   Windows and Linux (withheld on macOS per rsac ADR-0021): a default-device
   change or stream invalidation now reopens the stream — tracked via rsac

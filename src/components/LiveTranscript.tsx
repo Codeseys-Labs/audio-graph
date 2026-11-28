@@ -10,10 +10,17 @@
  * Exports: TXT (via `transcriptToTxt`) or JSON (via the backend's
  * `export_transcript` command); both funnel through `downloadAsFile`.
  *
- * Store bindings: `transcriptSegments`, `asrPartial`, `speakers`,
- * `exportTranscript`, `getSessionId`, plus `isCapturing` / `isTranscribing` /
- * `isGeminiActive` to distinguish the "not started" vs "listening" empty
- * states (the same flags ControlBar / PipelineStatusBar drive).
+ * Store bindings: `useTranscriptView()` (`session/SessionViewProvider`) for
+ * the segments, `speakers`, speaker-timeline ledger, transcript events and
+ * `asrPartial`; `exportTranscript`, `getSessionId`, plus `isCapturing` /
+ * `isTranscribing` / `isGeminiActive` to distinguish the "not started" vs
+ * "listening" empty states (the same flags ControlBar / PipelineStatusBar
+ * drive).
+ *
+ * Review (issue #140): under a `SessionViewProvider` with a `reviewSessionId`
+ * the same panel renders a historical session from the query-backed Review
+ * store — loading / closed localized error / empty states, an export named
+ * for (and built from) the reviewed session, and no read of Live fields.
  *
  * Parent: two sites post SHELL-R4 (the legacy `App.tsx` right-panel tab,
  * gated on the now-write-only `rightPanelTab` slice, was deleted) —
@@ -23,7 +30,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
-import { useSessionView } from "../session/SessionViewProvider";
+import { useTranscriptView } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -49,25 +56,27 @@ const FALLBACK_COLORS = [
 
 function LiveTranscript() {
   const { t } = useTranslation();
-  const { transcriptSegments: rawSegments } = useSessionView();
-  const diarizationSpanRevisions = useAudioGraphStore(
-    (s) => s.diarizationSpanRevisions,
-  );
-  const asrPartial = useAudioGraphStore((s) => s.asrPartial);
-  const sessionTranscriptEvents = useAudioGraphStore(
-    (s) => s.sessionTranscriptEvents,
-  );
+  const {
+    reviewSessionId,
+    review,
+    segments: rawSegments,
+    transcriptEvents: sessionTranscriptEvents,
+    diarizationSpanRevisions,
+    speakers,
+    asrPartial,
+  } = useTranscriptView();
+  const isReview = reviewSessionId !== null;
   // Materialize the speaker-timeline ledger (seed 8145): the backend resolves
   // speaker attribution in its own provider-neutral `SpeakerTimeline`, so JOIN
   // the same revision stream onto the rendered transcript here. Segments the
   // timeline does not attribute keep their inline speaker fields (and object
   // identity), so this is a no-op until diarization spans actually arrive.
+  // Under Review the ledger is the session's persisted diarization log.
   const segments = useMemo(
     () =>
       joinSpeakerTimelineToTranscript(rawSegments, diarizationSpanRevisions),
     [rawSegments, diarizationSpanRevisions],
   );
-  const speakers = useAudioGraphStore((s) => s.speakers);
   const exportTranscript = useAudioGraphStore((s) => s.exportTranscript);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
   // Capture + transcription pipeline flags (same source of truth as ControlBar
@@ -101,26 +110,40 @@ function LiveTranscript() {
   const [seekAnnouncement, setSeekAnnouncement] = useState("");
 
   // Build a filename for an export in the form
-  // `transcript-<sessionId>-<timestamp>.<ext>`. Falls back to "session" if
-  // the backend session id can't be resolved.
+  // `transcript-<sessionId>-<timestamp>.<ext>`. A reviewed session names its
+  // own id (never the live session's); Live falls back to "session" if the
+  // backend session id can't be resolved.
   const buildFilename = useCallback(
     async (ext: "json" | "txt") => {
       let sessionId = "session";
-      try {
-        sessionId = await getSessionId();
-      } catch {
-        // Non-fatal — keep the fallback.
+      if (reviewSessionId !== null) {
+        sessionId = reviewSessionId;
+      } else {
+        try {
+          sessionId = await getSessionId();
+        } catch {
+          // Non-fatal — keep the fallback.
+        }
       }
       return `transcript-${sessionId}-${filenameTimestamp()}.${ext}`;
     },
-    [getSessionId],
+    [getSessionId, reviewSessionId],
   );
 
   const handleExportJson = useCallback(async () => {
     setIsExporting(true);
     setExportError(null);
     try {
-      const json = await exportTranscript();
+      // `export_transcript` exports the LIVE session's buffer; a reviewed
+      // session is serialized from its own snapshot (speaker attribution
+      // joined from its persisted ledger) so no backend command is issued.
+      // Same shape as the backend export, a pretty-printed
+      // `TranscriptSegment[]`, so consumers of the JSON see one format; the
+      // session id is in the filename.
+      const json =
+        reviewSessionId !== null
+          ? JSON.stringify(segments, null, 2)
+          : await exportTranscript();
       const filename = await buildFilename("json");
       downloadAsFile(json, filename, "application/json");
     } catch (e) {
@@ -128,7 +151,7 @@ function LiveTranscript() {
     } finally {
       setIsExporting(false);
     }
-  }, [exportTranscript, buildFilename]);
+  }, [exportTranscript, buildFilename, reviewSessionId, segments]);
 
   const handleExportTxt = useCallback(async () => {
     setIsExporting(true);
@@ -217,8 +240,11 @@ function LiveTranscript() {
   // no signal that the view moved. Cancelling auto-follow
   // (wasNearBottom=false) keeps the tail from yanking the view back to the
   // bottom while the user inspects a moment.
+  // A Review pane has no segments until its snapshot has loaded, so it waits
+  // for `ready` (once: a later refresh does not re-fire the jump).
+  const seekReady = !review || review.status === "ready";
   useEffect(() => {
-    if (!transcriptSeekTarget) return;
+    if (!transcriptSeekTarget || !seekReady) return;
     const { segmentId } = transcriptSeekTarget;
     const container = scrollRef.current;
     const el = container?.querySelector<HTMLElement>(
@@ -246,7 +272,7 @@ function LiveTranscript() {
       setSeekAnnouncement("");
     }, 1600);
     return () => window.clearTimeout(timer);
-  }, [transcriptSeekTarget, t]);
+  }, [transcriptSeekTarget, seekReady, t]);
 
   // Display only the shared tail window for performance. The After
   // SeekTimeline caps its blocks to the SAME constant so every timeline block
@@ -257,14 +283,21 @@ function LiveTranscript() {
   );
 
   return (
-    <div className="flex flex-col h-full p-(--space-5)">
+    <div
+      className="flex flex-col h-full p-(--space-5)"
+      data-review-session-id={reviewSessionId ?? undefined}
+    >
       {/* Polite SR announcement for seek jumps (WCAG 4.1.3): the scroll +
           transient highlight are visual-only, so voice the jump here. */}
       <div role="status" aria-live="polite" className="sr-only">
         {seekAnnouncement}
       </div>
       <div className="flex items-center justify-between mb-[10px] shrink-0">
-        <h3 className="panel-title">{t("transcript.title")}</h3>
+        <h3 className="panel-title">
+          {isReview
+            ? t("sessions.review.transcriptTitle")
+            : t("transcript.title")}
+        </h3>
         <div className="flex items-center gap-(--space-3)">
           {segments.length > 0 && (
             <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
@@ -293,6 +326,22 @@ function LiveTranscript() {
           </button>
         </div>
       </div>
+      {review?.stale && review.status === "ready" && (
+        <div
+          className="mb-(--space-4) flex items-center justify-between gap-(--space-3) py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-warning) bg-(--tint-warning) border border-(--tint-border-warning) rounded-sm"
+          role="alert"
+        >
+          <span>{t("sessions.review.stale")}</span>
+          <button
+            type="button"
+            className="ag-btn-micro"
+            onClick={review.retry}
+            disabled={review.refreshing}
+          >
+            <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
+          </button>
+        </div>
+      )}
       {exportError && (
         <div
           className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm"
@@ -308,7 +357,11 @@ function LiveTranscript() {
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
-        aria-label={t("transcript.label")}
+        aria-label={
+          isReview
+            ? t("sessions.review.transcriptLabel")
+            : t("transcript.label")
+        }
       >
         {visibleSegments.length === 0 && !asrPartial ? (
           <div className="flex flex-col items-center justify-center flex-1 select-none">
@@ -318,7 +371,34 @@ function LiveTranscript() {
             >
               <Icon name="transcript" size={24} />
             </span>
-            {isTranscriptionRunning ? (
+            {review ? (
+              review.status === "error" ? (
+                <>
+                  <p
+                    className="text-text-secondary text-md font-medium m-0"
+                    role="alert"
+                  >
+                    {t("sessions.review.unavailable")}
+                  </p>
+                  <button
+                    type="button"
+                    className="ag-btn-micro mt-(--space-3)"
+                    onClick={review.retry}
+                  >
+                    <Icon name="refresh" size={14} />{" "}
+                    {t("sessions.review.retry")}
+                  </button>
+                </>
+              ) : review.status === "loading" ? (
+                <p className="text-text-muted text-md italic m-0" role="status">
+                  {t("sessions.review.loading")}
+                </p>
+              ) : (
+                <p className="text-text-secondary text-md m-0">
+                  {t("sessions.review.emptyTranscript")}
+                </p>
+              )
+            ) : isTranscriptionRunning ? (
               <p className="text-text-muted text-md italic m-0">
                 {t("transcript.listening")}
               </p>

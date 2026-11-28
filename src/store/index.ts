@@ -1251,6 +1251,7 @@ function samplePreviewCopy(language?: string) {
 function clearSamplePreviewState() {
   return {
     samplePreviewActive: false,
+    pendingFinalizingSession: null,
     transcriptSegments: [],
     asrPartial: null,
     asrSpanRevisions: [],
@@ -1695,6 +1696,7 @@ function sampleSessionPreviewState(language?: string) {
   );
   return {
     samplePreviewActive: true,
+    pendingFinalizingSession: null,
     transcriptSegments,
     asrPartial: null,
     asrSpanRevisions,
@@ -2480,6 +2482,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         ? clearSamplePreviewState()
         : {
             samplePreviewActive: false,
+            pendingFinalizingSession: null,
             transcriptSegments: [],
             asrPartial: null,
             asrSpanRevisions: [],
@@ -2506,6 +2509,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     historicalLoadGeneration += 1;
     set((state) => ({
       ...exitSamplePreviewState(state.samplePreviewActive),
+      pendingFinalizingSession: null,
       transcriptSegments: [],
       asrPartial: null,
       asrSpanRevisions: [],
@@ -3843,6 +3847,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   sessions: [],
   sessionsLoading: false,
   loadedSessionId: null,
+  // Invariant: `pendingFinalizingSession` names the session whose data is
+  // resident in the global store after Stop; any action that replaces or
+  // clears that data must clear it.
   pendingFinalizingSession: null,
   // SHELL-R2 (plan §R2, ADR-0046): the Sessions browser stopped being a modal —
   // it is the "sessions" destination, always rendered inside
@@ -3906,6 +3913,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // Replace current transcript view with the loaded session's segments.
       set((state) => ({
         ...exitSamplePreviewState(state.samplePreviewActive),
+        pendingFinalizingSession: null,
         transcriptSegments: segments,
         asrPartial: null,
         asrSpanRevisions: [],
