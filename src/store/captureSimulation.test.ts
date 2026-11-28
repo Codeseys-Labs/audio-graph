@@ -639,22 +639,27 @@ describe("capture snapshot simulation: the round-5 and re-check 4 findings", () 
 
   it("a delayed New Session success never clears the new live transcript", async () => {
     // The rotation is published at once; its reply waits while a capture
-    // starts, transcribes and speaks in the new session.
-    const failures = await scripted({ starts: 1, newSessions: 1, speech: 1 }, [
-      ...STARTUP,
-      "New Session",
-      "deliver new_session_cmd",
-      "event pipeline-status",
-      "press Start",
-      "deliver start_capture",
-      "commit",
-      "reply start_capture",
-      "deliver start_transcribe",
-      "reply start_transcribe",
-      "speech",
-      "event transcript-update",
-      "reply new_session_cmd",
-    ]);
+    // starts, transcribes and speaks in the new session. A later snapshot
+    // of that same session follows, and must not reset it either.
+    const failures = await scripted(
+      { starts: 1, newSessions: 1, speech: 1, backpressures: 1 },
+      [
+        ...STARTUP,
+        "New Session",
+        "deliver new_session_cmd",
+        "event pipeline-status",
+        "press Start",
+        "deliver start_capture",
+        "commit",
+        "reply start_capture",
+        "deliver start_transcribe",
+        "reply start_transcribe",
+        "speech",
+        "event transcript-update",
+        "reply new_session_cmd",
+        "backpressure",
+      ],
+    );
     expect(failures).toEqual([]);
   });
 
