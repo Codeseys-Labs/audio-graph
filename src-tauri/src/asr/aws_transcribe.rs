@@ -27,10 +27,10 @@ use crate::settings::AwsCredentialSource;
 use crate::state::TranscriptSegment;
 use std::time::Duration;
 
-use super::ProviderContentEgressPolicy;
 #[cfg(test)]
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
+use super::{AsrReconnectReason, ProviderContentEgressPolicy};
 
 const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
@@ -274,10 +274,14 @@ fn service_failure_diagnostic(failure: AwsServiceFailure) -> TranscribeFailure {
             RuntimeSafeRecoveryAction::Retry,
             Some(RuntimeStatusClass::ServerError),
         ),
+        // AWS assigns the same exception to concurrent-stream quota, rapid
+        // stream scaling, and maximum duration at open and in the result
+        // stream. The SDK exposes no structured discriminator.
+        // https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html
         AwsServiceFailure::LimitExceeded => sdk_runtime_diagnostic(
-            RuntimeErrorCode::CapacityExhausted,
-            true,
-            RuntimeSafeRecoveryAction::RetryAfterDelay,
+            RuntimeErrorCode::RequestRejected,
+            false,
+            RuntimeSafeRecoveryAction::None,
             Some(RuntimeStatusClass::ClientError),
         ),
         AwsServiceFailure::ServiceUnavailable => sdk_runtime_diagnostic(
@@ -470,7 +474,11 @@ fn final_segments_from_result(
 pub enum AwsTranscribeStatus {
     /// A recoverable drop was detected; a reconnect is scheduled after
     /// `backoff_secs` (1-based `attempt` on the shared ladder).
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     /// The stream was successfully re-established.
     Reconnected,
 }
@@ -720,6 +728,7 @@ fn spawn_audio_forwarder(
 async fn advance_reconnect_ladder(
     reconnect_attempts: &mut u32,
     is_transcribing: &Arc<AtomicBool>,
+    reason: AsrReconnectReason,
     on_status: &mut impl FnMut(AwsTranscribeStatus),
 ) -> LadderStep {
     match next_reconnect_step(*reconnect_attempts) {
@@ -731,6 +740,7 @@ async fn advance_reconnect_ladder(
             on_status(AwsTranscribeStatus::Reconnecting {
                 attempt,
                 backoff_secs,
+                reason,
             });
             log::info!("AWS Transcribe: reconnecting (attempt {attempt}, backoff {backoff_secs}s)");
 
@@ -875,6 +885,7 @@ async fn run_streaming_session(
                 match advance_reconnect_ladder(
                     &mut reconnect_attempts,
                     &is_transcribing,
+                    AsrReconnectReason::from_diagnostic(&diagnostic.diagnostic),
                     &mut on_status,
                 )
                 .await
@@ -1012,8 +1023,13 @@ async fn run_streaming_session(
             );
         }
 
-        match advance_reconnect_ladder(&mut reconnect_attempts, &is_transcribing, &mut on_status)
-            .await
+        match advance_reconnect_ladder(
+            &mut reconnect_attempts,
+            &is_transcribing,
+            AsrReconnectReason::from_diagnostic(&reconnect_diagnostic.diagnostic),
+            &mut on_status,
+        )
+        .await
         {
             LadderStep::Continue => continue,
             LadderStep::Cancelled => return Ok(()),
@@ -1024,6 +1040,35 @@ async fn run_streaming_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ambiguous_streaming_limits_are_terminal_at_both_sdk_boundaries() {
+        let limit = transcribe::types::error::LimitExceededException::builder()
+            .message("private limit note")
+            .build();
+        let start = transcribe::error::SdkError::service_error(
+            StartStreamTranscriptionError::LimitExceededException(limit.clone()),
+            (),
+        );
+        let stream = transcribe::error::SdkError::service_error(
+            TranscriptResultStreamError::LimitExceededException(limit),
+            (),
+        );
+        assert!(!is_recoverable_sdk_error(&start));
+        assert!(!is_recoverable_sdk_error(&stream));
+        for failure in [
+            start_stream_sdk_diagnostic(&start),
+            transcript_stream_sdk_diagnostic(&stream),
+        ] {
+            assert!(matches!(
+                &failure.diagnostic,
+                RuntimeDiagnostic::Runtime(error) if error.code == RuntimeErrorCode::RequestRejected
+                    && !error.retryable
+                    && error.recovery_action == RuntimeSafeRecoveryAction::None
+            ));
+            assert!(!format!("{failure:?} {failure}").contains("private limit note"));
+        }
+    }
+
     use super::*;
     use crate::asr::reconnect::DEFAULT_BACKOFF_SECONDS;
     use aws_sdk_transcribestreaming::types::Item;
@@ -1369,9 +1414,9 @@ mod tests {
                         .message(message)
                         .build(),
                 ),
-                RuntimeErrorCode::CapacityExhausted,
-                true,
-                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::None,
                 Some(RuntimeStatusClass::ClientError),
             ),
             (
@@ -1439,9 +1484,9 @@ mod tests {
                         .message(message)
                         .build(),
                 ),
-                RuntimeErrorCode::CapacityExhausted,
-                true,
-                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::None,
                 Some(RuntimeStatusClass::ClientError),
             ),
             (
@@ -1604,9 +1649,9 @@ mod tests {
             ),
             (
                 "LimitExceededException",
-                RuntimeErrorCode::CapacityExhausted,
-                true,
-                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::None,
                 Some(RuntimeStatusClass::ClientError),
             ),
             (
@@ -1813,9 +1858,13 @@ mod tests {
         let mut attempts: u32 = 0;
         let mut statuses = Vec::new();
 
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::Continue));
         assert_eq!(attempts, 1);
@@ -1823,7 +1872,8 @@ mod tests {
             statuses,
             vec![AwsTranscribeStatus::Reconnecting {
                 attempt: 1,
-                backoff_secs: 1
+                backoff_secs: 1,
+                reason: AsrReconnectReason::ConnectionLost,
             }]
         );
     }
@@ -1836,9 +1886,13 @@ mod tests {
 
         // With `is_transcribing` already cleared, the very first backoff poll
         // must cancel rather than sleep out the full ladder step.
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::Cancelled));
         // The Reconnecting notification still fired before the cancel.
@@ -1854,9 +1908,13 @@ mod tests {
         let mut attempts: u32 = budget;
         let mut statuses = Vec::new();
 
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::GiveUp));
         // No Reconnecting emitted once the schedule is exhausted.

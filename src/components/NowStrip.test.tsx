@@ -296,6 +296,30 @@ describe("NowStrip", () => {
   });
 
   // ── Composite health chip (50e3 fold) ────────────────────────────────────
+  it("labels ASR reconnecting with the degraded health tone", () => {
+    resetStore({
+      isCapturing: true,
+      selectedSourceIds: ["system-default"],
+      pipelineStatus: {
+        ...useAudioGraphStore.getState().pipelineStatus,
+        capture: { type: "Running", processed_count: 0 },
+        pipeline: { type: "Idle" },
+        asr: {
+          type: "Reconnecting",
+          reason: "connection_lost",
+          retry_delay: "short",
+        },
+        diarization: { type: "Idle" },
+        entity_extraction: { type: "Idle" },
+        graph: { type: "Idle" },
+      },
+    });
+    render(<NowStrip />);
+    const chip = screen.getByRole("button", { name: "Open system status" });
+    expect(chip).toHaveTextContent("Reconnecting to the provider.");
+    expect(chip).toHaveAttribute("data-tone", "warning");
+  });
+
   it("opens the System drawer from the health chip while capturing", () => {
     resetStore({
       isCapturing: true,

@@ -6,7 +6,7 @@
 //! evidence is strong enough to promote Soniox from planned to selectable.
 
 use super::{
-    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    AsrReconnectReason, AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
     is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
     websocket_error, websocket_upgrade_error, websocket_write_error,
 };
@@ -88,10 +88,20 @@ pub use super::AsrParseError as SonioxParseError;
 pub enum SonioxEvent {
     Revision(SonioxParsedRevision),
     Finished,
-    Error { message: RuntimeDiagnostic },
+    Error {
+        message: RuntimeDiagnostic,
+    },
+    /// A diagnostic that leaves streaming or reconnecting active.
+    Advisory {
+        message: RuntimeDiagnostic,
+    },
     Connected,
     Disconnected,
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     Reconnected,
 }
 
@@ -654,6 +664,7 @@ impl Drop for SonioxClient {
 #[allow(dead_code)]
 enum DisconnectKind {
     DurationRollover,
+    ProviderRetryLater,
     ServerClose(RuntimeDiagnostic),
     NetworkError(RuntimeDiagnostic),
     PolicyBlocked(RuntimeDiagnostic),
@@ -858,6 +869,16 @@ async fn session_task_with_backoff(
                     break;
                 }
 
+                let initial_reason = match &disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic) => {
+                        AsrReconnectReason::from_diagnostic(diagnostic)
+                    }
+                    DisconnectKind::DurationRollover => AsrReconnectReason::SessionRollover,
+                    DisconnectKind::ProviderRetryLater => AsrReconnectReason::ProviderRetryLater,
+                    _ => AsrReconnectReason::ConnectionLost,
+                };
                 let reconnected = loop {
                     match stop_signal.reason() {
                         Some(AsrStopReason::UserRequested) => {
@@ -900,6 +921,9 @@ async fn session_task_with_backoff(
                     let _ = event_tx.send(SonioxEvent::Reconnecting {
                         attempt,
                         backoff_secs: backoff,
+                        reason: last_open_error
+                            .as_ref()
+                            .map_or(initial_reason, AsrReconnectReason::from_diagnostic),
                     });
 
                     stop_signal
@@ -944,7 +968,7 @@ async fn session_task_with_backoff(
                                 break false;
                             }
                             last_open_error = Some(diag.clone());
-                            let _ = event_tx.send(SonioxEvent::Error { message: diag });
+                            let _ = event_tx.send(SonioxEvent::Advisory { message: diag });
                         }
                     }
                 };
@@ -1076,12 +1100,14 @@ async fn run_io_with_keepalive_interval(
                         match handle_server_message_with_acceptance(
                             &text, event_tx, parser, &mut on_accepted,
                         ) {
-                            Ok(ServerMessage::DurationRollover) => {
+                            Ok(message @ (ServerMessage::DurationRollover | ServerMessage::RetryLater)) => {
                                 let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
                                 return if finishing || stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                                     DisconnectKind::UserRequested
-                                } else {
+                                } else if matches!(message, ServerMessage::DurationRollover) {
                                     DisconnectKind::DurationRollover
+                                } else {
+                                    DisconnectKind::ProviderRetryLater
                                 };
                             }
                             Ok(ServerMessage::Finished) if finishing => {
@@ -1146,6 +1172,7 @@ enum ServerMessage {
     Continue,
     Finished,
     DurationRollover,
+    RetryLater,
 }
 
 fn handle_server_message_with_acceptance(
@@ -1157,7 +1184,7 @@ fn handle_server_message_with_acceptance(
     let parsed = match parser.parse_message(text, current_unix_millis()) {
         Ok(parsed) => parsed,
         Err(error) => {
-            let _ = tx.send(SonioxEvent::Error {
+            let _ = tx.send(SonioxEvent::Advisory {
                 message: error.into(),
             });
             return Ok(ServerMessage::Continue);
@@ -1173,7 +1200,11 @@ fn handle_server_message_with_acceptance(
         {
             return Err(message);
         }
-        let _ = tx.send(SonioxEvent::Error { message });
+        let reason = AsrReconnectReason::from_diagnostic(&message);
+        let _ = tx.send(SonioxEvent::Advisory { message });
+        if reason == AsrReconnectReason::ProviderRetryLater {
+            return Ok(ServerMessage::RetryLater);
+        }
     }
 
     if parsed.accepted
@@ -1538,7 +1569,7 @@ mod tests {
                 _ => None,
             },
             |event| match event {
-                SonioxEvent::Error { message } => Some(message),
+                SonioxEvent::Error { message } | SonioxEvent::Advisory { message } => Some(message),
                 _ => None,
             },
         );
@@ -1687,7 +1718,11 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                SonioxEvent::Reconnecting { attempt: 1, .. },
+                SonioxEvent::Reconnecting {
+                    attempt: 1,
+                    reason: AsrReconnectReason::SessionRollover,
+                    ..
+                },
                 SonioxEvent::Reconnected,
                 SonioxEvent::Disconnected,
                 SonioxEvent::Error { message: replaced },
@@ -1783,7 +1818,7 @@ mod tests {
             assert!(!handle_server_message(&frame.to_string(), &tx, &mut parser).unwrap());
             let event = rx.try_recv().expect("non-rollover error event");
             assert!(
-                matches!(event, SonioxEvent::Error { message } if message == websocket_diagnostic(code))
+                matches!(event, SonioxEvent::Advisory { message } if message == websocket_diagnostic(code))
             );
         }
         assert!(rx.is_empty());
@@ -1846,6 +1881,16 @@ mod tests {
                 matches!(events.as_slice(), [.., SonioxEvent::Error { .. }]),
                 "unexpected events: {events:?}"
             );
+            if statuses == [429, 403] {
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    SonioxEvent::Reconnecting {
+                        attempt: 2,
+                        reason: AsrReconnectReason::ProviderRetryLater,
+                        ..
+                    }
+                )));
+            }
             assert_eq!(
                 events
                     .iter()
@@ -1859,7 +1904,9 @@ mod tests {
             let errors: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    SonioxEvent::Error { message } => Some(message),
+                    SonioxEvent::Error { message } | SonioxEvent::Advisory { message } => {
+                        Some(message)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2594,6 +2641,7 @@ mod tests {
             SonioxEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
@@ -2607,7 +2655,7 @@ mod tests {
         );
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
-            SonioxEvent::Error { message } => {
+            SonioxEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::NetworkUnreachable));
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
@@ -2616,6 +2664,7 @@ mod tests {
             SonioxEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 2);
                 assert_eq!(backoff_secs, 2);
@@ -2751,6 +2800,7 @@ mod tests {
             SonioxEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
@@ -2914,7 +2964,7 @@ mod tests {
                     while let Ok(event) = event_rx.try_recv() {
                         match event {
                             SonioxEvent::Finished => saw_finished = true,
-                            SonioxEvent::Error { message } => {
+                            SonioxEvent::Error { message } | SonioxEvent::Advisory { message } => {
                                 panic!("Soniox live smoke provider error: {}", message)
                             }
                             _ => {}
@@ -2963,7 +3013,7 @@ mod tests {
         ).unwrap();
 
         match rx.recv().expect("error event") {
-            SonioxEvent::Error { message } => {
+            SonioxEvent::Advisory { message } => {
                 for leaked in [
                     api_key,
                     "bearer-soniox-secret",
@@ -2989,7 +3039,7 @@ mod tests {
         assert!(!handle_server_message("{", &tx, &mut parser).unwrap());
 
         match rx.recv().expect("error event") {
-            SonioxEvent::Error { message } => {
+            SonioxEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::InvalidResponse));
             }
             other => panic!("expected error event, got {other:?}"),

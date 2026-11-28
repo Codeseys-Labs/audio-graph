@@ -366,7 +366,7 @@ describe("PipelineStatusBar", () => {
       "network_unreachable",
       "retry_after_delay",
       "short",
-      "Reconnecting to the provider.",
+      "The app could not reach the provider. Check your connection.",
     ],
     [
       "en",
@@ -380,7 +380,7 @@ describe("PipelineStatusBar", () => {
       "network_unreachable",
       "retry_after_delay",
       "short",
-      "Reconectando ao provedor.",
+      "O aplicativo não conseguiu acessar o provedor. Verifique sua conexão.",
     ],
   ] as const)("presents %s %s with %s and delay %s", async (locale, code, recovery_action, retry_delay, expected) => {
     resetStore({
@@ -411,6 +411,38 @@ describe("PipelineStatusBar", () => {
       expect(
         screen.getByRole("img", { name: `ASR: ${expected}` }),
       ).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previousLanguage);
+    }
+  });
+
+  it.each([
+    [
+      "en",
+      "Reconnecting to the provider. Starting a new streaming session. Retrying in a few seconds.",
+    ],
+    [
+      "pt",
+      "Reconectando ao provedor. Iniciando uma nova sessão de transmissão. Nova tentativa em alguns segundos.",
+    ],
+  ] as const)("renders a routine reconnect as a warning in %s", async (locale, label) => {
+    const previousLanguage = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({
+        ...allIdle(),
+        asr: {
+          type: "Reconnecting",
+          reason: "session_rollover",
+          retry_delay: "short",
+        },
+      });
+      expect(screen.getByRole("img", { name: `ASR: ${label}` })).toHaveClass(
+        "bg-accent-yellow",
+      );
+      expect(view.container.innerHTML).not.toContain("session_rollover");
     } finally {
       view.unmount();
       await i18n.changeLanguage(previousLanguage);

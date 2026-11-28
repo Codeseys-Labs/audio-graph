@@ -901,45 +901,67 @@ fn websocket_connect_diagnostic(
     diagnostic
 }
 
-fn reconnecting_transcription_diagnostic(
-    transport: RuntimeTransport,
-    backoff_secs: u64,
-) -> RuntimeDiagnostic {
-    RuntimeErrorDiagnostic::new(
-        RuntimeErrorCode::NetworkUnreachable,
-        true,
-        RuntimeSafeRecoveryAction::RetryAfterDelay,
-        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
-            .with_transport(transport)
-            .with_retry_delay(RuntimeRetryDelayBucket::from_seconds(backoff_secs)),
-    )
-    .into()
+/// Preserves the stage snapshot for one streaming receiver across retry attempts.
+#[derive(Default)]
+struct AsrReconnectStatus {
+    previous: Option<StageStatus>,
 }
 
-fn disconnected_transcription_diagnostic(transport: RuntimeTransport) -> RuntimeDiagnostic {
-    transcription_diagnostic(
-        RuntimeErrorCode::NetworkUnreachable,
-        true,
-        RuntimeSafeRecoveryAction::CheckNetwork,
-        transport,
-    )
-}
+impl AsrReconnectStatus {
+    fn reconnecting(
+        &mut self,
+        app: &AppHandle,
+        pipeline: &Arc<RwLock<PipelineStatus>>,
+        reason: events::AsrReconnectReason,
+        backoff_secs: u64,
+    ) {
+        {
+            let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
+            match &status.asr {
+                StageStatus::Error { .. } => return,
+                StageStatus::Reconnecting { .. } => {}
+                _ => self.previous = Some(status.asr.clone()),
+            }
+            status.asr = StageStatus::Reconnecting {
+                reason,
+                retry_delay: RuntimeRetryDelayBucket::from_seconds(backoff_secs),
+            };
+        }
+        emit_pipeline_status(app, pipeline);
+    }
 
-/// A terminal disconnect can immediately follow the adapter's specific error.
-fn mark_websocket_disconnected(app: &AppHandle, pipeline: &Arc<RwLock<PipelineStatus>>) {
-    {
-        let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
-        if let StageStatus::Error { diagnostic } = &status.asr {
-            let was_reconnecting = matches!(diagnostic, RuntimeDiagnostic::Runtime(d) if d.context.retry_delay.is_some());
-            if !was_reconnecting {
+    fn reconnected(&mut self, app: &AppHandle, pipeline: &Arc<RwLock<PipelineStatus>>) {
+        let Some(previous) = self.previous.take() else {
+            return;
+        };
+        {
+            let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
+            if !matches!(status.asr, StageStatus::Reconnecting { .. }) {
                 return;
             }
+            status.asr = previous;
         }
-        status.asr = StageStatus::Error {
-            diagnostic: disconnected_transcription_diagnostic(RuntimeTransport::Websocket),
-        };
+        emit_pipeline_status(app, pipeline);
     }
-    emit_pipeline_status(app, pipeline);
+
+    fn handle_aws_status(
+        &mut self,
+        app: &AppHandle,
+        pipeline: &Arc<RwLock<PipelineStatus>>,
+        status: crate::asr::aws_transcribe::AwsTranscribeStatus,
+    ) {
+        use crate::asr::aws_transcribe::AwsTranscribeStatus;
+        match status {
+            AwsTranscribeStatus::Reconnecting {
+                reason,
+                backoff_secs,
+                ..
+            } => {
+                self.reconnecting(app, pipeline, reason, backoff_secs);
+            }
+            AwsTranscribeStatus::Reconnected => self.reconnected(app, pipeline),
+        }
+    }
 }
 
 fn emit_asr_span_revision(app_handle: &AppHandle, payload: events::AsrSpanRevisionPayload) {
@@ -4711,7 +4733,11 @@ fn publish_accepted_final(
     if let Ok(mut status) = ctx.pipeline_status.write() {
         // A local promotion advances a healthy count, but provides no evidence
         // that a disconnected or failed provider has recovered.
-        if !promoted_interim || matches!(status.asr, StageStatus::Running { .. }) {
+        if !matches!(
+            status.asr,
+            StageStatus::Reconnecting { .. } | StageStatus::Error { .. }
+        ) && (!promoted_interim || matches!(status.asr, StageStatus::Running { .. }))
+        {
             status.asr = StageStatus::Running {
                 processed_count: asr_count,
             };
@@ -8119,6 +8145,7 @@ fn run_deepgram_event_receiver(
     provider_native_diarization_active: bool,
 ) {
     use crate::asr::deepgram::{DeepgramEvent, DeepgramTurnKind};
+    let mut reconnect_status = AsrReconnectStatus::default();
 
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
@@ -8681,43 +8708,27 @@ fn run_deepgram_event_receiver(
                 flux.disconnect();
                 saved_speech_final = None;
                 log::info!("Deepgram event receiver: disconnected; waiting for reconnect or stop");
-                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
             DeepgramEvent::Connected => {
                 log::debug!("Deepgram event receiver: connected event received");
             }
-            DeepgramEvent::Reconnecting {
-                attempt,
-                backoff_secs,
+            DeepgramEvent::Advisory {
+                message: diagnostic,
             } => {
-                // Auto-reconnect in flight — surface through pipeline status
-                // so the UI can show a "reconnecting…" hint instead of
-                // leaving the stage looking healthy.
-                log::info!(
-                    "Deepgram event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
-                );
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: reconnecting_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                            backoff_secs,
-                        ),
-                    },
-                );
+                log::debug!("Deepgram event receiver: advisory diagnostic={diagnostic}");
             }
+            DeepgramEvent::Reconnecting {
+                reason,
+                backoff_secs,
+                ..
+            } => reconnect_status.reconnecting(
+                &ctx.app_handle,
+                &ctx.pipeline_status,
+                reason,
+                backoff_secs,
+            ),
             DeepgramEvent::Reconnected => {
-                log::info!("Deepgram event receiver: reconnected");
-                // Preserve the running count across reconnects so the UI
-                // doesn't flash back to 0 transcripts.
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Running {
-                        processed_count: asr_count,
-                    },
-                );
+                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
         }
     }
@@ -8905,6 +8916,7 @@ fn run_assemblyai_event_receiver(
     source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::assemblyai::AssemblyAIEvent;
+    let mut reconnect_status = AsrReconnectStatus::default();
 
     let mut asr_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
@@ -8964,11 +8976,6 @@ fn run_assemblyai_event_receiver(
                     Err(error) => {
                         let diagnostic = RuntimeDiagnostic::from(error);
                         log::warn!("AssemblyAI v3 parser error diagnostic={diagnostic}");
-                        set_asr_status_and_emit(
-                            &ctx.app_handle,
-                            &ctx.pipeline_status,
-                            StageStatus::Error { diagnostic },
-                        );
                         continue;
                     }
                 };
@@ -8983,11 +8990,6 @@ fn run_assemblyai_event_receiver(
                 if let Some(error) = parsed.error {
                     let diagnostic = error.message;
                     log::warn!("AssemblyAI event receiver: provider error diagnostic={diagnostic}");
-                    set_asr_status_and_emit(
-                        &ctx.app_handle,
-                        &ctx.pipeline_status,
-                        StageStatus::Error { diagnostic },
-                    );
                     continue;
                 }
 
@@ -9057,35 +9059,23 @@ fn run_assemblyai_event_receiver(
                 log::info!("AssemblyAI event receiver: session terminated");
                 break;
             }
-            AssemblyAIEvent::Reconnecting {
-                attempt,
-                backoff_secs,
+            AssemblyAIEvent::Advisory {
+                message: diagnostic,
             } => {
-                log::info!(
-                    "AssemblyAI event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
-                );
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: reconnecting_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                            backoff_secs,
-                        ),
-                    },
-                );
+                log::debug!("AssemblyAI event receiver: advisory diagnostic={diagnostic}");
             }
+            AssemblyAIEvent::Reconnecting {
+                reason,
+                backoff_secs,
+                ..
+            } => reconnect_status.reconnecting(
+                &ctx.app_handle,
+                &ctx.pipeline_status,
+                reason,
+                backoff_secs,
+            ),
             AssemblyAIEvent::Reconnected => {
-                log::info!("AssemblyAI event receiver: reconnected");
-                // Preserve the running count across reconnects so the UI
-                // doesn't flash back to 0 transcripts.
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Running {
-                        processed_count: asr_count,
-                    },
-                );
+                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
         }
     }
@@ -9227,6 +9217,7 @@ fn run_soniox_event_receiver(
     max_speakers: u32,
 ) {
     use crate::asr::soniox::SonioxEvent;
+    let mut reconnect_status = AsrReconnectStatus::default();
 
     let mut asr_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
@@ -9321,38 +9312,27 @@ fn run_soniox_event_receiver(
             }
             SonioxEvent::Disconnected => {
                 log::info!("Soniox event receiver: disconnected; waiting for reconnect or stop");
-                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
             SonioxEvent::Connected => {
                 log::debug!("Soniox event receiver: connected event received");
             }
-            SonioxEvent::Reconnecting {
-                attempt,
-                backoff_secs,
+            SonioxEvent::Advisory {
+                message: diagnostic,
             } => {
-                log::info!(
-                    "Soniox event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
-                );
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: reconnecting_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                            backoff_secs,
-                        ),
-                    },
-                );
+                log::debug!("Soniox event receiver: advisory diagnostic={diagnostic}");
             }
+            SonioxEvent::Reconnecting {
+                reason,
+                backoff_secs,
+                ..
+            } => reconnect_status.reconnecting(
+                &ctx.app_handle,
+                &ctx.pipeline_status,
+                reason,
+                backoff_secs,
+            ),
             SonioxEvent::Reconnected => {
-                log::info!("Soniox event receiver: reconnected");
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Running {
-                        processed_count: asr_count,
-                    },
-                );
+                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
         }
     }
@@ -9565,6 +9545,7 @@ fn run_openai_realtime_event_receiver(
     source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::openai_realtime::OpenAiRealtimeEvent;
+    let mut reconnect_status = AsrReconnectStatus::default();
 
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
@@ -9733,37 +9714,24 @@ fn run_openai_realtime_event_receiver(
                 log::info!(
                     "OpenAI Realtime event receiver: disconnected; waiting for reconnect or stop"
                 );
-                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
+            }
+            OpenAiRealtimeEvent::Advisory {
+                message: diagnostic,
+            } => {
+                log::debug!("OpenAI Realtime event receiver: advisory diagnostic={diagnostic}");
             }
             OpenAiRealtimeEvent::Reconnecting {
-                attempt,
+                reason,
                 backoff_secs,
-            } => {
-                log::info!(
-                    "OpenAI Realtime event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
-                );
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: reconnecting_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                            backoff_secs,
-                        ),
-                    },
-                );
-            }
+                ..
+            } => reconnect_status.reconnecting(
+                &ctx.app_handle,
+                &ctx.pipeline_status,
+                reason,
+                backoff_secs,
+            ),
             OpenAiRealtimeEvent::Reconnected => {
-                log::info!("OpenAI Realtime event receiver: reconnected");
-                // Preserve the running count across reconnects so the UI
-                // doesn't flash back to 0 transcripts.
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Running {
-                        processed_count: asr_count,
-                    },
-                );
+                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
         }
     }
@@ -9804,10 +9772,6 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let mut diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
-    // Shared mirror of `asr_count` so the reconnect status callback can restore
-    // the running transcript count on `Reconnected` without racing the
-    // transcript callback that owns the `u64` (M1 / audio-graph-35de).
-    let asr_count_shared = Arc::new(AtomicU64::new(0));
 
     if let Ok(mut status) = shared.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
@@ -9836,50 +9800,23 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let ctx_for_partial = ctx.clone();
     let aws_config = aws_config.with_content_egress_policy(provider_content_egress_policy);
 
-    // Reconnect status callback (M1 / audio-graph-35de): mirror the WebSocket
-    // siblings' `Reconnecting`/`Reconnected` → pipeline `StageStatus` mapping so
-    // the UI shows a "reconnecting…" hint (not a healthy dot) while the AWS
-    // stream is being re-established, and returns to Running on success.
     let app_handle_for_status = ctx.app_handle.clone();
     let pipeline_status_for_status = ctx.pipeline_status.clone();
-    let asr_count_for_status = asr_count_shared.clone();
-    let on_status = move |status: crate::asr::aws_transcribe::AwsTranscribeStatus| match status {
-        crate::asr::aws_transcribe::AwsTranscribeStatus::Reconnecting {
-            attempt,
-            backoff_secs,
-        } => {
-            log::info!("AWS Transcribe: reconnecting attempt={attempt} backoff={backoff_secs}s");
-            set_asr_status_and_emit(
-                &app_handle_for_status,
-                &pipeline_status_for_status,
-                StageStatus::Error {
-                    diagnostic: reconnecting_transcription_diagnostic(
-                        RuntimeTransport::Sdk,
-                        backoff_secs,
-                    ),
-                },
-            );
-        }
-        crate::asr::aws_transcribe::AwsTranscribeStatus::Reconnected => {
-            log::info!("AWS Transcribe: reconnected");
-            set_asr_status_and_emit(
-                &app_handle_for_status,
-                &pipeline_status_for_status,
-                StageStatus::Running {
-                    processed_count: asr_count_for_status.load(Ordering::Relaxed),
-                },
-            );
-        }
+    let mut reconnect_status = AsrReconnectStatus::default();
+    let on_status = move |status| {
+        reconnect_status.handle_aws_status(
+            &app_handle_for_status,
+            &pipeline_status_for_status,
+            status,
+        );
     };
 
-    let asr_count_for_transcript = asr_count_shared.clone();
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
         is_transcribing,
         aws_config,
         move |transcript| {
             asr_count += 1;
-            asr_count_for_transcript.store(asr_count, Ordering::Relaxed);
             let source_id = transcript.segment.source_id.clone();
             let provider_item_id = transcript.provider_item_id.clone();
             let span_id = provider_item_id
@@ -10407,13 +10344,14 @@ mod tests_provider_dispatch {
 #[cfg(test)]
 mod tests_status {
     use super::{
-        AGENT_SIGNAL_MIN_CHARS, AGENT_SIGNAL_MIN_TOKENS, DiarizationDegradationReason,
-        DiarizationDispatchContext, DiarizationEventSink, ExtractionDeps, PipelineStatus,
-        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchAttempt,
-        ProjectionPatchGenerator, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
-        SpeechShared, StageStatus, agent_proposal_body, agent_signal_content_text,
-        agent_signal_grade, apply_extraction_result_if_current, current_unix_millis,
-        deregister_projection_job, diarization_degradation_for_provider_labeled_session,
+        AGENT_SIGNAL_MIN_CHARS, AGENT_SIGNAL_MIN_TOKENS, AsrReconnectStatus,
+        DiarizationDegradationReason, DiarizationDispatchContext, DiarizationEventSink,
+        ExtractionDeps, PipelineStatus, ProjectionDataMovementSink, ProjectionDispatchContext,
+        ProjectionPatchAttempt, ProjectionPatchGenerator, ProjectionRuntimeEventSink,
+        SpeechChannels, SpeechConfig, SpeechShared, StageStatus, agent_proposal_body,
+        agent_signal_content_text, agent_signal_grade, apply_extraction_result_if_current,
+        current_unix_millis, deregister_projection_job,
+        diarization_degradation_for_provider_labeled_session,
         diarization_span_revision_for_transcript, dispatch_projection_decision,
         emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
@@ -10423,6 +10361,7 @@ mod tests_status {
         record_asr_span_revision_event, record_asr_span_revision_event_and_observe_projection,
         revision_ref, run_agent_proposal_task, run_moonshine_speech_processor_with_worker,
         run_projection_job, set_asr_status, spawn_deferred_lane_observation, spawn_projection_job,
+        transcription_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -10447,7 +10386,7 @@ mod tests_status {
     use crate::state::{AppState, TranscriptSegment};
     use audio_graph_ipc_contract::runtime_diagnostic::{
         RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeOperation,
-        RuntimeSafeRecoveryAction, RuntimeTransport,
+        RuntimeRetryDelayBucket, RuntimeSafeRecoveryAction, RuntimeTransport,
     };
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
@@ -13544,13 +13483,6 @@ mod tests_status {
         };
         let context = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
             .with_transport(RuntimeTransport::Websocket);
-        let disconnected: RuntimeDiagnostic = RuntimeErrorDiagnostic::new(
-            RuntimeErrorCode::NetworkUnreachable,
-            true,
-            RuntimeSafeRecoveryAction::CheckNetwork,
-            context,
-        )
-        .into();
         let unavailable: RuntimeDiagnostic = RuntimeErrorDiagnostic::new(
             RuntimeErrorCode::ProviderUnavailable,
             true,
@@ -13561,6 +13493,7 @@ mod tests_status {
         let reconnecting = || Event::Reconnecting {
             attempt: 1,
             backoff_secs: 2,
+            reason: events::AsrReconnectReason::ConnectionLost,
         };
         let final_transcript = |start| Event::Transcript {
             text: "hello".into(),
@@ -13576,29 +13509,29 @@ mod tests_status {
             other => panic!("expected an ASR error, got {other:?}"),
         };
 
-        assert_eq!(error_after(vec![Event::Disconnected]), disconnected);
-        assert_eq!(
-            error_after(vec![reconnecting()]),
-            RuntimeErrorDiagnostic::new(
-                RuntimeErrorCode::NetworkUnreachable,
-                true,
-                RuntimeSafeRecoveryAction::RetryAfterDelay,
-                context.with_retry_delay(
-                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket::Short
-                ),
-            )
-            .into()
-        );
-        assert_eq!(
-            error_after(vec![reconnecting(), Event::Disconnected]),
-            disconnected
-        );
+        assert!(matches!(
+            run(vec![Event::Disconnected]),
+            StageStatus::Running { processed_count: 0 }
+        ));
+        assert!(matches!(
+            run(vec![
+                Event::Disconnected,
+                reconnecting(),
+                Event::Disconnected
+            ]),
+            StageStatus::Reconnecting {
+                reason: events::AsrReconnectReason::ConnectionLost,
+                retry_delay: RuntimeRetryDelayBucket::Short,
+            }
+        ));
         assert_eq!(
             error_after(vec![
                 Event::Error {
                     message: unavailable.clone()
                 },
-                Event::Disconnected
+                Event::Disconnected,
+                reconnecting(),
+                Event::Reconnected,
             ]),
             unavailable
         );
@@ -13652,15 +13585,216 @@ mod tests_status {
             ]),
             StageStatus::Running { processed_count: 1 }
         ));
-        assert!(matches!(
-            run(vec![
+        assert_eq!(
+            error_after(vec![
+                reconnecting(),
                 Event::Error {
-                    message: unavailable
+                    message: unavailable.clone()
                 },
-                final_transcript(1.0)
+                Event::Reconnected,
+                final_transcript(1.0),
             ]),
-            StageStatus::Running { processed_count: 1 }
+            unavailable
+        );
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
+    fn streaming_receivers_preserve_status_and_terminal_errors_during_reconnect() {
+        use crate::asr::assemblyai::AssemblyAIEvent;
+        use crate::asr::aws_transcribe::AwsTranscribeStatus;
+        use crate::asr::openai_realtime::OpenAiRealtimeEvent;
+        use crate::asr::soniox::SonioxEvent;
+        use crate::events::AsrReconnectReason;
+
+        fn check<E: Clone>(
+            run: impl Fn(Vec<E>) -> StageStatus,
+            reconnecting: E,
+            reconnected: E,
+            advisory: E,
+            terminal: E,
+            reason: AsrReconnectReason,
+            diagnostic: &RuntimeDiagnostic,
+        ) {
+            assert!(matches!(
+                run(vec![reconnecting.clone(), advisory.clone()]),
+                StageStatus::Reconnecting { reason: actual, retry_delay: RuntimeRetryDelayBucket::Medium }
+                    if actual == reason
+            ));
+            assert!(matches!(
+                run(vec![reconnecting.clone(), advisory, reconnected.clone()]),
+                StageStatus::Running {
+                    processed_count: 17
+                }
+            ));
+            assert!(matches!(
+                run(vec![reconnecting.clone(), terminal.clone(), reconnecting, reconnected]),
+                StageStatus::Error { diagnostic: actual } if &actual == diagnostic
+            ));
+        }
+
+        fn run_receiver<E>(
+            app: &AppState,
+            dir: &std::path::Path,
+            events: Vec<E>,
+            receive: impl FnOnce(crossbeam_channel::Receiver<E>, SpeechShared, SpeechConfig),
+        ) -> StageStatus {
+            set_asr_status(
+                &app.pipeline_status,
+                StageStatus::Running {
+                    processed_count: 17,
+                },
+            );
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for event in events {
+                tx.send(event).unwrap();
+            }
+            drop(tx);
+            receive(
+                rx,
+                moonshine_shared_for_app(app, super::shared_test_app_handle()),
+                moonshine_speech_config(dir.to_path_buf()),
+            );
+            app.pipeline_status.read().unwrap().asr.clone()
+        }
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("streaming-reconnect-stage");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let diagnostic = transcription_diagnostic(
+            RuntimeErrorCode::ProviderUnavailable,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            RuntimeTransport::Websocket,
+        );
+        let source = || Arc::new(RwLock::new(None));
+        let active = || Arc::new(AtomicBool::new(true));
+
+        check(
+            |events| {
+                run_receiver(&app, &dir, events, |rx, shared, config| {
+                    super::run_assemblyai_event_receiver(rx, active(), shared, config, source());
+                })
+            },
+            AssemblyAIEvent::Reconnecting {
+                attempt: 3,
+                backoff_secs: 10,
+                reason: AsrReconnectReason::ProviderRetryLater,
+            },
+            AssemblyAIEvent::Reconnected,
+            AssemblyAIEvent::Advisory {
+                message: diagnostic.clone(),
+            },
+            AssemblyAIEvent::Error {
+                message: diagnostic.clone(),
+            },
+            AsrReconnectReason::ProviderRetryLater,
+            &diagnostic,
+        );
+        check(
+            |events| {
+                run_receiver(&app, &dir, events, |rx, shared, config| {
+                    super::run_soniox_event_receiver(rx, active(), shared, config, 0);
+                })
+            },
+            SonioxEvent::Reconnecting {
+                attempt: 3,
+                backoff_secs: 10,
+                reason: AsrReconnectReason::SessionRollover,
+            },
+            SonioxEvent::Reconnected,
+            SonioxEvent::Advisory {
+                message: diagnostic.clone(),
+            },
+            SonioxEvent::Error {
+                message: diagnostic.clone(),
+            },
+            AsrReconnectReason::SessionRollover,
+            &diagnostic,
+        );
+        check(
+            |events| {
+                run_receiver(&app, &dir, events, |rx, shared, config| {
+                    super::run_openai_realtime_event_receiver(
+                        rx,
+                        active(),
+                        shared,
+                        config,
+                        source(),
+                    );
+                })
+            },
+            OpenAiRealtimeEvent::Reconnecting {
+                attempt: 3,
+                backoff_secs: 10,
+                reason: AsrReconnectReason::ConnectionLost,
+            },
+            OpenAiRealtimeEvent::Reconnected,
+            OpenAiRealtimeEvent::Advisory {
+                message: diagnostic.clone(),
+            },
+            OpenAiRealtimeEvent::Error {
+                message: diagnostic.clone(),
+            },
+            AsrReconnectReason::ConnectionLost,
+            &diagnostic,
+        );
+
+        let app_handle = super::shared_test_app_handle();
+        set_asr_status(
+            &app.pipeline_status,
+            StageStatus::Running {
+                processed_count: 17,
+            },
+        );
+        let mut reconnect_status = AsrReconnectStatus::default();
+        let attempt = AwsTranscribeStatus::Reconnecting {
+            attempt: 3,
+            backoff_secs: 10,
+            reason: AsrReconnectReason::ConnectionLost,
+        };
+        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt.clone());
+        assert!(matches!(
+            app.pipeline_status.read().unwrap().asr,
+            StageStatus::Reconnecting {
+                reason: AsrReconnectReason::ConnectionLost,
+                retry_delay: RuntimeRetryDelayBucket::Medium
+            }
         ));
+        reconnect_status.handle_aws_status(
+            &app_handle,
+            &app.pipeline_status,
+            AwsTranscribeStatus::Reconnected,
+        );
+        assert!(matches!(
+            app.pipeline_status.read().unwrap().asr,
+            StageStatus::Running {
+                processed_count: 17
+            }
+        ));
+        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt.clone());
+        set_asr_status(
+            &app.pipeline_status,
+            StageStatus::Error {
+                diagnostic: diagnostic.clone(),
+            },
+        );
+        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt);
+        reconnect_status.handle_aws_status(
+            &app_handle,
+            &app.pipeline_status,
+            AwsTranscribeStatus::Reconnected,
+        );
+        assert!(
+            matches!(&app.pipeline_status.read().unwrap().asr, StageStatus::Error { diagnostic: actual } if actual == &diagnostic)
+        );
+
         drain_app_writers(&app);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
