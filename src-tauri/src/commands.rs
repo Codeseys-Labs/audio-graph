@@ -399,31 +399,13 @@ pub struct CredentialPresence {
 /// Outcome of `save_credential_cmd`, so a caller *can* tell a real write apart
 /// from an empty/whitespace no-op skip.
 ///
-/// Previously the command returned `Ok(())` for both, which made a skipped
-/// save look identical to a persisted one on the wire (cred-review M2.1):
-/// a caller that passed a blank value got a success result, a bumped readiness
-/// epoch, and a "presence refreshed" flow that re-confirmed the OLD stored
-/// key. The primary fix is on the backend: the empty-value path now
-/// short-circuits BEFORE the epoch bump + cache rehydrate (see
-/// `save_credential_impl`), so a blank save is a true no-op regardless of what
-/// the frontend does with the return value.
-///
-/// The typed return is **forward-looking plumbing**: every current frontend
-/// caller pre-guards with `value.trim()` before invoking (so the
-/// `SkippedEmpty` path is only reachable defensively, e.g. from a future caller
-/// or a Rust unit test) and none branch on the result today. It exists so a
-/// caller that *does* want to skip its post-save presence/readiness refresh on
-/// a no-op can do so without re-deriving "was this blank?" itself. Serialized
-/// `snake_case` so the frontend union is `"saved" | "skipped_empty"`. Returning
-/// a value from a previously `()`-typed command is backward-compatible:
-/// existing callers that `await invoke(...)` without inspecting the result are
-/// unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SaveCredentialOutcome {
     /// The value was written to the credential store (keychain or YAML) and the
     /// readiness epoch + settings cache were refreshed.
     Saved,
+    SavedWithWarning(crate::credentials::LegacyCredentialError),
     /// The value was empty or whitespace-only, so nothing was written: the
     /// previously stored value (if any) is untouched and no readiness caches
     /// were invalidated. Use `delete_credential_cmd` to actually clear a key.
@@ -2937,7 +2919,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                             key: "aws_access_key".to_string(),
                         });
                     }
-                    let cred_store = crate::credentials::load_credentials();
+                    let cred_store = crate::credentials::load_credentials()?;
                     let secret_valid = cred_store
                         .aws_secret_key
                         .as_ref()
@@ -3545,17 +3527,31 @@ pub async fn configure_api_endpoint(
 // Chat commands (backed by native LLM engine or API client)
 // ---------------------------------------------------------------------------
 
+/// One chat request: the messages to send (the stored history plus
+/// `user_turn`), its graph + transcript system context, and the history
+/// generation those messages were read at. The history itself is left
+/// untouched until the call succeeds (see [`record_chat_turns`]).
+struct PreparedChat {
+    messages: Vec<ChatMessage>,
+    graph_context: String,
+    user_turn: ChatMessage,
+    history_generation: u64,
+}
+
 /// Build the per-request graph + transcript context block used as the chat
-/// system prompt, and append the user message to history.
+/// system prompt, and the message list for this request, ready to feed
+/// either the streaming or blocking chat path. Locks are taken under short
+/// critical sections and released before any string formatting (I4 fix
+/// carried over from the legacy `send_chat_message` body).
 ///
-/// Returns `(messages, graph_context)` ready to feed either the streaming
-/// or blocking chat path. Locks are taken under short critical sections
-/// and released before any string formatting (I4 fix carried over from
-/// the legacy `send_chat_message` body).
+/// `history_generation` is the generation the command read on entry, before
+/// any await. If the chat was cleared since, the request is refused as
+/// `cancelled` and nothing is sent to the provider.
 fn prepare_chat_request(
     state: &AppState,
     message: String,
-) -> Result<(Vec<ChatMessage>, String), String> {
+    history_generation: u64,
+) -> AppResult<PreparedChat> {
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -3592,56 +3588,197 @@ fn prepare_chat_request(
         ctx
     };
 
-    let user_msg = ChatMessage {
+    let user_turn = ChatMessage {
         role: "user".to_string(),
         content: message,
     };
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(user_msg);
-        cap_chat_history(&mut history);
-    }
-    let messages: Vec<ChatMessage> = {
+    let mut messages = {
         let history = state
             .chat_history
             .read()
             .map_err(|e| format!("Lock error: {}", e))?;
-        history.clone()
+        if history.generation() != history_generation {
+            log::info!("Chat history was cleared before the request was sent; it is not sent");
+            return Err(llm_cancelled_diagnostic().into());
+        }
+        history.messages().to_vec()
     };
-    Ok((messages, graph_context))
+    messages.push(user_turn.clone());
+    crate::state::cap_chat_messages(&mut messages);
+    Ok(PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    })
 }
 
-/// Append the assistant message to chat history. Best-effort: lock-poisoning
-/// returns an error but the caller should still surface the reply to the
-/// user — chat_history is a UX convenience, not a correctness invariant.
-fn append_assistant_message(state: &AppState, content: String) -> Result<ChatMessage, String> {
-    let assistant_msg = ChatMessage {
-        role: "assistant".to_string(),
-        content,
-    };
-    let mut history = state
+/// The chat-history generation a chat command reads on entry, before any
+/// await, so a clear that lands while the command prepares is caught by
+/// [`prepare_chat_request`].
+fn chat_history_generation(state: &AppState) -> u64 {
+    state
         .chat_history
-        .write()
-        .map_err(|e| format!("Lock error: {}", e))?;
-    history.push(assistant_msg.clone());
-    cap_chat_history(&mut history);
-    Ok(assistant_msg)
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .generation()
 }
 
-/// Maximum chat messages retained in memory. Chat history is unbounded by
-/// nature (a long session could push thousands of turns) and is cloned whole
-/// into every chat request, so cap it to bound memory and prompt-build cost.
-/// Keeps the most recent messages.
-const MAX_CHAT_HISTORY: usize = 200;
+/// Removes one stream's `stream_registry` entry when dropped, so every exit
+/// from a stream task, a panic included, frees the entry.
+struct StreamRegistration {
+    registry: crate::llm::streaming::StreamRegistry,
+    request_id: String,
+}
 
-/// Trim `history` in place to the most recent [`MAX_CHAT_HISTORY`] messages.
-fn cap_chat_history(history: &mut Vec<ChatMessage>) {
-    if history.len() > MAX_CHAT_HISTORY {
-        let drop = history.len() - MAX_CHAT_HISTORY;
-        history.drain(0..drop);
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        self.registry.finish(&self.request_id);
+    }
+}
+
+/// Record a finished request's turns, unless the chat was cleared or the
+/// session rotated (which clears it) since the request read its history at
+/// `generation`. A stale write is dropped, so a cleared message never comes
+/// back. A failed call records nothing, neither its user message nor any
+/// partial reply, so the next request replays exactly the history that
+/// preceded it.
+fn record_chat_turns(
+    history: &std::sync::RwLock<crate::state::ChatHistory>,
+    generation: u64,
+    turns: impl IntoIterator<Item = ChatMessage>,
+) {
+    let mut history = history
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !history.append_if_current(generation, turns) {
+        log::info!("Chat history was cleared during the request; its turn is not recorded");
+    }
+}
+
+/// Record a finished turn and return its assistant message.
+fn record_chat_turn(
+    state: &AppState,
+    generation: u64,
+    user_turn: ChatMessage,
+    reply: String,
+) -> ChatMessage {
+    let assistant_turn = ChatMessage {
+        role: "assistant".to_string(),
+        content: reply,
+    };
+    record_chat_turns(
+        &state.chat_history,
+        generation,
+        [user_turn, assistant_turn.clone()],
+    );
+    assistant_turn
+}
+
+fn llm_internal_diagnostic() -> RuntimeDiagnostic {
+    RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
+        RuntimeOperation::LanguageModelInference,
+    ))
+}
+
+fn llm_cancelled_diagnostic() -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::Cancelled,
+        false,
+        RuntimeSafeRecoveryAction::None,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .into()
+}
+
+fn llm_timeout_diagnostic() -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::Timeout,
+        false,
+        RuntimeSafeRecoveryAction::None,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .into()
+}
+
+/// Longest a blocking LLM executor call may run. The executor has one worker
+/// thread; if that thread panics mid-job, every later job waits in its queue
+/// forever, so no caller may wait unbounded. Long enough for a slow
+/// local-model generation.
+const BLOCKING_LLM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run a blocking LLM executor call off the async runtime, bounded by
+/// `limit`. A call that panics is `internal`, and one that outlives `limit` is
+/// `timeout`. Nothing can cancel a timed-out call, so its thread stays
+/// blocked.
+async fn bounded_blocking_llm_call<T: Send + 'static>(
+    limit: std::time::Duration,
+    call: impl FnOnce() -> Result<T, RuntimeDiagnostic> + Send + 'static,
+) -> Result<T, RuntimeDiagnostic> {
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(call)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_panicked)) => Err(llm_internal_diagnostic()),
+        Err(_elapsed) => Err(llm_timeout_diagnostic()),
+    }
+}
+
+/// The frames of one LLM stream, as the chat and card-answer consumers read
+/// them. A producer that drops its sender without a terminal frame (its task
+/// panicked or was aborted) yields one `internal` [`TokenDelta::Error`]
+/// carrying the text streamed so far, so each consumer finalizes the call
+/// exactly once, as a failure, and never mistakes a cut-off stream for a
+/// reply. Consumers stop reading at the first terminal frame.
+struct LlmStreamFrames {
+    rx: tokio::sync::mpsc::Receiver<crate::llm::streaming::TokenDelta>,
+    streamed: String,
+}
+
+impl LlmStreamFrames {
+    fn new(rx: tokio::sync::mpsc::Receiver<crate::llm::streaming::TokenDelta>) -> Self {
+        Self {
+            rx,
+            streamed: String::new(),
+        }
+    }
+
+    async fn next(&mut self) -> crate::llm::streaming::TokenDelta {
+        use crate::llm::streaming::TokenDelta;
+        let frame = self.rx.recv().await.unwrap_or_else(|| TokenDelta::Error {
+            diagnostic: llm_internal_diagnostic(),
+            full_text: std::mem::take(&mut self.streamed),
+        });
+        if let TokenDelta::Delta { content, .. } = &frame {
+            self.streamed.push_str(content);
+        }
+        frame
+    }
+}
+
+/// Drain a stream into one whole reply and its token count. Only an explicit
+/// `Done` is a reply: a failure, a cancellation, or a stream that ends without
+/// a terminal frame is an error, and its partial text is discarded.
+async fn collect_chat_reply(
+    mut frames: LlmStreamFrames,
+) -> Result<(String, u32), RuntimeDiagnostic> {
+    use crate::llm::streaming::TokenDelta;
+    let mut reply = String::new();
+    loop {
+        match frames.next().await {
+            TokenDelta::Delta { content, .. } => reply.push_str(&content),
+            TokenDelta::Done {
+                full_text, usage, ..
+            } => {
+                if !full_text.is_empty() {
+                    reply = full_text;
+                }
+                // `total_tokens` from the provider's terminal `usage` block
+                // covers the whole request (prompt + completion). It stays 0
+                // when the provider omitted usage.
+                return Ok((reply, tokens_used_from_stream_usage(usage)));
+            }
+            TokenDelta::Error { diagnostic, .. } => return Err(diagnostic),
+            TokenDelta::Cancelled { .. } => return Err(llm_cancelled_diagnostic()),
+        }
     }
 }
 
@@ -3732,29 +3869,29 @@ fn stream_params_from_settings(
 /// Spawn the streaming-chat task for `request_id`.
 ///
 /// Drives `crate::llm::streaming::stream_chat` to completion, sending one
-/// [`ChatStreamEvent::Delta`] per [`crate::llm::streaming::TokenDelta::Delta`]
-/// and exactly one [`ChatStreamEvent::Done`] on terminal (Done / Error /
-/// Cancelled) over the per-invocation `channel` (audio-graph-1534: this hot
-/// path streams 20-100+ token deltas/sec, so it uses `tauri::ipc::Channel`
-/// rather than `AppHandle::emit`). Removes the request from
-/// `state.stream_registry` on terminal so a stale id cannot be cancelled later.
+/// [`crate::llm::streaming::ChatStreamEvent::Delta`] per
+/// [`crate::llm::streaming::TokenDelta::Delta`] and exactly one terminal
+/// `Done` (completed or cancelled) or `Failed` frame over the per-invocation
+/// `channel` (audio-graph-1534: this hot path streams 20-100+ token
+/// deltas/sec, so it uses `tauri::ipc::Channel` rather than
+/// `AppHandle::emit`). Removes the request from `state.stream_registry` on
+/// terminal so a stale id cannot be cancelled later. Only a completed or
+/// cancelled stream records its user turn in chat history.
 ///
 /// At most one active chat stream per session: any prior live registry entry
 /// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
 /// tracks only a single `streamingChatRequestId`, so a stream left running
 /// from an earlier `start_streaming_chat` would burn tokens unreachably.
-#[allow(clippy::too_many_arguments)]
 fn spawn_stream_task(
     app: tauri::AppHandle,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
-    history: Vec<ChatMessage>,
-    graph_context: String,
+    prepared: PreparedChat,
     settings: crate::settings::AppSettings,
-    persist_to_history: bool,
 ) {
+    use crate::events::ChatStreamFrame;
     use crate::llm::streaming::{
         ChatStreamEvent, StreamChatRequest, StreamSourceMetadata, TokenDelta,
         stream_chat_with_request,
@@ -3779,7 +3916,13 @@ fn spawn_stream_task(
         &settings,
         provider.requires_cloud_content_transfer(),
     );
-    let request = StreamChatRequest::new(provider, history, graph_context, params)
+    let PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    } = prepared;
+    let request = StreamChatRequest::new(provider, messages, graph_context, params)
         .with_content_egress_policy(content_egress_policy)
         .with_backend_handles(stream_backend_handles_from_state(state))
         .with_source_metadata(StreamSourceMetadata {
@@ -3787,10 +3930,13 @@ fn spawn_stream_task(
             source_id: None,
             request_id: Some(request_id.clone()),
         });
-    let (mut rx, cancel) = stream_chat_with_request(request);
+    let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
 
-    let registry = state.stream_registry.clone();
+    let registration = StreamRegistration {
+        registry: state.stream_registry.clone(),
+        request_id: request_id.clone(),
+    };
     let chat_history = state.chat_history.clone();
     let request_id_for_task = request_id.clone();
 
@@ -3812,6 +3958,7 @@ fn spawn_stream_task(
     let request_id_for_pipe_log = request_id.clone();
 
     tokio::spawn(async move {
+        let _registration = registration;
         let mut pipe: Option<crate::speak_aloud::SpeakAloudPipe> =
             match crate::speak_aloud::SpeakAloudPipe::maybe_new(
                 settings_snapshot.0,
@@ -3833,8 +3980,9 @@ fn spawn_stream_task(
                 }
             };
 
-        while let Some(frame) = rx.recv().await {
-            match frame {
+        let mut frames = LlmStreamFrames::new(rx);
+        loop {
+            match frames.next().await {
                 TokenDelta::Delta {
                     content,
                     finish_reason,
@@ -3844,11 +3992,11 @@ fn spawn_stream_task(
                     {
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Delta {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Delta {
                         request_id: request_id_for_task.clone(),
                         delta: content,
                         finish_reason,
-                    }) {
+                    })) {
                         // A closed channel means the frontend dropped the
                         // stream (window closed / navigated). Stop draining
                         // rather than spin on a dead channel — mirrors the
@@ -3862,7 +4010,6 @@ fn spawn_stream_task(
                         if let Some(p) = pipe.take() {
                             let _ = p.cancel();
                         }
-                        registry.finish(&request_id_for_task);
                         break;
                     }
                 }
@@ -3871,13 +4018,17 @@ fn spawn_stream_task(
                     usage,
                     finish_reason,
                 } => {
-                    if persist_to_history && let Ok(mut history) = chat_history.write() {
-                        history.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: full_text.clone(),
-                        });
-                        cap_chat_history(&mut history);
-                    }
+                    record_chat_turns(
+                        &chat_history,
+                        history_generation,
+                        [
+                            user_turn,
+                            ChatMessage {
+                                role: "assistant".to_string(),
+                                content: full_text.clone(),
+                            },
+                        ],
+                    );
                     if let Some(p) = pipe.take()
                         && let Err(e) = p.finish()
                     {
@@ -3885,62 +4036,61 @@ fn spawn_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &session_id_for_usage, tokens_used);
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason,
                         usage,
-                    }) {
+                    })) {
                         log::warn!(
                             "chat stream {}: done channel send failed: {}",
                             request_id_for_task,
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
                 TokenDelta::Error {
                     diagnostic,
                     full_text,
                 } => {
-                    let message = diagnostic.to_string();
-                    log::warn!("Streaming chat error: {}", message);
+                    // Nothing is recorded in chat history, so the partial
+                    // text sent below is never replayed to a provider.
+                    log::warn!("Streaming chat failed: {diagnostic}");
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(ChatStreamFrame::Failed {
                         request_id: request_id_for_task.clone(),
                         full_text,
-                        finish_reason: format!("error: {}", message),
-                        usage: None,
+                        diagnostic,
                     }) {
                         log::warn!(
-                            "chat stream {}: error-done channel send failed: {}",
+                            "chat stream {}: failed-frame channel send failed: {}",
                             request_id_for_task,
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
                 TokenDelta::Cancelled { full_text } => {
+                    // A cancel keeps the user's turn but not the partial reply.
+                    record_chat_turns(&chat_history, history_generation, [user_turn]);
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason: "cancelled".to_string(),
                         usage: None,
-                    }) {
+                    })) {
                         log::warn!(
                             "chat stream {}: cancelled-done channel send failed: {}",
                             request_id_for_task,
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
             }
@@ -3951,7 +4101,7 @@ fn spawn_stream_task(
 /// Start a streaming chat request. Returns the `request_id` immediately so
 /// the frontend can correlate the stream back to this call (and cancel it via
 /// `cancel_streaming_chat`). Token deltas + the terminal frame are delivered
-/// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamEvent>`,
+/// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamFrame>`,
 /// audio-graph-1534) rather than the legacy `chat-token-delta` /
 /// `chat-token-done` events — the channel is ordered, per-invocation, and
 /// avoids the per-token serialize + event-router + JS-bridge cost the event
@@ -3966,11 +4116,12 @@ fn spawn_stream_task(
 #[tauri::command]
 pub async fn start_streaming_chat(
     message: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    log::info!("start_streaming_chat called ({} chars)", message.len());
+    let history_generation = chat_history_generation(state.inner());
+    log::info!("start_streaming_chat called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
     // module doc for why this is not attribution).
@@ -4023,7 +4174,7 @@ pub async fn start_streaming_chat(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
+    let prepared = prepare_chat_request(state.inner(), message, history_generation)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
         app,
@@ -4031,10 +4182,8 @@ pub async fn start_streaming_chat(
         state.inner(),
         request_id.clone(),
         llm_provider,
-        messages,
-        graph_context,
+        prepared,
         settings,
-        true, // persist assistant reply to chat history
     );
     Ok(request_id)
 }
@@ -4076,7 +4225,8 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
-    log::info!("send_chat_message called ({} chars)", message.len());
+    let history_generation = chat_history_generation(state.inner());
+    log::info!("send_chat_message called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
     // module doc for why this is not attribution).
@@ -4102,7 +4252,12 @@ pub async fn send_chat_message(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
+    let PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    } = prepare_chat_request(state.inner(), message, history_generation)?;
 
     // Streaming path — accumulate to full text via the same producer the
     // event-driven command uses. The shim doesn't fire IPC events itself;
@@ -4110,7 +4265,7 @@ pub async fn send_chat_message(
     // delta event spam.
     if provider_supports_streaming(&llm_provider) {
         use crate::llm::streaming::{
-            StreamChatRequest, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
+            StreamChatRequest, StreamSourceMetadata, stream_chat_with_request,
         };
         // Honour the user-configured sampling settings on the blocking shim
         // too, matching the legacy executor path (AUD-STR1 P2).
@@ -4120,7 +4275,7 @@ pub async fn send_chat_message(
             &settings,
             requires_cloud_content_transfer,
         );
-        let request = StreamChatRequest::new(llm_provider, messages, graph_context.clone(), params)
+        let request = StreamChatRequest::new(llm_provider, messages, graph_context, params)
             .with_content_egress_policy(content_egress_policy)
             .with_backend_handles(stream_backend_handles_from_state(state.inner()))
             .with_source_metadata(StreamSourceMetadata {
@@ -4131,63 +4286,19 @@ pub async fn send_chat_message(
         // This blocking shim drains the stream to completion and does not expose
         // cancellation. Dropping a CancellationToken does not fire it; this
         // binding only keeps the stream infrastructure intact.
-        let (mut rx, _no_cancel) = stream_chat_with_request(request);
-        let mut full_text = String::new();
-        // Real token count from the provider's terminal `usage` block (sent when
-        // `stream_options.include_usage` is honoured). `total_tokens` covers the
-        // whole request (prompt + completion), matching the single `tokens_used`
-        // field the frontend dashboard surfaces. Stays 0 only if the provider
-        // omitted usage entirely.
-        let mut tokens_used = 0u32;
-        while let Some(frame) = rx.recv().await {
-            match frame {
-                TokenDelta::Delta { content, .. } => full_text.push_str(&content),
-                TokenDelta::Done {
-                    full_text: t,
-                    usage,
-                    ..
-                } => {
-                    if !t.is_empty() {
-                        full_text = t;
-                    }
-                    tokens_used = tokens_used_from_stream_usage(usage);
-                    break;
-                }
-                TokenDelta::Error {
-                    diagnostic,
-                    full_text: partial,
-                } => {
-                    let message = diagnostic.to_string();
-                    log::warn!("send_chat_message streaming error: {}", message);
-                    let fallback = if partial.is_empty() {
-                        format!(
-                            "I couldn't generate a streaming response (LLM error: {}).\n\n{}",
-                            message, graph_context
-                        )
-                    } else {
-                        partial
-                    };
-                    let assistant_msg = append_assistant_message(state.inner(), fallback)?;
-                    // No usage signal: a stream that errors mid-flight never
-                    // reaches the terminal `usage` block, so the real token count
-                    // is genuinely unavailable here.
-                    return Ok(ChatResponse {
-                        message: assistant_msg,
-                        tokens_used: 0,
-                    });
-                }
-                TokenDelta::Cancelled { full_text: partial } => {
-                    let assistant_msg = append_assistant_message(state.inner(), partial)?;
-                    // No usage signal: a cancelled stream is dropped before the
-                    // terminal `usage` block arrives, so no real count exists.
-                    return Ok(ChatResponse {
-                        message: assistant_msg,
-                        tokens_used: 0,
-                    });
-                }
-            }
-        }
-        let assistant_msg = append_assistant_message(state.inner(), full_text)?;
+        let (rx, _no_cancel) = stream_chat_with_request(request);
+        // Chat history keeps neither turn of a call that did not complete.
+        // This command returns only a whole reply, so partial text from a
+        // failed or cancelled call is discarded rather than presented as an
+        // answer.
+        let (reply, tokens_used) =
+            collect_chat_reply(LlmStreamFrames::new(rx))
+                .await
+                .map_err(|diagnostic| {
+                    log::warn!("send_chat_message failed: {diagnostic}");
+                    AppError::from(diagnostic)
+                })?;
+        let assistant_msg = record_chat_turn(state.inner(), history_generation, user_turn, reply);
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
         return Ok(ChatResponse {
             message: assistant_msg,
@@ -4196,38 +4307,27 @@ pub async fn send_chat_message(
     }
 
     // Legacy blocking path: native engines + bedrock until their streaming
-    // support lands. Wrap the synchronous executor call in
-    // `spawn_blocking` so we don't stall the runtime worker. Clone the
-    // graph context once so we still have it for the error fallback path.
+    // support lands. `chat_with_history` returns the reply text plus the token
+    // usage the backend reported. The native `LlmEngine` surfaces a real
+    // (prompt + completion) count; the cloud backends routed through this
+    // blocking path (Bedrock via ApiClient, OpenRouter blocking, mistral.rs)
+    // report 0 because their `chat_with_history` signatures don't carry usage
+    // yet — never fabricated.
     let executor = state.llm_executor.clone();
-    let graph_for_error = graph_context.clone();
-    // `chat_with_history` now returns the reply text plus the token usage the
-    // backend reported. The native `LlmEngine` surfaces a real (prompt +
-    // completion) count; the cloud backends routed through this blocking path
-    // (Bedrock via ApiClient, OpenRouter blocking, mistral.rs) report 0 because
-    // their `chat_with_history` signatures don't carry usage yet — never
-    // fabricated. On error we synthesize a fallback message with no count.
-    let (response_text, tokens_used) = match tokio::task::spawn_blocking(move || {
+    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|e| format!("chat task join failed: {}", e))?
-    {
-        Ok(outcome) => (outcome.text, outcome.tokens_used),
-        Err(e) => (
-            format!(
-                "I couldn't generate a detailed response (LLM error: {}). \
-                 Please check the LLM provider configuration.\n\n{}",
-                e, graph_for_error
-            ),
-            0,
-        ),
-    };
-    let assistant_msg = append_assistant_message(state.inner(), response_text)?;
-    persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
+    .map_err(|diagnostic| {
+        log::warn!("send_chat_message failed: {diagnostic}");
+        AppError::from(diagnostic)
+    })?;
+    let assistant_msg =
+        record_chat_turn(state.inner(), history_generation, user_turn, outcome.text);
+    persist_llm_usage_for_session(&app, &state.current_session_id(), outcome.tokens_used);
     Ok(ChatResponse {
         message: assistant_msg,
-        tokens_used,
+        tokens_used: outcome.tokens_used,
     })
 }
 
@@ -4306,17 +4406,13 @@ pub async fn synthesize_notes(
     }];
 
     let executor = state.llm_executor.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|e| format!("notes synthesis task join failed: {}", e))?
-    .map_err(|e| {
-        format!(
-            "Failed to synthesize notes (LLM error: {}). Check the LLM provider \
-             configuration.",
-            e
-        )
+    .map_err(|diagnostic| {
+        log::warn!("synthesize_notes failed: {diagnostic}");
+        AppError::from(diagnostic)
     })?;
 
     // Notes synthesis only needs the generated Markdown; the token usage on the
@@ -4331,7 +4427,7 @@ pub async fn get_chat_history(state: State<'_, AppState>) -> AppResult<Vec<ChatM
         .chat_history
         .read()
         .map_err(|e| format!("Lock error: {}", e))?;
-    Ok(history.clone())
+    Ok(history.messages().to_vec())
 }
 
 /// Clear the chat message history.
@@ -4580,6 +4676,9 @@ fn approve_agent_proposal_impl(
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<events::LiveAssistCardRecord> {
+    // Read before any work, so a clear or rotation during the approval keeps
+    // this proposal out of the cleared history.
+    let history_generation = chat_history_generation(state);
     let proposal = {
         let mut pending = state
             .pending_agent_proposals
@@ -4714,17 +4813,14 @@ fn approve_agent_proposal_impl(
         format!("Approved agent proposal for review: {}", proposal.title)
     };
     let message = format!("{}\n\n{}", summary, proposal.body);
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(ChatMessage {
+    record_chat_turns(
+        &state.chat_history,
+        history_generation,
+        [ChatMessage {
             role: "assistant".to_string(),
             content: message.clone(),
-        });
-        cap_chat_history(&mut history);
-    }
+        }],
+    );
 
     events::emit_or_log(
         &app,
@@ -5449,7 +5545,7 @@ fn evaluate_answer_spend_gate(
             return Some(Reason::Duplicate);
         }
     }
-    if !state.stream_registry.is_empty() {
+    if !state.stream_registry.is_empty() || state.card_answer_in_flight.load(Ordering::SeqCst) {
         return Some(Reason::Busy);
     }
     if auto {
@@ -5915,26 +6011,23 @@ fn build_assist_answer_terminal_event(
 /// abort or unwind the answer path (the answer itself, and its telemetry,
 /// still matter even if the audit row didn't persist) — same posture as
 /// `append_capture_lifecycle_movement_for`'s callers, which log and continue.
+/// The write error names the session's file path, so only a fixed message is
+/// logged.
 fn append_assist_answer_ledger_event(
     session_id: &str,
     event: &crate::persistence::DataMovementEvent,
 ) {
-    if let Err(err) =
-        FileMemoryRepository::user_data().append_data_movement_event(session_id, event)
+    if FileMemoryRepository::user_data()
+        .append_data_movement_event(session_id, event)
+        .is_err()
     {
-        log::warn!(
-            "Failed to append assist-answer movement ledger row: {}",
-            err
-        );
+        log::warn!("Failed to append an assist-answer movement ledger row");
     }
 }
 
 /// Everything `spawn_card_answer_stream_task` needs that isn't already a
 /// parameter of `spawn_stream_task` (which this function otherwise mirrors).
-/// Bundled into one struct rather than growing the parameter list further —
-/// `spawn_stream_task` itself already carries an
-/// `#[allow(clippy::too_many_arguments)]`; this avoids needing a second one
-/// with even more parameters.
+/// Bundled into one struct rather than growing the parameter list further.
 struct CardAnswerContext {
     session_id: String,
     card_id: String,
@@ -5948,17 +6041,49 @@ struct CardAnswerContext {
     provider_id_for_ledger: String,
     requires_cloud_transfer: bool,
     cloud_transfer_allowed: bool,
+    /// The live session id (`AppState::session_id`), read when the answer is
+    /// finalized so a card from a session that has since rotated is not
+    /// announced into the new one.
+    live_session: std::sync::Arc<std::sync::RwLock<String>>,
+}
+
+/// How one card-answer attempt ended: what [`finalize_card_answer`] persists,
+/// and the terminal frame sent once it has.
+struct CardAnswerTerminal {
+    status: events::CardAnswerStatus,
+    full_text: String,
+    finish_reason: Option<String>,
+    diagnostic: Option<RuntimeDiagnostic>,
+    total_tokens: Option<u64>,
+    frame: events::ChatStreamFrame,
+}
+
+/// Holds [`AppState::card_answer_in_flight`] for one card-answer attempt and
+/// releases it when dropped, including when the answer task panics.
+struct CardAnswerSlot(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CardAnswerSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Build, cap, and persist the `CardAnswer` on the stream's terminal frame
 /// (deliverable a: "persist ONCE on the terminal frame — never per-delta"),
-/// append the terminal ledger row, emit `AGENT_CARD_UPDATE`, and log the
-/// `Completed`/`Failed` telemetry event (`Interrupted` also logs `Failed` —
-/// deliverable f names exactly four telemetry events, not five).
+/// after appending the terminal ledger row, then emit `AGENT_CARD_UPDATE`
+/// and log the `Completed`/`Failed` telemetry event (`Interrupted` also logs
+/// `Failed` — deliverable f names exactly four telemetry events, not five).
+/// The ledger row lands first so anyone who observes the finished answer
+/// also finds its terminal row.
 ///
 /// Re-fetches the card fresh from disk rather than reusing a copy captured
 /// at dispatch time, so a concurrent approve/dismiss that landed while the
 /// stream was in flight is not clobbered by a stale `existing` snapshot.
+///
+/// Returns a closed `internal` diagnostic when the card could not be
+/// written, so the caller reports a failure rather than a normal terminal
+/// frame. The card is announced only once written, and only while its
+/// session is still the live one.
 #[allow(clippy::too_many_arguments)]
 fn finalize_card_answer(
     app: &tauri::AppHandle,
@@ -5966,8 +6091,9 @@ fn finalize_card_answer(
     status: events::CardAnswerStatus,
     full_text: String,
     finish_reason: Option<String>,
+    diagnostic: Option<RuntimeDiagnostic>,
     total_tokens: Option<u64>,
-) {
+) -> Result<(), RuntimeDiagnostic> {
     let mut answer = events::CardAnswer {
         status,
         text: full_text,
@@ -5978,6 +6104,7 @@ fn finalize_card_answer(
         route_id: ctx.route_id.clone(),
         requested_by: ctx.requested_by,
         finish_reason,
+        diagnostic,
         total_tokens,
         answered_at_ms: unix_millis(),
     };
@@ -5987,29 +6114,6 @@ fn finalize_card_answer(
     // validator error, exactly the seam `CardAnswer::cap_text`'s own doc
     // comment describes.
     answer.cap_text();
-
-    match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
-        Some(mut card) => {
-            card.answer = Some(answer);
-            card.updated_at_ms = unix_millis();
-            if let Err(err) =
-                FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
-            {
-                log::warn!(
-                    "Failed to persist card answer for card_id={}: {}",
-                    ctx.card_id,
-                    err
-                );
-            }
-            events::emit_or_log(app, events::AGENT_CARD_UPDATE, card);
-        }
-        None => {
-            log::warn!(
-                "Card answer terminal frame arrived but card_id={} no longer exists; answer not persisted",
-                ctx.card_id
-            );
-        }
-    }
 
     let has_notes = ctx.notes_last_sequence.is_some();
     let terminal_event = build_assist_answer_terminal_event(
@@ -6023,6 +6127,55 @@ fn finalize_card_answer(
         status,
     );
     append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
+
+    // A card that cannot be read is a failure; one that is gone is not.
+    let card = FileMemoryRepository::user_data()
+        .load_live_assist_cards(&ctx.session_id)
+        .map(|cards| {
+            cards
+                .into_iter()
+                .find(|card| card.proposal.id == ctx.card_id)
+        });
+    let persisted = match card {
+        Err(_) => {
+            log::warn!(
+                "Failed to read the card for card_id={}; answer not persisted",
+                ctx.card_id
+            );
+            Err(llm_internal_diagnostic())
+        }
+        Ok(Some(mut card)) => {
+            card.answer = Some(answer);
+            card.updated_at_ms = unix_millis();
+            // The write error names the session's file path, so only a fixed
+            // message is logged.
+            match FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
+            {
+                Ok(()) => {
+                    let still_live = *ctx
+                        .live_session
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        == ctx.session_id;
+                    if still_live {
+                        events::emit_or_log(app, events::AGENT_CARD_UPDATE, card);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    log::warn!("Failed to persist the answer for card_id={}", ctx.card_id);
+                    Err(llm_internal_diagnostic())
+                }
+            }
+        }
+        Ok(None) => {
+            log::warn!(
+                "Card answer terminal frame arrived but card_id={} no longer exists; answer not persisted",
+                ctx.card_id
+            );
+            Ok(())
+        }
+    };
 
     let telemetry_event = match status {
         events::CardAnswerStatus::Answered => {
@@ -6039,6 +6192,7 @@ fn finalize_card_answer(
         ctx.auto,
         telemetry_event,
     );
+    persisted
 }
 
 /// Spawn the answer stream task. Deliberately NOT a call to
@@ -6046,16 +6200,23 @@ fn finalize_card_answer(
 /// `state.stream_registry.cancel_all()` before registering (AUD-STR1 P1),
 /// which is exactly the hazard the ordered spend gate's `Busy` check exists
 /// to avoid — this function never cancels a prior stream; the gate's
-/// `stream_registry.is_empty()` check (evaluated by the caller before this
-/// function is reached) is the ENTIRE protection. Also never touches
+/// `stream_registry.is_empty()` and `card_answer_in_flight` checks
+/// (evaluated by the caller before this function is reached) are the ENTIRE
+/// protection. Also never touches
 /// `state.chat_history` (stateless, per `prepare_card_answer_request`'s doc
 /// comment) and forces `speak_aloud` off whenever `ctx.auto` is `true`
 /// (deliverable e) by simply never constructing a `SpeakAloudPipe` for the
 /// auto path.
+///
+/// The attempt holds `card_answer_in_flight` until its answer and terminal
+/// ledger row are written, and only then sends the terminal frame. A retry
+/// that frame prompts therefore starts after this attempt is durable, and
+/// this attempt can never overwrite it. A `stream_registry` entry alone
+/// cannot hold the slot: cancelling removes it before the task finalizes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_card_answer_stream_task(
     app: tauri::AppHandle,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
@@ -6064,6 +6225,7 @@ fn spawn_card_answer_stream_task(
     effective_speak_aloud: bool,
     ctx: CardAnswerContext,
 ) {
+    use crate::events::ChatStreamFrame;
     use crate::llm::streaming::{
         ChatStreamEvent, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
     };
@@ -6086,10 +6248,15 @@ fn spawn_card_answer_stream_task(
         source_id: None,
         request_id: Some(request_id.clone()),
     });
-    let (mut rx, cancel) = stream_chat_with_request(request);
+    let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
+    state.card_answer_in_flight.store(true, Ordering::SeqCst);
+    let slot = CardAnswerSlot(state.card_answer_in_flight.clone());
 
-    let registry = state.stream_registry.clone();
+    let registration = StreamRegistration {
+        registry: state.stream_registry.clone(),
+        request_id: request_id.clone(),
+    };
     let request_id_for_task = request_id.clone();
 
     let settings_snapshot = (
@@ -6141,8 +6308,9 @@ fn spawn_card_answer_stream_task(
         // send failure) broke.
         let mut channel_alive = true;
 
-        while let Some(frame) = rx.recv().await {
-            match frame {
+        let mut frames = LlmStreamFrames::new(rx);
+        let terminal = loop {
+            match frames.next().await {
                 TokenDelta::Delta {
                     content,
                     finish_reason,
@@ -6153,11 +6321,12 @@ fn spawn_card_answer_stream_task(
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Delta {
-                            request_id: request_id_for_task.clone(),
-                            delta: content,
-                            finish_reason,
-                        })
+                        && let Err(e) =
+                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Delta {
+                                request_id: request_id_for_task.clone(),
+                                delta: content,
+                                finish_reason,
+                            }))
                     {
                         log::warn!(
                             "card answer stream {}: delta channel send failed ({}); the frontend can no longer see this answer, but it will still be finalized and persisted when the terminal frame arrives",
@@ -6182,128 +6351,95 @@ fn spawn_card_answer_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &ctx.session_id, tokens_used);
-                    let total_tokens = (tokens_used > 0).then(|| u64::from(tokens_used));
-                    if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Stream(ChatStreamEvent::Done {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             finish_reason: finish_reason.clone(),
                             usage,
-                        })
-                    {
-                        log::warn!(
-                            "card answer stream {}: done channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Answered,
+                        }),
+                        status: events::CardAnswerStatus::Answered,
                         full_text,
-                        Some(finish_reason).filter(|s| !s.is_empty()),
-                        total_tokens,
-                    );
-                    return;
+                        finish_reason: Some(finish_reason).filter(|s| !s.is_empty()),
+                        diagnostic: None,
+                        total_tokens: (tokens_used > 0).then(|| u64::from(tokens_used)),
+                    };
                 }
                 TokenDelta::Error {
                     diagnostic,
                     full_text,
                 } => {
-                    let message = diagnostic.to_string();
-                    // Fix-round finding (scope-honesty review, minor,
-                    // declined as a functional change): `message` here is
-                    // already `crate::error::redacted_error_excerpt`'d at
-                    // its source in `llm/streaming.rs` (secrets stripped,
-                    // bounded to 200 chars) before it ever reaches this
-                    // channel — the SAME redaction convention
-                    // `redacted_provider_diagnostic` wraps (it is that
-                    // function plus a wider bound, not a distinct
-                    // "class"-reduction step; error.rs has no separate
-                    // class-only reducer to call into here). This line is a
-                    // byte-for-byte mirror of the pre-existing
-                    // `start_streaming_chat` error line just above it in
-                    // this file. Declined further reduction: doing so only
-                    // for this new call site while leaving the identical,
-                    // pre-existing chat line as-is would create an
-                    // inconsistency with no clear security win, and
-                    // widening the redaction convention itself is out of
-                    // this ticket's scope.
-                    log::warn!("Card answer streaming error: {}", message);
+                    log::warn!("Card answer stream failed: {diagnostic}");
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    let finish_reason = format!("error: {}", message);
-                    if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Failed {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
-                            finish_reason: finish_reason.clone(),
-                            usage: None,
-                        })
-                    {
-                        log::warn!(
-                            "card answer stream {}: error-done channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Failed,
+                            diagnostic: diagnostic.clone(),
+                        },
+                        status: events::CardAnswerStatus::Failed,
                         full_text,
-                        Some(finish_reason),
-                        None,
-                    );
-                    return;
+                        finish_reason: None,
+                        diagnostic: Some(diagnostic),
+                        total_tokens: None,
+                    };
                 }
                 TokenDelta::Cancelled { full_text } => {
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Stream(ChatStreamEvent::Done {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             finish_reason: "cancelled".to_string(),
                             usage: None,
-                        })
-                    {
-                        log::warn!(
-                            "card answer stream {}: cancelled-done channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Interrupted,
+                        }),
+                        status: events::CardAnswerStatus::Interrupted,
                         full_text,
-                        Some("cancelled".to_string()),
-                        None,
-                    );
-                    return;
+                        finish_reason: Some("cancelled".to_string()),
+                        diagnostic: None,
+                        total_tokens: None,
+                    };
                 }
             }
+        };
+
+        // Persist, then free the slot, then tell the frontend.
+        let persisted = finalize_card_answer(
+            &app,
+            &ctx,
+            terminal.status,
+            terminal.full_text,
+            terminal.finish_reason,
+            terminal.diagnostic,
+            terminal.total_tokens,
+        );
+        drop(registration);
+        drop(slot);
+        let frame = match persisted {
+            Ok(()) => terminal.frame,
+            // The answer the model produced is still shown, as the failed
+            // attempt's display-only partial text.
+            Err(diagnostic) => ChatStreamFrame::Failed {
+                request_id: request_id_for_task.clone(),
+                full_text: match terminal.frame {
+                    ChatStreamFrame::Stream(ChatStreamEvent::Done { full_text, .. })
+                    | ChatStreamFrame::Failed { full_text, .. } => full_text,
+                    ChatStreamFrame::Stream(ChatStreamEvent::Delta { .. }) => String::new(),
+                },
+                diagnostic,
+            },
+        };
+        if channel_alive && let Err(e) = channel.send(frame) {
+            log::warn!(
+                "card answer stream {}: terminal channel send failed: {}",
+                request_id_for_task,
+                e
+            );
         }
-        // Fix-round finding (adversarial review, minor): if the producer
-        // ends (adapter task panic, sender dropped) WITHOUT ever sending a
-        // terminal frame, every arm's own `registry.finish` above is
-        // unreached, and — because this path is deliberately
-        // refuse-not-cancel — the leaked entry would wedge the `Busy` gate
-        // for the rest of the session (neither `answer_question_card` nor
-        // `ask_question_card` can ever cancel it themselves). This is a
-        // no-op on every normal path: each reachable match arm above
-        // already calls `return` immediately after its own
-        // `registry.finish`, so this line only executes on the abnormal
-        // no-terminal-frame path.
-        registry.finish(&request_id_for_task);
     });
 }
 
@@ -6312,7 +6448,7 @@ fn spawn_card_answer_stream_task(
 async fn answer_question_card_impl(
     proposal_id: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AnswerDispatch> {
@@ -6470,6 +6606,7 @@ async fn answer_question_card_impl(
         provider_id_for_ledger,
         requires_cloud_transfer,
         cloud_transfer_allowed,
+        live_session: state.session_id.clone(),
     };
     spawn_card_answer_stream_task(
         app,
@@ -6738,7 +6875,7 @@ fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
 /// test cannot call the `#[tauri::command]`-annotated function below
 /// directly without standing up a full mock webview + IPC round trip
 /// (disproportionate for this ticket's scope, and fragile for a
-/// `Channel<ChatStreamEvent>` argument's wire encoding). Pulling the actual
+/// `Channel<ChatStreamFrame>` argument's wire encoding). Pulling the actual
 /// logic out into this plain `&AppState`-taking function means a test CAN
 /// call it directly — the annotated wrapper below is then a one-line
 /// delegation, correct by inspection.
@@ -6746,7 +6883,7 @@ async fn dispatch_answer_question_card(
     proposal_id: String,
     question: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AnswerQuestionCardDispatch> {
@@ -6764,7 +6901,7 @@ pub async fn answer_question_card(
     proposal_id: String,
     question: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<AnswerQuestionCardDispatch> {
@@ -6791,7 +6928,7 @@ pub async fn answer_question_card(
 /// `#[tauri::command]`-annotated wrapper itself.
 async fn dispatch_ask_question_card(
     text: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AskQuestionCardDispatch> {
@@ -6817,7 +6954,7 @@ async fn dispatch_ask_question_card(
 #[tauri::command]
 pub async fn ask_question_card(
     text: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<AskQuestionCardDispatch> {
@@ -6978,9 +7115,14 @@ pub fn load_settings_cmd(
         settings
     };
 
-    let credentials = crate::credentials::load_credentials();
-    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
     let settings_for_ipc = crate::settings::redacted_settings(&settings);
+    let runtime_settings = match crate::credentials::load_credentials() {
+        Ok(store) => crate::settings::hydrate_runtime_credentials(&settings, &store),
+        Err(error) => {
+            log::warn!("{error}");
+            settings_for_ipc.clone()
+        }
+    };
 
     // Sync in-memory cache with runtime-only hydrated credentials.
     if let Ok(mut cached) = state.app_settings.write() {
@@ -6999,25 +7141,47 @@ pub fn load_settings_cmd(
 /// Save application settings to disk (atomic write).
 /// Also updates the in-memory `AppState.app_settings` cache.
 #[tauri::command]
-pub fn save_settings_cmd(
-    app: tauri::AppHandle,
+pub fn save_settings_cmd<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     settings: crate::settings::AppSettings,
     state: State<'_, AppState>,
-) -> AppResult<()> {
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
     crate::settings::save_settings(&app, &settings)?;
-    let credentials = crate::credentials::load_credentials();
-    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
+    apply_saved_settings(
+        state.inner(),
+        &settings,
+        crate::credentials::load_credentials(),
+    )
+}
 
-    // Sync in-memory cache with runtime-only hydrated credentials.
-    if let Ok(mut cached) = state.app_settings.write() {
-        *cached = runtime_settings;
-    }
+fn apply_saved_settings(
+    state: &AppState,
+    settings: &crate::settings::AppSettings,
+    credentials: Result<
+        crate::credentials::CredentialStore,
+        crate::credentials::LegacyCredentialError,
+    >,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
+    let (runtime_settings, warning) = match credentials {
+        Ok(store) => (
+            crate::settings::hydrate_runtime_credentials(settings, &store),
+            None,
+        ),
+        Err(error) => {
+            log::warn!("Settings saved without credential hydration: {error}");
+            (crate::settings::redacted_settings(settings), Some(error))
+        }
+    };
+    *state
+        .app_settings
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = runtime_settings;
     sync_llm_clients_from_settings_cache(
         &state.app_settings,
         &state.api_client,
         &state.openrouter_client,
     )?;
-    Ok(())
+    Ok(warning)
 }
 
 /// Delete a downloaded model file by filename.
@@ -11071,53 +11235,20 @@ fn ensure_session_idle_for_rotation(state: &AppState) -> AppResult<()> {
             reason: "wait for or cancel the active chat before starting a new session".to_string(),
         });
     }
+    // A cancelled card answer leaves the registry at once but keeps this slot
+    // until its answer is written to its own session.
+    if state.card_answer_in_flight.load(Ordering::SeqCst) {
+        return Err(AppError::SessionInvalid {
+            reason: "wait for the live-assist answer to finish before starting a new session"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Credential management commands
 // ---------------------------------------------------------------------------
-
-/// Re-hydrate the in-memory settings cache (`AppState.app_settings`) from the
-/// given credential store so a running capture/chat session picks up a
-/// just-mutated key WITHOUT a restart or a full settings Save.
-///
-/// This is the shared writer-side re-hydrate used by BOTH `save_credential_cmd`
-/// (fill the cache with the new key) and `delete_credential_cmd` (clear the
-/// deleted key out of the cache). The capture read-path
-/// (`read_settings_for_session_content`) clones this cache, so if a writer
-/// mutates the keychain without touching the cache the session keeps using the
-/// stale value: for save that resurfaced as a stale-cache 401 (#39), and for
-/// delete it means the session keeps transmitting a *deleted* key
-/// (audio-graph-c4d0). Keeping the two writers on one helper prevents the two
-/// paths from diverging again.
-///
-/// `hydrate_runtime_credentials` internally redacts (clears) every inline secret
-/// before re-filling from the store, so a store that no longer holds the key
-/// leaves the cached provider `api_key` empty (the delete case), while a store
-/// that holds a new value fills it (the save case). Passing the already-hydrated
-/// cache back in is therefore safe and idempotent.
-///
-/// A poisoned/contended lock is logged (not propagated): the keychain write has
-/// already succeeded and the readiness epoch already bumped, so the new state
-/// still applies after the next settings load/save or restart. `context` labels
-/// the log line with the calling command.
-fn rehydrate_app_settings_cache(
-    state: &AppState,
-    store: &crate::credentials::CredentialStore,
-    context: &str,
-    key: &str,
-) {
-    if let Ok(mut cached) = state.app_settings.write() {
-        let rehydrated = crate::settings::hydrate_runtime_credentials(&cached, store);
-        *cached = rehydrated;
-    } else {
-        log::warn!(
-            "{context}: could not lock app_settings to re-hydrate cache for key={key}; \
-             the change will apply after the next settings load/save or restart."
-        );
-    }
-}
 
 #[tauri::command]
 pub fn save_credential_cmd(
@@ -11135,29 +11266,7 @@ fn save_credential_impl(
     value: String,
     state: &AppState,
 ) -> AppResult<SaveCredentialOutcome> {
-    // Diagnostic instrumentation: log invocation with key + value LENGTH +
-    // a non-secret FINGERPRINT (never the secret itself). The fingerprint is a
-    // one-way sha256 prefix (see `credentials::secret_fingerprint`); comparing
-    // it against the fingerprint the Deepgram connect log emits reveals whether
-    // the key that reaches the wire matches the one just saved — the decisive
-    // signal for the stale-cache 401 root cause. Pairs with the success log
-    // below to disambiguate frontend-skip vs backend-persist paths when a saved
-    // credential appears not to take effect. See docs/plans/
-    // 2026-07-01-deepgram-401-rootcause.md.
-    log::info!(
-        "save_credential_cmd: key={} value_len={} fingerprint={}",
-        key,
-        value.len(),
-        crate::credentials::secret_fingerprint(Some(&value))
-    );
-    // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
-    // here before they reach the inner `set_field` match. Mirrors the
-    // convention used by `validate_session_id` elsewhere in this module.
-    if !crate::credentials::is_allowed_key(&key) {
-        return Err(crate::error::AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
-        });
-    }
+    crate::credentials::validate_key(&key)?;
 
     // Empty/whitespace-only is a no-op skip (the backend `set` treats blank as
     // "don't clobber a stored key" — use `delete_credential_cmd` to clear).
@@ -11175,67 +11284,89 @@ fn save_credential_impl(
         return Ok(SaveCredentialOutcome::SkippedEmpty);
     }
 
-    // Bubble credential-file failures as `CredentialFileError` so the
-    // frontend can render a localized / actionable message instead of a bare
-    // string.
-    crate::credentials::set_credential(&key, &value)
-        .map_err(|reason| crate::error::AppError::CredentialFileError { reason })?;
+    let write_warning = crate::credentials::set_credential_with_warning(&key, &value)?;
     bump_provider_credential_epoch();
-
-    // Re-hydrate the in-memory settings cache from the (now-updated) credential
-    // store so a running session picks up the new key WITHOUT a restart or a
-    // full settings Save. This closes the confirmed stale-cache 401: the
-    // capture read-path (`read_settings_for_session_content`) clones this cache,
-    // and `save_credential_cmd` previously only wrote the keychain + bumped the
-    // readiness epoch, leaving the cache holding the OLD key. Shared with
-    // `delete_credential_cmd` via `rehydrate_app_settings_cache` so the two
-    // symmetric writers cannot diverge again (audio-graph-c4d0).
-    let store = crate::credentials::load_credentials();
-    rehydrate_app_settings_cache(state, &store, "save_credential_cmd", &key);
-
-    log::info!("save_credential_cmd: persisted key={}", key);
-    Ok(SaveCredentialOutcome::Saved)
+    let refresh_warning = refresh_after_credential_write(
+        state,
+        &key,
+        Some(value.trim()),
+        write_warning,
+        crate::credentials::load_credentials(),
+    )?;
+    Ok(match refresh_warning {
+        Some(error) => SaveCredentialOutcome::SavedWithWarning(error),
+        None => SaveCredentialOutcome::Saved,
+    })
 }
 
 /// Explicitly clear a stored credential. Needed because `save_credential_cmd`
 /// treats empty strings as a no-op (to avoid clobbering on blank form fields),
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
-pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResult<()> {
-    // Boundary-layer allowlist check (loop11 MEDIUM #5). Emit the same
-    // message the inner `set_field` match would have produced, but reject at
-    // the command boundary so the frontend receives a structured payload.
-    if !crate::credentials::is_allowed_key(&key) {
-        return Err(AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
-        });
-    }
-    crate::credentials::delete_credential(&key)
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+pub fn delete_credential_cmd(
+    key: String,
+    state: State<'_, AppState>,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
+    crate::credentials::validate_key(&key)?;
+    crate::credentials::delete_credential(&key)?;
     bump_provider_credential_epoch();
+    refresh_after_credential_write(
+        state.inner(),
+        &key,
+        None,
+        None,
+        crate::credentials::load_credentials(),
+    )
+}
 
-    // Re-hydrate the in-memory settings cache from the (now-updated) credential
-    // store so a running session stops using the just-deleted key WITHOUT a
-    // restart. Symmetric to `save_credential_cmd`: the capture read-path
-    // (`read_settings_for_session_content`) clones this cache, and delete
-    // previously only wrote the keychain + bumped the readiness epoch, leaving
-    // the cache holding the OLD (now-revoked) key so the session kept
-    // transmitting it to the provider while the readiness chip already showed
-    // 'no key' (audio-graph-c4d0). Because the reloaded store no longer holds
-    // the key, `hydrate_runtime_credentials` leaves the cached provider api_key
-    // cleared. `state` is Tauri-injected, so `invoke('delete_credential_cmd',
-    // { key })` from the frontend is unchanged.
-    let store = crate::credentials::load_credentials();
-    rehydrate_app_settings_cache(state.inner(), &store, "delete_credential_cmd", &key);
-
-    Ok(())
+fn refresh_after_credential_write(
+    state: &AppState,
+    key: &str,
+    value: Option<&str>,
+    write_warning: Option<crate::credentials::LegacyCredentialError>,
+    reload: Result<crate::credentials::CredentialStore, crate::credentials::LegacyCredentialError>,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
+    let mut cached = state
+        .app_settings
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let warning = match reload {
+        Ok(store) => {
+            *cached = crate::settings::hydrate_runtime_credentials(&cached, &store);
+            write_warning
+        }
+        Err(error) => {
+            log::warn!("Credential persisted; refresh deferred: {error}");
+            write_warning.or(Some(error))
+        }
+    };
+    if warning.is_some() {
+        crate::settings::update_cached_credential(&mut cached, Some(key), value);
+    }
+    drop(cached);
+    sync_llm_clients_from_settings_cache(
+        &state.app_settings,
+        &state.api_client,
+        &state.openrouter_client,
+    )?;
+    Ok(warning)
 }
 
 fn credential_is_present(
     store: &crate::credentials::CredentialStore,
     key: &str,
-) -> Result<bool, String> {
+) -> Result<bool, crate::credentials::LegacyCredentialError> {
     store.is_present(key)
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum CredentialPresenceResponse {
+    Rows(Vec<CredentialPresence>),
+    WithDiagnostics {
+        presence: Vec<CredentialPresence>,
+        legacy_file_warning: Option<crate::credentials::LegacyCredentialError>,
+    },
 }
 
 /// Return non-secret credential presence for every allowlisted key.
@@ -11244,10 +11375,19 @@ fn credential_is_present(
 /// providers and show "saved key present" state without receiving plaintext
 /// secret values over IPC.
 #[tauri::command]
-pub fn load_credential_presence_cmd() -> AppResult<Vec<CredentialPresence>> {
-    let snapshot = crate::credentials::try_load_credentials_with_source()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
-    credential_presence_from_snapshot(&snapshot)
+pub fn load_credential_presence_cmd(
+    include_diagnostics: Option<bool>,
+) -> AppResult<CredentialPresenceResponse> {
+    let snapshot = crate::credentials::try_load_credentials_with_source()?;
+    let presence = credential_presence_from_snapshot(&snapshot)?;
+    Ok(if include_diagnostics == Some(true) {
+        CredentialPresenceResponse::WithDiagnostics {
+            presence,
+            legacy_file_warning: snapshot.legacy_file_warning,
+        }
+    } else {
+        CredentialPresenceResponse::Rows(presence)
+    })
 }
 
 #[cfg(test)]
@@ -11264,8 +11404,7 @@ fn credential_presence_from_snapshot(
     crate::credentials::ALLOWED_CREDENTIAL_KEYS
         .iter()
         .map(|&key| {
-            let present = credential_is_present(&snapshot.store, key)
-                .map_err(|reason| AppError::CredentialFileError { reason })?;
+            let present = credential_is_present(&snapshot.store, key)?;
             Ok(CredentialPresence {
                 key: key.to_string(),
                 present,
@@ -12950,8 +13089,7 @@ pub async fn get_provider_readiness_cmd(
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     let request = register_provider_readiness_request(request_id)?;
     let (_request_guard, cancel) = match &request {
         Some((guard, token)) => (Some(guard), Some(token)),
@@ -13055,7 +13193,7 @@ pub fn diagnose_credentials() -> AppResult<String> {
                 snapshot.source, count
             ))
         }
-        Err(reason) => Err(AppError::CredentialFileError { reason }),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -13303,8 +13441,7 @@ fn endpoint_api_key_from_draft_or_store(
         return Ok(Some(api_key));
     }
 
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     Ok(endpoint_api_key_from_store(endpoint, &store))
 }
 
@@ -13753,8 +13890,7 @@ fn deepgram_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<St
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     deepgram_api_key_from_store(&store)
 }
 
@@ -13772,8 +13908,7 @@ fn soniox_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<Stri
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     soniox_api_key_from_store(&store)
 }
 
@@ -13791,8 +13926,7 @@ fn assemblyai_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     assemblyai_api_key_from_store(&store)
 }
 
@@ -13847,8 +13981,7 @@ fn gemini_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<Stri
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     gemini_api_key_from_store(&store)
 }
 
@@ -13944,8 +14077,7 @@ pub async fn list_openrouter_models_cmd(
 pub async fn list_openrouter_providers_cmd(
     base_url: Option<String>,
 ) -> AppResult<Vec<OpenRouterProvider>> {
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     list_openrouter_providers_with_store(&store, base_url).await
 }
 
@@ -13966,8 +14098,7 @@ pub async fn list_openrouter_model_endpoints_cmd(
     model_id: String,
     base_url: Option<String>,
 ) -> AppResult<OpenRouterModelEndpoints> {
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     list_openrouter_model_endpoints_with_store(&store, model_id, base_url).await
 }
 
@@ -13987,8 +14118,7 @@ fn openrouter_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     openrouter_api_key_from_store(&store)
 }
 
@@ -14540,6 +14670,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: events::CardOrigin::User,
                 finish_reason: Some("stop".to_string()),
+                diagnostic: None,
                 total_tokens: Some(50),
                 answered_at_ms: 1_700_000_000_075,
             }),
@@ -17066,6 +17197,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: events::CardOrigin::Transcript,
                 finish_reason: Some("stop".to_string()),
+                diagnostic: None,
                 total_tokens: Some(1200),
                 answered_at_ms: 1_700_000_000_500 + i as u64,
             });
@@ -19259,7 +19391,10 @@ mod tests {
                 state.speech_processor_thread.lock().unwrap().is_none(),
                 "{row}"
             );
-            assert!(state.chat_history.read().unwrap().is_empty(), "{row}");
+            assert!(
+                state.chat_history.read().unwrap().messages().is_empty(),
+                "{row}"
+            );
             assert!(*state.is_capturing.read().unwrap(), "{row}");
             assert_eq!(
                 state.capture_manager.lock().unwrap().active_captures(),
@@ -19776,6 +19911,212 @@ mod tests {
     static CREDENTIAL_EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn settings_save_applies_local_provider_even_when_hydration_is_locked() {
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().identifier =
+            format!("com.audiograph.canary-lark-{}", uuid::Uuid::new_v4());
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new())
+            .build(context)
+            .unwrap();
+        let state = app.state::<AppState>();
+        let settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::LocalWhisper,
+            llm_provider: crate::settings::LlmProvider::LocalLlama,
+            ..Default::default()
+        };
+        *state.app_settings.write().unwrap() = deepgram_settings_with_cached_key("canary-lark-old");
+        state.app_settings.write().unwrap().llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: "canary-lark-old".into(),
+            model: "model".into(),
+        };
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+        assert!(state.api_client.lock().unwrap().is_some());
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        crate::credentials::with_partially_locked_keychain(Some("canary-cedar-old"), || {
+            let warning = save_settings_cmd(app.handle().clone(), settings, app.state())
+                .unwrap()
+                .expect("nonfatal credential warning");
+            crate::credentials::assert_closed(
+                warning,
+                audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Locked,
+                &["canary-lark-old"],
+            );
+        });
+        let path = crate::settings::get_settings_path(app.handle()).unwrap();
+        assert!(path.is_file());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        assert!(matches!(
+            state.app_settings.read().unwrap().asr_provider,
+            crate::settings::AsrProvider::LocalWhisper
+        ));
+        assert!(state.api_client.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_evicts_each_cached_copy_when_reload_fails() {
+        let _epoch = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let app = tauri::test::mock_app();
+        app.manage(AppState::new());
+        let state = app.state::<AppState>();
+        {
+            let mut cached = state.app_settings.write().unwrap();
+            cached.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: "canary-ash-deleted".into(),
+                model: "model".into(),
+            };
+            let crate::settings::OpenAiRealtimeAgentAuthMode::ApiKey { api_key } =
+                &mut cached.openai_realtime_agent.auth;
+            *api_key = "canary-ash-deleted".into();
+            cached.gemini.auth = crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "canary-ash-unrelated".into(),
+            };
+        }
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .api_client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .config()
+                .api_key
+                .as_deref(),
+            Some("canary-ash-deleted")
+        );
+        crate::credentials::with_partially_locked_keychain(None, || {
+            let warning = delete_credential_cmd("openai_api_key".into(), app.state())
+                .unwrap()
+                .expect("nonfatal credential warning");
+            crate::credentials::assert_closed(
+                warning,
+                audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Locked,
+                &["canary-ash-deleted"],
+            );
+        });
+        assert_eq!(
+            state
+                .api_client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .config()
+                .api_key,
+            None
+        );
+        let cached = state.app_settings.read().unwrap();
+        assert!(
+            matches!(&cached.llm_provider, crate::settings::LlmProvider::Api { api_key, .. } if api_key.is_empty())
+        );
+        let crate::settings::OpenAiRealtimeAgentAuthMode::ApiKey { api_key } =
+            &cached.openai_realtime_agent.auth;
+        assert!(api_key.is_empty());
+        assert!(
+            matches!(&cached.gemini.auth, crate::settings::GeminiAuthMode::ApiKey { api_key } if api_key == "canary-ash-unrelated")
+        );
+    }
+
+    #[test]
+    fn credential_command_save_rebuilds_client_when_another_entry_is_locked() {
+        let _epoch = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let app = tauri::test::mock_app();
+        app.manage(AppState::new());
+        let state = app.state::<AppState>();
+        state.app_settings.write().unwrap().llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: "model".into(),
+            api_key: "canary-cedar-old".into(),
+        };
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        crate::credentials::with_partially_locked_keychain(Some("canary-cedar-new"), || {
+            let outcome = save_credential_cmd(
+                "openai_api_key".into(),
+                " canary-cedar-new ".into(),
+                app.state(),
+            )
+            .unwrap();
+            let SaveCredentialOutcome::SavedWithWarning(error) = outcome else {
+                panic!("expected a saved credential with a refresh warning")
+            };
+            assert_eq!(
+                error.0,
+                audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Locked
+            );
+            assert!(
+                !format!(
+                    "{error} {outcome:?} {}",
+                    serde_json::to_string(&outcome).unwrap()
+                )
+                .contains("canary-cedar")
+            );
+        });
+        assert_eq!(
+            state
+                .api_client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .config()
+                .api_key
+                .as_deref(),
+            Some("canary-cedar-new")
+        );
+        let cached = state.app_settings.read().unwrap();
+        assert!(
+            matches!(&cached.llm_provider, crate::settings::LlmProvider::Api { api_key, .. } if api_key == "canary-cedar-new")
+        );
+        crate::test_log_capture::assert_process_logs_exclude(&["canary-cedar-new"]);
+    }
+
+    #[test]
+    fn rejected_credential_save_emits_no_key_value_length_or_fingerprint() {
+        let state = AppState::new();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "canary-poppy-field";
+        let value = "canary-poppy-value";
+        let error = save_credential_impl(key.into(), value.into(), &state).unwrap_err();
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire["diagnostic"]["detail"]["code"],
+            "invalid_credential_set"
+        );
+        for sink in [error.to_string(), format!("{error:?}"), wire.to_string()] {
+            assert!(!sink.contains(key));
+            assert!(!sink.contains(value));
+        }
+        // Even a derived hash or length emitted without the canary itself fails this check.
+        assert!(capture.finish().is_empty());
+        crate::test_log_capture::assert_process_logs_exclude(&[key, value]);
+    }
+
+    #[test]
     fn save_credential_empty_value_skips_without_epoch_bump_or_rehydrate() {
         // Hold the shared epoch lock for the whole test: the before/after epoch
         // comparison below is only meaningful if no concurrent test bumps the
@@ -19846,10 +20187,7 @@ mod tests {
         let unknown =
             save_credential_impl("totally_bogus_key".to_string(), "   ".to_string(), &state);
         assert!(
-            matches!(
-                unknown,
-                Err(crate::error::AppError::CredentialFileError { .. })
-            ),
+            matches!(unknown, Err(crate::error::AppError::RuntimeDiagnostic(_))),
             "unknown key must be rejected even for an empty value"
         );
     }
@@ -24479,7 +24817,7 @@ mod tests {
     // Writer-side credential cache re-hydrate (audio-graph-c4d0 + #39)
     //
     // Both `save_credential_cmd` and `delete_credential_cmd` route through
-    // `rehydrate_app_settings_cache`, which reloads the credential store and
+    // `refresh_after_credential_write`, which applies the reloaded store and
     // re-fills the in-memory settings cache the capture read-path clones. These
     // tests drive the helper directly with an explicit `CredentialStore` so they
     // exercise the exact write-back logic without touching the on-disk keychain
@@ -24536,12 +24874,14 @@ mod tests {
 
         // Simulate the post-delete world: the store has no deepgram key.
         let store_after_delete = crate::credentials::CredentialStore::default();
-        rehydrate_app_settings_cache(
+        refresh_after_credential_write(
             &state,
-            &store_after_delete,
-            "delete_credential_cmd",
             "deepgram_api_key",
-        );
+            None,
+            None,
+            Ok(store_after_delete),
+        )
+        .unwrap();
 
         assert_eq!(
             cached_deepgram_api_key(&state),
@@ -24562,12 +24902,14 @@ mod tests {
 
         let mut store_after_save = crate::credentials::CredentialStore::default();
         store_after_save.deepgram_api_key = Some("fresh-deepgram-secret".to_string());
-        rehydrate_app_settings_cache(
+        refresh_after_credential_write(
             &state,
-            &store_after_save,
-            "save_credential_cmd",
             "deepgram_api_key",
-        );
+            Some("fresh-deepgram-secret"),
+            None,
+            Ok(store_after_save),
+        )
+        .unwrap();
 
         assert_eq!(
             cached_deepgram_api_key(&state),
@@ -24646,6 +24988,7 @@ mod tests {
             route_id: "route.openrouter".to_string(),
             requested_by: events::CardOrigin::Transcript,
             finish_reason: Some("stop".to_string()),
+            diagnostic: None,
             total_tokens: Some(42),
             answered_at_ms: 1_700_000_000_500,
         });
@@ -25251,6 +25594,7 @@ mod tests {
             provider_id_for_ledger: "llm.openrouter".to_string(),
             requires_cloud_transfer: true,
             cloud_transfer_allowed: true,
+            live_session: std::sync::Arc::new(std::sync::RwLock::new(session_id.to_string())),
         }
     }
 
@@ -25287,8 +25631,10 @@ mod tests {
             events::CardAnswerStatus::Answered,
             "The roadmap moved the launch to Q3.".to_string(),
             Some("stop".to_string()),
+            None,
             Some(42),
-        );
+        )
+        .expect("the answer is written");
 
         let audit = FileMemoryRepository::user_data()
             .load_live_assist_card_audit(session_id)
@@ -25374,8 +25720,10 @@ mod tests {
             events::CardAnswerStatus::Answered,
             oversized,
             Some("length".to_string()),
+            None,
             Some(9000),
-        );
+        )
+        .expect("the capped answer is written");
 
         let current = FileMemoryRepository::user_data()
             .load_live_assist_cards(session_id)
@@ -25513,49 +25861,6 @@ mod tests {
         assert!(
             !body.contains("registry.cancel("),
             "the answer stream task must never cancel another registered stream by id either"
-        );
-    }
-
-    #[test]
-    fn spawn_card_answer_stream_task_finishes_the_registry_after_the_loop_as_a_leak_backstop() {
-        // Fix-round finding (adversarial review, minor): if the stream ends
-        // without ever sending a terminal frame (producer panic, sender
-        // dropped), every match arm's own `registry.finish` is unreached,
-        // and — because this path is refuse-not-cancel — the leaked entry
-        // would wedge the `Busy` gate for the rest of the session. Pins
-        // that a `registry.finish(&request_id_for_task)` call exists
-        // OUTSIDE (after) the `while` loop as a backstop, in addition to
-        // the 4 per-arm calls inside it (Delta no longer calls it at all
-        // post the channel-drop durability fix below; Done/Error/Cancelled
-        // each still call it once).
-        let source = include_str!("commands.rs");
-        let start = source
-            .find("fn spawn_card_answer_stream_task(")
-            .expect("spawn_card_answer_stream_task must exist");
-        let end = source[start..]
-            .find("/// Shared body of `answer_question_card`")
-            .map(|rel| start + rel)
-            .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
-        let body = &source[start..end];
-
-        let loop_end = body
-            .rfind("\n        }\n")
-            .expect("the while loop's closing brace must exist");
-        let after_loop = &body[loop_end..];
-        assert!(
-            after_loop.contains("registry.finish(&request_id_for_task);"),
-            "a backstop registry.finish must run after the while loop exits, \
-             for the no-terminal-frame case none of the match arms cover"
-        );
-
-        let finish_count = body
-            .matches("registry.finish(&request_id_for_task);")
-            .count();
-        assert_eq!(
-            finish_count, 4,
-            "expected exactly 4 registry.finish calls: Done + Error + Cancelled \
-             (one each) + the post-loop backstop — Delta intentionally does not \
-             call it (see the channel-drop durability test below)"
         );
     }
 
@@ -26069,11 +26374,11 @@ mod tests {
     // uses) is possible after all; these two tests exercise it.
     // =======================================================================
 
-    /// A no-op sink for a `ChatStreamEvent` channel — the test only needs
+    /// A no-op sink for a `ChatStreamFrame` channel — the test only needs
     /// the CALL to succeed and the background task to run; frame content is
     /// asserted by re-reading the persisted card instead of by inspecting
     /// what this channel receives.
-    fn noop_answer_channel() -> tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent> {
+    fn noop_answer_channel() -> tauri::ipc::Channel<events::ChatStreamFrame> {
         tauri::ipc::Channel::new(|_body| Ok(()))
     }
 
@@ -26517,6 +26822,1258 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+    }
+
+    // #526: a failed chat returns a closed diagnostic and records no turn.
+
+    const CHAT_TRANSCRIPT_SENTINEL: &str = "kkkk-transcript-sentinel-kkkk";
+    const CHAT_PROVIDER_CANARY: &str = "PROVIDER-BODY-CANARY";
+    const PARTIAL_REPLY: &str = "Partial reply before the drop";
+
+    /// Single-shot HTTP mock that answers with `response` verbatim.
+    async fn spawn_raw_http_mock(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut request = String::new();
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    request.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// [`spawn_raw_http_mock`], plus a flag set when the provider is
+    /// contacted at all.
+    async fn spawn_contact_recording_http_mock(
+        response: String,
+    ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let contacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = contacted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                flag.store(true, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), contacted)
+    }
+
+    /// The provider fails before sending a single token.
+    fn http_500_response() -> String {
+        let body = format!("{{\"error\":\"{CHAT_PROVIDER_CANARY}\"}}");
+        format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The provider sends one delta, then the body ends short of its
+    /// declared length.
+    fn truncated_sse_response() -> String {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{PARTIAL_REPLY}\"}}}}]}}\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len() + 512
+        )
+    }
+
+    /// Plant the transcript sentinel and one earlier turn, so "history is
+    /// unchanged" is not vacuously true. Returns that history as JSON.
+    fn seed_chat_session(state: &AppState) -> serde_json::Value {
+        state
+            .transcript_buffer
+            .write()
+            .unwrap()
+            .push_back(TranscriptSegment {
+                id: "segment-sentinel".to_string(),
+                source_id: "source-1".to_string(),
+                speaker_id: None,
+                speaker_label: Some("Speaker 1".to_string()),
+                text: CHAT_TRANSCRIPT_SENTINEL.to_string(),
+                start_time: 1.0,
+                end_time: 2.0,
+                confidence: 0.9,
+            });
+        {
+            let mut history = state.chat_history.write().unwrap();
+            let generation = history.generation();
+            history.append_if_current(
+                generation,
+                [
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "earlier question".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "earlier answer".to_string(),
+                    },
+                ],
+            );
+        }
+        chat_history_json(state)
+    }
+
+    /// The messages the next chat request would send.
+    fn prepare_next_chat_request(state: &AppState) -> Vec<ChatMessage> {
+        prepare_chat_request(
+            state,
+            "next question".to_string(),
+            chat_history_generation(state),
+        )
+        .expect("prepare the next request")
+        .messages
+    }
+
+    fn chat_history_json(state: &AppState) -> serde_json::Value {
+        serde_json::to_value(state.chat_history.read().unwrap().messages()).unwrap()
+    }
+
+    type ChatFrames = tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>;
+
+    fn recording_chat_channel() -> (tauri::ipc::Channel<events::ChatStreamFrame>, ChatFrames) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let _ = tx.send(serde_json::from_str(&json).expect("frame JSON"));
+            }
+            Ok(())
+        });
+        (channel, rx)
+    }
+
+    /// Every frame the stream sent, up to and including its terminal frame.
+    /// Nothing may follow the terminal frame: the channel then closes.
+    async fn chat_frames_through_terminal(frames: &mut ChatFrames) -> Vec<serde_json::Value> {
+        let mut seen = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+                .await
+                .expect("terminal frame in time")
+                .expect("channel open");
+            let terminal = frame["event"] != "delta";
+            seen.push(frame);
+            if terminal {
+                let after = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+                    .await
+                    .expect("the stream closes its channel");
+                assert_eq!(after, None, "a frame after the terminal frame");
+                return seen;
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn chat_failure_before_the_first_token_returns_a_diagnostic_and_records_nothing() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-failure-before-first-token");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let prior = seed_chat_session(&state);
+        // A length that would be easy to spot in a log line.
+        let message = "q".repeat(39_017);
+
+        // A current-thread runtime keeps the command and its stream task on
+        // this thread, where the log capture records them.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let (error, seen) = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let error = send_chat_message(message.clone(), app.clone(), manager.state())
+                .await
+                .expect_err("a failed chat is an error, not a reply");
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            start_streaming_chat(message.clone(), channel, app.clone(), manager.state())
+                .await
+                .expect("the stream starts");
+            (error, chat_frames_through_terminal(&mut frames).await)
+        });
+        let logs = crate::test_log_capture::render(&capture.finish());
+        let frame = seen.last().expect("a terminal frame").clone();
+        let every_frame = serde_json::Value::from(seen).to_string();
+
+        let error = serde_json::to_value(&error).expect("serialize the IPC error");
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        // The provider's 500 is classified; its body never crosses.
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "provider_unavailable",
+            "{error}"
+        );
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(frame["data"]["full_text"], "", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "provider_unavailable",
+            "{frame}"
+        );
+        assert_eq!(chat_history_json(&state), prior);
+        let history = chat_history_json(&state).to_string();
+        for surface in [error.to_string(), every_frame, history, logs.clone()] {
+            assert!(!surface.contains(CHAT_TRANSCRIPT_SENTINEL), "{surface}");
+            assert!(!surface.contains(CHAT_PROVIDER_CANARY), "{surface}");
+        }
+        assert!(!logs.contains("39017"), "{logs}");
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            CHAT_TRANSCRIPT_SENTINEL,
+            CHAT_PROVIDER_CANARY,
+        ]);
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn chat_failure_after_partial_text_keeps_it_out_of_history_and_the_next_request() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-failure-after-partial-text");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let prior = seed_chat_session(&state);
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let (seen, error) = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(truncated_sse_response()).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            start_streaming_chat(
+                "first question".to_string(),
+                channel,
+                app.clone(),
+                manager.state(),
+            )
+            .await
+            .expect("the stream starts");
+            let seen = chat_frames_through_terminal(&mut frames).await;
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(truncated_sse_response()).await,
+            );
+            let error =
+                send_chat_message("second question".to_string(), app.clone(), manager.state())
+                    .await
+                    .expect_err("a failed chat is an error, not a reply");
+            (seen, error)
+        });
+
+        // The streaming terminal carries the partial text for display, as a
+        // failed turn, and no frame carries the transcript.
+        let frame = seen.last().expect("a terminal frame");
+        assert!(seen.iter().any(|frame| frame["event"] == "delta"));
+        let every_frame = serde_json::Value::from(seen.clone()).to_string();
+        assert!(
+            !every_frame.contains(CHAT_TRANSCRIPT_SENTINEL),
+            "{every_frame}"
+        );
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(frame["data"]["full_text"], PARTIAL_REPLY, "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "invalid_response",
+            "{frame}"
+        );
+        // The accumulating command discards it: its contract is a whole reply.
+        let error = serde_json::to_value(&error).expect("serialize the IPC error");
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "invalid_response",
+            "{error}"
+        );
+        assert!(!error.to_string().contains(PARTIAL_REPLY), "{error}");
+
+        // Neither failed call recorded a turn, so the next request sends the
+        // earlier history plus only its own question.
+        assert_eq!(chat_history_json(&state), prior);
+        let next = prepare_next_chat_request(&state);
+        let mut expected = prior.as_array().unwrap().clone();
+        expected.push(serde_json::json!({ "role": "user", "content": "next question" }));
+        assert_eq!(
+            serde_json::to_value(&next).unwrap(),
+            serde_json::Value::Array(expected)
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const CLEARED_QUESTION: &str = "question-the-user-cleared";
+
+    /// A provider stream that completes normally.
+    fn complete_sse_response(text: &str) -> String {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// What happens to a streaming chat after it read the history and before
+    /// its task first runs. A current-thread runtime runs the spawned stream
+    /// task only at the test's next await, so each step lands inside the
+    /// request's lifetime, deterministically.
+    #[derive(Clone, Copy)]
+    enum MidStream {
+        Clear,
+        ClearThenCancel,
+        CancelThenRotate,
+    }
+
+    /// Stream a chat for [`CLEARED_QUESTION`], apply `step` mid-request, and
+    /// wait for the terminal frame. Returns that frame, the history
+    /// afterwards, and the messages the next request would send.
+    fn chat_with_mid_stream_step(
+        step: MidStream,
+        dir_name: &str,
+    ) -> (serde_json::Value, serde_json::Value, Vec<ChatMessage>) {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir(dir_name);
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        seed_chat_session(&state);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let frame = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("the private answer")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let request_id = start_streaming_chat(
+                CLEARED_QUESTION.to_string(),
+                channel,
+                app.clone(),
+                manager.state(),
+            )
+            .await
+            .expect("the stream starts");
+            match step {
+                MidStream::Clear => clear_chat_history(manager.state()).await.expect("clear"),
+                MidStream::ClearThenCancel => {
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    cancel_streaming_chat(request_id, manager.state())
+                        .await
+                        .expect("cancel");
+                }
+                MidStream::CancelThenRotate => {
+                    cancel_streaming_chat(request_id, manager.state())
+                        .await
+                        .expect("cancel");
+                    // The cancel already freed the registry slot, so the
+                    // rotation runs before the stream task records anything.
+                    ensure_session_idle_for_rotation(&state).expect("idle once cancelled");
+                    assert!(matches!(
+                        state.rotate_session("rotated-session"),
+                        crate::state::RotateOutcome::Rotated(_)
+                    ));
+                }
+            }
+            chat_frames_through_terminal(&mut frames)
+                .await
+                .pop()
+                .expect("a terminal frame")
+        });
+        let history = chat_history_json(&state);
+        let next = prepare_next_chat_request(&state);
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+        (frame, history, next)
+    }
+
+    fn assert_cleared_question_stays_gone(history: &serde_json::Value, next: &[ChatMessage]) {
+        assert_eq!(history, &serde_json::json!([]), "history after the clear");
+        assert_eq!(
+            serde_json::to_value(next).unwrap(),
+            serde_json::json!([{ "role": "user", "content": "next question" }]),
+            "the next request carries only its own question"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_chat_that_completes_after_a_clear_records_nothing() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::Clear, "chat-clear-then-complete");
+        assert_eq!(frame["event"], "done", "{frame}");
+        assert_eq!(frame["data"]["finish_reason"], "stop", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_chat_cancelled_after_a_clear_records_nothing() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::ClearThenCancel, "chat-clear-then-cancel");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_cancelled_chat_records_nothing_into_a_session_that_rotated_first() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::CancelThenRotate, "chat-rotate-during-cancel");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    /// Which chat command a clear races.
+    #[derive(Clone, Copy)]
+    enum ChatCommand {
+        Streaming,
+        Blocking,
+    }
+
+    /// Run `command` for [`CLEARED_QUESTION`] and clear the chat while the
+    /// command waits inside its async preparation, after it read the history
+    /// generation on entry. The test holds the session-lifecycle lock to park
+    /// the command there. Returns the command's error, whether the provider
+    /// was contacted, the history afterwards, and the next request.
+    fn chat_cleared_during_preparation(
+        command: ChatCommand,
+        dir_name: &str,
+    ) -> (serde_json::Value, bool, serde_json::Value, Vec<ChatMessage>) {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir(dir_name);
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        seed_chat_session(&state);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let (error, contacted) = rt.block_on(async {
+            let (url, contacted) =
+                spawn_contact_recording_http_mock(complete_sse_response("the private answer"))
+                    .await;
+            point_state_at_mock_llm_provider(&state, url);
+            let lifecycle = state.session_lifecycle.lock().await;
+            let error = match command {
+                ChatCommand::Streaming => {
+                    let (channel, mut frames) = recording_chat_channel();
+                    let mut call = std::pin::pin!(start_streaming_chat(
+                        CLEARED_QUESTION.to_string(),
+                        channel,
+                        app.clone(),
+                        manager.state(),
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = &mut call => panic!("the command must wait for the lifecycle lock"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    drop(lifecycle);
+                    let error = call.await.expect_err("a cleared request is refused");
+                    // The refused command dropped its channel, so no stream
+                    // task exists that could still contact the provider.
+                    assert_eq!(frames.recv().await, None);
+                    serde_json::to_value(error)
+                }
+                ChatCommand::Blocking => {
+                    let mut call = std::pin::pin!(send_chat_message(
+                        CLEARED_QUESTION.to_string(),
+                        app.clone(),
+                        manager.state(),
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = &mut call => panic!("the command must wait for the lifecycle lock"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    drop(lifecycle);
+                    // This command awaits its own stream, so any provider
+                    // request would have finished before it returned.
+                    serde_json::to_value(call.await.expect_err("a cleared request is refused"))
+                }
+            }
+            .expect("serialize the IPC error");
+            (error, contacted.load(Ordering::SeqCst))
+        });
+        let history = chat_history_json(&state);
+        let next = prepare_next_chat_request(&state);
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+        (error, contacted, history, next)
+    }
+
+    fn assert_cleared_request_was_never_sent(
+        error: &serde_json::Value,
+        contacted: bool,
+        history: &serde_json::Value,
+        next: &[ChatMessage],
+    ) {
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "cancelled",
+            "{error}"
+        );
+        assert!(
+            !contacted,
+            "the provider must not receive the cleared question"
+        );
+        assert_cleared_question_stays_gone(history, next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_streaming_chat_cleared_while_it_prepares_is_never_sent() {
+        let (error, contacted, history, next) = chat_cleared_during_preparation(
+            ChatCommand::Streaming,
+            "chat-clear-during-stream-prep",
+        );
+        assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_blocking_chat_cleared_while_it_prepares_is_never_sent() {
+        let (error, contacted, history, next) = chat_cleared_during_preparation(
+            ChatCommand::Blocking,
+            "chat-clear-during-blocking-prep",
+        );
+        assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
+    }
+
+    /// A stream whose producer queues `frames` and then drops its sender.
+    fn frames_then_dropped_sender(
+        frames: Vec<crate::llm::streaming::TokenDelta>,
+    ) -> LlmStreamFrames {
+        let (tx, rx) = tokio::sync::mpsc::channel(frames.len().max(1));
+        for frame in frames {
+            tx.try_send(frame).expect("queue a frame");
+        }
+        LlmStreamFrames::new(rx)
+    }
+
+    #[test]
+    fn a_stream_that_ends_without_a_terminal_frame_is_an_internal_failure() {
+        use crate::llm::streaming::TokenDelta;
+        let delta = || TokenDelta::Delta {
+            content: PARTIAL_REPLY.to_string(),
+            finish_reason: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        rt.block_on(async {
+            // Every consumer reads one internal failure carrying the partial
+            // text.
+            let mut frames = frames_then_dropped_sender(vec![delta()]);
+            assert!(matches!(frames.next().await, TokenDelta::Delta { .. }));
+            match frames.next().await {
+                TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                } => {
+                    assert_eq!(diagnostic, llm_internal_diagnostic());
+                    assert_eq!(full_text, PARTIAL_REPLY);
+                }
+                other => panic!("expected the synthesized failure, got {other:?}"),
+            }
+
+            // The accumulating command reports it, and a cancellation, as an
+            // error; only an explicit `Done` is a reply.
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![delta()])).await,
+                Err(llm_internal_diagnostic())
+            );
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![
+                    delta(),
+                    TokenDelta::Cancelled {
+                        full_text: PARTIAL_REPLY.to_string(),
+                    },
+                ]))
+                .await,
+                Err(llm_cancelled_diagnostic())
+            );
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![
+                    delta(),
+                    TokenDelta::Done {
+                        full_text: PARTIAL_REPLY.to_string(),
+                        usage: None,
+                        finish_reason: "stop".to_string(),
+                    },
+                ]))
+                .await,
+                Ok((PARTIAL_REPLY.to_string(), 0))
+            );
+        });
+    }
+
+    #[test]
+    fn a_blocking_llm_call_that_never_returns_times_out_and_a_panic_is_internal() {
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            // A job left in a dead worker's queue: nothing ever answers it.
+            let (keep_unanswered, unanswered) = std::sync::mpsc::channel::<()>();
+            let hung = bounded_blocking_llm_call(Duration::from_millis(50), move || {
+                let _ = unanswered.recv();
+                Ok(())
+            })
+            .await;
+            assert_eq!(hung, Err(llm_timeout_diagnostic()));
+            drop(keep_unanswered);
+
+            let panicked = bounded_blocking_llm_call::<()>(Duration::from_secs(20), || {
+                panic!("the executor call panicked")
+            })
+            .await;
+            assert_eq!(panicked, Err(llm_internal_diagnostic()));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn failed_card_answer_persists_a_closed_diagnostic_instead_of_an_error_string() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("failed-card-answer-diagnostic");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "failing-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let answered = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            wait_for_answered_card(&session_id, card_id).await
+        });
+
+        let answer = answered.answer.as_ref().expect("answer persisted");
+        assert_eq!(answer.status, events::CardAnswerStatus::Failed);
+        assert_eq!(answer.finish_reason, None);
+        let diagnostic = serde_json::to_value(&answer.diagnostic).expect("serialize");
+        assert_eq!(
+            diagnostic["detail"]["code"], "provider_unavailable",
+            "{diagnostic}"
+        );
+        let record = serde_json::to_string(&answered).expect("serialize the card");
+        assert!(!record.contains(CHAT_PROVIDER_CANARY), "{record}");
+        assert!(!record.contains("error:"), "{record}");
+
+        // The terminal ledger row is written before the answer is visible.
+        let ledger_rows = FileMemoryRepository::user_data()
+            .load_data_movement_events(&session_id)
+            .expect("load movement ledger");
+        assert_eq!(
+            ledger_rows
+                .iter()
+                .map(|row| row.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::persistence::DataMovementEventType::ProviderCallStarted,
+                crate::persistence::DataMovementEventType::ProviderCallFailed,
+            ]
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    /// What the frontend could observe the moment a card answer's terminal
+    /// frame arrived.
+    #[derive(Debug, PartialEq)]
+    struct CardTerminalSnapshot {
+        event: String,
+        ledger: Vec<crate::persistence::DataMovementEventType>,
+        answer_status: Option<events::CardAnswerStatus>,
+        retry_admitted: bool,
+    }
+
+    /// A card-answer channel that, as its terminal frame arrives, records the
+    /// ledger, the persisted answer, and whether the gate would admit a
+    /// retry at that instant.
+    fn snapshotting_answer_channel(
+        state: &AppState,
+        session_id: &str,
+        card_id: &str,
+    ) -> (
+        tauri::ipc::Channel<events::ChatStreamFrame>,
+        std::sync::mpsc::Receiver<CardTerminalSnapshot>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = state.stream_registry.clone();
+        let in_flight = state.card_answer_in_flight.clone();
+        let (session_id, card_id) = (session_id.to_string(), card_id.to_string());
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let frame: serde_json::Value = serde_json::from_str(&json).expect("frame JSON");
+                if frame["event"] != "delta" {
+                    let ledger = FileMemoryRepository::user_data()
+                        .load_data_movement_events(&session_id)
+                        .expect("load movement ledger")
+                        .iter()
+                        .map(|row| row.event_type)
+                        .collect();
+                    let answer_status = existing_live_assist_card(&session_id, &card_id)
+                        .and_then(|card| card.answer)
+                        .map(|answer| answer.status);
+                    let _ = tx.send(CardTerminalSnapshot {
+                        event: frame["event"].as_str().unwrap_or_default().to_string(),
+                        ledger,
+                        answer_status,
+                        retry_admitted: registry.is_empty() && !in_flight.load(Ordering::SeqCst),
+                    });
+                }
+            }
+            Ok(())
+        });
+        (channel, rx)
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_terminal_frame_waits_until_the_attempt_is_durable() {
+        use crate::persistence::DataMovementEventType::{ProviderCallFailed, ProviderCallStarted};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-retry-during-finalize");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "retried-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let snapshots = rt.block_on(async {
+            let mut snapshots = Vec::new();
+            // The retry is dispatched the moment the first attempt's terminal
+            // frame arrives, the earliest the frontend could offer it.
+            for _attempt in 0..2 {
+                point_state_at_mock_llm_provider(
+                    &state,
+                    spawn_raw_http_mock(http_500_response()).await,
+                );
+                let (channel, terminal) = snapshotting_answer_channel(&state, &session_id, card_id);
+                let dispatch = answer_question_card_impl(
+                    card_id.to_string(),
+                    false,
+                    channel,
+                    app_handle.clone(),
+                    &state,
+                )
+                .await
+                .expect("the dispatch call itself must not error");
+                assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+                snapshots.push(
+                    tokio::task::spawn_blocking(move || {
+                        terminal
+                            .recv_timeout(Duration::from_secs(20))
+                            .expect("terminal frame in time")
+                    })
+                    .await
+                    .expect("join the frame wait"),
+                );
+            }
+            snapshots
+        });
+
+        let failed = Some(events::CardAnswerStatus::Failed);
+        assert_eq!(
+            snapshots,
+            vec![
+                CardTerminalSnapshot {
+                    event: "failed".to_string(),
+                    ledger: vec![ProviderCallStarted, ProviderCallFailed],
+                    answer_status: failed,
+                    retry_admitted: true,
+                },
+                CardTerminalSnapshot {
+                    event: "failed".to_string(),
+                    ledger: vec![
+                        ProviderCallStarted,
+                        ProviderCallFailed,
+                        ProviderCallStarted,
+                        ProviderCallFailed,
+                    ],
+                    answer_status: failed,
+                    retry_admitted: true,
+                },
+            ]
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_cancelled_card_answer_holds_off_rotation_and_stays_out_of_the_next_session() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-cancel-then-rotate");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_a = state.current_session_id();
+        let card_id = "cancelled-before-rotation";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_a,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_a, &seed)
+            .expect("seed the card");
+        let announced = Arc::new(Mutex::new(Vec::<String>::new()));
+        let announced_for_listener = announced.clone();
+        let listener_id = app_handle.listen_any(events::AGENT_CARD_UPDATE, move |event| {
+            if event.payload().contains(card_id) {
+                announced_for_listener
+                    .lock()
+                    .unwrap()
+                    .push(event.payload().to_owned());
+            }
+        });
+
+        // A current-thread runtime runs the answer task only at the next
+        // await, so the cancel lands before its first token.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("the old session's answer")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                channel,
+                app_handle.clone(),
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            let AnswerDispatch::Dispatched { request_id } = dispatch else {
+                panic!("the answer is dispatched");
+            };
+            assert!(state.stream_registry.cancel(&request_id));
+            assert!(state.stream_registry.is_empty());
+            assert!(matches!(
+                ensure_session_idle_for_rotation(&state),
+                Err(AppError::SessionInvalid { .. })
+            ));
+            // Rotate anyway, as if the check were bypassed: the late answer
+            // still lands in its own session and is not announced.
+            assert!(matches!(
+                state.rotate_session("session-after-the-cancel"),
+                crate::state::RotateOutcome::Rotated(_)
+            ));
+            chat_frames_through_terminal(&mut frames).await
+        });
+        app_handle.unlisten(listener_id);
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "done", "{frame}");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        let answer = existing_live_assist_card(&session_a, card_id)
+            .and_then(|card| card.answer)
+            .expect("the interruption is written to the old session");
+        assert_eq!(answer.status, events::CardAnswerStatus::Interrupted);
+        assert_eq!(answer.text, "");
+        assert_eq!(*announced.lock().unwrap(), Vec::<String>::new());
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_that_cannot_be_written_ends_on_a_failed_frame() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-write-failure");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "unwritable-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+        // A directory where the card's audit log belongs makes the next card
+        // write fail.
+        let audit_log = crate::user_data::resolve_live_assist_current_path(&session_id)
+            .expect("resolve the card file")
+            .with_file_name(format!("{session_id}.jsonl"));
+        std::fs::remove_file(&audit_log).expect("remove the audit log");
+        std::fs::create_dir(&audit_log).expect("block the audit log");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("an answer that cannot be saved")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch =
+                answer_question_card_impl(card_id.to_string(), false, channel, app_handle, &state)
+                    .await
+                    .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            chat_frames_through_terminal(&mut frames).await
+        });
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "internal",
+            "{frame}"
+        );
+        assert_eq!(
+            frame["data"]["full_text"], "an answer that cannot be saved",
+            "{frame}"
+        );
+        assert_eq!(
+            existing_live_assist_card(&session_id, card_id).and_then(|card| card.answer),
+            None
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_whose_card_cannot_be_read_ends_on_a_failed_frame() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-read-failure");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "unreadable-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        // A current-thread runtime runs the answer task only at the next
+        // await, so the card file breaks after dispatch, before finalizing.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("an answer nobody can store")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch =
+                answer_question_card_impl(card_id.to_string(), false, channel, app_handle, &state)
+                    .await
+                    .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            let current = crate::user_data::resolve_live_assist_current_path(&session_id)
+                .expect("resolve the card file");
+            std::fs::remove_file(&current).expect("remove the card file");
+            std::fs::create_dir(&current).expect("make the card file unreadable");
+            chat_frames_through_terminal(&mut frames).await
+        });
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "internal",
+            "{frame}"
+        );
+        assert_eq!(
+            frame["data"]["full_text"], "an answer nobody can store",
+            "{frame}"
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_containing(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+        let mut hits = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                hits.extend(files_containing(&path, needle));
+            } else if String::from_utf8_lossy(&std::fs::read(&path).expect("read file"))
+                .contains(needle)
+            {
+                hits.push(path);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn a_legacy_failed_answer_loses_its_failure_prose_on_load_and_in_later_writes() {
+        const PROSE_CANARY: &str = "LEGACY-FAILURE-PROSE-CANARY";
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("legacy-failed-answer-prose");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "legacy-answer-session";
+        let mut card = answer_engine_test_card(
+            "legacy-card",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        card.answer = Some(events::CardAnswer {
+            status: events::CardAnswerStatus::Failed,
+            text: String::new(),
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: events::CardOrigin::Transcript,
+            finish_reason: None,
+            diagnostic: None,
+            total_tokens: None,
+            answered_at_ms: 1,
+        });
+        // The card as an older build wrote it: the failure is prose in
+        // `finish_reason`.
+        let mut legacy = serde_json::to_value(&card).expect("serialize the card");
+        legacy["answer"]["finish_reason"] = serde_json::json!(format!("error: {PROSE_CANARY}"));
+        let current = crate::user_data::resolve_live_assist_current_path(session_id)
+            .expect("resolve the current card file");
+        std::fs::create_dir_all(current.parent().expect("card directory"))
+            .expect("create the card directory");
+        std::fs::write(&current, serde_json::to_vec(&[legacy]).expect("encode"))
+            .expect("write the legacy card file");
+
+        let loaded = FileMemoryRepository::user_data()
+            .load_live_assist_cards(session_id)
+            .expect("the legacy card loads");
+        let ipc_payload = serde_json::to_string(&loaded).expect("serialize the IPC payload");
+        assert!(!ipc_payload.contains(PROSE_CANARY), "{ipc_payload}");
+
+        // A dismissal rewrites the card file and appends to its audit log.
+        let dismissed = live_assist_card_record(
+            session_id,
+            &loaded[0].proposal,
+            events::LiveAssistCardStatus::Dismissed,
+            None,
+            None,
+            2,
+            Some(&loaded[0]),
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &dismissed)
+            .expect("dismiss the card");
+        assert_eq!(
+            files_containing(&dir, PROSE_CANARY),
+            Vec::<std::path::PathBuf>::new()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

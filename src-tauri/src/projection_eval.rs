@@ -733,6 +733,7 @@ mod tests {
     fn openrouter_smoke_key_from_env_or_store() -> Option<String> {
         non_empty_env("OPENROUTER_API_KEY").or_else(|| {
             crate::credentials::load_credentials()
+                .expect("credential smoke store must be readable")
                 .openrouter_api_key
                 .clone()
                 .and_then(|key| {

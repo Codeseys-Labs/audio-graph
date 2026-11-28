@@ -1054,11 +1054,11 @@ pub enum ChatStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
     },
-    /// Terminal frame, sent exactly once per stream, carrying the
+    /// Terminal frame of a completed or cancelled stream, carrying the
     /// authoritative `full_text` + optional `usage`. `finish_reason` is the
-    /// closed [`FinishReason`] token of a completed turn, `"cancelled"` for a
-    /// cancelled one, and `"error: runtime/<code>"` for a failed one. Mirrors
-    /// the legacy `chat-token-done` payload.
+    /// closed [`FinishReason`] token of a completed turn, or `"cancelled"`. A
+    /// failed stream ends on [`crate::events::ChatStreamFrame::Failed`]
+    /// instead. Mirrors the legacy `chat-token-done` payload.
     #[serde(rename = "done")]
     Done {
         request_id: String,

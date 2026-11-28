@@ -1528,19 +1528,6 @@ fn aws_access_key_credentials_have_inline_secret(
         || option_non_empty_secret(session_token).is_some()
 }
 
-fn redact_aws_access_key_credentials(credential_source: &mut AwsCredentialSource) {
-    if let AwsCredentialSource::AccessKeys {
-        access_key,
-        secret_key,
-        session_token,
-    } = credential_source
-    {
-        access_key.clear();
-        *secret_key = None;
-        *session_token = None;
-    }
-}
-
 fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpdate> {
     let mut updates = Vec::new();
 
@@ -1722,52 +1709,84 @@ pub fn has_inline_credentials(settings: &AppSettings) -> bool {
 pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
     let mut redacted = settings.clone();
 
-    match &mut redacted.asr_provider {
-        AsrProvider::Api { api_key, .. }
-        | AsrProvider::DeepgramStreaming { api_key, .. }
-        | AsrProvider::AssemblyAI { api_key, .. }
-        | AsrProvider::Soniox { api_key, .. }
-        | AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => api_key.clear(),
+    update_cached_credential(&mut redacted, None, None);
+    redacted
+}
+
+/// Update the cached copies of a committed field while preserving unrelated credentials.
+pub(crate) fn update_cached_credential(
+    settings: &mut AppSettings,
+    only: Option<&str>,
+    replacement: Option<&str>,
+) {
+    let matches = |key: &str| only.is_none_or(|slot| slot == key);
+    let update = |key: &str, value: &mut String| {
+        if matches(key) {
+            *value = replacement.unwrap_or_default().to_owned();
+        }
+    };
+    let update_optional = |key: &str, value: &mut Option<String>| {
+        if matches(key) {
+            *value = replacement.map(str::to_owned);
+        }
+    };
+    let update_aws = |source: &mut AwsCredentialSource| {
+        if let AwsCredentialSource::AccessKeys {
+            access_key,
+            secret_key,
+            session_token,
+        } = source
+        {
+            update("aws_access_key", access_key);
+            // AWS secret/session values are read on demand and never hydrated.
+            if replacement.is_none() {
+                update_optional("aws_secret_key", secret_key);
+                update_optional("aws_session_token", session_token);
+            }
+        }
+    };
+    match &mut settings.asr_provider {
+        AsrProvider::Api {
+            endpoint, api_key, ..
+        } => update(credential_key_for_endpoint(endpoint), api_key),
+        AsrProvider::DeepgramStreaming { api_key, .. } => update("deepgram_api_key", api_key),
+        AsrProvider::AssemblyAI { api_key, .. } => update("assemblyai_api_key", api_key),
+        AsrProvider::Soniox { api_key, .. } => update("soniox_api_key", api_key),
+        AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+            update("openai_api_key", api_key)
+        }
         AsrProvider::AwsTranscribe {
             credential_source, ..
-        } => {
-            redact_aws_access_key_credentials(credential_source);
-        }
+        } => update_aws(credential_source),
         AsrProvider::LocalWhisper
         | AsrProvider::SherpaOnnx { .. }
         | AsrProvider::Moonshine { .. } => {}
     }
-
-    match &mut redacted.llm_provider {
-        LlmProvider::Api { api_key, .. } | LlmProvider::OpenRouter { api_key, .. } => {
-            api_key.clear()
-        }
+    match &mut settings.llm_provider {
+        LlmProvider::Api {
+            endpoint, api_key, ..
+        } => update(credential_key_for_endpoint(endpoint), api_key),
+        LlmProvider::OpenRouter { api_key, .. } => update("openrouter_api_key", api_key),
         LlmProvider::AwsBedrock {
             credential_source, ..
-        } => {
-            redact_aws_access_key_credentials(credential_source);
-        }
+        } => update_aws(credential_source),
         LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
     }
-
-    if let Some(config) = &mut redacted.llm_api_config {
-        config.api_key = None;
+    if let Some(config) = &mut settings.llm_api_config {
+        update_optional(
+            credential_key_for_endpoint(&config.endpoint),
+            &mut config.api_key,
+        );
     }
-
-    if let GeminiAuthMode::ApiKey { api_key } = &mut redacted.gemini.auth {
-        api_key.clear();
-    } else if let GeminiAuthMode::VertexAI {
-        service_account_path,
-        ..
-    } = &mut redacted.gemini.auth
-    {
-        *service_account_path = None;
+    match &mut settings.gemini.auth {
+        GeminiAuthMode::ApiKey { api_key } => update("gemini_api_key", api_key),
+        GeminiAuthMode::VertexAI {
+            service_account_path,
+            ..
+        } => update_optional("google_service_account_path", service_account_path),
     }
-
-    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut redacted.openai_realtime_agent.auth;
-    api_key.clear();
-
-    redacted
+    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut settings.openai_realtime_agent.auth;
+    update("openai_api_key", api_key);
 }
 
 /// Return a runtime-only copy with secrets filled from `credentials.yaml`.
@@ -1881,7 +1900,7 @@ pub fn hydrate_runtime_credentials(
 // Path resolution
 // ---------------------------------------------------------------------------
 
-pub fn get_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub fn get_settings_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
     let config_dir = app
         .path()
         .app_config_dir()
@@ -2366,7 +2385,10 @@ pub fn apply_first_launch_demo_mode(
 /// Acquires the process-wide `SETTINGS_IO_LOCK` for the duration of the
 /// write. Callers that already hold that lock (e.g. a load→patch→save
 /// sequence) must call [`save_settings_locked`] instead to avoid deadlock.
-pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+pub fn save_settings<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    settings: &AppSettings,
+) -> Result<(), String> {
     let _guard = lock_settings_io();
     save_settings_locked(app, settings)
 }
@@ -2375,7 +2397,10 @@ pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(
 ///
 /// Pre-condition: the caller already holds the lock (via [`lock_settings_io`])
 /// so the full read+write sequence is atomic with respect to other writers.
-pub fn save_settings_locked(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+pub fn save_settings_locked<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    settings: &AppSettings,
+) -> Result<(), String> {
     let path = get_settings_path(app)?;
     ensure_existing_config_is_parseable_for_write(&path)?;
     persist_settings_to_path(&path, settings)

@@ -2902,9 +2902,20 @@ fn parse_framed_v1(
     }
     wire.payload = canonicalize_json_value(wire.payload);
     validate_stored_metadata(&wire.event_id, &wire.causal_event_ids, &wire.basis_heads)?;
-    let payload_hash =
-        payload_digest(&wire.payload).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
-    if payload_hash != wire.payload_hash {
+    // Verify the IEEE values spelled in the frame. The legacy visitor can map
+    // adjacent decimals to the same float, so its digest cannot authenticate
+    // a framed payload even when it happens to match the stored digest.
+    #[derive(serde::Deserialize)]
+    struct RawPayload<'a> {
+        #[serde(borrow)]
+        payload: &'a serde_json::value::RawValue,
+    }
+    let raw: RawPayload<'_> =
+        serde_json::from_slice(json).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
+    restore_float_values(&mut wire.payload, raw.payload)?;
+    if payload_digest(&wire.payload).map_err(|_| CanonicalCorruptionReason::InvalidJson)?
+        != wire.payload_hash
+    {
         return Err(CanonicalCorruptionReason::PayloadHashMismatch);
     }
     let record_hash = framed_record_hash(
@@ -2947,6 +2958,38 @@ fn parse_framed_v1(
         commitment_hash,
         payload: wire.payload,
     })
+}
+
+/// `UniqueJsonValue` has already checked this tree's syntax, member uniqueness
+/// and nesting limit. Borrow scalar spellings from the same JSON bytes and
+/// use the standard library's correctly rounded conversion for floats only.
+fn restore_float_values(
+    value: &mut Value,
+    raw: &serde_json::value::RawValue,
+) -> Result<(), CanonicalCorruptionReason> {
+    use serde_json::value::RawValue;
+    let invalid = CanonicalCorruptionReason::InvalidJson;
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            let exact = raw.get().parse::<f64>().map_err(|_| invalid)?;
+            *number = serde_json::Number::from_f64(exact).ok_or(invalid)?;
+        }
+        Value::Array(items) => {
+            let children: Vec<&RawValue> = serde_json::from_str(raw.get()).map_err(|_| invalid)?;
+            for (item, child) in items.iter_mut().zip(children) {
+                restore_float_values(item, child)?;
+            }
+        }
+        Value::Object(items) => {
+            let children: BTreeMap<String, &RawValue> =
+                serde_json::from_str(raw.get()).map_err(|_| invalid)?;
+            for (key, child) in children {
+                restore_float_values(items.get_mut(&key).ok_or(invalid)?, child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_stream_context(
@@ -4246,6 +4289,97 @@ mod tests {
     }
 
     #[test]
+    fn framed_float_replay_preserves_binary64_values_and_historical_hashes() {
+        // Precomputed v1 commitments. The bare prefix and frame three both
+        // committed the original parser's value one ULP below widened 0.92f32.
+        const LEGACY_HEAD: &str =
+            "b50745a2a8adf16261602df2d5ca3e3af5ed2dc66890f69ece2fb71ab631c431";
+        const EXACT_HEAD: &str = "5b4c7e68a6955139025ee658f955dff0e8e72af65990d5c88fd4ac50b02b5ab5";
+        const OLD_HEAD: &str = "c4032f6db785e3787ce6609d3ddea942cdda89b00dabc39a47dee61c485e8170";
+        const EXACT_HASH: &str = "13401e7913552879ee4d1d447053b1a777a7f1d1997a63e3aeb745a2168b887a";
+        const OLD_HASH: &str = "6adf73f05234d3d33466c9395465556e308a25e47ea99ab1944419fd61a1227d";
+        const LEGACY: &str = r#"{"confidence":0.9200000166893005}"#;
+        const EXACT: &str =
+            r#"{"confidence":0.9200000166893005,"timing":[0.10123456789012347,-0.0]}"#;
+
+        fn line(seq: u64, id: &str, prev: &str, hash: &str, head: &str, payload: &str) -> String {
+            let json = format!(
+                r#"{{"format_version":1,"session_id":"session-1","stream_id":"transcript","domain_schema_version":1,"sequence":{seq},"event_id":"{id}","causal_event_ids":[],"basis_heads":{{}},"previous_hash":"{prev}","payload_hash":"{hash}","record_hash":"{head}","payload":{payload}}}"#
+            );
+            format!("AGCL1 {:016x} {json}", json.len())
+        }
+
+        let path = temp_log("roundtrip-floats");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let exact = line(2, "float", LEGACY_HEAD, EXACT_HASH, EXACT_HEAD, EXACT);
+        let old_payload = r#"{"confidence":0.9200000166893004}"#;
+        let old = line(3, "old", EXACT_HEAD, OLD_HASH, OLD_HEAD, old_payload);
+        let aliased = line(3, "old", EXACT_HEAD, OLD_HASH, OLD_HEAD, LEGACY);
+        assert_eq!(
+            parse_framed_v1(aliased.as_bytes(), SESSION, STREAM, SCHEMA, 3, EXACT_HEAD).err(),
+            Some(CanonicalCorruptionReason::PayloadHashMismatch),
+            "the legacy parser maps this different decimal to the hashed value"
+        );
+        fs::write(&path, format!("{LEGACY}\n{exact}\n{old}\n")).unwrap();
+        let replay = load_canonical_stream::<Value>(
+            &path,
+            SESSION,
+            STREAM,
+            SCHEMA,
+            CanonicalTailRecovery::Strict,
+        )
+        .expect("the old prefix and both valid framed commitments must replay");
+        assert_eq!(replay.records[0].record_hash, LEGACY_HEAD);
+        assert_eq!(replay.records[1].record_hash, EXACT_HEAD);
+        let payload = &replay.records[1].payload;
+        assert_eq!(
+            payload["confidence"].as_f64().unwrap().to_bits(),
+            f64::from(0.92_f32).to_bits()
+        );
+        assert_eq!(
+            payload["timing"][0].as_f64().unwrap().to_bits(),
+            0.10123456789012347_f64.to_bits()
+        );
+        assert_eq!(
+            payload["timing"][1].as_f64().unwrap().to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(replay.head.unwrap().record_hash, OLD_HEAD);
+        assert_eq!(
+            replay.records[2].payload["confidence"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            0.9200000166893004_f64.to_bits()
+        );
+
+        // Exact parsing may recover the committed value, never bypass hashing
+        // or the duplicate-key and nesting checks on the original envelope.
+        let depth = format!("{}1{}", "[".repeat(150), "]".repeat(150));
+        for (invalid, reason) in [
+            (
+                EXACT.replace("0.10123456789012347", "0.25"),
+                CanonicalCorruptionReason::PayloadHashMismatch,
+            ),
+            (
+                EXACT.replace("\"timing\":", "\"timing\":null,\"timing\":"),
+                CanonicalCorruptionReason::InvalidJson,
+            ),
+            (
+                EXACT.replace("-0.0", &depth),
+                CanonicalCorruptionReason::InvalidJson,
+            ),
+        ] {
+            let changed = line(2, "float", LEGACY_HEAD, EXACT_HASH, EXACT_HEAD, &invalid);
+            assert_eq!(
+                parse_framed_v1(changed.as_bytes(), SESSION, STREAM, SCHEMA, 2, LEGACY_HEAD).err(),
+                Some(reason),
+            );
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn v1_payload_commitment_is_key_canonical_and_fixture_stable() {
         let path = temp_log("v1-golden-fixture");
         let mut nested = serde_json::Map::new();
@@ -5528,3 +5662,6 @@ mod tests {
         cleanup(&path);
     }
 }
+
+#[cfg(test)]
+mod float_tests;

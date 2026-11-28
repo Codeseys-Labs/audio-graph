@@ -876,7 +876,13 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     );
     invariant(
         cargoManifest.includes('[target.\'cfg(target_os = "macos")\'.dependencies]') &&
-            cargoManifest.includes('nix = { version = "0.31.3", features = ["fs"] }'),
+            // `fs` is the held-descriptor filesystem identity cc9a depends on.
+            // `user` was added by the credential-v2 authority journal (#537) to
+            // resolve the effective user's home independently of `HOME`. Any
+            // other feature set is drift and must be reviewed here.
+            cargoManifest.includes(
+                'nix = { version = "0.31.3", features = ["fs", "user"] }',
+            ),
         "cc9a macOS-target-only nix fs dependency drift",
     );
     const audioGraphLockPackage = cargoLock.slice(

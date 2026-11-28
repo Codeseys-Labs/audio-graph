@@ -21,12 +21,12 @@
  * Lifecycle: a draft is set to `"streaming"` the moment a dispatch starts
  * (`askQuestion`/`answerQuestionCard`, `store/index.ts`), accumulates delta
  * text via `appendAnswerDraftDelta`, and is CLEARED the moment the stream's
- * terminal frame lands with a non-error `finish_reason` — at that point the
+ * terminal `done` frame lands — at that point the
  * durable answer is expected to already be on its way to `card.answer`
  * (today: nothing repopulates it, since the backend command/event T3 owns
  * is unlanded; `AnswerThread`, `AgentProposalsPanel.tsx`, documents this gap
  * explicitly rather than papering over it with a client-synthesized answer).
- * A terminal frame carrying an error, or a synchronously-rejected dispatch,
+ * A terminal `failed` frame, or a synchronously-rejected dispatch,
  * instead sets `status: "failed"` and PRESERVES the draft (never cleared
  * automatically) so `AnswerThread` can render the typed failure + a Retry
  * affordance. `dismissAgentProposal`/`clearAgentProposals` (`store/index.ts`)
@@ -48,6 +48,8 @@
  * successful dispatch rather than something derived from `liveAssistCards`.
  */
 
+import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
+
 /** One card's transient answer-stream progress. `requestId` is `null` only
  * in the brief window between a dispatch starting and its `invoke` resolving
  * (mirrors `sendChatMessage`'s pre-arm window, `store/index.ts`) — deltas
@@ -55,10 +57,13 @@
  * and applied once armed. */
 export interface AnswerDraftState {
   status: "streaming" | "failed";
-  /** Accumulated delta text while `status === "streaming"`; the typed
-   * failure message while `status === "failed"`. */
+  /** Accumulated delta text while streaming. When `failure` is set, the
+   * partial answer of the failed stream; otherwise, on a `failed` draft,
+   * the message of the rejected dispatch. */
   text: string;
   requestId: string | null;
+  /** Normalized closed diagnostic of a failed stream. */
+  failure?: RuntimeDiagnostic;
 }
 
 export interface AnswerDraftsSlice {
