@@ -3050,10 +3050,22 @@ pub(crate) fn retire_transcript_publications(
     session: &str,
     outstanding: &[crate::projections::TranscriptEvent],
 ) {
-    publications()
+    let retired: Vec<_> = publications()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retain(|p| p.session != session || !outstanding.contains(&p.event));
+        .extract_if(.., |p| {
+            p.session == session && outstanding.contains(&p.event)
+        })
+        .collect();
+    // A waiter can still own the publication after it leaves the registry.
+    // Release the registry before waiting for any in-flight action.
+    for publication in retired {
+        publication
+            .action
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
 }
 
 impl TranscriptProcessingContext {
@@ -12309,6 +12321,31 @@ mod tests_status {
             asr_latency_ms: None,
             received_at_ms: 1_700_000_000_000 + revision_number,
         }
+    }
+
+    #[test]
+    fn retired_publication_ignores_a_held_waiters_lost_reply() {
+        use super::{
+            PendingPublication, retire_transcript_publications, update_transcript_saving_status,
+        };
+        let status = Arc::new(Mutex::new(PipelineStatus::default()));
+        let observed = status.clone();
+        let held = PendingPublication::register(
+            "orchard".into(),
+            &projection_asr_payload("reed", 1, "leaf", true),
+            move |receipt, _, id| {
+                update_transcript_saving_status(&mut observed.lock().unwrap(), id, &receipt)
+            },
+        );
+        retire_transcript_publications(&held.session, std::slice::from_ref(&held.event));
+        let changed = held.observe(
+            Err(crate::persistence::canonical_log::TranscriptCommitError::ReplyLost),
+            false,
+        );
+        let status = status.lock().unwrap();
+        assert!(status.pending_transcript_saves.is_empty());
+        assert!(status.transcript_not_saving.is_none());
+        assert!(!changed);
     }
 
     fn assemblyai_speaker_revision(
