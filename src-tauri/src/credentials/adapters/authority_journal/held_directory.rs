@@ -341,6 +341,17 @@ mod windows_held {
             .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)
     }
 
+    /// Refuses an object whose owner could undo its hardening. Any owner keeps
+    /// implicit `WRITE_DAC`, so a protected owner-only DACL means nothing on an
+    /// object someone else owns. See `fs_util::owner_is_trusted` for which
+    /// owners are accepted.
+    fn require_trusted_owner(file: &File) -> Result<(), CredentialStoreFailure> {
+        match crate::fs_util::owner_is_trusted(file) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(CredentialStoreFailure::PermissionHardeningFailed),
+        }
+    }
+
     /// Marks the open file for deletion when its last handle closes. The
     /// handle names the object, whatever its path resolves to by then.
     fn dispose(file: &File) -> std::io::Result<()> {
@@ -444,6 +455,7 @@ mod windows_held {
                 Err(error) => return Err(open_failure(error.kind())),
             };
             require_kind(&handle, true)?;
+            require_trusted_owner(&handle)?;
             harden_directory(&handle)?;
             let final_path =
                 final_path(&handle).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
@@ -463,7 +475,9 @@ mod windows_held {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|_| CredentialStoreFailure::Unavailable)?;
             }
-            match std::fs::create_dir(path) {
+            // Created with its protected owner-only DACL, so no other principal
+            // can open it between creation and hardening.
+            match crate::fs_util::create_owner_only_directory(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(open_failure(error.kind())),
@@ -472,9 +486,10 @@ mod windows_held {
         }
 
         /// Opens a child without following a final reparse point, refuses it
-        /// unless its final path names a direct child of the held directory,
-        /// and hardens it through the handle before returning it. A child this
-        /// open created is deleted through its handle if it is refused.
+        /// unless its final path names a direct child of the held directory
+        /// and a trusted principal owns it, and hardens it through the handle
+        /// before returning it. A child this open created is deleted through
+        /// its handle if it is refused.
         fn open_child(
             &self,
             name: &str,
@@ -508,6 +523,7 @@ mod windows_held {
             if child.parent() != Some(self.final_path.as_path()) {
                 return Err(CredentialStoreFailure::PermissionHardeningFailed);
             }
+            require_trusted_owner(file)?;
             harden(file)
         }
 

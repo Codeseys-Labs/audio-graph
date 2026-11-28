@@ -1414,4 +1414,148 @@ mod tests {
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows cleanup-swap directory");
     }
+
+    /// A base directory whose inheritable ACL grants Everyone full control,
+    /// so anything created under it without its own protection is exposed.
+    #[cfg(windows)]
+    fn permissive_base(label: &str) -> PathBuf {
+        let base = scratch(label);
+        std::fs::create_dir_all(&base).expect("create permissive base");
+        windows_command(
+            "icacls.exe",
+            &[
+                base.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(CI)F".as_ref(),
+            ],
+            &base,
+        );
+        base
+    }
+
+    /// The root is created already carrying its protected owner-only DACL;
+    /// it is inspected before anything opens or hardens it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_new_root_is_owner_only_from_the_moment_it_is_created() {
+        let base = permissive_base("windows-create-protected");
+        let root = base.join("journal");
+
+        crate::fs_util::create_owner_only_directory(&root).expect("create protected root");
+
+        let dacl = windows_dacl(&root, &base);
+        assert_protected_owner_only(&dacl);
+        assert!(
+            dacl.contains("(A;OICI;FA;;;"),
+            "owner ACE is not inherited by children: {dacl}"
+        );
+        assert_eq!(
+            crate::fs_util::create_owner_only_directory(&root).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::AlreadyExists)
+        );
+        std::fs::remove_dir_all(&base).expect("remove isolated protected-create directory");
+    }
+
+    /// A file created inside a held root, even by code that never hardens
+    /// it, starts out owner-only through the root's inherited ACE. So the
+    /// lock and staged files are never exposed between creation and their
+    /// own hardening.
+    #[cfg(windows)]
+    #[test]
+    fn windows_children_of_a_held_root_start_owner_only() {
+        let base = permissive_base("windows-child-inherits");
+        let root = base.join("journal");
+        let held = HeldDirectory::open_or_create(&root).expect("hold root");
+
+        std::fs::write(root.join("unhardened-child"), b"child").expect("create plain child");
+
+        let dacl = windows_dacl(&root.join("unhardened-child"), &base);
+        assert_eq!(
+            dacl.matches('(').count(),
+            1,
+            "child has extra entries: {dacl}"
+        );
+        assert!(
+            dacl.contains("(A;ID;FA;;;")
+                && dacl.ends_with(&format!(";;;{})", windows_current_sid())),
+            "child is not owner-only by inheritance: {dacl}"
+        );
+        drop(held);
+        std::fs::remove_dir_all(&base).expect("remove isolated child-inheritance directory");
+    }
+
+    #[cfg(windows)]
+    fn open_for_read_control(path: &Path) -> std::fs::File {
+        use ::windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+            .expect("open for READ_CONTROL")
+    }
+
+    /// The owner is read from the open handle. The Windows directory is owned
+    /// by TrustedInstaller, which is not a trusted owner for credential state.
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_trust_accepts_the_user_and_refuses_another_owner() {
+        let base = scratch("windows-owner-trust");
+        std::fs::create_dir_all(&base).expect("create own directory");
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"));
+
+        assert!(
+            crate::fs_util::owner_is_trusted(&open_for_read_control(&base))
+                .expect("read own directory owner")
+        );
+        assert!(
+            !crate::fs_util::owner_is_trusted(&open_for_read_control(&system_root))
+                .expect("read Windows directory owner")
+        );
+        std::fs::remove_dir_all(&base).expect("remove isolated owner-trust directory");
+    }
+
+    /// A root someone else owns is refused before its DACL is touched: its
+    /// owner keeps implicit `WRITE_DAC` and could undo any hardening.
+    /// Assigning another owner needs `SeRestorePrivilege`, so this fixture can
+    /// only be built by an elevated run; GitHub's Windows runners are elevated.
+    #[cfg(windows)]
+    #[test]
+    fn windows_foreign_owned_root_is_refused_before_it_is_hardened() {
+        let base = scratch("windows-foreign-owner");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create journal root");
+        let assigned = Command::new("icacls.exe")
+            .arg(&root)
+            .args(["/setowner", "*S-1-5-19"])
+            .current_dir(&base)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run icacls")
+            .success();
+        if !assigned {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "the foreign-owner fixture must build on an elevated CI runner"
+            );
+            std::fs::remove_dir_all(&base).expect("remove isolated foreign-owner directory");
+            return;
+        }
+        let dacl_before = windows_dacl(&root, &base);
+
+        assert_eq!(
+            boundary(&base, "journal", "namespace").replace(b"journal"),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        assert_eq!(
+            windows_dacl(&root, &base),
+            dacl_before,
+            "a foreign-owned root was hardened"
+        );
+        assert!(!root.join(JOURNAL_FILE_NAME).exists());
+        std::fs::remove_dir_all(&base).expect("remove isolated foreign-owner directory");
+    }
 }
