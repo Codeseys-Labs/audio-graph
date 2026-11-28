@@ -27237,6 +27237,87 @@ mod tests {
             .take();
     }
 
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_containing(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+        let mut hits = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                hits.extend(files_containing(&path, needle));
+            } else if String::from_utf8_lossy(&std::fs::read(&path).expect("read file"))
+                .contains(needle)
+            {
+                hits.push(path);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn a_legacy_failed_answer_loses_its_failure_prose_on_load_and_in_later_writes() {
+        const PROSE_CANARY: &str = "LEGACY-FAILURE-PROSE-CANARY";
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("legacy-failed-answer-prose");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "legacy-answer-session";
+        let mut card = answer_engine_test_card(
+            "legacy-card",
+            session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        card.answer = Some(events::CardAnswer {
+            status: events::CardAnswerStatus::Failed,
+            text: String::new(),
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: events::CardOrigin::Transcript,
+            finish_reason: None,
+            diagnostic: None,
+            total_tokens: None,
+            answered_at_ms: 1,
+        });
+        // The card as an older build wrote it: the failure is prose in
+        // `finish_reason`.
+        let mut legacy = serde_json::to_value(&card).expect("serialize the card");
+        legacy["answer"]["finish_reason"] = serde_json::json!(format!("error: {PROSE_CANARY}"));
+        let current = crate::user_data::resolve_live_assist_current_path(session_id)
+            .expect("resolve the current card file");
+        std::fs::create_dir_all(current.parent().expect("card directory"))
+            .expect("create the card directory");
+        std::fs::write(&current, serde_json::to_vec(&[legacy]).expect("encode"))
+            .expect("write the legacy card file");
+
+        let loaded = FileMemoryRepository::user_data()
+            .load_live_assist_cards(session_id)
+            .expect("the legacy card loads");
+        let ipc_payload = serde_json::to_string(&loaded).expect("serialize the IPC payload");
+        assert!(!ipc_payload.contains(PROSE_CANARY), "{ipc_payload}");
+
+        // A dismissal rewrites the card file and appends to its audit log.
+        let dismissed = live_assist_card_record(
+            session_id,
+            &loaded[0].proposal,
+            events::LiveAssistCardStatus::Dismissed,
+            None,
+            None,
+            2,
+            Some(&loaded[0]),
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(session_id, &dismissed)
+            .expect("dismiss the card");
+        assert_eq!(files_containing(&dir, PROSE_CANARY), Vec::<std::path::PathBuf>::new());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn decision_shadow_user_question_keeps_manual_kind_and_grade() {
         use crate::decision::shadow::{DisagreeingEngine, ShadowWork};

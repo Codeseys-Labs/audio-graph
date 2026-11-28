@@ -769,7 +769,12 @@ pub const MAX_CARD_ANSWER_TEXT_CHARS: usize = 4_000;
 /// that served it, and it lives on this Session Artifact, never in the
 /// temporal graph — ADR-0013: no new graph write path is introduced by this
 /// type.
+///
+/// Loading a `Failed` answer drops its `finish_reason` (see the
+/// `Deserialize` impl below). `remote = "Self"` turns the derives into
+/// inherent `CardAnswer::serialize`/`deserialize`, which the trait impls wrap.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(remote = "Self")]
 pub struct CardAnswer {
     pub status: CardAnswerStatus,
     /// Full answer text from the stream's terminal frame. Non-empty unless
@@ -803,8 +808,8 @@ pub struct CardAnswer {
     pub requested_by: CardOrigin,
     /// Finish reason of an `Answered` or `Interrupted` stream. A `Failed`
     /// answer carries [`Self::diagnostic`] instead. Records written before the
-    /// closed outcome may hold a free-form failure string here; it is kept
-    /// only so those records still load and is never rendered.
+    /// closed outcome kept free-form failure prose here; loading a `Failed`
+    /// answer drops it, so it never reaches the renderer or a later write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     /// Closed failure diagnostic of a `Failed` answer. Absent on answers that
@@ -817,6 +822,22 @@ pub struct CardAnswer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
     pub answered_at_ms: u64,
+}
+
+impl serde::Serialize for CardAnswer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CardAnswer::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CardAnswer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut answer = CardAnswer::deserialize(deserializer)?;
+        if answer.status == CardAnswerStatus::Failed {
+            answer.finish_reason = None;
+        }
+        Ok(answer)
+    }
 }
 
 impl CardAnswer {
@@ -1447,6 +1468,7 @@ mod tests {
         .expect("a pre-diagnostic failed answer still loads");
         assert_eq!(legacy.status, CardAnswerStatus::Failed);
         assert_eq!(legacy.diagnostic, None);
+        assert_eq!(legacy.finish_reason, None, "the legacy prose is dropped");
     }
 
     #[test]
