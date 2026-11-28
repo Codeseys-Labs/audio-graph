@@ -1025,6 +1025,7 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     let projection_lane_stopping = Arc::new(AtomicBool::new(false));
     let ctx = TranscriptProcessingContext {
         asr_provider: "assemblyai",
+        streaming_asr_terminated: Arc::new(AtomicBool::new(false)),
         active_session_id,
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),

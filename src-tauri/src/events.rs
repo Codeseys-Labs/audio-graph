@@ -255,6 +255,11 @@ pub enum StageStatus {
     Error {
         diagnostic: RuntimeDiagnostic,
     },
+    /// A streaming provider is being re-established.
+    Reconnecting {
+        reason: AsrReconnectReason,
+        retry_delay: audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket,
+    },
     /// The stage is running, but not with the backend/fidelity the user's
     /// configuration asked for — e.g. diarization silently fell back from a
     /// missing/invalid neural model asset to the crude Simple heuristic
@@ -277,6 +282,14 @@ pub enum StageStatus {
         reason: crate::speech::DiarizationDegradationReason,
         diagnostic: RuntimeDiagnostic,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrReconnectReason {
+    SessionRollover,
+    ConnectionLost,
+    ProviderRetryLater,
 }
 
 /// Reason the canonical transcript writer could not acknowledge the current revision.
@@ -1072,6 +1085,24 @@ pub fn is_storage_full(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconnecting_stage_serializes_only_the_reason_and_delay_bucket() {
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket;
+
+        assert_eq!(
+            serde_json::to_value(super::StageStatus::Reconnecting {
+                reason: super::AsrReconnectReason::SessionRollover,
+                retry_delay: RuntimeRetryDelayBucket::Medium,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "Reconnecting",
+                "reason": "session_rollover",
+                "retry_delay": "medium"
+            })
+        );
+    }
+
     use super::*;
 
     fn test_runtime_diagnostic() -> audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic

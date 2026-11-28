@@ -94,7 +94,7 @@
       "turn_index": 4
     },
     {
-      "type": "error",
+      "type": "advisory",
       "message": {
         "kind": "runtime",
         "detail": {
@@ -118,7 +118,7 @@
       }
     },
     {
-      "type": "error",
+      "type": "advisory",
       "message": {
         "kind": "runtime",
         "detail": {
