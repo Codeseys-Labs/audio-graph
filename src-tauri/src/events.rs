@@ -5,6 +5,8 @@
 
 use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
 
+use crate::llm::streaming::ChatStreamEvent;
+
 /// Event emitted when a new transcript segment is available.
 pub const TRANSCRIPT_UPDATE: &str = "transcript-update";
 
@@ -152,40 +154,51 @@ pub const AWS_ERROR: &str = "aws-error";
 // returned by `start_streaming_chat` (audio-graph-1534) — the event system is
 // not designed for the 20-100+/sec per-token throughput.
 
-/// One frame on a streaming-chat or card-answer channel. The
-/// `#[serde(tag = "event", content = "data")]` shape is a discriminated
-/// union for the frontend's single `channel.onmessage` handler. Every
-/// stream ends with exactly one `done` or `failed` frame.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "event", content = "data")]
+/// One frame on a streaming-chat or card-answer channel, as the frontend's
+/// single `channel.onmessage` handler sees it: `{ event, data }`. Every
+/// stream ends with exactly one `done` or `failed` frame; a cancelled stream
+/// ends on `done` with `finish_reason == "cancelled"`.
+#[derive(Debug, Clone)]
 pub enum ChatStreamFrame {
-    /// One generated token-delta chunk.
-    #[serde(rename = "delta")]
-    Delta {
-        request_id: String,
-        delta: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        finish_reason: Option<String>,
-    },
-    /// The stream completed, or the user cancelled it
-    /// (`finish_reason == "cancelled"`).
-    #[serde(rename = "done")]
-    Done {
-        request_id: String,
-        full_text: String,
-        finish_reason: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<crate::llm::streaming::StreamUsage>,
-    },
+    /// A `delta` or `done` frame, encoded exactly as [`ChatStreamEvent`].
+    Stream(ChatStreamEvent),
     /// The stream failed. `full_text` is model output produced before the
     /// failure: partial product data for display, never written to chat
     /// history and never replayed to a provider.
-    #[serde(rename = "failed")]
     Failed {
         request_id: String,
         full_text: String,
         diagnostic: RuntimeDiagnostic,
     },
+}
+
+impl serde::Serialize for ChatStreamFrame {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        /// `failed`, in the same adjacently tagged encoding as [`ChatStreamEvent`].
+        #[derive(serde::Serialize)]
+        #[serde(tag = "event", content = "data")]
+        enum Failure<'a> {
+            #[serde(rename = "failed")]
+            Failed {
+                request_id: &'a str,
+                full_text: &'a str,
+                diagnostic: &'a RuntimeDiagnostic,
+            },
+        }
+        match self {
+            Self::Stream(event) => event.serialize(serializer),
+            Self::Failed {
+                request_id,
+                full_text,
+                diagnostic,
+            } => Failure::Failed {
+                request_id,
+                full_text,
+                diagnostic,
+            }
+            .serialize(serializer),
+        }
+    }
 }
 
 /// Event emitted after a chat/LLM completion's provider-reported token usage

@@ -3747,7 +3747,7 @@ fn stream_params_from_settings(
 /// Spawn the streaming-chat task for `request_id`.
 ///
 /// Drives `crate::llm::streaming::stream_chat` to completion, sending one
-/// [`events::ChatStreamFrame::Delta`] per
+/// [`crate::llm::streaming::ChatStreamEvent::Delta`] per
 /// [`crate::llm::streaming::TokenDelta::Delta`] and exactly one terminal
 /// `Done` (completed or cancelled) or `Failed` frame over the per-invocation
 /// `channel` (audio-graph-1534: this hot path streams 20-100+ token
@@ -3773,8 +3773,10 @@ fn spawn_stream_task(
     user_turn: ChatMessage,
     persist_to_history: bool,
 ) {
+    use crate::events::ChatStreamFrame;
     use crate::llm::streaming::{
-        StreamChatRequest, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
+        ChatStreamEvent, StreamChatRequest, StreamSourceMetadata, TokenDelta,
+        stream_chat_with_request,
     };
 
     let params = stream_params_from_settings(&settings);
@@ -3861,11 +3863,11 @@ fn spawn_stream_task(
                     {
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
-                    if let Err(e) = channel.send(events::ChatStreamFrame::Delta {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Delta {
                         request_id: request_id_for_task.clone(),
                         delta: content,
                         finish_reason,
-                    }) {
+                    })) {
                         // A closed channel means the frontend dropped the
                         // stream (window closed / navigated). Stop draining
                         // rather than spin on a dead channel — mirrors the
@@ -3905,12 +3907,12 @@ fn spawn_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &session_id_for_usage, tokens_used);
-                    if let Err(e) = channel.send(events::ChatStreamFrame::Done {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason,
                         usage,
-                    }) {
+                    })) {
                         log::warn!(
                             "chat stream {}: done channel send failed: {}",
                             request_id_for_task,
@@ -3930,7 +3932,7 @@ fn spawn_stream_task(
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(events::ChatStreamFrame::Failed {
+                    if let Err(e) = channel.send(ChatStreamFrame::Failed {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         diagnostic,
@@ -3952,12 +3954,12 @@ fn spawn_stream_task(
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(events::ChatStreamFrame::Done {
+                    if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason: "cancelled".to_string(),
                         usage: None,
-                    }) {
+                    })) {
                         log::warn!(
                             "chat stream {}: cancelled-done channel send failed: {}",
                             request_id_for_task,
@@ -6068,7 +6070,10 @@ fn spawn_card_answer_stream_task(
     effective_speak_aloud: bool,
     ctx: CardAnswerContext,
 ) {
-    use crate::llm::streaming::{StreamSourceMetadata, TokenDelta, stream_chat_with_request};
+    use crate::events::ChatStreamFrame;
+    use crate::llm::streaming::{
+        ChatStreamEvent, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
+    };
 
     let params = stream_params_from_settings(&settings);
     let content_egress_policy = provider_content_egress_policy_from_settings(
@@ -6220,7 +6225,7 @@ fn spawn_card_answer_stream_task(
                         let _ = p.cancel();
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(events::ChatStreamFrame::Failed {
+                        && let Err(e) = channel.send(ChatStreamFrame::Failed {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             diagnostic: diagnostic.clone(),
