@@ -1097,6 +1097,7 @@ fn emit_asr_partial_with_meta(
         received_at_ms,
     };
     if !record_asr_span_revision_event_and_observe_projection(
+        Some((&ctx.app_handle, &ctx.pipeline_status)),
         &ctx.transcript_ledger,
         &ctx.transcript_event_writer,
         &ctx.projection_schedulers,
@@ -1132,6 +1133,28 @@ struct TurnEventInput {
     end_time: Option<f64>,
     confidence: Option<f32>,
     turn_index: Option<u64>,
+}
+
+/// Capture a provider turn marker before the revision is normalized and
+/// consumed. Callers publish this content-bearing marker after receipt.
+fn revision_end_of_turn(
+    provider: &'static str,
+    payload: &events::AsrSpanRevisionPayload,
+) -> Option<TurnEventInput> {
+    payload.end_of_turn.then(|| TurnEventInput {
+        provider,
+        source_id: payload.source_id.clone(),
+        kind: events::TurnEventKind::EndOfTurn,
+        text: Some(payload.text.clone()),
+        start_time: Some(payload.start_time),
+        end_time: Some(payload.end_time),
+        confidence: Some(payload.confidence),
+        turn_index: payload
+            .turn_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("turn-"))
+            .and_then(|number| number.parse().ok()),
+    })
 }
 
 /// Emit a provider-neutral speech turn lifecycle event.
@@ -2842,83 +2865,86 @@ fn shared_to_transcript_context(
     }
 }
 
+/// True means the caller should publish this revision's live side effects once.
+#[cfg(test)]
 fn record_asr_span_revision_event(
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     payload: &events::AsrSpanRevisionPayload,
 ) -> bool {
-    let transcript_event = crate::projections::TranscriptEvent::from(payload.clone());
-    let mut ledger = match transcript_ledger.lock() {
-        Ok(ledger) => ledger,
-        Err(poisoned) => {
-            log::warn!("Transcript ledger lock poisoned; recovering");
-            poisoned.into_inner()
-        }
-    };
-    let mut next_ledger = ledger.clone();
-    match next_ledger.apply_event(transcript_event.clone()) {
-        Ok(()) => {}
-        Err(_) => {
-            log::warn!("Transcript ledger rejected span revision");
-            return false;
+    report_transcript_commit(
+        commit_asr_span_revision(transcript_ledger, transcript_event_writer, payload),
+        None,
+    )
+}
+
+fn report_transcript_commit(
+    receipt: Result<bool, crate::persistence::canonical_log::TranscriptCommitError>,
+    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
+) -> bool {
+    use crate::persistence::canonical_log::TranscriptCommitError;
+
+    let failure = receipt.as_ref().err().map(|error| match error {
+        TranscriptCommitError::WriterAbsent => events::TranscriptSavingFailure::WriterAbsent,
+        error if error.is_storage_full() => events::TranscriptSavingFailure::StorageFull,
+        _ => events::TranscriptSavingFailure::WriteFailed,
+    });
+    if let Some((app, status)) = status {
+        let mut status = status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.transcript_not_saving != failure {
+            status.transcript_not_saving = failure;
+            let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
         }
     }
-    match transcript_event_writer.lock() {
-        Ok(writer_guard) => {
-            let Some(writer) = writer_guard.as_ref() else {
-                log::warn!(
-                    "Transcript event writer unavailable for span_id={} revision={}; ledger was not advanced",
-                    transcript_event.span_id,
-                    transcript_event.revision_number
-                );
-                return false;
-            };
-            if !writer.append(&transcript_event) {
-                log::warn!(
-                    "Transcript event writer rejected span revision span_id={} revision={}; ledger was not advanced",
-                    transcript_event.span_id,
-                    transcript_event.revision_number
-                );
-                return false;
-            }
-        }
-        Err(poisoned) => {
-            log::warn!("Transcript event writer lock poisoned; recovering before ledger advance");
-            let writer_guard = poisoned.into_inner();
-            match writer_guard.as_ref() {
-                Some(writer) => {
-                    if !writer.append(&transcript_event) {
-                        log::warn!(
-                            "Transcript event writer rejected span revision span_id={} revision={} after poisoned-lock recovery; ledger was not advanced",
-                            transcript_event.span_id,
-                            transcript_event.revision_number
-                        );
-                        return false;
-                    }
-                }
-                None => {
-                    log::warn!(
-                        "Transcript event writer lock poisoned with no recoverable writer for span_id={} revision={}; ledger was not advanced",
-                        transcript_event.span_id,
-                        transcript_event.revision_number
-                    );
-                    return false;
-                }
-            }
-        }
+    receipt.unwrap_or_else(|error| {
+        log::warn!("transcript commit refused: {error:?}");
+        false
+    })
+}
+
+/// Commit the proposed ledger only after the writer returns a durable receipt.
+/// The returned failure is content-free, including validation failures.
+fn commit_asr_span_revision(
+    transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
+    transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
+    payload: &events::AsrSpanRevisionPayload,
+) -> Result<bool, crate::persistence::canonical_log::TranscriptCommitError> {
+    use crate::persistence::canonical_log::TranscriptCommitError;
+
+    let event = crate::projections::TranscriptEvent::from(payload.clone());
+    let mut ledger = transcript_ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut next_ledger = ledger.clone();
+    next_ledger
+        .apply_event(event.clone())
+        .map_err(|_| TranscriptCommitError::InvalidRevision)?;
+    let writer = transcript_event_writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let receipt = writer
+        .as_ref()
+        .ok_or(TranscriptCommitError::WriterAbsent)?
+        .append_after(&event, Some(ledger.accepted_event_count))?;
+    if receipt.already_accepted && receipt.sequence <= ledger.accepted_event_count {
+        return Ok(false);
     }
     *ledger = next_ledger;
-    true
+    Ok(true)
 }
 
 fn record_asr_span_revision_event_and_observe_projection(
+    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     projection_schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     projection_dispatch: Option<&ProjectionDispatchContext>,
     payload: &events::AsrSpanRevisionPayload,
 ) -> bool {
-    if !record_asr_span_revision_event(transcript_ledger, transcript_event_writer, payload) {
+    let receipt = commit_asr_span_revision(transcript_ledger, transcript_event_writer, payload);
+    if !report_transcript_commit(receipt, status) {
         return false;
     }
     observe_projection_schedulers_for_asr_revision(
@@ -2961,13 +2987,6 @@ fn observe_projection_schedulers_for_asr_revision(
             }
         };
         let observation = schedulers.observe_ledger(&ledger, current_unix_millis());
-        log::debug!(
-            "projection_schedulers.observe_asr_revision span_id={} revision={} notes={:?} graph={:?}",
-            payload.span_id,
-            payload.revision_number,
-            observation.notes,
-            observation.graph
-        );
         log_attempt_budget_exhausted(
             &observation.notes,
             schedulers.notes().metrics().attempts_exhausted,
@@ -4163,6 +4182,7 @@ fn emit_transcript_and_extract_with_meta(
         received_at_ms,
     };
     if !record_asr_span_revision_event_and_observe_projection(
+        Some((&ctx.app_handle, &ctx.pipeline_status)),
         &ctx.transcript_ledger,
         &ctx.transcript_event_writer,
         &ctx.projection_schedulers,
@@ -4342,6 +4362,7 @@ fn emit_moonshine_span_revision(
     }
 
     if !record_asr_span_revision_event_and_observe_projection(
+        Some((&ctx.app_handle, &ctx.pipeline_status)),
         &ctx.transcript_ledger,
         &ctx.transcript_event_writer,
         &ctx.projection_schedulers,
@@ -4435,6 +4456,7 @@ fn emit_provider_span_revision_payload(
     }
 
     if !record_asr_span_revision_event_and_observe_projection(
+        Some((&ctx.app_handle, &ctx.pipeline_status)),
         &ctx.transcript_ledger,
         &ctx.transcript_event_writer,
         &ctx.projection_schedulers,
@@ -6075,23 +6097,20 @@ fn run_asr_worker(
                         &final_meta,
                     );
 
-                    emit_turn_event(
-                        &ctx.app_handle,
-                        TurnEventInput {
-                            provider: "local_whisper",
-                            source_id: final_segment.source_id.clone(),
-                            kind: events::TurnEventKind::LocalWindow,
-                            text: Some(final_segment.text.clone()),
-                            start_time: Some(final_segment.start_time),
-                            end_time: Some(final_segment.end_time),
-                            confidence: Some(final_segment.confidence),
-                            turn_index: Some(asr_count),
-                        },
-                    );
+                    let turn = TurnEventInput {
+                        provider: "local_whisper",
+                        source_id: final_segment.source_id.clone(),
+                        kind: events::TurnEventKind::LocalWindow,
+                        text: Some(final_segment.text.clone()),
+                        start_time: Some(final_segment.start_time),
+                        end_time: Some(final_segment.end_time),
+                        confidence: Some(final_segment.confidence),
+                        turn_index: Some(asr_count),
+                    };
 
                     // 3–6. Buffer, persist, emit, update status, and spawn
                     //      extraction in the shared tail helper.
-                    emit_transcript_and_extract_with_meta(
+                    if emit_transcript_and_extract_with_meta(
                         final_segment,
                         speaker_info_to_emit,
                         &ctx,
@@ -6100,7 +6119,9 @@ fn run_asr_worker(
                         &extraction_count,
                         &graph_update_count,
                         final_meta,
-                    );
+                    ) {
+                        emit_turn_event(&ctx.app_handle, turn);
+                    }
                 }
             }
             Err(_) => {
@@ -6330,37 +6351,6 @@ pub(crate) fn run_speech_processor_diarization_only(
             #[cfg(not(feature = "diarization-clustering"))]
             let emit_simple_speaker = true;
 
-            emit_turn_event(
-                &shared.app_handle,
-                TurnEventInput {
-                    provider: "local_diarization",
-                    source_id: final_segment.source_id.clone(),
-                    kind: events::TurnEventKind::LocalWindow,
-                    text: Some(final_segment.text.clone()),
-                    start_time: Some(final_segment.start_time),
-                    end_time: Some(final_segment.end_time),
-                    confidence: Some(final_segment.confidence),
-                    turn_index: Some(count),
-                },
-            );
-
-            if let Ok(mut buffer) = shared.transcript_buffer.write() {
-                buffer.push_back(final_segment.clone());
-                if buffer.len() > 500 {
-                    buffer.pop_front();
-                }
-            }
-            // Persist transcript segment asynchronously. This is a second,
-            // independent display-write site (local diarization-in-place ASR),
-            // not routed through `emit_transcript_and_extract_with_meta`'s shared
-            // tail, so it shares `persist_display_transcript_segment` rather than
-            // duplicating the miss-counting logic (audio-graph-64e3).
-            persist_display_transcript_segment(
-                &shared.transcript_writer,
-                &shared.display_transcript_write_misses,
-                &final_segment,
-            );
-
             let final_meta = final_only_revision_meta(
                 "local_diarization",
                 &final_segment.source_id,
@@ -6395,15 +6385,49 @@ pub(crate) fn run_speech_processor_diarization_only(
                 asr_latency_ms: None,
                 received_at_ms: current_unix_millis(),
             };
-            if record_asr_span_revision_event_and_observe_projection(
+            if !record_asr_span_revision_event_and_observe_projection(
+                Some((&shared.app_handle, &shared.pipeline_status)),
                 &shared.transcript_ledger,
                 &shared.transcript_event_writer,
                 &shared.projection_schedulers,
                 Some(&projection_dispatch),
                 &asr_payload,
             ) {
-                emit_asr_span_revision(&shared.app_handle, asr_payload);
+                continue;
             }
+
+            emit_turn_event(
+                &shared.app_handle,
+                TurnEventInput {
+                    provider: "local_diarization",
+                    source_id: final_segment.source_id.clone(),
+                    kind: events::TurnEventKind::LocalWindow,
+                    text: Some(final_segment.text.clone()),
+                    start_time: Some(final_segment.start_time),
+                    end_time: Some(final_segment.end_time),
+                    confidence: Some(final_segment.confidence),
+                    turn_index: Some(count),
+                },
+            );
+
+            if let Ok(mut buffer) = shared.transcript_buffer.write() {
+                buffer.push_back(final_segment.clone());
+                if buffer.len() > 500 {
+                    buffer.pop_front();
+                }
+            }
+            // Persist transcript segment asynchronously. This is a second,
+            // independent display-write site (local diarization-in-place ASR),
+            // not routed through `emit_transcript_and_extract_with_meta`'s shared
+            // tail, so it shares `persist_display_transcript_segment` rather than
+            // duplicating the miss-counting logic (audio-graph-64e3).
+            persist_display_transcript_segment(
+                &shared.transcript_writer,
+                &shared.display_transcript_write_misses,
+                &final_segment,
+            );
+
+            emit_asr_span_revision(&shared.app_handle, asr_payload);
             let event_sink = TauriDiarizationEventSink {
                 app_handle: &shared.app_handle,
             };
@@ -8176,26 +8200,7 @@ fn run_assemblyai_event_receiver(
                 }
 
                 for mut revision in parsed.revisions {
-                    if revision.payload.end_of_turn {
-                        emit_turn_event(
-                            &ctx.app_handle,
-                            TurnEventInput {
-                                provider: "assemblyai",
-                                source_id: revision.payload.source_id.clone(),
-                                kind: events::TurnEventKind::EndOfTurn,
-                                text: Some(revision.payload.text.clone()),
-                                start_time: Some(revision.payload.start_time),
-                                end_time: Some(revision.payload.end_time),
-                                confidence: Some(revision.payload.confidence),
-                                turn_index: revision
-                                    .payload
-                                    .turn_id
-                                    .as_deref()
-                                    .and_then(|turn_id| turn_id.strip_prefix("turn-"))
-                                    .and_then(|turn| turn.parse::<u64>().ok()),
-                            },
-                        );
-                    }
+                    let turn = revision_end_of_turn("assemblyai", &revision.payload);
 
                     normalize_assemblyai_v3_revision_for_side_effects(&mut revision);
 
@@ -8206,14 +8211,19 @@ fn run_assemblyai_event_receiver(
                         &revision.payload,
                         &speaker_revision_numbers_by_span,
                     );
-                    if emit_provider_span_revision_payload(
+                    if !emit_provider_span_revision_payload(
                         revision.payload,
                         &ctx,
                         asr_count,
                         &extraction_count,
                         &graph_update_count,
-                    ) && let Some(initial_speaker) = initial_speaker
-                    {
+                    ) {
+                        continue;
+                    }
+                    if let Some(turn) = turn {
+                        emit_turn_event(&ctx.app_handle, turn);
+                    }
+                    if let Some(initial_speaker) = initial_speaker {
                         let event_sink = TauriDiarizationEventSink {
                             app_handle: &ctx.app_handle,
                         };
@@ -8473,37 +8483,21 @@ fn run_soniox_event_receiver(
                     revision.payload.speaker_label = Some(format!("Speaker {speaker_id}"));
                 }
 
-                if revision.payload.end_of_turn {
-                    emit_turn_event(
-                        &ctx.app_handle,
-                        TurnEventInput {
-                            provider: "soniox",
-                            source_id: revision.payload.source_id.clone(),
-                            kind: events::TurnEventKind::EndOfTurn,
-                            text: Some(revision.payload.text.clone()),
-                            start_time: Some(revision.payload.start_time),
-                            end_time: Some(revision.payload.end_time),
-                            confidence: Some(revision.payload.confidence),
-                            turn_index: revision
-                                .payload
-                                .turn_id
-                                .as_deref()
-                                .and_then(|turn_id| turn_id.strip_prefix("turn-"))
-                                .and_then(|turn| turn.parse::<u64>().ok()),
-                        },
-                    );
-                }
+                let turn = revision_end_of_turn("soniox", &revision.payload);
 
                 if revision.payload.is_final {
                     asr_count += 1;
                 }
-                let _ = emit_soniox_span_revision(
+                if emit_soniox_span_revision(
                     revision,
                     &ctx,
                     asr_count,
                     &extraction_count,
                     &graph_update_count,
-                );
+                ) && let Some(turn) = turn
+                {
+                    emit_turn_event(&ctx.app_handle, turn);
+                }
             }
             SonioxEvent::Finished => {
                 log::info!("Soniox event receiver: session finished");
@@ -13019,6 +13013,103 @@ mod tests_status {
     }
 
     #[test]
+    fn normal_pipeline_status_omits_transcript_saving_failure() {
+        let status = serde_json::to_value(crate::events::PipelineStatus::default()).unwrap();
+        assert!(status.get("transcript_not_saving").is_none());
+    }
+
+    #[test]
+    fn transcript_live_snapshot_and_scheduled_basis_follow_the_durable_log() {
+        use crate::persistence::canonical_durability::CanonicalFilesystemQualification;
+
+        let session = "session-receipts";
+        let fixture = AcceptingTranscriptEventWriterFixture::new(session);
+        let writer = fixture.writer();
+        let repo = FileMemoryRepository::with_data_root(&fixture.root);
+        let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session)));
+        let schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session)));
+        let partial = projection_asr_payload("orchard path", 1, "quiet pond", false);
+        let final_revision = projection_asr_payload("orchard path", 2, "quiet pond birds", true);
+        let publish = |payload| {
+            record_asr_span_revision_event_and_observe_projection(
+                None,
+                &ledger,
+                &writer,
+                &schedulers,
+                None,
+                payload,
+            )
+        };
+        let replay = || {
+            TranscriptLedger::replay(session, repo.load_transcript_events(session).unwrap())
+                .unwrap()
+        };
+
+        assert!(publish(&partial));
+        assert_eq!(*ledger.lock().unwrap(), replay());
+
+        // Fail inside the real writer after queue admission. A final cannot
+        // publish to the ledger, schedule a snapshot, or disclose its input.
+        let dir = fixture.root.join("transcripts");
+        let (qualification, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&dir).unwrap();
+        let guard = durability
+            .try_lock_exclusive_qualified(&dir, &qualification)
+            .unwrap();
+        let logs = crate::test_log_capture::ThreadLogCapture::start();
+        assert!(!publish(&final_revision));
+        let refusal = crate::test_log_capture::render(&logs.finish());
+        assert!(refusal.contains("Coordination(Contended)"));
+        for canary in ["orchard path", "quiet pond", fixture.root.to_str().unwrap()] {
+            assert!(!refusal.contains(canary));
+        }
+        drop(guard);
+        assert_eq!(ledger.lock().unwrap().accepted_event_count, 1);
+        assert_eq!(*ledger.lock().unwrap(), replay());
+        assert!(schedulers.lock().unwrap().notes().in_flight_job().is_none());
+
+        assert!(publish(&final_revision));
+        let durable = replay();
+        assert_eq!(*ledger.lock().unwrap(), durable);
+        assert_eq!(
+            schedulers
+                .lock()
+                .unwrap()
+                .notes()
+                .in_flight_job()
+                .unwrap()
+                .basis,
+            durable.current_basis(),
+            "the scheduled materialization's basis must exist on disk at acknowledgement"
+        );
+        let display_segments = crate::projections::derive_legacy_transcript_segments(&durable);
+        let misses = Arc::new(AtomicU64::new(0));
+        assert!(!super::persist_display_transcript_segment(
+            &Arc::new(Mutex::new(None)),
+            &misses,
+            &display_segments[0],
+        ));
+        assert_eq!(misses.load(Ordering::SeqCst), 1);
+        let restored = crate::projections::derive_legacy_transcript_segments(&replay());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, display_segments[0].id);
+        assert_eq!(restored[0].text, final_revision.text);
+        assert!(
+            !publish(&final_revision),
+            "an exact retry needs no live delivery"
+        );
+        assert!(
+            !publish(&partial),
+            "an older retry must not regress the live snapshot"
+        );
+        assert_eq!(replay(), durable);
+        assert_eq!(*ledger.lock().unwrap(), durable);
+        let schedulers = schedulers.lock().unwrap();
+        assert_eq!(schedulers.notes().metrics().coalesced_updates, 0);
+        assert_eq!(schedulers.graph().metrics().coalesced_updates, 0);
+    }
+
+    #[test]
     fn asr_partial_revision_queue_full_does_not_advance_ledger() {
         let session_id = "session-asr-queue-full";
         let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
@@ -13117,6 +13208,90 @@ mod tests_status {
         assert_eq!(loaded[0].text, payload.text);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn diarization_observation_without_a_canonical_writer_cannot_publish_a_transcript() {
+        use crate::persistence::canonical_log::TranscriptCommitError;
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("missing-transcript-writer");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let writer = app.transcript_event_writer.lock().unwrap().take().unwrap();
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(5)));
+        let payload = projection_asr_payload("reed", 1, "pond", true);
+        assert_eq!(
+            super::commit_asr_span_revision(
+                &app.transcript_ledger,
+                &app.transcript_event_writer,
+                &payload
+            ),
+            Err(TranscriptCommitError::WriterAbsent)
+        );
+
+        let (tx, processed_rx) = crossbeam_channel::unbounded();
+        tx.send(ProcessedAudioChunk {
+            data: vec![0.25; super::TARGET_FRAMES],
+            num_frames: super::TARGET_FRAMES,
+            ..processed_audio_chunk("reed", 0.25)
+        })
+        .unwrap();
+        drop(tx);
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        super::run_speech_processor_diarization_only(
+            SpeechChannels {
+                processed_rx,
+                is_transcribing: Arc::new(AtomicBool::new(true)),
+            },
+            moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+            SpeechConfig {
+                models_dir: dir.clone(),
+                llm_provider: LlmProvider::default(),
+                llm_allow_cloud_fallbacks: false,
+                provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                    "local_only",
+                ),
+                diarization_mode: crate::settings::DiarizationMode::default(),
+            },
+        );
+        assert!(
+            capture
+                .finish()
+                .iter()
+                .any(|record| record.message == "transcript commit refused: WriterAbsent")
+        );
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            Some(events::TranscriptSavingFailure::WriterAbsent)
+        );
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        let ledger = app.transcript_ledger.lock().unwrap();
+        assert_eq!(ledger.accepted_event_count, 0);
+        assert!(ledger.latest_spans.is_empty());
+        drop(ledger);
+        assert!(
+            load_transcript_events(&app.current_session_id())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.projection_schedulers
+                .lock()
+                .unwrap()
+                .notes()
+                .in_flight_job()
+                .is_none()
+        );
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13461,6 +13636,7 @@ mod tests_status {
             projection_asr_payload("projection-success-span", 1, "Alice met Bob.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -13564,6 +13740,7 @@ mod tests_status {
             projection_asr_payload("projection-basis-currency-span", 1, "Alice met Bob.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -13695,6 +13872,7 @@ mod tests_status {
         );
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -16480,6 +16658,7 @@ mod tests_status {
             projection_asr_payload("projection-failure-span", 1, "No backend works.", true);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -16695,6 +16874,7 @@ mod tests_status {
         let partial = projection_asr_payload("projection-partial-span", 1, "still partial", false);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &app.transcript_ledger,
             &writer,
             &app.projection_schedulers,
@@ -16810,6 +16990,7 @@ mod tests_status {
         };
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16817,6 +16998,7 @@ mod tests_status {
             &first_partial
         ));
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16830,6 +17012,7 @@ mod tests_status {
         }
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16845,6 +17028,7 @@ mod tests_status {
         }
 
         assert!(!record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,
@@ -16866,6 +17050,7 @@ mod tests_status {
         }
 
         assert!(record_asr_span_revision_event_and_observe_projection(
+            None,
             &ledger,
             &writer,
             &schedulers,

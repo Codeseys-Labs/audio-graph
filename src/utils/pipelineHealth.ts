@@ -42,7 +42,9 @@ export function computeCompositeHealth({
   persistenceQueueBackpressure,
   backpressuredSourceCount,
 }: CompositeHealthInput): CompositeHealth {
-  const stages = Object.values(pipelineStatus);
+  const { transcript_not_saving, ...stageStatuses } = pipelineStatus;
+  if (transcript_not_saving) return "error";
+  const stages = Object.values(stageStatuses);
   if (stages.some((stage) => stage.type === "Error")) return "error";
 
   const persistenceDropped = Object.values(persistenceQueueBackpressure).reduce(

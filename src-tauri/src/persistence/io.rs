@@ -128,6 +128,23 @@ pub(crate) fn handle_write_error(
     }
 }
 
+/// The transcript protocol cannot infer lost bytes from an uncertain write.
+pub(super) fn notify_transcript_storage_full(app: Option<&tauri::AppHandle>) {
+    if !STORAGE_FULL_ACTIVE.swap(true, Ordering::SeqCst)
+        && let Some(app) = app
+    {
+        events::emit_or_log(
+            app,
+            events::CAPTURE_STORAGE_FULL,
+            CaptureStorageFullPayload {
+                path: String::new(),
+                bytes_written: 0,
+                bytes_lost: 0,
+            },
+        );
+    }
+}
+
 /// Probe whether writes to `dir` are currently succeeding.
 ///
 /// Used by the retry-storage-write command: after the user clicks Resume in

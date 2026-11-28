@@ -114,6 +114,61 @@ impl CanonicalFilesystemQualification {
         Ok((qualification, durability))
     }
 
+    /// Publish the transcript directory under the provisioned data root. An
+    /// earlier boot or another repository adapter may already have created it.
+    /// Repeat the parent barrier in either case before using it for receipts.
+    pub(crate) fn provision_child_directory(
+        &self,
+        child: &Path,
+        recovery_key: CanonicalRecoveryKey,
+    ) -> CanonicalDurabilityOutcome {
+        let platform = current_platform();
+        let parent = match self.namespace.bind_parent(child, platform) {
+            Ok(parent) => parent,
+            Err(error) => return CanonicalDurabilityOutcome::Rejected(error),
+        };
+        if !parent.barrier.is_available() {
+            return CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform,
+                    operation: CanonicalNamespaceOperation::FirstCreate,
+                },
+            );
+        }
+        match std::fs::create_dir(child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return CanonicalDurabilityOutcome::Rejected(durability_io(
+                    CanonicalDurabilityStage::CreateNew,
+                    &error,
+                ));
+            }
+        }
+        match std::fs::symlink_metadata(child) {
+            Ok(meta) if meta.is_dir() && !crate::sessions::is_reparse_point(&meta) => {}
+            Ok(_) => {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::NonRegularCanonicalEntry,
+                );
+            }
+            Err(error) => {
+                return indeterminate(CanonicalDurabilityStage::InspectEntry, &error, recovery_key);
+            }
+        }
+        if let Err(error) = parent.barrier.sync_all() {
+            return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
+        }
+        CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+            mutation: CanonicalMutation::EnsureDirectory,
+            barrier: if platform == CanonicalPlatform::Windows {
+                CanonicalDurabilityBarrier::WindowsNtfsParentFlush
+            } else {
+                CanonicalDurabilityBarrier::ParentNamespace
+            },
+        })
+    }
+
     /// Bind real directory identity (Unix device/inode or Windows volume/file ID).
     /// Test evidence skips the live production filesystem capability probe.
     #[cfg(test)]
@@ -368,6 +423,7 @@ pub enum CanonicalNamespaceOperation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalMutation {
+    EnsureDirectory,
     ExistingAppend,
     FirstCreate,
     ImmutableExactCreate,
@@ -388,7 +444,7 @@ pub enum CanonicalDurabilityBarrier {
     ParentNamespace,
     /// The file was flushed, its name verified, and the held NTFS parent flushed.
     FileAndWindowsNtfsParentFlush,
-    /// The name was absent under the cooperative lock and the NTFS parent was flushed.
+    /// The held NTFS parent was flushed and its directory identity rechecked.
     WindowsNtfsParentFlush,
 }
 
@@ -3355,6 +3411,56 @@ fn open_writer_coordination(path: &Path) -> Result<File, CanonicalCoordinationEr
         }
         Err(error) => Err(coordination_io(CanonicalCoordinationStage::Open, &error)),
     }
+}
+
+/// Hold cooperative ownership during cleanup without minting a mutation receipt.
+/// A restored protocol session can have evidence but no directory lock. Recreate
+/// that lock before deletion when the filesystem could admit a new writer.
+pub(super) fn lock_transcript_removal(
+    root: &Path,
+    lease_path: &Path,
+    has_recovery_artifacts: impl Fn() -> io::Result<bool>,
+) -> Result<[Option<File>; 2], CanonicalCoordinationError> {
+    fn lock_existing(path: &Path) -> Result<Option<File>, CanonicalCoordinationError> {
+        match ensure_regular_lock_entry(path) {
+            Ok(()) => {
+                let file = open_plain_existing(path, OpenOptions::new().read(true))
+                    .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
+                try_lock_exclusive(file).map(Some)
+            }
+            Err(CanonicalCoordinationError::Missing) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    let lock_path = root.join(COORDINATION_FILE_NAME);
+    let mut directory = lock_existing(&lock_path)?;
+    if directory.is_none() {
+        use CanonicalFilesystemQualificationError as Refusal;
+        let permanently_unqualified = matches!(
+            CanonicalFilesystemQualification::for_existing_managed_root(root),
+            Err(Refusal::NamespaceDurabilityUnsupported { .. }
+                | Refusal::FilesystemUnsupported { .. }
+                | Refusal::ReadOnlyFilesystem { .. }
+                | Refusal::RemovableFilesystem { .. })
+        );
+        if !permanently_unqualified {
+            // Serialize even the first writer on a writable volume. An older
+            // ACL may allow deletion but deny adding a lock; this is safe for
+            // legacy-only contents because the writer also cannot create one.
+            match open_writer_coordination(&lock_path) {
+                Ok(file) => directory = Some(try_lock_exclusive(file)?),
+                Err(CanonicalCoordinationError::Io {
+                    kind: io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem,
+                    ..
+                }) if !has_recovery_artifacts().map_err(|error| {
+                    coordination_io(CanonicalCoordinationStage::InspectLock, &error)
+                })? => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let lease = lock_existing(lease_path)?;
+    Ok([directory, lease])
 }
 
 impl CanonicalSharedGuard {

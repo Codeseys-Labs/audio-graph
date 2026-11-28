@@ -1437,6 +1437,11 @@
     "stageCapture": "Capture",
     "stageResample": "Resample",
     "stageAsr": "ASR",
+    "transcriptNotSaving": {
+      "writer_absent": "Transcript is not being saved",
+      "storage_full": "Transcript is not being saved because storage is full",
+      "write_failed": "Transcript is not being saved because the write failed"
+    },
     "stageDiarization": "Diarization",
     "stageExtraction": "Extraction",
     "stageGraph": "Graph",

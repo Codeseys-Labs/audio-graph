@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
@@ -85,6 +85,54 @@ function resetStore(
 describe("PipelineStatusBar", () => {
   beforeEach(() => {
     resetStore();
+  });
+
+  it.each([
+    ["en", "writer_absent", "Transcript is not being saved"],
+    ["pt", "writer_absent", "A transcrição não está sendo salva"],
+    [
+      "en",
+      "storage_full",
+      "Transcript is not being saved because storage is full",
+    ],
+    [
+      "pt",
+      "storage_full",
+      "A transcrição não está sendo salva porque o armazenamento está cheio",
+    ],
+    [
+      "en",
+      "write_failed",
+      "Transcript is not being saved because the write failed",
+    ],
+    [
+      "pt",
+      "write_failed",
+      "A transcrição não está sendo salva porque houve uma falha na gravação",
+    ],
+  ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      const publish = (status: PipelineStatus) =>
+        act(() => useAudioGraphStore.getState().setPipelineStatus(status));
+      publish({ ...allIdle(), transcript_not_saving: reason });
+      const bar = screen.getByRole("status");
+      expect(bar).toHaveAttribute("aria-live", "polite");
+      const warning = within(bar).getByText(sentence);
+      expect(warning.querySelector("svg")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      publish({ ...allIdle(), transcript_not_saving: reason });
+      expect(within(bar).getByText(sentence)).toBe(warning);
+      publish(allIdle());
+      expect(within(bar).queryByText(sentence)).toBeNull();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
   });
 
   it("renders the status landmark with an accessible name", () => {

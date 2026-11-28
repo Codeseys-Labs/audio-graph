@@ -658,7 +658,7 @@ export type StageStatus =
         | "asset_invalid";
     };
 
-export interface PipelineStatus {
+interface PipelineStages {
   capture: StageStatus;
   pipeline: StageStatus;
   asr: StageStatus;
@@ -667,13 +667,17 @@ export interface PipelineStatus {
   graph: StageStatus;
 }
 
+export interface PipelineStatus extends PipelineStages {
+  transcript_not_saving?: "writer_absent" | "storage_full" | "write_failed";
+}
+
 /**
  * Per-stage latency sample emitted by the Rust backend. Keys match
- * `PipelineStatus` where possible; future stages such as `agent` can be
+ * `PipelineStages` where possible; future stages such as `agent` can be
  * added without changing the status enum.
  */
 export interface PipelineLatencyEvent {
-  stage: keyof PipelineStatus | "agent" | "turn_detection";
+  stage: keyof PipelineStages | "agent" | "turn_detection";
   source_id?: string | null;
   segment_id?: string | null;
   latency_ms: number;

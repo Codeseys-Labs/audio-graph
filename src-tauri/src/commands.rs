@@ -10482,13 +10482,16 @@ fn load_session_graph_artifact_for_admitted_session(
 }
 
 /// A portable export extends the legacy core wire shape only when the
-/// admitted session has control-plane evidence or residue to report.
+/// admitted session has control-plane or transcript recovery evidence to report.
 #[derive(Debug, serde::Serialize)]
 pub struct SessionExportWithControlPlane {
     #[serde(flatten)]
     core: SessionExportBundle,
     #[serde(skip_serializing_if = "Option::is_none")]
     control_plane: Option<crate::persistence::session_semantics::SessionControlPlaneExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_recovery:
+        Option<crate::persistence::canonical_log::transcript_export::TranscriptRecoveryExport>,
 }
 
 impl std::ops::Deref for SessionExportWithControlPlane {
@@ -10500,6 +10503,7 @@ impl std::ops::Deref for SessionExportWithControlPlane {
 }
 
 const CONTROL_PLANE_EXPORT_SCHEMA_VERSION: u32 = 2;
+const TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION: u32 = 3;
 
 /// Assemble the portable session bundle, including available control evidence.
 /// Usage, scheduler, live-assist audit, and data-movement records remain outside
@@ -10561,7 +10565,12 @@ fn session_export_for_admitted_session(
     let (_transcript_path, graph_path) =
         crate::sessions::resolve_indexed_session_paths(data_root, session_id, metadata.as_ref())?;
     let repository = FileMemoryRepository::user_data();
-    let transcript_snapshot = read_admitted_session_transcript_snapshot(&repository, session_id)?;
+    let (transcript_snapshot, transcript_recovery) =
+        crate::persistence::canonical_log::transcript_export::read_for_export(
+            &crate::user_data::resolve_transcript_events_path(session_id)?,
+            MAX_TRANSCRIPT_EVENTS_BYTES,
+            || read_admitted_session_transcript_snapshot(&repository, session_id),
+        )?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
@@ -10607,7 +10616,9 @@ fn session_export_for_admitted_session(
 
     let bundle = SessionExportWithControlPlane {
         core: SessionExportBundle {
-            schema_version: if control_plane.is_some() {
+            schema_version: if transcript_recovery.is_some() {
+                TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION
+            } else if control_plane.is_some() {
                 CONTROL_PLANE_EXPORT_SCHEMA_VERSION
             } else {
                 SESSION_EXPORT_SCHEMA_VERSION
@@ -10623,7 +10634,12 @@ fn session_export_for_admitted_session(
             graph,
         },
         control_plane,
+        transcript_recovery,
     };
+    if bundle.transcript_recovery.is_some() {
+        log::info!("session_export_bundle transcript_recovery_evidence_included");
+        return Ok(bundle);
+    }
     let response_bytes = response_len_for_log(&bundle);
     let elapsed_ms = read_start.elapsed().as_millis();
     let log_line = format!(
@@ -15642,7 +15658,8 @@ mod tests {
         guard
             .as_ref()
             .expect("transcript event writer")
-            .append(event);
+            .append(event)
+            .expect("durable transcript event");
     }
 
     fn append_projection_patch(state: &AppState, patch: &crate::projections::ProjectionPatch) {
@@ -17642,6 +17659,78 @@ mod tests {
         assert!(json.contains("\"diarization_events\""));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_transcript_recovery_carries_evidence_and_keeps_it_out_of_replay() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("transcript-recovery-export");
+        let _home = HomeGuard::set(&root);
+        let session = "orchard";
+        let source = crate::user_data::transcript_events_path(session).unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let interrupted = uuid::Uuid::new_v4().to_string();
+        let descriptor = serde_json::to_vec(&serde_json::json!({
+            "attempt": attempt, "owner": uuid::Uuid::new_v4().to_string(), "after": null,
+            "base_len": 0, "source_was_absent": false, "frame_len": 10, "frame_hash": "a".repeat(64)
+        }))
+        .unwrap();
+        let gap = br#"{"stream":"transcript_revisions","after":null,"suffix_quarantined":true}"#;
+        std::fs::write(&source, b"tor").unwrap();
+        std::fs::write(source.with_added_extension("attempt"), &descriptor).unwrap();
+        std::fs::write(
+            source.with_added_extension(format!("{interrupted}.gap")),
+            gap,
+        )
+        .unwrap();
+        std::fs::write(
+            source.with_added_extension(format!("{interrupted}.quarantine")),
+            b"apple plum",
+        )
+        .unwrap();
+        std::fs::write(source.with_added_extension("attempt-lock"), b"").unwrap();
+        std::fs::write(source.with_added_extension("attempt-stage"), b"stage").unwrap();
+
+        let capture = ThreadLogCapture::start();
+        let bundle = session_export_bundle(session).unwrap();
+        let logs = render(&capture.finish());
+        assert!(logs.contains("transcript_recovery_evidence_included"));
+        assert!(!logs.contains("apple plum") && !logs.contains("response_bytes="));
+        assert_eq!(
+            bundle.schema_version,
+            TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION
+        );
+        assert!(bundle.transcript_events.is_empty() && bundle.transcript.is_empty());
+        let json = serde_json::to_value(bundle).unwrap();
+        let recovery = &json["transcript_recovery"];
+        assert_eq!(
+            recovery["gaps"],
+            serde_json::json!([serde_json::from_slice::<serde_json::Value>(gap).unwrap()])
+        );
+        let evidence = recovery["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 3);
+        for (kind, bytes, id) in [
+            ("attempt", descriptor.as_slice(), None),
+            ("gap", &gap[..], Some(interrupted.as_str())),
+            ("quarantine", &b"apple plum"[..], Some(interrupted.as_str())),
+        ] {
+            let row = evidence.iter().find(|row| row["kind"] == kind).unwrap();
+            assert_eq!(
+                row.get("attempt_id").and_then(serde_json::Value::as_str),
+                id
+            );
+            assert_eq!(row["data_base64"], STANDARD.encode(bytes));
+        }
+        assert!(
+            source.with_added_extension("attempt").exists(),
+            "export is read-only"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

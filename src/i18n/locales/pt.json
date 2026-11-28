@@ -1437,6 +1437,11 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptNotSaving": {
+      "writer_absent": "A transcrição não está sendo salva",
+      "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
+      "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"
+    },
     "stageDiarization": "Diarização",
     "stageExtraction": "Extração",
     "stageGraph": "Grafo",

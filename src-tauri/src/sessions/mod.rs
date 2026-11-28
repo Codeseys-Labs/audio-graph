@@ -405,8 +405,13 @@ pub fn purge_expired_sessions_excluding(
             residual_failures.push(format!("session {session_id}: {error}"));
             continue;
         }
-        let paths = session_artifact_paths(entry);
-        let report = remove_artifact_paths(session_id, &paths);
+        let report = match remove_session_artifacts(session_id, Some(entry)) {
+            Ok(report) => report,
+            Err(error) => {
+                residual_failures.push(format!("session {session_id}: {error}"));
+                continue;
+            }
+        };
         if !report.failed_files.is_empty() {
             residual_failures.extend(report.failed_files);
             continue;
@@ -572,69 +577,29 @@ fn is_managed_artifact_path(path: &Path) -> bool {
     true
 }
 
-/// Default artifact paths owned by a session in the current storage layout.
+/// Best-effort inventory for callers displaying managed paths.
 pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if validate_session_id(session_id).is_err() {
-        return paths;
-    }
-    if let Ok(path) = crate::user_data::transcript_path(session_id) {
-        push_artifact_path(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::transcript_events_path(session_id) {
-        push_artifact_path(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::diarization_events_path(session_id) {
-        paths
-            .extend(crate::persistence::speaker_log::legacy_quarantines(&path).unwrap_or_default());
-        push_artifact_path(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::projection_events_path(session_id) {
-        push_artifact_path(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::notes_path(session_id) {
-        push_atomic_json_artifact(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::graph_path(session_id) {
-        push_atomic_json_artifact(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::materialized_graph_path(session_id) {
-        push_atomic_json_artifact(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::data_movement_ledger_path(session_id) {
-        push_artifact_path(&mut paths, path);
-    }
-    if let Ok(path) = crate::user_data::scheduler_queue_path(session_id) {
-        push_atomic_json_artifact(&mut paths, path);
-    }
-    if let Ok(path) = usage::usage_path(session_id) {
-        push_atomic_json_artifact(&mut paths, path);
-    }
-    if let Ok(root) = crate::user_data::data_root() {
-        let live_assist_dir = root.join("live_assist");
-        push_artifact_path(
-            &mut paths,
-            live_assist_dir.join(format!("{session_id}.jsonl")),
-        );
-        push_atomic_json_artifact(
-            &mut paths,
-            live_assist_dir.join(format!("{session_id}.current.json")),
-        );
-    }
+    checked_default_session_artifact_paths(session_id).unwrap_or_default()
+}
+
+/// All known managed and indexed paths for this session.
+pub fn session_artifact_paths(entry: &SessionMetadata) -> Vec<PathBuf> {
+    let mut paths = default_session_artifact_paths(&entry.id);
+    push_indexed_paths(&mut paths, entry);
     paths
 }
 
-/// All known durable files for a session, including legacy index paths and
-/// current event/materialized projection artifacts.
-pub fn session_artifact_paths(entry: &SessionMetadata) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+fn push_indexed_paths(paths: &mut Vec<PathBuf>, entry: &SessionMetadata) {
     let (transcript, graph) = session_file_paths(entry);
-    push_artifact_path(&mut paths, transcript);
-    push_atomic_json_artifact(&mut paths, graph);
-    for path in default_session_artifact_paths(&entry.id) {
-        push_artifact_path(&mut paths, path);
-    }
-    paths
+    push_artifact_path(paths, transcript);
+    push_atomic_json_artifact(paths, graph);
+}
+
+/// Destructive operations require a complete inventory.
+fn checked_default_session_artifact_paths(session_id: &str) -> Result<Vec<PathBuf>, String> {
+    let root = crate::user_data::resolve_data_root()?;
+    let (transcript, graph) = resolve_indexed_session_paths(&root, session_id, None)?;
+    owned_session_artifact_paths(&root, session_id, transcript, graph)
 }
 
 /// Resolve the complete current artifact inventory for a nominal read without
@@ -645,15 +610,26 @@ pub(crate) fn session_artifact_paths_for_id_resolve_only(
     let root = crate::user_data::resolve_data_root()?;
     let entry = find_session_resolve_only(session_id);
     let (transcript, graph) = resolve_indexed_session_paths(&root, session_id, entry.as_ref())?;
-    let mut paths = Vec::new();
+    owned_session_artifact_paths(&root, session_id, transcript, graph)
+}
 
+fn owned_session_artifact_paths(
+    root: &Path,
+    session_id: &str,
+    transcript: PathBuf,
+    graph: PathBuf,
+) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
     push_artifact_path(&mut paths, transcript);
     push_atomic_json_artifact(&mut paths, graph);
-    push_artifact_path(
-        &mut paths,
-        root.join("transcripts")
-            .join(format!("{session_id}.events.jsonl")),
+    let events = root
+        .join("transcripts")
+        .join(format!("{session_id}.events.jsonl"));
+    paths.extend(
+        crate::persistence::canonical_log::transcript_recovery_artifacts(&events)
+            .map_err(|error| format!("transcript recovery inventory: {:?}", error.kind()))?,
     );
+    push_artifact_path(&mut paths, events);
     paths.extend(crate::persistence::speaker_log::legacy_quarantines(
         &root
             .join("transcripts")
@@ -715,23 +691,27 @@ pub struct SessionArtifactRemovalReport {
     pub failed_files: Vec<String>,
 }
 
-fn remove_artifact_paths(
+fn remove_session_artifacts(
     session_id: &str,
-    artifact_paths: &[PathBuf],
-) -> SessionArtifactRemovalReport {
-    // Deletion authority is narrower than "somewhere under the app root".
-    // A corrupt/tampered index row for session A must never be able to name
-    // session B's transcript (or sessions.json itself) as an owned artifact.
-    let allowed_paths = default_session_artifact_paths(session_id)
-        .into_iter()
-        .collect::<HashSet<_>>();
+    entry: Option<&SessionMetadata>,
+) -> Result<SessionArtifactRemovalReport, String> {
+    // Discover every owned path before the first unlink. A failed directory
+    // scan leaves the index and all contents available for another attempt.
+    let _locks = crate::persistence::lock_transcript_for_removal(
+        &crate::user_data::resolve_transcript_events_path(session_id)?,
+    )?;
+    let mut artifact_paths = checked_default_session_artifact_paths(session_id)?;
+    let allowed_paths: HashSet<_> = artifact_paths.iter().cloned().collect();
+    if let Some(entry) = entry {
+        push_indexed_paths(&mut artifact_paths, entry);
+    }
     let mut report = SessionArtifactRemovalReport {
         session_id: session_id.to_string(),
         deleted_files: Vec::new(),
         missing_files: Vec::new(),
         failed_files: Vec::new(),
     };
-    for path in artifact_paths {
+    for path in &artifact_paths {
         if !allowed_paths.contains(path) || !is_managed_artifact_path(path) {
             report.failed_files.push(format!(
                 "{}: unmanaged or cross-session artifact path rejected",
@@ -749,7 +729,7 @@ fn remove_artifact_paths(
                 .push(format!("{}: {error}", path.display())),
         }
     }
-    report
+    Ok(report)
 }
 
 /// Retire one Session's three OWNED control-plane entries, returning the
@@ -758,7 +738,7 @@ fn remove_artifact_paths(
 /// ADR-0044 §3 makes per-Session control lifecycle a separate authority from the
 /// manifest's managed artifact inventory, which is why these three identities are
 /// deliberately NOT members of [`default_session_artifact_paths`] and not
-/// members of [`remove_artifact_paths`]'s allow-list. The store-owned
+/// members of [`remove_session_artifacts`]'s allow-list. The store-owned
 /// `.audio-graph-canonical.lock` is unrepresentable in the type the retirement
 /// derives, and another Session's entries are unreachable from this Session's
 /// validated address.
@@ -816,12 +796,10 @@ pub fn permanently_delete_session(
             "session deletion refused for {session_id}; no files unlinked and the index entry was preserved for retry: {error}"
         )
     })?;
-    let artifact_paths = index
-        .iter()
-        .find(|entry| entry.id == session_id)
-        .map(session_artifact_paths)
-        .unwrap_or_else(|| default_session_artifact_paths(session_id));
-    let report = remove_artifact_paths(session_id, &artifact_paths);
+    let report = remove_session_artifacts(
+        session_id,
+        index.iter().find(|entry| entry.id == session_id),
+    )?;
     // Content inventory first, then the Session-owned control plane, then the
     // index entry. Control retirement is attempted only once every content
     // unlink succeeded, so a content residual can never leave this Session's
@@ -2072,6 +2050,140 @@ mod tests {
         assert_eq!(actual.len(), 18, "artifact paths must be unique");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_recovery_inventory_is_session_scoped_and_removed_before_the_index() {
+        use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("transcript-recovery-inventory");
+        let _home = HomeGuard::set(&dir);
+        let session = "orchard";
+        save_index(&[make_meta(session)]).unwrap();
+        let events = crate::user_data::transcript_events_path(session).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let gap = events.with_added_extension(format!("{id}.gap"));
+        let quarantine = events.with_added_extension(format!("{id}.quarantine"));
+        let owned = [
+            events.with_added_extension("attempt"),
+            events.with_added_extension("attempt-lock"),
+            events.with_added_extension("attempt-stage"),
+            gap,
+            quarantine,
+        ];
+        let other = crate::user_data::transcript_events_path("pear")
+            .unwrap()
+            .with_added_extension(format!("{id}.gap"));
+        let unrelated = events.with_added_extension("not-an-attempt.gap");
+        for path in owned.iter().chain([&other, &unrelated]) {
+            write_artifact(path, b"evidence");
+        }
+
+        for repo in [
+            FileMemoryRepository::user_data(),
+            FileMemoryRepository::with_data_root(&dir),
+        ] {
+            let files = repo.session_artifact_paths(session).unwrap();
+            assert!(owned.iter().all(|file| files.contains(file)));
+            assert!(!files.contains(&other));
+            assert!(!files.contains(&unrelated));
+        }
+        let report = permanently_delete_session(session).unwrap();
+        assert!(
+            owned
+                .iter()
+                .all(|path| report.deleted_files.contains(path) && !path.exists())
+        );
+        assert!(other.exists() && unrelated.exists());
+        assert!(find_session(session).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn busy_transcript_cleanup_preserves_index_and_evidence_until_owner_releases() {
+        use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("transcript-cleanup-contention");
+        let _home = HomeGuard::set(&root);
+        for directory_busy in [true, false] {
+            let session = "orchard";
+            let mut metadata = make_meta(session);
+            metadata.deleted = true;
+            metadata.deleted_at = Some(0);
+            save_index(&[metadata]).unwrap();
+
+            let source = crate::user_data::transcript_events_path(session).unwrap();
+            let directory_lock = source.parent().unwrap().join(".audio-graph-canonical.lock");
+            let lease = source.with_added_extension("attempt-lock");
+            let evidence =
+                source.with_added_extension(format!("{}.quarantine", uuid::Uuid::new_v4()));
+            write_artifact(&source, b"source");
+            write_artifact(&lease, b"");
+            write_artifact(&directory_lock, b"");
+            write_artifact(&evidence, b"evidence");
+            let owner = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(if directory_busy {
+                    &directory_lock
+                } else {
+                    &lease
+                })
+                .unwrap();
+            owner.try_lock().unwrap();
+
+            let expected = "Transcript cleanup unavailable: Contended";
+            assert_eq!(permanently_delete_session(session).unwrap_err(), expected);
+            assert!(purge_expired_sessions().unwrap_err().contains(expected));
+            for repo in [
+                FileMemoryRepository::user_data(),
+                FileMemoryRepository::with_data_root(&root),
+            ] {
+                assert_eq!(
+                    repo.delete_session_artifacts(session).unwrap_err(),
+                    expected
+                );
+            }
+            assert!(find_session(session).is_some());
+            assert_eq!(fs::read(&source).unwrap(), b"source");
+            assert_eq!(fs::read(&evidence).unwrap(), b"evidence");
+            assert!(lease.exists());
+
+            drop(owner);
+            if directory_busy {
+                let report = FileMemoryRepository::with_data_root(&root)
+                    .delete_session_artifacts(session)
+                    .unwrap();
+                assert!(report.deleted_files.contains(&evidence) && !report.has_failures());
+            }
+            permanently_delete_session(session).unwrap();
+            assert!(!source.exists() && !lease.exists() && !evidence.exists());
+            assert!(find_session(session).is_none());
+            assert!(
+                directory_lock.exists(),
+                "cleanup keeps the shared directory lock"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_inventory_obstruction_preserves_session_and_other_artifacts() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("transcript-inventory-obstruction");
+        let _home = HomeGuard::set(&dir);
+        let session = "orchard";
+        save_index(&[make_meta(session)]).unwrap();
+        write_artifact(&dir.join("transcripts"), b"obstructed");
+        let notes = crate::user_data::notes_path(session).unwrap();
+        write_artifact(&notes, b"retained");
+
+        assert!(permanently_delete_session(session).is_err());
+        assert_eq!(fs::read(notes).unwrap(), b"retained");
+        assert!(find_session(session).is_some());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

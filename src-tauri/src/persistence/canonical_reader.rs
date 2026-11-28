@@ -89,6 +89,7 @@ impl<T> StrictCanonicalRead<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CanonicalReaderError {
     Canonical(CanonicalLogError),
+    TranscriptAttemptUnreadable,
     DataMovementSessionMismatch { record_index: usize },
     DataMovementSchemaVersionMismatch { record_index: usize },
 }
@@ -97,6 +98,9 @@ impl fmt::Display for CanonicalReaderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Canonical(error) => error.fmt(formatter),
+            Self::TranscriptAttemptUnreadable => {
+                formatter.write_str("transcript attempt requires verified recovery")
+            }
             Self::DataMovementSessionMismatch { record_index } => write!(
                 formatter,
                 "canonical data-movement record {record_index} has the wrong session"
@@ -122,19 +126,25 @@ fn load_strict_canonical_stream<T: DeserializeOwned>(
     session_id: &str,
     descriptor: CanonicalStreamDescriptor,
 ) -> Result<StrictCanonicalRead<T>, CanonicalReaderError> {
-    match load_canonical_stream(
-        path,
-        session_id,
-        descriptor.stream_id,
-        descriptor.domain_schema_version,
-        CanonicalTailRecovery::Strict,
-    ) {
+    let result = if descriptor == TRANSCRIPT_REVISIONS {
+        super::canonical_log::read_committed(path, session_id)
+    } else {
+        load_canonical_stream(
+            path,
+            session_id,
+            descriptor.stream_id,
+            descriptor.domain_schema_version,
+            CanonicalTailRecovery::Strict,
+        )
+        .map_err(CanonicalReaderError::from)
+    };
+    match result {
         Ok(snapshot) => Ok(StrictCanonicalRead::Present(snapshot)),
-        Err(CanonicalLogError::Io {
+        Err(CanonicalReaderError::Canonical(CanonicalLogError::Io {
             operation: CanonicalIoOperation::Read,
             kind: io::ErrorKind::NotFound,
-        }) => Ok(StrictCanonicalRead::Missing),
-        Err(error) => Err(error.into()),
+        })) => Ok(StrictCanonicalRead::Missing),
+        Err(error) => Err(error),
     }
 }
 

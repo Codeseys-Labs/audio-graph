@@ -134,7 +134,7 @@ pub struct AppState {
     /// session's writer) is not detected here at all.
     pub display_transcript_write_misses: Arc<AtomicU64>,
 
-    /// Async transcript event writer (appends immutable span revisions to JSONL).
+    /// Writes framed span revisions and returns a receipt after synchronization.
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
     /// Canonical transcript span ledger for projection-basis checks.
@@ -860,6 +860,12 @@ impl AppState {
         // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
+        let pipeline_status = PipelineStatus {
+            transcript_not_saving: transcript_event_writer
+                .is_none()
+                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent),
+            ..Default::default()
+        };
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
         let speaker_timeline = SpeakerTimeline::new(session_id.clone());
@@ -914,7 +920,7 @@ impl AppState {
             projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
-            pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
+            pipeline_status: Arc::new(RwLock::new(pipeline_status)),
             is_capturing: Arc::new(RwLock::new(false)),
             is_transcribing,
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),

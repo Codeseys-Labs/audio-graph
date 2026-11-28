@@ -231,9 +231,20 @@ pub enum StageStatus {
     },
 }
 
+/// Reason the canonical transcript writer could not acknowledge the current revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptSavingFailure {
+    WriterAbsent,
+    StorageFull,
+    WriteFailed,
+}
+
 /// Overall pipeline status, combining all stages.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_not_saving: Option<TranscriptSavingFailure>,
     pub capture: StageStatus,
     pub pipeline: StageStatus,
     pub asr: StageStatus,
