@@ -8,6 +8,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::{ChatMessage, ChatOutcome};
@@ -22,6 +24,7 @@ use crate::projection_llm::{
 use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
 
+use super::http_diag::SchemaRejection;
 use super::route::{
     AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
     ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
@@ -59,30 +62,6 @@ fn note_openrouter_schema_unsupported(model: &str) {
     if let Ok(mut set) = OPENROUTER_SCHEMA_UNSUPPORTED.lock() {
         set.insert(model.to_string());
     }
-}
-
-/// Whether a provider error means the structured-outputs request should **retry
-/// without the schema** — a 400/404/422-class rejection, as opposed to a
-/// transient failure or an auth error (which must NOT trigger the schema-less
-/// retry: a schema-less call would just fail the same way on auth, and transient
-/// errors are already retried in-client). Both blocking error strings carry
-/// `status=<code>` (`openrouter_http_error_message` / `api_error_message`).
-///
-/// The retry it authorizes is a MODE downgrade on the SAME authorized route —
-/// json_schema to json_object — never a provider substitution (ADR-0038).
-fn is_schema_rejection(err: &str) -> bool {
-    err.contains("status=400") || err.contains("status=404") || err.contains("status=422")
-}
-
-/// Whether a schema rejection is **model-level** evidence worth caching (vs. a
-/// single-provider validation quirk). With `require_parameters=true` on the
-/// request, a 404-class response means "no endpoint for this model supports the
-/// requested params" — that applies to the whole model slug, so it is
-/// cache-worthy. A 400/422 came from a provider that WAS routed to (it advertised
-/// support) and is schema-specific, not model-level, so it is not cached (seed
-/// audio-graph-a324, Codex P2).
-fn is_openrouter_schema_unsupported_by_model(err: &str) -> bool {
-    err.contains("status=404")
 }
 
 // ---------------------------------------------------------------------------
@@ -129,18 +108,12 @@ pub fn extraction_in_cooldown() -> bool {
     now_ms() < EXTRACTION_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed)
 }
 
-fn is_rate_limited(err: &str) -> bool {
-    err.contains("429")
-        || err.contains("Too Many Requests")
-        || err.to_ascii_lowercase().contains("rate limit")
-}
-
-/// If `err` looks like a rate-limit, start/extend the extraction cooldown.
-fn note_extraction_error(err: &str) {
-    if is_rate_limited(err) {
+/// Back off background work only on typed provider rate-limit evidence.
+fn note_extraction_error(diagnostic: &RuntimeDiagnostic) {
+    if matches!(diagnostic, RuntimeDiagnostic::Runtime(error) if error.code == Code::RateLimited) {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(now_ms() + EXTRACTION_COOLDOWN_MS, Ordering::Relaxed);
         log::warn!(
-            "Extraction rate-limited (429) — pausing background extraction for {}s to preserve \
+            "Extraction rate-limited — pausing background extraction for {}s to preserve \
              quota for chat. Consider a non-`:free` OpenRouter model or adding credits.",
             EXTRACTION_COOLDOWN_MS / 1000
         );
@@ -1080,7 +1053,7 @@ fn projection_api(
         Some(form) => match client.chat_completion_with_wire_outcome(prompt_tuples(messages), form)
         {
             Ok(result) => result,
-            Err(error) if is_schema_rejection(&error) => {
+            Err(error) if error.schema_rejection.is_some() => {
                 // A MODE downgrade on the SAME route, recorded rather than only
                 // logged: the returned `WireOutcome` carries `Unconstrained`.
                 log::warn!(
@@ -1093,7 +1066,7 @@ fn projection_api(
                     RequestOutputForm::JsonObject,
                 )?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         },
         None => client.chat_completion_with_wire_outcome(
             prompt_tuples(messages),
@@ -1160,11 +1133,8 @@ fn projection_openrouter(
             name: "projection_patch".to_string(),
             schema: projection_patch_strict_json_schema(&cache.kind),
         };
-        match client.chat_completion_with_wire_outcome(
-            prompt_tuples(messages),
-            &form,
-            Some(hint.clone()),
-        ) {
+        match client.chat_completion_diagnostic(prompt_tuples(messages), &form, Some(hint.clone()))
+        {
             Ok((raw_json, tokens_used, wire)) => {
                 return Ok(projection_output_from_wire(
                     route,
@@ -1175,8 +1145,8 @@ fn projection_openrouter(
                     wire,
                 ));
             }
-            Err(e) if is_schema_rejection(&e) => {
-                if is_openrouter_schema_unsupported_by_model(&e) {
+            Err(e) if e.schema_rejection.is_some() => {
+                if e.schema_rejection == Some(SchemaRejection::Model) {
                     log::warn!(
                         "OpenRouter structured projection output: no schema-capable provider for \
                          model (caching + falling back to JSON mode for the session): {e}"
@@ -1191,11 +1161,11 @@ fn projection_openrouter(
                 }
                 // fall through to JSON mode below, on the SAME route
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
-    let (raw_json, tokens_used, wire) = client.chat_completion_with_wire_outcome(
+    let (raw_json, tokens_used, wire) = client.chat_completion_diagnostic(
         prompt_tuples(messages),
         &RequestOutputForm::JsonObject,
         Some(hint),
@@ -1365,11 +1335,11 @@ fn extract_api(
         log::warn!("LLM extraction route refused: {error}");
         return None;
     }
-    match client.extract_entities(text, speaker, context) {
+    match client.extract_entities_diagnostic(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("API extraction failed: {}", e);
-            note_extraction_error(&e);
+            note_extraction_error(&e.diagnostic);
             None
         }
     }
@@ -1394,11 +1364,11 @@ fn extract_openrouter(
         log::warn!("LLM extraction route refused: {error}");
         return None;
     }
-    match client.extract_entities(text, speaker, context) {
+    match client.extract_entities_diagnostic(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("OpenRouter extraction failed: {}", e);
-            note_extraction_error(&e);
+            note_extraction_error(&e.diagnostic);
             None
         }
     }
@@ -1548,26 +1518,6 @@ mod tests {
         }
     }
 
-    // ----- is_rate_limited --------------------------------------------------
-
-    #[test]
-    fn is_rate_limited_matches_known_signals() {
-        assert!(is_rate_limited("API error 429 from endpoint"));
-        assert!(is_rate_limited("Too Many Requests"));
-        assert!(is_rate_limited("rate limit exceeded"));
-        // case-insensitive on the "rate limit" phrase
-        assert!(is_rate_limited("RATE LIMIT reached"));
-        assert!(is_rate_limited("Provider says: Rate Limit hit"));
-    }
-
-    #[test]
-    fn is_rate_limited_rejects_plain_errors() {
-        assert!(!is_rate_limited("connection refused"));
-        assert!(!is_rate_limited("500 Internal Server Error"));
-        assert!(!is_rate_limited("No LLM backend configured"));
-        assert!(!is_rate_limited(""));
-    }
-
     // ----- cooldown set / observe ------------------------------------------
 
     #[test]
@@ -1577,7 +1527,10 @@ mod tests {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
         assert!(!extraction_in_cooldown());
 
-        note_extraction_error("HTTP 429 Too Many Requests");
+        note_extraction_error(&super::super::http_diag::diagnostic(
+            Code::RateLimited,
+            super::super::http_diag::INFERENCE,
+        ));
         assert!(
             extraction_in_cooldown(),
             "a 429 error must start the cooldown window"
@@ -1592,7 +1545,10 @@ mod tests {
         let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
 
-        note_extraction_error("connection refused");
+        note_extraction_error(&super::super::http_diag::diagnostic(
+            Code::NetworkUnreachable,
+            super::super::http_diag::INFERENCE,
+        ));
         assert!(
             !extraction_in_cooldown(),
             "a non-rate-limit error must NOT start the cooldown"
@@ -2192,48 +2148,22 @@ mod tests {
     // ----- a324: OpenRouter structured-output rejection classification ------
 
     #[test]
-    fn schema_rejection_matches_4xx_class_only() {
-        // A model that lacks structured-output support returns a 400/404/422;
-        // those trigger the schema-less retry.
-        assert!(is_schema_rejection(
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=400 body_bytes=12"
-        ));
-        assert!(is_schema_rejection("... status=404 ..."));
-        assert!(is_schema_rejection("... status=422 ..."));
-        // Auth and transient failures must NOT be treated as schema rejections —
-        // a schema-less retry would fail the same way (401/403) or should have
-        // been retried in-client (429/5xx).
-        assert!(!is_schema_rejection("... status=401 ..."));
-        assert!(!is_schema_rejection("... status=403 ..."));
-        assert!(!is_schema_rejection("... status=429 ..."));
-        assert!(!is_schema_rejection("... status=502 ..."));
-        assert!(!is_schema_rejection(
-            "OpenRouter chat completion request failed: timed out"
-        ));
-    }
+    fn only_schema_related_statuses_authorize_a_downgrade() {
+        use super::super::http_diag::{HttpFailure, INFERENCE};
 
-    #[test]
-    fn only_model_level_404_is_cacheable_as_schema_unsupported() {
-        // With require_parameters=true, a 404 (no provider for the model supports
-        // the schema) is model-level → cache-worthy. A 400/422 came from a
-        // routed-to provider that advertised support and is schema-specific → NOT
-        // model-level, must not demote the whole model for the session (Codex P2).
-        assert!(is_openrouter_schema_unsupported_by_model(
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404 body_bytes=30"
-        ));
-        assert!(
-            !is_openrouter_schema_unsupported_by_model("... status=400 ..."),
-            "a 400 is a per-provider validation quirk, not model-level evidence"
-        );
-        assert!(
-            !is_openrouter_schema_unsupported_by_model("... status=422 ..."),
-            "a 422 is a per-provider validation quirk, not model-level evidence"
-        );
-        // Sanity: every model-level signal is also a (broader) schema rejection.
-        let no_providers =
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404";
-        assert!(is_schema_rejection(no_providers));
-        assert!(is_openrouter_schema_unsupported_by_model(no_providers));
+        for (status, expected) in [
+            (400, Some(SchemaRejection::Request)),
+            (404, Some(SchemaRejection::Model)),
+            (422, Some(SchemaRejection::Request)),
+            (401, None),
+            (403, None),
+            (429, None),
+            (502, None),
+        ] {
+            let failure =
+                HttpFailure::status(reqwest::StatusCode::from_u16(status).unwrap(), INFERENCE);
+            assert_eq!(failure.schema_rejection, expected, "status {status}");
+        }
     }
 
     #[test]

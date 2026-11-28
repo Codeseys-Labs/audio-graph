@@ -7,6 +7,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+
 use serde::{Deserialize, Serialize};
 
 use crate::asr::ProviderContentEgressPolicy;
@@ -249,6 +251,7 @@ impl fmt::Debug for StreamChatRequest {
 pub enum StreamTerminalReason {
     Done { finish_reason: String },
     Error { message: String },
+    Diagnostic(RuntimeDiagnostic),
     Cancelled,
 }
 
@@ -278,6 +281,19 @@ impl StreamTerminalEvent {
     pub fn error(message: String, full_text: String, metadata: StreamContextMetadata) -> Self {
         Self {
             reason: StreamTerminalReason::Error { message },
+            full_text,
+            usage: None,
+            metadata,
+        }
+    }
+
+    pub(super) fn failure(
+        diagnostic: RuntimeDiagnostic,
+        full_text: String,
+        metadata: StreamContextMetadata,
+    ) -> Self {
+        Self {
+            reason: StreamTerminalReason::Diagnostic(diagnostic),
             full_text,
             usage: None,
             metadata,

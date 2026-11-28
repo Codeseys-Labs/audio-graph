@@ -34,6 +34,9 @@
 //!   the whole frame as UTF-8. JSON token deltas are always whole UTF-8
 //!   strings so we don't split graphemes.
 
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+
+use crate::llm::http_diag::{INFERENCE, diagnostic};
 pub use crate::llm::stream_contract::StreamUsage;
 
 /// Default maximum size for one buffered SSE frame before the decoder reports
@@ -72,8 +75,8 @@ pub enum SseEvent {
     /// The `data: [DONE]` terminator. After this, no further frames will
     /// arrive on a well-behaved stream.
     Done,
-    /// The decoder discarded an invalid frame or partial frame.
-    Error(String),
+    /// A provider fault or an invalid frame. Never carries provider content.
+    Error(RuntimeDiagnostic),
 }
 
 impl SseDecoder {
@@ -113,10 +116,7 @@ impl SseDecoder {
             (None, None) => {
                 if self.buf.len() > self.max_frame_bytes {
                     self.buf.clear();
-                    return Some(SseEvent::Error(format!(
-                        "SSE frame exceeded {} bytes without a terminator",
-                        self.max_frame_bytes
-                    )));
+                    return Some(SseEvent::Error(diagnostic(Code::ProtocolError, INFERENCE)));
                 }
                 return None;
             }
@@ -124,10 +124,7 @@ impl SseDecoder {
 
         if idx > self.max_frame_bytes {
             self.buf.drain(..idx + sep_len);
-            return Some(SseEvent::Error(format!(
-                "SSE frame exceeded {} bytes",
-                self.max_frame_bytes
-            )));
+            return Some(SseEvent::Error(diagnostic(Code::ProtocolError, INFERENCE)));
         }
 
         let frame_bytes: Vec<u8> = self.buf.drain(..idx + sep_len).collect();
@@ -142,7 +139,7 @@ impl SseDecoder {
 
         let mut data = String::new();
         let mut have_data = false;
-        let mut event_name: Option<String> = None;
+        let mut is_error_event = false;
         for line in frame_str.split('\n') {
             // SSE spec: lines starting with `:` are comments. OpenAI sends
             // `: OPENROUTER PROCESSING` / similar keepalives; ignore them.
@@ -164,17 +161,15 @@ impl SseDecoder {
                 // OpenAI-compatible gateways (and SSE in general) use a named
                 // `error` event to report a fault that occurs after the 200
                 // response headers were sent.
-                event_name = Some(rest.strip_prefix(' ').unwrap_or(rest).trim().to_string());
+                is_error_event = rest.trim() == "error";
             }
             // Other field names (id:, retry:) are intentionally ignored.
         }
 
-        // A named `error` event carries a fault that must reach the consumer as
-        // an `SseEvent::Error` (which the caller redacts before display) rather
-        // than being parsed as a token chunk and silently dropped.
-        if event_name.as_deref() == Some("error") {
-            return Some(SseEvent::Error(error_message_from_frame(
-                have_data.then_some(data.as_str()),
+        if is_error_event {
+            return Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE,
             )));
         }
 
@@ -195,70 +190,26 @@ impl SseDecoder {
         // as an error so it isn't deserialized into an empty `StreamChunk` and
         // dropped. A normal token chunk has no top-level `error` field, so this
         // never misclassifies real deltas.
-        if let Some(message) = error_message_from_data(&data) {
-            return Some(SseEvent::Error(message));
+        if has_error_envelope(&data) {
+            return Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE,
+            )));
         }
 
         Some(SseEvent::Data(data))
     }
 }
 
-/// Build an error message for a named `event: error` frame, preferring a
-/// structured `error.message` / `message` field from the `data:` payload and
-/// falling back to the raw payload (or a generic note when the frame had none).
-fn error_message_from_frame(data: Option<&str>) -> String {
-    match data {
-        Some(payload) => error_message_from_data(payload)
-            .unwrap_or_else(|| format!("stream error event: {}", payload.trim())),
-        None => "stream error event (no payload)".to_string(),
-    }
-}
-
-/// If `data` is a JSON object carrying an error envelope, extract a concise
-/// human-readable message. Returns `None` for any payload that is not an error
-/// envelope (e.g. a normal token-delta chunk), so callers can fall through to
-/// the regular `Data` path.
-///
-/// Recognized shapes (OpenAI-compatible providers vary):
-/// - `{"error": {"message": "..."}}`
-/// - `{"error": "..."}`
-/// - `{"message": "...", "type": "error"}` (some gateways)
-///
-/// A `null`/`false` value at the `error` key (e.g. the healthy
-/// `{"choices":[...],"error":null}` chunk many providers send) is treated as
-/// "no error" and falls through to `None`.
-fn error_message_from_data(data: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(data.trim()).ok()?;
-    let obj = value.as_object()?;
-
-    if let Some(error) = obj.get("error") {
-        // A healthy chunk often carries `"error": null` (or `false`) as an
-        // explicit "no error" signal: `{"choices":[...],"error":null}`. Such a
-        // value is NOT an error — treat it as absent and fall through to the
-        // regular `Data` path instead of fabricating `stream error: null`.
-        if error.is_null() || error == &serde_json::Value::Bool(false) {
-            // fall through
-        } else if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
-            return Some(message.to_string());
-        } else if let Some(message) = error.as_str() {
-            return Some(message.to_string());
-        } else {
-            // An `error` field that isn't a string or message-bearing object is
-            // still an error signal; surface its compact JSON form.
-            return Some(format!("stream error: {error}"));
-        }
-    }
-
-    // `{"type":"error", "message": "..."}` style without a nested `error`.
-    if obj.get("type").and_then(|t| t.as_str()) == Some("error") {
-        let message = obj
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("provider reported an error");
-        return Some(message.to_string());
-    }
-
-    None
+/// Detect an error signal without extracting or formatting its contents.
+fn has_error_envelope(data: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return false;
+    };
+    value
+        .get("error")
+        .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false))
+        || value.get("type").and_then(|kind| kind.as_str()) == Some("error")
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Linear scan; for the
@@ -397,12 +348,10 @@ mod tests {
         let mut dec = SseDecoder::with_max_frame_bytes(8);
         dec.feed(b"data: this frame never terminates");
 
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => {
-                assert!(message.contains("without a terminator"));
-            }
-            other => panic!("expected overflow error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(Code::ProtocolError, INFERENCE)))
+        );
         assert_eq!(dec.next_event(), None);
 
         dec.feed(b"data: ok\n\n");
@@ -414,12 +363,10 @@ mod tests {
         let mut dec = SseDecoder::with_max_frame_bytes(8);
         dec.feed(b"data: 123456789\n\ndata: ok\n\n");
 
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => {
-                assert!(message.contains("SSE frame exceeded"));
-            }
-            other => panic!("expected overflow error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(Code::ProtocolError, INFERENCE)))
+        );
         assert_eq!(dec.next_event(), Some(SseEvent::Data("ok".to_string())));
     }
 
@@ -442,22 +389,20 @@ mod tests {
     }
 
     #[test]
-    fn named_error_event_surfaces_as_error_with_message() {
+    fn named_error_event_discards_provider_message() {
         // BUG 4a49: a provider that reports a mid-stream fault via a named
         // `event: error` SSE frame must reach SseEvent::Error, not be dropped.
         let mut dec = SseDecoder::new();
         dec.feed(
             b"event: error\ndata: {\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit\"}}\n\n",
         );
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => {
-                assert!(
-                    message.contains("rate limit exceeded"),
-                    "expected the provider message, got: {message}"
-                );
-            }
-            other => panic!("expected SseEvent::Error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE
+            )))
+        );
     }
 
     #[test]
@@ -467,24 +412,26 @@ mod tests {
         // still surface as an error instead of parsing to an empty chunk.
         let mut dec = SseDecoder::new();
         dec.feed(b"data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n");
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => {
-                assert!(message.contains("context length exceeded"));
-            }
-            other => panic!("expected SseEvent::Error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE
+            )))
+        );
     }
 
     #[test]
     fn error_event_without_payload_surfaces_generic_error() {
         let mut dec = SseDecoder::new();
         dec.feed(b"event: error\n\n");
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => {
-                assert!(message.contains("error event"));
-            }
-            other => panic!("expected SseEvent::Error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE
+            )))
+        );
     }
 
     #[test]
@@ -524,10 +471,9 @@ mod tests {
     fn explicit_false_error_field_is_not_misclassified() {
         // Sibling of 4a72: some gateways use `"error": false` as the "no error"
         // sentinel. It must also fall through to Data, not fabricate an error.
-        assert_eq!(
-            error_message_from_data(r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#),
-            None,
-        );
+        assert!(!has_error_envelope(
+            r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#
+        ));
     }
 
     #[test]
@@ -538,10 +484,13 @@ mod tests {
         dec.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
         assert!(matches!(dec.next_event(), Some(SseEvent::Data(_))));
         dec.feed(b"event: error\ndata: {\"error\":\"upstream timeout\"}\n\n");
-        match dec.next_event() {
-            Some(SseEvent::Error(message)) => assert!(message.contains("upstream timeout")),
-            other => panic!("expected mid-stream SseEvent::Error, got {other:?}"),
-        }
+        assert_eq!(
+            dec.next_event(),
+            Some(SseEvent::Error(diagnostic(
+                Code::ProviderUnavailable,
+                INFERENCE
+            )))
+        );
     }
 
     #[test]

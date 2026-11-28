@@ -12,12 +12,18 @@
 //! possible, attaching the OpenRouter-specific headers via reqwest's
 //! `default_headers` builder.
 
+use audio_graph_ipc_contract::credential_contract::{
+    CredentialError, CredentialErrorCode, CredentialSafeRecoveryAction,
+};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeOperation,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
-use crate::llm::http_diag::{diagnostic_path, response_request_id};
+use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic, http_context};
 use crate::llm::route::{
     ConstrainedDecodingGrade, RequestOutputForm, TerminalStatus, WireOutcome,
     terminal_status_from_finish_reason,
@@ -1184,80 +1190,19 @@ fn sanitize_metadata_value(raw: &str) -> Option<String> {
 /// Returns `Ok(())` on HTTP 200, `Err(diagnostic)` on 401/403/network errors.
 /// Used by `test_openrouter_connection_cmd`.
 pub async fn test_connection(api_key: &str, base_url: &str) -> Result<(), String> {
-    if api_key.trim().is_empty() {
-        return Err("OpenRouter API key is empty".to_string());
-    }
-
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = build_async_client()?;
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
-        .header("HTTP-Referer", DEFAULT_HTTP_REFERER)
-        .header("X-OpenRouter-Title", DEFAULT_APP_TITLE)
-        .send()
+    let operation = RuntimeOperation::ProviderReadiness;
+    let url = openrouter_api_url(base_url, &["models"], operation);
+    get_catalog_response(api_key, url, operation)
         .await
-        .map_err(|e| format!("OpenRouter connection failed: {}", e))?;
-
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        let detail = format!(
-            "invalid_key: OpenRouter rejected the API key (HTTP {})",
-            status.as_u16()
-        );
-        // Only 401 gets the stable `Credential rejected (401):` marker
-        // (audio-graph-57cc) — 403 stays the pre-existing `invalid_key:` copy
-        // since it's a distinct rejection class (e.g. a key that's valid but
-        // scope/plan-restricted) and the seed scopes this to 401 specifically.
-        return Err(crate::error::classify_credential_rejected_message(
-            status, detail,
-        ));
-    }
-    if !status.is_success() {
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(openrouter_http_error_message(
-            status,
-            &url,
-            &body,
-            request_id.as_deref(),
-        ));
-    }
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 /// Fetch the live OpenRouter model catalog.
 pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<OpenRouterModel>, String> {
-    if api_key.trim().is_empty() {
-        return Err("OpenRouter API key is empty".to_string());
-    }
-
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = build_async_client()?;
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
-        .header("HTTP-Referer", DEFAULT_HTTP_REFERER)
-        .header("X-OpenRouter-Title", DEFAULT_APP_TITLE)
-        .send()
-        .await
-        .map_err(|e| format!("OpenRouter list_models request failed: {}", e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(openrouter_http_error_message(
-            status,
-            &url,
-            &body,
-            request_id.as_deref(),
-        ));
-    }
-    let parsed: ModelsResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenRouter models response: {}", e))?;
+    let operation = RuntimeOperation::ModelDiscovery;
+    let url = openrouter_api_url(base_url, &["models"], operation);
+    let parsed: ModelsResponse = get_catalog_json(api_key, url).await?;
     Ok(parsed.data)
 }
 
@@ -1266,37 +1211,8 @@ pub async fn list_providers(
     api_key: &str,
     base_url: &str,
 ) -> Result<Vec<OpenRouterProvider>, String> {
-    if api_key.trim().is_empty() {
-        return Err("OpenRouter API key is empty".to_string());
-    }
-
-    let url = openrouter_providers_url(base_url)?;
-    let client = build_async_client()?;
-    let resp = client
-        .get(url.clone())
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
-        .header("HTTP-Referer", DEFAULT_HTTP_REFERER)
-        .header("X-OpenRouter-Title", DEFAULT_APP_TITLE)
-        .send()
-        .await
-        .map_err(|e| openrouter_request_error_message("list_providers", &url, &e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(openrouter_http_error_message(
-            status,
-            url.as_str(),
-            &body,
-            request_id.as_deref(),
-        ));
-    }
-
-    let parsed: ProvidersResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenRouter providers response: {}", e))?;
+    let parsed: ProvidersResponse =
+        get_catalog_json(api_key, openrouter_providers_url(base_url)).await?;
     Ok(parsed.data)
 }
 
@@ -1306,78 +1222,110 @@ pub async fn list_model_endpoints(
     base_url: &str,
     model_id: &str,
 ) -> Result<OpenRouterModelEndpoints, String> {
-    if api_key.trim().is_empty() {
-        return Err("OpenRouter API key is empty".to_string());
+    let url = openrouter_model_endpoints_url(base_url, model_id);
+    let parsed: ModelEndpointsResponse = get_catalog_json(api_key, url).await?;
+    Ok(parsed.data)
+}
+
+async fn get_catalog_json<T: serde::de::DeserializeOwned>(
+    api_key: &str,
+    url: Result<reqwest::Url, RuntimeDiagnostic>,
+) -> Result<T, String> {
+    let operation = RuntimeOperation::ModelDiscovery;
+    get_catalog_response(api_key, url, operation)
+        .await
+        .map_err(|error| error.to_string())?
+        .json()
+        .await
+        .map_err(|error| HttpFailure::response(&error, http_context(operation)).to_string())
+}
+
+async fn get_catalog_response(
+    api_key: &str,
+    url: Result<reqwest::Url, RuntimeDiagnostic>,
+    operation: RuntimeOperation,
+) -> Result<reqwest::Response, RuntimeDiagnostic> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(catalog_credential_error(CredentialErrorCode::Missing));
     }
 
-    let url = openrouter_model_endpoints_url(base_url, model_id)?;
-    let client = build_async_client()?;
-    let resp = client
-        .get(url.clone())
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
+    let context = http_context(operation);
+    let url = url?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| RuntimeDiagnostic::internal(context))?;
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
         .header("HTTP-Referer", DEFAULT_HTTP_REFERER)
         .header("X-OpenRouter-Title", DEFAULT_APP_TITLE)
         .send()
         .await
-        .map_err(|e| openrouter_request_error_message("list_model_endpoints", &url, &e))?;
+        .map_err(|error| HttpFailure::request(&error, context).diagnostic)?;
 
-    let status = resp.status();
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(catalog_credential_error(CredentialErrorCode::AccessDenied));
+    }
     if !status.is_success() {
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(openrouter_http_error_message(
-            status,
-            url.as_str(),
-            &body,
-            request_id.as_deref(),
-        ));
+        capture_openrouter_http_diagnostic();
+        return Err(HttpFailure::status(status, context).diagnostic);
     }
-
-    let parsed: ModelEndpointsResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenRouter model endpoints response: {}", e))?;
-    Ok(parsed.data)
+    Ok(response)
 }
 
-fn openrouter_providers_url(base_url: &str) -> Result<reqwest::Url, String> {
-    openrouter_api_url(base_url, &["providers"])
+fn catalog_credential_error(code: CredentialErrorCode) -> RuntimeDiagnostic {
+    CredentialError {
+        code,
+        retryable: false,
+        recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+        set_id: None,
+    }
+    .into()
 }
 
-fn openrouter_model_endpoints_url(base_url: &str, model_id: &str) -> Result<reqwest::Url, String> {
-    let (author, slug) = split_model_id(model_id)?;
-    openrouter_api_url(base_url, &["models", author, slug, "endpoints"])
+fn openrouter_providers_url(base_url: &str) -> Result<reqwest::Url, RuntimeDiagnostic> {
+    openrouter_api_url(base_url, &["providers"], RuntimeOperation::ModelDiscovery)
 }
 
-fn openrouter_api_url(base_url: &str, path_segments: &[&str]) -> Result<reqwest::Url, String> {
-    let trimmed = base_url.trim();
-    if trimmed.is_empty() {
-        return Err("Invalid OpenRouter base URL: empty".to_string());
-    }
+fn openrouter_model_endpoints_url(
+    base_url: &str,
+    model_id: &str,
+) -> Result<reqwest::Url, RuntimeDiagnostic> {
+    let (author, slug) = split_model_id(model_id).ok_or_else(|| {
+        diagnostic(
+            Code::RequestRejected,
+            http_context(RuntimeOperation::ModelDiscovery),
+        )
+    })?;
+    openrouter_api_url(
+        base_url,
+        &["models", author, slug, "endpoints"],
+        RuntimeOperation::ModelDiscovery,
+    )
+}
 
-    let mut url =
-        reqwest::Url::parse(trimmed).map_err(|e| format!("Invalid OpenRouter base URL: {}", e))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "Invalid OpenRouter base URL: unsupported scheme `{}` (expected http or https)",
-                other
-            ));
-        }
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "Invalid OpenRouter base URL: embedded credentials are not allowed".to_string(),
-        );
+fn openrouter_api_url(
+    base_url: &str,
+    path_segments: &[&str],
+    operation: RuntimeOperation,
+) -> Result<reqwest::Url, RuntimeDiagnostic> {
+    let invalid = || diagnostic(Code::RequestRejected, http_context(operation));
+    let mut url = reqwest::Url::parse(base_url.trim()).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid());
     }
 
     url.set_query(None);
     url.set_fragment(None);
     {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| "Invalid OpenRouter base URL: cannot append request path".to_string())?;
+        let mut segments = url.path_segments_mut().map_err(|_| invalid())?;
         segments.pop_if_empty();
         for segment in path_segments {
             segments.push(segment);
@@ -1386,23 +1334,15 @@ fn openrouter_api_url(base_url: &str, path_segments: &[&str]) -> Result<reqwest:
     Ok(url)
 }
 
-fn split_model_id(model_id: &str) -> Result<(&str, &str), String> {
+fn split_model_id(model_id: &str) -> Option<(&str, &str)> {
     let trimmed = model_id.trim();
     let mut parts = trimmed.split('/');
     let author = parts.next().unwrap_or_default().trim();
     let slug = parts.next().unwrap_or_default().trim();
     if author.is_empty() || slug.is_empty() || parts.next().is_some() {
-        return Err("Invalid OpenRouter model id: expected `author/slug`".to_string());
+        return None;
     }
-    Ok((author, slug))
-}
-
-fn build_async_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+    Some((author, slug))
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,10 +1383,10 @@ impl OpenRouterClient {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .default_headers(headers)
             .build()
-            .unwrap_or_else(|e| {
+            .unwrap_or_else(|_| {
                 log::warn!(
-                    "Failed to build OpenRouter reqwest client; falling back to defaults: {}",
-                    e
+                    "OpenRouter HTTP client setup failed: {}",
+                    HttpFailure::new(Code::Internal, INFERENCE)
                 );
                 reqwest::blocking::Client::new()
             });
@@ -1585,6 +1525,7 @@ impl OpenRouterClient {
             RequestOutputForm::Unconstrained
         };
         self.chat_completion_send(messages, &form, cache_hint)
+            .map_err(String::from)
     }
 
     /// The route-contract entry point (ADR-0038): send one chat completion on an
@@ -1602,6 +1543,16 @@ impl OpenRouterClient {
         form: &RequestOutputForm,
         cache_hint: Option<PromptCacheHint>,
     ) -> Result<(String, u32, WireOutcome), String> {
+        self.chat_completion_diagnostic(messages, form, cache_hint)
+            .map_err(String::from)
+    }
+
+    pub(super) fn chat_completion_diagnostic(
+        &self,
+        messages: Vec<(String, String)>,
+        form: &RequestOutputForm,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, u32, WireOutcome), HttpFailure> {
         self.chat_completion_send(messages, form, cache_hint)
             .map(|(text, telemetry, wire)| (text, telemetry.usage.total_tokens.unwrap_or(0), wire))
     }
@@ -1636,6 +1587,7 @@ impl OpenRouterClient {
         };
         self.chat_completion_send(messages, &form, cache_hint)
             .map(|(text, telemetry, _wire)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
+            .map_err(String::from)
     }
 
     /// Shared blocking send + bounded retry + telemetry collection for every
@@ -1647,8 +1599,10 @@ impl OpenRouterClient {
         messages: Vec<(String, String)>,
         form: &RequestOutputForm,
         cache_hint: Option<PromptCacheHint>,
-    ) -> Result<(String, OpenRouterRoutingTelemetry, WireOutcome), String> {
-        self.content_egress_policy.check_prompt("llm.openrouter")?;
+    ) -> Result<(String, OpenRouterRoutingTelemetry, WireOutcome), HttpFailure> {
+        self.content_egress_policy
+            .check_prompt("llm.openrouter")
+            .map_err(|_| HttpFailure::new(Code::PolicyBlocked, INFERENCE))?;
 
         let response_format = match form {
             RequestOutputForm::Unconstrained => None,
@@ -1742,8 +1696,8 @@ impl OpenRouterClient {
                     if !status.is_success() {
                         if is_retryable_chat_status(status) && attempt < CHAT_MAX_ATTEMPTS {
                             log::warn!(
-                                "OpenRouter chat completion transient status={} (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying",
-                                status.as_u16()
+                                "OpenRouter chat transient HTTP failure (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying: {}",
+                                HttpFailure::status(status, INFERENCE)
                             );
                             // Honor a server-provided Retry-After (clamped so the
                             // total budget stays bounded); otherwise fall back to
@@ -1759,15 +1713,8 @@ impl OpenRouterClient {
                             attempt_number += 1;
                             continue;
                         }
-                        // Terminal (auth/validation 4xx) or budget exhausted.
-                        let request_id = response_request_id(response.headers());
-                        let body = response.text().unwrap_or_default();
-                        return Err(openrouter_http_error_message(
-                            status,
-                            &url,
-                            &body,
-                            request_id.as_deref(),
-                        ));
+                        capture_openrouter_http_diagnostic();
+                        return Err(HttpFailure::status(status, INFERENCE));
                     }
                     // Success status: capture the sanitized request id from the
                     // headers, then decode the body inside the retry loop. A
@@ -1793,13 +1740,9 @@ impl OpenRouterClient {
                                 attempt_number += 1;
                                 continue;
                             }
-                            // Class-only diagnostic: never the response body,
-                            // never the serde error's field-value text (there
-                            // is none to capture here — `e` carries structural
-                            // position/type info only, e.g. "invalid type:
-                            // null, expected a string at line 1 column 42").
+                            // Do not format the decoder source or inspect the payload.
                             capture_openrouter_decode_diagnostic();
-                            return Err(format!("Failed to parse OpenRouter chat response: {}", e));
+                            return Err(HttpFailure::response(&e, INFERENCE));
                         }
                     }
                 }
@@ -1814,7 +1757,7 @@ impl OpenRouterClient {
                         attempt_number += 1;
                         continue;
                     }
-                    return Err(format!("OpenRouter chat completion request failed: {}", e));
+                    return Err(HttpFailure::request(&e, INFERENCE));
                 }
             }
         };
@@ -1842,8 +1785,9 @@ impl OpenRouterClient {
 
         let choice = completion
             .choices
-            .first()
-            .ok_or_else(|| "No response choices from OpenRouter".to_string())?;
+            .into_iter()
+            .next()
+            .ok_or_else(|| HttpFailure::new(Code::InvalidResponse, INFERENCE))?;
 
         // ADR-0038 defect 1 + 3: read the stop signal and the SERVED identity off
         // the response instead of dropping both. `served_model` /
@@ -1878,11 +1822,7 @@ impl OpenRouterClient {
         // validator rejects an empty string on its own merits, and
         // `wire.terminal_status` above already carries the honest
         // classification for this response.
-        Ok((
-            choice.message.content.clone().unwrap_or_default(),
-            telemetry,
-            wire,
-        ))
+        Ok((choice.message.content.unwrap_or_default(), telemetry, wire))
     }
 
     /// Extract entities and relationships from a transcript segment via
@@ -1893,6 +1833,16 @@ impl OpenRouterClient {
         speaker: &str,
         context: &str,
     ) -> Result<ExtractionResult, String> {
+        self.extract_entities_diagnostic(text, speaker, context)
+            .map_err(String::from)
+    }
+
+    pub(super) fn extract_entities_diagnostic(
+        &self,
+        text: &str,
+        speaker: &str,
+        context: &str,
+    ) -> Result<ExtractionResult, HttpFailure> {
         let system_prompt = crate::ontology::extraction_system_prompt();
 
         // Prepend recent conversation as read-only context so the model can
@@ -1915,10 +1865,10 @@ impl OpenRouterClient {
             ("user".to_string(), user_prompt),
         ];
 
-        let raw = self.chat_completion(messages, true)?;
-        serde_json::from_str::<ExtractionResult>(&raw).map_err(|e| {
-            extraction_parse_error("OpenRouter", "llm.openrouter.extract_entities", &e, &raw)
-        })
+        let (raw, _, _) =
+            self.chat_completion_send(messages, &RequestOutputForm::JsonObject, None)?;
+        serde_json::from_str::<ExtractionResult>(&raw)
+            .map_err(|_| HttpFailure::new(Code::InvalidResponse, INFERENCE))
     }
 
     /// Chat with full message history and knowledge graph context.
@@ -2198,84 +2148,40 @@ fn chat_retry_jittered_backoff(base_ms: u64) -> Duration {
     Duration::from_millis(millis)
 }
 
-fn openrouter_http_error_message(
-    status: reqwest::StatusCode,
-    url: &str,
-    body: &str,
-    request_id: Option<&str>,
-) -> String {
-    // Anonymous, structured diagnostic (no-op unless analytics is enabled). Only
-    // the controlled category/provider/status ride along — never the body/url.
+fn capture_openrouter_http_diagnostic() {
     crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
         name: "llm.openrouter.http_error",
         category: crate::analytics::Category::Llm,
         level: sentry::Level::Error,
         provider: Some("openrouter"),
         kind: Some("http_error"),
-        http_status: Some(status.as_u16()),
+        http_status: None,
         recoverable: None,
     });
-    format!(
-        "OpenRouter HTTP error: provider=openrouter path={} status={} body_bytes={} body_chars={}{}",
-        diagnostic_path(url),
-        status.as_u16(),
-        body.len(),
-        body.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
 }
 
-fn openrouter_request_error_message(
-    operation: &str,
-    url: &reqwest::Url,
-    error: &reqwest::Error,
-) -> String {
-    let class = if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connect"
-    } else if error.is_decode() {
-        "decode"
-    } else if error.is_body() {
-        "body"
-    } else if error.is_status() {
-        "status"
-    } else if error.is_request() {
-        "request"
-    } else {
-        "unknown"
-    };
-    format!(
-        "OpenRouter request failed: operation={} provider=openrouter path={} error_class={}",
-        operation,
-        diagnostic_path(url.as_str()),
-        class
-    )
-}
-
-fn extraction_parse_error(
-    provider: &str,
-    path: &str,
-    error: &serde_json::Error,
-    provider_output: &str,
-) -> String {
-    let class = match error.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
-    format!(
-        "Failed to parse extraction JSON from {} ({}): class={}; detail={}; provider_output_bytes={}; provider_output_chars={}",
-        provider,
-        path,
-        class,
-        error,
-        provider_output.len(),
-        provider_output.chars().count()
-    )
+/// Request IDs belong to successful, local routing telemetry only. Never use
+/// this helper when constructing a diagnostic or logging a response.
+fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in [
+        "x-request-id",
+        "request-id",
+        "x-openrouter-request-id",
+        "cf-ray",
+    ] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let sanitized: String = value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+            .take(128)
+            .collect();
+        if !sanitized.is_empty() {
+            return Some(sanitized);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3059,7 +2965,7 @@ mod tests {
             .join()
             .expect("worker thread panic")
             .expect_err("401 must fail immediately with no retry");
-        assert!(err.contains("status=401"), "expected 401 diagnostic: {err}");
+        assert_eq!(err, "runtime/request_rejected");
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3634,27 +3540,11 @@ mod tests {
         let err = test_connection("sk-bad", &base)
             .await
             .expect_err("test_connection must return Err on HTTP 401");
-        assert!(
-            err.contains("invalid_key"),
-            "401 must produce an invalid_key diagnostic, got: {err}"
-        );
-        // audio-graph-57cc: 401 also carries the stable
-        // `Credential rejected (401):` prefix so the frontend's readiness
-        // classifier (`isCredentialRejectedReadinessMessage`,
-        // ProviderReadinessPanel.tsx) can distinguish this from a generic
-        // transport/HTTP failure.
-        assert!(
-            err.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX),
-            "401 must carry the stable credential-rejected prefix, got: {err}"
-        );
+        assert_eq!(err, "credential/access_denied");
     }
 
     #[tokio::test]
-    async fn test_connection_fails_on_403_without_credential_rejected_prefix() {
-        // 403 (Forbidden) is a distinct rejection class from 401 — e.g. a key
-        // that's syntactically valid but scope/plan-restricted. audio-graph-57cc
-        // scopes the stable-prefix classifier to 401 specifically, so 403 must
-        // keep the pre-existing `invalid_key:` copy without the 401 prefix.
+    async fn test_connection_distinguishes_forbidden_from_invalid_credential() {
         let (base, _captured) = spawn_mock(|_req| {
             (
                 403,
@@ -3666,60 +3556,37 @@ mod tests {
         let err = test_connection("sk-bad", &base)
             .await
             .expect_err("test_connection must return Err on HTTP 403");
-        assert!(
-            err.contains("invalid_key"),
-            "403 must still produce an invalid_key diagnostic, got: {err}"
-        );
-        assert!(
-            !err.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX),
-            "403 must NOT carry the 401-only credential-rejected prefix, got: {err}"
-        );
+        assert_eq!(err, "runtime/request_rejected");
     }
 
     #[tokio::test]
-    async fn list_models_error_uses_metadata_only_diagnostic() {
-        let api_key = "sk-openrouter-list-secret";
-        let prompt_echo = "transcript summary and graph context";
-        let body = format!(r#"{{"error":"echoed key {api_key}; {prompt_echo}"}}"#);
-        let err = openrouter_http_error_message(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "https://openrouter.ai/api/v1/models",
-            &body,
-            Some("or_req_123"),
-        );
+    async fn discovery_returns_only_the_diagnostic_token() {
+        use crate::llm::http_diag::log_canary::Capture;
 
-        assert!(
-            err.contains("status=429"),
-            "error must carry the status, got: {err}"
-        );
-        assert!(
-            err.contains("provider=openrouter"),
-            "error must carry the provider, got: {err}"
-        );
-        assert!(
-            err.contains("path=/api/v1/models"),
-            "error must carry the request path, got: {err}"
-        );
-        assert!(
-            err.contains("request_id=or_req_123"),
-            "error must carry the provider request id, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_bytes={}", body.len())),
-            "error must carry the body byte length, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_chars={}", body.chars().count())),
-            "error must carry the body char length, got: {err}"
-        );
-        assert!(
-            !err.contains(api_key),
-            "error must redact the submitted key, got: {err}"
-        );
-        assert!(
-            !err.contains("echoed key") && !err.contains(prompt_echo),
-            "error must not echo provider body or prompt context: {err}"
-        );
+        let key = "catalog-credential-canary";
+        let body = "catalog-provider-body-canary";
+        let (base, _) = spawn_scripted_mock(vec![(
+            429,
+            "Too Many Requests",
+            "X-Request-Id: catalog-request-canary\r\n",
+            body.to_owned(),
+        )])
+        .await;
+        let logs = Capture::start();
+        let err = list_models(
+            key,
+            &format!("{base}/catalog-path-canary?private=query-canary"),
+        )
+        .await
+        .expect_err("catalog HTTP error");
+        assert_eq!(err, "runtime/rate_limited");
+        logs.assert_absent(&[
+            key,
+            body,
+            "catalog-request-canary",
+            "catalog-path-canary",
+            "query-canary",
+        ]);
     }
 
     #[tokio::test]
@@ -3897,10 +3764,7 @@ mod tests {
         for bad_model_id in ["", "anthropic", "anthropic/", "/claude", "a/b/c"] {
             let err = openrouter_model_endpoints_url(DEFAULT_BASE_URL, bad_model_id)
                 .expect_err("malformed model ids should be rejected");
-            assert!(
-                err.contains("author/slug"),
-                "error should explain expected model id shape, got: {err}"
-            );
+            assert_eq!(err.to_string(), "runtime/request_rejected");
         }
     }
 
@@ -3909,31 +3773,7 @@ mod tests {
         let err = openrouter_providers_url("https://user:secret@proxy.example/api/v1")
             .expect_err("embedded URL credentials must be rejected");
 
-        assert!(err.contains("embedded credentials"));
-        assert!(!err.contains("secret"));
-        assert!(!err.contains("proxy.example"));
-    }
-
-    #[test]
-    fn catalog_error_diagnostics_are_metadata_only() {
-        let secret = "query-secret";
-        let body =
-            format!(r#"{{"error":"provider echoed {secret}","prompt":"meeting transcript"}}"#);
-        let err = openrouter_http_error_message(
-            reqwest::StatusCode::BAD_GATEWAY,
-            "https://proxy.example/api/v1/models/openai/gpt-4/endpoints?api_key=query-secret",
-            &body,
-            Some("or_req_456"),
-        );
-
-        assert!(err.contains("status=502"));
-        assert!(err.contains("path=/api/v1/models/openai/gpt-4/endpoints"));
-        assert!(err.contains("body_bytes="));
-        assert!(err.contains("body_chars="));
-        assert!(err.contains("request_id=or_req_456"));
-        assert!(!err.contains(secret));
-        assert!(!err.contains("meeting transcript"));
-        assert!(!err.contains("proxy.example"));
+        assert_eq!(err.to_string(), "runtime/request_rejected");
     }
 
     #[tokio::test]
@@ -4063,9 +3903,7 @@ mod tests {
             .expect("worker thread panic")
             .expect_err("blocked policy must reject before cloud prompt egress");
 
-        assert!(err.contains("Privacy policy blocked"), "got: {err}");
-        assert!(err.contains("llm.openrouter"), "got: {err}");
-        assert!(err.contains("local_only"), "got: {err}");
+        assert_eq!(err, "runtime/policy_blocked");
         assert!(
             !err.contains(prompt),
             "policy error must not echo prompt text: {err}"
@@ -4119,9 +3957,7 @@ mod tests {
             .expect("worker thread panic")
             .expect_err("default policy must reject before cloud prompt egress");
 
-        assert!(err.contains("Privacy policy blocked"), "got: {err}");
-        assert!(err.contains("llm.openrouter"), "got: {err}");
-        assert!(err.contains("explicit_policy_required"), "got: {err}");
+        assert_eq!(err, "runtime/policy_blocked");
         assert!(
             !err.contains(prompt),
             "policy error must not echo prompt text: {err}"
@@ -4171,42 +4007,7 @@ mod tests {
         .expect("worker thread panic")
         .expect_err("malformed extraction JSON must be Err");
 
-        assert!(
-            err.contains("Failed to parse extraction JSON from OpenRouter"),
-            "got: {err}"
-        );
-        assert!(
-            err.contains("llm.openrouter.extract_entities"),
-            "parse error must include the extraction path, got: {err}"
-        );
-        assert!(
-            err.contains("class=syntax"),
-            "parse error must include a parse class, got: {err}"
-        );
-        assert!(
-            err.contains("provider_output_bytes="),
-            "parse error must include output length, got: {err}"
-        );
-        assert!(
-            err.contains("provider_output_chars="),
-            "parse error must include output length, got: {err}"
-        );
-        assert!(
-            !err.contains(provider_output),
-            "parse error must not echo provider output: {err}"
-        );
-        assert!(
-            !err.contains("patient diagnosis"),
-            "parse error must not echo transcript-derived content: {err}"
-        );
-        assert!(
-            !err.contains("sk-provider-output-secret"),
-            "parse error must not echo secret-like provider output: {err}"
-        );
-        assert!(
-            !err.contains("Earlier private context"),
-            "parse error must not echo prompt context: {err}"
-        );
+        assert_eq!(err, "runtime/invalid_response");
     }
 
     #[test]
@@ -4454,49 +4255,46 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_error_uses_metadata_only_diagnostic() {
-        let api_key = "sk-openrouter-chat-secret";
-        let prompt_echo = "patient transcript and graph context";
-        let body = format!(r#"{{"error":"upstream echoed {api_key}; {prompt_echo}"}}"#);
-        let err = openrouter_http_error_message(
-            reqwest::StatusCode::BAD_GATEWAY,
-            "https://openrouter.ai/api/v1/chat/completions",
-            &body,
-            Some("chat_req_456"),
-        );
+    fn chat_completion_http_diagnostic_and_retry_logs_are_content_free() {
+        use crate::llm::http_diag::log_canary::Capture;
 
-        assert!(
-            err.contains("status=502"),
-            "error must carry the status, got: {err}"
-        );
-        assert!(
-            err.contains("provider=openrouter"),
-            "error must carry the provider, got: {err}"
-        );
-        assert!(
-            err.contains("path=/api/v1/chat/completions"),
-            "error must carry the request path, got: {err}"
-        );
-        assert!(
-            err.contains("request_id=chat_req_456"),
-            "error must carry the provider request id, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_bytes={}", body.len())),
-            "error must carry the body byte length, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_chars={}", body.chars().count())),
-            "error must carry the body char length, got: {err}"
-        );
-        assert!(
-            !err.contains(api_key),
-            "error must redact the submitted key, got: {err}"
-        );
-        assert!(
-            !err.contains("upstream echoed") && !err.contains(prompt_echo),
-            "error must not echo provider body or prompt context: {err}"
-        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let key = "openrouter-credential-canary";
+        let prompt = format!("openrouter-prompt-canary{}", "x".repeat(2048));
+        let length = prompt.len().to_string();
+        let body = format!("private-body-canary {key} {prompt}");
+        let (base, request_count) = rt.block_on(spawn_scripted_mock(vec![
+            (
+                502,
+                "Bad Gateway",
+                "X-Request-Id: openrouter-request-canary\r\nRetry-After: 0\r\n",
+                body
+            );
+            3
+        ]));
+        let err = std::thread::spawn(move || {
+            let logs = Capture::start();
+            let mut config = retry_test_config(format!("{base}/path-canary?private=query-canary"));
+            config.api_key = key.to_owned();
+            let client = OpenRouterClient::new(config)
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+            let result = client.chat_completion(vec![("user".into(), prompt)], false);
+            assert!(logs.contents().contains("runtime/provider_unavailable"));
+            logs.assert_absent(&[
+                key,
+                "private-body-canary",
+                "openrouter-prompt-canary",
+                "openrouter-request-canary",
+                "path-canary",
+                "query-canary",
+                &length,
+            ]);
+            result.expect_err("502 after exhausting retries")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(err, "runtime/provider_unavailable");
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

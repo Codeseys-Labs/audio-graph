@@ -4,10 +4,12 @@
 //! LM Studio, vLLM, OpenRouter, Anthropic via proxy, etc.).
 //! Used as an alternative to the native llama-cpp-2 engine.
 
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::http_diag::{HttpFailure, INFERENCE};
 use crate::llm::route::{
     RequestOutputForm, WireOutcome, sanitize_route_metadata, terminal_status_from_finish_reason,
 };
@@ -242,10 +244,10 @@ impl ApiClient {
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|e| {
+            .unwrap_or_else(|_| {
                 log::warn!(
-                    "Failed to build reqwest client with API timeouts; falling back to defaults: {}",
-                    e
+                    "API HTTP client setup failed: {}",
+                    HttpFailure::new(Code::Internal, INFERENCE)
                 );
                 reqwest::blocking::Client::new()
             });
@@ -328,27 +330,7 @@ impl ApiClient {
         };
         self.chat_completion_with_wire_outcome(messages, form)
             .map(|(text, tokens, _wire)| (text, tokens))
-    }
-
-    pub(crate) fn chat_completion_with_structured_outputs_with_usage(
-        &self,
-        messages: Vec<(String, String)>,
-        schema: serde_json::Value,
-    ) -> Result<(String, u32), String> {
-        self.chat_completion_with_wire_outcome(
-            messages,
-            RequestOutputForm::VllmStructuredOutputs { schema },
-        )
-        .map(|(text, tokens, _wire)| (text, tokens))
-    }
-
-    fn chat_completion_with_structured_outputs(
-        &self,
-        messages: Vec<(String, String)>,
-        schema: serde_json::Value,
-    ) -> Result<String, String> {
-        self.chat_completion_with_structured_outputs_with_usage(messages, schema)
-            .map(|(text, _tokens)| text)
+            .map_err(String::from)
     }
 
     /// The route-contract entry point (ADR-0038): send one chat completion in the
@@ -359,12 +341,14 @@ impl ApiClient {
     /// [`ConstrainedDecodingGrade`](crate::llm::route::ConstrainedDecodingGrade),
     /// not from a host substring — that is what lets direct Cerebras request its
     /// documented strict-decoding guarantee (ADR-0038 defect 2).
-    pub(crate) fn chat_completion_with_wire_outcome(
+    pub(super) fn chat_completion_with_wire_outcome(
         &self,
         messages: Vec<(String, String)>,
         form: RequestOutputForm,
-    ) -> Result<(String, u32, WireOutcome), String> {
-        self.content_egress_policy.check_prompt("llm.api")?;
+    ) -> Result<(String, u32, WireOutcome), HttpFailure> {
+        self.content_egress_policy
+            .check_prompt("llm.api")
+            .map_err(|_| HttpFailure::new(Code::PolicyBlocked, INFERENCE))?;
 
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
@@ -431,23 +415,16 @@ impl ApiClient {
 
         let response = req
             .send()
-            .map_err(|e| format!("API request to {} failed: {}", url, e))?;
+            .map_err(|error| HttpFailure::request(&error, INFERENCE))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let request_id = response_request_id(response.headers());
-            let body = response.text().unwrap_or_default();
-            return Err(api_error_message(
-                status,
-                &url,
-                &body,
-                request_id.as_deref(),
-            ));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(HttpFailure::status(status, INFERENCE));
         }
 
         let completion: ChatCompletionResponse = response
             .json()
-            .map_err(|e| format!("Failed to parse API response: {}", e))?;
+            .map_err(|error| HttpFailure::response(&error, INFERENCE))?;
 
         // A missing `usage` block (or a provider that omits `total_tokens`)
         // reports 0 — never fabricated.
@@ -462,8 +439,9 @@ impl ApiClient {
 
         let choice = completion
             .choices
-            .first()
-            .ok_or_else(|| "No response choices from API".to_string())?;
+            .into_iter()
+            .next()
+            .ok_or_else(|| HttpFailure::new(Code::InvalidResponse, INFERENCE))?;
 
         let wire = WireOutcome {
             terminal_status: terminal_status_from_finish_reason(choice.finish_reason.as_deref()),
@@ -473,7 +451,7 @@ impl ApiClient {
             served_upstream_provider: None,
             constrained_decoding: form.achieved_grade(constrained_decoding_ceiling),
         };
-        Ok((choice.message.content.clone(), total_tokens, wire))
+        Ok((choice.message.content, total_tokens, wire))
     }
 
     // ------------------------------------------------------------------
@@ -489,6 +467,16 @@ impl ApiClient {
         speaker: &str,
         context: &str,
     ) -> Result<ExtractionResult, String> {
+        self.extract_entities_diagnostic(text, speaker, context)
+            .map_err(String::from)
+    }
+
+    pub(super) fn extract_entities_diagnostic(
+        &self,
+        text: &str,
+        speaker: &str,
+        context: &str,
+    ) -> Result<ExtractionResult, HttpFailure> {
         let system_prompt = crate::ontology::extraction_system_prompt();
 
         // See OpenRouterClient::extract_entities: recent context for reference
@@ -511,27 +499,29 @@ impl ApiClient {
 
         let raw = if self.prefers_vllm_structured_outputs() {
             let schema = Self::extraction_json_schema()?;
-            match self.chat_completion_with_structured_outputs(messages.clone(), schema) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    log::warn!(
-                        "vLLM structured outputs failed, falling back to JSON mode: {}",
-                        e
-                    );
-                    self.chat_completion(messages, true)?
+            match self.chat_completion_with_wire_outcome(
+                messages.clone(),
+                RequestOutputForm::VllmStructuredOutputs { schema },
+            ) {
+                Ok((raw, _, _)) => raw,
+                Err(error) => {
+                    log::warn!("vLLM structured output failed; falling back to JSON mode: {error}");
+                    self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
+                        .0
                 }
             }
         } else {
-            self.chat_completion(messages, true)?
+            self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
+                .0
         };
 
         serde_json::from_str::<ExtractionResult>(&raw)
-            .map_err(|e| extraction_parse_error("API", "llm.api.extract_entities", &e, &raw))
+            .map_err(|_| HttpFailure::new(Code::InvalidResponse, INFERENCE))
     }
 
-    fn extraction_json_schema() -> Result<serde_json::Value, String> {
+    fn extraction_json_schema() -> Result<serde_json::Value, HttpFailure> {
         serde_json::to_value(schemars::schema_for!(ExtractionResult))
-            .map_err(|e| format!("Failed to build extraction JSON schema: {}", e))
+            .map_err(|_| HttpFailure::new(Code::Internal, INFERENCE))
     }
 
     pub(crate) fn prefers_vllm_structured_outputs(&self) -> bool {
@@ -601,6 +591,7 @@ impl ApiClient {
             self.history_messages(messages, graph_context),
             RequestOutputForm::Unconstrained,
         )
+        .map_err(String::from)
     }
 
     /// Build the `(role, content)` message list for the history chat paths:
@@ -623,75 +614,6 @@ impl ApiClient {
         }
         api_messages
     }
-}
-
-fn api_error_message(
-    status: reqwest::StatusCode,
-    url: &str,
-    body: &str,
-    request_id: Option<&str>,
-) -> String {
-    format!(
-        "API error: provider=api path={} status={} body_bytes={} body_chars={}{}",
-        diagnostic_path(url),
-        status.as_u16(),
-        body.len(),
-        body.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
-}
-
-fn diagnostic_path(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| "<unparseable>".to_string())
-}
-
-fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for name in [
-        "x-request-id",
-        "request-id",
-        "x-openrouter-request-id",
-        "cf-ray",
-    ] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-            continue;
-        };
-        let sanitized: String = value
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
-            .take(128)
-            .collect();
-        if !sanitized.is_empty() {
-            return Some(sanitized);
-        }
-    }
-    None
-}
-
-fn extraction_parse_error(
-    provider: &str,
-    path: &str,
-    error: &serde_json::Error,
-    provider_output: &str,
-) -> String {
-    let class = match error.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
-    format!(
-        "Failed to parse extraction JSON from {} ({}): class={}; detail={}; provider_output_bytes={}; provider_output_chars={}",
-        provider,
-        path,
-        class,
-        error,
-        provider_output.len(),
-        provider_output.chars().count()
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +702,7 @@ mod tests {
                     *guard = total.clone();
                 }
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nX-Request-Id: api-request-canary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
                     status_text,
                     body.len(),
@@ -961,9 +883,7 @@ mod tests {
         })
         .expect_err("blocked policy must reject before cloud prompt egress");
 
-        assert!(err.contains("Privacy policy blocked"), "got: {err}");
-        assert!(err.contains("llm.api"), "got: {err}");
-        assert!(err.contains("local_only"), "got: {err}");
+        assert_eq!(err, "runtime/policy_blocked");
         assert!(
             !err.contains(prompt),
             "policy error must not echo prompt text: {err}"
@@ -997,9 +917,7 @@ mod tests {
         })
         .expect_err("default policy must reject before cloud prompt egress");
 
-        assert!(err.contains("Privacy policy blocked"), "got: {err}");
-        assert!(err.contains("llm.api"), "got: {err}");
-        assert!(err.contains("explicit_policy_required"), "got: {err}");
+        assert_eq!(err, "runtime/policy_blocked");
         assert!(
             !err.contains(prompt),
             "policy error must not echo prompt text: {err}"
@@ -1127,15 +1045,17 @@ mod tests {
 
         let client = ApiClient::new(config(&base, Some("sk-secret")))
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-        let (text, tokens) = run_blocking(move || {
-            client.chat_completion_with_structured_outputs_with_usage(
+        let (text, tokens, _) = run_blocking(move || {
+            client.chat_completion_with_wire_outcome(
                 vec![("user".to_string(), "patch".to_string())],
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "operations": { "type": "array" }
-                    }
-                }),
+                RequestOutputForm::VllmStructuredOutputs {
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "operations": { "type": "array" }
+                        }
+                    }),
+                },
             )
         })
         .expect("structured output response");
@@ -1183,49 +1103,34 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_non_2xx_uses_metadata_only_diagnostic() {
-        let api_key = "sk-test-redact-api-client";
-        let prompt_echo = "patient transcript and private graph context";
-        let body = format!("slow down; echoed key {api_key}; echoed prompt {prompt_echo}");
-        let err = api_error_message(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "https://provider.example/v1/chat/completions",
-            &body,
-            Some("req_123"),
-        );
+    fn chat_completion_non_2xx_returns_only_the_diagnostic_token() {
+        use crate::llm::http_diag::log_canary::Capture;
 
-        assert!(
-            err.contains("status=429"),
-            "error must carry the status, got: {err}"
-        );
-        assert!(
-            err.contains("provider=api"),
-            "error must carry the provider, got: {err}"
-        );
-        assert!(
-            err.contains("path=/v1/chat/completions"),
-            "error must carry the request path, got: {err}"
-        );
-        assert!(
-            err.contains("request_id=req_123"),
-            "error must carry the provider request id, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_bytes={}", body.len())),
-            "error must carry the body byte length, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_chars={}", body.chars().count())),
-            "error must carry the body char length, got: {err}"
-        );
-        assert!(
-            !err.contains(api_key),
-            "error must redact the submitted key, got: {err}"
-        );
-        assert!(
-            !err.contains("slow down") && !err.contains(prompt_echo),
-            "error must not echo provider body or prompt context: {err}"
-        );
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let key = "api-credential-canary";
+        let body = "provider-private-body-canary";
+        let path = "private-endpoint-canary";
+        let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", body.to_owned()));
+        let prompt = format!("api-prompt-canary{}", "x".repeat(2048));
+        let length = prompt.len().to_string();
+        let endpoint = format!("{base}/{path}?private=query-canary");
+        let err = run_blocking(move || {
+            let logs = Capture::start();
+            let client = ApiClient::new(config(&endpoint, Some(key)))
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+            let result = client.chat_completion(vec![("user".into(), prompt)], false);
+            logs.assert_absent(&[
+                key,
+                body,
+                path,
+                "query-canary",
+                "api-request-canary",
+                "api-prompt-canary",
+                &length,
+            ]);
+            result.expect_err("provider rejected the request")
+        });
+        assert_eq!(err, "runtime/rate_limited");
     }
 
     #[test]
@@ -1240,7 +1145,7 @@ mod tests {
             client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
         })
         .expect_err("empty choices must be Err");
-        assert!(err.contains("No response choices"), "got: {err}");
+        assert_eq!(err, "runtime/invalid_response");
     }
 
     // ----- ADR-0038 defect (a): finish_reason on the generic blocking path ---
@@ -1407,11 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_schema_rejection_reports_the_status_so_the_caller_can_downgrade() {
-        // A 400-class rejection of the strict schema must surface with the status
-        // in the message, because that is what `executor::is_schema_rejection`
-        // reads to downgrade to JSON mode ON THE SAME ROUTE — a mode downgrade,
-        // never a provider substitution.
+    fn strict_schema_rejection_preserves_private_downgrade_evidence() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let (base, _captured) = rt.block_on(spawn_mock(
             400,
@@ -1431,11 +1332,11 @@ mod tests {
             )
         })
         .expect_err("a 400 is an error");
-        assert!(err.contains("status=400"), "got: {err}");
-        assert!(
-            !err.contains("schema unsupported"),
-            "the provider body must not be echoed, got: {err}"
+        assert_eq!(
+            err.schema_rejection,
+            Some(crate::llm::http_diag::SchemaRejection::Request)
         );
+        assert_eq!(err.to_string(), "runtime/request_rejected");
     }
 
     #[test]
@@ -1481,41 +1382,6 @@ mod tests {
             )
         })
         .expect_err("malformed extraction JSON must be Err");
-        assert!(
-            err.contains("Failed to parse extraction JSON from API"),
-            "got: {err}"
-        );
-        assert!(
-            err.contains("llm.api.extract_entities"),
-            "parse error must include the extraction path, got: {err}"
-        );
-        assert!(
-            err.contains("class=syntax"),
-            "parse error must include a parse class, got: {err}"
-        );
-        assert!(
-            err.contains("provider_output_bytes="),
-            "parse error must include output length, got: {err}"
-        );
-        assert!(
-            err.contains("provider_output_chars="),
-            "parse error must include output length, got: {err}"
-        );
-        assert!(
-            !err.contains(provider_output),
-            "parse error must not echo provider output: {err}"
-        );
-        assert!(
-            !err.contains("patient diagnosis"),
-            "parse error must not echo transcript-derived content: {err}"
-        );
-        assert!(
-            !err.contains("sk-provider-output-secret"),
-            "parse error must not echo secret-like provider output: {err}"
-        );
-        assert!(
-            !err.contains("Earlier private context"),
-            "parse error must not echo prompt context: {err}"
-        );
+        assert_eq!(err, "runtime/invalid_response");
     }
 }

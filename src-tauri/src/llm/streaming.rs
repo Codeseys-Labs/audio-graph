@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -29,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::{ChatMessage, LlmChatParams, LlmStreamEvent};
-use crate::llm::http_diag::{diagnostic_path, response_request_id};
+use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic};
 use crate::llm::openrouter::{
     DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
 };
@@ -91,6 +92,10 @@ impl TokenDelta {
                 message,
                 full_text: event.full_text,
             },
+            StreamTerminalReason::Diagnostic(diagnostic) => Self::Error {
+                message: diagnostic.to_string(),
+                full_text: event.full_text,
+            },
             StreamTerminalReason::Cancelled => Self::Cancelled {
                 full_text: event.full_text,
             },
@@ -104,11 +109,9 @@ impl TokenDelta {
 /// rather than passing the full `LlmProvider` enum down through the SSE
 /// loop, so the loop itself stays provider-agnostic.
 struct StreamRequest {
-    provider: &'static str,
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
-    secrets: Vec<String>,
 }
 
 /// Build an OpenAI-style chat-completion `messages` array from the chat
@@ -165,17 +168,7 @@ fn build_api_request(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    let secrets = (!api_key.is_empty())
-        .then(|| api_key.to_string())
-        .into_iter()
-        .collect();
-    StreamRequest {
-        provider: "api",
-        url,
-        headers,
-        body,
-        secrets,
-    }
+    StreamRequest { url, headers, body }
 }
 
 /// Build the wire-shape request for the first-class OpenRouter provider.
@@ -210,13 +203,7 @@ fn build_openrouter_request(
     if let Some(provider) = config.provider_routing_value() {
         body["provider"] = provider;
     }
-    StreamRequest {
-        provider: "openrouter",
-        url,
-        headers,
-        body,
-        secrets: vec![config.api_key.clone()],
-    }
+    StreamRequest { url, headers, body }
 }
 
 fn openrouter_routing_policy_from_backend_handles(
@@ -245,7 +232,7 @@ fn openrouter_routing_policy_from_backend_handles(
 /// `ConverseStream` adapter and remains deferred.
 fn build_request_for_provider(
     request: &StreamChatRequest,
-) -> Result<Option<StreamRequest>, String> {
+) -> Result<Option<StreamRequest>, RuntimeDiagnostic> {
     check_streaming_http_content_egress(request)?;
 
     let StreamParams {
@@ -308,13 +295,18 @@ fn streaming_http_provider_policy_name(provider: &LlmProvider) -> Option<&'stati
     }
 }
 
-fn check_streaming_http_content_egress(request: &StreamChatRequest) -> Result<(), String> {
+fn check_streaming_http_content_egress(
+    request: &StreamChatRequest,
+) -> Result<(), RuntimeDiagnostic> {
     let Some(provider) = streaming_http_provider_policy_name(&request.provider) else {
         return Ok(());
     };
 
-    request.content_egress_policy.check_prompt(provider)?;
-    request.content_egress_policy.check_json(provider)
+    request
+        .content_egress_policy
+        .check_prompt(provider)
+        .and_then(|()| request.content_egress_policy.check_json(provider))
+        .map_err(|_| diagnostic(Code::PolicyBlocked, INFERENCE))
 }
 
 /// Spawn a background tokio task that streams chat tokens for `provider`
@@ -385,14 +377,19 @@ pub fn stream_chat_with_request(
         {
             // Honor the same content-egress policy gate the SSE path applies
             // before any cloud request leaves the machine.
-            if let Err(message) = request
+            if request
                 .content_egress_policy
                 .check_prompt("llm.aws_bedrock")
                 .and_then(|()| request.content_egress_policy.check_json("llm.aws_bedrock"))
+                .is_err()
             {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(
+                        crate::llm::bedrock::policy_blocked(),
+                        String::new(),
+                        metadata,
+                    ),
                 )
                 .await;
                 return;
@@ -417,22 +414,21 @@ pub fn stream_chat_with_request(
         let stream_request = match build_request_for_provider(&request) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                let _ = tx
-                    .send(TokenDelta::from_terminal_event(StreamTerminalEvent::error(
-                        format!(
-                            "Streaming chat not supported for provider {}.",
-                            provider_name(&request.provider)
-                        ),
-                        String::new(),
-                        metadata,
-                    )))
-                    .await;
-                return;
-            }
-            Err(message) => {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(
+                        diagnostic(Code::Unsupported, INFERENCE),
+                        String::new(),
+                        metadata,
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(diagnostic) => {
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
                 )
                 .await;
                 return;
@@ -442,17 +438,6 @@ pub fn stream_chat_with_request(
     });
 
     (rx, cancel)
-}
-
-/// Short string identifier for a provider, used only in error messages.
-fn provider_name(p: &LlmProvider) -> &'static str {
-    match p {
-        LlmProvider::Api { .. } => "Api",
-        LlmProvider::OpenRouter { .. } => "OpenRouter",
-        LlmProvider::LocalLlama => "LocalLlama",
-        LlmProvider::MistralRs { .. } => "MistralRs",
-        LlmProvider::AwsBedrock { .. } => "AwsBedrock",
-    }
 }
 
 async fn send_terminal(tx: &mpsc::Sender<TokenDelta>, event: StreamTerminalEvent) {
@@ -781,11 +766,11 @@ async fn run_sse_stream(
         .build()
     {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
             send_terminal(
                 &tx,
-                StreamTerminalEvent::error(
-                    format!("Failed to build HTTP client: {}", e),
+                StreamTerminalEvent::failure(
+                    RuntimeDiagnostic::internal(INFERENCE),
                     String::new(),
                     metadata,
                 ),
@@ -818,34 +803,21 @@ async fn run_sse_stream(
         result = req.send() => match result {
             Ok(r) => r,
             Err(e) => {
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("HTTP request failed: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(HttpFailure::request(&e, INFERENCE).diagnostic, String::new(), metadata),
                 ).await;
                 return;
             }
         }
     };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status();
+    if !status.is_success() {
         send_terminal(
             &tx,
-            StreamTerminalEvent::error(
-                streaming_http_error_message(
-                    request.provider,
-                    &request.url,
-                    status,
-                    &body,
-                    request_id.as_deref(),
-                ),
+            StreamTerminalEvent::failure(
+                HttpFailure::status(status, INFERENCE).diagnostic,
                 String::new(),
                 metadata,
             ),
@@ -858,7 +830,6 @@ async fn run_sse_stream(
     let mut full_text = String::new();
     let mut usage: Option<StreamUsage> = None;
     let mut last_finish_reason: Option<String> = None;
-    let response_request_id = response_request_id(resp.headers());
     let mut byte_stream = resp.bytes_stream();
 
     loop {
@@ -877,18 +848,13 @@ async fn run_sse_stream(
         let bytes: Bytes = match next_chunk {
             Some(Ok(b)) => b,
             Some(Err(e)) => {
-                // Route the transport read error through the safe helper: a
-                // reqwest stream error Displays the request URL, which can
-                // embed userinfo / query credentials, and any registered
-                // provider secret could otherwise surface verbatim here.
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("Stream read error: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, full_text, metadata),
+                    StreamTerminalEvent::failure(
+                        HttpFailure::response(&e, INFERENCE).diagnostic,
+                        full_text,
+                        metadata,
+                    ),
                 )
                 .await;
                 return;
@@ -915,15 +881,10 @@ async fn run_sse_stream(
                     .await;
                     return;
                 }
-                Some(SseEvent::Error(message)) => {
-                    let message = crate::error::redacted_error_excerpt(
-                        &message,
-                        request.secrets.iter().map(String::as_str),
-                        500,
-                    );
+                Some(SseEvent::Error(diagnostic)) => {
                     send_terminal(
                         &tx,
-                        StreamTerminalEvent::error(message, full_text, metadata),
+                        StreamTerminalEvent::failure(diagnostic, full_text, metadata),
                     )
                     .await;
                     return;
@@ -969,16 +930,10 @@ async fn run_sse_stream(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             log::warn!(
-                                "{}",
-                                streaming_parse_error_message(
-                                    request.provider,
-                                    &request.url,
-                                    &e,
-                                    &payload,
-                                    response_request_id.as_deref(),
-                                )
+                                "Ignoring malformed SSE chunk: {}",
+                                diagnostic(Code::InvalidResponse, INFERENCE)
                             );
                         }
                     }
@@ -999,56 +954,6 @@ async fn run_sse_stream(
         ),
     )
     .await;
-}
-
-fn streaming_http_error_message(
-    provider: &str,
-    url: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-    request_id: Option<&str>,
-) -> String {
-    format!(
-        "Streaming chat HTTP error: provider={} path={} status={} body_bytes={} body_chars={}{}",
-        provider,
-        diagnostic_path(url),
-        status.as_u16(),
-        body.len(),
-        body.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
-}
-
-fn streaming_parse_error_message(
-    provider: &str,
-    url: &str,
-    error: &serde_json::Error,
-    payload: &str,
-    request_id: Option<&str>,
-) -> String {
-    format!(
-        "Failed to parse streaming chunk: provider={} path={} class={} detail={} payload_bytes={} payload_chars={}{}",
-        provider,
-        diagnostic_path(url),
-        json_error_class(error),
-        error,
-        payload.len(),
-        payload.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
-}
-
-fn json_error_class(error: &serde_json::Error) -> &'static str {
-    match error.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    }
 }
 
 /// In-memory request_id → cancel token registry.
@@ -1228,9 +1133,14 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    async fn spawn_http_error_mock(status: u16, status_text: &'static str, body: String) -> String {
+    async fn spawn_http_error_mock(
+        status: u16,
+        status_text: &'static str,
+        body: String,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let (keep_open, closed) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
@@ -1250,14 +1160,16 @@ mod tests {
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nX-Request-Id: stream_req_123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
                     status_text,
-                    body.len(),
+                    body.len() + 1,
                     body,
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                // Keep the body incomplete until the test has seen the
+                // terminal frame. Reading the body would block that frame.
+                let _ = closed.await;
             }
         });
-        format!("http://{}", addr)
+        (format!("http://{}", addr), keep_open)
     }
 
     /// Mock that streams the payload byte-by-byte with delays so the cancel
@@ -1384,13 +1296,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_http_error_uses_metadata_only_diagnostic() {
+    async fn stream_chat_rejects_non_2xx_without_waiting_for_error_body() {
         let api_key = "sk-stream-chat-secret";
         let prompt_echo = "patient transcript and private graph context";
         let body = format!(
             r#"{{"error":"bad auth {api_key}; {prompt_echo}","authorization":"Bearer bearer-stream-secret-12345","aws":"AKIA1234567890ABCDEF"}}"#
         );
-        let base = spawn_http_error_mock(401, "Unauthorized", body).await;
+        let (base, _keep_open) = spawn_http_error_mock(401, "Unauthorized", body).await;
         let provider = LlmProvider::Api {
             endpoint: base,
             api_key: api_key.to_string(),
@@ -1404,126 +1316,61 @@ mod tests {
             StreamParams::default(),
         ));
 
-        match rx.recv().await.expect("terminal frame") {
-            TokenDelta::Error { message, .. } => {
-                assert!(message.contains("Streaming chat HTTP error"));
-                assert!(message.contains("provider=api"));
-                assert!(message.contains("path=/chat/completions"));
-                assert!(message.contains("status=401"));
-                assert!(message.contains("request_id=stream_req_123"));
-                assert!(
-                    message.contains("body_bytes="),
-                    "error must carry body byte length, got: {message}"
-                );
-                assert!(
-                    message.contains("body_chars="),
-                    "error must carry body char length, got: {message}"
-                );
-                assert!(
-                    !message.contains("bad auth") && !message.contains(prompt_echo),
-                    "streaming error must not echo provider body or prompt context: {message}"
-                );
-                for leaked in [
-                    api_key,
-                    "bearer-stream-secret-12345",
-                    "AKIA1234567890ABCDEF",
-                ] {
-                    assert!(
-                        !message.contains(leaked),
-                        "streaming error leaked {leaked}: {message}"
-                    );
-                }
-            }
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("non-2xx must not wait for the body")
+            .expect("terminal frame")
+        {
+            TokenDelta::Error { message, .. } => assert_eq!(message, "runtime/request_rejected"),
             other => panic!("expected HTTP error terminal frame, got {other:?}"),
         }
     }
 
-    /// The streaming HTTP-error diagnostic must be metadata-only: it emits only
-    /// the URL *path* (never the query string or userinfo) plus body byte/char
-    /// counts, so no credential shape — API-key-like, bearer-token-like,
-    /// AWS-access-key-like, or URL userinfo/query credential — can reach the
-    /// UI-visible `TokenDelta::Error`, even when the provider echoes them in the
-    /// response body or they ride in the request URL.
-    #[test]
-    fn streaming_http_error_diagnostic_never_surfaces_any_credential_shape() {
-        let body = concat!(
-            r#"{"error":"echoed provider body; patient transcript","#,
-            r#""api_key":"sk-stream-body-secret-12345","#,
-            r#""authorization":"Bearer bearer-stream-body-secret-12345","#,
-            r#""aws":"AKIA1234567890ABCDEF"}"#,
-        );
-        // Assemble the userinfo at runtime so the source carries no contiguous
-        // scheme://user:pass@host literal (which secret scanners flag as a Basic
-        // Auth String); the runtime URL is byte-identical, so the redaction
-        // assertions below still exercise a real credential-bearing URL.
-        let userinfo = format!("{}:{}", "svc-user", "svc-pass");
-        let url = format!(
-            "https://{userinfo}@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345"
-        );
-        let message = streaming_http_error_message(
-            "api",
-            &url,
-            reqwest::StatusCode::UNAUTHORIZED,
-            body,
-            Some("stream_req_xyz"),
-        );
+    #[tokio::test]
+    async fn malformed_chunk_and_provider_error_do_not_leak_content() {
+        use crate::llm::http_diag::log_canary::Capture;
 
-        // Metadata context is preserved.
-        assert!(message.contains("Streaming chat HTTP error"));
-        assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
-        assert!(message.contains("status=401"));
-        assert!(message.contains("request_id=stream_req_xyz"));
-        assert!(message.contains(&format!("body_bytes={}", body.len())));
-        assert!(message.contains(&format!("body_chars={}", body.chars().count())));
-
-        // No credential shape, body content, or URL query/userinfo leaks.
-        for leaked in [
-            "sk-stream-body-secret-12345",
-            "bearer-stream-body-secret-12345",
-            "AKIA1234567890ABCDEF",
-            "svc-user:svc-pass",
-            "stream-url-secret-12345",
-            "stream-url-token-12345",
-            "echoed provider body",
-            "patient transcript",
-            "api_key=",
-            "token=",
-        ] {
-            assert!(
-                !message.contains(leaked),
-                "streaming HTTP diagnostic leaked {leaked}: {message}"
-            );
+        let key = "sse-credential-canary";
+        let prompt = format!("sse-prompt-canary{}", "x".repeat(2048));
+        let length = prompt.len().to_string();
+        let body = format!(
+            "data: {{\"choices\":\"sse-malformed-chunk-canary\"}}\n\n\
+             event: error\ndata: {{\"error\":\"sse-provider-body-canary {key} {prompt}\"}}\n\n"
+        );
+        let base = spawn_sse_mock_owned(body).await;
+        let logs = Capture::start();
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            LlmProvider::Api {
+                endpoint: format!("{base}/sse-path-canary?private=sse-query-canary"),
+                api_key: key.to_owned(),
+                model: "test-model".to_owned(),
+            },
+            vec![ChatMessage {
+                role: "user".to_owned(),
+                content: prompt,
+            }],
+            String::new(),
+            StreamParams::default(),
+        ));
+        match rx.recv().await.expect("terminal frame") {
+            TokenDelta::Error { message, full_text } => {
+                assert_eq!(message, "runtime/provider_unavailable");
+                assert!(full_text.is_empty());
+            }
+            other => panic!("expected SSE error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn streaming_parse_error_diagnostic_uses_payload_metadata_only() {
-        let payload =
-            r#"{"choices":[{"delta":{"content":"patient transcript and graph context"}}]"#;
-        let error = serde_json::from_str::<StreamChunk>(payload)
-            .expect_err("fixture must be malformed JSON");
-        let message = streaming_parse_error_message(
-            "api",
-            "https://provider.example/v1/chat/completions",
-            &error,
-            payload,
-            Some("parse_req_123"),
-        );
-
-        assert!(message.contains("Failed to parse streaming chunk"));
-        assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
-        assert!(message.contains("class=eof"));
-        assert!(message.contains("request_id=parse_req_123"));
-        assert!(message.contains(&format!("payload_bytes={}", payload.len())));
-        assert!(message.contains(&format!("payload_chars={}", payload.chars().count())));
-        assert!(
-            !message.contains("patient transcript")
-                && !message.contains("graph context")
-                && !message.contains(payload),
-            "parse diagnostic must not echo malformed SSE payload: {message}"
-        );
+        assert!(rx.recv().await.is_none());
+        assert!(logs.contents().contains("runtime/invalid_response"));
+        logs.assert_absent(&[
+            key,
+            "sse-prompt-canary",
+            "sse-malformed-chunk-canary",
+            "sse-provider-body-canary",
+            "sse-request-canary",
+            "sse-path-canary",
+            "sse-query-canary",
+            &length,
+        ]);
     }
 
     #[tokio::test]
@@ -1566,17 +1413,7 @@ mod tests {
             {
                 TokenDelta::Error { message, full_text } => {
                     assert!(full_text.is_empty());
-                    assert!(
-                        message.contains(&format!(
-                            "Privacy policy blocked prompt egress to {provider_name}"
-                        )),
-                        "blocked egress error should name provider and prompt class, got: {message}"
-                    );
-                    assert!(
-                        !message.contains("sensitive question")
-                            && !message.contains("sensitive graph context"),
-                        "blocked egress error must not echo prompt content: {message}"
-                    );
+                    assert_eq!(message, "runtime/policy_blocked");
                 }
                 other => panic!("expected blocked policy Error frame, got {other:?}"),
             }
@@ -1629,17 +1466,7 @@ mod tests {
                 Err(err) => err,
                 Ok(_) => panic!("default policy must reject before building a cloud request"),
             };
-            assert!(
-                err.contains(&format!(
-                    "Privacy policy blocked prompt egress to {provider_name}"
-                )),
-                "default egress error should name provider and prompt class, got: {err}"
-            );
-            assert!(err.contains("explicit_policy_required"), "got: {err}");
-            assert!(
-                !err.contains("sensitive question") && !err.contains("sensitive graph context"),
-                "default egress error must not echo prompt content: {err}"
-            );
+            assert_eq!(err, diagnostic(Code::PolicyBlocked, INFERENCE));
         }
     }
 
@@ -2379,15 +2206,7 @@ mod tests {
         {
             TokenDelta::Error { message, full_text } => {
                 assert!(full_text.is_empty());
-                assert!(
-                    message.contains("Privacy policy blocked prompt egress to llm.aws_bedrock"),
-                    "blocked Bedrock egress error should name the provider, got: {message}"
-                );
-                assert!(
-                    !message.contains("sensitive question")
-                        && !message.contains("sensitive graph context"),
-                    "blocked egress error must not echo prompt content: {message}"
-                );
+                assert_eq!(message, "runtime/policy_blocked");
             }
             other => panic!("expected blocked-egress Error frame, got {other:?}"),
         }
@@ -2778,7 +2597,7 @@ mod tests {
                     }
                 }
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-Id: sse-request-canary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(header.as_bytes()).await;
@@ -2789,14 +2608,7 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    /// Drives the SSE `SseEvent::Error` arm (streaming.rs `run_sse_stream`,
-    /// the `redacted_error_excerpt` call on the decoder error message) by
-    /// streaming a single frame larger than the decoder's 1 MiB cap so the
-    /// decoder reports an overflow. The frame body embeds an API key, a
-    /// `Bearer` token, an AWS access key, and a `?token=` URL credential; the
-    /// provider's `sk-` api_key is registered as a request secret. The
-    /// terminal `TokenDelta::Error` must be the metadata-only overflow
-    /// diagnostic with none of the injected credentials echoed back.
+    /// An oversized frame may contain provider data but its terminal diagnostic cannot.
     #[tokio::test]
     async fn stream_chat_sse_error_event_redacts_provider_secrets() {
         let api_key = "sk-sse-error-provider-secret-12345";
@@ -2834,10 +2646,7 @@ mod tests {
             .expect("terminal frame")
         {
             TokenDelta::Error { message, .. } => {
-                assert!(
-                    message.contains("SSE frame exceeded"),
-                    "SSE error path must surface the decoder overflow diagnostic, got: {message}"
-                );
+                assert_eq!(message, "runtime/protocol_error");
                 for leaked in [
                     api_key,
                     "bearer-sse-secret-12345",
@@ -2854,13 +2663,7 @@ mod tests {
         }
     }
 
-    /// Drives the transport-error arm (streaming.rs `run_sse_stream`, the
-    /// `req.send()` failure -> `redacted_error_excerpt` call) by pointing the
-    /// request at an unroutable endpoint whose URL embeds userinfo and a
-    /// `?api_key=` query credential, with the provider `sk-` api_key
-    /// registered as a request secret. reqwest's transport error Displays the
-    /// request URL, so the terminal `TokenDelta::Error` must redact every
-    /// registered/pattern secret before it reaches UI/log surfaces.
+    /// Even a transport error whose source contains the URL only returns a diagnostic token.
     #[tokio::test]
     async fn stream_chat_transport_error_redacts_registered_secrets() {
         let api_key = "sk-transport-provider-secret-12345";
@@ -2890,6 +2693,7 @@ mod tests {
         {
             TokenDelta::Error { message, full_text } => {
                 assert!(full_text.is_empty(), "transport error has no partial text");
+                assert_eq!(message, "runtime/network_unreachable");
                 for leaked in [api_key, "svc-user", "transport-query-secret-12345"] {
                     assert!(
                         !message.contains(leaked),
@@ -2905,10 +2709,7 @@ mod tests {
     /// the `byte_stream.next()` -> `Some(Err(e))` branch). The mock declares a
     /// large `Content-Length`, writes a partial SSE delta, then aborts the
     /// connection before satisfying it, forcing reqwest to surface a stream
-    /// read error whose Display includes the request URL. The endpoint embeds
-    /// userinfo + a query credential and the `sk-` api_key is registered, so
-    /// the terminal `TokenDelta::Error` must carry none of them — this guards
-    /// the production fix that routes this path through `redacted_error_excerpt`.
+    /// read error whose native source must not cross the terminal boundary.
     #[tokio::test]
     async fn stream_chat_read_error_redacts_registered_secrets() {
         let api_key = "sk-readerr-provider-secret-12345";
@@ -2967,6 +2768,7 @@ mod tests {
             match frame {
                 TokenDelta::Delta { .. } => continue,
                 TokenDelta::Error { message, .. } => {
+                    assert_eq!(message, "runtime/invalid_response");
                     for leaked in [api_key, "svc-user", "readerr-query-secret-12345"] {
                         assert!(
                             !message.contains(leaked),
