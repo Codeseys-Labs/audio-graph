@@ -1846,17 +1846,35 @@ struct PendingAppend {
 }
 
 mod transcript_commit;
+
+pub(super) fn remember_speaker_head(
+    path: &Path,
+    file: &File,
+    offset: u64,
+    head: Option<&CanonicalStreamHead>,
+) {
+    transcript_commit::remember_speaker_head(path, file, offset, head);
+}
+
 #[cfg(test)]
 pub(crate) use transcript_commit::tests::interrupted_historical_caption;
+pub use transcript_commit::tier::StreamReceiptEvidence;
+pub(crate) use transcript_commit::tier::receipt_evidence;
 pub(crate) mod transcript_export;
-pub(crate) use transcript_commit::CapturedTranscript;
+pub(crate) use transcript_commit::{
+    CapturedTranscript, PreparedProjectionStorage, ProjectionReceipt,
+};
 pub(crate) use transcript_commit::{
     PreparedTranscriptStorage, commit_transcript, transcript_recovery_artifacts,
 };
 pub use transcript_commit::{
-    TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
+    TranscriptCommitError, TranscriptGap, TranscriptReceipt, VerifiedTranscriptHead,
+    transcript_gaps,
 };
-pub(super) use transcript_commit::{capture_committed, read_committed};
+pub(super) use transcript_commit::{
+    capture_committed, capture_committed_projection_bounded, read_committed,
+    read_committed_projection,
+};
 #[cfg(test)]
 pub(super) use transcript_commit::{
     simulate_disk_full, simulate_failed_recovery_sync, simulate_failed_sync,
@@ -2183,6 +2201,12 @@ where
 
     pub fn head(&self) -> Option<&CanonicalStreamHead> {
         self.head.as_ref()
+    }
+
+    /// The frame prefix starts after the separator when extending an
+    /// unterminated legacy row. Valid only for a newly accepted append.
+    pub(super) fn next_frame_offset(&self) -> u64 {
+        self.byte_len + u64::from(self.byte_len > 0 && !self.ends_with_newline)
     }
 
     pub fn cached_event_count(&self) -> usize {
@@ -2673,10 +2697,22 @@ fn parse_structural_records(
     stream_id: &str,
     domain_schema_version: u32,
 ) -> Result<RawSnapshot, StructuralFailure> {
+    parse_structural_suffix(bytes, session_id, stream_id, domain_schema_version, None)
+}
+
+fn parse_structural_suffix(
+    bytes: &[u8],
+    session_id: &str,
+    stream_id: &str,
+    domain_schema_version: u32,
+    after: Option<(usize, &str, CanonicalRecordEncoding, u32)>,
+) -> Result<RawSnapshot, StructuralFailure> {
     let mut records = Vec::new();
     let mut event_ids = HashSet::new();
     let mut offset = 0;
-    let mut framed_seen = false;
+    let mut framed_seen =
+        after.is_some_and(|(_, _, enc, _)| enc == CanonicalRecordEncoding::FramedV1);
+    let prior = after.map_or(0, |a| a.0);
 
     while offset < bytes.len() {
         let newline = bytes[offset..]
@@ -2690,7 +2726,7 @@ fn parse_structural_records(
                 valid_up_to: offset,
                 repairable_unterminated_tail: true,
                 error: CanonicalLogError::CorruptRecord {
-                    record_index: records.len() + 1,
+                    record_index: prior + records.len() + 1,
                     reason: CanonicalCorruptionReason::InvalidFrame,
                     newline_terminated: false,
                 },
@@ -2708,13 +2744,12 @@ fn parse_structural_records(
             continue;
         }
 
-        let record_index = records.len() + 1;
+        let record_index = prior + records.len() + 1;
         let expected_sequence = record_index as u64;
-        let previous_hash = records
-            .last()
-            .map_or(ZERO_HASH, |record: &RawCanonicalRecord| {
-                record.record_hash.as_str()
-            });
+        let previous_hash = records.last().map_or(
+            after.map_or(ZERO_HASH, |a| a.1),
+            |record: &RawCanonicalRecord| record.record_hash.as_str(),
+        );
 
         match parse_structural_record(
             line,
@@ -2727,9 +2762,11 @@ fn parse_structural_records(
         ) {
             Ok(record) => {
                 if mixed_speaker_versions(stream_id, domain_schema_version)
-                    && records.last().is_some_and(|prev| {
-                        prev.domain_schema_version > record.domain_schema_version
-                    })
+                    && records
+                        .last()
+                        .map(|prev| prev.domain_schema_version)
+                        .or_else(|| after.map(|a| a.3))
+                        .is_some_and(|version| version > record.domain_schema_version)
                 {
                     return Err(StructuralFailure {
                         valid_up_to: offset,
@@ -2886,6 +2923,29 @@ fn parse_framed_v1(
     expected_sequence: u64,
     expected_previous_hash: &str,
 ) -> Result<RawCanonicalRecord, CanonicalCorruptionReason> {
+    parse_anchored_frame(
+        line,
+        session_id,
+        stream_id,
+        domain_schema_version,
+        expected_sequence,
+        FrameAnchor::Previous(expected_previous_hash),
+    )
+}
+
+enum FrameAnchor<'a> {
+    Previous(&'a str),
+    VerifiedHead(&'a str),
+}
+
+fn parse_anchored_frame(
+    line: &[u8],
+    session_id: &str,
+    stream_id: &str,
+    domain_schema_version: u32,
+    expected_sequence: u64,
+    anchor: FrameAnchor<'_>,
+) -> Result<RawCanonicalRecord, CanonicalCorruptionReason> {
     let length_start = FRAME_PREFIX_V1.len();
     let length_end = length_start + FRAME_LENGTH_HEX_BYTES;
     if line.len() <= length_end || line.get(length_end) != Some(&b' ') {
@@ -2942,7 +3002,7 @@ fn parse_framed_v1(
     if wire.sequence != expected_sequence {
         return Err(CanonicalCorruptionReason::SequenceMismatch);
     }
-    if wire.previous_hash != expected_previous_hash {
+    if matches!(anchor, FrameAnchor::Previous(hash) if wire.previous_hash != hash) {
         return Err(CanonicalCorruptionReason::PreviousHashMismatch);
     }
     wire.payload = canonicalize_json_value(wire.payload);
@@ -2975,7 +3035,9 @@ fn parse_framed_v1(
         &wire.payload_hash,
     )
     .map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
-    if record_hash != wire.record_hash {
+    if record_hash != wire.record_hash
+        || matches!(anchor, FrameAnchor::VerifiedHead(hash) if record_hash != hash)
+    {
         return Err(CanonicalCorruptionReason::RecordHashMismatch);
     }
     let commitment_hash = event_commitment_hash(

@@ -116,6 +116,17 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
     );
   }
 
+  const data = artifact.data;
+  const projection =
+    kind === "notes" && data && "projection_events" in data
+      ? data.notes
+      : kind === "graph" && data && "nodes" in data
+        ? data
+        : null;
+  const behind =
+    projection?.reviewProjectionStatuses?.includes("behind_transcript");
+  const gap =
+    projection?.reviewProjectionStatuses?.includes("recompute_required");
   const stale = review.stale || artifact.stale;
   return frame(
     <>
@@ -138,6 +149,19 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
             <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
           </button>
         </div>
+      )}
+      {(behind || gap) && (
+        <p
+          className="mx-(--space-5) mt-(--space-4) text-sm text-text-secondary"
+          role="status"
+        >
+          {[
+            behind && t("sessions.review.projectionBehindTranscript"),
+            gap && t("sessions.review.projectionGap"),
+          ]
+            .filter(Boolean)
+            .join(" ")}
+        </p>
       )}
       {children}
     </>,

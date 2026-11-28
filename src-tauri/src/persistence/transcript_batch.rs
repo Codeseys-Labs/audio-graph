@@ -298,8 +298,7 @@ pub(super) fn run(
     let mut live_index = TranscriptLiveIndex::default();
     let mut deferred = None;
     let mut recovery = Recovery::default();
-    let mut idle_retry = Duration::from_millis(100);
-    let mut retry_at = Instant::now();
+    let mut retry = super::RecoveryBackoff::new();
     #[cfg(test)]
     let mut paused = None::<(mpsc::Sender<()>, mpsc::Receiver<()>)>;
     #[cfg(test)]
@@ -350,16 +349,11 @@ pub(super) fn run(
             Ok(Message::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) if shutdown.load(Ordering::SeqCst) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if recovery.needs_resolution && Instant::now() >= retry_at {
-                    if recovery
+                if recovery.needs_resolution && Instant::now() >= retry.next {
+                    let resolved = recovery
                         .resolve(storage, &mut live_index, path, session)
-                        .is_err()
-                    {
-                        idle_retry = (idle_retry * 2).min(Duration::from_secs(5));
-                    } else {
-                        idle_retry = Duration::from_millis(100);
-                    }
-                    retry_at = Instant::now() + idle_retry;
+                        .is_ok();
+                    retry.record(Instant::now(), resolved);
                 }
             }
         }
