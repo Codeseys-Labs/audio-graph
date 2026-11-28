@@ -1424,7 +1424,7 @@ pub fn transcript_gaps(path: &Path) -> Result<Vec<TranscriptGap>, TranscriptComm
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(test)]
 mod domain_tests;

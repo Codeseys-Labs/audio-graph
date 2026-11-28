@@ -315,6 +315,16 @@ fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl Fn
     }
 }
 
+/// Leave a complete first frame on disk at the subprocess's pre-sync cut.
+pub(crate) fn interrupted_historical_caption(root: &Path) -> (&'static str, TranscriptEvent) {
+    let directory = root.join("transcripts");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{SESSION}.events.jsonl"));
+    kill_at_writer_checkpoint(&path, "complete", || {});
+    assert!(path.with_added_extension("attempt").is_file());
+    (SESSION, transcript_event(SPAN, CONTENT))
+}
+
 fn group_events() -> [TranscriptEvent; 3] {
     [
         transcript_event("willow", "second"),

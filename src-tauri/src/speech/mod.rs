@@ -14807,6 +14807,91 @@ mod tests_status {
     }
 
     #[test]
+    fn startup_recovers_a_historical_caption_for_review_and_export_without_live_dispatch() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("historical-caption");
+        let _guard = DataDirGuard::set(&dir);
+        let (historical, revision) =
+            crate::persistence::canonical_log::interrupted_historical_caption(&dir);
+        let app = AppState::new();
+        let active = app.current_session_id();
+        assert_ne!(active, historical);
+        let (generator, model_calls) = FnProjectionPatchGenerator::new(|_, _, _, _, _| {
+            panic!("historical text reached a model")
+        });
+        let (dispatch, sink) = projection_dispatch_for_app(&app, generator);
+        let live_publications = Arc::new(AtomicUsize::new(0));
+        let calls = live_publications.clone();
+        let ledger = app.transcript_ledger.clone();
+        let schedulers = app.projection_schedulers.clone();
+        let payload: events::AsrSpanRevisionPayload =
+            serde_json::from_value(serde_json::to_value(&revision).unwrap()).unwrap();
+        let observed_payload = payload.clone();
+        // Make even the event identity and content identical. Only the session
+        // distinguishes this waiting live publication from the crashed one.
+        let publication =
+            super::PendingPublication::register(active.clone(), &payload, move |receipt, _| {
+                if receipt.is_ok() {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    return super::observe_transcript_receipt(
+                        None,
+                        &ledger,
+                        &schedulers,
+                        Some(&dispatch),
+                        &observed_payload,
+                        &active,
+                        receipt,
+                    );
+                }
+                false
+            });
+        crate::persistence::transcript_startup::recover_at_startup();
+        let (review, portable) = tauri::async_runtime::block_on(async {
+            let review = crate::commands::load_session(historical.into())
+                .await
+                .unwrap();
+            let portable = crate::commands::export_session_bundle(historical.into())
+                .await
+                .unwrap();
+            (review, portable)
+        });
+        assert_eq!(
+            review.transcript_events.as_slice(),
+            std::slice::from_ref(&revision)
+        );
+        assert_eq!(portable.session_id, historical);
+        assert_eq!(
+            portable.transcript_events.as_slice(),
+            std::slice::from_ref(&revision)
+        );
+        assert_eq!(review.transcript.len(), 1);
+        assert_eq!(review.transcript[0].text, revision.text);
+        assert_eq!(portable.transcript.len(), 1);
+        assert_eq!(portable.transcript[0].text, revision.text);
+        assert!(portable.diarization_events.is_empty() && portable.projection_events.is_empty());
+        assert!(portable.notes.is_none() && portable.materialized_graph.is_none());
+        assert!(portable.graph.is_none());
+        assert!(review.graph.nodes.is_empty() && review.graph.links.is_empty());
+        assert!(app.transcript_buffer.read().unwrap().is_empty());
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        assert_eq!(live_publications.load(Ordering::SeqCst), 0);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.patch_count(), 0);
+        publication.observe(
+            Err(crate::persistence::canonical_log::TranscriptCommitError::WriterAbsent),
+            false,
+        );
+        drain_app_writers(&app);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn runtime_projection_dispatch_applies_fake_notes_and_graph_patches() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()

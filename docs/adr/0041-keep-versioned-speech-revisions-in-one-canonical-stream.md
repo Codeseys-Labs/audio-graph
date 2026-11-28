@@ -214,6 +214,14 @@ appear late in its span's position. Exact provider redelivery after process
 death cannot be required because the provider connection and source audio
 may both be gone. Conflicting history remains a typed refusal.
 
+Startup resolves an earlier session's attempt before Review or export reads
+it. Recovered captions belong to that session's history. Only an outstanding
+publication owned by the same live capture can emit a caption or turn and
+schedule derived work. After a restart those publications are gone. Startup
+does not send historical content to a provider or generate speaker, extraction
+or graph updates from it. The canonical log supplies Review and export without
+a persisted publication queue.
+
 ## Consequences
 
 - **Positive:** One canonical sequence orders all legacy and v2 revisions, so

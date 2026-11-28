@@ -2370,6 +2370,7 @@ pub(crate) struct TranscriptCommitClient {
 }
 
 impl TranscriptCommitClient {
+    #[cfg(test)]
     pub(crate) fn append_live(
         &self,
         event: &TranscriptEvent,
@@ -2378,21 +2379,13 @@ impl TranscriptCommitClient {
         self.submit_live(event, ledger)?.wait()
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_live(
         &self,
         event: &TranscriptEvent,
         ledger: Arc<Mutex<TranscriptLedger>>,
     ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
-        self.submit_live_with_timeout(event, ledger, TRANSCRIPT_ACK_TIMEOUT)
-    }
-
-    fn submit_live_with_timeout(
-        &self,
-        event: &TranscriptEvent,
-        ledger: Arc<Mutex<TranscriptLedger>>,
-        timeout: std::time::Duration,
-    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
-        self.submit_live_observed(event, ledger, timeout, None)
+        self.submit_live_observed(event, ledger, TRANSCRIPT_ACK_TIMEOUT, None)
     }
 
     pub(crate) fn submit_live_with_publication(

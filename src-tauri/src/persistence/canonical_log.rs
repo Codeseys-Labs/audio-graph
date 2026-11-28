@@ -1846,6 +1846,8 @@ struct PendingAppend {
 }
 
 mod transcript_commit;
+#[cfg(test)]
+pub(crate) use transcript_commit::tests::interrupted_historical_caption;
 pub(crate) mod transcript_export;
 pub(crate) use transcript_commit::CapturedTranscript;
 pub(crate) use transcript_commit::{
