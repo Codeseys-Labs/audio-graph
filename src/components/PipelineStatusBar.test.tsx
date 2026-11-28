@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
@@ -33,6 +33,10 @@ function allIdle(): PipelineStatus {
     entity_extraction: idle,
     graph: idle,
   };
+}
+
+function publish(status: PipelineStatus) {
+  act(() => useAudioGraphStore.getState().setPipelineStatus(status));
 }
 
 // SHELL-R3 (plan §R3, ADR-0046, folds audio-graph-50e3): the footer
@@ -85,6 +89,86 @@ function resetStore(
 describe("PipelineStatusBar", () => {
   beforeEach(() => {
     resetStore();
+  });
+
+  it.each([
+    ["en", "writer_absent", "Transcript is not being saved"],
+    ["pt", "writer_absent", "A transcrição não está sendo salva"],
+    [
+      "en",
+      "storage_full",
+      "Transcript is not being saved because storage is full",
+    ],
+    [
+      "pt",
+      "storage_full",
+      "A transcrição não está sendo salva porque o armazenamento está cheio",
+    ],
+    [
+      "en",
+      "write_failed",
+      "Transcript is not being saved because the write failed",
+    ],
+    [
+      "pt",
+      "write_failed",
+      "A transcrição não está sendo salva porque houve uma falha na gravação",
+    ],
+    [
+      "en",
+      "confirmation_delayed",
+      "Waiting for confirmation that the transcript was saved",
+    ],
+    [
+      "pt",
+      "confirmation_delayed",
+      "Aguardando confirmação de que a transcrição foi salva",
+    ],
+  ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({ ...allIdle(), transcript_not_saving: reason });
+      const bar = screen.getByRole("status");
+      expect(bar).toHaveAttribute("aria-live", "polite");
+      const warning = within(bar).getByText(sentence);
+      expect(warning.querySelector("svg")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      publish({ ...allIdle(), transcript_not_saving: reason });
+      expect(within(bar).getByText(sentence)).toBe(warning);
+      publish(allIdle());
+      expect(within(bar).queryByText(sentence)).toBeNull();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
+  });
+
+  it.each([
+    ["en", "Transcript saved. Crash recovery is unverified on this storage."],
+    [
+      "pt",
+      "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
+    ],
+  ])("keeps the %s storage qualification notice visible while recording", async (locale, message) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    resetStore({ isCapturing: true });
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({ ...allIdle(), transcript_crash_safety_unverified: true });
+      const notice = screen.getByText(message);
+      publish({ ...allIdle(), transcript_crash_safety_unverified: true });
+      expect(screen.getByText(message)).toBe(notice);
+      publish(allIdle());
+      expect(notice).not.toBeInTheDocument();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
   });
 
   it("renders the status landmark with an accessible name", () => {
