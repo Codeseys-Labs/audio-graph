@@ -201,6 +201,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn healthy_session_requires_at_least_thirty_seconds_after_readiness() {
+        let ready_at = tokio::time::Instant::now();
+        let boundary = Duration::from_secs(30);
+        let tick = Duration::from_millis(1);
+        for (elapsed, expected) in [
+            (boundary - tick, false),
+            (boundary, true),
+            (boundary + tick, true),
+        ] {
+            assert_eq!(
+                should_reset_reconnect_budget(Some(ready_at), || ready_at + elapsed),
+                expected
+            );
+        }
+        assert!(!should_reset_reconnect_budget(None, || ready_at + boundary));
+    }
+
+    #[test]
     fn default_backoff_schedule_matches_provider_contract() {
         // Fast head (unchanged) then the cold-restart tail (review m1).
         assert_eq!(backoff_for_attempt(0), None);

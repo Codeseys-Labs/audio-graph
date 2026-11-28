@@ -23,9 +23,9 @@
 //! a `crossbeam_channel` that the speech processor consumes.
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
-    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
-    websocket_write_error,
+    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
+    websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -217,11 +217,11 @@ impl std::fmt::Debug for DeepgramConfig {
 /// ([`crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS`]) this is only
 /// ~6.4s of audio — well beyond any *healthy* send window, so hitting it while
 /// the socket is up signals a bug or a stuck writer. New chunks are then dropped
-/// and `user_disconnected` is flipped so the caller sees a clean error.
+/// and the backlog timeout is latched.
 ///
 /// OVERFLOW POLICY (deliberate; review m2) — the ASR clients (Deepgram,
 /// AssemblyAI, Soniox, OpenAI-realtime) all use this **fail-fast** cap: on
-/// overflow they flip `user_disconnected` and return an error, ending the
+/// overflow they latch a backlog timeout and return an error, ending the
 /// session. That is the right choice for transcription because a dropped audio
 /// window produces a *silently wrong* transcript — words vanish with no visible
 /// signal — so it is safer to end loudly than to emit a transcript with
@@ -330,7 +330,7 @@ pub struct DeepgramStreamingClient {
     /// Used by the reader loop to distinguish a user-initiated teardown
     /// (do not auto-reconnect) from a network error or server close
     /// (auto-reconnect with exponential backoff).
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     /// One-shot guard ensuring `Disconnected` is emitted at most once per
     /// session teardown across `disconnect()` and the session task.
     disconnected_emitted: Arc<AtomicBool>,
@@ -384,7 +384,7 @@ impl DeepgramStreamingClient {
             event_tx,
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
+            stop_signal: Arc::new(AsrSessionStop::default()),
             disconnected_emitted: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
@@ -420,11 +420,11 @@ impl DeepgramStreamingClient {
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
-        let user_disconnected = Arc::clone(&self.user_disconnected);
+        let stop_signal = Arc::clone(&self.stop_signal);
         let disconnected_emitted = Arc::clone(&self.disconnected_emitted);
         // Reset on (re)connect so any prior teardown flag does not poison a
         // fresh session.
-        user_disconnected.store(false, Ordering::SeqCst);
+        stop_signal.reset();
         disconnected_emitted.store(false, Ordering::SeqCst);
         // Reset any stale count from a prior session.
         self.pending_chunks
@@ -457,7 +457,7 @@ impl DeepgramStreamingClient {
                 config,
                 event_tx,
                 connected,
-                user_disconnected,
+                stop_signal,
                 disconnected_emitted,
                 pending_chunks: Arc::clone(&pending_chunks),
                 #[cfg(test)]
@@ -491,14 +491,20 @@ impl DeepgramStreamingClient {
     /// # Behaviour during auto-reconnect
     ///
     /// This method *does not* check the `connected` flag — only
-    /// `user_disconnected`. That way, if the session task is in the middle of
+    /// `stop_signal`. That way, if the session task is in the middle of
     /// a reconnect cycle, audio is still queued to the unbounded channel and
     /// will be flushed to Deepgram as soon as the new socket is open. The
     /// caller never sees a spurious "Not connected" error for a transient
     /// network hiccup.
     pub fn send_audio(&self, audio: &[f32]) -> Result<(), String> {
-        if self.user_disconnected.load(Ordering::SeqCst) {
-            return Err("Deepgram client has been disconnected".to_string());
+        match self.stop_signal.reason() {
+            Some(AsrStopReason::UserRequested) => {
+                return Err("Deepgram client has been disconnected".to_string());
+            }
+            Some(AsrStopReason::BacklogTimeout) => {
+                return Err(websocket_diagnostic(Code::Timeout).to_string());
+            }
+            None => {}
         }
 
         if audio.is_empty() {
@@ -520,9 +526,8 @@ impl DeepgramStreamingClient {
         // socket is healthy, widened to the reconnect-scoped cap while a
         // reconnect is climbing the ladder (and through the post-reconnect drain
         // window) so a long capture can ride out a multi-minute partition
-        // instead of dying ~6s in (Codex P2). Flipping `user_disconnected` is
-        // deliberate: once we start losing data the caller deserves to know the
-        // session is effectively dead rather than silently seeing gaps.
+        // instead of dying ~6s in (Codex P2). Once this cap is reached, reject further audio
+        // and prevent another reconnect.
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -534,11 +539,8 @@ impl DeepgramStreamingClient {
             RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
         );
         if depth >= cap {
-            self.user_disconnected
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(format!(
-                "Deepgram audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
-            ));
+            self.stop_signal.request(AsrStopReason::BacklogTimeout);
+            return Err(websocket_diagnostic(Code::Timeout).to_string());
         }
 
         // f32 -> i16 LE PCM bytes
@@ -583,7 +585,7 @@ impl DeepgramStreamingClient {
     ///
     /// Sends a close frame, then blocks (bounded) until the session task's
     /// close-drain has actually finished before returning. Setting
-    /// `user_disconnected` prevents the session task from attempting to
+    /// `stop_signal` prevents the session task from attempting to
     /// auto-reconnect.
     ///
     /// # Why this blocks (audio-graph-653a)
@@ -608,11 +610,11 @@ impl DeepgramStreamingClient {
     /// no-op in the common case -- so `Disconnected` reaches `event_rx`
     /// AFTER any drained `Transcript`/`Turn` events, not before.
     pub fn disconnect(&mut self) {
-        log::info!("DeepgramStreamingClient: disconnecting (user-initiated)");
+        log::info!("DeepgramStreamingClient: disconnecting");
 
         // Mark this teardown as user-initiated so the session task does not
         // try to reconnect after the close frame is observed.
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
 
         // Signal not connected first (stops send_audio calls).
         self.connected.store(false, Ordering::SeqCst);
@@ -654,7 +656,7 @@ impl Drop for DeepgramStreamingClient {
     fn drop(&mut self) {
         // Mark teardown as user-initiated so the session task exits cleanly
         // instead of trying to reconnect after we shut the runtime down.
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
 
         // Signal writer to stop.
@@ -1117,7 +1119,7 @@ struct DeepgramSessionCtx {
     config: DeepgramConfig,
     event_tx: crossbeam_channel::Sender<DeepgramEvent>,
     connected: Arc<AtomicBool>,
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     disconnected_emitted: Arc<AtomicBool>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1144,7 +1146,7 @@ fn emit_disconnected_once(
 /// half reports a disconnect (server Close frame, tungstenite error, etc.),
 /// the task:
 ///
-/// 1. Checks the `user_disconnected` flag — if set, exits silently.
+/// 1. Checks the `stop_signal` flag — if set, exits silently.
 /// 2. Emits `Disconnected` + a fresh `Reconnecting { attempt }` event.
 /// 3. Sleeps for the exponential backoff period (1s/2s/5s/10s).
 /// 4. Calls [`open_ws`] to re-establish the socket.
@@ -1192,7 +1194,7 @@ async fn session_task_with_backoff(
         config,
         event_tx,
         connected,
-        user_disconnected,
+        stop_signal,
         disconnected_emitted,
         pending_chunks,
         #[cfg(test)]
@@ -1222,7 +1224,7 @@ async fn session_task_with_backoff(
             &mut reader,
             &mut audio_rx,
             &event_tx,
-            &user_disconnected,
+            &stop_signal,
             &pending_chunks,
             &write_guard,
         )
@@ -1235,6 +1237,15 @@ async fn session_task_with_backoff(
             reconnect_attempts = 0;
         }
 
+        let disconnect = if stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+            && !matches!(
+                disconnect,
+                DisconnectKind::TerminalError(_) | DisconnectKind::PolicyBlocked(_)
+            ) {
+            DisconnectKind::TerminalError(websocket_diagnostic(Code::Timeout))
+        } else {
+            disconnect
+        };
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 // Clean end — the user asked to stop, or we ran out of audio
@@ -1258,7 +1269,7 @@ async fn session_task_with_backoff(
                 // Network-ish failure. If the user *also* asked to disconnect
                 // (e.g. they hit stop just as the socket was dying), honour
                 // that and skip the reconnect dance.
-                if user_disconnected.load(Ordering::SeqCst) {
+                if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                     emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
@@ -1282,6 +1293,16 @@ async fn session_task_with_backoff(
 
                 let mut last_open_error = None;
                 let reconnected = loop {
+                    match stop_signal.reason() {
+                        Some(AsrStopReason::UserRequested) => break false,
+                        Some(AsrStopReason::BacklogTimeout) => {
+                            let _ = event_tx.send(DeepgramEvent::Error {
+                                message: websocket_diagnostic(Code::Timeout),
+                            });
+                            break false;
+                        }
+                        None => {}
+                    }
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
                             attempt,
@@ -1310,21 +1331,11 @@ async fn session_task_with_backoff(
                         backoff_secs: backoff,
                     });
 
-                    // Sleep for the backoff window, but bail out early if the
-                    // user cancels during the wait.
-                    let sleep = tokio::time::sleep(backoff_duration(backoff));
-                    tokio::pin!(sleep);
-                    loop {
-                        tokio::select! {
-                            _ = &mut sleep => break,
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                if user_disconnected.load(Ordering::SeqCst) {
-                                    log::info!("Deepgram session: user cancelled during backoff");
-                                    emit_disconnected_once(&event_tx, &disconnected_emitted);
-                                    return;
-                                }
-                            }
-                        }
+                    stop_signal
+                        .wait_for_backoff(backoff_duration(backoff))
+                        .await;
+                    if stop_signal.reason().is_some() {
+                        continue;
                     }
 
                     // Attempt the reconnect. Deepgram has no setup handshake —
@@ -1337,6 +1348,7 @@ async fn session_task_with_backoff(
                     let reconnect_result = open_ws(&config).await;
 
                     match reconnect_result {
+                        Ok(_) if stop_signal.reason().is_some() => continue,
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
@@ -1383,14 +1395,8 @@ async fn session_task_with_backoff(
 /// short deadline instead of waiting out the full production
 /// [`DEEPGRAM_CLOSE_DRAIN_TIMEOUT`] twice (once per arm's test).
 ///
-/// Deliberately returns `()`, not a [`DisconnectKind`]: no matter how the
-/// drain ends — server Close, reader-stream end, a read error, or the
-/// deadline — the caller (both arms) always classifies the teardown as the
-/// same clean-end `DisconnectKind` it already returns today. That is what
-/// keeps a flaky/slow/silent server during the drain window from ever being
-/// misclassified as a network error or tripping the reconnect ladder
-/// (audio-graph-653a acceptance: server-Close-during-drain and
-/// deadline-exhaustion both stay on the clean-end path).
+/// Returns a terminal provider diagnostic when it ends the drain. The caller
+/// can preserve it for a backlog timeout while ordinary teardown stays clean.
 ///
 /// No keepalive ticks fire in here — this loop does not select on the
 /// keep-alive timer, so nothing is sent to Deepgram after `Terminal` except
@@ -1399,7 +1405,7 @@ async fn drain_after_terminal(
     reader: &mut AsrWsReader,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
     deadline: Duration,
-) {
+) -> Option<RuntimeDiagnostic> {
     let sleep = tokio::time::sleep(deadline);
     tokio::pin!(sleep);
 
@@ -1409,24 +1415,25 @@ async fn drain_after_terminal(
                 log::info!(
                     "Deepgram: close-drain deadline ({deadline:?}) elapsed before server Close"
                 );
-                return;
+                return None;
             }
             frame = reader.next() => {
                 match frame {
                     None => {
                         log::info!("Deepgram: close-drain reader ended without an explicit Close");
-                        return;
+                        return None;
                     }
                     Some(Ok(Message::Close(_))) => {
                         log::info!("Deepgram: close-drain observed the server's Close frame");
-                        return;
+                        return None;
                     }
                     Some(Ok(Message::Text(text))) => {
                         // Same handling path as the live loop: a final
                         // transcript the server flushes in response to
                         // Terminal lands exactly like a live-phase message.
-                        if process_server_message(&text, event_tx).is_some() {
-                            return;
+                        if let Some(message) = process_server_message(&text, event_tx) {
+                            log::warn!("Deepgram: terminal response during teardown {message}");
+                            return Some(message);
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
@@ -1444,7 +1451,7 @@ async fn drain_after_terminal(
                         // the key before it reaches logs.
                         let diag = websocket_error(&e);
                         log::info!("Deepgram: {diag}");
-                        return;
+                        return None;
                     }
                 }
             }
@@ -1463,7 +1470,7 @@ async fn run_io(
     reader: &mut AsrWsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
 ) -> DisconnectKind {
@@ -1472,7 +1479,7 @@ async fn run_io(
         reader,
         audio_rx,
         event_tx,
-        user_disconnected,
+        stop_signal,
         pending_chunks,
         write_guard,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
@@ -1486,7 +1493,7 @@ async fn run_io_with_keepalive_interval(
     reader: &mut AsrWsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
     keepalive_interval: Duration,
@@ -1570,13 +1577,18 @@ async fn run_io_with_keepalive_interval(
                         let _ = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
                             .await;
-                        drain_after_terminal(
+                        let terminal = drain_after_terminal(
                             reader,
                             event_tx,
                             DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
                         )
                         .await;
                         let _ = writer.close().await;
+                        if let Some(message) = terminal
+                            && stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+                        {
+                            return DisconnectKind::TerminalError(message);
+                        }
                         return DisconnectKind::UserRequested;
                     }
                     None => {
@@ -1589,13 +1601,18 @@ async fn run_io_with_keepalive_interval(
                         let _ = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
                             .await;
-                        drain_after_terminal(
+                        let terminal = drain_after_terminal(
                             reader,
                             event_tx,
                             DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
                         )
                         .await;
                         let _ = writer.close().await;
+                        if let Some(message) = terminal
+                            && stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+                        {
+                            return DisconnectKind::TerminalError(message);
+                        }
                         return DisconnectKind::WriterEnded;
                     }
                 }
@@ -1612,7 +1629,8 @@ async fn run_io_with_keepalive_interval(
                 match result {
                     Ok(Message::Text(text)) => {
                         if let Some(message) = process_server_message(&text, event_tx) {
-                            if user_disconnected.load(Ordering::SeqCst) {
+                            if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
+                                log::warn!("Deepgram: terminal response during teardown {message}");
                                 return DisconnectKind::UserRequested;
                             }
                             return DisconnectKind::TerminalError(message);
@@ -1622,7 +1640,7 @@ async fn run_io_with_keepalive_interval(
                         // If the user was the one asking to close, honour that;
                         // otherwise classify as a server-initiated close that
                         // should trigger reconnect.
-                        if user_disconnected.load(Ordering::SeqCst) {
+                        if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                             return DisconnectKind::UserRequested;
                         }
                         let diagnostic = websocket_close(frame.as_ref());
@@ -2339,7 +2357,7 @@ mod tests {
                 let (mut writer, mut reader) = socket.split();
                 let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
                 let (event_tx, event_rx) = crossbeam_channel::unbounded();
-                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let stop_signal = Arc::new(AsrSessionStop::default());
                 let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
                     audio.is_some(),
                 )));
@@ -2355,7 +2373,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                     keepalive_interval,
@@ -2937,22 +2955,22 @@ mod tests {
     #[test]
     fn steady_state_backlog_fails_fast_at_the_200_chunk_cap() {
         // Socket healthy: the fail-fast cap must be the steady 200, and hitting
-        // it flips user_disconnected (the m2 fail-fast policy is unchanged).
+        // it flips stop_signal (the m2 fail-fast policy is unchanged).
         let (client, _rx) = client_with_channel(true);
         client.pending_chunks.store(
             AUDIO_BUFFER_MAX_CHUNKS,
             std::sync::atomic::Ordering::Relaxed,
         );
         let err = client.send_audio(&[0.1, -0.1]).unwrap_err();
-        assert!(err.contains(&format!("{AUDIO_BUFFER_MAX_CHUNKS}")));
-        assert!(client.user_disconnected.load(Ordering::SeqCst));
+        assert_eq!(err, websocket_diagnostic(Code::Timeout).to_string());
+        assert!(client.stop_signal.reason() == Some(AsrStopReason::BacklogTimeout));
     }
 
     #[test]
     fn reconnecting_backlog_grows_past_the_steady_cap_without_disconnecting() {
         // Socket down (mid-reconnect): a backlog well past the steady 200 cap
         // must still enqueue — otherwise the multi-minute ladder tail (m1) is
-        // dead code for long captures (Codex P2). user_disconnected stays clear.
+        // dead code for long captures (Codex P2). stop_signal stays clear.
         let (client, _rx) = client_with_channel(false);
         client.pending_chunks.store(
             AUDIO_BUFFER_MAX_CHUNKS + 500,
@@ -2962,7 +2980,7 @@ mod tests {
             client.send_audio(&[0.1, -0.1]).is_ok(),
             "reconnect-scoped cap must accept a backlog past the steady 200"
         );
-        assert!(!client.user_disconnected.load(Ordering::SeqCst));
+        assert!(client.stop_signal.reason().is_none());
         assert!(client.reconnect_backlog_active.load(Ordering::Relaxed));
     }
 
@@ -2976,8 +2994,9 @@ mod tests {
             std::sync::atomic::Ordering::Relaxed,
         );
         let err = client.send_audio(&[0.1, -0.1]).unwrap_err();
-        assert!(err.contains(&format!("{RECONNECT_AUDIO_BUFFER_MAX_CHUNKS}")));
-        assert!(client.user_disconnected.load(Ordering::SeqCst));
+        assert_eq!(err, websocket_diagnostic(Code::Timeout).to_string());
+        assert_eq!(client.send_audio(&[0.1]).unwrap_err(), err);
+        assert!(client.stop_signal.reason() == Some(AsrStopReason::BacklogTimeout));
     }
 
     #[test]
@@ -3434,7 +3453,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -3442,7 +3461,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             // Move the write guard into the spawned block, mirroring the
             // `Arc::clone` re-bindings above so `async move` captures it here.
@@ -3454,7 +3473,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                 )
@@ -3563,7 +3582,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -3571,7 +3590,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             // Move the write guard into the spawned block, mirroring the
             // `Arc::clone` re-bindings above so `async move` captures it here.
@@ -3583,7 +3602,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                     Duration::from_millis(20),
@@ -3680,12 +3699,13 @@ mod tests {
         // (well under it, asserted below), the drain resolved via the
         // server's Close frame, not the deadline.
         let started = std::time::Instant::now();
-        tokio::time::timeout(
+        let terminal = tokio::time::timeout(
             Duration::from_millis(500),
             drain_after_terminal(&mut reader, &event_tx, Duration::from_secs(5)),
         )
         .await
         .expect("drain should resolve via server Close, not the 5s deadline");
+        assert!(terminal.is_none());
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "drain should end promptly on server Close, not wait out the deadline"
@@ -3747,7 +3767,11 @@ mod tests {
 
         let deadline = Duration::from_millis(60);
         let started = std::time::Instant::now();
-        drain_after_terminal(&mut reader, &event_tx, deadline).await;
+        assert!(
+            drain_after_terminal(&mut reader, &event_tx, deadline)
+                .await
+                .is_none()
+        );
         let elapsed = started.elapsed();
 
         assert!(
@@ -3767,25 +3791,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn terminal_frame_during_user_stop_is_a_clean_disconnect() {
-        for drain_started in [false, true] {
+    async fn terminal_frame_during_teardown_preserves_the_shutdown_reason() {
+        use crate::test_log_capture::ThreadLogCapture;
+
+        enum Teardown {
+            PendingUserStop,
+            UserDrain,
+            WriterEnded,
+            BacklogDrain,
+        }
+
+        for teardown in [
+            Teardown::PendingUserStop,
+            Teardown::UserDrain,
+            Teardown::WriterEnded,
+            Teardown::BacklogDrain,
+        ] {
+            let draining = !matches!(teardown, Teardown::PendingUserStop);
             let mut steps = Vec::new();
-            if drain_started {
+            if draining {
                 steps.push(ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()));
             }
             steps.push(ws_fixture::ServerStep::send_text(
                 r#"{"type":"Error","err_code":"INVALID_AUTH","description":"private stop note"}"#,
             ));
-            if drain_started {
+            if draining {
                 steps.push(ws_fixture::ServerStep::expect_close());
             }
             let (url, server) = ws_fixture::spawn_scripted_server(steps).await;
             let (writer, reader) = ws_fixture::connect_client(&url).await.split();
-            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
-            if drain_started {
-                audio_tx.send(AudioCmd::Stop).unwrap();
+            let (mut client, audio_rx) = client_with_channel(false);
+            if matches!(teardown, Teardown::BacklogDrain) {
+                client
+                    .pending_chunks
+                    .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
+                assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+            }
+            if matches!(teardown, Teardown::WriterEnded) {
+                drop(client.audio_tx.take());
+            } else {
+                client.stop_signal.request(AsrStopReason::UserRequested);
+                if draining {
+                    client
+                        .audio_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(AudioCmd::Stop)
+                        .unwrap();
+                }
             }
             let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            let logs = ThreadLogCapture::start();
             tokio::time::timeout(
                 Duration::from_secs(3),
                 session_task(DeepgramSessionCtx {
@@ -3795,18 +3851,41 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(true)),
+                    stop_signal: Arc::clone(&client.stop_signal),
                     disconnected_emitted: Arc::new(AtomicBool::new(false)),
-                    pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    reconnect_opener: Some(Arc::new(|_| panic!("user stop must not reconnect"))),
+                    pending_chunks: Arc::clone(&client.pending_chunks),
+                    reconnect_opener: Some(Arc::new(|_| panic!("teardown must not reconnect"))),
                     run_io_entries: None,
                 }),
             )
             .await
-            .expect("stop must complete after the terminal frame");
+            .expect("teardown must complete after the terminal frame");
             server.await.unwrap();
+            let records = logs.finish();
+            let terminal_logs: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record
+                        .message
+                        .starts_with("Deepgram: terminal response during teardown")
+                })
+                .map(|record| record.message.as_str())
+                .collect();
+            assert_eq!(
+                terminal_logs,
+                ["Deepgram: terminal response during teardown runtime/credential_rejected"]
+            );
+            assert!(!crate::test_log_capture::render(&records).contains("private stop note"));
             let events: Vec<_> = event_rx.try_iter().collect();
-            assert!(matches!(events.as_slice(), [DeepgramEvent::Disconnected]));
+            if matches!(teardown, Teardown::BacklogDrain) {
+                assert!(matches!(
+                    events.as_slice(),
+                    [DeepgramEvent::Disconnected, DeepgramEvent::Error { message }]
+                        if *message == websocket_diagnostic(Code::CredentialRejected)
+                ));
+            } else {
+                assert!(matches!(events.as_slice(), [DeepgramEvent::Disconnected]));
+            }
         }
     }
 
@@ -3833,7 +3912,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -3842,7 +3921,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
@@ -3852,7 +3931,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                 )
@@ -3944,7 +4023,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -3957,7 +4036,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
@@ -3967,7 +4046,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                 )
@@ -4052,7 +4131,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -4061,7 +4140,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
@@ -4071,7 +4150,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                 )
@@ -4144,7 +4223,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let write_guard = AsrWsWriteGuard::new(
             "asr.deepgram",
@@ -4152,7 +4231,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             // Move the write guard into the spawned block, mirroring the
             // `Arc::clone` re-bindings above so `async move` captures it here.
@@ -4164,7 +4243,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                 )
@@ -4226,7 +4305,7 @@ mod tests {
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -4237,7 +4316,7 @@ mod tests {
             config: test_config("nova-3"),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted: Arc::clone(&disconnected_emitted),
             pending_chunks,
             reconnect_opener: None,
@@ -4259,7 +4338,7 @@ mod tests {
             other => panic!("expected Reconnecting event, got {other:?}"),
         }
 
-        user_disconnected.store(true, Ordering::SeqCst);
+        stop_signal.request(AsrStopReason::UserRequested);
 
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
@@ -4318,7 +4397,7 @@ mod tests {
                 audio_rx,
                 event_tx,
                 connected: Arc::new(AtomicBool::new(true)),
-                user_disconnected: Arc::new(AtomicBool::new(false)),
+                stop_signal: Arc::new(AsrSessionStop::default()),
                 disconnected_emitted: Arc::new(AtomicBool::new(false)),
                 pending_chunks: Arc::new(AtomicUsize::new(0)),
                 reconnect_opener: Some(opener),
@@ -4398,7 +4477,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     disconnected_emitted: Arc::new(AtomicBool::new(false)),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
@@ -4442,28 +4521,20 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhaustion_reports_last_open_error_from_the_current_outage() {
-        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
-        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage, session_clock};
         use std::sync::atomic::AtomicUsize;
 
         let (initial_url, initial) =
             ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
-        let (recovered_url, recovered) =
-            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
         let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
-        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
-        let mut statuses = vec![(429, None)];
-        statuses.extend(std::iter::repeat_n((503, None), budget - 1));
-        statuses.push((408, None));
-        let (reject_url, rejecting) = reject_upgrades(statuses, true).await;
+        let script = fresh_outage(vec![ws_fixture::ServerStep::send_close()], true).await;
+        let (recovery, rejections) = (script.recovery, script.rejections);
+        let endpoints = script.endpoints;
+        let expected_attempts = endpoints.len();
         let attempts = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&attempts);
         let opener: ReconnectOpener = Arc::new(move |config| {
-            let url = if count.fetch_add(1, Ordering::SeqCst) == 1 {
-                recovered_url.clone()
-            } else {
-                reject_url.clone()
-            };
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
             Box::pin(async move { open_ws_url(&config, &url).await })
         });
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
@@ -4478,14 +4549,14 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     disconnected_emitted: Arc::new(AtomicBool::new(false)),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
                 },
                 |_| Duration::ZERO,
-                super::super::diagnostic_tests::session_clock(
+                session_clock(
                     crate::reconnect::HEALTHY_SESSION_RESET_AFTER + Duration::from_secs(1),
                 ),
             ),
@@ -4493,48 +4564,22 @@ mod tests {
         .await
         .expect("second outage must exhaust the budget");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), budget + 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
         initial.await.unwrap();
-        recovered.await.unwrap();
-        rejecting.await.unwrap();
+        recovery.await.unwrap();
+        rejections.await.unwrap();
         let events: Vec<_> = event_rx.try_iter().collect();
-        let reset = events
-            .iter()
-            .position(|event| matches!(event, DeepgramEvent::Reconnected))
-            .unwrap();
-        assert_eq!(reset, 4, "the first reconnect must succeed after the 429");
-        let second_outage = &events[reset + 1..];
-        assert!(matches!(
-            second_outage.first(),
-            Some(DeepgramEvent::Disconnected)
-        ));
-        let second_attempts = second_outage.iter().filter_map(|event| match event {
-            DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
-            _ => None,
-        });
-        assert!(
-            second_attempts.eq(1..=budget as u32),
-            "the second outage needs a fresh budget"
-        );
-        let [
-            ..,
-            DeepgramEvent::Error {
-                message: final_open,
+        assert_fresh_outage(
+            &events,
+            |event| matches!(event, DeepgramEvent::Reconnected),
+            |event| match event {
+                DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                _ => None,
             },
-            DeepgramEvent::Error { message: exhausted },
-        ] = second_outage
-        else {
-            panic!("expected final open and exhaustion errors");
-        };
-        assert_eq!(final_open, exhausted);
-        assert_outcome(
-            exhausted,
-            (
-                Code::Timeout,
-                true,
-                Action::Retry,
-                Some(RuntimeStatusClass::ClientError),
-            ),
+            |event| match event {
+                DeepgramEvent::Error { message } => Some(message),
+                _ => None,
+            },
         );
     }
 
@@ -4550,7 +4595,7 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(32);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4604,7 +4649,7 @@ mod tests {
             config: test_config("nova-3"),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted,
             pending_chunks: Arc::clone(&pending_chunks),
             reconnect_opener: Some(opener),
@@ -4735,7 +4780,7 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -4746,7 +4791,7 @@ mod tests {
             config: test_config("nova-3"),
             event_tx,
             connected,
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted,
             pending_chunks,
             reconnect_opener: None,
@@ -4755,7 +4800,7 @@ mod tests {
 
         // Mirrors `disconnect()`'s own ordering: mark user-initiated, then
         // queue Stop.
-        user_disconnected.store(true, Ordering::SeqCst);
+        stop_signal.request(AsrStopReason::UserRequested);
         audio_tx.send(AudioCmd::Stop).expect("queue stop");
 
         // The completion signal must not fire before the session task (and
@@ -4829,7 +4874,8 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(true));
+        let stop_signal = Arc::new(AsrSessionStop::default());
+        stop_signal.request(AsrStopReason::UserRequested);
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -4842,7 +4888,7 @@ mod tests {
             config: test_config("nova-3"),
             event_tx,
             connected,
-            user_disconnected,
+            stop_signal,
             disconnected_emitted,
             pending_chunks,
             reconnect_opener: None,

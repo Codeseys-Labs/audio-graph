@@ -1615,7 +1615,7 @@
       "credential_expired": "The provider credential expired. Refresh it before trying again.",
       "permission_denied": "The provider denied access to this operation. Check your account permissions or plan.",
       "invalid_configuration": "The provider configuration is invalid. Check the model, region, or endpoint in Settings.",
-      "capacity_exhausted": "The provider is at capacity, or your account's quota or balance is used up. Check your plan and balance, or try again later.",
+      "capacity_exhausted": "Your account has reached a quota or concurrency limit, or its balance is depleted. Check your plan and balance, or try again later.",
       "policy_blocked": "The current policy blocks this operation.",
       "unsupported": "The provider does not support this operation.",
       "cancelled": "The operation was cancelled.",

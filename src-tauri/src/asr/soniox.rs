@@ -67,6 +67,7 @@ pub struct SonioxParsedMessage {
     pub final_audio_proc_ms: Option<u64>,
     pub total_audio_proc_ms: Option<u64>,
     accepted: bool,
+    duration_reached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,10 +174,8 @@ impl SonioxResponse {
             Some("temp_api_key_session_expired") => Code::CredentialExpired,
             Some("permission_denied") => Code::PermissionDenied,
             Some("invalid_request" | "model_not_available") => Code::InvalidConfiguration,
-            // The replacement already owns the stream. A duration limit,
-            // on the other hand, allows a fresh session after the peer closes.
+            // The replacement already owns the stream.
             Some("connection_replaced") => Code::Cancelled,
-            Some("max_duration_reached") => Code::Timeout,
             Some(
                 "organization_balance_exhausted"
                 | "organization_monthly_budget_exhausted"
@@ -314,14 +313,23 @@ impl SonioxRealtimeParser {
 
         // Error responses have no transcription output. Convert their private
         // fields before returning from the parser.
-        if let Some(error) = response.diagnostic() {
+        // Soniox documents opening a fresh connection at the duration limit.
+        // https://docs.soniox.com/api-reference/errors#max-duration-reached
+        let duration_reached = response.error_type.as_deref() == Some("max_duration_reached");
+        let error = if duration_reached {
+            None
+        } else {
+            response.diagnostic()
+        };
+        if duration_reached || error.is_some() {
             return Ok(SonioxParsedMessage {
                 revisions: Vec::new(),
                 finished: response.finished,
                 final_audio_proc_ms: None,
                 total_audio_proc_ms: None,
-                error: Some(error),
+                error,
                 accepted: false,
+                duration_reached,
             });
         }
 
@@ -385,6 +393,7 @@ impl SonioxRealtimeParser {
             final_audio_proc_ms: response.final_audio_proc_ms,
             total_audio_proc_ms: response.total_audio_proc_ms,
             accepted,
+            duration_reached: false,
         })
     }
 
@@ -641,6 +650,7 @@ impl Drop for SonioxClient {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum DisconnectKind {
+    DurationRollover,
     ServerClose(RuntimeDiagnostic),
     NetworkError(RuntimeDiagnostic),
     PolicyBlocked(RuntimeDiagnostic),
@@ -823,7 +833,11 @@ async fn session_task_with_backoff(
                     break;
                 }
 
-                log::warn!("Soniox session: disconnected — {disconnect:?}");
+                if matches!(disconnect, DisconnectKind::DurationRollover) {
+                    log::info!("Soniox session: rolling over at the duration limit");
+                } else {
+                    log::warn!("Soniox session: disconnected — {disconnect:?}");
+                }
                 if let Err(message) =
                     required_api_key(&config.api_key, BuiltInCredentialSetId::Soniox)
                 {
@@ -1045,18 +1059,26 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        let finished = match handle_server_message_with_acceptance(
+                        match handle_server_message_with_acceptance(
                             &text, event_tx, parser, &mut on_accepted,
                         ) {
-                            Ok(finished) => finished,
+                            Ok(ServerMessage::DurationRollover) => {
+                                let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
+                                return if finishing || user_disconnected.load(Ordering::SeqCst) {
+                                    DisconnectKind::UserRequested
+                                } else {
+                                    DisconnectKind::DurationRollover
+                                };
+                            }
+                            Ok(ServerMessage::Finished) if finishing => {
+                                let _ = writer.close().await;
+                                return DisconnectKind::UserRequested;
+                            }
+                            Ok(_) => {}
                             Err(_) if finishing || user_disconnected.load(Ordering::SeqCst) => {
                                 return DisconnectKind::UserRequested;
                             }
                             Err(message) => return DisconnectKind::TerminalError(message),
-                        };
-                        if finished && finishing {
-                            let _ = writer.close().await;
-                            return DisconnectKind::UserRequested;
                         }
                     }
                     Ok(Message::Close(frame)) => {
@@ -1101,6 +1123,13 @@ pub(super) fn handle_server_message(
     parser: &mut SonioxRealtimeParser,
 ) -> Result<bool, RuntimeDiagnostic> {
     handle_server_message_with_acceptance(text, tx, parser, &mut None::<fn()>)
+        .map(|message| matches!(message, ServerMessage::Finished))
+}
+
+enum ServerMessage {
+    Continue,
+    Finished,
+    DurationRollover,
 }
 
 fn handle_server_message_with_acceptance(
@@ -1108,17 +1137,20 @@ fn handle_server_message_with_acceptance(
     tx: &crossbeam_channel::Sender<SonioxEvent>,
     parser: &mut SonioxRealtimeParser,
     on_accepted: &mut Option<impl FnOnce()>,
-) -> Result<bool, RuntimeDiagnostic> {
+) -> Result<ServerMessage, RuntimeDiagnostic> {
     let parsed = match parser.parse_message(text, current_unix_millis()) {
         Ok(parsed) => parsed,
         Err(error) => {
             let _ = tx.send(SonioxEvent::Error {
                 message: error.into(),
             });
-            return Ok(false);
+            return Ok(ServerMessage::Continue);
         }
     };
 
+    if parsed.duration_reached {
+        return Ok(ServerMessage::DurationRollover);
+    }
     if let Some(message) = parsed.error {
         if is_terminal_reconnect_error(&message)
             || matches!(&message, RuntimeDiagnostic::Runtime(error) if error.code == Code::Cancelled)
@@ -1140,9 +1172,10 @@ fn handle_server_message_with_acceptance(
 
     if parsed.finished {
         let _ = tx.send(SonioxEvent::Finished);
+        return Ok(ServerMessage::Finished);
     }
 
-    Ok(parsed.finished)
+    Ok(ServerMessage::Continue)
 }
 
 fn soniox_session_config_payload(config: &SonioxConfig) -> Value {
@@ -1560,7 +1593,7 @@ mod tests {
             ws_fixture::ServerStep::send_text(
                 r#"{"error_code":413,"error_type":"max_duration_reached","error_message":"private duration note"}"#,
             ),
-            ws_fixture::ServerStep::send_close(),
+            ws_fixture::ServerStep::expect_close(),
         ])
         .await;
         let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
@@ -1605,13 +1638,11 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                SonioxEvent::Error { message: duration },
                 SonioxEvent::Reconnecting { attempt: 1, .. },
                 SonioxEvent::Reconnected,
                 SonioxEvent::Disconnected,
                 SonioxEvent::Error { message: replaced },
-            ] if *duration == websocket_diagnostic(Code::Timeout)
-                && *replaced == websocket_diagnostic(Code::Cancelled)
+            ] if *replaced == websocket_diagnostic(Code::Cancelled)
         ));
     }
 
