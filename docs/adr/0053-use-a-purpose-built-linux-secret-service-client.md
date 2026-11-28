@@ -55,6 +55,51 @@ pinned for each transaction. zbus's `Hello` goes to the bus driver without
 flags. The driver cannot be activated, and the scripted peer observes only
 messages delivered to the fake Secret Service.
 
+## Noninteractive mutations
+
+Search both halves for an exact attribute match before dispatch, on the same
+connection and pinned service owner. A locked, duplicate, or indeterminate
+lookup prevents a mutation. For writes, resolve the default collection and
+check that it is unlocked. Create with `CreateItem(replace=false)` only after
+definite absence. Replace the verified item in that collection with
+`Item.SetSecret`. Both GNOME Keyring and KWallet can create an item when
+`CreateItem(replace=true)` finds no replacement. `SetSecret` addresses the
+verified item path directly. Delete also addresses the verified item path.
+The protocol exposes no compare-and-swap across independent desktop clients.
+[Secret Service API](https://specifications.freedesktop.org/secret-service/latest-single/)
+· [GNOME Keyring](https://github.com/GNOME/gnome-keyring/blob/8561976b6b4662330caeb16c921472a89e891ed1/daemon/dbus/gkd-secret-objects.c)
+· [KWallet](https://github.com/KDE/kwallet/blob/v6.25.0/src/runtime/ksecretd/kwalletfreedesktopcollection.cpp)
+
+Every secret encryption draws a fresh 16-byte IV from the OS CSPRNG used for
+the private exponent. The production encryption API generates the IV and
+sends it with the ciphertext. The caller supplies an owned zeroizing
+plaintext buffer. The prior value and encrypted read-back plaintext also use
+owned zeroizing buffers.
+
+One ten-second wall-clock deadline covers a mutation and its read-back.
+Preparation, dispatch, and any prompt settlement have the first five seconds.
+Explicit session cleanup and read-back fit in the remaining time, with up to
+125 milliseconds reserved at each connection's cutoff for `Session.Close`.
+Reads keep their five-second total deadline and reserve the same cleanup
+interval. Close a session once when its path is known and time remains.
+Cleanup failure preserves the transaction outcome and the connection is retired.
+
+A prompt returned by a mutation is subscribed to before `Dismiss`. A
+dismissed `Completed` signal plus an exact read-back of the prior state yields
+`InteractionRequired`. An unsettled prompt or a mismatched read-back latches
+`CommitUnknown`. The noninteractive path sends neither `Prompt.Prompt` nor
+`Unlock`.
+
+A deadline, disconnect, or error after dispatch triggers a fresh encrypted
+read-back against the same bus and service owner within the remaining budget.
+A write is confirmed by the exact intended bytes at the intended item, and a
+delete by definite absence across both search halves. After a lost reply,
+the desired state must differ from the prior state to confirm the mutation.
+A terminal rejection plus corroborating read-back is required to report
+`NotCommitted`. An unchanged value after a lost reply cannot exclude a late
+mutation. Any unverified outcome latches `CommitUnknown` on the native
+interaction gate. The client sends the mutation once.
+
 ### Consequences
 
 - The first slice exercises encrypted exact-match reads and the read-only wire
