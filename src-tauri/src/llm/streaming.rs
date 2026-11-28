@@ -711,8 +711,9 @@ async fn drain_engine_stream_events(
 /// 3. Push each chunk into [`SseDecoder`]; for every emitted `data:` frame,
 ///    parse it as a [`StreamChunk`] and forward each non-empty
 ///    `choices[0].delta.content` as a [`TokenDelta::Delta`].
-/// 4. Terminate on `data: [DONE]` or `finish_reason` ≠ `null` with
-///    [`TokenDelta::Done`].
+/// 4. Terminate with [`TokenDelta::Done`] on `data: [DONE]`, or when the body
+///    ends after a `finish_reason`. A body that ends with neither marker was
+///    cut off and terminates with [`TokenDelta::Error`].
 ///
 /// All early exits (HTTP non-2xx, network error, malformed JSON, cancel
 /// token tripped) emit exactly one terminal frame, so the consumer side
@@ -907,18 +908,18 @@ async fn run_sse_stream(
         }
     }
 
-    // Stream ended without an explicit `[DONE]` (some providers do this):
-    // emit a Done with whatever we accumulated.
-    send_terminal(
-        &tx,
-        StreamTerminalEvent::done(
+    // The body ended without `[DONE]`. A server that sent a `finish_reason`
+    // and then closed has finished its turn. One that sent neither marker was
+    // cut off: what arrived is a partial reply, not an answer.
+    let terminal = match last_finish_reason {
+        Some(finish_reason) => StreamTerminalEvent::done(full_text, usage, finish_reason, metadata),
+        None => StreamTerminalEvent::failure(
+            diagnostic(Code::InvalidResponse, INFERENCE),
             full_text,
-            usage,
-            last_finish_reason.unwrap_or(FinishReason::Stop),
             metadata,
         ),
-    )
-    .await;
+    };
+    send_terminal(&tx, terminal).await;
 }
 
 /// In-memory request_id → cancel token registry.
@@ -1420,6 +1421,54 @@ mod tests {
         );
         assert_absent(&format!("{frames:?}"), &["finish-reason-canary", "error:"]);
         assert_absent(&logs, &["finish-reason-canary"]);
+    }
+
+    /// Each body arrives whole and the connection then closes cleanly, so
+    /// this is the end of the stream and not a transport error.
+    async fn frames_of(body: &'static str) -> Vec<TokenDelta> {
+        let base = spawn_sse_mock(body).await;
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_with_no_terminal_marker_is_a_failure() {
+        let frames =
+            frames_of("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_then_end_of_body_is_a_complete_answer() {
+        // Some servers send the final chunk and close without `[DONE]`.
+        let frames = frames_of(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"whole\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Done { full_text, finish_reason, .. },
+            ] if content == "whole" && full_text == "whole" && finish_reason == "stop"),
+            "{frames:?}"
+        );
     }
 
     #[tokio::test]

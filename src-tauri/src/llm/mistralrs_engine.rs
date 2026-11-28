@@ -550,11 +550,12 @@ Output JSON:"#,
                             }
                             None => {
                                 // Stream ended without a terminal (finish_reason)
-                                // chunk: surface a single defensive Error carrying
+                                // chunk. It was cut off: report the failure every
+                                // streaming adapter reports for that, carrying
                                 // whatever text was generated so far.
                                 let _ = events
                                     .send(LlmStreamEvent::Error {
-                                        diagnostic: engine_failure(Code::ProtocolError),
+                                        diagnostic: engine_failure(Code::InvalidResponse),
                                         full_text,
                                     })
                                     .await;

@@ -97,8 +97,8 @@ pub fn stream_usage_from_counts(input: i32, output: i32, total: i32) -> StreamUs
 /// [`StreamTerminalEvent`] so Done/Error/Cancelled semantics stay shared.
 ///
 /// `events` yields a decoded event or a closed terminal diagnostic.
-/// `None` means the stream closed without a `messageStop`, which we treat as a
-/// clean end (`finish_reason = "stop"`) using whatever text was accumulated.
+/// `None` means the stream closed without a `messageStop`: it was cut off, so
+/// the text accumulated so far is a partial reply and the terminal is a failure.
 async fn drive_bedrock_events<S>(
     mut events: S,
     tx: mpsc::Sender<TokenDelta>,
@@ -183,14 +183,13 @@ async fn drive_bedrock_events<S>(
                 return;
             }
             None => {
-                // Stream closed without an explicit messageStop. Emit a Done with
-                // whatever we accumulated (some providers/edge cases do this).
+                // The stream closed without `messageStop`. It was cut off: what
+                // arrived is a partial reply, not an answer.
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::done(
+                    StreamTerminalEvent::failure(
+                        diagnostic(Code::InvalidResponse, INFERENCE),
                         std::mem::take(&mut full_text),
-                        usage.take(),
-                        FinishReason::Stop,
                         metadata,
                     ),
                 )
@@ -971,19 +970,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_end_without_message_stop_emits_done() {
+    async fn stream_end_without_message_stop_is_a_failure_that_keeps_the_text() {
         let frames = drain(vec![Ok(BedrockStreamEvent::TextDelta("hi".to_string()))]).await;
-        match frames.last().expect("terminal frame") {
-            TokenDelta::Done {
-                full_text,
-                finish_reason,
-                ..
-            } => {
-                assert_eq!(full_text, "hi");
-                assert_eq!(finish_reason, "stop");
-            }
-            other => panic!("expected Done on clean EOF, got {other:?}"),
-        }
+        assert!(
+            matches!(frames.as_slice(), [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "hi"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "hi"),
+            "{frames:?}"
+        );
     }
 
     #[tokio::test]
