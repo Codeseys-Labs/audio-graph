@@ -36,7 +36,7 @@
 use async_trait::async_trait;
 use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
-    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeStatusClass, RuntimeTransport,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
 };
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -256,6 +256,12 @@ impl TtsError {
         use RuntimeSafeRecoveryAction as Action;
 
         let (retryable, action) = match code {
+            Code::CredentialRejected => {
+                return Self::new(kind, RuntimeErrorDiagnostic::credential_rejected(context));
+            }
+            Code::PermissionDenied => {
+                return Self::new(kind, RuntimeErrorDiagnostic::permission_denied(context));
+            }
             Code::RateLimited => (true, Action::RetryAfterDelay),
             Code::NetworkUnreachable => (true, Action::CheckNetwork),
             Code::Timeout | Code::ProviderUnavailable | Code::ProtocolError => {
@@ -273,30 +279,20 @@ impl TtsError {
 
     /// Classify a synthesis HTTP failure using only its status, including
     /// failures returned by a WebSocket upgrade.
-    pub fn from_http_status(status: u16) -> Self {
-        use RuntimeErrorCode as Code;
-
-        let mut context = RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
+    pub fn from_http_status(status: u16, credential_sent: bool) -> Self {
+        let context = RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
             .with_transport(RuntimeTransport::Http);
-        let status_class = match status {
-            300..=399 => Some(RuntimeStatusClass::Redirect),
-            400..=499 => Some(RuntimeStatusClass::ClientError),
-            500..=599 => Some(RuntimeStatusClass::ServerError),
-            _ => None,
+        let kind = match status {
+            401 | 403 => TtsErrorKind::Auth,
+            429 => TtsErrorKind::RateLimit,
+            400..=499 => TtsErrorKind::BadRequest,
+            500..=599 => TtsErrorKind::Server,
+            _ => TtsErrorKind::Unknown,
         };
-        if let Some(status_class) = status_class {
-            context = context.with_status_class(status_class);
-        }
-
-        let (kind, code) = match status {
-            300..=399 => (TtsErrorKind::Unknown, Code::RequestRejected),
-            401 | 403 => (TtsErrorKind::Auth, Code::RequestRejected),
-            429 => (TtsErrorKind::RateLimit, Code::RateLimited),
-            400..=499 => (TtsErrorKind::BadRequest, Code::RequestRejected),
-            500..=599 => (TtsErrorKind::Server, Code::ProviderUnavailable),
-            _ => (TtsErrorKind::Unknown, Code::Internal),
-        };
-        Self::runtime(kind, code, context)
+        Self::new(
+            kind,
+            RuntimeErrorDiagnostic::from_http_status(status, credential_sent, context),
+        )
     }
 }
 
@@ -471,53 +467,109 @@ mod tests {
     #[test]
     fn http_status_classification_exports_only_closed_context() {
         use RuntimeErrorCode as Code;
-        use RuntimeStatusClass as Status;
+        use RuntimeSafeRecoveryAction as Action;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass as Status;
 
-        for (status, kind, code, status_class) in [
+        for (status, credential_sent, kind, code, retryable, action, status_class) in [
             (
                 307,
+                true,
                 TtsErrorKind::Unknown,
                 Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
                 Some(Status::Redirect),
             ),
             (
                 401,
+                true,
+                TtsErrorKind::Auth,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Some(Status::ClientError),
+            ),
+            (
+                401,
+                false,
                 TtsErrorKind::Auth,
                 Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
                 Some(Status::ClientError),
             ),
             (
                 403,
+                true,
                 TtsErrorKind::Auth,
-                Code::RequestRejected,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(Status::ClientError),
+            ),
+            (
+                408,
+                true,
+                TtsErrorKind::BadRequest,
+                Code::Timeout,
+                true,
+                Action::Retry,
                 Some(Status::ClientError),
             ),
             (
                 429,
+                true,
                 TtsErrorKind::RateLimit,
                 Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
                 Some(Status::ClientError),
             ),
             (
                 422,
+                true,
                 TtsErrorKind::BadRequest,
                 Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
                 Some(Status::ClientError),
             ),
             (
                 503,
+                true,
                 TtsErrorKind::Server,
                 Code::ProviderUnavailable,
+                true,
+                Action::Retry,
                 Some(Status::ServerError),
             ),
-            (700, TtsErrorKind::Unknown, Code::Internal, None),
+            (
+                504,
+                true,
+                TtsErrorKind::Server,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Some(Status::ServerError),
+            ),
+            (
+                700,
+                true,
+                TtsErrorKind::Unknown,
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
         ] {
-            let error = TtsError::from_http_status(status);
+            let error = TtsError::from_http_status(status, credential_sent);
             assert_eq!(error.kind(), kind);
             let RuntimeDiagnostic::Runtime(diagnostic) = error.diagnostic() else {
                 panic!("expected a runtime diagnostic");
             };
             assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.retryable, retryable);
+            assert_eq!(diagnostic.recovery_action, action);
             assert_eq!(
                 diagnostic.context.operation,
                 RuntimeOperation::SpeechSynthesis
@@ -546,7 +598,7 @@ mod tests {
                 backoff_secs: 2,
             }),
             TtsEvent::Status(TtsStatus::Reconnected),
-            TtsError::from_http_status(403).into(),
+            TtsError::from_http_status(403, true).into(),
         ];
 
         for event in &events {

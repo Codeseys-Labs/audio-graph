@@ -137,9 +137,8 @@ impl GladiaLiveConfig {
     }
 
     pub fn init_url(&self) -> Result<url::Url, RuntimeDiagnostic> {
-        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT).map_err(|_| {
-            super::asr_diagnostic(Code::Internal, super::RuntimeTransport::Http, None)
-        })?;
+        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT)
+            .map_err(|_| super::asr_diagnostic(Code::Internal, super::RuntimeTransport::Http))?;
         if let Some(region) = self.region {
             url.query_pairs_mut()
                 .append_pair("region", region.query_value());
@@ -554,7 +553,15 @@ fn utterance_confidence(utterance: &GladiaUtterance) -> f32 {
 }
 
 fn gladia_error_diagnostic(error: &serde_json::Value) -> RuntimeDiagnostic {
-    let code = match error.get("code").and_then(serde_json::Value::as_str) {
+    // Live error objects are open-ended. Classify Gladia's documented denial
+    // codes if supplied, without inferring auth from error prose.
+    // https://eu1.docs.gladia.io/introduction/authentication/#errors
+    let code = match error
+        .get("code")
+        .or_else(|| error.get("error"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("api_key_scope_denied" | "ip_not_allowed") => Code::PermissionDenied,
         Some("invalid_audio") => Code::RequestRejected,
         _ => Code::Internal,
     };
@@ -643,6 +650,45 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_error_outcomes() {
+        use super::super::diagnostic_tests::assert_outcome;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                "api_key_scope_denied",
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "ip_not_allowed",
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "api_key_scope_denied extra",
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
+        ] {
+            let mut parser = GladiaLiveParser::new("mic");
+            let frame = serde_json::json!({"type": "error", "error": {"error": wire_code}});
+            let diagnostic = parser
+                .parse_message(&frame.to_string(), 1)
+                .unwrap()
+                .error
+                .unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::projections::{TranscriptEvent, TranscriptLedger};
     use std::collections::HashMap;
 

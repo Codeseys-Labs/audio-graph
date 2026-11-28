@@ -6,7 +6,8 @@
 //! evidence is strong enough to promote Soniox from planned to selectable.
 
 use super::{
-    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, missing_provider_credential, websocket_close,
+    websocket_diagnostic, websocket_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -163,12 +164,19 @@ impl SonioxResponse {
             return None;
         }
 
-        let code = match self.error_code.as_ref().and_then(Value::as_u64) {
-            Some(400 | 401 | 403) => Code::RequestRejected,
-            Some(408 | 504) => Code::Timeout,
-            Some(429) => Code::RateLimited,
-            Some(503) => Code::ProviderUnavailable,
-            _ => Code::Internal,
+        // https://docs.soniox.com/api-reference/errors
+        // The numeric 403 alone cannot distinguish permission from expiry.
+        let code = match self.error_type.as_deref() {
+            Some("unauthenticated") => Code::CredentialRejected,
+            Some("temp_api_key_session_expired") => Code::CredentialExpired,
+            Some("permission_denied") => Code::PermissionDenied,
+            _ => match self.error_code.as_ref().and_then(Value::as_u64) {
+                Some(400 | 401 | 403) => Code::RequestRejected,
+                Some(408 | 504) => Code::Timeout,
+                Some(429) => Code::RateLimited,
+                Some(503) => Code::ProviderUnavailable,
+                _ => Code::Internal,
+            },
         };
         Some(websocket_diagnostic(code))
     }
@@ -480,7 +488,7 @@ impl SonioxClient {
 
     pub fn connect(&mut self) -> Result<(), AppError> {
         if self.config.api_key.trim().is_empty() {
-            return Err(websocket_diagnostic(Code::RequestRejected).into());
+            return Err(missing_provider_credential(BuiltInCredentialSetId::Soniox));
         }
         if self.config.model.trim().is_empty() {
             return Err(websocket_diagnostic(Code::RequestRejected).into());
@@ -491,7 +499,7 @@ impl SonioxClient {
             .enable_all()
             .thread_name("soniox-ws-rt")
             .build()
-            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -632,6 +640,7 @@ async fn open_ws_url(
 ) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error instead of hanging the reconnect ladder forever.
+    // This adapter sends the key in the first config frame, after the upgrade.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(url_str)
         .await
         .map_err(|error| websocket_error(&error))?;
@@ -1158,6 +1167,92 @@ fn is_marker_only(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upgrade_and_provider_error_outcomes() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+
+        let mut config = test_config();
+        config.api_key = "sample credential".into();
+        for (status, code, retryable, action, status_class) in [
+            (
+                400,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                401,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                403,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+        ] {
+            let (url, server) = reject_upgrade(status, false).await;
+            let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                (401, "unauthenticated"),
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                None,
+            ),
+            (
+                (403, "temp_api_key_session_expired"),
+                Code::CredentialExpired,
+                false,
+                Action::RefreshCredential,
+                None,
+            ),
+            (
+                (403, "permission_denied"),
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                (403, "unknown denial"),
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                (499, "permission_denied extra"),
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
+        ] {
+            let diagnostic = serde_json::from_value::<SonioxResponse>(serde_json::json!({
+                "error_code": wire_code.0,
+                "error_type": wire_code.1,
+            }))
+            .unwrap()
+            .diagnostic()
+            .unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::asr::ws_fixture;
 
     #[tokio::test]
@@ -1245,6 +1340,29 @@ mod tests {
             language_hints: vec!["en".into(), "es".into()],
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         }
+    }
+
+    #[test]
+    fn blank_api_key_reports_missing_credential() {
+        use super::super::{CredentialErrorCode, CredentialSafeRecoveryAction, CredentialSetId};
+
+        let mut config = test_config();
+        config.api_key = " ".into();
+        let Err(AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(error))) =
+            SonioxClient::new(config).connect()
+        else {
+            panic!("expected credential error");
+        };
+        assert_eq!(error.code, CredentialErrorCode::Missing);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::ReenterCredential
+        );
+        assert_eq!(
+            error.set_id,
+            Some(CredentialSetId::BuiltIn(BuiltInCredentialSetId::Soniox))
+        );
     }
 
     fn with_blocked_content_egress(mut config: SonioxConfig) -> SonioxConfig {

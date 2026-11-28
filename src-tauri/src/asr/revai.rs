@@ -294,7 +294,8 @@ pub fn classify_close_code(code: u16) -> RuntimeDiagnostic {
         .into();
     }
     websocket_diagnostic(match code {
-        4001 | 4002 => Code::RequestRejected,
+        4001 => Code::CredentialRejected,
+        4002 => Code::RequestRejected,
         4003 => Code::CapacityExhausted,
         4010 | 4013 => Code::ProviderUnavailable,
         _ => Code::Internal,
@@ -674,9 +675,9 @@ mod tests {
         for (wire_code, code, retryable, recovery) in [
             (
                 4001,
-                Code::RequestRejected,
+                Code::CredentialRejected,
                 false,
-                Recovery::ReviewConfiguration,
+                Recovery::ReenterCredential,
             ),
             (
                 4002,
@@ -699,8 +700,13 @@ mod tests {
                 panic!("expected runtime diagnostic for {wire_code}");
             };
             assert_eq!(
-                (actual.code, actual.retryable, actual.recovery_action),
-                (code, retryable, recovery)
+                (
+                    actual.code,
+                    actual.retryable,
+                    actual.recovery_action,
+                    actual.context.status_class
+                ),
+                (code, retryable, recovery, None)
             );
         }
     }

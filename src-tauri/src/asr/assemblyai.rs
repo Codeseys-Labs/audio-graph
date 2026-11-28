@@ -21,7 +21,8 @@
 //! delivered back through `crossbeam_channel`.
 
 use super::{
-    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, missing_provider_credential, websocket_close,
+    websocket_diagnostic, websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -598,8 +599,10 @@ impl AssemblyAIClient {
     /// audio writing, server message reading, and automatic reconnection with
     /// exponential backoff if the WebSocket drops mid-session.
     pub fn connect(&mut self) -> Result<(), AppError> {
-        if self.config.api_key.is_empty() {
-            return Err(websocket_diagnostic(Code::RequestRejected).into());
+        if self.config.api_key.trim().is_empty() {
+            return Err(missing_provider_credential(
+                BuiltInCredentialSetId::Assemblyai,
+            ));
         }
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
@@ -608,7 +611,7 @@ impl AssemblyAIClient {
             .enable_all()
             .thread_name("assemblyai-ws-rt")
             .build()
-            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -845,7 +848,7 @@ async fn open_ws_url(
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_error(&error))?;
+        .map_err(|error| websocket_upgrade_error(&error, !config.api_key.trim().is_empty()))?;
 
     Ok(ws_stream.split())
 }
@@ -1270,7 +1273,8 @@ fn emit_invalid_response(tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
 
 fn assemblyai_error_diagnostic(code: Option<u64>) -> RuntimeDiagnostic {
     // https://www.assemblyai.com/docs/streaming/common-session-errors-and-closures
-    // 1008 has several causes. Its numeric code alone cannot justify a retry.
+    // 1008 shares a code across auth, rate, and billing failures. It cannot
+    // establish credential rejection or expiration without provider prose.
     websocket_diagnostic(match code {
         Some(1008 | 3007) => Code::RequestRejected,
         Some(1011) => Code::ProviderUnavailable,
@@ -1303,6 +1307,60 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upgrade_and_provider_error_outcomes() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+
+        let mut config = test_config();
+        config.api_key = "sample credential".into();
+        for (status, code, retryable, action, status_class) in [
+            (
+                400,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                401,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Some(ClientError),
+            ),
+            (
+                403,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+        ] {
+            let (url, server) = reject_upgrade(status, true).await;
+            let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                1008,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (1011, Code::ProviderUnavailable, true, Action::Retry, None),
+            (4999, Code::Internal, false, Action::None, None),
+        ] {
+            let diagnostic = assemblyai_error_diagnostic(Some(wire_code));
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::asr::ws_fixture;
 
     #[tokio::test]
@@ -1567,7 +1625,11 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(error))
+                if error.code == super::super::CredentialErrorCode::Missing
+                    && !error.retryable
+                    && error.recovery_action == super::super::CredentialSafeRecoveryAction::ReenterCredential
+                    && error.set_id == Some(super::super::CredentialSetId::BuiltIn(BuiltInCredentialSetId::Assemblyai))
         ));
     }
 

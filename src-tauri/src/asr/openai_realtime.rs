@@ -41,7 +41,8 @@
 //! streaming clients (`backoff_for_attempt`).
 
 use super::{
-    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, missing_provider_credential, websocket_close,
+    websocket_diagnostic, websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -295,7 +296,7 @@ impl OpenAiRealtimeClient {
     /// with exponential backoff (re-sending `session.update` on each reconnect).
     pub fn connect(&mut self) -> Result<(), AppError> {
         if self.config.api_key.trim().is_empty() {
-            return Err(websocket_diagnostic(Code::RequestRejected).into());
+            return Err(missing_provider_credential(BuiltInCredentialSetId::Openai));
         }
 
         // Build a dedicated multi-threaded (1 worker) tokio runtime for the WS.
@@ -304,7 +305,7 @@ impl OpenAiRealtimeClient {
             .enable_all()
             .thread_name("openai-realtime-ws-rt")
             .build()
-            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -619,7 +620,7 @@ async fn open_ws_url(
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_error(&error))?;
+        .map_err(|error| websocket_upgrade_error(&error, !config.api_key.trim().is_empty()))?;
 
     let (mut writer, reader) = ws_stream.split();
 
@@ -1249,8 +1250,10 @@ fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic 
         .and_then(Value::as_str);
     websocket_diagnostic(match code {
         Some("rate_limit_exceeded") => Code::RateLimited,
-        Some("invalid_api_key" | "invalid_value") => Code::RequestRejected,
-        Some("session_expired") => Code::Timeout,
+        // https://developers.openai.com/api/reference/resources/realtime/server-events#error
+        Some("invalid_api_key") => Code::CredentialRejected,
+        Some("session_expired") => Code::CredentialExpired,
+        Some("invalid_value") => Code::RequestRejected,
         _ => Code::Internal,
     })
 }
@@ -1308,6 +1311,80 @@ fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upgrade_and_provider_error_outcomes() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+
+        let mut config = test_config();
+        config.api_key = "sample credential".into();
+        for (status, code, retryable, action, status_class) in [
+            (
+                400,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                401,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Some(ClientError),
+            ),
+            (
+                403,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+        ] {
+            let (url, server) = reject_upgrade(status, true).await;
+            let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                "invalid_api_key",
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                None,
+            ),
+            (
+                "session_expired",
+                Code::CredentialExpired,
+                false,
+                Action::RefreshCredential,
+                None,
+            ),
+            (
+                "invalid_value",
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "invalid_api_key extra",
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
+        ] {
+            let diagnostic =
+                openai_realtime_error_diagnostic(Some(&serde_json::json!({"code": wire_code})));
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::asr::ws_fixture;
 
     fn test_config() -> OpenAiRealtimeConfig {
@@ -1507,7 +1584,11 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(error))
+                if error.code == super::super::CredentialErrorCode::Missing
+                    && !error.retryable
+                    && error.recovery_action == super::super::CredentialSafeRecoveryAction::ReenterCredential
+                    && error.set_id == Some(super::super::CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai))
         ));
     }
 

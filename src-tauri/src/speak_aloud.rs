@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn pipe_speak_and_flush_errors_discard_utterance_and_lengths() {
         let fake = FakeSession {
-            error: Some(TtsError::from_http_status(422)),
+            error: Some(TtsError::from_http_status(422, true)),
             ..FakeSession::default()
         };
         let secret = "pipe-utterance-secret-canary";
@@ -637,7 +637,7 @@ mod tests {
         let cancel = CancellationToken::new();
         // A FATAL Error event before a pending tail → the error arm must return
         // even though the stream would otherwise never end.
-        let stream = futures_util::stream::iter([TtsError::from_http_status(503).into()])
+        let stream = futures_util::stream::iter([TtsError::from_http_status(503, true).into()])
             .chain(futures_util::stream::pending());
         let player = AudioPlayer::new();
         // Must return (not hang) via the error arm.
