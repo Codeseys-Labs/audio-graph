@@ -56,6 +56,7 @@ beforeEach(() => {
     // default; the auto-answer trigger and the native-converse gate read them.
     conversationMode: "notes",
     converseEngine: "pipelined",
+    converseRealtimeAgentProvider: "gemini",
     pendingFinalizingSession: null,
     systemDrawerOpen: false,
     credentialPresence: [],
