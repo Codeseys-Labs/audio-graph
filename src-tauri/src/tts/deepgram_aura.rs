@@ -513,8 +513,7 @@ fn classify_tungstenite_error(error: &tungstenite::Error) -> TtsError {
             aura_error(Kind::Network, Code::NetworkUnreachable)
         }
         Error::Url(_) | Error::HttpFormat(_) => aura_error(Kind::BadRequest, Code::RequestRejected),
-        Error::Protocol(_) => aura_error(Kind::Protocol, Code::ProtocolError),
-        Error::Capacity(_) => aura_error(Kind::Protocol, Code::CapacityExhausted),
+        Error::Protocol(_) | Error::Capacity(_) => aura_error(Kind::Protocol, Code::ProtocolError),
         _ => aura_error(Kind::Unknown, Code::Internal),
     }
 }
@@ -947,10 +946,9 @@ fn classify_aura_code(frame: &Value) -> (Kind, Code) {
         // https://developers.deepgram.com/docs/errors
         Some("INVALID_AUTH") => (Kind::Auth, Code::CredentialRejected),
         Some("INSUFFICIENT_PERMISSIONS") => (Kind::Auth, Code::PermissionDenied),
-        Some("MESSAGE-0000" | "DATA-0000" | "BIG-0000" | "BIG-0001") => {
+        Some("MESSAGE-0000" | "DATA-0000" | "BIG-0000" | "BIG-0001" | "TEXT_LENGTH_WARNING") => {
             (Kind::BadRequest, Code::RequestRejected)
         }
-        Some("TEXT_LENGTH_WARNING") => (Kind::BadRequest, Code::CapacityExhausted),
         Some("DATA-0001" | "TOO_MANY_REQUESTS") => (Kind::RateLimit, Code::RateLimited),
         Some("NET-0000") => (Kind::Server, Code::ProviderUnavailable),
         Some("NET-0001" | "NET-0002") => (Kind::Network, Code::NetworkUnreachable),
@@ -1162,6 +1160,31 @@ mod tests {
                 "native-secret",
             ],
         );
+    }
+
+    #[test]
+    fn websocket_and_text_limits_report_transport_and_request_failures() {
+        use tungstenite::error::CapacityError;
+
+        let error = tungstenite::Error::Capacity(CapacityError::MessageTooLong {
+            size: 691,
+            max_size: 379,
+        });
+        let diagnostic = classify_tungstenite_error(&error);
+        assert_eq!(diagnostic.kind(), Kind::Protocol);
+        assert_eq!(diagnostic.to_string(), "runtime/protocol_error");
+        assert_no_canaries(&format!("{diagnostic:?} {diagnostic}"), &["691", "379"]);
+
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        handle_server_text(
+            r#"{"type":"Warning","warn_code":"TEXT_LENGTH_WARNING","description":"private text note"}"#,
+            &tx,
+            &mut VecDeque::new(),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let event = rx.try_recv().expect("warning diagnostic");
+        assert_error_event(&event, Kind::Unknown, Code::RequestRejected);
+        assert_no_canaries(&format!("{event:?}"), &["private text note"]);
     }
 
     #[test]
