@@ -19943,12 +19943,15 @@ mod tests {
             );
         };
 
+        // A synthetic handle belongs to the manager's initial capture id,
+        // which chained transcription starts below name.
         *state.is_capturing.write().unwrap() = true;
         state
             .capture_manager
             .lock()
             .unwrap()
             .insert_synthetic_handle("system", false);
+        let synthetic_capture = json!({ "captureId": { "epoch": 0, "seq": 0 } });
         let mut settings = AppSettings {
             asr_provider: crate::settings::AsrProvider::LocalWhisper,
             llm_provider: LlmProvider::Api {
@@ -19959,22 +19962,34 @@ mod tests {
             ..Default::default()
         };
         persist(&settings);
-        for (command, provider_id, display_name) in [
-            ("start_transcribe", "asr.local_whisper", "Local Whisper"),
-            ("start_gemini", "realtime_agent.gemini_live", "Gemini Live"),
+        for (command, args, provider_id, display_name) in [
+            (
+                "start_transcribe",
+                synthetic_capture.clone(),
+                "asr.local_whisper",
+                "Local Whisper",
+            ),
+            (
+                "start_gemini",
+                json!({}),
+                "realtime_agent.gemini_live",
+                "Gemini Live",
+            ),
             (
                 "start_converse",
+                json!({}),
                 "realtime_agent.gemini_live",
                 "Gemini Live",
             ),
             (
                 "start_openai_realtime",
+                json!({}),
                 "realtime_agent.openai_realtime",
                 "OpenAI Realtime voice agent",
             ),
         ] {
             assert_eq!(
-                invoke(command, json!({})),
+                invoke(command, args),
                 Err(json!({
                     "code": "provider_deferred",
                     "message": { "provider_id": provider_id, "display_name": display_name }
@@ -20024,7 +20039,7 @@ mod tests {
             persist(&settings);
             let row = format!("start_transcribe with {:?}", settings.llm_provider);
             assert_eq!(
-                invoke("start_transcribe", json!({})),
+                invoke("start_transcribe", synthetic_capture.clone()),
                 Err(json!({
                     "code": "credential_missing",
                     "message": { "key": "deepgram_api_key" }
