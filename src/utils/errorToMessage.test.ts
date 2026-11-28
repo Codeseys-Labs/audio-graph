@@ -48,6 +48,20 @@ describe("errorToMessage", () => {
     ).toBe("Access to the credential was denied.");
   });
 
+  it("discards prose from unrecognized structured errors in both locales", async () => {
+    const legacy = {
+      code: "retired_code",
+      message: { reason: "canary-tulip-path" },
+    };
+    for (const language of ["en", "pt"]) {
+      await i18n.changeLanguage(language);
+      expect(errorToMessage(legacy)).toBe(
+        i18n.t("runtimeDiagnostics.runtime.internal"),
+      );
+      expect(errorToMessage(legacy)).not.toContain("canary-tulip-path");
+    }
+  });
+
   it("does not fall back to the message field of a malformed diagnostic", () => {
     expect(
       errorToMessage({

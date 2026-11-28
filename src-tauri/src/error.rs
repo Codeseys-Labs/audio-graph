@@ -87,8 +87,6 @@ pub enum AppError {
     /// A credential required for the current operation is not stored.
     /// `key` is the credential-store slot name (e.g. `"aws_secret_key"`).
     CredentialMissing { key: String },
-    /// Writing / reading the on-disk credential file failed.
-    CredentialFileError { reason: String },
     /// AWS STS reports the current credentials have expired.
     AwsCredentialExpired,
     /// A configured AWS region is empty or not a recognized region string.
@@ -151,9 +149,6 @@ enum LegacyAppErrorWire<'a> {
     CredentialMissing {
         key: &'a str,
     },
-    CredentialFileError {
-        reason: &'a str,
-    },
     AwsCredentialExpired,
     AwsRegionInvalid {
         region: &'a str,
@@ -214,9 +209,6 @@ impl serde::Serialize for AppError {
             }
             Self::Io(message) => LegacyAppErrorWire::Io(message),
             Self::CredentialMissing { key } => LegacyAppErrorWire::CredentialMissing { key },
-            Self::CredentialFileError { reason } => {
-                LegacyAppErrorWire::CredentialFileError { reason }
-            }
             Self::AwsCredentialExpired => LegacyAppErrorWire::AwsCredentialExpired,
             Self::AwsRegionInvalid { region } => LegacyAppErrorWire::AwsRegionInvalid { region },
             Self::GeminiRateLimited => LegacyAppErrorWire::GeminiRateLimited,
@@ -273,9 +265,6 @@ impl fmt::Display for AppError {
             AppError::Io(msg) => write!(f, "I/O error: {}", msg),
             AppError::CredentialMissing { key } => {
                 write!(f, "Credential missing: {}", key)
-            }
-            AppError::CredentialFileError { reason } => {
-                write!(f, "Credential file error: {}", reason)
             }
             AppError::AwsCredentialExpired => write!(f, "AWS credentials have expired"),
             AppError::AwsRegionInvalid { region } => {
@@ -706,15 +695,6 @@ mod tests {
                 serde_json::json!({
                     "code": "credential_missing",
                     "message": {"key": "aws_secret_key"},
-                }),
-            ),
-            (
-                AppError::CredentialFileError {
-                    reason: "legacy parse failure".into(),
-                },
-                serde_json::json!({
-                    "code": "credential_file_error",
-                    "message": {"reason": "legacy parse failure"},
                 }),
             ),
             (

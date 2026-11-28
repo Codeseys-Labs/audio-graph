@@ -6,6 +6,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  RUNTIME_DIAGNOSTIC_CONTRACT,
+  type RuntimeDiagnostic,
+} from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type { ChatMessage } from "../types";
@@ -51,6 +55,29 @@ function resetStore(
 
 function msg(role: ChatMessage["role"], content: string): ChatMessage {
   return { role, content };
+}
+
+function runtimeDiagnostic(
+  code: (typeof RUNTIME_DIAGNOSTIC_CONTRACT.error_codes)[number],
+  recoveryAction: (typeof RUNTIME_DIAGNOSTIC_CONTRACT.recovery_actions)[number] = "none",
+): RuntimeDiagnostic {
+  return {
+    kind: "runtime",
+    detail: {
+      code,
+      retryable: false,
+      recovery_action: recoveryAction,
+      context: { operation: "language_model_inference" },
+    },
+  };
+}
+
+function renderFailedTurn(failure: RuntimeDiagnostic, content = "") {
+  resetStore({
+    chatMessages: [msg("user", "q"), { role: "assistant", content, failure }],
+  });
+  render(<ChatSidebar />);
+  return screen.getByRole("alert");
 }
 
 describe("ChatSidebar", () => {
@@ -242,5 +269,56 @@ describe("ChatSidebar", () => {
     expect(
       screen.getByRole("textbox", { name: /pergunte sobre a conversa/i }),
     ).toBeDisabled();
+  });
+
+  describe("failed turns", () => {
+    it.each(
+      RUNTIME_DIAGNOSTIC_CONTRACT.error_codes,
+    )("renders localized copy for %s, never the raw token", (code) => {
+      const alert = renderFailedTurn(runtimeDiagnostic(code));
+      expect(alert).toHaveTextContent(i18n.t("chat.failed"));
+      expect(alert).toHaveTextContent(
+        i18n.t(`runtimeDiagnostics.runtime.${code}`),
+      );
+      expect(alert.textContent).not.toContain("runtime/");
+      // The rate-limit guidance is keyed on the code, not on text.
+      if (code === "rate_limited") {
+        expect(alert).toHaveTextContent(i18n.t("chat.rateLimitedHint"));
+      } else {
+        expect(alert).not.toHaveTextContent(i18n.t("chat.rateLimitedHint"));
+      }
+    });
+
+    it("shows the recovery step and keeps partial text visible but labeled", () => {
+      const alert = renderFailedTurn(
+        runtimeDiagnostic("credential_rejected", "reenter_credential"),
+        "Half an answer",
+      );
+      expect(alert).toHaveTextContent("Re-enter the credential in Settings.");
+      expect(screen.getByText("Half an answer")).toBeInTheDocument();
+      expect(screen.getByText(i18n.t("chat.partialReply"))).toBeInTheDocument();
+    });
+
+    it("fails closed to the fixed internal copy for a malformed diagnostic", () => {
+      const alert = renderFailedTurn({
+        kind: "runtime",
+        detail: { code: "runtime/provider_unavailable" },
+      } as unknown as RuntimeDiagnostic);
+      expect(alert).toHaveTextContent(
+        i18n.t("runtimeDiagnostics.runtime.internal"),
+      );
+      expect(alert.textContent).not.toContain("runtime/");
+    });
+
+    it("localizes the failure copy", async () => {
+      await act(async () => {
+        await i18n.changeLanguage("pt");
+      });
+      const alert = renderFailedTurn(runtimeDiagnostic("rate_limited"));
+      expect(alert).toHaveTextContent("A resposta falhou.");
+      expect(alert).toHaveTextContent(
+        "O provedor está limitando as solicitações. Tente novamente mais tarde.",
+      );
+    });
   });
 });

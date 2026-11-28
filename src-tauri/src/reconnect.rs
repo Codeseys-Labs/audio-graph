@@ -23,10 +23,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 ///
 /// Providers define when a reconnect has recovered. AssemblyAI waits for
 /// `Begin`, Soniox waits for a successful response, and OpenAI Realtime ASR
-/// waits for `session.updated` and a sustained healthy session.
-/// AWS Transcribe waits for a sustained healthy stream. Deepgram, Gemini,
-/// and Aura reset when the transport reopens.
+/// waits for `session.updated`. Deepgram is ready when the transport opens.
+/// All four reset their budget only after a sustained healthy session.
+/// AWS Transcribe waits for a sustained healthy stream. Gemini and Aura
+/// reset when the transport reopens.
 pub(crate) const DEFAULT_BACKOFF_SECONDS: [u64; 10] = [1, 2, 5, 10, 20, 30, 60, 60, 60, 60];
+
+pub(crate) const HEALTHY_SESSION_RESET_AFTER: Duration = Duration::from_secs(30);
+
+pub(crate) fn should_reset_reconnect_budget(
+    ready_at: Option<tokio::time::Instant>,
+    now: impl FnOnce() -> tokio::time::Instant,
+) -> bool {
+    ready_at.is_some_and(|ready_at| {
+        now().saturating_duration_since(ready_at) >= HEALTHY_SESSION_RESET_AFTER
+    })
+}
 
 /// One step of a reconnect ladder, computed from the number of reconnect
 /// attempts already made.

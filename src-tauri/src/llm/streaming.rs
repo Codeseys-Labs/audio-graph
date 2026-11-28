@@ -32,9 +32,7 @@ use crate::llm::engine::{
     ChatMessage, LlmChatParams, LlmStreamEvent, engine_failure, engine_not_loaded,
 };
 use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic, same_origin_redirects};
-use crate::llm::openrouter::{
-    DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
-};
+use crate::llm::openrouter::{DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig};
 use crate::llm::sse::{SseDecoder, SseEvent, StreamChunk};
 pub use crate::llm::stream_contract::{
     FinishReason, StreamBackendHandles, StreamChatRequest, StreamContextMetadata, StreamParams,
@@ -223,15 +221,6 @@ fn build_openrouter_request(
     }
 }
 
-fn openrouter_routing_policy_from_backend_handles(
-    request: &StreamChatRequest,
-) -> Option<OpenRouterRoutingPolicy> {
-    let client = request.backend_handles.openrouter_client.as_ref()?;
-    let guard = client.lock().ok()?;
-    let client = guard.as_ref()?;
-    client.config().routing_policy.clone()
-}
-
 /// Convert an [`LlmProvider`] enum value into a [`StreamRequest`], or `None`
 /// if the variant doesn't have streaming support yet.
 ///
@@ -283,7 +272,10 @@ fn build_request_for_provider(
                 model: model.clone(),
                 base_url: base_url.clone(),
                 provider_order: provider_order.clone(),
-                routing_policy: openrouter_routing_policy_from_backend_handles(request),
+                // From the request, never the shared client cache: the cache
+                // follows the live settings, and by the time this runs it can
+                // be empty or hold another configuration.
+                routing_policy: request.openrouter_routing_policy.clone(),
                 include_usage_in_stream: *include_usage_in_stream,
                 http_referer: DEFAULT_HTTP_REFERER.to_string(),
                 app_title: DEFAULT_APP_TITLE.to_string(),
@@ -326,8 +318,87 @@ fn check_streaming_http_content_egress(
         .map_err(|_| diagnostic(Code::PolicyBlocked, INFERENCE))
 }
 
-/// Spawn a background tokio task that streams chat tokens for `provider`
-/// and emits them as [`TokenDelta`] messages on the returned receiver.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REQUEST_BUILD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm a one-shot hook that runs on the stream task after a request was handed
+/// to [`stream_chat_with_request`] and before its HTTP request is built: the
+/// window a settings save can land in. It is thread-local, so it reaches the
+/// task only on a current-thread runtime.
+#[cfg(test)]
+pub(crate) fn before_next_request_build(hook: impl FnOnce() + 'static) {
+    BEFORE_REQUEST_BUILD.set(Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn before_request_build_test_point() {
+    if let Some(hook) = BEFORE_REQUEST_BUILD.take() {
+        hook();
+    }
+}
+
+/// Single-shot SSE mock that hands back the JSON body of the one request it
+/// receives, then answers with `body`.
+#[cfg(test)]
+pub(crate) async fn spawn_capturing_sse_mock(
+    body: &'static str,
+) -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (captured, request_body) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        let body_start = loop {
+            if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+        };
+        let content_length = String::from_utf8_lossy(&request[..body_start])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while request.len() < body_start + content_length {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = captured.send(
+            serde_json::from_slice(&request[body_start..body_start + content_length])
+                .expect("the request body is JSON"),
+        );
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(body.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+    (format!("http://{}", addr), request_body)
+}
+
+/// Spawn a background tokio task that streams chat tokens for `request` and
+/// emits them as [`TokenDelta`] messages on the returned receiver.
 ///
 /// The task terminates after exactly one of `Done` / `Error` / `Cancelled`
 /// has been sent, then drops `tx`. Callers should consume the channel to
@@ -342,27 +413,10 @@ fn check_streaming_http_content_egress(
 /// to abort the stream. Cloning the cancel token (cheap) and storing the
 /// clone in `AppState` is what `cancel_streaming_chat` uses to abort.
 ///
-/// `params` carries the user-configured sampling settings (`max_tokens` /
-/// `temperature`). The caller must source them from the same config the
-/// blocking chat path reads so both paths produce comparable replies.
-pub fn stream_chat(
-    provider: LlmProvider,
-    history: Vec<ChatMessage>,
-    graph_context: String,
-    params: StreamParams,
-) -> (mpsc::Receiver<TokenDelta>, CancellationToken) {
-    stream_chat_with_request(StreamChatRequest::new(
-        provider,
-        history,
-        graph_context,
-        params,
-    ))
-}
-
-/// Spawn a streaming chat task from an explicit provider-neutral request.
-///
-/// This is the entry point future LocalLlama, mistral.rs, and Bedrock adapters
-/// should use when they need backend handles or source/context metadata.
+/// The task builds the HTTP request after this returns, and settings can
+/// change in between. Everything the request is built from is therefore in
+/// `request`: the provider, its routing policy and the sampling settings, all
+/// from the one settings snapshot the caller admitted the request under.
 pub fn stream_chat_with_request(
     request: StreamChatRequest,
 ) -> (mpsc::Receiver<TokenDelta>, CancellationToken) {
@@ -428,6 +482,8 @@ pub fn stream_chat_with_request(
             return;
         }
 
+        #[cfg(test)]
+        before_request_build_test_point();
         let stream_request = match build_request_for_provider(&request) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -1054,11 +1110,11 @@ pub enum ChatStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
     },
-    /// Terminal frame, sent exactly once per stream, carrying the
+    /// Terminal frame of a completed or cancelled stream, carrying the
     /// authoritative `full_text` + optional `usage`. `finish_reason` is the
-    /// closed [`FinishReason`] token of a completed turn, `"cancelled"` for a
-    /// cancelled one, and `"error: runtime/<code>"` for a failed one. Mirrors
-    /// the legacy `chat-token-done` payload.
+    /// closed [`FinishReason`] token of a completed turn, or `"cancelled"`. A
+    /// failed stream ends on [`crate::events::ChatStreamFrame::Failed`]
+    /// instead. Mirrors the legacy `chat-token-done` payload.
     #[serde(rename = "done")]
     Done {
         request_id: String,
@@ -1076,6 +1132,7 @@ pub enum ChatStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::openrouter::{OpenRouterDataCollectionPolicy, OpenRouterRoutingPolicy};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1224,7 +1281,7 @@ mod tests {
         graph_context: String,
         params: StreamParams,
     ) -> StreamChatRequest {
-        StreamChatRequest::new(provider, history, graph_context, params)
+        StreamChatRequest::new(provider, None, history, graph_context, params)
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
     }
 
@@ -1689,6 +1746,7 @@ mod tests {
             };
             let request = StreamChatRequest::new(
                 provider,
+                None,
                 vec![ChatMessage {
                     role: "user".to_string(),
                     content: "sensitive question".to_string(),
@@ -1752,6 +1810,7 @@ mod tests {
             };
             let request = StreamChatRequest::new(
                 provider,
+                None,
                 vec![ChatMessage {
                     role: "user".to_string(),
                     content: "sensitive question".to_string(),
@@ -1823,9 +1882,13 @@ mod tests {
 
     #[tokio::test]
     async fn local_llama_stream_chat_requires_explicit_backend_handle() {
-        let provider = LlmProvider::LocalLlama;
-        let (mut rx, _cancel) =
-            stream_chat(provider, vec![], String::new(), StreamParams::default());
+        let (mut rx, _cancel) = stream_chat_with_request(StreamChatRequest::new(
+            LlmProvider::LocalLlama,
+            None,
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
             TokenDelta::Error { diagnostic, .. } => {
@@ -1846,6 +1909,7 @@ mod tests {
     async fn local_llama_stream_chat_reports_unloaded_engine_from_handle() {
         let request = StreamChatRequest::new(
             LlmProvider::LocalLlama,
+            None,
             vec![],
             String::new(),
             StreamParams::default(),
@@ -1878,6 +1942,7 @@ mod tests {
     ) -> StreamChatRequest {
         StreamChatRequest::new(
             LlmProvider::LocalLlama,
+            None,
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -2079,6 +2144,7 @@ mod tests {
             LlmProvider::MistralRs {
                 model_id: "mistralrs-test-model".to_string(),
             },
+            None,
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -2436,6 +2502,7 @@ mod tests {
 
         let request = StreamChatRequest::new(
             provider.clone(),
+            None,
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -2451,7 +2518,7 @@ mod tests {
         })
         .with_context_id("graph-context:session-1");
 
-        assert!(request.backend_handles.has_handle_for(&provider));
+        assert!(request.backend_handles.mistralrs_engine.is_some());
         assert_eq!(request.metadata.backend.provider, "MistralRs");
         assert_eq!(
             request.metadata.backend.model.as_deref(),
@@ -2494,6 +2561,7 @@ mod tests {
     fn aws_bedrock_is_not_an_sse_request_provider() {
         let request = StreamChatRequest::new(
             aws_bedrock_provider(),
+            None,
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -2520,6 +2588,7 @@ mod tests {
     async fn aws_bedrock_blocked_egress_rejects_before_cloud_call() {
         let request = StreamChatRequest::new(
             aws_bedrock_provider(),
+            None,
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "sensitive question".to_string(),
@@ -2818,55 +2887,112 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openrouter_stream_request_prefers_synced_rich_policy_over_provider_order() {
-        let rich_config = OpenRouterConfig {
+    fn openrouter_provider(base_url: &str, provider_order: Option<Vec<String>>) -> LlmProvider {
+        LlmProvider::OpenRouter {
             api_key: "sk-or".to_string(),
             model: "anthropic/claude-sonnet-4.5".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            provider_order: Some(vec!["legacy-provider".to_string()]),
-            routing_policy: Some(OpenRouterRoutingPolicy {
+            base_url: base_url.to_string(),
+            provider_order,
+            include_usage_in_stream: true,
+        }
+    }
+
+    /// The restrictions a user approves a request under.
+    fn restricted_routing() -> OpenRouterRoutingPolicy {
+        OpenRouterRoutingPolicy {
+            data_collection: Some(OpenRouterDataCollectionPolicy::Deny),
+            zdr: Some(true),
+            ..OpenRouterRoutingPolicy::default()
+        }
+    }
+
+    fn openrouter_request(
+        provider: LlmProvider,
+        routing_policy: Option<OpenRouterRoutingPolicy>,
+    ) -> StreamChatRequest {
+        StreamChatRequest::new(
+            provider,
+            routing_policy,
+            vec![],
+            "ctx".to_string(),
+            StreamParams::default(),
+        )
+        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+    }
+
+    #[test]
+    fn openrouter_stream_request_takes_its_routing_policy_from_the_request_alone() {
+        let base_url = "https://openrouter.ai/api/v1";
+        let provider_object = |request: &StreamChatRequest| {
+            build_request_for_provider(request)
+                .expect("request builds")
+                .expect("OpenRouter provider builds a stream request")
+                .body
+                .get("provider")
+                .cloned()
+        };
+
+        let restricted = openrouter_request(
+            openrouter_provider(base_url, None),
+            Some(restricted_routing()),
+        );
+        assert_eq!(
+            provider_object(&restricted),
+            Some(serde_json::json!({ "data_collection": "deny", "zdr": true }))
+        );
+
+        // A request admitted with no policy has none to send.
+        let unrestricted = openrouter_request(openrouter_provider(base_url, None), None);
+        assert_eq!(provider_object(&unrestricted), None);
+
+        // The rich policy still precedes the legacy provider order.
+        let rich = openrouter_request(
+            openrouter_provider(base_url, Some(vec!["legacy-provider".to_string()])),
+            Some(OpenRouterRoutingPolicy {
                 order: vec!["cerebras".to_string(), "groq".to_string()],
                 only: vec!["cerebras".to_string(), "groq".to_string()],
                 allow_fallbacks: Some(false),
                 ..OpenRouterRoutingPolicy::default()
             }),
-            include_usage_in_stream: true,
-            http_referer: DEFAULT_HTTP_REFERER.to_string(),
-            app_title: DEFAULT_APP_TITLE.to_string(),
-            max_tokens: 512,
-            temperature: 0.1,
-        };
-        let openrouter_client = crate::llm::openrouter::OpenRouterClient::new(rich_config)
-            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-        let handles = StreamBackendHandles {
-            openrouter_client: Some(Arc::new(Mutex::new(Some(openrouter_client)))),
-            ..StreamBackendHandles::empty()
-        };
-        let provider = LlmProvider::OpenRouter {
-            api_key: "sk-or".to_string(),
-            model: "anthropic/claude-sonnet-4.5".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            provider_order: Some(vec!["legacy-provider".to_string()]),
-            include_usage_in_stream: true,
-        };
-
-        let request =
-            StreamChatRequest::new(provider, vec![], "ctx".to_string(), StreamParams::default())
-                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
-                .with_backend_handles(handles);
-        let stream_request = build_request_for_provider(&request)
-            .expect("request builds")
-            .expect("OpenRouter provider builds a stream request");
-
+        );
         assert_eq!(
-            stream_request.body.get("provider"),
-            Some(&serde_json::json!({
+            provider_object(&rich),
+            Some(serde_json::json!({
                 "order": ["cerebras", "groq"],
                 "only": ["cerebras", "groq"],
                 "allow_fallbacks": false
-            })),
-            "streaming request construction must prefer synced rich policy over legacy provider_order"
+            }))
+        );
+    }
+
+    /// The routing policy a request was admitted with is what reaches the
+    /// endpoint. A stream request holds no handle to the shared client slots,
+    /// so there is nothing here for a settings save to change; the three
+    /// callers' tests in `commands.rs` run a save in that window.
+    #[tokio::test]
+    async fn an_openrouter_stream_sends_the_routing_policy_it_was_admitted_with() {
+        let (base_url, request_body) = spawn_capturing_sse_mock(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (mut rx, _cancel) = stream_chat_with_request(openrouter_request(
+            openrouter_provider(&base_url, None),
+            Some(restricted_routing()),
+        ));
+
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        assert!(
+            matches!(frames.last(), Some(TokenDelta::Done { .. })),
+            "{frames:?}"
+        );
+        let body = request_body.await.expect("the mock received the request");
+        assert_eq!(
+            body["provider"],
+            serde_json::json!({ "data_collection": "deny", "zdr": true })
         );
     }
 
