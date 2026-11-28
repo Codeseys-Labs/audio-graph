@@ -1,6 +1,6 @@
 use super::*;
 use crate::credentials::adapters::native_interaction::NativeInteractionGate;
-use mutations::{Mutation, mutate_at};
+use mutations::{DispatchInterruption, Mutation, mutate_at};
 use std::collections::HashMap;
 
 const NEW_SECRET: &str = "write canary apricot";
@@ -27,13 +27,20 @@ enum Behavior {
     Prompt,
     PromptNeverSettles,
     PromptChangedState,
+    PromptCompleted,
     LostCommitted,
     LostUnchanged,
     LostReadFails,
     DisconnectAfterCommit,
+    DisconnectClient,
     ErrorAfterCommit,
     RelockAtMutation,
     DisappearAtMutation,
+    AccessDenied,
+    MissingSession,
+    PlainSession,
+    PrepareReadFails,
+    ExpireBeforeSend,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,10 +57,11 @@ struct Store {
     callers: HashMap<String, usize>,
     sessions: HashMap<usize, super::super::super::crypto::SessionKey>,
     ledger: Vec<Step>,
+    disconnect: Option<oneshot::Sender<()>>,
 }
 
 impl Store {
-    fn new(initial: Initial, behavior: Behavior) -> Self {
+    fn new(initial: Initial, behavior: Behavior, disconnect: Option<oneshot::Sender<()>>) -> Self {
         Self {
             initial,
             behavior,
@@ -66,6 +74,7 @@ impl Store {
             callers: HashMap::new(),
             sessions: HashMap::new(),
             ledger: Vec::new(),
+            disconnect,
         }
     }
 
@@ -141,11 +150,18 @@ impl Store {
                         .insert(client, exchange.finish(&public).unwrap())
                         .is_none()
                 );
-                connection
-                    .reply(&header, &(Variant::from(vec![4_u8]), path(SESSION)))
-                    .await
+                let output = if self.behavior == Behavior::PlainSession {
+                    Variant::from("")
+                } else {
+                    Variant::from(vec![4_u8])
+                };
+                connection.reply(&header, &(output, path(SESSION))).await
             }
             Call::Secret => {
+                if self.behavior == Behavior::PrepareReadFails {
+                    return reply_error(connection, message, "org.freedesktop.DBus.Error.Failed")
+                        .await;
+                }
                 let session: OwnedObjectPath = message.body().deserialize().unwrap();
                 assert!(session == path(SESSION));
                 let iv = [7; 16];
@@ -178,7 +194,10 @@ impl Store {
                 assert!(header.path().is_some_and(|p| p.as_str() == PROMPT_PATH));
                 assert!(matches!(
                     self.behavior,
-                    Behavior::Prompt | Behavior::PromptNeverSettles | Behavior::PromptChangedState
+                    Behavior::Prompt
+                        | Behavior::PromptNeverSettles
+                        | Behavior::PromptChangedState
+                        | Behavior::PromptCompleted
                 ));
                 if self.behavior != Behavior::PromptNeverSettles {
                     // Emit before replying. A client that subscribes after
@@ -189,7 +208,10 @@ impl Store {
                             PROMPT_PATH,
                             PROMPT_INTERFACE,
                             "Completed",
-                            &(true, Variant::from("/")),
+                            &(
+                                self.behavior != Behavior::PromptCompleted,
+                                Variant::from("/"),
+                            ),
                         )
                         .await
                         .unwrap();
@@ -251,8 +273,10 @@ impl Store {
                 reply_error(connection, message, "org.freedesktop.Secret.Error.IsLocked").await;
                 return;
             }
-            Behavior::DisappearAtMutation => {
-                self.value = None;
+            Behavior::DisappearAtMutation | Behavior::MissingSession => {
+                if self.behavior == Behavior::DisappearAtMutation {
+                    self.value = None;
+                }
                 reply_error(
                     connection,
                     message,
@@ -261,8 +285,23 @@ impl Store {
                 .await;
                 return;
             }
-            Behavior::Prompt | Behavior::PromptNeverSettles | Behavior::PromptChangedState => {
-                if self.behavior == Behavior::PromptChangedState {
+            Behavior::AccessDenied => {
+                reply_error(
+                    connection,
+                    message,
+                    "org.freedesktop.DBus.Error.AccessDenied",
+                )
+                .await;
+                return;
+            }
+            Behavior::Prompt
+            | Behavior::PromptNeverSettles
+            | Behavior::PromptChangedState
+            | Behavior::PromptCompleted => {
+                if matches!(
+                    self.behavior,
+                    Behavior::PromptChangedState | Behavior::PromptCompleted
+                ) {
                     self.value = new_value;
                 }
                 match call {
@@ -285,6 +324,11 @@ impl Store {
                 // owner disconnect. The peer's sessions disappear with it.
                 self.sessions.clear();
                 connection.clone().close().await.unwrap();
+                return;
+            }
+            Behavior::DisconnectClient => {
+                self.sessions.remove(&client);
+                self.disconnect.take().unwrap().send(()).unwrap();
                 return;
             }
             Behavior::ErrorAfterCommit => {
@@ -332,6 +376,14 @@ fn run(
     let bus = Bus::start();
     let (stop, stopped) = oneshot::channel();
     let (ready, response) = mpsc::sync_channel(1);
+    let (disconnect, interruption) = match behavior {
+        Behavior::DisconnectClient => {
+            let (send, receive) = oneshot::channel();
+            (Some(send), Some(DispatchInterruption::Disconnect(receive)))
+        }
+        Behavior::ExpireBeforeSend => (None, Some(DispatchInterruption::ExpireBeforeSend)),
+        _ => (None, None),
+    };
     let address = bus.address();
     let peer = thread::spawn(move || {
         zbus::block_on(async {
@@ -339,7 +391,7 @@ fn run(
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
             ready.send(()).unwrap();
-            let mut store = Store::new(initial, behavior);
+            let mut store = Store::new(initial, behavior, disconnect);
             let mut stopped = pin!(stopped);
             while let Either::Left((Some(Ok(message)), _)) =
                 select(messages.next(), stopped.as_mut()).await
@@ -359,6 +411,10 @@ fn run(
     let gate = NativeInteractionGate::isolated_for_test();
     let mut lease = gate.acquire().unwrap();
     let (prompt, invocation) = lease.mutation_capabilities();
+    if behavior == Behavior::ExpireBeforeSend {
+        // An earlier write on this same lease already set the aggregate flag.
+        invocation.mark_started();
+    }
     let outcome = mutate_at(
         bus.address(),
         prompt,
@@ -366,6 +422,7 @@ fn run(
         &wanted(),
         mutation,
         CALL_DEADLINE,
+        interruption,
     );
     let rendered = format!("{outcome:?}");
     assert_redacted(&rendered);
@@ -383,7 +440,8 @@ fn run(
                 invocation,
                 &wanted(),
                 Mutation::Delete,
-                CALL_DEADLINE
+                CALL_DEADLINE,
+                None,
             ),
             Err(Failure::StalledWorker.into())
         );
@@ -413,9 +471,6 @@ fn mutation_calls(calls: &[Step]) -> Vec<Call> {
 }
 
 fn assert_readback(calls: &[Step]) {
-    let originals = calls.iter().filter(|step| step.client == 0);
-    let closes = originals.filter(|step| step.call == Call::Close).count();
-    assert_eq!(closes, 1);
     assert!(
         calls
             .iter()
@@ -487,6 +542,11 @@ fn deletes_one_exact_item_and_treats_definite_absence_as_a_noop() {
     );
     assert_eq!(mutation_calls(&calls), [Call::Delete]);
     assert_readback(&calls);
+    assert!(
+        calls
+            .iter()
+            .all(|step| !matches!(step.call, Call::Session | Call::Secret))
+    );
     let calls = run(
         Initial::Absent,
         Behavior::Acknowledge,
@@ -521,7 +581,11 @@ fn dismisses_create_and_delete_prompts_and_verifies_the_prior_state() {
             .filter(|step| step.client == 0)
             .map(|step| step.call)
             .collect();
-        assert_eq!(sent[sent.len() - 3..], [call, Call::Dismiss, Call::Close]);
+        if call == Call::Create {
+            assert!(sent.ends_with(&[call, Call::Dismiss, Call::Close]));
+        } else {
+            assert!(sent.ends_with(&[call, Call::Dismiss]));
+        }
     }
 }
 
@@ -616,4 +680,100 @@ fn close_failure_does_not_change_a_verified_commit() {
     );
     assert_eq!(mutation_calls(&calls), [Call::Create]);
     assert_readback(&calls);
+}
+
+#[test]
+fn lost_create_replies_use_a_live_peer_and_lost_delete_can_leave_the_item() {
+    for (behavior, expected) in [
+        (Behavior::LostCommitted, Ok(MutationOutcome::Committed)),
+        (Behavior::LostUnchanged, Err(Failure::CommitUnknown.into())),
+        (Behavior::LostReadFails, Err(Failure::CommitUnknown.into())),
+    ] {
+        let calls = run(Initial::Absent, behavior, put(), expected);
+        assert_eq!(mutation_calls(&calls), [Call::Create]);
+        assert_readback(&calls);
+    }
+    let calls = run(
+        Initial::Present,
+        Behavior::LostUnchanged,
+        Mutation::Delete,
+        Err(Failure::CommitUnknown.into()),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::Delete]);
+    assert_readback(&calls);
+}
+
+#[test]
+fn create_reconciles_collection_relock_or_disappearance_and_access_denied() {
+    for (behavior, code) in [
+        (Behavior::RelockAtMutation, Failure::Locked),
+        (Behavior::DisappearAtMutation, Failure::Unavailable),
+        (Behavior::AccessDenied, Failure::AccessDenied),
+    ] {
+        let calls = run(
+            Initial::Absent,
+            behavior,
+            put(),
+            Ok(MutationOutcome::NotCommitted(code)),
+        );
+        assert_eq!(mutation_calls(&calls), [Call::Create]);
+        assert_readback(&calls);
+    }
+}
+
+#[test]
+fn preparation_errors_close_the_session_without_dispatch() {
+    for (behavior, code) in [
+        (Behavior::PlainSession, Failure::Unsupported),
+        (Behavior::PrepareReadFails, Failure::Internal),
+        (Behavior::ExpireBeforeSend, Failure::Unavailable),
+    ] {
+        let calls = run(Initial::Present, behavior, put(), Err(code.into()));
+        assert!(mutation_calls(&calls).is_empty());
+        assert!(calls.iter().all(|step| step.client == 0));
+        assert_eq!(calls.last().unwrap().call, Call::Close);
+    }
+}
+
+#[test]
+fn missing_session_is_unavailable_when_readback_proves_the_item_is_present() {
+    let calls = run(
+        Initial::Present,
+        Behavior::MissingSession,
+        put(),
+        Ok(MutationOutcome::NotCommitted(Failure::Unavailable)),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::SetSecret]);
+    assert_readback(&calls);
+}
+
+#[test]
+fn completed_prompt_is_verified_and_disconnect_of_only_the_client_can_commit() {
+    let calls = run(
+        Initial::Absent,
+        Behavior::PromptCompleted,
+        put(),
+        Ok(MutationOutcome::Committed),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::Create]);
+    assert!(calls.iter().any(|step| step.call == Call::Dismiss));
+    assert_readback(&calls);
+
+    let calls = run(
+        Initial::Absent,
+        Behavior::DisconnectClient,
+        put(),
+        Ok(MutationOutcome::Committed),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::Create]);
+    assert!(
+        !calls
+            .iter()
+            .any(|step| step.client == 0 && step.call == Call::Close)
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|step| step.client == 1 && step.call == Call::Close)
+    );
 }
