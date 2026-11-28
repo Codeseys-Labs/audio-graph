@@ -168,7 +168,7 @@ Exact strings emitted by `src-tauri/src/gemini/mod.rs`. Grep targets.
 | Log string (prefix match)                                              | Level | Meaning                                                                                   |
 | ---------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------------------------- |
 | `Gemini Live: setup complete`                                          | info  | Initial connect finished handshake; session is live.                                      |
-| `Gemini Live: pre-setup message: <text>`                               | debug | Non-`setupComplete` frame seen during handshake (unusual but harmless).                   |
+| `Gemini Live: pre-setup message type=<closed> fields=<bucket>`         | debug | Non-`setupComplete` frame seen during handshake (unusual but harmless).                   |
 | `GeminiLiveClient: disconnecting (user-initiated)`                     | info  | `disconnect()` called; session task will exit without reconnecting.                       |
 | `GeminiLiveClient: dropped`                                            | info  | Client dropped; runtime shutdown under way.                                               |
 | `Gemini session: ending (UserRequested)`                               | info  | Clean end after `disconnect()`.                                                           |
@@ -181,20 +181,21 @@ Exact strings emitted by `src-tauri/src/gemini/mod.rs`. Grep targets.
 | `Gemini session: reconnecting with resumption handle`                  | info  | Reconnect will send a cached handle so server can restore state.                          |
 | `Gemini session: reconnecting without resumption handle (new session)` | info  | No cached handle; next session starts fresh.                                              |
 | `Gemini session: reconnected on attempt N`                             | info  | Reconnect succeeded (new socket + setup-complete); resuming I/O.                          |
-| `Gemini session: reconnect attempt N failed: <err>`                    | warn  | Reconnect attempt failed; will try next backoff step.                                     |
-| `Gemini session: reconnect budget exhausted after N attempts`          | error | Gave up after 4 failed attempts; fatal `Error` event emitted, session task exits.         |
+| `Gemini session: reconnect attempt N failed (<category>)`              | warn  | Reconnect attempt failed; will try next backoff step. `<category>` is the closed classification (`Auth`, `Network`, `RateLimit { retry_delay }`, ...) — never provider text. |
+| `Gemini session: reconnect budget exhausted (N attempts)`              | warn  | Gave up after 4 failed attempts; fatal `Error` event emitted, session task exits.         |
 | `Gemini: session task exited`                                          | info  | Session task has fully unwound.                                                           |
-| `Gemini: server closed connection: <frame>`                            | info  | Close frame observed in the read loop. Followed by classification into `ServerClose`.     |
-| `Gemini: failed to send audio: <err>`                                  | error | Write failed; classified as `NetworkError` and triggers reconnect.                        |
-| `Gemini: WebSocket read error: <err>`                                  | error | Read failed with a non-Close error; classified as `NetworkError` and triggers reconnect.  |
+| `Gemini: server closed connection (<category>)`                        | warn  | Classified close frame (auth / quota / server) observed in the read loop. The close reason text is never logged. |
+| `Gemini: server closed connection (uncategorized)`                     | info  | Unclassified / normal close frame; reconnect follows.                                     |
+| `Gemini: audio send failed (<category>)`                               | warn  | Write failed; classified as `NetworkError` and triggers reconnect. Same shape for `end-turn send failed`. |
+| `Gemini: WebSocket read error (<category>)`                            | warn  | Read failed with a non-Close error; classified as `NetworkError` and triggers reconnect.  |
+| `Gemini Live: connect failed (<category>)`                             | warn  | Initial connect / setup handshake failed; the command returns a typed `runtime_diagnostic` error. |
 | `Gemini: unexpected binary message`                                    | warn  | Non-text frame received (should not happen with TEXT-only modality); ignored.             |
 | `Gemini Live: received goAway — server is shutting down`               | warn  | Server is draining; client will reconnect.                                                |
 | `Gemini Live: session resumption handle refreshed`                     | debug | New resumable handle cached from a `sessionResumptionUpdate`.                             |
 | `Gemini Live: sessionResumptionUpdate with resumable=false`            | debug | Update arrived but resumption is temporarily unavailable; cached handle preserved.        |
-| `Gemini Live: invalid JSON: <err>`                                     | warn  | Server sent non-JSON text; emitted as an `Error` event but does not end the session.      |
-| `Gemini Live: turn complete with usage (...)`                          | debug | `turnComplete` frame carried token accounting.                                            |
-| `Gemini Live: standalone usage frame (total=...)`                      | debug | `usageMetadata` arrived without `serverContent` (billing roll-up).                        |
-| `Gemini Live: unhandled message: <text>`                               | debug | Server frame the client does not recognise; safe to ignore.                               |
+| `Gemini Live: invalid server JSON`                                     | warn  | Server sent non-JSON text; emitted as an `Error` event (`invalid_json`) but does not end the session. The frame text is never logged. |
+| `Gemini Live: standalone usage frame`                                  | debug | `usageMetadata` arrived without `serverContent` (billing roll-up). Token counts ride the `turn_complete` event and persisted usage, never the log. |
+| `Gemini Live: unhandled message type=<closed> fields=<bucket>`         | debug | Server frame the client does not recognise; safe to ignore. Only a closed frame-type label and a field-count bucket are logged. |
 
 ## Escalation
 

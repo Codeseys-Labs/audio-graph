@@ -69,7 +69,8 @@ pub struct TurnDelta {
 
 /// Root directory for usage files (`~/.audiograph/usage/`). Creates parents.
 pub fn usage_dir() -> Result<PathBuf, String> {
-    crate::user_data::usage_dir()
+    // Fixed label: the underlying error names the data-root path.
+    crate::user_data::usage_dir().map_err(|_| "usage directory unavailable".to_string())
 }
 
 /// Path to a specific session's usage file.
@@ -97,12 +98,14 @@ pub fn load_usage(session_id: &str) -> SessionUsage {
         return zeroed(session_id);
     }
     match fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str::<SessionUsage>(&contents).unwrap_or_else(|e| {
-            log::warn!("usage: malformed {:?} ({}), resetting to zero", path, e);
+        Ok(contents) => serde_json::from_str::<SessionUsage>(&contents).unwrap_or_else(|_| {
+            // Issue #145: fixed label — the path embeds the session id and the
+            // home directory, and the serde error quotes file content.
+            log::warn!("usage: malformed session usage record, resetting to zero");
             zeroed(session_id)
         }),
-        Err(e) => {
-            log::warn!("usage: read {:?} failed: {}", path, e);
+        Err(_) => {
+            log::warn!("usage: session usage record read failed");
             zeroed(session_id)
         }
     }
@@ -119,11 +122,12 @@ fn zeroed(session_id: &str) -> SessionUsage {
 /// sibling `.tmp` file and renames. Sets owner-only permissions on both.
 pub fn save_usage(usage: &SessionUsage) -> Result<(), String> {
     let path = usage_path(&usage.session_id)?;
-    let json = serde_json::to_string_pretty(usage).map_err(|e| format!("{}", e))?;
+    let json = serde_json::to_string_pretty(usage)
+        .map_err(|_| "usage record serialize failed".to_string())?;
     let tmp = path.with_extension("json.tmp");
     write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
-    fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
+    fs::rename(&tmp, &path).map_err(|_| "usage record rename failed".to_string())?;
     crate::fs_util::set_owner_only(&path);
     Ok(())
 }
@@ -149,8 +153,8 @@ pub fn clear_all_usage() -> Result<(), String> {
     let dir = usage_dir()?;
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(e) => {
-            log::warn!("usage clear: read_dir {:?} failed: {}", dir, e);
+        Err(_) => {
+            log::warn!("usage clear: usage directory read failed");
             return Ok(());
         }
     };
@@ -163,7 +167,7 @@ pub fn clear_all_usage() -> Result<(), String> {
         if !(name.ends_with(".json") || name.ends_with(".json.tmp")) {
             continue;
         }
-        fs::remove_file(&path).map_err(|e| format!("remove {:?}: {}", path, e))?;
+        fs::remove_file(&path).map_err(|_| "usage record removal failed".to_string())?;
     }
     Ok(())
 }
@@ -177,11 +181,11 @@ pub fn clear_all_usage() -> Result<(), String> {
 /// publishes the temp file.
 fn write_tmp_synced(tmp: &PathBuf, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let mut file = fs::File::create(tmp).map_err(|e| format!("create {:?}: {}", tmp, e))?;
+    let mut file = fs::File::create(tmp).map_err(|_| "usage record create failed".to_string())?;
     file.write_all(bytes)
-        .map_err(|e| format!("write {:?}: {}", tmp, e))?;
+        .map_err(|_| "usage record write failed".to_string())?;
     file.sync_all()
-        .map_err(|e| format!("sync {:?}: {}", tmp, e))?;
+        .map_err(|_| "usage record sync failed".to_string())?;
     Ok(())
 }
 
@@ -216,18 +220,15 @@ pub struct LifetimeUsage {
 pub fn load_lifetime_usage() -> LifetimeUsage {
     let dir = match usage_dir() {
         Ok(d) => d,
-        Err(e) => {
-            log::warn!(
-                "lifetime usage: cannot resolve usage dir ({}), returning zero",
-                e
-            );
+        Err(_) => {
+            log::warn!("lifetime usage: usage directory unavailable, returning zero");
             return LifetimeUsage::default();
         }
     };
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) => {
-            log::warn!("lifetime usage: read_dir {:?} failed: {}", dir, e);
+        Err(_) => {
+            log::warn!("lifetime usage: usage directory read failed, returning zero");
             return LifetimeUsage::default();
         }
     };
@@ -240,15 +241,15 @@ pub fn load_lifetime_usage() -> LifetimeUsage {
         }
         let contents = match fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(e) => {
-                log::warn!("lifetime usage: read {:?} failed: {}", path, e);
+            Err(_) => {
+                log::warn!("lifetime usage: session usage record read failed");
                 continue;
             }
         };
         let u: SessionUsage = match serde_json::from_str(&contents) {
             Ok(u) => u,
-            Err(e) => {
-                log::warn!("lifetime usage: parse {:?} failed: {}", path, e);
+            Err(_) => {
+                log::warn!("lifetime usage: session usage record parse failed");
                 continue;
             }
         };
@@ -303,7 +304,8 @@ pub fn seed_lifetime_migration(payload: &LifetimeUsage) -> Result<(), String> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("migration-") && name.ends_with(".json") {
-                log::info!("lifetime migration: existing {} found, skipping seed", name);
+                // Fixed label: the record file name is not a diagnostic.
+                log::info!("lifetime migration: existing record found, skipping seed");
                 return Ok(());
             }
         }
@@ -330,18 +332,16 @@ pub fn seed_lifetime_migration(payload: &LifetimeUsage) -> Result<(), String> {
     };
 
     let path = dir.join(format!("{}.json", sid));
-    let json = serde_json::to_string_pretty(&record).map_err(|e| format!("{}", e))?;
+    let json = serde_json::to_string_pretty(&record)
+        .map_err(|_| "usage record serialize failed".to_string())?;
     let tmp = path.with_extension("json.tmp");
     write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
-    fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
+    fs::rename(&tmp, &path).map_err(|_| "usage migration record rename failed".to_string())?;
     crate::fs_util::set_owner_only(&path);
-    log::info!(
-        "lifetime migration: wrote {} (total={} turns={})",
-        path.display(),
-        payload.total,
-        payload.turns
-    );
+    // Fixed label: the record path embeds the data directory and the exact
+    // migrated totals are user usage data, not diagnostics.
+    log::info!("lifetime migration: wrote migration record");
     Ok(())
 }
 
@@ -491,6 +491,51 @@ mod tests {
         assert_eq!(u.turns, 0);
         assert_eq!(u.total, 0);
         assert_eq!(u.updated_at, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #145: directory failures must surface a fixed label, never the
+    /// data-root path (home directory, user name) or the exact migrated
+    /// totals. The data root is planted UNDER A REGULAR FILE so directory
+    /// creation fails with a path-bearing OS error that must not survive.
+    #[test]
+    fn directory_failures_expose_only_fixed_labels() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("fixed-labels");
+        let blocker = dir.join("canary-private-blocker");
+        fs::write(&blocker, b"x").expect("write blocker file");
+        let _g = HomeGuard::set(&blocker.join("canary-private-root"));
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+
+        let failures = [
+            usage_dir().map(|_| ()),
+            save_usage(&SessionUsage {
+                session_id: "fixed-label-session".into(),
+                ..SessionUsage::default()
+            }),
+            clear_all_usage(),
+            seed_lifetime_migration(&LifetimeUsage {
+                total: 987_654_321,
+                turns: 4_242,
+                ..LifetimeUsage::default()
+            }),
+            append_turn("fixed-label-session", TurnDelta::default()).map(|_| ()),
+        ];
+        for failure in failures {
+            let message = failure.expect_err("an unusable data root must fail");
+            assert_eq!(message, "usage directory unavailable");
+        }
+        assert_eq!(load_lifetime_usage(), LifetimeUsage::default());
+
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(
+            logs.contains("lifetime usage: usage directory unavailable"),
+            "{logs}"
+        );
+        for leaked in ["canary-private", "987654321", "4242"] {
+            assert!(!logs.contains(leaked), "`{leaked}` logged: {logs}");
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -2,11 +2,18 @@ import type { Event } from "@tauri-apps/api/event";
 import { listen } from "@tauri-apps/api/event";
 import { renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  RUNTIME_DIAGNOSTIC_CONTRACT,
+  type RuntimeDiagnostic,
+  type RuntimeErrorCode,
+  type RuntimeSafeRecoveryAction,
+} from "../generated/runtimeDiagnostic";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
-import type { AwsErrorPayload, GeminiErrorCategory } from "../types";
+import type { AwsErrorPayload } from "../types";
 import {
   awsErrorToMessage,
-  routeGeminiError,
+  routeRealtimeDiagnostic,
   useTauriEvents,
 } from "./useTauriEvents";
 
@@ -807,95 +814,258 @@ describe("useTauriEvents", () => {
     errSpy.mockRestore();
   });
 
-  // Exhaustive routing check for every GeminiErrorCategory variant:
-  // confirms the (kind → i18n key, toast variant) pairing stays stable.
-  // If the category spec ever grows a new variant this test should fail
-  // at the switch exhaustiveness check rather than surface the wrong
-  // toast severity in production.
-  it("routes every Gemini error category to the right i18n key + toast variant", () => {
-    const cases: Array<{
-      category: GeminiErrorCategory;
-      expectedKey: string;
-      expectedVariant: "warning" | "info" | "error";
-    }> = [
-      {
-        category: { kind: "auth" },
-        expectedKey: "gemini.error.auth",
-        expectedVariant: "warning",
-      },
-      {
-        category: { kind: "auth_expired" },
-        expectedKey: "gemini.error.authExpired",
-        expectedVariant: "warning",
-      },
-      {
-        category: { kind: "rate_limit", retry_after_secs: 30 },
-        expectedKey: "gemini.error.rateLimit",
-        expectedVariant: "warning",
-      },
-      {
-        category: { kind: "network" },
-        expectedKey: "gemini.error.network",
-        expectedVariant: "info",
-      },
-      {
-        category: { kind: "server" },
-        expectedKey: "gemini.error.server",
-        expectedVariant: "error",
-      },
-      {
-        category: { kind: "unknown" },
-        expectedKey: "gemini.error.unknown",
-        expectedVariant: "error",
-      },
-    ];
+  // ------------------------------------------------------------------
+  // Issue #145 — closed runtime diagnostics on realtime S2S errors
+  // ------------------------------------------------------------------
+  //
+  // The backend attaches a closed `RuntimeDiagnostic` envelope to every
+  // `gemini-status` / `openai-realtime-status` event of type `"error"`.
+  // These tests pin (1) the closed code → i18n key + toast severity matrix,
+  // (2) the exact localized toast through the real hook, (3) the canary:
+  // planted provider text, secrets, close reasons, request ids, and exact
+  // numbers never reach notifications, the sticky error banner, or the
+  // console, and (4) malformed payloads fail closed end to end.
 
-    for (const { category, expectedKey, expectedVariant } of cases) {
-      const { key, variant } = routeGeminiError(category);
-      expect(key).toBe(expectedKey);
-      expect(variant).toBe(expectedVariant);
+  function runtimeDiagnostic(
+    code: RuntimeErrorCode,
+    retryable: boolean,
+    recoveryAction: RuntimeSafeRecoveryAction = "none",
+  ): RuntimeDiagnostic {
+    return {
+      kind: "runtime",
+      detail: {
+        code,
+        retryable,
+        recovery_action: recoveryAction,
+        context: {
+          operation: "realtime_conversation",
+          transport: "websocket",
+        },
+      },
+    };
+  }
+
+  /** Expected toast severity per closed code (the issue #145 routing table). */
+  const EXPECTED_SEVERITY: Record<
+    RuntimeErrorCode,
+    "warning" | "info" | "error"
+  > = {
+    rate_limited: "warning",
+    request_rejected: "warning",
+    policy_blocked: "warning",
+    unsupported: "warning",
+    network_unreachable: "info",
+    timeout: "info",
+    cancelled: "info",
+    credential_rejected: "error",
+    credential_expired: "error",
+    permission_denied: "error",
+    invalid_configuration: "error",
+    provider_unavailable: "error",
+    capacity_exhausted: "error",
+    protocol_error: "error",
+    invalid_response: "error",
+    internal: "error",
+  };
+
+  const ENGINES = [
+    { event: "gemini-status", label: "Gemini Live" },
+    { event: "openai-realtime-status", label: "OpenAI Realtime" },
+  ] as const;
+
+  it("routes EVERY closed runtime code to its i18n key + severity, independent of retryable", () => {
+    // The matrix covers the whole closed vocabulary: a new code in the
+    // generated contract fails this until it is routed.
+    expect(Object.keys(EXPECTED_SEVERITY).sort()).toEqual(
+      [...RUNTIME_DIAGNOSTIC_CONTRACT.error_codes].sort(),
+    );
+    for (const code of RUNTIME_DIAGNOSTIC_CONTRACT.error_codes) {
+      // Severity keys off the closed CODE, not `retryable`: a retryable rate
+      // limit must stay a warning and a retryable outage must stay an error.
+      for (const retryable of [true, false]) {
+        expect(
+          routeRealtimeDiagnostic(runtimeDiagnostic(code, retryable)),
+        ).toEqual({
+          key: `runtimeDiagnostics.runtime.${code}`,
+          variant: EXPECTED_SEVERITY[code],
+        });
+      }
     }
   });
 
-  it("fires a toast when gemini-status 'error' arrives with a category", async () => {
-    useAudioGraphStore.setState({ notifications: [] });
-    renderHook(() => useTauriEvents());
-    await waitForAllHandlers();
-
-    handlers.get("gemini-status")?.(
-      makeEvent("gemini-status", {
-        type: "error",
-        message: "WS close 1008 api key invalid",
-        category: { kind: "auth" },
-      }),
+  it.each([
+    ["credential_rejected", "reenter_credential"],
+    ["credential_expired", "refresh_credential"],
+    ["permission_denied", "review_configuration"],
+    ["invalid_configuration", "review_configuration"],
+  ] as const)("routes provider-auth code %s to an error toast, never info", (code, action) => {
+    const routed = routeRealtimeDiagnostic(
+      runtimeDiagnostic(code, false, action),
     );
-
-    // Classified errors route through a notification (warning) — they do
-    // NOT set the global error banner, because auth failures are
-    // recoverable via Settings → Gemini Live.
-    const notes = useAudioGraphStore.getState().notifications;
-    expect(notes).toHaveLength(1);
-    expect(notes[0].severity).toBe("warning");
+    expect(routed).toEqual({
+      key: `runtimeDiagnostics.runtime.${code}`,
+      variant: "error",
+    });
+    // The localized copy exists for the key (no raw-key fallback).
+    expect(i18n.t(routed.key)).not.toBe(routed.key);
   });
 
-  it("falls back to the error banner when gemini-status 'error' has no category", async () => {
-    useAudioGraphStore.setState({ notifications: [], error: null });
-    renderHook(() => useTauriEvents());
-    await waitForAllHandlers();
+  it("fail-closes malformed or missing envelopes to the internal tuple", () => {
+    for (const malformed of [
+      undefined,
+      null,
+      "GEMINI_CANARY_STRING_DIAGNOSTIC",
+      { kind: "runtime" },
+      { kind: "runtime", detail: { code: "NOT_A_CODE" } },
+    ]) {
+      expect(routeRealtimeDiagnostic(malformed)).toEqual({
+        key: "runtimeDiagnostics.runtime.internal",
+        variant: "error",
+      });
+    }
+  });
 
-    handlers.get("gemini-status")?.(
-      makeEvent("gemini-status", {
-        type: "error",
-        message: "legacy plain-string error",
-      }),
-    );
+  describe.each(ENGINES)("$label status events", ({ event }) => {
+    function consoleSpies() {
+      return (["log", "info", "warn", "error", "debug"] as const).map(
+        (method) => vi.spyOn(console, method).mockImplementation(() => {}),
+      );
+    }
 
-    // Legacy events without `category` preserve the prior behavior:
-    // the message lands in the banner so existing backend paths keep
-    // working during the migration.
-    expect(useAudioGraphStore.getState().error).toBe(
-      "Gemini: legacy plain-string error",
-    );
-    expect(useAudioGraphStore.getState().notifications).toHaveLength(0);
+    function visibleSurfaces() {
+      const state = useAudioGraphStore.getState();
+      return JSON.stringify({
+        error: state.error,
+        notifications: state.notifications,
+      });
+    }
+
+    it("shows the exact localized closed copy as a toast and never touches the sticky banner", async () => {
+      useAudioGraphStore.setState({ notifications: [], error: null });
+      renderHook(() => useTauriEvents());
+      await waitForAllHandlers();
+
+      handlers.get(event)?.(
+        makeEvent(event, {
+          type: "error",
+          message: "server_close",
+          category: { kind: "rate_limit", retry_delay: "short" },
+          diagnostic: runtimeDiagnostic(
+            "rate_limited",
+            true,
+            "retry_after_delay",
+          ),
+        }),
+      );
+
+      const state = useAudioGraphStore.getState();
+      expect(state.error).toBeNull();
+      expect(state.notifications).toHaveLength(1);
+      expect(state.notifications[0]).toMatchObject({
+        severity: "warning",
+        message: i18n.t("runtimeDiagnostics.runtime.rate_limited"),
+      });
+      // A rate limit must not be presented as an outage.
+      expect(state.notifications[0].message).not.toBe(
+        i18n.t("runtimeDiagnostics.runtime.provider_unavailable"),
+      );
+    });
+
+    it("issue #145 canary: planted secrets, provider bodies, close reasons, request ids, and exact numbers never reach the store or the console", async () => {
+      const spies = consoleSpies();
+      useAudioGraphStore.setState({ notifications: [], error: null });
+      renderHook(() => useTauriEvents());
+      await waitForAllHandlers();
+
+      const sentinels = [
+        "canary-credential-value",
+        "canary-provider-body-text",
+        "canary-request-identifier",
+        "canary-close-reason-text",
+        "7391",
+      ];
+      handlers.get(event)?.(
+        makeEvent(event, {
+          type: "error",
+          // Every leak class planted in fields the router must never read.
+          message: `${sentinels[0]} ${sentinels[1]} request_id=${sentinels[2]} reason=${sentinels[3]} len=${sentinels[4]}`,
+          category: { kind: "rate_limit", retry_delay: "short" },
+          detail: sentinels[1],
+          request_id: sentinels[2],
+          diagnostic: runtimeDiagnostic("request_rejected", false),
+        }),
+      );
+
+      const state = useAudioGraphStore.getState();
+      expect(state.error).toBeNull();
+      expect(state.notifications).toHaveLength(1);
+      expect(state.notifications[0]).toMatchObject({
+        severity: "warning",
+        message: i18n.t("runtimeDiagnostics.runtime.request_rejected"),
+      });
+      const everything = visibleSurfaces();
+      const consoleOutput = JSON.stringify(
+        spies.flatMap((spy) => spy.mock.calls),
+      );
+      for (const sentinel of sentinels) {
+        expect(everything).not.toContain(sentinel);
+        expect(consoleOutput).not.toContain(sentinel);
+      }
+      for (const spy of spies) spy.mockRestore();
+    });
+
+    it.each([
+      ["a missing diagnostic", undefined],
+      ["a string diagnostic", "CANARY_STRING_DIAGNOSTIC"],
+      [
+        "a well-typed envelope with an out-of-vocabulary code",
+        {
+          kind: "runtime",
+          detail: {
+            code: "CANARY_CODE",
+            retryable: true,
+            recovery_action: "retry",
+            context: { operation: "realtime_conversation" },
+          },
+        },
+      ],
+      ["a half-built envelope", { kind: "runtime" }],
+    ])("fails closed end to end for %s: internal copy, error severity, no raw text", async (_label, diagnostic) => {
+      const spies = consoleSpies();
+      useAudioGraphStore.setState({ notifications: [], error: null });
+      renderHook(() => useTauriEvents());
+      await waitForAllHandlers();
+
+      handlers.get(event)?.(
+        makeEvent(event, {
+          type: "error",
+          message: "legacy plain-string error CANARY_LEGACY_MESSAGE",
+          category: { kind: "unknown" },
+          diagnostic,
+        }),
+      );
+
+      const state = useAudioGraphStore.getState();
+      // The legacy raw-message fallback into the sticky banner is gone.
+      expect(state.error).toBeNull();
+      expect(state.notifications).toHaveLength(1);
+      expect(state.notifications[0]).toMatchObject({
+        severity: "error",
+        message: i18n.t("runtimeDiagnostics.runtime.internal"),
+      });
+      const everything = visibleSurfaces();
+      const consoleOutput = JSON.stringify(
+        spies.flatMap((spy) => spy.mock.calls),
+      );
+      for (const sentinel of [
+        "CANARY_LEGACY_MESSAGE",
+        "CANARY_STRING_DIAGNOSTIC",
+        "CANARY_CODE",
+      ]) {
+        expect(everything).not.toContain(sentinel);
+        expect(consoleOutput).not.toContain(sentinel);
+      }
+      for (const spy of spies) spy.mockRestore();
+    });
   });
 });
