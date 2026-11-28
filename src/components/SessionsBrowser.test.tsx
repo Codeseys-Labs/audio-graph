@@ -1,8 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
+import NowStrip from "./NowStrip";
 import SessionsBrowser, {
   applyFilterAndSort,
   mergeSessionRows,
@@ -717,29 +725,229 @@ describe("SessionsBrowser component", () => {
     expect(useAudioGraphStore.getState().nav.sessionId).toBe("session-a");
   });
 
-  it("keeps historical session selection disabled during live capture, showing the live-locked detail", async () => {
-    seed([makeSession({ id: "past-session", title: "Past Session" })]);
-    useAudioGraphStore.setState({
-      isCapturing: true,
-      isTranscribing: true,
+  describe("while capture is running (issue #140: Review next to Live)", () => {
+    const LIVE_SEGMENT = {
+      id: "live-seg-1",
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: "live capture line",
+      start_time: 0,
+      end_time: 1,
+      confidence: 1,
+    };
+
+    function startLiveCapture(): void {
+      useAudioGraphStore.setState({
+        isCapturing: true,
+        isTranscribing: true,
+        selectedSourceIds: ["system-default"],
+        captureStartTime: Date.now(),
+        transcriptSegments: [LIVE_SEGMENT],
+        loadedSessionId: null,
+      });
+    }
+
+    /** Every command the mocked `invoke` saw, in order. */
+    function invokedCommands(): string[] {
+      return mockedInvoke.mock.calls.map(([cmd]) => cmd);
+    }
+
+    afterEach(() => {
+      useAudioGraphStore.setState({
+        selectedSourceIds: [],
+        captureStartTime: null,
+        transcriptSegments: [],
+        loadedSessionId: null,
+      });
     });
 
-    render(<SessionsBrowser />);
+    it("opens a completed row's transcript in Review while Stop stays reachable, issuing only load_session", async () => {
+      seed([makeSession({ id: "past-session", title: "Past Session" })]);
+      startLiveCapture();
+      const liveSegments = useAudioGraphStore.getState().transcriptSegments;
 
-    // The detail pane renders SHELL-R2's new live-locked state with this
-    // copy as visible text (the disabled row ALSO carries it, but only as a
-    // `title` attribute — not queryable via `getByText`).
-    const notices = await screen.findAllByText(
-      /stop the live capture before opening a past session/i,
-    );
-    expect(notices.length).toBeGreaterThanOrEqual(1);
-    const selectButton = screen.getByTestId("session-select-past-session");
-    expect(selectButton).toBeDisabled();
-    fireEvent.click(selectButton);
-    expect(mockedInvoke).not.toHaveBeenCalledWith(
-      "load_session",
-      expect.anything(),
-    );
+      render(
+        <>
+          <NowStrip />
+          <SessionsBrowser />
+        </>,
+      );
+
+      const selectButton = await screen.findByTestId(
+        "session-select-past-session",
+      );
+      expect(selectButton).toBeEnabled();
+      expect(selectButton).toHaveAccessibleName("Past Session");
+      selectButton.focus();
+      expect(document.activeElement).toBe(selectButton);
+      fireEvent.click(selectButton);
+
+      // Review lands on the Transcript lens and shows the historical session.
+      expect(await screen.findByText("historical transcript")).toBeVisible();
+      expect(
+        screen.getByRole("tab", { name: /^transcript$/i }),
+      ).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByText("live capture line")).not.toBeInTheDocument();
+      expect(useAudioGraphStore.getState().nav.sessionId).toBe("past-session");
+
+      // The live session's Stop control is reachable and not disabled.
+      const stop = screen.getByRole("button", { name: "Stop" });
+      expect(stop).toBeEnabled();
+      expect(stop).not.toHaveAttribute("tabindex", "-1");
+      stop.focus();
+      expect(document.activeElement).toBe(stop);
+
+      // Review issued no capture/writer command: only the rail's list query
+      // and the one read-only `load_session`.
+      expect(new Set(invokedCommands())).toEqual(
+        new Set(["list_sessions", "load_session"]),
+      );
+      expect(mockedInvoke).toHaveBeenCalledWith("load_session", {
+        sessionId: "past-session",
+      });
+
+      // The Live fields are exactly what capture left there.
+      const live = useAudioGraphStore.getState();
+      expect(live.transcriptSegments).toBe(liveSegments);
+      expect(live.loadedSessionId).toBeNull();
+      expect(live.isCapturing).toBe(true);
+      expect(live.isTranscribing).toBe(true);
+    });
+
+    it("Stop still stops the live capture while a past session is under Review", async () => {
+      seed([makeSession({ id: "past-session", title: "Past Session" })]);
+      startLiveCapture();
+      render(
+        <>
+          <NowStrip />
+          <SessionsBrowser />
+        </>,
+      );
+      fireEvent.click(await screen.findByTestId("session-select-past-session"));
+      await screen.findByText("historical transcript");
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      });
+
+      await waitFor(() =>
+        expect(mockedInvoke).toHaveBeenCalledWith("stop_capture", {
+          sourceId: "system-default",
+        }),
+      );
+    });
+
+    it("keeps Notes, Timeline and Graph gated with the existing message, for those lenses only", async () => {
+      seed([makeSession({ id: "past-session", title: "Past Session" })]);
+      startLiveCapture();
+      render(<SessionsBrowser />);
+      fireEvent.click(await screen.findByTestId("session-select-past-session"));
+      await screen.findByText("historical transcript");
+
+      for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
+        fireEvent.click(screen.getByRole("tab", { name: lens }));
+        const panel = screen.getByRole("tabpanel");
+        expect(
+          within(panel).getByText(
+            /stop the live capture before opening a past session/i,
+          ),
+        ).toBeInTheDocument();
+      }
+      // The gated lenses did not fetch (their actions hydrate Live fields).
+      expect(invokedCommands()).not.toContain(
+        "load_session_notes_artifacts_cmd",
+      );
+      expect(invokedCommands()).not.toContain(
+        "load_session_graph_artifact_cmd",
+      );
+      expect(invokedCommands()).not.toContain("build_session_timeline_cmd");
+
+      // Transcript is not gated.
+      fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
+      const panel = screen.getByRole("tabpanel");
+      expect(
+        within(panel).queryByText(/stop the live capture/i),
+      ).not.toBeInTheDocument();
+      expect(
+        await within(panel).findByText("historical transcript"),
+      ).toBeVisible();
+    });
+
+    it("keeps the live session's own row (active) disabled, with the completed-only message", async () => {
+      seed([
+        makeSession({
+          id: "the-live-one",
+          title: "Live Now",
+          status: "active",
+        }),
+      ]);
+      startLiveCapture();
+      render(<SessionsBrowser />);
+
+      const selectButton = await screen.findByTestId(
+        "session-select-the-live-one",
+      );
+      expect(selectButton).toBeDisabled();
+      expect(selectButton).toHaveAttribute(
+        "title",
+        "Only completed sessions can be opened while capture is running.",
+      );
+      fireEvent.click(selectButton);
+      expect(mockedInvoke).not.toHaveBeenCalledWith(
+        "load_session",
+        expect.anything(),
+      );
+    });
+
+    it("shows the localized closed error for a corrupt session and never a raw backend string", async () => {
+      seed([makeSession({ id: "broken", title: "Broken" })]);
+      startLiveCapture();
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "list_sessions")
+          return useAudioGraphStore.getState().sessions;
+        if (cmd === "load_session") {
+          throw { code: "session_invalid", message: { reason: "C:\\boom\\x" } };
+        }
+        return null;
+      });
+      render(<SessionsBrowser />);
+      fireEvent.click(await screen.findByTestId("session-select-broken"));
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(
+        "This session's transcript is missing or could not be read.",
+      );
+      expect(document.body.textContent).not.toContain("boom");
+      // Live is untouched by the failed Review.
+      expect(useAudioGraphStore.getState().error).toBeNull();
+    });
+
+    it("a Review opened while live loads normally if the run ends with nav still on that session", async () => {
+      seed([makeSession({ id: "past-session", title: "Past Session" })]);
+      startLiveCapture();
+      render(<SessionsBrowser />);
+      fireEvent.click(await screen.findByTestId("session-select-past-session"));
+      await screen.findByText("historical transcript");
+      expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+
+      // Stop that could not re-route nav (e.g. unresolved session id).
+      act(() => {
+        useAudioGraphStore.setState({
+          isCapturing: false,
+          isTranscribing: false,
+        });
+      });
+
+      await waitFor(() =>
+        expect(useAudioGraphStore.getState().loadedSessionId).toBe(
+          "past-session",
+        ),
+      );
+      expect(
+        useAudioGraphStore.getState().transcriptSegments.map((s) => s.text),
+      ).toEqual(["historical transcript"]);
+    });
   });
 
   it("export button invokes export_session_bundle with the session id", async () => {

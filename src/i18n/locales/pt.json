@@ -824,6 +824,15 @@
     "trashCount": "Lixeira ({{count}})",
     "load": "Carregar",
     "reviewLockedWhileLive": "Pare a captura ao vivo antes de abrir uma sessão anterior. A revisão do histórico fica bloqueada para não misturar dados entre sessões.",
+    "reviewNeedsCompletedWhileLive": "Só é possível abrir sessões concluídas enquanto a captura está em andamento.",
+    "review": {
+      "transcriptTitle": "Transcrição da sessão",
+      "transcriptLabel": "Transcrição da sessão",
+      "loading": "Carregando a transcrição da sessão…",
+      "unavailable": "A transcrição desta sessão está ausente ou não pôde ser lida.",
+      "retry": "Tentar novamente",
+      "emptyTranscript": "Esta sessão não tem transcrição."
+    },
     "delete": "Excluir",
     "activeDeleteLocked": "A sessão ativa não pode ser excluída. Inicie uma nova sessão primeiro.",
     "restore": "Restaurar",
