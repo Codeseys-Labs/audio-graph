@@ -47,6 +47,11 @@ pub(crate) enum FakeSettingsCall {
     ClearPending,
 }
 
+/// An in-memory store that makes the same scope and admission decisions as
+/// the native one, without its native parts: it has no staging guards and
+/// no uncertainty latch, so an unknown outcome it reports does not refuse
+/// the next call the way the native store does. Tests that depend on either
+/// run against the native store over an in-memory keyring.
 pub(crate) struct FakeCredentialStore {
     state: Mutex<FakeCredentialState>,
     entry_reads: AtomicUsize,
@@ -185,6 +190,29 @@ impl FakeCredentialStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore_before_load = Some((loads_before, journal));
+    }
+
+    /// Puts `record` in place as `set_id`'s active record without any
+    /// journal change, as another process writing the native record
+    /// directly would.
+    pub(crate) fn substitute_active(
+        &self,
+        set_id: &CredentialSetId,
+        record: &EncodedCredentialRecord,
+    ) {
+        let bytes = Zeroizing::new(record.as_bytes().to_vec());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state
+            .active
+            .iter_mut()
+            .find(|(candidate, _)| candidate == set_id)
+        {
+            Some((_, active)) => *active = bytes,
+            None => state.active.push((set_id.clone(), bytes)),
+        }
     }
 
     /// Leaves a staging record for `operation_id` in `set_id` that no journal
