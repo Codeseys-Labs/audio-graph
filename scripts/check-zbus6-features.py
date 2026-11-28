@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the resolved Linux features of each zbus 6 package."""
+"""Check the resolved Linux runtime and logging features."""
 
 import json
 import subprocess
@@ -8,31 +8,38 @@ from pathlib import Path
 
 def check(metadata, profile):
     packages = {
-        package["id"]: package["version"]
+        package["id"]: (package["name"], package["version"])
         for package in metadata["packages"]
-        if package["name"] == "zbus" and package["version"].split(".")[0] == "6"
+        if package["name"] == "zruntime"
+        or (package["name"] == "zbus" and package["version"].split(".")[0] == "6")
     }
     nodes = {
         node["id"]: set(node["features"])
         for node in metadata["resolve"]["nodes"]
         if node["id"] in packages
     }
-    if not nodes:
-        raise SystemExit(f"{profile}: zbus 6 is missing from the Linux resolution")
+    missing = {"zbus", "zruntime"} - {packages[package][0] for package in nodes}
+    if missing:
+        raise SystemExit(f"{profile}: Linux resolution is missing {', '.join(sorted(missing))}")
     for package, features in nodes.items():
-        forbidden = sorted(features & {"tokio", "tracing"})
+        name, version = packages[package]
+        blocked = {"tokio", "tracing"} if name == "zbus" else {"tracing"}
+        forbidden = sorted(features & blocked)
         if forbidden:
             raise SystemExit(
-                f"{profile}: zbus {packages[package]} enables {', '.join(forbidden)}"
+                f"{profile}: {name} {version} enables {', '.join(forbidden)}"
             )
-    print(f"{profile}: resolved zbus 6 excludes tokio and tracing")
+    print(f"{profile}: resolved zbus 6 and zruntime exclude the forbidden features")
 
 
 def main():
     manifest = Path(__file__).resolve().parents[1] / "src-tauri" / "Cargo.toml"
+    optional = "diarization,sherpa-streaming,surrealdb-embedded"
     for profile, features in (
         ("default", []),
         ("cloud", ["--no-default-features", "--features", "cloud"]),
+        ("default + optional", ["--features", optional]),
+        ("cloud + optional", ["--no-default-features", "--features", f"cloud,{optional}"]),
     ):
         raw = subprocess.check_output(
             [

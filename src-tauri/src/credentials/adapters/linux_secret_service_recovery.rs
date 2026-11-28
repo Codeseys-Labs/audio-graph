@@ -9,15 +9,15 @@ use super::{
 use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::adapters::linux_secret_service_wire::{
     LockedTarget, WireError, ensure_worker_context, recovery_error, recovery_until,
+    session_address, unix_builder,
 };
 use crate::credentials::domain::CredentialStoreFailure as Failure;
 use futures_util::future::{Either, select};
 use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
 use std::future::{Future, poll_fn};
-use std::path::Path;
 use std::pin::pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Mutex;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use zbus::message::Type;
@@ -25,7 +25,8 @@ use zbus::names::OwnedUniqueName;
 use zbus::proxy::{Builder as ProxyBuilder, CacheProperties, MethodFlags};
 use zbus::wire::DynamicDeserialize;
 use zbus::{
-    Connection, DynamicType, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Proxy,
+    Address, Connection, DynamicType, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant,
+    Proxy,
 };
 use zruntime::SharedRuntime;
 
@@ -38,80 +39,73 @@ const DISMISS_GRACE: Duration = Duration::from_millis(500);
 const RETIRE_GRACE: Duration = Duration::from_millis(125);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Dismissal {
-    NoPrompt,
-    ServiceAcknowledged,
-    Unacknowledged,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Outcome {
-    Verified,
-    DismissedByUser,
-    Cancelled(Dismissal),
-    TimedOut(Dismissal),
-    StillLocked,
-    Unavailable,
-    Unsupported,
-    Failed(Failure),
-    PromptMayStillBeOpen(Dismissal),
-}
-
 #[cfg(test)]
 #[derive(Default)]
-struct TestOptions {
+pub(super) struct TestOptions {
     gate: Option<&'static super::NativeInteractionGate>,
-    daemon: Option<&'static str>,
+    address: Option<Address>,
     cancel_with_queued_completion: bool,
+    timeout_with_queued_completion: bool,
     panic_after_prompt: bool,
 }
 
 /// Dedicated worker only. The existing facade holds the lease, issues the
 /// AllowPrompt capability, and invokes verification with a separate ForbidPrompt.
-fn recover_exact(
+pub(super) fn recovery_facade(
     target: LockedTarget,
     window: Option<String>,
     budget: Duration,
-    cancellation: &CancellationToken,
     #[cfg(test)] test: TestOptions,
-) -> Outcome {
-    if let Err(WireError(code)) = ensure_worker_context() {
-        return failed(code);
-    }
-    let Some(end) = Instant::now().checked_add(budget) else {
-        return Outcome::Failed(Failure::Internal);
-    };
-    let result = Arc::new(OnceLock::new());
+) -> Result<NativeRecoveryFacade, Failure> {
+    let end = Instant::now()
+        .checked_add(budget)
+        .ok_or(Failure::Internal)?;
     let boundary = Boundary {
-        target,
+        state: Mutex::new(State::Pending(target)),
         window,
         end,
-        result: Arc::clone(&result),
         #[cfg(test)]
         test,
     };
     let gate = process_native_interaction_gate();
     #[cfg(test)]
     let gate = boundary.test.gate.unwrap_or(gate);
-    let facade = NativeRecoveryFacade::from_boundary(gate, Box::new(boundary));
-    let closed = facade.diagnose_or_unlock(RecoveryTarget::CredentialStore, cancellation);
-    result.get().copied().unwrap_or_else(|| match closed {
-        Err(Failure::Cancelled) => Outcome::Cancelled(Dismissal::NoPrompt),
-        Err(code) => failed(code),
-        Ok(_) => Outcome::Failed(Failure::Internal),
-    })
+    Ok(NativeRecoveryFacade::from_boundary(
+        gate,
+        Box::new(boundary),
+    ))
+}
+
+enum State {
+    Pending(LockedTarget),
+    Verify(LockedTarget),
+    Used,
 }
 
 struct Boundary {
-    target: LockedTarget,
+    state: Mutex<State>,
     window: Option<String>,
     end: Instant,
-    // The sealed facade returns a platform-neutral readiness result. Keep the
-    // detailed closed Linux outcome in this single-call boundary.
-    result: Arc<OnceLock<Outcome>>,
     #[cfg(test)]
     test: TestOptions,
+}
+
+impl Boundary {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, State>, RecoveryFailure> {
+        self.state
+            .lock()
+            .map_err(|_| RecoveryFailure::Closed(Failure::RevisionConflict))
+    }
+
+    fn take_pending(&self) -> Result<LockedTarget, RecoveryFailure> {
+        let mut state = self.state()?;
+        if let State::Pending(_) = &*state
+            && let State::Pending(target) = std::mem::replace(&mut *state, State::Used)
+        {
+            return Ok(target);
+        }
+        Err(RecoveryFailure::Closed(Failure::RevisionConflict))
+    }
 }
 
 impl RecoveryBoundary for Boundary {
@@ -121,18 +115,23 @@ impl RecoveryBoundary for Boundary {
         _target: RecoveryTarget,
         cancellation: &CancellationToken,
     ) -> Result<(), RecoveryFailure> {
-        let outcome = zbus::block_on(interact(
+        let target = self.take_pending()?;
+        ensure_worker_context().map_err(closed_wire)?;
+        #[cfg(test)]
+        let address = self.test.address.clone().map_or_else(session_address, Ok);
+        #[cfg(not(test))]
+        let address = session_address();
+        zbus::block_on(interact(
             permission,
-            &self.target,
+            &target,
+            address.map_err(closed_wire)?,
             self.window.as_deref().unwrap_or_default(),
             self.end,
             cancellation,
             #[cfg(test)]
             &self.test,
-        ));
-        if let Some(outcome) = outcome {
-            let _ = self.result.set(outcome);
-        }
+        ))?;
+        *self.state()? = State::Verify(target);
         Ok(())
     }
 
@@ -141,20 +140,22 @@ impl RecoveryBoundary for Boundary {
         permission: &ForbidPrompt<'_>,
         _target: RecoveryTarget,
     ) -> Result<RecoveryOutcome, RecoveryFailure> {
-        if self.result.get().is_some() {
-            return Ok(RecoveryOutcome::RecoveryRequired);
-        }
-        let outcome = match self.target.verify(permission) {
-            Ok(()) => Outcome::Verified,
-            Err(WireError(Failure::Locked)) => Outcome::StillLocked,
-            Err(WireError(code)) => failed(code),
+        let target = {
+            let mut state = self.state()?;
+            let State::Verify(_) = &*state else {
+                // The sealed facade invokes this after an ordinary closed error.
+                return Ok(RecoveryOutcome::RecoveryRequired);
+            };
+            std::mem::replace(&mut *state, State::Used)
         };
-        let _ = self.result.set(outcome);
-        Ok(if outcome == Outcome::Verified {
-            RecoveryOutcome::Ready
-        } else {
-            RecoveryOutcome::RecoveryRequired
-        })
+        let State::Verify(target) = target else {
+            unreachable!()
+        };
+        match target.verify(permission) {
+            Ok(()) => Ok(RecoveryOutcome::Ready),
+            Err(WireError(Failure::Locked)) => Ok(RecoveryOutcome::RecoveryRequired),
+            Err(error) => Err(closed_wire(error)),
+        }
     }
 }
 
@@ -173,38 +174,19 @@ impl<'lease, 'gate> Peer<'lease, 'gate> {
     async fn connect_for_recovery(
         permission: &'lease AllowPrompt<'lease, 'gate>,
         target: &LockedTarget,
-        #[cfg(test)] test: &TestOptions,
+        address: Address,
     ) -> WireResult<Option<Self>> {
-        let connection = zbus::connection::Builder::address(target.address().clone())
+        let connection = unix_builder(address)?
             .build()
             .await
             .map_err(recovery_error)?;
-        let (owner, pid, locked) = target.check_recovery_connection(&connection).await?;
-        #[cfg(test)]
-        let override_name = test.daemon;
-        #[cfg(not(test))]
-        let override_name: Option<&str> = None;
-        let executable = match override_name {
-            Some(executable) => executable.into(),
-            None => {
-                std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| Failure::Unsupported)?
-            }
-        };
-        if !allows_interactive_recovery(&executable) {
-            return Err(Failure::Unsupported.into());
-        }
+        let (owner, locked) = target.check_recovery_connection(&connection).await?;
         Ok(locked.then_some(Self {
             _permission: permission,
             connection,
             owner,
         }))
     }
-}
-
-fn allows_interactive_recovery(executable: &Path) -> bool {
-    executable
-        .file_name()
-        .is_some_and(|name| name == "gnome-keyring-daemon")
 }
 
 impl Peer<'_, '_> {
@@ -246,7 +228,7 @@ impl Peer<'_, '_> {
         &self,
         path: &OwnedObjectPath,
         completions: Option<MessageStream>,
-    ) -> Dismissal {
+    ) -> Option<bool> {
         let end = Instant::now() + DISMISS_GRACE;
         let completions = match completions {
             Some(stream) => Some(stream),
@@ -257,7 +239,7 @@ impl Peer<'_, '_> {
         let request = self.call::<_, ()>(path.as_str(), PROMPT, "Dismiss", &());
         let Some(mut completions) = completions else {
             let _ = recovery_until(end, request).await;
-            return Dismissal::Unacknowledged;
+            return None;
         };
         let settlement = async {
             let mut request = pin!(request);
@@ -266,35 +248,27 @@ impl Peer<'_, '_> {
                 Either::Right((result, _)) => result,
             }
         };
-        if matches!(recovery_until(end, settlement).await, Ok(true)) {
-            Dismissal::ServiceAcknowledged
-        } else {
-            Dismissal::Unacknowledged
-        }
+        recovery_until(end, settlement).await.ok()
     }
 }
 
 async fn interact(
     permission: &AllowPrompt<'_, '_>,
     target: &LockedTarget,
+    address: Address,
     window: &str,
     end: Instant,
     cancellation: &CancellationToken,
     #[cfg(test)] test: &TestOptions,
-) -> Option<Outcome> {
+) -> Result<(), RecoveryFailure> {
     let wait = Wait { end, cancellation };
     let peer = match wait
-        .run(Peer::connect_for_recovery(
-            permission,
-            target,
-            #[cfg(test)]
-            test,
-        ))
+        .run(Peer::connect_for_recovery(permission, target, address))
         .await
     {
         Ok(Some(peer)) => peer,
-        Ok(None) => return None, // The target unlocked before dispatch.
-        Err(stop) => return Some(stop.outcome(Dismissal::NoPrompt)),
+        Ok(None) => return Ok(()), // The target unlocked before dispatch.
+        Err(stop) => return Err(stop.closed()),
     };
     let outcome = unlock(
         &peer,
@@ -318,18 +292,18 @@ async fn unlock(
     window: &str,
     wait: &Wait<'_>,
     #[cfg(test)] test: &TestOptions,
-) -> Option<Outcome> {
+) -> Result<(), RecoveryFailure> {
     let objects = [target.path()];
     let reply: UnlockReply = match wait
         .run(peer.call(SERVICE_PATH, SERVICE, UNLOCK_METHOD, &(objects.as_slice(),)))
         .await
     {
         Ok(reply) => reply,
-        Err(stop) => return Some(stop.outcome(Dismissal::NoPrompt)),
+        Err(stop) => return Err(stop.closed()),
     };
     let (_, path) = reply;
     if path.as_str() == "/" {
-        return None;
+        return Ok(());
     }
     PromptGuard {
         peer,
@@ -359,7 +333,7 @@ impl PromptGuard<'_, '_, '_> {
         window: &str,
         wait: &Wait<'_>,
         #[cfg(test)] test: &TestOptions,
-    ) -> Option<Outcome> {
+    ) -> Result<(), RecoveryFailure> {
         let result = catch_interactive(async {
             let stream = wait.run(self.peer.subscribe(&self.path)).await?;
             let completions = self.completions.insert(stream);
@@ -372,6 +346,8 @@ impl PromptGuard<'_, '_, '_> {
                     assert!(!test.panic_after_prompt, "scripted prompt unwind");
                     if test.cancel_with_queued_completion {
                         wait.cancellation.cancel();
+                    }
+                    if test.cancel_with_queued_completion || test.timeout_with_queued_completion {
                         std::future::pending::<()>().await;
                     }
                 }
@@ -381,24 +357,50 @@ impl PromptGuard<'_, '_, '_> {
         })
         .await;
         match result {
-            Ok(Ok(false)) => None,
-            Ok(Ok(true)) => Some(Outcome::DismissedByUser),
-            Ok(Err(Stop::Cancelled)) if self.approval_is_queued() => None,
-            Ok(Err(stop)) => Some(stop.outcome(self.dismiss().await)),
-            Err(()) => Some(Outcome::PromptMayStillBeOpen(self.dismiss().await)),
+            Ok(Ok(dismissed)) => completion_outcome(dismissed),
+            Ok(Err(stop)) => {
+                if let Some(dismissed) = self.queued_completion() {
+                    return completion_outcome(dismissed);
+                }
+                match self
+                    .dismiss()
+                    .await
+                    .map_err(|()| RecoveryFailure::Uncertain)?
+                {
+                    Some(false) => Ok(()),
+                    Some(true) => Err(stop.closed()),
+                    None => {
+                        log::warn!(
+                            "Secret Service did not acknowledge dismissal. A dialog may still be open."
+                        );
+                        Err(stop.closed())
+                    }
+                }
+            }
+            Err(()) => {
+                let _ = self.dismiss().await;
+                log::warn!("Secret Service recovery panicked. A dialog may still be open.");
+                Err(RecoveryFailure::Uncertain)
+            }
         }
     }
 
-    fn approval_is_queued(&mut self) -> bool {
+    fn queued_completion(&mut self) -> Option<bool> {
         self.completions
             .as_mut()
-            .is_some_and(|stream| matches!(completed(stream).now_or_never(), Some(Ok(false))))
+            .and_then(|stream| completed(stream).now_or_never()?.ok())
     }
 
-    async fn dismiss(self) -> Dismissal {
-        catch_interactive(self.peer.dismiss(&self.path, self.completions))
-            .await
-            .unwrap_or(Dismissal::Unacknowledged)
+    async fn dismiss(self) -> Result<Option<bool>, ()> {
+        catch_interactive(self.peer.dismiss(&self.path, self.completions)).await
+    }
+}
+
+fn completion_outcome(dismissed: bool) -> Result<(), RecoveryFailure> {
+    if dismissed {
+        Err(RecoveryFailure::Closed(Failure::Cancelled))
+    } else {
+        Ok(())
     }
 }
 
@@ -465,25 +467,23 @@ enum Stop {
 }
 
 impl Stop {
-    fn outcome(self, dismissal: Dismissal) -> Outcome {
+    fn closed(self) -> RecoveryFailure {
         match self {
-            Self::Cancelled => Outcome::Cancelled(dismissal),
-            Self::TimedOut => Outcome::TimedOut(dismissal),
-            Self::Failed(_) if dismissal == Dismissal::Unacknowledged => {
-                Outcome::PromptMayStillBeOpen(dismissal)
-            }
-            Self::Failed(code) => failed(code),
+            Self::Cancelled => RecoveryFailure::Closed(Failure::Cancelled),
+            Self::TimedOut => RecoveryFailure::Closed(Failure::Unavailable),
+            Self::Failed(code) => closed_wire(WireError(code)),
         }
     }
 }
 
-fn failed(code: Failure) -> Outcome {
-    match code {
-        Failure::Locked => Outcome::StillLocked,
-        Failure::Unavailable => Outcome::Unavailable,
-        Failure::Unsupported => Outcome::Unsupported,
-        code => Outcome::Failed(code),
-    }
+fn closed_wire(WireError(code): WireError) -> RecoveryFailure {
+    // A provider result never latches the process. A pre-existing gate latch
+    // is enforced by the sealed facade before it calls this boundary.
+    let closed = match code {
+        Failure::StalledWorker | Failure::CommitUnknown => Failure::Unavailable,
+        code => code,
+    };
+    RecoveryFailure::Closed(closed)
 }
 
 #[cfg(test)]

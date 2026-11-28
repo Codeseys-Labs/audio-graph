@@ -80,6 +80,18 @@ impl Store {
     }
 
     async fn serve(&mut self, connection: &Connection, message: &Message) {
+        let header = message.header();
+        if header
+            .interface()
+            .is_some_and(|interface| interface.as_str() == PROMPT_INTERFACE)
+        {
+            assert!(
+                header
+                    .member()
+                    .is_some_and(|member| member.as_str() == "Dismiss"),
+                "a mutation may dismiss a prompt but must never display one"
+            );
+        }
         let call = inspect_call(message);
         let header = message.header();
         let sender = header.sender().unwrap().as_str();
@@ -365,6 +377,43 @@ impl Store {
             "wire IV did not decrypt the expected secret"
         );
         actual
+    }
+}
+
+#[test]
+fn mutations_never_display_prompts() {
+    for (initial, behavior, mutation, expected, dismissals) in [
+        (
+            Initial::Absent,
+            Behavior::Prompt,
+            put(),
+            MutationOutcome::InteractionRequired,
+            1,
+        ),
+        (
+            Initial::Present,
+            Behavior::Acknowledge,
+            put(),
+            MutationOutcome::Committed,
+            0,
+        ),
+        (
+            Initial::Present,
+            Behavior::Prompt,
+            Mutation::Delete,
+            MutationOutcome::InteractionRequired,
+            1,
+        ),
+    ] {
+        let calls = run(initial, behavior, mutation, Ok(expected));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|step| step.call == Call::Dismiss)
+                .count(),
+            dismissals
+        );
+        assert_eq!(mutation_calls(&calls).len(), 1);
     }
 }
 
