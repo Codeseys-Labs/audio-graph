@@ -835,6 +835,8 @@
       "stale": "This transcript may be out of date: the latest refresh failed. Showing the last copy that loaded.",
       "needsLoad": "This view needs the session loaded first.",
       "loadSession": "Load session",
+      "staleView": "This view may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "emptyNotes": "This session has no notes.",
       "viewUnavailable": "This session could not be loaded.",
       "emptyTranscript": "This session has no transcript."
     },
@@ -873,7 +875,11 @@
       "classLabel": {
         "materialized_graph": "knowledge graph",
         "materialized_notes": "notes",
-        "projection_events": "projection log"
+        "projection_events": "projection log",
+        "transcript_events": "transcript",
+        "diarization_events": "speaker log",
+        "live_graph": "live graph",
+        "other": "data"
       }
     },
     "lensFetchError": {
@@ -1622,7 +1628,7 @@
       "credential_expired": "The provider credential expired. Refresh it before trying again.",
       "permission_denied": "The provider denied access to this operation. Check your account permissions or plan.",
       "invalid_configuration": "The provider configuration is invalid. Check the model, region, or endpoint in Settings.",
-      "capacity_exhausted": "The provider is at capacity, or your account's quota or balance is used up. Check your plan and balance, or try again later.",
+      "capacity_exhausted": "Your account has reached a quota or concurrency limit, or its balance is depleted. Check your plan and balance, or try again later.",
       "policy_blocked": "The current policy blocks this operation.",
       "unsupported": "The provider does not support this operation.",
       "cancelled": "The operation was cancelled.",

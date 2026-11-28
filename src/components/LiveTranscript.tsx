@@ -27,10 +27,20 @@
  * `App.tsx`'s Capture panel (always mounted there) and `SessionsBrowser`'s
  * Transcript lens. No props.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
-import { useTranscriptView } from "../session/SessionViewProvider";
+import {
+  useSessionInteractions,
+  useTranscriptView,
+} from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -42,6 +52,7 @@ import { formatTime } from "../utils/format";
 import { scrollBehavior } from "../utils/motion";
 import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
+import { useRetryFocus } from "./useRetryFocus";
 
 /** Default fallback colors when speaker has no assigned color. */
 const FALLBACK_COLORS = [
@@ -92,12 +103,22 @@ function LiveTranscript() {
 
   // Cross-component seek request from the After seek-timeline
   // (audio-graph-3b3f): a bumped `nonce` re-fires the scroll even when the same
-  // segment is re-selected.
-  const transcriptSeekTarget = useAudioGraphStore(
-    (s) => s.transcriptSeekTarget,
-  );
+  // segment is re-selected. A Review pane reads the Review store's own
+  // target (written by its own Timeline lens) and holds no Live subscription.
+  const { transcriptSeekTarget } = useSessionInteractions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Keyboard focus after a Review retry control goes away (`useRetryFocus`).
+  const rootRef = useRef<HTMLDivElement>(null);
+  const markRetry = useRetryFocus(rootRef, scrollRef);
+  const retryReview = useCallback(
+    (event: MouseEvent<HTMLElement>) => {
+      markRetry(event);
+      review?.retry();
+    },
+    [markRetry, review],
+  );
+
   const wasNearBottomRef = useRef(true);
 
   const [isExporting, setIsExporting] = useState(false);
@@ -284,6 +305,7 @@ function LiveTranscript() {
 
   return (
     <div
+      ref={rootRef}
       className="flex flex-col h-full p-(--space-5)"
       data-review-session-id={reviewSessionId ?? undefined}
     >
@@ -335,7 +357,8 @@ function LiveTranscript() {
           <button
             type="button"
             className="ag-btn-micro"
-            onClick={review.retry}
+            data-review-retry
+            onClick={retryReview}
             disabled={review.refreshing}
           >
             <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
@@ -354,6 +377,7 @@ function LiveTranscript() {
       <div
         className="flex-1 overflow-y-auto min-h-0 flex flex-col gap-px [scrollbar-width:thin] [scrollbar-color:var(--hover-overlay-strong)_transparent]"
         ref={scrollRef}
+        tabIndex={-1}
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
@@ -383,7 +407,8 @@ function LiveTranscript() {
                   <button
                     type="button"
                     className="ag-btn-micro mt-(--space-3)"
-                    onClick={review.retry}
+                    data-review-retry
+                    onClick={retryReview}
                   >
                     <Icon name="refresh" size={14} />{" "}
                     {t("sessions.review.retry")}

@@ -242,9 +242,10 @@ describe("Review pane isolation from Live (issue #140)", () => {
     expect(await screen.findByText("recovered line")).toBeInTheDocument();
   });
 
-  it("honours a retained timeline seek target in the Review pane once its snapshot has loaded", async () => {
-    // The timeline lens set this target against the loaded session; opening the
-    // Transcript lens (a Review pane) must consume it like the Live pane does.
+  it("honours the Review seek target once its snapshot has loaded, and ignores the Live one", async () => {
+    // The Review pane's own Timeline lens sets its target in the Review store;
+    // a seek target in the Live store is a different session's and is ignored
+    // (the pane holds no subscription to it).
     const scrollIntoView = vi.fn();
     const original = HTMLElement.prototype.scrollIntoView;
     HTMLElement.prototype.scrollIntoView = scrollIntoView;
@@ -263,6 +264,9 @@ describe("Review pane isolation from Live (issue #140)", () => {
           <LiveTranscript />
         </SessionViewProvider>,
       );
+      act(() => {
+        useReviewStore.getState().seekTranscriptToSegment("past-1");
+      });
       // Not yet loaded: nothing to scroll to, and no premature jump.
       expect(scrollIntoView).not.toHaveBeenCalled();
 
@@ -276,8 +280,39 @@ describe("Review pane isolation from Live (issue #140)", () => {
         container.querySelector('[data-segment-id="past-1"]'),
       ).toBeInTheDocument();
     } finally {
-      HTMLElement.prototype.scrollIntoView = original;
+      // Clear the targets first so no later re-render re-fires the jump.
+      useReviewStore.setState({ transcriptSeekTarget: null });
       useAudioGraphStore.setState({ transcriptSeekTarget: null });
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+
+  it("does not jump on a Live seek target alone", async () => {
+    const scrollIntoView = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      mockedInvoke.mockResolvedValue(
+        loadedSession("past-1", "historical line", "Alice"),
+      );
+      render(
+        <SessionViewProvider reviewSessionId="past">
+          <LiveTranscript />
+        </SessionViewProvider>,
+      );
+      await screen.findByText("historical line");
+      act(() => {
+        useAudioGraphStore.setState({
+          transcriptSeekTarget: { segmentId: "past-1", nonce: 1 },
+        });
+      });
+      await act(async () => {});
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    } finally {
+      // Clear the targets first so no later re-render re-fires the jump.
+      useReviewStore.setState({ transcriptSeekTarget: null });
+      useAudioGraphStore.setState({ transcriptSeekTarget: null });
+      HTMLElement.prototype.scrollIntoView = original;
     }
   });
 
