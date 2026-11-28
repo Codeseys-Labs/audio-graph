@@ -640,11 +640,14 @@ fn owned_session_artifact_paths(
         root.join("transcripts")
             .join(format!("{session_id}.speaker.jsonl")),
     );
-    push_artifact_path(
-        &mut paths,
-        root.join("projections")
-            .join(format!("{session_id}.events.jsonl")),
+    let projections = root
+        .join("projections")
+        .join(format!("{session_id}.events.jsonl"));
+    paths.extend(
+        crate::persistence::canonical_log::transcript_recovery_artifacts(&projections)
+            .map_err(|error| format!("projection recovery inventory: {:?}", error.kind()))?,
     );
+    push_artifact_path(&mut paths, projections);
     push_atomic_json_artifact(
         &mut paths,
         root.join("notes").join(format!("{session_id}.json")),
@@ -697,8 +700,11 @@ fn remove_session_artifacts(
 ) -> Result<SessionArtifactRemovalReport, String> {
     // Discover every owned path before the first unlink. A failed directory
     // scan leaves the index and all contents available for another attempt.
-    let _locks = crate::persistence::lock_transcript_for_removal(
+    let _locks = crate::persistence::lock_session_stream_for_removal(
         &crate::user_data::resolve_transcript_events_path(session_id)?,
+    )?;
+    let _projection_locks = crate::persistence::lock_session_stream_for_removal(
+        &crate::user_data::resolve_projection_events_path(session_id)?,
     )?;
     let mut artifact_paths = checked_default_session_artifact_paths(session_id)?;
     let allowed_paths: HashSet<_> = artifact_paths.iter().cloned().collect();
@@ -2101,20 +2107,27 @@ mod tests {
     }
 
     #[test]
-    fn busy_transcript_cleanup_preserves_index_and_evidence_until_owner_releases() {
+    fn busy_session_stream_cleanup_preserves_index_and_evidence_until_owner_releases() {
         use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 
         let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tempdir("transcript-cleanup-contention");
         let _home = HomeGuard::set(&root);
-        for directory_busy in [true, false] {
+        for (projection, directory_busy) in
+            [(false, true), (false, false), (true, true), (true, false)]
+        {
             let session = "orchard";
             let mut metadata = make_meta(session);
             metadata.deleted = true;
             metadata.deleted_at = Some(0);
             save_index(&[metadata]).unwrap();
 
-            let source = crate::user_data::transcript_events_path(session).unwrap();
+            let source = if projection {
+                crate::user_data::projection_events_path(session)
+            } else {
+                crate::user_data::transcript_events_path(session)
+            }
+            .unwrap();
             let directory_lock =
                 crate::persistence::canonical_durability::transcript_coordination_path(&source);
             let lease = source.with_added_extension("attempt-lock");
@@ -2135,7 +2148,7 @@ mod tests {
                 .unwrap();
             owner.try_lock().unwrap();
 
-            let expected = "Transcript cleanup unavailable: Contended";
+            let expected = "Session stream cleanup unavailable: Contended";
             assert_eq!(permanently_delete_session(session).unwrap_err(), expected);
             assert!(purge_expired_sessions().unwrap_err().contains(expected));
             for repo in [
@@ -2184,6 +2197,41 @@ mod tests {
         assert!(permanently_delete_session(session).is_err());
         assert_eq!(fs::read(notes).unwrap(), b"retained");
         assert!(find_session(session).is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn permanent_delete_owns_only_this_sessions_projection_recovery_and_receipt_files() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-receipt-inventory");
+        let _home = HomeGuard::set(&dir);
+        save_index(&[make_meta("orchard"), make_meta("forest")]).unwrap();
+        let gap = uuid::Uuid::new_v4();
+        let mut keep = Vec::new();
+        let mut remove = Vec::new();
+        for (id, paths) in [("forest", &mut keep), ("orchard", &mut remove)] {
+            let stream = crate::user_data::resolve_projection_events_path(id).unwrap();
+            for suffix in [
+                "attempt".to_owned(),
+                "attempt-stage".into(),
+                format!("{gap}.gap"),
+                format!("{gap}.quarantine"),
+                "qualified-receipt".into(),
+                "unqualified-receipt".into(),
+                "attempt-origin".into(),
+                "recovered-unqualified-attempt".into(),
+            ] {
+                let path = stream.with_added_extension(suffix);
+                write_artifact(&path, b"twig");
+                paths.push(path);
+            }
+        }
+        let inventory = session_artifact_paths_for_id_resolve_only("orchard").unwrap();
+        assert!(remove.iter().all(|p| inventory.contains(p)));
+        assert!(keep.iter().all(|p| !inventory.contains(p)));
+        permanently_delete_session("orchard").unwrap();
+        assert!(remove.iter().all(|p| !p.exists()));
+        assert!(keep.iter().all(|p| p.is_file()));
         fs::remove_dir_all(dir).unwrap();
     }
 

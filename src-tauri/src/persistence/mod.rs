@@ -35,6 +35,15 @@ use crate::state::TranscriptSegment;
 mod canonical_crash_harness;
 pub mod canonical_durability;
 pub mod canonical_log;
+mod projection_history;
+pub(crate) use projection_history::{MAX_PROJECTION_EVENTS_BYTES, ProjectionHistory};
+
+pub(crate) struct VerifiedCaptureCoverage {
+    pub(crate) coverage: projection_history::ProjectionCaptureCoverage,
+    pub(crate) transcript_count: u64,
+    pub(crate) resume_basis: Option<crate::projections::ProjectionBasis>,
+    pub(crate) behind: [bool; 2],
+}
 pub(crate) mod canonical_reader;
 pub(crate) mod speaker_log;
 pub(crate) const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
@@ -126,6 +135,23 @@ pub fn transcripts_dir() -> Option<PathBuf> {
 /// Resolve the transcript event-log path for a session.
 pub fn transcript_events_path(session_id: &str) -> Option<PathBuf> {
     crate::user_data::transcript_events_path(session_id).ok()
+}
+
+/// Invalidate the prior capture's coverage before ASR can publish a revision.
+pub(crate) fn begin_projection_capture(state: &crate::state::AppState) -> Arc<()> {
+    let check = state
+        .projection_schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_coverage_check();
+    let mut view = state
+        .materialized_projection_state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    use crate::projections::ProjectionCoverageStatus::BehindTranscript;
+    view.notes.transcript_coverage = Some(BehindTranscript);
+    view.graph.transcript_coverage = Some(BehindTranscript);
+    check
 }
 
 /// Resolve the projection event-log path for a session.
@@ -538,20 +564,22 @@ impl SessionArtifactDeleteReport {
 }
 
 /// Writers acquire the directory guard before this Session's attempt lease.
-pub(crate) fn lock_transcript_for_removal(path: &Path) -> Result<[Option<fs::File>; 2], String> {
-    let parent = path.parent().ok_or("Invalid transcript location")?;
+pub(crate) fn lock_session_stream_for_removal(
+    path: &Path,
+) -> Result<[Option<fs::File>; 2], String> {
+    let parent = path.parent().ok_or("Invalid session stream location")?;
     // Validate the same managed parent as the inventory before opening any lock.
     for directory in [
-        parent.parent().ok_or("Invalid transcript location")?,
+        parent.parent().ok_or("Invalid session stream location")?,
         parent,
     ] {
         match fs::symlink_metadata(directory) {
             Ok(metadata) if metadata.is_dir() && !crate::sessions::is_reparse_point(&metadata) => {}
-            Ok(_) => return Err("Invalid transcript directory".into()),
+            Ok(_) => return Err("Invalid session stream directory".into()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok([None, None]),
             Err(error) => {
                 return Err(format!(
-                    "Transcript cleanup unavailable: {:?}",
+                    "Session stream cleanup unavailable: {:?}",
                     error.kind()
                 ));
             }
@@ -560,7 +588,7 @@ pub(crate) fn lock_transcript_for_removal(path: &Path) -> Result<[Option<fs::Fil
     canonical_durability::lock_transcript_removal(path, || {
         canonical_log::transcript_recovery_artifacts(path).map(|paths| !paths.is_empty())
     })
-    .map_err(|error| format!("Transcript cleanup unavailable: {error:?}"))
+    .map_err(|error| format!("Session stream cleanup unavailable: {error:?}"))
 }
 
 fn remove_repository_files(session_id: &str, paths: Vec<PathBuf>) -> SessionArtifactDeleteReport {
@@ -634,6 +662,13 @@ pub trait LocalMemoryRepository: Send + Sync {
         event: &TranscriptEvent,
     ) -> Result<(), String>;
     fn load_transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>, String>;
+
+    fn projection_commit_path(
+        &self,
+        _session_id: &str,
+    ) -> Result<PathBuf, canonical_log::TranscriptCommitError> {
+        Err(canonical_log::TranscriptCommitError::UnsupportedRepository)
+    }
 
     fn append_projection_patch(
         &self,
@@ -1017,6 +1052,107 @@ impl FileMemoryRepository {
         .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn read_projection_history(
+        &self,
+        session_id: &str,
+        portable: bool,
+    ) -> Result<
+        (
+            ProjectionHistory,
+            Option<canonical_log::transcript_export::TranscriptRecoveryExport>,
+        ),
+        String,
+    > {
+        self.read_projection_history_with_limit(session_id, portable, MAX_PROJECTION_EVENTS_BYTES)
+    }
+
+    fn read_projection_history_with_limit(
+        &self,
+        session_id: &str,
+        portable: bool,
+        byte_limit: u64,
+    ) -> Result<
+        (
+            ProjectionHistory,
+            Option<canonical_log::transcript_export::TranscriptRecoveryExport>,
+        ),
+        String,
+    > {
+        let path = self.resolve_projection_events_path(session_id)?;
+        let (captured, recovery) = canonical_log::transcript_export::capture_projection(
+            &path,
+            byte_limit,
+            || {
+                canonical_log::capture_committed_projection_bounded(&path, session_id, byte_limit)
+                    .map_err(|error| error.to_string())
+            },
+            portable,
+        )?;
+        let snapshot = captured
+            .map(|source| source.verify(session_id))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let evidence = snapshot
+            .as_ref()
+            .map(|s| canonical_log::receipt_evidence(&path, &s.records))
+            .unwrap_or_default();
+        let mut history = ProjectionHistory::from_snapshot(snapshot, recovery.as_ref())?;
+        history.receipt_evidence = evidence;
+        Ok((history, recovery))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_capture_coverage(
+        &self,
+        session_id: &str,
+    ) -> Result<projection_history::ProjectionCaptureCoverage, String> {
+        Ok(self.verify_capture_coverage(session_id)?.coverage)
+    }
+
+    pub(crate) fn verify_capture_coverage(
+        &self,
+        session_id: &str,
+    ) -> Result<VerifiedCaptureCoverage, String> {
+        #[cfg(test)]
+        crate::speech::test_probe::record_read();
+        let (history, _) = self.read_projection_history_with_limit(session_id, false, u64::MAX)?;
+        let transcript = self.load_transcript_event_stream(session_id)?;
+        history.verify_source("transcript_revisions", transcript.records())?;
+        history.verify_source(
+            "speaker_revisions",
+            self.load_speaker_revision_stream(session_id)?.records(),
+        )?;
+        let ledger =
+            TranscriptLedger::replay_source_prefix(session_id, &transcript.into_payloads())
+                .map_err(|_| "unverified transcript coverage")?;
+        let coverage = history.into_capture_coverage();
+        let ((notes, graph), gaps) = &coverage;
+        let behind = |basis: &Option<crate::projections::ProjectionBasis>, kind| {
+            !gaps.for_kind(&kind).is_empty()
+                || match basis {
+                    Some(basis) => ledger.projection_coverage(Some(basis)).is_some(),
+                    None => ledger
+                        .latest_spans
+                        .iter()
+                        .any(crate::projections::projection_event_is_eligible),
+                }
+        };
+        use crate::projections::ProjectionKind;
+        let behind = [
+            behind(notes, ProjectionKind::Notes),
+            behind(graph, ProjectionKind::Graph),
+        ];
+        let resume_basis = (!gaps.for_kind(&ProjectionKind::Notes).is_empty()
+            || !gaps.for_kind(&ProjectionKind::Graph).is_empty())
+        .then(|| ledger.current_projection_basis());
+        Ok(VerifiedCaptureCoverage {
+            coverage,
+            transcript_count: ledger.accepted_event_count,
+            resume_basis,
+            behind,
+        })
+    }
+
     pub(crate) fn load_projection_patch_stream(
         &self,
         session_id: &str,
@@ -1265,11 +1401,22 @@ impl FileMemoryRepository {
                 path,
             );
         }
+        let projection_events = self.projection_events_path(session_id)?;
+        for path in canonical_log::transcript_recovery_artifacts(&projection_events)
+            .map_err(|error| format!("projection recovery inventory: {:?}", error.kind()))?
+        {
+            push_unique_file_artifact(
+                &mut artifacts,
+                SessionArtifactKind::ProjectionEvents,
+                "Projection recovery artifact",
+                path,
+            );
+        }
         push_unique_file_artifact(
             &mut artifacts,
             SessionArtifactKind::ProjectionEvents,
             "Projection patch event log",
-            self.projection_events_path(session_id)?,
+            projection_events,
         );
         push_unique_file_artifact(
             &mut artifacts,
@@ -1494,7 +1641,9 @@ impl LocalMemoryRepository for FileMemoryRepository {
         session_id: &str,
     ) -> Result<SessionArtifactDeleteReport, String> {
         let _locks =
-            lock_transcript_for_removal(&self.resolve_transcript_events_path(session_id)?)?;
+            lock_session_stream_for_removal(&self.resolve_transcript_events_path(session_id)?)?;
+        let _projection_locks =
+            lock_session_stream_for_removal(&self.resolve_projection_events_path(session_id)?)?;
         Ok(remove_repository_files(
             session_id,
             self.session_artifact_paths(session_id)?,
@@ -1531,18 +1680,28 @@ impl LocalMemoryRepository for FileMemoryRepository {
             .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
+    fn projection_commit_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, canonical_log::TranscriptCommitError> {
+        self.resolve_projection_events_path(session_id)
+            .map_err(|_| canonical_log::TranscriptCommitError::InvalidAddress)
+    }
+
     fn append_projection_patch(
         &self,
         session_id: &str,
         patch: &ProjectionPatch,
     ) -> Result<(), String> {
-        append_jsonl(
-            patch,
-            &self.projection_events_path(session_id)?,
-            "projection patch",
-        )
+        let commit = || {
+            let storage = canonical_log::PreparedProjectionStorage::open(
+                &self.projection_commit_path(session_id)?,
+                session_id,
+            )?;
+            storage.commit_after(patch, None)
+        };
+        commit().map(|_| ()).map_err(|e| format!("{e:?}"))
     }
-
     fn load_projection_patches(&self, session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
         self.load_projection_patch_stream(session_id)
             .map(canonical_reader::StrictCanonicalRead::into_payloads)
@@ -1574,22 +1733,26 @@ impl LocalMemoryRepository for FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<HistoricalProjectionReplay, String> {
-        let transcript_events = self
-            .load_transcript_event_stream(session_id)?
-            .into_payloads();
-        let speaker_events = self
-            .load_speaker_revision_stream(session_id)?
-            .speaker_history(session_id)?;
-        let projection_patches = self
-            .load_projection_patch_stream(session_id)?
-            .into_payloads();
-        MaterializedProjectionState::replay_accepted_patches_with_history(
+        let (history, _) = self.read_projection_history(session_id, false)?;
+        let transcript = self.load_transcript_event_stream(session_id)?;
+        history.verify_source("transcript_revisions", transcript.records())?;
+        let transcript_events = transcript.into_payloads();
+        let speakers = self.load_speaker_revision_stream(session_id)?;
+        history.verify_source("speaker_revisions", speakers.records())?;
+        let speaker_events = speakers.speaker_history(session_id)?;
+        let ledger = TranscriptLedger::replay_source_prefix(session_id, &transcript_events)
+            .map_err(|_| "Projection transcript basis invalid".to_string())?;
+        let mut replay = MaterializedProjectionState::replay_accepted_patches_with_history(
             session_id,
             transcript_events,
             speaker_events,
-            projection_patches,
+            history.patches.clone(),
         )
-        .map_err(|error| format!("Projection replay failed for {session_id}: {error:?}"))
+        .map_err(|_| "Projection replay failed".to_string())?;
+        if replay.validation.invalid_patch_count == 0 {
+            history.bind(&ledger, &mut replay.state);
+        }
+        Ok(replay)
     }
 
     fn append_data_movement_event(
@@ -1951,12 +2114,14 @@ impl TranscriptEventWriteMsg {
 }
 
 /// Messages sent to the projection event writer thread.
-// Channel message enum: boxing the large `Append` variant would ripple
-// through every send and match site for negligible benefit.
-#[allow(clippy::large_enum_variant)]
-pub enum ProjectionEventWriteMsg {
-    /// Append a replayable notes/graph projection patch as a JSON line.
-    Append(ProjectionPatch),
+pub(crate) enum ProjectionEventWriteMsg {
+    #[cfg(test)]
+    FailSync,
+
+    /// Validate and materialize this patch on its canonical receipt.
+    Apply(Box<crate::state::ProjectionApplyCommand>),
+    #[cfg(test)]
+    Append(Box<ProjectionPatch>, mpsc::Sender<ProjectionCommitResult>),
     /// Flush the writer and shut down.
     Shutdown,
 }
@@ -1965,6 +2130,32 @@ pub enum ProjectionEventWriteMsg {
 /// latency is ~tens of ms on an idle channel, large enough that we don't burn
 /// CPU when no segments are arriving.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Queue polling stays responsive to shutdown while a failing storage device rests.
+struct RecoveryBackoff {
+    delay: std::time::Duration,
+    next: std::time::Instant,
+}
+
+impl RecoveryBackoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self {
+            delay: Self::INITIAL,
+            next: std::time::Instant::now(),
+        }
+    }
+
+    fn record(&mut self, now: std::time::Instant, resolved: bool) {
+        self.delay = if resolved {
+            Self::INITIAL
+        } else {
+            (self.delay * 2).min(std::time::Duration::from_secs(5))
+        };
+        self.next = now + self.delay;
+    }
+}
 
 /// Maximum queued transcript/projection events per durable event writer.
 ///
@@ -2055,24 +2246,6 @@ fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, 
     }
 }
 
-fn write_projection_event(
-    writer: &mut BufWriter<fs::File>,
-    patch: &ProjectionPatch,
-    file_path: &Path,
-) {
-    match serde_json::to_string(patch) {
-        Ok(json) => {
-            let bytes_lost = json.len() as u64 + 1;
-            if let Err(e) = writeln!(writer, "{}", json) {
-                io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
-            }
-        }
-        Err(e) => {
-            log::warn!("Projection event writer: serialize error: {}", e);
-        }
-    }
-}
-
 /// Drain any buffered messages after shutdown is requested, so segments that
 /// were already in the channel when `shutdown_requested` flipped still land on
 /// disk. Stops at the first `Shutdown` message or when the channel empties.
@@ -2091,34 +2264,47 @@ fn drain_remaining(
     }
 }
 
-fn drain_remaining_projection_events(
-    rx: &mpsc::Receiver<ProjectionEventWriteMsg>,
-    writer: &mut BufWriter<fs::File>,
-    file_path: &Path,
-) {
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            ProjectionEventWriteMsg::Append(patch) => {
-                write_projection_event(writer, &patch, file_path);
-            }
-            ProjectionEventWriteMsg::Shutdown => break,
-        }
-    }
-}
+#[cfg(test)]
+pub(crate) type ProjectionCommitResult =
+    Result<canonical_log::ProjectionReceipt, canonical_log::TranscriptCommitError>;
 
-fn drain_remaining_repository_projection_events(
-    rx: &mpsc::Receiver<ProjectionEventWriteMsg>,
-    session_id: &str,
-    repository: &dyn LocalMemoryRepository,
+fn projection_worker(
+    rx: mpsc::Receiver<ProjectionEventWriteMsg>,
+    storage: canonical_log::PreparedProjectionStorage,
+    shutdown: &AtomicBool,
 ) {
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            ProjectionEventWriteMsg::Append(patch) => {
-                if let Err(e) = repository.append_projection_patch(session_id, &patch) {
-                    log::warn!("Projection event repository writer: failed to append patch: {e}");
+    let mut pending: Option<crate::state::PendingProjectionApply> = None;
+    let mut retry = RecoveryBackoff::new();
+    loop {
+        if let Some(in_flight) = pending.as_mut()
+            && std::time::Instant::now() >= retry.next
+        {
+            let resolved = in_flight.resolve(&storage);
+            retry.record(std::time::Instant::now(), resolved);
+            if resolved {
+                pending = None;
+            }
+        }
+        match rx.recv_timeout(POLL_INTERVAL) {
+            Ok(ProjectionEventWriteMsg::Apply(apply)) => {
+                if pending.is_some() {
+                    apply.refuse_pending();
+                } else {
+                    pending = apply.execute(&storage);
                 }
             }
-            ProjectionEventWriteMsg::Shutdown => break,
+            #[cfg(test)]
+            Ok(ProjectionEventWriteMsg::FailSync) => canonical_log::simulate_failed_sync(),
+            #[cfg(test)]
+            Ok(ProjectionEventWriteMsg::Append(patch, reply)) => {
+                let result = storage.commit_after(&patch, None);
+                let _ = reply.send(result);
+            }
+            Ok(ProjectionEventWriteMsg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if shutdown.load(Ordering::SeqCst) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -2620,6 +2806,9 @@ impl TranscriptEventWriter {
         let path = repository.transcript_commit_path(&session_id).ok()?;
         let storage = canonical_log::PreparedTranscriptStorage::open(&path, &session_id).ok()?;
         storage.ready().ok()?;
+        // A reopened session is materialized by replay. These receipts belong
+        // to its prior owner and must not settle a later live transaction.
+        storage.take_recovered();
         let unqualified = storage.is_unqualified();
         let (tx, rx) = mpsc::sync_channel(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -2754,7 +2943,8 @@ impl TranscriptEventWriter {
     }
 }
 
-/// Handle to the durable projection patch event-log writer thread.
+/// Per-session projection actor. A patch receives the qualified or unqualified
+/// sync tier established for its canonical log.
 pub struct ProjectionEventWriter {
     tx: mpsc::SyncSender<ProjectionEventWriteMsg>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -2767,81 +2957,17 @@ pub struct ProjectionEventWriter {
 impl ProjectionEventWriter {
     /// Spawn a new projection event writer thread for the given session.
     pub fn spawn(session_id: &str) -> Option<Self> {
-        let file_path = projection_events_path(session_id)?;
-        if let Some(parent) = file_path.parent()
-            && let Err(e) = ensure_dir(parent)
-        {
-            log::warn!("Projection event persistence disabled: {}", e);
-            return None;
-        }
-
-        let file = open_session_writer_file(&file_path, "Projection event writer")?;
-        let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let shutdown_flag = shutdown_requested.clone();
-        let thread_path = file_path.clone();
-
-        let handle = std::thread::Builder::new()
-            .name("projection-event-writer".to_string())
-            .spawn(move || {
-                let mut writer = BufWriter::new(file);
-
-                'outer: loop {
-                    match rx.recv_timeout(POLL_INTERVAL) {
-                        Ok(ProjectionEventWriteMsg::Append(patch)) => {
-                            write_projection_event(&mut writer, &patch, &thread_path);
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_projection_events(&rx, &mut writer, &thread_path);
-                                break 'outer;
-                            }
-                        }
-                        Ok(ProjectionEventWriteMsg::Shutdown) => break 'outer,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_projection_events(&rx, &mut writer, &thread_path);
-                                break 'outer;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-                    }
-                }
-
-                let flush_start = std::time::Instant::now();
-                let flush_result = writer.flush();
-                let flush_elapsed = flush_start.elapsed();
-                if let Err(e) = flush_result {
-                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                    log::info!(
-                        "projection_event_writer.final_flush file={:?} elapsed_ms={} outcome=error",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                } else {
-                    log::info!(
-                        "projection_event_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                }
-                log::info!("Projection event writer: shut down for {:?}", thread_path);
-            })
-            .ok()?;
-
-        Some(Self {
-            tx,
-            handle: Some(handle),
-            shutdown_requested,
-            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
-            dropped_event_count: Arc::new(AtomicU64::new(0)),
-            queue_full_active: Arc::new(AtomicBool::new(false)),
-        })
+        Self::repository(session_id, Arc::new(FileMemoryRepository::user_data()))
     }
 
     #[cfg(test)]
     pub(crate) fn saturated_for_tests(patch: ProjectionPatch) -> Self {
         let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(1);
-        tx.try_send(ProjectionEventWriteMsg::Append(patch))
-            .expect("pre-fill projection event queue");
+        tx.try_send(ProjectionEventWriteMsg::Append(
+            Box::new(patch),
+            mpsc::channel().0,
+        ))
+        .expect("pre-fill projection event queue");
         std::mem::forget(rx);
         Self {
             tx,
@@ -2853,67 +2979,22 @@ impl ProjectionEventWriter {
         }
     }
 
-    /// Build a repository-backed projection event writer.
-    ///
-    /// The default application path still calls [`Self::spawn`] and uses the
-    /// bounded file writer with disk-full diagnostics.
+    /// Open and recover the same framed log that will acknowledge every
+    /// projection patch submitted to this worker.
     pub fn repository(
         session_id: impl Into<String>,
         repository: Arc<dyn LocalMemoryRepository>,
     ) -> Option<Self> {
         let session_id = session_id.into();
-        if let Err(e) = crate::sessions::validate_session_id(&session_id) {
-            log::warn!("Projection event repository writer disabled: {e}");
-            return None;
-        }
-
-        let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let path = repository.projection_commit_path(&session_id).ok()?;
+        let storage = canonical_log::PreparedProjectionStorage::open(&path, &session_id).ok()?;
+        storage.ready().ok()?;
+        let (tx, rx) = mpsc::sync_channel(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let shutdown_flag = shutdown_requested.clone();
-        let thread_session_id = session_id.clone();
-        let thread_repository = repository.clone();
-
+        let shutdown = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
-            .name("projection-event-repository-writer".to_string())
-            .spawn(move || {
-                'outer: loop {
-                    match rx.recv_timeout(POLL_INTERVAL) {
-                        Ok(ProjectionEventWriteMsg::Append(patch)) => {
-                            if let Err(e) =
-                                thread_repository.append_projection_patch(&thread_session_id, &patch)
-                            {
-                                log::warn!(
-                                    "Projection event repository writer: failed to append patch: {e}"
-                                );
-                            }
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_repository_projection_events(
-                                    &rx,
-                                    &thread_session_id,
-                                    thread_repository.as_ref(),
-                                );
-                                break 'outer;
-                            }
-                        }
-                        Ok(ProjectionEventWriteMsg::Shutdown) => break 'outer,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                drain_remaining_repository_projection_events(
-                                    &rx,
-                                    &thread_session_id,
-                                    thread_repository.as_ref(),
-                                );
-                                break 'outer;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-                    }
-                }
-                log::info!(
-                    "Projection event repository writer: shut down for {}",
-                    thread_session_id
-                );
-            })
+            .name("projection-commit".into())
+            .spawn(move || projection_worker(rx, storage, &shutdown))
             .ok()?;
 
         Some(Self {
@@ -2926,12 +3007,24 @@ impl ProjectionEventWriter {
         })
     }
 
-    /// Enqueue a projection patch for writing. Non-blocking.
-    pub fn append(&self, patch: &ProjectionPatch) -> bool {
-        match self
-            .tx
-            .try_send(ProjectionEventWriteMsg::Append(patch.clone()))
-        {
+    pub(crate) fn owns_projection_token(&self, token: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(token, &self.shutdown_requested)
+    }
+
+    pub(crate) fn submit_apply(
+        &self,
+        mut apply: crate::state::ProjectionApplyCommand,
+    ) -> Result<(), canonical_log::TranscriptCommitError> {
+        apply.bind(self.shutdown_requested.clone());
+        self.enqueue(ProjectionEventWriteMsg::Apply(Box::new(apply)))
+    }
+
+    fn enqueue(
+        &self,
+        message: ProjectionEventWriteMsg,
+    ) -> Result<(), canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        match self.tx.try_send(message) {
             Ok(()) => {
                 note_event_writer_enqueue_success(
                     "projection_event",
@@ -2939,7 +3032,7 @@ impl ProjectionEventWriter {
                     &self.dropped_event_count,
                     &self.queue_full_active,
                 );
-                true
+                Ok(())
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 note_event_writer_queue_full(
@@ -2948,13 +3041,44 @@ impl ProjectionEventWriter {
                     &self.dropped_event_count,
                     &self.queue_full_active,
                 );
-                false
+                Err(Error::QueueFull)
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 note_event_writer_disconnected("projection_event");
-                false
+                Err(Error::WriterAbsent)
             }
         }
+    }
+
+    /// The materializer owns the lane through settlement. Once the worker accepts
+    /// a patch, only its storage result can release the apply transaction.
+    #[cfg(test)]
+    pub(crate) fn fail_next_projection_sync(&self) {
+        self.enqueue(ProjectionEventWriteMsg::FailSync)
+            .expect("projection fault channel");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit(
+        &self,
+        patch: &ProjectionPatch,
+    ) -> Result<mpsc::Receiver<ProjectionCommitResult>, canonical_log::TranscriptCommitError> {
+        let (reply, rx) = mpsc::channel();
+        self.enqueue(ProjectionEventWriteMsg::Append(
+            Box::new(patch.clone()),
+            reply,
+        ))?;
+        Ok(rx)
+    }
+
+    #[cfg(test)]
+    pub fn append(&self, patch: &ProjectionPatch) -> bool {
+        self.submit(patch)
+            .and_then(|r| {
+                r.recv()
+                    .map_err(|_| canonical_log::TranscriptCommitError::ReplyLost)?
+            })
+            .is_ok()
     }
 
     pub fn shutdown(&self) {
@@ -3677,45 +3801,50 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn drain_remaining_projection_events_writes_pending_patches_then_stops() {
-        let path = unique_tempfile("drain-projection-pending");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("open temp file");
-        let mut writer = BufWriter::new(file);
+    fn recovery_retries_back_off_to_five_seconds_and_reset_after_success() {
+        let mut retry = super::RecoveryBackoff::new();
+        let start = retry.next;
+        for delay_ms in [200, 400, 800, 1600, 3200, 5000, 5000] {
+            let previous = retry.next;
+            retry.record(previous, false);
+            assert_eq!(
+                retry.next.duration_since(previous),
+                std::time::Duration::from_millis(delay_ms)
+            );
+        }
+        retry.record(start, true);
+        assert_eq!(retry.next - start, super::RecoveryBackoff::INITIAL);
+    }
 
-        let (tx, rx) = mpsc::channel::<ProjectionEventWriteMsg>();
-        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
-            1, "note-a",
-        )))
-        .unwrap();
-        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
-            2, "note-b",
-        )))
-        .unwrap();
+    #[test]
+    fn projection_worker_returns_receipts_in_order_and_stops_at_shutdown() {
+        let root = unique_tempfile("projection-receipts")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let session = "branch";
+        let path = root
+            .join("projections")
+            .join(format!("{session}.events.jsonl"));
+        let storage = canonical_log::PreparedProjectionStorage::open(&path, session).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let submit = |sequence| {
+            let (reply, result) = mpsc::channel();
+            let mut patch = projection_patch(sequence, "leaf");
+            patch.basis = crate::projections::ProjectionBasis::from_transcript_events(&[]);
+            tx.send(ProjectionEventWriteMsg::Append(Box::new(patch), reply))
+                .unwrap();
+            result
+        };
+        let first = submit(1);
+        let second = submit(2);
         tx.send(ProjectionEventWriteMsg::Shutdown).unwrap();
-        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
-            3,
-            "note-after-sentinel",
-        )))
-        .unwrap();
-
-        drain_remaining_projection_events(&rx, &mut writer, &path);
-        writer.flush().unwrap();
-
-        let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("\"sequence\":1"));
-        assert!(contents.contains("\"sequence\":2"));
-        assert!(
-            !contents.contains("note-after-sentinel"),
-            "projection drain must stop at Shutdown sentinel, got: {:?}",
-            contents
-        );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let third = submit(3);
+        projection_worker(rx, storage, &AtomicBool::default());
+        assert_eq!(first.recv().unwrap().unwrap().head.sequence, 1);
+        assert_eq!(second.recv().unwrap().unwrap().head.sequence, 2);
+        assert!(third.recv().is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3860,7 +3989,7 @@ mod shutdown_tests {
             queue_full_active: queue_full_active.clone(),
         };
 
-        assert!(writer.append(&projection_patch(1, "queued-note")));
+        let _waiting = writer.submit(&projection_patch(1, "queued-note")).unwrap();
         assert!(!writer.append(&projection_patch(2, "dropped-note")));
         assert_eq!(dropped_event_count.load(Ordering::SeqCst), 1);
         assert!(queue_full_active.load(Ordering::SeqCst));
@@ -5092,8 +5221,10 @@ mod local_memory_repository_tests {
             4_000,
         );
 
-        repo.append_projection_patch(session_id, &stale_patch)
-            .expect("append stale projection patch");
+        // Seed a predecessor's legacy row whose transcript was already revised.
+        // The activated writer refuses to create this history.
+        let path = repo.projection_events_path(session_id).unwrap();
+        append_jsonl(&stale_patch, &path, "legacy projection").unwrap();
         repo.append_projection_patch(session_id, &repair_patch)
             .expect("append repair projection patch");
 
@@ -5186,6 +5317,8 @@ mod local_memory_repository_tests {
         );
         let notes_patch = note_patch(1, basis.clone(), 2_000);
         let graph_patch = graph_patch(2, basis, 3_000);
+        repo.append_transcript_event(session_id, &event)
+            .expect("seed verified transcript basis");
         let writer =
             ProjectionEventWriter::repository(session_id, repository).expect("repository writer");
 

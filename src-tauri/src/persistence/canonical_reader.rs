@@ -70,6 +70,13 @@ pub(crate) enum StrictCanonicalRead<T> {
 }
 
 impl<T> StrictCanonicalRead<T> {
+    pub(crate) fn records(&self) -> &[super::canonical_log::CanonicalRecord<T>] {
+        match self {
+            Self::Missing => &[],
+            Self::Present(snapshot) => &snapshot.records,
+        }
+    }
+
     /// Compatibility projection for callers whose contract still models a
     /// missing stream and a present-empty stream as the same empty row list.
     pub(crate) fn into_payloads(self) -> Vec<T> {
@@ -90,6 +97,7 @@ impl<T> StrictCanonicalRead<T> {
 pub(crate) enum CanonicalReaderError {
     Canonical(CanonicalLogError),
     TranscriptAttemptUnreadable,
+    TranscriptLockContended,
     DataMovementSessionMismatch { record_index: usize },
     DataMovementSchemaVersionMismatch { record_index: usize },
 }
@@ -98,6 +106,7 @@ impl fmt::Display for CanonicalReaderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Canonical(error) => error.fmt(formatter),
+            Self::TranscriptLockContended => formatter.write_str("transcript coordination is busy"),
             Self::TranscriptAttemptUnreadable => {
                 formatter.write_str("transcript attempt requires verified recovery")
             }
@@ -128,6 +137,8 @@ fn load_strict_canonical_stream<T: DeserializeOwned>(
 ) -> Result<StrictCanonicalRead<T>, CanonicalReaderError> {
     let result = if descriptor == TRANSCRIPT_REVISIONS {
         super::canonical_log::read_committed(path, session_id)
+    } else if descriptor == PROJECTION_PATCHES {
+        super::canonical_log::read_committed_projection(path, session_id)
     } else {
         load_canonical_stream(
             path,

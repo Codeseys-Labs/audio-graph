@@ -213,12 +213,10 @@ fn start_daemon(address: Address) -> WireResult<Daemon> {
                 daemon.0.id(),
                 "the opted-in daemon must own the service"
             );
-            require_gnome_owner(&bus, &owner).await?;
             Ok(daemon)
         })
         .await
     })
 }
 
-#[path = "linux_secret_service_inventory_tests.rs"]
 mod inventory;

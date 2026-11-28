@@ -14,8 +14,8 @@ enum RecoveryScope {
 /// one object on one daemon and deliberately has no printable representation.
 pub(in super::super::super) struct LockedTarget {
     address: Address,
-    owner: OwnedUniqueName,
-    bus: zbus::OwnedGuid,
+    owner: ServiceOwner,
+    bus: OwnedGuid,
     path: OwnedObjectPath,
     attributes: Attributes,
     scope: RecoveryScope,
@@ -47,7 +47,7 @@ pub(in super::super::super) fn locked_target_at(
             }
             Ok(Some(LockedTarget {
                 address,
-                owner: client.owner,
+                owner: client.owner().clone(),
                 bus: client.connection.server_guid().clone(),
                 path,
                 attributes,
@@ -74,17 +74,13 @@ impl LockedTarget {
         &self.path
     }
 
-    /// Inspect a connection opened by the capability-bearing recovery child.
-    /// This function cannot produce or hand out a raw connection.
-    pub(in super::super::super) async fn check_recovery_connection(
+    pub(super) async fn check_recovery_connection(
         &self,
-        connection: &Connection,
-    ) -> WireResult<(OwnedUniqueName, bool)> {
-        let client = Client::bind(connection.clone()).await?;
-        self.check_binding(&client)?;
-        require_gnome_owner(connection, &client.owner).await?;
-        let locked = self.current_lock(&client).await?;
-        Ok((client.owner, locked))
+        client: &Client,
+    ) -> WireResult<(ServiceOwner, bool)> {
+        self.check_binding(client)?;
+        let locked = self.current_lock(client).await?;
+        Ok((client.owner().clone(), locked))
     }
 
     /// Verification is a distinct five-second transaction. It consumes
@@ -123,7 +119,7 @@ impl LockedTarget {
     }
 
     fn check_binding(&self, client: &Client) -> WireResult<()> {
-        if client.owner != self.owner || client.connection.server_guid() != &self.bus {
+        if client.owner() != &self.owner || client.connection.server_guid() != &self.bus {
             return Err(Failure::Unavailable.into());
         }
         Ok(())

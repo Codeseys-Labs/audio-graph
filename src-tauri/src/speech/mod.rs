@@ -3367,6 +3367,27 @@ fn log_attempt_budget_exhausted(decision: &ProjectionSchedulerDecision, attempts
     }
 }
 
+mod capture_coverage;
+pub(crate) use capture_coverage::spawn_capture_verification;
+#[cfg(test)]
+pub(crate) use capture_coverage::test_probe;
+
+#[cfg(test)]
+fn start_capture_projection_repairs(dispatch: ProjectionDispatchContext) {
+    let observation = {
+        let ledger = dispatch
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut lanes = dispatch
+            .projection_schedulers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        lanes.take_capture_repairs(&ledger, current_unix_millis())
+    };
+    dispatch_projection_observation(dispatch, observation);
+}
+
 fn dispatch_projection_observation(
     dispatch: ProjectionDispatchContext,
     observation: ProjectionSchedulersObservation,
@@ -4194,7 +4215,16 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                     // `patch` value the apply call already persisted.
                     emitted_patch.basis_currency_at_apply =
                         Some(result.basis_currency_at_apply.clone());
-                    emit_projection_runtime_events(&dispatch, &emitted_patch);
+                    {
+                        let _epoch = dispatch
+                            .projection_runtime
+                            .transcript_publication
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner());
+                        if result.may_emit(&dispatch.projection_runtime) {
+                            emit_projection_runtime_events(&dispatch, &emitted_patch);
+                        }
+                    }
                     finish_projection_scheduler_job(
                         dispatch,
                         &job,
@@ -4233,6 +4263,29 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         ProjectionRuntimeApplyError::SaveMaterializedGraph { .. } => {
                             (false, "save_graph_failed")
                         }
+                        ProjectionRuntimeApplyError::ProjectionStorage { reason } => (
+                            false,
+                            match reason {
+                                crate::state::ProjectionSaveError::ConfirmationPending => {
+                                    "projection_save_confirmation_pending"
+                                }
+                                crate::state::ProjectionSaveError::StorageFull => {
+                                    "projection_storage_full"
+                                }
+                                crate::state::ProjectionSaveError::InvalidHistory => {
+                                    "projection_invalid_history"
+                                }
+                                crate::state::ProjectionSaveError::Refused => {
+                                    "projection_commit_refused"
+                                }
+                                crate::state::ProjectionSaveError::Uncommitted => {
+                                    "projection_uncommitted_attempt"
+                                }
+                                crate::state::ProjectionSaveError::WriteFailed => {
+                                    "projection_write_failed"
+                                }
+                            },
+                        ),
                         ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
                             ..
                         } => (false, "event_writer_unavailable"),
@@ -11125,6 +11178,18 @@ mod tests_status {
         )
     }
 
+    fn seed_projection_source(app: &AppState, payload: AsrSpanRevisionPayload) {
+        assert!(
+            super::commit_asr_span_revision(
+                &app.transcript_ledger,
+                &app.transcript_event_writer,
+                &payload
+            )
+            .expect("seed canonical transcript basis")
+            .0
+        );
+    }
+
     fn test_projection_patch(
         job: &ProjectionJob,
         sequence: u64,
@@ -15098,6 +15163,7 @@ mod tests_status {
 
     #[test]
     fn startup_recovers_a_historical_caption_for_review_and_export_without_live_dispatch() {
+        use tauri::Manager;
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -15140,21 +15206,36 @@ mod tests_status {
             });
         // Plugin initialization finishes during build. The first load can run
         // even before Tauri's application setup callback and see the receipt.
-        let _runtime = tauri::test::mock_builder()
+        let runtime = tauri::test::mock_builder()
             .plugin(crate::persistence::transcript_startup::plugin(
                 app.current_session_id(),
             ))
+            .manage(app)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        let (review, portable) = tauri::async_runtime::block_on(async {
-            let review = crate::commands::load_session(historical.into())
+        let app = runtime.state::<AppState>();
+        let (review, portable, review_notes, review_graph) =
+            tauri::async_runtime::block_on(async {
+                let review = crate::commands::load_session(historical.into())
+                    .await
+                    .unwrap();
+                let portable = crate::commands::export_session_bundle(historical.into())
+                    .await
+                    .unwrap();
+                let notes = crate::commands::load_session_notes_artifacts_cmd(
+                    historical.into(),
+                    app.clone(),
+                )
                 .await
                 .unwrap();
-            let portable = crate::commands::export_session_bundle(historical.into())
+                let graph = crate::commands::load_session_graph_artifact_cmd(
+                    historical.into(),
+                    app.clone(),
+                )
                 .await
                 .unwrap();
-            (review, portable)
-        });
+                (review, portable, notes, graph)
+            });
         assert_eq!(
             review.transcript_events.as_slice(),
             std::slice::from_ref(&revision)
@@ -15170,6 +15251,8 @@ mod tests_status {
         assert_eq!(portable.transcript[0].text, revision.text);
         assert!(portable.diarization_events.is_empty() && portable.projection_events.is_empty());
         assert!(portable.notes.is_none() && portable.materialized_graph.is_none());
+        assert!(review_notes.notes.is_none() && review_graph.is_none());
+        assert!(review_notes.projection_events.is_empty());
         assert!(portable.graph.is_none());
         assert!(review.graph.nodes.is_empty() && review.graph.links.is_empty());
         assert!(app.transcript_buffer.read().unwrap().is_empty());
@@ -15185,8 +15268,111 @@ mod tests_status {
             false,
         );
         drain_app_writers(&app);
-        drop(app);
+        drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn capture_resume_dispatches_one_notes_gap_through_the_configured_generator() {
+        use crate::projections::{ProjectionPriority, ProjectionRecoveryStatus};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("capture-repair");
+        let _guard = DataDirGuard::set(&root);
+        let app = AppState::new();
+        let session = app.current_session_id();
+        let seed = projection_asr_payload("oak", 1, "reed", true);
+        super::commit_asr_span_revision(
+            &app.transcript_ledger,
+            &app.transcript_event_writer,
+            &seed,
+        )
+        .unwrap();
+        let basis = app.transcript_ledger.lock().unwrap().current_basis();
+        let job = ProjectionJob {
+            id: "starter".into(),
+            session_id: session.clone(),
+            kind: ProjectionKind::Notes,
+            basis: basis.clone(),
+            priority: ProjectionPriority::Realtime,
+            queued_at_ms: 1,
+        };
+        let patch = test_projection_patch(&job, 1, super::current_unix_millis());
+        app.projection_runtime_handle()
+            .apply_runtime_projection_patch(&session, &basis, patch)
+            .unwrap();
+        let head = app
+            .materialized_projection_state
+            .lock()
+            .unwrap()
+            .notes
+            .projection_log_head
+            .clone()
+            .unwrap();
+        let path = crate::user_data::resolve_projection_events_path(&session).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let gap = serde_json::json!({"stream":"projection_patches", "projection_lanes":["notes"], "after":head, "suffix_quarantined":true});
+        std::fs::write(
+            path.with_added_extension(format!("{id}.gap")),
+            serde_json::to_vec(&gap).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            path.with_added_extension(format!("{id}.quarantine")),
+            b"elm",
+        )
+        .unwrap();
+        let (entered, running) = std::sync::mpsc::channel();
+        let (proceed, release) = std::sync::mpsc::channel();
+        let release = Mutex::new(release);
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(move |job, _, _, sequence, now| {
+                entered.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap();
+                assert_eq!(job.kind, ProjectionKind::Notes);
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, now),
+                    tokens_used: 1,
+                    no_op_filtered_count: 0,
+                })
+            });
+        let (dispatch, events) = projection_dispatch_for_app(&app, generator);
+        let repo = FileMemoryRepository::user_data();
+        assert_eq!(
+            repo.replay_projection_state(&session)
+                .unwrap()
+                .state
+                .notes
+                .projection_recovery,
+            Some(ProjectionRecoveryStatus::RecomputeRequired)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let check = crate::persistence::begin_projection_capture(&app);
+        super::capture_coverage::launch(&app, check, dispatch.clone());
+        running.recv_timeout(Duration::from_secs(60)).unwrap();
+        super::start_capture_projection_repairs(dispatch);
+        let workers = std::mem::take(&mut *app.projection_job_workers.lock().unwrap());
+        assert_eq!(workers.len(), 1);
+        proceed.send(()).unwrap();
+        for (_, _, handle) in workers {
+            handle.join().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.patch_count(), 1);
+        let state = repo.replay_projection_state(&session).unwrap().state;
+        assert!(state.notes.projection_recovery.is_none());
+        assert_eq!(state.notes.last_sequence, 2);
+        assert_eq!(state.graph.last_sequence, 0);
+        let (_, gaps) = repo.projection_capture_coverage(&session).unwrap();
+        assert!(gaps.for_kind(&ProjectionKind::Notes).is_empty());
+        drain_app_writers(&app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -15394,44 +15580,51 @@ mod tests_status {
         let app = AppState::new();
         let session_id = app.current_session_id();
         let live_ledger = app.transcript_ledger.clone();
-        let ledger_grown = Arc::new(AtomicBool::new(false));
-        let ledger_grown_for_closure = ledger_grown.clone();
+        let client = app
+            .transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .client();
+        // Both first-round jobs already own the original basis. Neither may
+        // enter apply while the other is still waiting for the tail receipt.
+        let grow_ledger = std::sync::Once::new();
         let (generator, _calls) = FnProjectionPatchGenerator::new(
             move |job, _ledger, _notes, sequence, created_at_ms| {
-                if !ledger_grown_for_closure.swap(true, Ordering::SeqCst) {
-                    let mut ledger = match live_ledger.lock() {
-                        Ok(ledger) => ledger,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    ledger
-                        .apply_event(crate::projections::TranscriptEvent {
-                            span_id: "projection-basis-currency-tail-span-2".into(),
-                            provider: "test".into(),
-                            source_id: "test-source".into(),
-                            provider_item_id: None,
-                            transcript_segment_id: Some(
-                                "segment-projection-basis-currency-tail-span-2".into(),
-                            ),
-                            speaker_id: Some("speaker-1".into()),
-                            speaker_label: Some("Speaker 1".into()),
-                            channel: None,
-                            text: "Carol joined too.".into(),
-                            start_time: 5.0,
-                            end_time: 6.0,
-                            confidence: 1.0,
-                            is_final: true,
-                            stability: crate::projections::TranscriptEventStability::Final,
-                            revision_number: 1,
-                            supersedes: None,
-                            turn_id: None,
-                            end_of_turn: true,
-                            raw_event_ref: None,
-                            capture_latency_ms: None,
-                            asr_latency_ms: None,
-                            received_at_ms: 1_700_000_000_500,
-                        })
+                grow_ledger.call_once(|| {
+                    client
+                        .append_live(
+                            &crate::projections::TranscriptEvent {
+                                span_id: "projection-basis-currency-tail-span-2".into(),
+                                provider: "test".into(),
+                                source_id: "test-source".into(),
+                                provider_item_id: None,
+                                transcript_segment_id: Some(
+                                    "segment-projection-basis-currency-tail-span-2".into(),
+                                ),
+                                speaker_id: Some("speaker-1".into()),
+                                speaker_label: Some("Speaker 1".into()),
+                                channel: None,
+                                text: "Carol joined too.".into(),
+                                start_time: 5.0,
+                                end_time: 6.0,
+                                confidence: 1.0,
+                                is_final: true,
+                                stability: crate::projections::TranscriptEventStability::Final,
+                                revision_number: 1,
+                                supersedes: None,
+                                turn_id: None,
+                                end_of_turn: true,
+                                raw_event_ref: None,
+                                capture_latency_ms: None,
+                                asr_latency_ms: None,
+                                received_at_ms: 1_700_000_000_500,
+                            },
+                            live_ledger.clone(),
+                        )
                         .expect("append the live-ledger tail span between basis-pin and apply");
-                }
+                });
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
                     tokens_used: 37,
@@ -15545,20 +15738,22 @@ mod tests_status {
         let app = AppState::new();
         let session_id = app.current_session_id();
         let notes_job = {
-            let mut ledger = app
+            let seed = projection_asr_payload(
+                "projection-empty-ops-span",
+                1,
+                "Everything the model said here got filtered as a no-op.",
+                true,
+            );
+            super::commit_asr_span_revision(
+                &app.transcript_ledger,
+                &app.transcript_event_writer,
+                &seed,
+            )
+            .expect("seed canonical transcript");
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "projection-empty-ops-span",
-                        1,
-                        "Everything the model said here got filtered as a no-op.",
-                        true,
-                    ),
-                ))
-                .expect("seed transcript");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -15741,20 +15936,19 @@ mod tests_status {
 
         let app = AppState::new();
         let observation = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "registry-self-deregister-span",
+                    1,
+                    "Both projection lanes must self-deregister.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "registry-self-deregister-span",
-                        1,
-                        "Both projection lanes must self-deregister.",
-                        true,
-                    ),
-                ))
-                .expect("seed transcript");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -15847,20 +16041,19 @@ mod tests_status {
 
         let app = AppState::new();
         let job_a = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "stopping-race-span-1",
+                    1,
+                    "First utterance before Stop races the drain.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "stopping-race-span-1",
-                        1,
-                        "First utterance before Stop races the drain.",
-                        true,
-                    ),
-                ))
-                .expect("seed first span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -15878,24 +16071,27 @@ mod tests_status {
         // cascade to at most one extra hop even if the gate under test were
         // ever reverted, so this test cannot hang.
         let ledger_handle = app.transcript_ledger.clone();
+        let writer_handle = app.transcript_event_writer.clone();
         let stopping_flag = app.projection_lane_stopping.clone();
         let span_appended = Arc::new(AtomicBool::new(false));
         let span_appended_in_closure = span_appended.clone();
         let (generator, calls) = FnProjectionPatchGenerator::new(
             move |job, _ledger, _notes, sequence, created_at_ms| {
                 if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
-                    ledger_handle
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .apply_event(crate::projections::TranscriptEvent::from(
-                            projection_asr_payload(
+                    assert!(
+                        super::commit_asr_span_revision(
+                            &ledger_handle,
+                            &writer_handle,
+                            &projection_asr_payload(
                                 "stopping-race-span-2",
                                 1,
                                 "Second utterance lands while A is mid-generation.",
                                 true,
-                            ),
-                        ))
-                        .expect("append second span mid-generation");
+                            )
+                        )
+                        .unwrap()
+                        .0
+                    );
                     stopping_flag.store(true, Ordering::SeqCst);
                 }
                 Ok(ProjectionPatchOutcome {
@@ -15978,20 +16174,19 @@ mod tests_status {
 
         let app = AppState::new();
         let job_a = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "abandon-restart-span-1",
+                    1,
+                    "First utterance before Stop races the drain.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "abandon-restart-span-1",
-                        1,
-                        "First utterance before Stop races the drain.",
-                        true,
-                    ),
-                ))
-                .expect("seed first span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -16007,24 +16202,27 @@ mod tests_status {
         // starting a mandatory follow-up) AND Stop begins, both before job
         // A's own completion tail reaches `dispatch_projection_decision`.
         let ledger_handle = app.transcript_ledger.clone();
+        let writer_handle = app.transcript_event_writer.clone();
         let stopping_flag = app.projection_lane_stopping.clone();
         let span_appended = Arc::new(AtomicBool::new(false));
         let span_appended_in_closure = span_appended.clone();
         let (generator, calls) = FnProjectionPatchGenerator::new(
             move |job, _ledger, _notes, sequence, created_at_ms| {
                 if !span_appended_in_closure.swap(true, Ordering::SeqCst) {
-                    ledger_handle
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .apply_event(crate::projections::TranscriptEvent::from(
-                            projection_asr_payload(
+                    assert!(
+                        super::commit_asr_span_revision(
+                            &ledger_handle,
+                            &writer_handle,
+                            &projection_asr_payload(
                                 "abandon-restart-span-2",
                                 1,
                                 "Second utterance lands while A is mid-generation.",
                                 true,
-                            ),
-                        ))
-                        .expect("append second span mid-generation");
+                            )
+                        )
+                        .unwrap()
+                        .0
+                    );
                     stopping_flag.store(true, Ordering::SeqCst);
                 }
                 Ok(ProjectionPatchOutcome {
@@ -16070,18 +16268,15 @@ mod tests_status {
         app.projection_lane_stopping.store(false, Ordering::SeqCst);
 
         // A new final ASR revision lands post-restart.
-        app.transcript_ledger
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .apply_event(crate::projections::TranscriptEvent::from(
-                projection_asr_payload(
-                    "abandon-restart-span-3",
-                    1,
-                    "Third utterance lands after the same-session restart.",
-                    true,
-                ),
-            ))
-            .expect("append third span after restart");
+        seed_projection_source(
+            &app,
+            projection_asr_payload(
+                "abandon-restart-span-3",
+                1,
+                "Third utterance lands after the same-session restart.",
+                true,
+            ),
+        );
 
         let graph_decision = {
             let ledger = app
@@ -16149,20 +16344,19 @@ mod tests_status {
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         let failed_job_id = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "deferred-retry-fires-span-1",
+                    1,
+                    "Failing basis armed for a deferred retry.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "deferred-retry-fires-span-1",
-                        1,
-                        "Failing basis armed for a deferred retry.",
-                        true,
-                    ),
-                ))
-                .expect("seed span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -16394,20 +16588,19 @@ mod tests_status {
         // eventual `observe_ledger` re-check inside the fired retry can
         // legitimately act on.
         let failed_job_id = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "dispatch-decision-arms-deferred-retry-span-1",
+                    1,
+                    "Failing basis fed straight into dispatch_projection_decision.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "dispatch-decision-arms-deferred-retry-span-1",
-                        1,
-                        "Failing basis fed straight into dispatch_projection_decision.",
-                        true,
-                    ),
-                ))
-                .expect("seed span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -16603,20 +16796,19 @@ mod tests_status {
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         let (failed_job_id, deferred_retry_at_ms) = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "dispatch-decision-abandons-deferred-retry-span-1",
+                    1,
+                    "Failing basis whose deferral must not survive as an orphan.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "dispatch-decision-abandons-deferred-retry-span-1",
-                        1,
-                        "Failing basis whose deferral must not survive as an orphan.",
-                        true,
-                    ),
-                ))
-                .expect("seed span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -17503,20 +17695,19 @@ mod tests_status {
 
         // ----- Job 1: first Notes-kind tick, no notes exist yet.
         let job_one = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "executor-chain-span-1",
+                    1,
+                    "Alice chose Soniox for the pilot.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "executor-chain-span-1",
-                        1,
-                        "Alice chose Soniox for the pilot.",
-                        true,
-                    ),
-                ))
-                .expect("seed transcript");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -17607,20 +17798,19 @@ mod tests_status {
         // dispatch must observe job 1's applied note through the SAME live
         // AppState -> generator -> executor chain.
         let job_two = {
-            let mut ledger = app
+            seed_projection_source(
+                &app,
+                projection_asr_payload(
+                    "executor-chain-span-2",
+                    1,
+                    "Bob confirmed the timeline.",
+                    true,
+                ),
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "executor-chain-span-2",
-                        1,
-                        "Bob confirmed the timeline.",
-                        true,
-                    ),
-                ))
-                .expect("seed second transcript span");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()
@@ -18283,42 +18473,49 @@ mod tests_status {
         let app = AppState::new();
         let mutated = Arc::new(AtomicBool::new(false));
         let ledger_for_mutation = app.transcript_ledger.clone();
+        let client = app
+            .transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .client();
         let mutated_for_generator = mutated.clone();
         let (generator, calls) = FnProjectionPatchGenerator::new(
             move |job, _ledger, _notes, sequence, created_at_ms| {
                 if job.kind == ProjectionKind::Notes
                     && !mutated_for_generator.swap(true, Ordering::SeqCst)
                 {
-                    let mut ledger = ledger_for_mutation
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    ledger
-                        .apply_event(crate::projections::TranscriptEvent {
-                            span_id: "projection-repair-new-span".to_string(),
-                            provider: "projection-test".to_string(),
-                            source_id: "system".to_string(),
-                            provider_item_id: Some("projection-repair-new-span".to_string()),
-                            transcript_segment_id: Some(
-                                "segment-projection-repair-new-span".to_string(),
-                            ),
-                            speaker_id: Some("speaker-1".to_string()),
-                            speaker_label: Some("Speaker 1".to_string()),
-                            channel: None,
-                            text: "Newer context arrived before apply.".to_string(),
-                            start_time: 2.0,
-                            end_time: 3.0,
-                            confidence: 0.94,
-                            is_final: true,
-                            stability: crate::projections::TranscriptEventStability::Final,
-                            revision_number: 1,
-                            supersedes: None,
-                            turn_id: None,
-                            end_of_turn: true,
-                            raw_event_ref: Some("projection-test[repair]".to_string()),
-                            capture_latency_ms: None,
-                            asr_latency_ms: None,
-                            received_at_ms: 1_700_000_000_010,
-                        })
+                    client
+                        .append_live(
+                            &crate::projections::TranscriptEvent {
+                                span_id: "projection-repair-new-span".to_string(),
+                                provider: "projection-test".to_string(),
+                                source_id: "system".to_string(),
+                                provider_item_id: Some("projection-repair-new-span".to_string()),
+                                transcript_segment_id: Some(
+                                    "segment-projection-repair-new-span".to_string(),
+                                ),
+                                speaker_id: Some("speaker-1".to_string()),
+                                speaker_label: Some("Speaker 1".to_string()),
+                                channel: None,
+                                text: "Newer context arrived before apply.".to_string(),
+                                start_time: 2.0,
+                                end_time: 3.0,
+                                confidence: 0.94,
+                                is_final: true,
+                                stability: crate::projections::TranscriptEventStability::Final,
+                                revision_number: 1,
+                                supersedes: None,
+                                turn_id: None,
+                                end_of_turn: true,
+                                raw_event_ref: Some("projection-test[repair]".to_string()),
+                                capture_latency_ms: None,
+                                asr_latency_ms: None,
+                                received_at_ms: 1_700_000_000_010,
+                            },
+                            ledger_for_mutation.clone(),
+                        )
                         .expect("mutate ledger with newer context");
                 }
                 Ok(ProjectionPatchOutcome {
@@ -18331,20 +18528,21 @@ mod tests_status {
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
 
         {
-            let mut ledger = app
+            let seed =
+                projection_asr_payload("projection-repair-old-span", 1, "Original context.", true);
+            assert!(
+                super::commit_asr_span_revision(
+                    &app.transcript_ledger,
+                    &app.transcript_event_writer,
+                    &seed
+                )
+                .unwrap()
+                .0
+            );
+            let ledger = app
                 .transcript_ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            ledger
-                .apply_event(crate::projections::TranscriptEvent::from(
-                    projection_asr_payload(
-                        "projection-repair-old-span",
-                        1,
-                        "Original context.",
-                        true,
-                    ),
-                ))
-                .expect("seed old basis");
             let mut schedulers = app
                 .projection_schedulers
                 .lock()

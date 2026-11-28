@@ -1,15 +1,14 @@
 //! Noninteractive writes and deletes, with a fresh read-back after dispatch.
 
 use super::{
-    Attributes, CLOSE_BUDGET, Client, Failure, ITEM, Method, SecretBytes, WireError, WireResult,
-    drive, map_crypto_error, session_address, until,
+    Address, Attributes, CLOSE_BUDGET, Client, Failure, ITEM, Method, OwnedObjectPath, SecretBytes,
+    Variant, WireError, WireResult, drive, map_crypto_error, session_address, until,
 };
 use crate::credentials::adapters::native_interaction::{
     ForbidPrompt, MutationInvocation, ensure_forbid_prompt,
 };
 use std::collections::HashMap;
 use std::time::Duration;
-use zbus::{Address, OwnedObjectPath, Variant};
 use zeroize::Zeroizing;
 
 const COLLECTION: &str = "org.freedesktop.Secret.Collection";
@@ -120,7 +119,7 @@ pub(super) fn mutate_at(
             Err(_) => Dispatch::Uncertain,
         };
 
-        let owner = client.owner.clone();
+        let owner = client.owner().clone();
         let bus = client.connection.server_guid().clone();
         client.close_session(dispatch_by + CLOSE_BUDGET).await;
         drop(client);
@@ -128,7 +127,7 @@ pub(super) fn mutate_at(
         let read_by = end - CLOSE_BUDGET;
         let after = async {
             let mut verifier = until(read_by, Client::connect(address)).await?;
-            if verifier.owner != owner || verifier.connection.server_guid() != &bus {
+            if verifier.owner() != &owner || verifier.connection.server_guid() != &bus {
                 return Err(Failure::Unavailable.into());
             }
             let after = until(read_by, snapshot(&mut verifier, attributes, &mutation)).await;
@@ -286,6 +285,7 @@ async fn send(
     invocation: &mut MutationInvocation<'_>,
     started: &mut bool,
 ) -> WireResult<Option<OwnedObjectPath>> {
+    client.connection.require_current().await?;
     let prompt = match (&plan.request, &plan.before) {
         (Request::Write { iv, ciphertext, .. }, Some(before)) => {
             let secret = (

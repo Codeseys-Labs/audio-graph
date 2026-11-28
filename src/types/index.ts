@@ -2280,7 +2280,13 @@ export interface MaterializedNote {
   valid_until_ms?: number | null;
 }
 
-export interface MaterializedNotes {
+/** Read-only diagnostics from this lens's verified projection generation. */
+interface ProjectionReadStatus {
+  projection_recovery?: "recompute_required";
+  transcript_coverage?: "behind_transcript";
+}
+
+export interface MaterializedNotes extends ProjectionReadStatus {
   schema_version: number;
   session_id: string;
   last_sequence: number;
@@ -2317,7 +2323,7 @@ export interface MaterializedGraphEdge {
   provenance: unknown;
 }
 
-export interface MaterializedGraph {
+export interface MaterializedGraph extends ProjectionReadStatus {
   schema_version: number;
   session_id: string;
   last_sequence: number;
