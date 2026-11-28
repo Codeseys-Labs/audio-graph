@@ -3673,6 +3673,37 @@ fn llm_cancelled_diagnostic() -> RuntimeDiagnostic {
     .into()
 }
 
+fn llm_timeout_diagnostic() -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::Timeout,
+        false,
+        RuntimeSafeRecoveryAction::None,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .into()
+}
+
+/// Longest a blocking LLM executor call may run. The executor has one worker
+/// thread; if that thread panics mid-job, every later job waits in its queue
+/// forever, so no caller may wait unbounded. Long enough for a slow
+/// local-model generation.
+const BLOCKING_LLM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run a blocking LLM executor call off the async runtime, bounded by
+/// `limit`. A call that panics is `internal`, and one that outlives `limit` is
+/// `timeout`. Nothing can cancel a timed-out call, so its thread stays
+/// blocked.
+async fn bounded_blocking_llm_call<T: Send + 'static>(
+    limit: std::time::Duration,
+    call: impl FnOnce() -> Result<T, RuntimeDiagnostic> + Send + 'static,
+) -> Result<T, RuntimeDiagnostic> {
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(call)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_panicked)) => Err(llm_internal_diagnostic()),
+        Err(_elapsed) => Err(llm_timeout_diagnostic()),
+    }
+}
+
 /// The frames of one LLM stream, as the chat and card-answer consumers read
 /// them. A producer that drops its sender without a terminal frame (its task
 /// panicked or was aborted) yields one `internal` [`TokenDelta::Error`]
@@ -4256,20 +4287,17 @@ pub async fn send_chat_message(
     }
 
     // Legacy blocking path: native engines + bedrock until their streaming
-    // support lands. Wrap the synchronous executor call in
-    // `spawn_blocking` so we don't stall the runtime worker.
-    // `chat_with_history` returns the reply text plus the token usage the
-    // backend reported. The native `LlmEngine` surfaces a real (prompt +
-    // completion) count; the cloud backends routed through this blocking path
-    // (Bedrock via ApiClient, OpenRouter blocking, mistral.rs) report 0 because
-    // their `chat_with_history` signatures don't carry usage yet — never
-    // fabricated.
+    // support lands. `chat_with_history` returns the reply text plus the token
+    // usage the backend reported. The native `LlmEngine` surfaces a real
+    // (prompt + completion) count; the cloud backends routed through this
+    // blocking path (Bedrock via ApiClient, OpenRouter blocking, mistral.rs)
+    // report 0 because their `chat_with_history` signatures don't carry usage
+    // yet — never fabricated.
     let executor = state.llm_executor.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|_| AppError::from(llm_internal_diagnostic()))?
     .map_err(|diagnostic| {
         log::warn!("send_chat_message failed: {diagnostic}");
         AppError::from(diagnostic)
@@ -4358,11 +4386,10 @@ pub async fn synthesize_notes(
     }];
 
     let executor = state.llm_executor.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|_| AppError::from(llm_internal_diagnostic()))?
     .map_err(|diagnostic| {
         log::warn!("synthesize_notes failed: {diagnostic}");
         AppError::from(diagnostic)
@@ -27019,6 +27046,28 @@ mod tests {
                 .await,
                 Ok((PARTIAL_REPLY.to_string(), 0))
             );
+        });
+    }
+
+    #[test]
+    fn a_blocking_llm_call_that_never_returns_times_out_and_a_panic_is_internal() {
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            // A job left in a dead worker's queue: nothing ever answers it.
+            let (keep_unanswered, unanswered) = std::sync::mpsc::channel::<()>();
+            let hung = bounded_blocking_llm_call(Duration::from_millis(50), move || {
+                let _ = unanswered.recv();
+                Ok(())
+            })
+            .await;
+            assert_eq!(hung, Err(llm_timeout_diagnostic()));
+            drop(keep_unanswered);
+
+            let panicked = bounded_blocking_llm_call::<()>(Duration::from_secs(20), || {
+                panic!("the executor call panicked")
+            })
+            .await;
+            assert_eq!(panicked, Err(llm_internal_diagnostic()));
         });
     }
 
