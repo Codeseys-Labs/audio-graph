@@ -79,7 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `private.gguf` for `/home/name/private.gguf`); a model at a remote endpoint
   keeps its provider's identifier. Sessions saved before this fix are read and
   exported the same way, and a local model whose stored path cannot be reduced
-  to a name shows as `local-model`; their files are not rewritten (#540).
+  to a name shows as `local-model`; their files are not rewritten (#540). A
+  record that says where its model ran in a form this version does not know
+  is read as one that does not say, instead of failing to load.
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw

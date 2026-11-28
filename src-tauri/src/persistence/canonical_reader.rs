@@ -734,6 +734,40 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_placement_reads_as_unmarked_and_keeps_the_stream_readable() {
+        let root = unique_tempdir("unknown-placement");
+        let path = root.join("projection.jsonl");
+        let session_id = "session-unknown-placement";
+        let mut bytes = Vec::new();
+        for (sequence, placement) in [
+            (1, serde_json::json!("elsewhere")),
+            (2, serde_json::json!(["remote"])),
+        ] {
+            let mut patch = projection_patch(sequence);
+            patch.provenance.provider = "llm.openrouter".to_string();
+            patch.provenance.route_id = Some("route.openrouter".to_string());
+            patch.provenance.model = "anthropic/claude-sonnet-4".to_string();
+            let mut value = serde_json::to_value(&patch).expect("serialize patch");
+            value["provenance"]["model_placement"] = placement;
+            serde_json::to_writer(&mut bytes, &value).expect("serialize stored patch");
+            bytes.push(b'\n');
+        }
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(&path, &bytes).expect("write accepted patches");
+
+        let read = load_projection_patches(&path, session_id).expect("the stream decodes");
+        let records = &present_snapshot(&read).records;
+        assert_eq!(records.len(), 2);
+        for record in records {
+            // Read as an unmarked OpenRouter record: by the local rule.
+            assert_eq!(record.payload.provenance.model, "claude-sonnet-4");
+            assert_eq!(record.payload.provenance.model_placement, None);
+        }
+        assert_eq!(fs::read(&path).expect("re-read bytes"), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn strict_reader_file_repository_routes_all_actual_stream_paths() {
         let root = unique_tempdir("repository-routes");
         let repo = FileMemoryRepository::with_data_root(&root);

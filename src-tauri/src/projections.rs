@@ -2119,7 +2119,10 @@ struct StoredProjectionProvenance {
     route_id: Option<String>,
     #[serde(default)]
     model_source: crate::llm::route::ModelIdentitySource,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "audio_graph_ipc_contract::model_id::lenient_placement"
+    )]
     model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
 }
 
