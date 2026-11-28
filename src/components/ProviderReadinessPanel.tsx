@@ -515,13 +515,29 @@ function providerReadinessNoteMessage(
   }
 }
 
-export function providerReadinessMessage(
+/** The sentence for an entry's cause or note, with no freshness caveat. */
+export function providerReadinessSentence(
   entry: ProviderReadiness,
   t: TFunction,
 ): string {
   return entry.diagnostic
     ? t(runtimeDiagnosticPresentation(entry.diagnostic).translationKey)
     : providerReadinessNoteMessage(entry, t);
+}
+
+/**
+ * How a readiness entry is worded, on every surface that shows one. A stale
+ * entry always carries the stale warning: its verdict may describe a key that
+ * has since been replaced, so it never reads as a plain pass.
+ */
+export function providerReadinessMessage(
+  entry: ProviderReadiness,
+  t: TFunction,
+): string {
+  const sentence = providerReadinessSentence(entry, t);
+  return entry.stale
+    ? `${sentence} ${t("settings.providerReadiness.stale")}`
+    : sentence;
 }
 
 /**
@@ -769,7 +785,10 @@ export default function ProviderReadinessPanel({
     : null;
   // An expired credential or a refused permission is its own next step: the
   // recovery copy for it is the sentence already shown as the message.
-  const nextStep = recoveryAction === message ? null : recoveryAction;
+  const nextStep =
+    entry && recoveryAction === providerReadinessSentence(entry, t)
+      ? null
+      : recoveryAction;
   // The tone LAW (audio-graph-2554, settings T2; folded in for T3 /
   // audio-graph-9d2b — seed 73bf): this panel always describes the provider
   // actually selected right now (every call site passes the ACTIVE
@@ -824,7 +843,6 @@ export default function ProviderReadinessPanel({
         {entry && (
           <p className="settings-provider-readiness__message">
             {message}
-            {entry.stale ? ` ${t("settings.providerReadiness.stale")}` : ""}
             {catalogSummary
               ? ` ${providerCatalogLabel(catalogSummary, t)}`
               : ""}

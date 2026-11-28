@@ -434,6 +434,18 @@ export function readinessAtLatestEpoch(
   };
 }
 
+/** Every entry shown as stale: what a credential write does to them. */
+function readinessShownStale(
+  entries: Record<string, ProviderReadiness>,
+): Record<string, ProviderReadiness> {
+  return Object.fromEntries(
+    Object.entries(entries).map(([providerId, entry]) => [
+      providerId,
+      entry.stale ? entry : { ...entry, stale: true },
+    ]),
+  );
+}
+
 function providerReadinessFromEntries(
   entries: ProviderReadiness[],
 ): Record<string, ProviderReadiness> {
@@ -2256,6 +2268,20 @@ export function useSettingsController() {
     return false;
   }, []);
 
+  // A credential write is about to be issued. Whether it lands is unknown
+  // until it settles, and the reply to a check already in flight may be for
+  // the key it replaces: retire that request so its reply is dropped, and show
+  // what is on screen as stale until the refresh that follows the write.
+  const fenceProviderReadiness = useCallback(() => {
+    const inFlight = providerReadinessRequestRef.current;
+    if (inFlight) {
+      providerReadinessRequestRef.current = null;
+      cancelProviderReadinessRequest(inFlight);
+      setProviderReadinessLoading(false);
+    }
+    setProviderReadiness(readinessShownStale);
+  }, [cancelProviderReadinessRequest]);
+
   const refreshProviderReadiness = async (
     options: {
       force?: boolean;
@@ -2352,6 +2378,7 @@ export function useSettingsController() {
       t("settings.credentialConfirm.clearPrompt", { label }),
     );
     if (!ok) return;
+    fenceProviderReadiness();
     const keys = Array.isArray(key) ? key : [key];
     // cred-review m3: a multi-key clear (e.g. the AWS access/secret/session
     // triple) must not stop at the first failure — that leaves a half-cleared
@@ -2412,6 +2439,7 @@ export function useSettingsController() {
       setCredentialSaveNotice((prev) => ({ ...prev, [key]: "empty" }));
       return;
     }
+    fenceProviderReadiness();
     try {
       await useAudioGraphStore.getState().saveCredential(key, value);
       setCredentialDrafts((prev) => {
@@ -2420,12 +2448,13 @@ export function useSettingsController() {
         return next;
       });
       setCredentialSaveNotice((prev) => ({ ...prev, [key]: "saved" }));
-      await refreshCredentialPresence();
-      void refreshProviderReadiness({ force: true });
     } catch (e) {
       console.error(`Failed to save ${key}:`, e);
       setCredentialSaveNotice((prev) => ({ ...prev, [key]: "error" }));
     }
+    // Refresh either way: a save that reports failure may still have landed.
+    await refreshCredentialPresence();
+    void refreshProviderReadiness({ force: true });
   };
 
   const handleTestAsrApi = () =>
@@ -3436,10 +3465,14 @@ export function useSettingsController() {
   // ADR-0011). A prior error is cleared on entry so a retry starts clean.
   const handleSave = async () => {
     setSaveError(null);
+    fenceProviderReadiness();
     try {
       await runSave();
     } catch (e) {
       setSaveError(errorToMessage(e));
+      // A save that fails part-way may already have written a key.
+      await refreshCredentialPresence();
+      void refreshProviderReadiness();
     }
   };
 

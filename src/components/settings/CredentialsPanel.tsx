@@ -34,6 +34,7 @@ import {
   providerCatalogLabel,
   providerCatalogSummary,
   providerReadinessMessage,
+  providerReadinessSentence,
   providerRecoveryAction,
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
@@ -214,7 +215,9 @@ export default function CredentialsPanel() {
                 // An expired credential or a refused permission is its own
                 // next step: its recovery copy is the sentence shown above.
                 const nextStep =
-                  recoveryAction === message ? null : recoveryAction;
+                  recoveryAction === providerReadinessSentence(entry, t)
+                    ? null
+                    : recoveryAction;
                 const credentialRoute = credentialRouteForReadiness(entry);
                 // The tone LAW (audio-graph-2554, settings T2): this rollup
                 // deliberately keeps showing REAL blockers (missing
@@ -265,9 +268,6 @@ export default function CredentialsPanel() {
                     )}
                     <p className="settings-readiness__message">
                       {message}
-                      {entry.stale
-                        ? ` ${t("settings.providerReadiness.stale")}`
-                        : ""}
                       {catalogSummary
                         ? ` ${providerCatalogLabel(catalogSummary, t)}`
                         : ""}

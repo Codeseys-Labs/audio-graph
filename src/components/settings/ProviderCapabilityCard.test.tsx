@@ -8,6 +8,7 @@ import {
   failedReadiness,
   READINESS_NOTE_CASES,
   runtimeFailure,
+  STALE_PASS,
 } from "../../test/readinessFixtures";
 import type { ProviderReadiness } from "../../types";
 import type { SettingsControllerValue } from "./useSettingsController";
@@ -227,6 +228,17 @@ describe("ProviderCapabilityCard — readiness copy from closed fields", () => {
       );
       expect(summary.textContent).toBe(c.message[locale]);
       expect(card.textContent).not.toMatch(/runtime\/|credential\//);
+      view.unmount();
+    }
+  });
+
+  it("never words a stale passed check as a plain pass", () => {
+    for (const locale of LOCALES) {
+      const { view, summary } = renderEntry(
+        locale,
+        makeEntry(STALE_PASS.readiness),
+      );
+      expect(summary.textContent).toBe(STALE_PASS.message[locale]);
       view.unmount();
     }
   });

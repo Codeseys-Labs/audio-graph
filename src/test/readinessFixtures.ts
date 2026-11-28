@@ -305,3 +305,18 @@ export const FAILURE_CASES: ReadonlyArray<{
     recovery: null,
   },
 ];
+
+/**
+ * A passed check that may describe a key since replaced, with the sentence
+ * every surface renders for it: never the "passed" sentence on its own.
+ */
+export const STALE_PASS: {
+  readiness: Pick<ProviderReadiness, "status" | "note" | "stale">;
+  message: { en: string; pt: string };
+} = {
+  readiness: { status: "ready", note: { kind: "verified" }, stale: true },
+  message: {
+    en: "Provider check passed. Cached result may be stale.",
+    pt: "A verificação do provedor foi aprovada. O resultado em cache pode estar desatualizado.",
+  },
+};

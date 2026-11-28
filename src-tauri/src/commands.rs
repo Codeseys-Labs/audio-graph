@@ -12309,15 +12309,6 @@ fn local_runtime_probe_outcome(
     }
 }
 
-fn apply_local_model_readiness(
-    descriptor: &crate::provider_registry::ProviderDescriptor,
-    app: &tauri::AppHandle,
-    readiness: ProviderReadiness,
-) -> ProviderReadiness {
-    let models_dir = crate::models::get_models_dir(app);
-    apply_local_model_readiness_from_dir(descriptor, &models_dir, readiness)
-}
-
 fn apply_local_model_readiness_from_dir(
     descriptor: &crate::provider_registry::ProviderDescriptor,
     models_dir: &std::path::Path,
@@ -13352,8 +13343,54 @@ pub async fn get_provider_readiness_cmd(
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
-    let (credential_epoch, store) =
-        readiness_credential_snapshot(crate::credentials::try_load_credentials)?;
+    let models_dir = crate::models::get_models_dir(&app);
+    provider_readiness_impl(
+        settings,
+        &models_dir,
+        crate::credentials::try_load_credentials,
+        ProviderReadinessQuery {
+            refresh: refresh.unwrap_or(false),
+            force: force.unwrap_or(false),
+            conversation_mode,
+            converse_engine,
+            provider_ids,
+            request_id,
+        },
+    )
+    .await
+}
+
+/// What a caller asks of [`get_provider_readiness_cmd`].
+#[derive(Debug, Default)]
+struct ProviderReadinessQuery {
+    refresh: bool,
+    force: bool,
+    conversation_mode: Option<String>,
+    converse_engine: Option<String>,
+    provider_ids: Option<Vec<String>>,
+    request_id: Option<String>,
+}
+
+/// Testable core of [`get_provider_readiness_cmd`]: everything after the app
+/// handle has given the saved settings and the models directory.
+async fn provider_readiness_impl<E>(
+    settings: crate::settings::AppSettings,
+    models_dir: &std::path::Path,
+    load_credentials: impl FnOnce() -> Result<crate::credentials::CredentialStore, E>,
+    query: ProviderReadinessQuery,
+) -> AppResult<Vec<ProviderReadiness>>
+where
+    AppError: From<E>,
+{
+    let ProviderReadinessQuery {
+        refresh,
+        force,
+        conversation_mode,
+        converse_engine,
+        provider_ids,
+        request_id,
+    } = query;
+    let (credential_epoch, store) = readiness_credential_snapshot(load_credentials)?;
     let request = register_provider_readiness_request(request_id)?;
     let (_request_guard, cancel) = match &request {
         Some((guard, token)) => (Some(guard), Some(token)),
@@ -13365,8 +13402,6 @@ pub async fn get_provider_readiness_cmd(
     );
     let active_ids =
         requested_provider_ids(&settings, native_realtime_active, provider_ids.as_deref());
-    let refresh = refresh.unwrap_or(false);
-    let force = force.unwrap_or(false);
     let now = unix_millis();
     let mut readiness = Vec::with_capacity(crate::provider_registry::provider_registry().len());
 
@@ -13425,7 +13460,7 @@ pub async fn get_provider_readiness_cmd(
             base_provider_readiness(descriptor, &settings, &store, credential_epoch)
         };
 
-        let value = apply_local_model_readiness(descriptor, &app, value);
+        let value = apply_local_model_readiness_from_dir(descriptor, models_dir, value);
 
         if value.checked_at.is_some() {
             store_provider_readiness_for_epoch(cache_key, &value, credential_epoch);
@@ -14271,7 +14306,12 @@ async fn probe_aws_credentials(
         session_token,
     )
     .await?;
-    aws_sdk_sts::Client::new(&sdk_config)
+    sts_caller_identity_check(&sdk_config).await
+}
+
+/// One `GetCallerIdentity` call under `sdk_config`, as a closed cause.
+async fn sts_caller_identity_check(sdk_config: &aws_config::SdkConfig) -> AppResult<()> {
+    aws_sdk_sts::Client::new(sdk_config)
         .get_caller_identity()
         .send()
         .await
@@ -21749,6 +21789,91 @@ mod tests {
         assert!(!returned[0].stale, "an undisturbed result stays current");
     }
 
+    #[test]
+    fn the_readiness_command_returns_a_verdict_stale_when_a_save_lands_during_its_check() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _lock = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let models_dir = unique_tempdir("readiness-command-epoch");
+        let key_a = || {
+            let mut store = crate::credentials::CredentialStore::default();
+            store.openai_api_key = Some("key-a".to_string());
+            Ok::<_, AppError>(store)
+        };
+        let query = |refresh| ProviderReadinessQuery {
+            refresh,
+            force: true,
+            provider_ids: Some(vec!["llm.api".to_string()]),
+            ..Default::default()
+        };
+        let entry_of = |readiness: Vec<ProviderReadiness>| {
+            readiness
+                .into_iter()
+                .find(|entry| entry.provider_id == "llm.api")
+                .expect("an llm.api entry")
+        };
+
+        for save_lands in [true, false] {
+            let (checked, later) = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind mock");
+                let endpoint = format!("http://{}/v1", listener.local_addr().expect("addr"));
+                tokio::spawn(async move {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let mut request = vec![0u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        // Key B is saved while the check of key A is in flight.
+                        if save_lands {
+                            bump_provider_credential_epoch();
+                        }
+                        let body = r#"{"data":[{"id":"probe-model"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+                let settings = crate::settings::AppSettings {
+                    llm_provider: crate::settings::LlmProvider::Api {
+                        endpoint,
+                        api_key: String::new(),
+                        model: "probe-model".to_string(),
+                    },
+                    ..Default::default()
+                };
+                let checked =
+                    provider_readiness_impl(settings.clone(), &models_dir, key_a, query(true))
+                        .await
+                        .expect("readiness");
+                // A later call that does not refresh shows what was kept.
+                let later = provider_readiness_impl(settings, &models_dir, key_a, query(false))
+                    .await
+                    .expect("readiness");
+                (entry_of(checked), entry_of(later))
+            });
+
+            // Key A passed either way; the verdict is current only if no save landed.
+            assert_eq!(
+                checked.status,
+                ProviderReadinessStatus::Ready,
+                "{checked:?}"
+            );
+            assert_eq!(checked.stale, save_lands, "{checked:?}");
+            // And it is kept for later calls only then.
+            assert_eq!(later.checked_at.is_some(), !save_lands, "{later:?}");
+        }
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
     #[tokio::test]
     async fn readiness_entries_and_notes_serialize_exactly_their_closed_fields() {
         fn keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
@@ -21959,6 +22084,42 @@ mod tests {
             panic!("a runtime diagnostic");
         };
         assert_eq!(detail.code, RuntimeErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn the_sts_check_reports_a_stopped_redirect_as_a_rejected_request() {
+        // Through the SDK: its HTTP layer does not follow the 307, and the
+        // check reads the raw status the error carries.
+        let endpoint = spawn_raw_http_mock(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "access-key",
+                "secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+
+        let error = sts_caller_identity_check(&sdk_config)
+            .await
+            .expect_err("a redirect is not an identity");
+
+        let AppError::RuntimeDiagnostic(RuntimeDiagnostic::Runtime(detail)) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::RequestRejected);
+        assert_eq!(
+            detail.context.status_class,
+            Some(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::Redirect)
+        );
     }
 
     #[tokio::test]

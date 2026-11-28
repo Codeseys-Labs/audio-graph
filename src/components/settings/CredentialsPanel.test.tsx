@@ -7,6 +7,7 @@ import {
   failedReadiness,
   READINESS_NOTE_CASES,
   runtimeFailure,
+  STALE_PASS,
 } from "../../test/readinessFixtures";
 import type {
   CredentialPresence,
@@ -474,6 +475,19 @@ describe("CredentialsPanel — readiness copy from closed fields", () => {
       }
       expect(item.textContent).not.toContain("(401)");
       expect(item.textContent).not.toMatch(/runtime\/|credential\//);
+      view.unmount();
+    }
+  });
+
+  it("never words a stale passed check as a plain pass", () => {
+    for (const locale of LOCALES) {
+      const { view, item } = renderEntry(
+        locale,
+        readiness({ provider_id: "asr.deepgram", ...STALE_PASS.readiness }),
+      );
+      expect(
+        item.querySelector(".settings-readiness__message")?.textContent,
+      ).toBe(STALE_PASS.message[locale]);
       view.unmount();
     }
   });

@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deferred } from "../../session/reviewTestUtils";
 import { useAudioGraphStore } from "../../store";
 import type {
   AppSettings,
+  CredentialPresence,
   OpenRouterModelEndpoints,
   ProviderReadiness,
 } from "../../types";
@@ -11,6 +13,7 @@ import { setField } from "../settingsTypes";
 import { inferOpenRouterRoutingPreset } from "./settingsControllerHelpers";
 import {
   readinessAtLatestEpoch,
+  type SettingsControllerValue,
   useSettingsController,
 } from "./useSettingsController";
 
@@ -1119,5 +1122,178 @@ describe("readinessAtLatestEpoch", () => {
     );
     expect(latestEpoch).toBe(5);
     expect(entries.map((e) => e.stale)).toEqual([true, false]);
+  });
+});
+
+// A reply to a check that began under key A must never be shown as current
+// once the user has issued a write for key B, even before Settings has heard
+// B's epoch. The controller fences at the moment it issues the write.
+describe("useSettingsController — a credential write fences readiness", () => {
+  const PROVIDER = "llm.openrouter";
+  const PRESENT: CredentialPresence[] = [
+    { key: "openrouter_api_key", present: true, source: "credentials_yaml" },
+  ];
+  const verdict = (
+    status: "ready" | "error",
+    credentialEpoch: number,
+  ): ProviderReadiness => ({
+    provider_id: PROVIDER,
+    status,
+    note: { kind: status === "ready" ? "verified" : "failed" },
+    automatic_probe_available: true,
+    checked_at: 1,
+    stale: false,
+    credential_epoch: credentialEpoch,
+    credentials: [{ key: "openrouter_api_key", present: true }],
+  });
+
+  /** What each backend command answers; a test swaps entries as it goes. */
+  let answers: Record<string, (args: unknown) => unknown>;
+  const readinessCalls = () =>
+    mockedInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "get_provider_readiness_cmd",
+    ).length;
+
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: openrouterSettings(),
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    answers = {
+      load_credential_presence_cmd: () => PRESENT,
+      // Key A verified under epoch 1.
+      get_provider_readiness_cmd: () => [verdict("ready", 1)],
+    };
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) =>
+      answers[cmd]?.(args),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useAudioGraphStore.setState({ settings: null } as never);
+  });
+
+  /**
+   * A's passing verdict is on screen and another check of A is in flight when
+   * `issueWrite` runs. A's reply then lands while the presence reload that
+   * follows the write is still out: the window in which it used to be shown.
+   */
+  async function expectLateReplyForOldKeyDropped(
+    issueWrite: (controller: SettingsControllerValue) => Promise<void>,
+    prepare?: (controller: SettingsControllerValue) => void,
+  ) {
+    const view = await mountController();
+    const shown = () => view.result.current.providerReadiness[PROVIDER];
+    await waitFor(() => expect(shown()?.status).toBe("ready"));
+    expect(shown()?.stale).toBe(false);
+    act(() => prepare?.(view.result.current));
+
+    const replyForA = deferred<ProviderReadiness[]>();
+    const presence = deferred<CredentialPresence[]>();
+    answers.get_provider_readiness_cmd = () => replyForA.promise;
+    answers.load_credential_presence_cmd = () => presence.promise;
+    act(() => {
+      void view.result.current.refreshProviderReadiness();
+    });
+
+    let write: Promise<void> = Promise.resolve();
+    await act(async () => {
+      write = issueWrite(view.result.current);
+      await Promise.resolve();
+    });
+    // Fenced as soon as the write was issued: nothing on screen is current.
+    expect(shown()?.stale).toBe(true);
+
+    await act(async () => {
+      replyForA.resolve([verdict("ready", 1)]);
+      await replyForA.promise;
+    });
+    // A's "ready" arrived with `stale: false` and must not replace the fence.
+    expect(shown()?.stale).toBe(true);
+
+    // The write settles; the refresh it starts shows key B's verdict.
+    const before = readinessCalls();
+    answers.get_provider_readiness_cmd = () => [verdict("error", 2)];
+    await act(async () => {
+      presence.resolve(PRESENT);
+      await write;
+    });
+    await waitFor(() => expect(shown()?.status).toBe("error"));
+    expect(readinessCalls()).toBeGreaterThan(before);
+    expect(shown()?.stale).toBe(false);
+    expect(shown()?.credential_epoch).toBe(2);
+  }
+
+  it("drops a late reply for the old key after an in-place save", async () => {
+    answers.save_credential_cmd = () => "saved";
+    await expectLateReplyForOldKeyDropped(
+      (controller) =>
+        controller.handleSaveCredentialValue("openrouter_api_key"),
+      (controller) =>
+        controller.setCredentialDraft("openrouter_api_key", "key-b"),
+    );
+    expect(mockedInvoke).toHaveBeenCalledWith("save_credential_cmd", {
+      key: "openrouter_api_key",
+      value: "key-b",
+    });
+  });
+
+  it("drops a late reply for the old key after a delete", async () => {
+    answers.delete_credential_cmd = () => null;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await expectLateReplyForOldKeyDropped((controller) =>
+      controller.handleClearCredential(
+        "openrouter_api_key",
+        "OpenRouter",
+        () => {},
+      ),
+    );
+    expect(mockedInvoke).toHaveBeenCalledWith("delete_credential_cmd", {
+      key: "openrouter_api_key",
+    });
+  });
+
+  it("refreshes after a footer Save that wrote one key and then failed", async () => {
+    const view = await mountController();
+    const shown = () => view.result.current.providerReadiness[PROVIDER];
+    await waitFor(() => expect(shown()?.status).toBe("ready"));
+    // OpenRouter's key is written first; the Gemini key that follows fails.
+    answers.save_credential_cmd = (args) => {
+      if (
+        typeof args === "object" &&
+        args !== null &&
+        "key" in args &&
+        args.key === "gemini_api_key"
+      ) {
+        throw new Error("keychain locked");
+      }
+      return "saved";
+    };
+    answers.get_provider_readiness_cmd = () => [verdict("error", 2)];
+    act(() => {
+      view.result.current.dispatch(setField("openrouterApiKey", "key-b"));
+      view.result.current.dispatch(setField("geminiApiKey", "gemini-key"));
+    });
+
+    const before = readinessCalls();
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+
+    expect(view.result.current.saveError).not.toBeNull();
+    expect(
+      mockedInvoke.mock.calls
+        .filter(([cmd]) => cmd === "save_credential_cmd")
+        .map(([, args]) => args),
+    ).toEqual([
+      { key: "openrouter_api_key", value: "key-b" },
+      { key: "gemini_api_key", value: "gemini-key" },
+    ]);
+    // The key that did land is checked: its verdict replaces the old "ready".
+    await waitFor(() => expect(shown()?.status).toBe("error"));
+    expect(readinessCalls()).toBeGreaterThan(before);
   });
 });

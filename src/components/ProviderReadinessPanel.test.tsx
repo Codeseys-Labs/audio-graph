@@ -9,6 +9,7 @@ import {
   failedReadiness,
   READINESS_NOTE_CASES,
   runtimeFailure,
+  STALE_PASS,
 } from "../test/readinessFixtures";
 import type { ProviderReadiness, ProviderRuntimeReadiness } from "../types";
 import ProviderReadinessPanel, {
@@ -1084,6 +1085,17 @@ describe("ProviderReadinessPanel", () => {
         expect(view.container.textContent).not.toMatch(
           /runtime\/|credential\//,
         );
+        view.unmount();
+      }
+    });
+
+    it("never words a stale passed check as a plain pass", () => {
+      for (const locale of LOCALES) {
+        const { view, message } = renderIn(
+          locale,
+          readiness(STALE_PASS.readiness),
+        );
+        expect(message?.textContent).toBe(STALE_PASS.message[locale]);
         view.unmount();
       }
     });
