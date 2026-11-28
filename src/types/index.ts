@@ -2886,12 +2886,14 @@ export interface ProjectionReplayLatencyMetrics
 export interface ProjectionBasisSummary {
   first_sequence: number;
   last_sequence: number;
+  /** Only the cited source bases verify. These patches were withheld from replay. */
   verified_sequences?: number[];
 }
 
 export interface ProjectionBasisUnavailable {
   first_sequence: number;
   last_sequence: number;
+  /** Source-basis evidence only. The operations have not been applied. */
   verified_frames?: {
     sequence: number;
     basis_heads: Record<

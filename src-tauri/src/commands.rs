@@ -10805,6 +10805,8 @@ impl AdmittedTranscriptBytes {
     ) -> Result<SessionTranscriptSnapshot, String> {
         match self {
             Self::Legacy(bytes) => {
+                // Legacy segments remain readable, but even identical text
+                // cannot prove the physical head cited by a canonical patch.
                 if let Some(history) = history {
                     history.observe_source::<crate::projections::TranscriptEvent>(
                         "transcript_revisions",
@@ -11676,7 +11678,7 @@ fn session_export_for_admitted_session(
         MAX_MATERIALIZED_NOTES_BYTES,
         "materialized_notes",
     )?;
-    let mut notes = choose_materialized_notes(
+    let notes = choose_materialized_notes(
         repository.load_materialized_notes(session_id)?,
         Some(&view),
         history.present,
@@ -11686,13 +11688,13 @@ fn session_export_for_admitted_session(
         MAX_MATERIALIZED_GRAPH_BYTES,
         "materialized_graph",
     )?;
-    let mut materialized_graph = choose_materialized_graph(
+    let materialized_graph = choose_materialized_graph(
         repository.load_materialized_graph(session_id)?,
         Some(&view),
         history.present,
     );
 
-    let projection_loss = history.take_export_loss(&mut notes, &mut materialized_graph);
+    let projection_loss = history.take_export_loss();
     let bundle = SessionExportWithControlPlane {
         core: SessionExportBundle {
             schema_version: if projection_loss.is_some() {

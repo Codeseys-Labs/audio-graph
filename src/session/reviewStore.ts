@@ -33,6 +33,7 @@
  * typed exception is the byte-ceiling refusal, which carries only numbers and
  * a stable artifact class name.
  */
+
 import { create } from "zustand";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
@@ -47,6 +48,7 @@ import type {
   TranscriptSegment,
 } from "../types";
 import { artifactTooLargeDetails } from "../utils/errorToMessage";
+import { hasUnavailableProjectionBasis } from "./projectionBasisUnavailable";
 
 /** Transcript + persisted speaker state for one reviewed session. */
 export interface ReviewSnapshot {
@@ -147,24 +149,10 @@ function parseProjectionStatus(raw: Record<string, unknown>) {
     reviewProjectionStatuses: _incoming,
     ...materialized
   } = raw;
-  if (isRecord(basis_unavailable)) {
-    const { first_sequence: first, last_sequence: last } = basis_unavailable;
-    if (
-      typeof first === "number" &&
-      Number.isSafeInteger(first) &&
-      first > 0 &&
-      typeof last === "number" &&
-      Number.isSafeInteger(last) &&
-      last >= first
-    ) {
-      return {
-        ...materialized,
-        reviewProjectionStatuses: ["basis_unavailable"],
-      };
-    }
-  }
   const statuses: ReviewProjectionStatus[] = [];
-  if (transcript_coverage === "behind_transcript")
+  if (hasUnavailableProjectionBasis(basis_unavailable))
+    statuses.push("basis_unavailable");
+  else if (transcript_coverage === "behind_transcript")
     statuses.push(transcript_coverage);
   if (projection_recovery === "recompute_required")
     statuses.push(projection_recovery);

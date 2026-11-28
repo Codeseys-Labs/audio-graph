@@ -172,6 +172,9 @@ it.each([
   await screen.findByText("orchard");
   expect(screen.getAllByRole("status")).toHaveLength(1);
   expect(screen.getByRole("status")).toHaveTextContent(expected);
+  expect(screen.getByRole("status")).toHaveTextContent(
+    i18n.t("sessions.review.projectionGap"),
+  );
   expect(backend).toHaveBeenCalledTimes(2);
   expect(screen.queryByRole("button")).toBeNull();
 });
