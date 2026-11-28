@@ -27,7 +27,14 @@
  * `App.tsx`'s Capture panel (always mounted there) and `SessionsBrowser`'s
  * Transcript lens. No props.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import {
@@ -45,6 +52,7 @@ import { formatTime } from "../utils/format";
 import { scrollBehavior } from "../utils/motion";
 import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
+import { useRetryFocus } from "./useRetryFocus";
 
 /** Default fallback colors when speaker has no assigned color. */
 const FALLBACK_COLORS = [
@@ -100,26 +108,17 @@ function LiveTranscript() {
   const { transcriptSeekTarget } = useSessionInteractions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
-  // Keyboard focus: activating a Review "Try again" removes the focused button
-  // (the first-load retry as soon as loading starts, the stale retry once
-  // recovery succeeds). Park focus on the transcript region instead of <body>.
-  const focusAfterRetry = useRef(false);
-  const retryReview = useCallback(() => {
-    focusAfterRetry.current = true;
-    review?.retry();
-  }, [review]);
-  useEffect(() => {
-    if (!focusAfterRetry.current) return;
-    const region = scrollRef.current;
-    if (
-      region === null ||
-      region.parentElement?.querySelector("[data-review-retry]")
-    ) {
-      return;
-    }
-    focusAfterRetry.current = false;
-    region.focus();
-  });
+  // Keyboard focus after a Review retry control goes away (`useRetryFocus`).
+  const rootRef = useRef<HTMLDivElement>(null);
+  const markRetry = useRetryFocus(rootRef, scrollRef);
+  const retryReview = useCallback(
+    (event: MouseEvent<HTMLElement>) => {
+      markRetry(event);
+      review?.retry();
+    },
+    [markRetry, review],
+  );
+
   const wasNearBottomRef = useRef(true);
 
   const [isExporting, setIsExporting] = useState(false);
@@ -306,6 +305,7 @@ function LiveTranscript() {
 
   return (
     <div
+      ref={rootRef}
       className="flex flex-col h-full p-(--space-5)"
       data-review-session-id={reviewSessionId ?? undefined}
     >

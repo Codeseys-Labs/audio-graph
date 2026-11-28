@@ -151,6 +151,56 @@ describe("Review Notes lens", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows no graph-derived chips in Review, since the snapshot's graph can still hold what the materialized graph retracted", async () => {
+    const topic = {
+      id: "topic-1",
+      name: "Retracted topic",
+      entity_type: "Topic",
+      val: 1,
+      color: "#60a5fa",
+      first_seen: 0,
+      last_seen: 0,
+      mention_count: 3,
+    };
+    const graph = {
+      nodes: [topic],
+      links: [],
+      stats: { total_nodes: 1, total_edges: 0, total_episodes: 0 },
+    };
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_session") {
+        return {
+          ...loadedSession("past-1", "a historical line", "ignored"),
+          diarization_events: [],
+          graph,
+        };
+      }
+      if (cmd === "load_session_notes_artifacts_cmd") {
+        return { notes: null, projection_events: [] };
+      }
+      return null;
+    });
+    renderReviewNotes();
+    await screen.findByTestId("notes-empty-hero");
+    expect(screen.queryByText(/Retracted topic/)).not.toBeInTheDocument();
+
+    // Positive control: a Live panel derives chips from the Live graph.
+    useAudioGraphStore.setState({
+      isCapturing: false,
+      isTranscribing: false,
+      graphSnapshot: graph,
+    });
+    render(<NotesPanel />);
+    expect(await screen.findByText(/Retracted topic/)).toBeInTheDocument();
+    useAudioGraphStore.setState({
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+    });
+  });
+
   it("does not mount the synthesis controller, so it adds no settings or loaded-session subscription", async () => {
     mockEmptySession();
     renderReviewNotes();

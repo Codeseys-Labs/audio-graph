@@ -76,8 +76,12 @@ export const ARTIFACT_REFUSAL_CLASSES = [
   "live_graph",
 ] as const;
 
+/**
+ * A real byte count: a safe non-negative integer. Finite but absurd values
+ * (1e300, which would render in scientific notation) are not byte counts.
+ */
 function isByteCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 /**
@@ -143,6 +147,21 @@ export function notifyCredentialWarning(
  *   - anything else (objects, undefined, numbers)
  */
 export function errorToMessage(e: unknown): string {
+  // Never throws, whatever it is given: a refusal-shaped error with no
+  // `message`, a hostile getter, an object whose `toString` throws. The
+  // fallback is the closed internal-error copy.
+  try {
+    return formatError(e);
+  } catch {
+    try {
+      return i18n.t("runtimeDiagnostics.runtime.internal");
+    } catch {
+      return "Unexpected error";
+    }
+  }
+}
+
+function formatError(e: unknown): string {
   if (
     typeof e === "object" &&
     e !== null &&

@@ -21,7 +21,12 @@ import {
 } from "../session/SessionViewProvider";
 import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { useAudioGraphStore } from "../store";
-import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
+import type {
+  GraphNode,
+  GraphSnapshot,
+  MaterializedNote,
+  ProjectionPatch,
+} from "../types";
 import Button from "./Button";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
@@ -52,6 +57,13 @@ export interface NotesPanelProps {
    */
   headerActions?: boolean;
 }
+
+/** The graph a Review Notes pane derives chips from: none (see below). */
+const NO_GRAPH_IN_REVIEW: GraphSnapshot = {
+  nodes: [],
+  links: [],
+  stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+};
 
 /** Stand-in controller for a pane that offers no synthesis (Review). */
 const NO_SYNTHESIS: NotesSynthesisController = {
@@ -110,7 +122,16 @@ function NotesPanelView({
   // `useNotesSynthesis`. Entity chips (Questions/Tasks/Decisions/
   // Topics) and the Person-node participant fallback below must read the
   // same graph the Graph lens shows, once it's loaded one.
-  const { snapshot: graph } = useActiveGraphSnapshot();
+  const { snapshot: activeGraph, materialized } = useActiveGraphSnapshot();
+  // In Review the entity chips (and the Person-node participant fallback)
+  // would come from the saved snapshot's live-lane graph, which is not
+  // retraction-aware: it can still hold an item the materialized graph (what
+  // the Graph lens shows) retracted. The Notes round does not read the
+  // materialized graph, so a Review pane shows no graph-derived chips rather
+  // than possibly-retracted ones; notes and transcript-derived participants
+  // are unaffected.
+  const graph =
+    reviewing && materialized === null ? NO_GRAPH_IN_REVIEW : activeGraph;
   // Synthesis reads the backend's current buffers, so it is blocked while a
   // historical session is loaded into the global store. A Review pane shows
   // its own session, offers no synthesis, and holds no subscription to it.

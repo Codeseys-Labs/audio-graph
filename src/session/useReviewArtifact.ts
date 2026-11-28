@@ -30,7 +30,7 @@ export function useReviewArtifact<K extends ArtifactKind>(
   const refresh = useReviewStore((s) => s.refresh);
   const slot = useReviewStore((s) => s.artifacts[kind]) as ReviewArtifacts[K];
   const selected = useReviewStore((s) => s.sessionId);
-  const retry = useCallback(() => void refresh(), [refresh]);
+  const retry = useCallback(() => void refresh({ explicit: true }), [refresh]);
 
   if (reviewSessionId === null) return null;
   // Until the provider's selection lands the slot belongs to nothing: loading.

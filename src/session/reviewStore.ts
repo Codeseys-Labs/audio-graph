@@ -230,12 +230,17 @@ interface ReviewState {
    */
   select: (sessionId: string, lens?: ArtifactKind | null) => Promise<void>;
   /**
-   * The lens whose artifact is needed changed. Starts a round (snapshot and
-   * the new lens's artifact together); `null` just stops refreshing one.
+   * The open lens changed (an explicit user action). Supersedes the round in
+   * flight and starts one for the lens now open: the snapshot and its artifact
+   * together, or the snapshot alone for the Transcript lens (`null`).
    */
   activateLens: (lens: ArtifactKind | null) => Promise<void>;
-  /** Re-query the snapshot and the active lens's artifact together. */
-  refresh: () => Promise<void>;
+  /**
+   * Re-query the snapshot and the open lens's artifact together. Passive
+   * callers (focus, visibility) coalesce; `{ explicit: true }` (a retry click,
+   * a timeline click needing fresh data) supersedes a round in flight.
+   */
+  refresh: (options?: { explicit?: boolean }) => Promise<void>;
   /** Drop the selection and invalidate any in-flight round. */
   close: () => void;
 }
@@ -284,35 +289,93 @@ function failedSlot(reason: unknown): ArtifactSlot<never> {
 interface InFlightRound {
   epoch: number;
   trailing: boolean;
+  /**
+   * An explicit user action (a lens switch or a retry) replaced this round:
+   * its replies are dropped and it queues nothing behind it.
+   */
+  superseded: boolean;
   done: Promise<void>;
 }
+
+const KINDS: readonly ArtifactKind[] = ["notes", "graph", "timeline"];
 
 export const useReviewStore = create<ReviewState>((set, get) => {
   /** The lens whose artifact rounds fetch; `null` while no artifact lens is open. */
   let activeKind: ArtifactKind | null = null;
   let inFlight: InFlightRound | null = null;
+  /** Monotonic id of the latest seek request (see `seekToSpan`). */
+  let seekSeq = 0;
+  /**
+   * The one timeline seek still waiting for a snapshot that knows its span.
+   * Replaced by any newer seek, dropped on a selection change, and resolved by
+   * the next round that publishes a snapshot containing the span.
+   */
+  let pendingSeek: { spanId: string; request: number } | null = null;
+  /** The segment behind `spanId` in the published snapshot, if it knows it. */
+  const segmentForSpan = (spanId: string): string | null => {
+    const event = get().snapshot?.transcriptEvents.find(
+      (candidate) => candidate.span_id === spanId,
+    );
+    return event ? (event.transcript_segment_id ?? event.span_id) : null;
+  };
+  const resolvePendingSeek = (): void => {
+    const pending = pendingSeek;
+    if (pending === null) return;
+    if (pending.request !== seekSeq) {
+      pendingSeek = null; // a newer seek replaced it
+      return;
+    }
+    const segmentId = segmentForSpan(pending.spanId);
+    if (segmentId === null) return; // still unknown: stays pending
+    pendingSeek = null;
+    applySeek(segmentId);
+  };
+  const applySeek = (segmentId: string | null): void =>
+    set((state) => ({
+      transcriptSeekTarget: segmentId
+        ? { segmentId, nonce: (state.transcriptSeekTarget?.nonce ?? 0) + 1 }
+        : null,
+    }));
 
   /**
-   * One round: re-query the snapshot and the active lens's artifact TOGETHER
-   * and publish both in ONE store update, only when both replies arrived and
-   * the selection is unchanged. A round that fails in either half publishes
-   * nothing from the other: the previous consistent pair stays on screen,
-   * marked stale. (The two reads are still two backend calls; a real
-   * guarantee needs a revision token in both replies.)
+   * THE ROUND RULES (everything below follows from these).
+   *
+   *  1. A round is the unit of reading: the snapshot and the artifact of the
+   *     lens that was open when it started (`null` = the Transcript lens: the
+   *     snapshot alone), queried together. The two are still two backend calls;
+   *     a real guarantee needs a revision token in both replies.
+   *  2. A round belongs to (selection epoch, that lens). Its replies are
+   *     dropped when the selection changed or an explicit user action (a lens
+   *     switch, a retry click, a timeline click needing fresh data) superseded
+   *     it. Passive triggers (window focus, tab visibility) coalesce instead.
+   *     So a lens that is no longer open can neither mark the open lens's data
+   *     stale nor block it.
+   *  3. The pair (snapshot + that lens's artifact) is REPLACED only when both
+   *     reads of the round succeed, in one store update that also resets every
+   *     other lens's slot (they were read against an older snapshot).
+   *  4. When either read fails and a previous pair exists (a ready artifact, or
+   *     a Transcript round over a snapshot), that pair stays untouched and is
+   *     marked stale; a lens with no data of its own records the failure on
+   *     ITS slot (closed error or typed refusal, with retry), so going back to
+   *     the lens that has data still shows it.
+   *  5. With no previous pair at all, a snapshot that succeeds may stand alone
+   *     (its lens's artifact failure is recorded on that lens's slot), and a
+   *     first snapshot failure is the closed `error` state.
    */
   const executeRound = async (
+    round: InFlightRound,
     sessionId: string,
-    epoch: number,
     kind: ArtifactKind | null,
   ): Promise<void> => {
-    const isStale = () => get().artifactEpoch !== epoch;
+    const isStale = () =>
+      get().artifactEpoch !== round.epoch || round.superseded;
     const before = get();
     const hadSnapshot = before.snapshot?.sessionId === sessionId;
     const previous = kind === null ? null : before.artifacts[kind];
-    // A consistent pair already on screen: the snapshot and, if a lens is
-    // active, its artifact from one earlier round.
-    const hadPair =
-      hadSnapshot && (previous === null || previous.status === "ready");
+    const anyReady = KINDS.some((k) => before.artifacts[k].status === "ready");
+    // A consistent pair on screen: the snapshot with a ready artifact, or (for
+    // a Transcript round) just the snapshot.
+    const hadPair = hadSnapshot && (kind === null || anyReady);
 
     set((state) => ({
       ...(hadSnapshot
@@ -349,6 +412,7 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     const snapshotOk = snapshotRes.status === "fulfilled";
     const artifactOk = kind === null || artifactRes.status === "fulfilled";
 
+    // Rule 3: both reads succeeded: replace the pair.
     if (snapshotOk && artifactOk) {
       set({
         snapshot: snapshotRes.value,
@@ -369,35 +433,44 @@ export const useReviewStore = create<ReviewState>((set, get) => {
                 },
               },
       });
+      resolvePendingSeek();
       return;
     }
 
-    if (hadPair) {
-      // Keep the previous consistent pair; neither new half is published.
-      set((state) => ({
-        refreshing: false,
-        stale: true,
-        artifacts:
-          kind === null
-            ? state.artifacts
-            : {
-                ...state.artifacts,
-                [kind]: { ...state.artifacts[kind], stale: true },
-              },
-      }));
-      return;
-    }
-
-    // A first load of the snapshot or of this lens's artifact, with no
-    // consistent pair to fall back on.
-    const failedArtifact =
+    // What this lens's slot records when its read failed, or when its read
+    // succeeded but could not be shown (the snapshot failed): closed, never
+    // backend text.
+    const lensFailure =
       kind === null
         ? null
         : failedSlot(
             artifactRes.status === "rejected" ? artifactRes.reason : null,
           );
+
+    // Rule 4: keep the previous pair, marked stale.
+    if (hadPair) {
+      set((state) => {
+        const stale = <T>(slot: ArtifactSlot<T>): ArtifactSlot<T> =>
+          slot.status === "ready" ? { ...slot, stale: true } : slot;
+        const marked: ReviewArtifacts = {
+          notes: stale(state.artifacts.notes),
+          graph: stale(state.artifacts.graph),
+          timeline: stale(state.artifacts.timeline),
+        };
+        // The open lens has no data of its own: it records the failure.
+        const artifacts =
+          kind !== null &&
+          lensFailure !== null &&
+          state.artifacts[kind].status !== "ready"
+            ? { ...marked, [kind]: lensFailure }
+            : marked;
+        return { refreshing: false, stale: true, artifacts };
+      });
+      return;
+    }
+
+    // Rule 5: no previous pair.
     if (snapshotOk) {
-      // The snapshot stands alone; only this lens is unavailable.
       set({
         snapshot: snapshotRes.value,
         status: "ready",
@@ -405,10 +478,11 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         stale: false,
         error: null,
         artifacts:
-          kind === null || failedArtifact === null
+          kind === null || lensFailure === null
             ? idleArtifacts()
-            : { ...idleArtifacts(), [kind]: failedArtifact },
+            : { ...idleArtifacts(), [kind]: lensFailure },
       });
+      resolvePendingSeek();
       return;
     }
     set((state) => ({
@@ -423,34 +497,43 @@ export const useReviewStore = create<ReviewState>((set, get) => {
           }),
       // An artifact read next to a failed snapshot is discarded, never shown.
       artifacts:
-        kind === null || failedArtifact === null
+        kind === null || lensFailure === null
           ? state.artifacts
-          : { ...state.artifacts, [kind]: failedArtifact },
+          : { ...state.artifacts, [kind]: lensFailure },
     }));
   };
 
   /**
-   * Start a round, or coalesce into the one in flight for this selection:
-   * never more than one round at a time, and at most ONE trailing round after
-   * it (focus, visibility and quick lens switches all land here).
+   * Start a round for the lens that is open now.
+   *
+   * Passive triggers (window focus, tab visibility) coalesce into the round in
+   * flight for this selection: never more than one at a time, and at most ONE
+   * trailing round after it. An EXPLICIT user action (a lens switch or a retry
+   * click) instead supersedes the round in flight and starts a new one: the
+   * replies of the superseded round are dropped, and a read that never settles
+   * cannot block anything for the lens now open.
    */
-  const requestRound = (): Promise<void> => {
+  const requestRound = (explicit = false): Promise<void> => {
     const { sessionId, artifactEpoch: epoch } = get();
     if (sessionId === null) return Promise.resolve();
     if (inFlight !== null && inFlight.epoch === epoch) {
-      inFlight.trailing = true;
-      return inFlight.done;
+      if (!explicit) {
+        inFlight.trailing = true;
+        return inFlight.done;
+      }
+      inFlight.superseded = true;
     }
     const round: InFlightRound = {
       epoch,
       trailing: false,
+      superseded: false,
       done: Promise.resolve(),
     };
     inFlight = round;
     const kindUsed = activeKind;
     round.done = (async () => {
       try {
-        await executeRound(sessionId, epoch, kindUsed);
+        await executeRound(round, sessionId, kindUsed);
       } finally {
         // Whatever happened (published, dropped as stale, or an unexpected
         // throw), this round is over: never leave the selection "in flight".
@@ -460,9 +543,11 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         get().artifactEpoch === epoch && get().sessionId === sessionId;
       // One more round when something asked for it while this one ran, or the
       // open lens changed to one this round did not fetch (a missed request
-      // must never leave a lens loading forever).
+      // must never leave a lens loading forever). Never after a round an
+      // explicit action already replaced.
       if (
         sameSelection &&
+        !round.superseded &&
         (round.trailing || (activeKind !== null && activeKind !== kindUsed))
       ) {
         await requestRound();
@@ -477,30 +562,28 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     artifacts: idleArtifacts(),
     transcriptSeekTarget: null,
     graphEdgeFocus: null,
-    seekTranscriptToSegment: (segmentId) =>
-      set((state) => ({
-        transcriptSeekTarget: segmentId
-          ? {
-              segmentId,
-              nonce: (state.transcriptSeekTarget?.nonce ?? 0) + 1,
-            }
-          : null,
-      })),
+    seekTranscriptToSegment: (segmentId) => {
+      // Any seek supersedes a deferred one still waiting on a refresh.
+      seekSeq += 1;
+      pendingSeek = null;
+      applySeek(segmentId);
+    },
     seekToSpan: async (spanId, knownSegmentId) => {
+      // Each seek request has its own monotonic id: a deferred seek applies
+      // only if it is still the latest one for this selection, so an older
+      // click can never overwrite a newer one.
+      const request = ++seekSeq;
+      pendingSeek = null;
       if (knownSegmentId) {
-        get().seekTranscriptToSegment(knownSegmentId);
+        applySeek(knownSegmentId);
         return;
       }
-      const epoch = get().artifactEpoch;
-      await get().refresh();
-      // The selection moved on while refreshing: the click no longer applies.
-      if (get().artifactEpoch !== epoch) return;
-      const event = get().snapshot?.transcriptEvents.find(
-        (candidate) => candidate.span_id === spanId,
-      );
-      get().seekTranscriptToSegment(
-        event ? (event.transcript_segment_id ?? event.span_id) : spanId,
-      );
+      // Unknown to the snapshot: the snapshot is behind the timeline read. Keep
+      // the seek PENDING and refresh; the round that publishes a snapshot with
+      // the span resolves it (now, or on a later retry). Until then the target
+      // is left alone: an unresolved span id is never a segment target.
+      pendingSeek = { spanId, request };
+      await get().refresh({ explicit: true });
     },
     focusGraphEdges: (edgeIds) =>
       set((state) => ({
@@ -518,6 +601,10 @@ export const useReviewStore = create<ReviewState>((set, get) => {
       const sameSession = get().snapshot?.sessionId === sessionId;
       const changed = get().sessionId !== sessionId;
       activeKind = lens;
+      if (changed) {
+        seekSeq += 1;
+        pendingSeek = null;
+      }
       set((state) => ({
         // A different session starts from empty artifacts and fresh targets,
         // and drops every reply still in flight for the previous selection.
@@ -543,12 +630,18 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     },
     activateLens: (lens) => {
       activeKind = lens;
-      return lens === null ? Promise.resolve() : requestRound();
+      // Opening the Transcript lens needs no artifact, so with no round in
+      // flight there is nothing to do; with one in flight it belongs to the
+      // lens that was just left, so replace it (snapshot alone).
+      if (lens === null && inFlight === null) return Promise.resolve();
+      return requestRound(true);
     },
-    refresh: () => requestRound(),
+    refresh: (options) => requestRound(options?.explicit === true),
     close: () => {
       activeKind = null;
       inFlight = null;
+      seekSeq += 1;
+      pendingSeek = null;
       set((state) => ({
         sessionId: null,
         status: "idle",

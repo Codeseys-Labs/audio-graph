@@ -24,7 +24,7 @@
  *
  * Must be rendered under a `SessionViewProvider` with a `reviewSessionId`.
  */
-import { type ReactNode, useEffect, useRef } from "react";
+import { type ReactNode, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { ArtifactKind } from "../session/reviewStore";
 import {
@@ -34,6 +34,7 @@ import {
 import { useReviewArtifact } from "../session/useReviewArtifact";
 import { ArtifactRefusalNotice } from "./ArtifactRefusalNotice";
 import Icon from "./Icon";
+import { useRetryFocus } from "./useRetryFocus";
 
 export interface ReviewLensGateProps {
   kind: ArtifactKind;
@@ -46,21 +47,9 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
   const review = useReviewView();
   const artifact = useReviewArtifact(kind, reviewSessionId);
 
-  // Keyboard focus: activating "Try again" removes the focused button (the
-  // first-load retry as soon as loading starts, the stale retry once recovery
-  // succeeds). Park focus on the lens region instead of dropping it to <body>.
-  const regionRef = useRef<HTMLDivElement>(null);
-  const focusAfterRetry = useRef(false);
-  useEffect(() => {
-    if (!focusAfterRetry.current) return;
-    const region = regionRef.current;
-    if (region === null || region.querySelector("[data-review-retry]")) return;
-    focusAfterRetry.current = false;
-    region.focus();
-  });
-  const markRetry = () => {
-    focusAfterRetry.current = true;
-  };
+  // Keyboard focus after a retry control goes away (see `useRetryFocus`).
+  const regionRef = useRef<HTMLElement>(null);
+  const markRetry = useRetryFocus(regionRef, regionRef);
 
   if (review === null || artifact === null) return <>{children}</>;
 
@@ -85,11 +74,8 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
   }
 
   if (review.status === "error" || artifact.status === "error") {
-    const retry = () => {
-      markRetry();
-      // One round re-queries the snapshot and this lens together.
-      review.retry();
-    };
+    // One round re-queries the snapshot and this lens together.
+    const retry = review.retry;
     return frame(
       <section
         className="flex h-full flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center"
@@ -105,7 +91,10 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
           type="button"
           className="ag-btn-micro"
           data-review-retry
-          onClick={retry}
+          onClick={(event) => {
+            markRetry(event);
+            retry();
+          }}
         >
           <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
         </button>
@@ -141,8 +130,8 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
             type="button"
             className="ag-btn-micro"
             data-review-retry
-            onClick={() => {
-              markRetry();
+            onClick={(event) => {
+              markRetry(event);
               review.retry();
             }}
           >

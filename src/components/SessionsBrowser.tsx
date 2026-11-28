@@ -51,9 +51,11 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useReviewStore } from "../session/reviewStore";
 import { SessionViewProvider } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
@@ -859,6 +861,19 @@ function SessionDetail({
   // stays locked.
   const reviewLensId =
     !samplePreviewActive && row && !residentRow ? row.id : null;
+
+  // A "→N" badge click on a reviewed session's Timeline (an explicit user
+  // action) records Review's own edge-focus target; bring this pane to its
+  // Graph lens, where the edges are emphasised. The Live view has no equivalent
+  // (the `App.tsx` bridge sets `nav.lens`, which nothing reads), and this
+  // reads only Review's store, never a Live field.
+  const edgeFocusNonce = useReviewStore((s) => s.graphEdgeFocus?.nonce ?? null);
+  const seenEdgeFocus = useRef(edgeFocusNonce);
+  useEffect(() => {
+    if (edgeFocusNonce === seenEdgeFocus.current) return;
+    seenEdgeFocus.current = edgeFocusNonce;
+    if (edgeFocusNonce !== null && reviewLensId !== null) setLens("graph");
+  }, [edgeFocusNonce, reviewLensId]);
   if (liveRunning && row && !samplePreviewActive && !reviewableWhileLive(row)) {
     return (
       <section

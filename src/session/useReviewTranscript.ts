@@ -86,7 +86,7 @@ export function useReviewTranscript(
     void activateLens(lens);
   }, [sessionId, lens, activateLens]);
 
-  const retry = useCallback(() => void refresh(), [refresh]);
+  const retry = useCallback(() => void refresh({ explicit: true }), [refresh]);
 
   return useMemo(() => {
     if (sessionId === null) return null;

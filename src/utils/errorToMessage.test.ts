@@ -235,11 +235,11 @@ describe("errorToMessage", () => {
       },
     ],
     [
-      "string numbers",
+      "a size sent as a string",
       {
         artifact_class: "materialized_notes",
         size_bytes: "1",
-        ceiling_bytes: "1",
+        ceiling_bytes: 1,
       },
     ],
   ])("artifactTooLargeDetails returns null, and never throws, for an artifact_too_large with %s", (_name, message) => {
@@ -265,6 +265,47 @@ describe("errorToMessage", () => {
         message: { artifact_class, size_bytes: 0, ceiling_bytes: 0 },
       }),
     ).toEqual({ artifactClass: artifact_class, sizeBytes: 0, ceilingBytes: 0 });
+  });
+
+  it("errorToMessage never throws on a refusal-shaped error with no message, and stays localized", () => {
+    // The retained global artifact loaders pass whatever `invoke` rejected with.
+    const text = errorToMessage({ code: "artifact_too_large" });
+    expect(typeof text).toBe("string");
+    expect(text.length).toBeGreaterThan(0);
+    expect(() =>
+      errorToMessage({ code: "artifact_too_large", message: null }),
+    ).not.toThrow();
+    expect(() =>
+      errorToMessage({
+        get code(): string {
+          throw new Error("hostile getter");
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      errorToMessage({
+        toString() {
+          throw new Error("hostile toString");
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["an absurd finite size", 1e300],
+    ["a fractional size", 1.5],
+    ["an unsafe integer", 2 ** 60],
+  ])("artifactTooLargeDetails returns null for %s", (_name, size) => {
+    expect(
+      artifactTooLargeDetails({
+        code: "artifact_too_large",
+        message: {
+          artifact_class: "materialized_notes",
+          size_bytes: size,
+          ceiling_bytes: 1,
+        },
+      }),
+    ).toBeNull();
   });
 
   it("falls back to String(e) for legacy bare-string rejections", () => {

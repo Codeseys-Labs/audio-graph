@@ -306,6 +306,194 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
     expect(useReviewStore.getState().snapshot).toBeNull();
   });
 
+  describe("a round belongs to the lens that was open when it started", () => {
+    it("lets a switch to Transcript win over a Notes refresh whose snapshot succeeds but whose Notes read fails", async () => {
+      const staleSnapshot = deferred<unknown>();
+      const staleNotes = deferred<unknown>();
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          if (nth === 1) return sessionPayload(id, "first");
+          if (nth === 2) return staleSnapshot.promise; // the abandoned refresh
+          return sessionPayload(id, "fresh"); // the Transcript round
+        }
+        if (cmd === COMMAND.notes) {
+          return nth === 1 ? NOTES : staleNotes.promise;
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+
+      const abandoned = store.refresh(); // focus refresh with Notes open
+      await store.activateLens(null); // the user switches to Transcript
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "fresh",
+      );
+
+      // The abandoned round's replies land now: snapshot ok, Notes fails.
+      staleSnapshot.resolve(
+        sessionPayload("sess-a", "from the abandoned round"),
+      );
+      staleNotes.reject(new Error("hiccup"));
+      await abandoned;
+
+      const state = useReviewStore.getState();
+      expect(state.snapshot?.transcript[0].text).toBe("fresh");
+      expect(state.stale).toBe(false);
+      expect(state.refreshing).toBe(false);
+    });
+
+    it("is not blocked by a Notes read that never settles: Transcript refreshes, and Notes retries", async () => {
+      let notesCalls = 0;
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") return sessionPayload(id, `read ${nth}`);
+        if (cmd === COMMAND.notes) {
+          notesCalls += 1;
+          if (notesCalls === 2) return new Promise(() => {}); // hangs forever
+          return NOTES;
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+
+      void store.refresh(); // Notes round that will never settle
+      await Promise.resolve();
+
+      // Switching to Transcript supersedes it and completes on its own.
+      await store.activateLens(null);
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "read 3",
+      );
+      // A later passive refresh on the Transcript lens is not blocked either.
+      await store.refresh();
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "read 4",
+      );
+
+      // And Notes itself can be retried while an older Notes read is hung.
+      notesCalls = 1; // the next Notes read hangs again
+      void store.activateLens("notes");
+      await Promise.resolve();
+      await store.refresh({ explicit: true }); // a retry click
+      expect(artifacts().notes.status).toBe("ready");
+    });
+
+    it("keeps passive triggers coalescing: focus does not supersede a round in flight", async () => {
+      const gate = deferred<unknown>();
+      let loads = 0;
+      backend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return loads === 1 ? gate.promise : sessionPayload(id);
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      const opening = store.select("sess-a", "notes");
+      void store.refresh();
+      void store.refresh();
+      expect(loads).toBe(1);
+      gate.resolve(sessionPayload("sess-a"));
+      await opening;
+      expect(loads).toBe(2);
+    });
+  });
+
+  describe("a lens that fails must not discard the last good pair", () => {
+    it("keeps the previous snapshot with its Notes when the new snapshot succeeds but the Timeline read fails", async () => {
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          return sessionPayload(id, nth === 1 ? "first" : "second");
+        }
+        if (cmd === COMMAND.timeline)
+          throw { code: "io", message: "disk gone" };
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+      await store.activateLens("timeline");
+
+      const state = useReviewStore.getState();
+      // The pair was NOT replaced: the old snapshot, still with its Notes.
+      expect(state.snapshot?.transcript[0].text).toBe("first");
+      expect(artifacts().notes.status).toBe("ready");
+      expect(artifacts().notes.data).toEqual(NOTES);
+      expect(state.stale).toBe(true);
+      expect(artifacts().notes.stale).toBe(true);
+      // The failure is recorded on the lens that failed, which can retry.
+      expect(artifacts().timeline.status).toBe("error");
+      expect(artifacts().timeline.data).toBeNull();
+    });
+
+    it("still shows the last good Notes when returning to them while every read keeps failing", async () => {
+      let failing = false;
+      backend((cmd, id) => {
+        if (
+          failing &&
+          (cmd === "load_session" ||
+            cmd === COMMAND.timeline ||
+            cmd === COMMAND.notes)
+        ) {
+          throw { code: "io", message: "disk gone" };
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+      failing = true;
+      await store.activateLens("timeline");
+      await store.activateLens("notes");
+
+      expect(artifacts().notes.status).toBe("ready");
+      expect(artifacts().notes.data).toEqual(NOTES);
+      expect(useReviewStore.getState().snapshot?.sessionId).toBe("sess-a");
+    });
+
+    it("keeps the pair too when the Timeline read succeeds but the snapshot fails, and replaces it only when both succeed", async () => {
+      let snapshotFails = true;
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          if (nth > 1 && snapshotFails) throw new Error("hiccup");
+          return sessionPayload(id, nth === 1 ? "first" : "second");
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "notes");
+      await store.activateLens("timeline");
+      // The fold arrived but could not be shown next to a missing snapshot.
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "first",
+      );
+      expect(artifacts().notes.data).toEqual(NOTES);
+      expect(artifacts().timeline.data).toBeNull();
+      expect(artifacts().timeline.status).toBe("error");
+
+      snapshotFails = false;
+      await store.refresh({ explicit: true }); // retry on the Timeline lens
+      expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
+        "second",
+      );
+      expect(artifacts().timeline.status).toBe("ready");
+      expect(artifacts().notes.status).toBe("idle"); // the old pair was replaced
+      expect(useReviewStore.getState().stale).toBe(false);
+    });
+
+    it("lets a snapshot stand alone when there was no previous pair at all", async () => {
+      backend((cmd, id) => {
+        if (cmd === COMMAND.timeline)
+          throw { code: "io", message: "disk gone" };
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a"); // Transcript lens: a snapshot, no artifact
+      await store.activateLens("timeline");
+      expect(useReviewStore.getState().snapshot?.sessionId).toBe("sess-a");
+      expect(artifacts().timeline.status).toBe("error");
+    });
+  });
+
   describe("overlapping refreshes", () => {
     it("never run two rounds at once and queue at most one trailing round", async () => {
       const gate = deferred<unknown>();
@@ -325,17 +513,16 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       });
       const store = useReviewStore.getState();
       const opening = store.select("sess-a", "notes");
-      // Focus, visibility and a quick lens re-activation all land while the
+      // Passive triggers (window focus, tab visibility) all land while the
       // first round is still in flight.
       void store.refresh();
       void store.refresh();
-      void store.activateLens("notes");
       void store.refresh();
 
       gate.resolve(sessionPayload("sess-a"));
       await opening;
 
-      // The opening round, plus exactly one trailing round for all four requests.
+      // The opening round, plus exactly one trailing round for all three requests.
       expect(countOf("load_session")).toBe(2);
       expect(countOf(COMMAND.notes)).toBe(2);
       expect(maxInFlight).toBe(1);
@@ -504,7 +691,11 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       ["a missing artifact class", { size_bytes: 1, ceiling_bytes: 1 }],
       [
         "a negative size",
-        { artifact_class: "notes", size_bytes: -1, ceiling_bytes: 1 },
+        {
+          artifact_class: "materialized_notes",
+          size_bytes: -1,
+          ceiling_bytes: 1,
+        },
       ],
       [
         "a non-finite size",
@@ -523,11 +714,11 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
         },
       ],
       [
-        "numbers sent as strings",
+        "a size sent as a string",
         {
           artifact_class: "materialized_notes",
           size_bytes: "10",
-          ceiling_bytes: "5",
+          ceiling_bytes: 5,
         },
       ],
     ])("falls back to the closed error state for %s, and never leaves the lens loading", async (_name, message) => {
@@ -614,6 +805,138 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
         "seg-2",
       );
+    });
+
+    function snapshotWithSpans(id: string, spans: string[]) {
+      return {
+        ...sessionPayload(id),
+        transcript_events: spans.map((span) =>
+          eventFor(span, span.replace("span", "seg")),
+        ),
+      };
+    }
+
+    it("lets a newer known-block click win over an older click still waiting on a refresh", async () => {
+      const refresh = deferred<unknown>();
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          return nth === 1
+            ? snapshotWithSpans(id, ["span-1"])
+            : refresh.promise;
+        }
+        return standard(cmd, id);
+      });
+      await useReviewStore.getState().select("sess-a", "timeline");
+
+      const older = useReviewStore.getState().seekToSpan("span-2", null); // needs a refresh
+      await useReviewStore.getState().seekToSpan("span-1", "seg-1"); // newer, known
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-1",
+      );
+
+      refresh.resolve(snapshotWithSpans("sess-a", ["span-1", "span-2"]));
+      await older;
+      // The first click's refresh resolved last and must not overwrite.
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-1",
+      );
+    });
+
+    it.each([
+      ["the older refresh resolving first", true],
+      ["the newer refresh resolving first", false],
+    ])("applies only the latest of two deferred clicks, with %s", async (_name, olderFirst) => {
+      const replies: Array<Deferred<unknown>> = [];
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          if (nth === 1) return snapshotWithSpans(id, ["span-1"]);
+          const reply = deferred<unknown>();
+          replies.push(reply);
+          return reply.promise;
+        }
+        return standard(cmd, id);
+      });
+      await useReviewStore.getState().select("sess-a", "timeline");
+
+      const first = useReviewStore.getState().seekToSpan("span-2", null);
+      const second = useReviewStore.getState().seekToSpan("span-3", null);
+      expect(replies).toHaveLength(2); // the second click superseded the first round
+
+      const fresh = snapshotWithSpans("sess-a", ["span-1", "span-2", "span-3"]);
+      if (olderFirst) {
+        replies[0].resolve(fresh);
+        replies[1].resolve(fresh);
+      } else {
+        replies[1].resolve(fresh);
+        replies[0].resolve(fresh);
+      }
+      await Promise.all([first, second]);
+
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-3",
+      );
+    });
+
+    it("leaves the target alone, never a raw span id, when the refresh cannot resolve the span, and resolves it on a later successful refresh", async () => {
+      let timelineFails = false;
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          return nth === 1
+            ? snapshotWithSpans(id, ["span-1"])
+            : snapshotWithSpans(id, ["span-1", "span-2"]);
+        }
+        if (cmd === COMMAND.timeline && timelineFails) {
+          throw { code: "io", message: "disk gone" };
+        }
+        return standard(cmd, id);
+      });
+      await useReviewStore.getState().select("sess-a", "timeline");
+
+      // The refresh's lens read fails, so the old pair (without span-2) stays.
+      timelineFails = true;
+      await useReviewStore.getState().seekToSpan("span-2", null);
+      expect(useReviewStore.getState().transcriptSeekTarget).toBeNull();
+
+      // The next successful refresh for the same selection replays that seek.
+      timelineFails = false;
+      await useReviewStore.getState().refresh();
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-2",
+      );
+    });
+
+    it("does not replay a pending seek once a newer seek replaced it, or the selection changed", async () => {
+      let timelineFails = false;
+      backend((cmd, id, nth) => {
+        if (cmd === "load_session") {
+          return nth === 1
+            ? snapshotWithSpans(id, ["span-1"])
+            : snapshotWithSpans(id, ["span-1", "span-2"]);
+        }
+        if (cmd === COMMAND.timeline && timelineFails) {
+          throw { code: "io", message: "disk gone" };
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      await store.select("sess-a", "timeline");
+
+      timelineFails = true;
+      await store.seekToSpan("span-2", null); // pending
+      await store.seekToSpan("span-1", "seg-1"); // newer, known: replaces it
+      timelineFails = false;
+      await store.refresh();
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-1",
+      );
+
+      // A pending seek does not survive a selection change either.
+      timelineFails = true;
+      await store.seekToSpan("span-2", null);
+      timelineFails = false;
+      store.seekTranscriptToSegment(null);
+      await store.select("sess-b", "timeline");
+      expect(useReviewStore.getState().transcriptSeekTarget).toBeNull();
     });
 
     it("does not seek when the selection changed while it refreshed", async () => {

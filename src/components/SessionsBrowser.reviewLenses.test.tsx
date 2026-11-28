@@ -596,6 +596,14 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
       expect(useAudioGraphStore.getState().transcriptSeekTarget).toBeNull();
       expect(useAudioGraphStore.getState().graphEdgeFocus).toBeNull();
 
+      // The badge click also brought this Review pane to its Graph lens, with
+      // the reviewed graph on screen.
+      expect(screen.getByRole("tab", { name: /^graph$/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      await expectLensShows("graph", "session-a");
+
       // Opening the Transcript lens consumes Review's target.
       await openLens("transcript");
       await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
@@ -823,40 +831,73 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
   });
 
   describe("refresh pile-up", () => {
-    it("starts no overlapping refresh for focus, visibility and quick lens re-activation, and queues one trailing round", async () => {
+    it("starts no overlapping refresh for focus and visibility, and queues one trailing round", async () => {
       const gate = deferred<unknown>();
       let loads = 0;
       mockBackend((cmd, id) => {
         if (cmd === "load_session") {
           loads += 1;
-          return loads === 1 ? gate.promise : loadSessionPayload(id);
+          // Read 1 is the Transcript lens's opening round; read 2 is the Notes
+          // round the user opens next, which is the one held back.
+          return loads === 2 ? gate.promise : loadSessionPayload(id);
         }
         return defaultRespond(cmd, id);
       });
       render(<SessionsBrowser />);
       await selectRow("session-a");
+      await screen.findByText("transcript of session-a");
       await openLens("notes");
-      await waitFor(() => expect(loads).toBe(1));
+      await waitFor(() => expect(loads).toBe(2));
 
-      // While the opening round is in flight: focus x3, visibility, and a
-      // quick Notes -> Transcript -> Notes re-activation.
+      // While the Notes round is in flight: focus x3 and a visibility change.
       await act(async () => {
         window.dispatchEvent(new Event("focus"));
         window.dispatchEvent(new Event("focus"));
         window.dispatchEvent(new Event("focus"));
         document.dispatchEvent(new Event("visibilitychange"));
       });
-      await openLens("transcript");
-      await openLens("notes");
-      expect(loads).toBe(1);
+      expect(loads).toBe(2);
 
       await act(async () => {
         gate.resolve(loadSessionPayload("session-a"));
       });
       await expectLensShows("notes", "session-a");
       await act(async () => {});
-      // The opening round plus ONE trailing round for everything above.
-      expect(loads).toBeLessThanOrEqual(2);
+      // The Notes round plus ONE trailing round for all four triggers.
+      expect(loads).toBeLessThanOrEqual(3);
+    });
+
+    it("lets an explicit lens switch replace the round in flight instead of queueing behind it", async () => {
+      const gate = deferred<unknown>();
+      let loads = 0;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return loads === 2 ? gate.promise : loadSessionPayload(id);
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await screen.findByText("transcript of session-a");
+      await openLens("notes");
+      await waitFor(() => expect(loads).toBe(2));
+
+      // The Notes round never settles; the user moves on to Timeline.
+      await openLens("timeline");
+      await expectLensShows("timeline", "session-a");
+      expect(loads).toBe(3);
+
+      // The abandoned round's reply lands late and changes nothing.
+      await act(async () => {
+        gate.resolve({
+          ...loadSessionPayload("session-a"),
+          transcript: [segment("late", "late abandoned text")],
+        });
+      });
+      await openLens("transcript");
+      expect(await screen.findByText("transcript of session-a")).toBeVisible();
+      expect(screen.queryByText("late abandoned text")).toBeNull();
     });
   });
 
@@ -938,6 +979,69 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
       expect(document.activeElement).toBe(
         within(screen.getByRole("tabpanel")).getByRole("log"),
       );
+    });
+  });
+
+  describe("keyboard focus is never stolen after a retry", () => {
+    it("leaves focus alone when the user moved it elsewhere before the retry control went away", async () => {
+      const gate = deferred<unknown>();
+      let failures = 1;
+      let loads = 0;
+      mockBackend((cmd, id) => {
+        if (cmd === COMMAND.notes) {
+          if (failures > 0) {
+            failures -= 1;
+            throw { code: "io", message: "disk gone" };
+          }
+          loads += 1;
+          return gate.promise;
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      const pane = await openLens("notes");
+      const retry = await within(pane).findByRole("button", {
+        name: /try again/i,
+      });
+      retry.focus();
+      fireEvent.click(retry);
+      await waitFor(() => expect(loads).toBe(1));
+
+      // While it loads, the user tabs to a different control.
+      const otherTab = screen.getByRole("tab", { name: /^transcript$/i });
+      otherTab.focus();
+      expect(document.activeElement).toBe(otherTab);
+
+      await act(async () => {
+        gate.resolve(notesPayload("session-a"));
+      });
+      await expectLensShows("notes", "session-a");
+      expect(document.activeElement).toBe(otherTab);
+    });
+
+    it("does not move focus for a retry the keyboard never activated", async () => {
+      let failures = 1;
+      mockBackend((cmd, id) => {
+        if (cmd === COMMAND.notes && failures > 0) {
+          failures -= 1;
+          throw { code: "io", message: "disk gone" };
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      const pane = await openLens("notes");
+      const retry = await within(pane).findByRole("button", {
+        name: /try again/i,
+      });
+      // Focus is on the body (e.g. a pointer click on a browser that does not
+      // focus buttons): the region is not forced either unless the retry
+      // control itself had focus.
+      (document.activeElement as HTMLElement | null)?.blur();
+      fireEvent.click(retry);
+      await expectLensShows("notes", "session-a");
+      expect(document.activeElement).toBe(document.body);
     });
   });
 
