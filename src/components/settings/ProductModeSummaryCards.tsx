@@ -10,6 +10,7 @@
  */
 
 import { useTranslation } from "react-i18next";
+import { providerSetupBlockerMessage } from "../ProviderReadinessPanel";
 import { modeReadinessTone } from "./badgeTone";
 import { readinessChipTone } from "./readinessTone";
 import { useSettings } from "./SettingsContext";
@@ -189,7 +190,7 @@ export default function ProductModeSummaryCards() {
                         <span>
                           {providerSetupBlockerKindLabel(blocker.kind)}:
                         </span>{" "}
-                        {blocker.message}
+                        {providerSetupBlockerMessage(blocker, t)}
                       </li>
                     ))}
                   </ul>

@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, SdkConfig};
+
+use crate::error::AppError;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::{
     ProvideCredentials, SharedCredentialsProvider, error::CredentialsError, future,
@@ -209,7 +211,7 @@ fn extract_action_from_access_denied(raw: &str) -> Option<String> {
 pub async fn build_aws_sdk_config(
     region: &str,
     source: AwsCredentialSource,
-) -> Result<SdkConfig, String> {
+) -> Result<SdkConfig, AppError> {
     let region = aws_config::Region::new(region.to_string());
     match source {
         AwsCredentialSource::DefaultChain => Ok(aws_config::defaults(BehaviorVersion::latest())
@@ -234,7 +236,7 @@ pub async fn build_aws_sdk_config(
             let secret = store
                 .aws_secret_key
                 .clone()
-                .ok_or_else(|| "AWS secret key not found in credentials store".to_string())?;
+                .ok_or_else(missing_credential)?;
 
             let provider: SharedCredentialsProvider = if store.aws_session_token.is_some() {
                 // STS / short-TTL creds: wrap in the refreshing provider so
@@ -289,7 +291,7 @@ pub async fn build_aws_sdk_config_with_draft_credentials(
     source: AwsCredentialSource,
     secret_access_key: Option<String>,
     session_token: Option<String>,
-) -> Result<SdkConfig, String> {
+) -> Result<SdkConfig, AppError> {
     let has_draft_credentials = secret_access_key
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
@@ -306,11 +308,7 @@ pub async fn build_aws_sdk_config_with_draft_credentials(
 
     let store = crate::credentials::load_credentials()?;
     let access_key = aws_access_key_from_source_or_store(access_key, &store)?;
-    let secret = draft_or_saved_secret(
-        secret_access_key,
-        store.aws_secret_key.as_deref(),
-        "AWS secret key is required for access key credential tests",
-    )?;
+    let secret = draft_or_saved_secret(secret_access_key, store.aws_secret_key.as_deref())?;
 
     let session_token = session_token
         .map(|token| token.trim().to_string())
@@ -342,7 +340,7 @@ pub async fn build_aws_sdk_config_with_draft_credentials(
 fn aws_access_key_from_source_or_store(
     access_key: String,
     store: &CredentialStore,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     let trimmed = access_key.trim();
     if !trimmed.is_empty() {
         return Ok(trimmed.to_string());
@@ -354,14 +352,10 @@ fn aws_access_key_from_source_or_store(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "AWS access key not found in credentials store".to_string())
+        .ok_or_else(missing_credential)
 }
 
-fn draft_or_saved_secret(
-    draft: Option<String>,
-    saved: Option<&str>,
-    missing_message: &str,
-) -> Result<String, String> {
+fn draft_or_saved_secret(draft: Option<String>, saved: Option<&str>) -> Result<String, AppError> {
     draft
         .as_deref()
         .map(str::trim)
@@ -373,7 +367,16 @@ fn draft_or_saved_secret(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
-        .ok_or_else(|| missing_message.to_string())
+        .ok_or_else(missing_credential)
+}
+
+/// A credential the store does not hold. The slot is not named: the closed
+/// credential code is the whole signal.
+fn missing_credential() -> AppError {
+    crate::credentials::LegacyCredentialError(
+        audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Missing,
+    )
+    .into()
 }
 
 /// A `ProvideCredentials` implementation that re-reads the configured
@@ -594,14 +597,21 @@ mod tests {
 
     #[test]
     fn draft_or_saved_secret_uses_saved_secret_when_draft_is_blank() {
-        let secret = draft_or_saved_secret(
-            Some("   ".to_string()),
-            Some(" SECRET_SAVED "),
-            "missing secret",
-        )
-        .expect("saved secret");
+        let secret = draft_or_saved_secret(Some("   ".to_string()), Some(" SECRET_SAVED "))
+            .expect("saved secret");
 
         assert_eq!(secret, "SECRET_SAVED");
+    }
+
+    #[test]
+    fn a_missing_aws_credential_is_the_closed_missing_code() {
+        let store = CredentialStore::default();
+        for error in [
+            aws_access_key_from_source_or_store("   ".to_string(), &store).unwrap_err(),
+            draft_or_saved_secret(None, None).unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "credential/missing");
+        }
     }
 
     #[test]

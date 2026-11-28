@@ -25,9 +25,10 @@ const MAX_REDIRECTS: usize = 10;
 /// carry the prompt to a host the egress policy never authorized. Stopping
 /// hands the 3xx back to the caller, which reports a rejected request.
 ///
-/// For a client that only fetches catalogs. A blocking client an executor job
-/// sends from uses [`job_client_builder`] and [`send_admitted`] instead.
-pub(super) fn same_origin_redirects() -> reqwest::redirect::Policy {
+/// For a client that only fetches catalogs or runs a readiness check. A
+/// blocking client an executor job sends from uses [`job_client_builder`] and
+/// [`send_admitted`] instead.
+pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         let same_origin = attempt
             .previous()
@@ -106,10 +107,11 @@ impl SendError {
 /// reports a non-success status as a rejected request. 301, 302 and 303 are
 /// not followed: they turn a POST into a GET without its body.
 ///
-/// The whole chain, connection to the last response body, shares one
+/// Every hop of the chain, from connection to response headers, shares one
 /// `budget`: each hop is given the time that remains once leave is given and
-/// its request is built, as the client's request timeout bounded the chain
-/// when reqwest followed redirects itself. A retry by the caller starts a new
+/// its request is built. Reading the final response body is not inside it:
+/// the blocking client gives that read its own timeout, as it did with the
+/// client-level timeout before. A retry by the caller starts a new
 /// chain. As under reqwest's policy, at most `MAX_REDIRECTS` requests are
 /// sent, the first and nine hops; a tenth redirect ends the chain as too many.
 ///

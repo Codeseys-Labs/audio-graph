@@ -13,6 +13,8 @@ import type { ProviderDescriptor } from "../../types";
 import {
   ProviderSttFidelityDetails,
   providerCatalogSummary,
+  providerReadinessMessage,
+  providerRuntimeMessage,
 } from "../ProviderReadinessPanel";
 import {
   modelCatalogForProvider,
@@ -349,14 +351,16 @@ export default function ProviderCapabilityCard({
             {readiness?.runtime
               ? `${providerRuntimeReadinessLabel(
                   readiness.runtime.status,
-                )}: ${readiness.runtime.message}`
+                )}: ${providerRuntimeMessage(readiness.runtime, t)}`
               : "Not reported"}
           </dd>
         </div>
       </dl>
 
       <p className="settings-provider-capability-card__readiness">
-        {readiness?.message ?? "No readiness check has run for this provider."}
+        {readiness
+          ? providerReadinessMessage(readiness, t)
+          : t("settings.providerReadiness.noReadiness")}
       </p>
 
       {selected && (

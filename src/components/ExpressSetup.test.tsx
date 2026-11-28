@@ -10,6 +10,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
+import { failedReadiness, runtimeFailure } from "../test/readinessFixtures";
 import type {
   AppSettings,
   AudioSourceInfo,
@@ -99,7 +100,7 @@ const readyProvider = (
 ): ProviderReadiness => ({
   provider_id: providerId,
   status: "ready",
-  message: `${providerId} ready`,
+  note: { kind: "verified" },
   stale: false,
   credential_epoch: 1,
   credentials: credentials.map((key) => ({ key, present: true })),
@@ -330,8 +331,7 @@ describe("ExpressSetup", () => {
         readyProvider("asr.deepgram", ["deepgram_api_key"]),
         {
           ...readyProvider("llm.api", ["openai_api_key"]),
-          status: "error",
-          message: "persisted route failed",
+          ...failedReadiness(runtimeFailure("provider_unavailable", "retry")),
         },
       ],
     });
@@ -360,7 +360,9 @@ describe("ExpressSetup", () => {
       expect(row).not.toHaveTextContent(/Ready/i);
       expect(row).not.toHaveTextContent(/Error/i);
     }
-    expect(cloudCard).not.toHaveTextContent(/persisted route failed/i);
+    expect(cloudCard).not.toHaveTextContent(
+      /provider check failed|provider is unavailable/i,
+    );
     expect(
       mockedInvoke.mock.calls.some(
         ([cmd]) => cmd === "get_provider_readiness_cmd",

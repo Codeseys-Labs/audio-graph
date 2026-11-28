@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
+import i18n from "../i18n";
+import { failedReadiness, runtimeFailure } from "../test/readinessFixtures";
 import type {
   CredentialPresence,
   ProviderReadiness,
   ProviderRuntimeReadiness,
 } from "../types";
+import {
+  providerReadinessMessage,
+  providerSetupBlockerMessage,
+} from "./ProviderReadinessPanel";
 import {
   deriveProviderSetupModeCards,
   type ProviderSetupAudioSource,
@@ -36,7 +42,7 @@ function readyProvider(
   return {
     provider_id: providerId,
     status: "ready",
-    message: "ready",
+    note: { kind: "verified" },
     stale: false,
     credential_epoch: 1,
     credentials: credentials.map((key) => ({ key, present: true })),
@@ -179,7 +185,7 @@ describe("deriveProviderSetupModeCards", () => {
         {
           provider_id: "asr.deepgram",
           status: "missing_credentials",
-          message: "Missing saved credential(s): deepgram_api_key",
+          note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
           stale: false,
           credential_epoch: 1,
           credentials: [{ key: "deepgram_api_key", present: false }],
@@ -261,12 +267,10 @@ describe("deriveProviderSetupModeCards", () => {
       providerReadiness: [
         readyProvider("asr.local_whisper", [], {
           status: "healthy",
-          message: "whisper model ready",
           model_id: "ggml-small.en.bin",
         }),
         readyProvider("llm.local_llama", [], {
           status: "healthy",
-          message: "llm model ready",
           model_id: "lfm2-350m-extract-q4_k_m.gguf",
         }),
       ],
@@ -308,7 +312,6 @@ describe("deriveProviderSetupModeCards", () => {
       providerReadiness: [
         readyProvider("asr.local_whisper", [], {
           status: "healthy",
-          message: "whisper ready",
         }),
         readyProvider("llm.openrouter", ["openrouter_api_key"]),
       ],
@@ -793,5 +796,138 @@ describe("deriveProviderSetupModeCards", () => {
       "tts.none",
     ]);
     expect(providerIds(hybrid)).not.toContain("asr.assemblyai");
+  });
+});
+
+describe("readiness presented by the setup model", () => {
+  const en = i18n.getFixedT("en");
+  const pt = i18n.getFixedT("pt");
+  const cloudSettings = settings({
+    asrType: "deepgram",
+    deepgramModel: "nova-3",
+    llmType: "openrouter",
+    openrouterModel: "openai/gpt-4o-mini",
+  });
+  const localSettings = settings({
+    asrType: "local_whisper",
+    llmType: "local_llama",
+    llmModel: "lfm2-350m-extract-q4_k_m.gguf",
+  });
+
+  it("presents a failed provider from its typed cause, in each locale", () => {
+    const failed: ProviderReadiness = {
+      ...readyProvider("asr.deepgram", ["deepgram_api_key"]),
+      ...failedReadiness(
+        runtimeFailure("permission_denied", "review_configuration"),
+      ),
+    };
+    const cards = deriveProviderSetupModeCards({
+      settings: cloudSettings,
+      credentialPresence: presence("deepgram_api_key", "openrouter_api_key"),
+      providerReadiness: [
+        failed,
+        readyProvider("llm.openrouter", ["openrouter_api_key"]),
+      ],
+    });
+    const cloud = byId(cards, "cloud_fast");
+    const deepgram = providerById(cloud, "asr.deepgram");
+    const blocker = cloud.missingBlockers.find(
+      (candidate) => candidate.kind === "provider_error",
+    );
+
+    expect(cloud.readinessStatus).toBe("error");
+    expect(deepgram.readiness).toBe(failed);
+    expect(blocker?.readiness).toBe(failed);
+    if (!blocker || !deepgram.readiness) throw new Error("failure not carried");
+    for (const t of [en, pt]) {
+      const expected = t("runtimeDiagnostics.runtime.permission_denied");
+      expect(providerSetupBlockerMessage(blocker, t)).toBe(expected);
+      expect(providerReadinessMessage(deepgram.readiness, t)).toBe(expected);
+      expect(expected).not.toMatch(/runtime\/|credential\//);
+    }
+    expect(pt("runtimeDiagnostics.runtime.permission_denied")).not.toBe(
+      en("runtimeDiagnostics.runtime.permission_denied"),
+    );
+  });
+
+  it("presents a readiness note without a credential plan from its closed kind", () => {
+    const awsSettings = settings({
+      asrType: "aws_transcribe",
+      awsAsrCredentialMode: "profile",
+      awsAsrProfileName: "",
+      llmType: "openrouter",
+      openrouterModel: "openai/gpt-4o-mini",
+    });
+    const awsReadiness: ProviderReadiness = {
+      ...readyProvider("asr.aws_transcribe"),
+      status: "missing_credentials",
+      note: { kind: "aws_profile_required" },
+    };
+    const cards = deriveProviderSetupModeCards({
+      settings: awsSettings,
+      credentialPresence: presence("openrouter_api_key"),
+      providerReadiness: [
+        awsReadiness,
+        readyProvider("llm.openrouter", ["openrouter_api_key"]),
+      ],
+    });
+    const blocker = byId(cards, "cloud_fast").missingBlockers.find(
+      (candidate) => candidate.readiness === awsReadiness,
+    );
+
+    expect(blocker?.kind).toBe("missing_credential");
+    if (!blocker) throw new Error("readiness blocker missing");
+    expect(providerSetupBlockerMessage(blocker, en)).toBe(
+      en("settings.providerReadiness.note.aws_profile_required"),
+    );
+    expect(providerSetupBlockerMessage(blocker, pt)).toBe(
+      pt("settings.providerReadiness.note.aws_profile_required"),
+    );
+    expect(providerSetupBlockerMessage(blocker, pt)).not.toBe(
+      providerSetupBlockerMessage(blocker, en),
+    );
+  });
+
+  it("presents a local runtime blocker from its status and registry model id", () => {
+    const cards = deriveProviderSetupModeCards({
+      settings: localSettings,
+      providerReadiness: [
+        readyProvider("asr.local_whisper", [], {
+          status: "model_missing",
+          model_id: "ggml-small.en.bin",
+        }),
+        readyProvider("llm.local_llama", [], { status: "healthy" }),
+      ],
+    });
+    const blocker = byId(cards, "local_private").missingBlockers.find(
+      (candidate) => candidate.kind === "missing_model",
+    );
+
+    expect(blocker?.model).toBe("ggml-small.en.bin");
+    if (!blocker) throw new Error("runtime blocker missing");
+    expect(providerSetupBlockerMessage(blocker, en)).toBe(
+      en("settings.providerReadiness.runtimeDetail.model_missing", {
+        model: "ggml-small.en.bin",
+      }),
+    );
+    expect(providerSetupBlockerMessage(blocker, pt)).toBe(
+      pt("settings.providerReadiness.runtimeDetail.model_missing", {
+        model: "ggml-small.en.bin",
+      }),
+    );
+    expect(providerSetupBlockerMessage(blocker, pt)).not.toBe(
+      providerSetupBlockerMessage(blocker, en),
+    );
+  });
+
+  it("keeps every other blocker's own summary", () => {
+    const cards = deriveProviderSetupModeCards({ settings: cloudSettings });
+    const blocker = byId(cards, "cloud_fast").missingBlockers.find(
+      (candidate) => candidate.kind === "missing_credential",
+    );
+
+    expect(blocker?.readiness).toBeUndefined();
+    if (!blocker) throw new Error("credential blocker missing");
+    expect(providerSetupBlockerMessage(blocker, en)).toBe(blocker.message);
   });
 });
