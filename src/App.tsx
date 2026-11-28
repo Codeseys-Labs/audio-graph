@@ -169,27 +169,14 @@ import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 import { hasConfiguredDurableNotesRoute } from "./utils/durableRoute";
 import "./styles/index.css";
 
-// cred-review m6: a rejected `load_credential_presence_cmd` carries a
-// structured `AppError` payload (`{ code, message: { reason } }`). The backend
-// collapses EVERY presence-load failure into `credential_file_error` —
-// including OS-keychain-locked/unavailable loads (e.g. Linux with no
-// secret-service) — so the code alone cannot mean "your credential file needs
-// repair". For a keychain-locked user, retry (after unlocking) is the right
-// recovery, so ambiguous causes default to the generic retryable fallback
-// copy. Only a RECOGNIZED file parse failure earns the review-before-
-// re-entering hint (`onboarding.unreadable*`), and parse failures are
-// recognizable without echoing file content: `redacted_yaml_parse_error`
-// (credentials/mod.rs, PR #81) deliberately keeps the stable
-// `Failed to parse {path}:` prefix in the structured reason.
+import { parseRuntimeDiagnosticAppError } from "./utils/runtimeDiagnostic";
+
 function isCredentialFileParseError(e: unknown): boolean {
-  if (typeof e !== "object" || e === null) return false;
-  const { code, message } = e as { code?: unknown; message?: unknown };
-  if (code !== "credential_file_error") return false;
-  const reason =
-    typeof message === "object" && message !== null
-      ? (message as { reason?: unknown }).reason
-      : undefined;
-  return typeof reason === "string" && reason.startsWith("Failed to parse ");
+  const diagnostic = parseRuntimeDiagnosticAppError(e)?.diagnostic;
+  return (
+    diagnostic?.kind === "credential" &&
+    diagnostic.detail.code === "corrupt_record"
+  );
 }
 
 // Persisted panel sizes (px). Kept in localStorage so the user's layout
@@ -885,12 +872,7 @@ function App() {
   // `probeFailed` flips the During workspace to a friendly Get-started fallback;
   // `probeRetrying` drives the Retry button's in-flight state.
   const [probeFailed, setProbeFailed] = useState(false);
-  // cred-review m6: true when the probe threw a `credential_file_error` — the
-  // credential store couldn't be READ (malformed credentials/state file, or a
-  // keychain-unavailable load, which the backend maps to the same code), as
-  // opposed to a fresh install (empty list, no throw). Drives a retry-first
-  // hint instead of the first-run "get started" copy so we don't invite
-  // ExpressSetup to re-prompt and overwrite existing (but unreadable) keys.
+  // Show the repair hint only for a structurally corrupt record.
   const [probeUnreadable, setProbeUnreadable] = useState(false);
   const [probeRetrying, setProbeRetrying] = useState(false);
   const [probeCompleted, setProbeCompleted] = useState(false);

@@ -2921,7 +2921,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                             key: "aws_access_key".to_string(),
                         });
                     }
-                    let cred_store = crate::credentials::load_credentials();
+                    let cred_store = crate::credentials::load_credentials()?;
                     let secret_valid = cred_store
                         .aws_secret_key
                         .as_ref()
@@ -6953,9 +6953,14 @@ pub fn load_settings_cmd(
         settings
     };
 
-    let credentials = crate::credentials::load_credentials();
-    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
     let settings_for_ipc = crate::settings::redacted_settings(&settings);
+    let runtime_settings = match crate::credentials::load_credentials() {
+        Ok(store) => crate::settings::hydrate_runtime_credentials(&settings, &store),
+        Err(error) => {
+            log::warn!("{error}");
+            settings_for_ipc.clone()
+        }
+    };
 
     // Sync in-memory cache with runtime-only hydrated credentials.
     if let Ok(mut cached) = state.app_settings.write() {
@@ -6980,7 +6985,7 @@ pub fn save_settings_cmd(
     state: State<'_, AppState>,
 ) -> AppResult<()> {
     crate::settings::save_settings(&app, &settings)?;
-    let credentials = crate::credentials::load_credentials();
+    let credentials = crate::credentials::load_credentials()?;
     let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
 
     // Sync in-memory cache with runtime-only hydrated credentials.
@@ -11104,29 +11109,7 @@ fn save_credential_impl(
     value: String,
     state: &AppState,
 ) -> AppResult<SaveCredentialOutcome> {
-    // Diagnostic instrumentation: log invocation with key + value LENGTH +
-    // a non-secret FINGERPRINT (never the secret itself). The fingerprint is a
-    // one-way sha256 prefix (see `credentials::secret_fingerprint`); comparing
-    // it against the fingerprint the Deepgram connect log emits reveals whether
-    // the key that reaches the wire matches the one just saved — the decisive
-    // signal for the stale-cache 401 root cause. Pairs with the success log
-    // below to disambiguate frontend-skip vs backend-persist paths when a saved
-    // credential appears not to take effect. See docs/plans/
-    // 2026-07-01-deepgram-401-rootcause.md.
-    log::info!(
-        "save_credential_cmd: key={} value_len={} fingerprint={}",
-        key,
-        value.len(),
-        crate::credentials::secret_fingerprint(Some(&value))
-    );
-    // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
-    // here before they reach the inner `set_field` match. Mirrors the
-    // convention used by `validate_session_id` elsewhere in this module.
-    if !crate::credentials::is_allowed_key(&key) {
-        return Err(crate::error::AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
-        });
-    }
+    crate::credentials::validate_key(&key)?;
 
     // Empty/whitespace-only is a no-op skip (the backend `set` treats blank as
     // "don't clobber a stored key" — use `delete_credential_cmd` to clear).
@@ -11144,11 +11127,7 @@ fn save_credential_impl(
         return Ok(SaveCredentialOutcome::SkippedEmpty);
     }
 
-    // Bubble credential-file failures as `CredentialFileError` so the
-    // frontend can render a localized / actionable message instead of a bare
-    // string.
-    crate::credentials::set_credential(&key, &value)
-        .map_err(|reason| crate::error::AppError::CredentialFileError { reason })?;
+    crate::credentials::set_credential(&key, &value)?;
     bump_provider_credential_epoch();
 
     // Re-hydrate the in-memory settings cache from the (now-updated) credential
@@ -11159,7 +11138,7 @@ fn save_credential_impl(
     // readiness epoch, leaving the cache holding the OLD key. Shared with
     // `delete_credential_cmd` via `rehydrate_app_settings_cache` so the two
     // symmetric writers cannot diverge again (audio-graph-c4d0).
-    let store = crate::credentials::load_credentials();
+    let store = crate::credentials::load_credentials()?;
     rehydrate_app_settings_cache(state, &store, "save_credential_cmd", &key);
 
     log::info!("save_credential_cmd: persisted key={}", key);
@@ -11171,16 +11150,8 @@ fn save_credential_impl(
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
 pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResult<()> {
-    // Boundary-layer allowlist check (loop11 MEDIUM #5). Emit the same
-    // message the inner `set_field` match would have produced, but reject at
-    // the command boundary so the frontend receives a structured payload.
-    if !crate::credentials::is_allowed_key(&key) {
-        return Err(AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
-        });
-    }
-    crate::credentials::delete_credential(&key)
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    crate::credentials::validate_key(&key)?;
+    crate::credentials::delete_credential(&key)?;
     bump_provider_credential_epoch();
 
     // Re-hydrate the in-memory settings cache from the (now-updated) credential
@@ -11194,7 +11165,7 @@ pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResu
     // the key, `hydrate_runtime_credentials` leaves the cached provider api_key
     // cleared. `state` is Tauri-injected, so `invoke('delete_credential_cmd',
     // { key })` from the frontend is unchanged.
-    let store = crate::credentials::load_credentials();
+    let store = crate::credentials::load_credentials()?;
     rehydrate_app_settings_cache(state.inner(), &store, "delete_credential_cmd", &key);
 
     Ok(())
@@ -11203,7 +11174,7 @@ pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResu
 fn credential_is_present(
     store: &crate::credentials::CredentialStore,
     key: &str,
-) -> Result<bool, String> {
+) -> Result<bool, crate::credentials::LegacyCredentialError> {
     store.is_present(key)
 }
 
@@ -11214,8 +11185,7 @@ fn credential_is_present(
 /// secret values over IPC.
 #[tauri::command]
 pub fn load_credential_presence_cmd() -> AppResult<Vec<CredentialPresence>> {
-    let snapshot = crate::credentials::try_load_credentials_with_source()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let snapshot = crate::credentials::try_load_credentials_with_source()?;
     credential_presence_from_snapshot(&snapshot)
 }
 
@@ -11233,8 +11203,7 @@ fn credential_presence_from_snapshot(
     crate::credentials::ALLOWED_CREDENTIAL_KEYS
         .iter()
         .map(|&key| {
-            let present = credential_is_present(&snapshot.store, key)
-                .map_err(|reason| AppError::CredentialFileError { reason })?;
+            let present = credential_is_present(&snapshot.store, key)?;
             Ok(CredentialPresence {
                 key: key.to_string(),
                 present,
@@ -12914,8 +12883,7 @@ pub async fn get_provider_readiness_cmd(
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     let request = register_provider_readiness_request(request_id)?;
     let (_request_guard, cancel) = match &request {
         Some((guard, token)) => (Some(guard), Some(token)),
@@ -13019,7 +12987,7 @@ pub fn diagnose_credentials() -> AppResult<String> {
                 snapshot.source, count
             ))
         }
-        Err(reason) => Err(AppError::CredentialFileError { reason }),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -13267,8 +13235,7 @@ fn endpoint_api_key_from_draft_or_store(
         return Ok(Some(api_key));
     }
 
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     Ok(endpoint_api_key_from_store(endpoint, &store))
 }
 
@@ -13717,8 +13684,7 @@ fn deepgram_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<St
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     deepgram_api_key_from_store(&store)
 }
 
@@ -13736,8 +13702,7 @@ fn soniox_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<Stri
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     soniox_api_key_from_store(&store)
 }
 
@@ -13755,8 +13720,7 @@ fn assemblyai_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     assemblyai_api_key_from_store(&store)
 }
 
@@ -13811,8 +13775,7 @@ fn gemini_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<Stri
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     gemini_api_key_from_store(&store)
 }
 
@@ -13910,8 +13873,7 @@ pub async fn list_openrouter_models_cmd(
 pub async fn list_openrouter_providers_cmd(
     base_url: Option<String>,
 ) -> AppResult<Vec<OpenRouterProvider>> {
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     list_openrouter_providers_with_store(&store, base_url).await
 }
 
@@ -13932,8 +13894,7 @@ pub async fn list_openrouter_model_endpoints_cmd(
     model_id: String,
     base_url: Option<String>,
 ) -> AppResult<OpenRouterModelEndpoints> {
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     list_openrouter_model_endpoints_with_store(&store, model_id, base_url).await
 }
 
@@ -13953,8 +13914,7 @@ fn openrouter_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<
     if let Some(api_key) = api_key.as_deref().and_then(non_empty_trimmed) {
         return Ok(api_key);
     }
-    let store = crate::credentials::try_load_credentials()
-        .map_err(|reason| AppError::CredentialFileError { reason })?;
+    let store = crate::credentials::try_load_credentials()?;
     openrouter_api_key_from_store(&store)
 }
 
@@ -19716,10 +19676,7 @@ mod tests {
         let unknown =
             save_credential_impl("totally_bogus_key".to_string(), "   ".to_string(), &state);
         assert!(
-            matches!(
-                unknown,
-                Err(crate::error::AppError::CredentialFileError { .. })
-            ),
+            matches!(unknown, Err(crate::error::AppError::RuntimeDiagnostic(_))),
             "unknown key must be rejected even for an empty value"
         );
     }

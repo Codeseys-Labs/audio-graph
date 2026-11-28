@@ -585,22 +585,28 @@ pub fn run() {
             // set and no cloud credentials are present, wire the app for
             // local-only providers and persist the decision so subsequent
             // launches skip this branch.
-            let store = crate::credentials::load_credentials();
-            if crate::settings::apply_first_launch_demo_mode(&mut settings, &store)
-                && crate::settings::allow_automatic_settings_writeback(
-                    load_status,
-                    "persisting first-launch demo-mode settings",
-                )
-                && let Err(e) = crate::settings::save_settings(handle, &settings)
-            {
-                log::warn!("Failed to persist first-launch demo-mode settings: {e}");
-            }
-            // Sync the loaded settings into the in-memory cache so other
-            // backend modules see them without re-reading the file.
+            let runtime_settings = match crate::credentials::load_credentials() {
+                Ok(store) => {
+                    if crate::settings::apply_first_launch_demo_mode(&mut settings, &store)
+                        && crate::settings::allow_automatic_settings_writeback(
+                            load_status,
+                            "persisting first-launch demo-mode settings",
+                        )
+                        && let Err(e) = crate::settings::save_settings(handle, &settings)
+                    {
+                        log::warn!("Failed to persist first-launch demo-mode settings: {e}");
+                    }
+                    crate::settings::hydrate_runtime_credentials(&settings, &store)
+                }
+                Err(error) => {
+                    log::warn!("{error}");
+                    crate::settings::redacted_settings(&settings)
+                }
+            };
             if let Some(state) = handle.try_state::<AppState>()
                 && let Ok(mut cached) = state.app_settings.write()
             {
-                *cached = crate::settings::hydrate_runtime_credentials(&settings, &store);
+                *cached = runtime_settings;
             }
 
             // Native capture UX (epic 5c24): build the system tray recording

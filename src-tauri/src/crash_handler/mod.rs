@@ -374,7 +374,7 @@ mod tests {
             format!("native-target-{nonce}"),
             format!("platform diagnostic {nonce}"),
             format!("exact-length={}", secret.len()),
-            crate::credentials::secret_fingerprint(Some(&secret)),
+            format!("fingerprint-canary-{nonce}"),
             secret,
         ]
     }

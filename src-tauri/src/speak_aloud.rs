@@ -63,7 +63,7 @@ impl SpeakAloudPipe {
     pub async fn maybe_new(
         speak_aloud: bool,
         tts_provider: &TtsProvider,
-        credentials: &CredentialStore,
+        credentials: &Result<CredentialStore, crate::credentials::LegacyCredentialError>,
         content_egress_policy: crate::asr::ProviderContentEgressPolicy,
         player: AudioPlayer,
     ) -> Result<Option<Self>, String> {
@@ -77,9 +77,11 @@ impl SpeakAloudPipe {
                 sample_rate,
                 speed,
             } => {
-                let provider = DeepgramAuraProvider::from_store(credentials)
-                    .map(|provider| provider.with_content_egress_policy(content_egress_policy))
-                    .map_err(|_| "tts_credential_missing".to_owned())?;
+                let provider = DeepgramAuraProvider::from_store(
+                    credentials.as_ref().map_err(ToString::to_string)?,
+                )
+                .map(|provider| provider.with_content_egress_policy(content_egress_policy))
+                .map_err(|_| "tts_credential_missing".to_owned())?;
                 let tts_config = TtsConfig {
                     voice: voice.clone(),
                     sample_rate: *sample_rate,
@@ -370,7 +372,7 @@ mod tests {
             sample_rate: 24_000,
             speed: 1.0,
         };
-        let mut credentials = CredentialStore::default();
+        let mut credentials = Ok(CredentialStore::default());
         let policy = crate::asr::ProviderContentEgressPolicy::allow();
 
         let missing =
@@ -382,7 +384,7 @@ mod tests {
 
         let secret = "pipe-handshake-secret-canary";
         // An invalid header value fails request construction before network I/O.
-        credentials.deepgram_api_key = Some(format!("{secret}\ncanary"));
+        credentials.as_mut().unwrap().deepgram_api_key = Some(format!("{secret}\ncanary"));
         let rejected =
             SpeakAloudPipe::maybe_new(true, &settings, &credentials, policy, AudioPlayer::new())
                 .await

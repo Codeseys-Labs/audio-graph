@@ -54,7 +54,7 @@ function formatAppError(err: AppErrorPayload): string {
     case "credential_missing":
       return `Missing credential: ${err.message.key}. Open Settings to configure it.`;
     case "credential_file_error":
-      return `Credential/configuration error: ${err.message.reason}`;
+      return i18n.t("runtimeDiagnostics.credential.internal");
     case "aws_credential_expired":
       return "AWS credentials have expired. Please refresh them.";
     case "aws_region_invalid":
