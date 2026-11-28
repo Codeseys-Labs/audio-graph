@@ -19606,6 +19606,27 @@ mod tests {
     static CREDENTIAL_EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn rejected_credential_save_emits_no_key_value_length_or_fingerprint() {
+        let state = AppState::new();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "canary-poppy-field";
+        let value = "canary-poppy-value";
+        let error = save_credential_impl(key.into(), value.into(), &state).unwrap_err();
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire["diagnostic"]["detail"]["code"],
+            "invalid_credential_set"
+        );
+        for sink in [error.to_string(), format!("{error:?}"), wire.to_string()] {
+            assert!(!sink.contains(key));
+            assert!(!sink.contains(value));
+        }
+        // Even a derived hash or length emitted without the canary itself fails this check.
+        assert!(capture.finish().is_empty());
+        crate::test_log_capture::assert_process_logs_exclude(&[key, value]);
+    }
+
+    #[test]
     fn save_credential_empty_value_skips_without_epoch_bump_or_rehydrate() {
         // Hold the shared epoch lock for the whole test: the before/after epoch
         // comparison below is only meaningful if no concurrent test bumps the
