@@ -23,11 +23,14 @@
 //! a `crossbeam_channel` that the speech processor consumes.
 
 use super::{
-    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
+    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
+    websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
-    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeTransport,
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeStatusClass, RuntimeTransport,
 };
 
 #[cfg(test)]
@@ -404,9 +407,7 @@ impl DeepgramStreamingClient {
     /// audio writing, server message reading, and automatic reconnection with
     /// exponential backoff if the WebSocket drops mid-session.
     pub fn connect(&mut self) -> Result<(), AppError> {
-        if self.config.api_key.is_empty() {
-            return Err(websocket_diagnostic(Code::RequestRejected).into());
-        }
+        required_api_key(&self.config.api_key, BuiltInCredentialSetId::Deepgram)?;
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -414,7 +415,7 @@ impl DeepgramStreamingClient {
             .enable_all()
             .thread_name("deepgram-ws-rt")
             .build()
-            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -707,11 +708,17 @@ enum DisconnectKind {
 /// query-string-only "handshake" means a reconnect is just re-running this
 /// function — no replay of a setup frame is required.
 async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
-    let url_str = deepgram_listen_url(config);
+    open_ws_url(config, &deepgram_listen_url(config)).await
+}
 
+async fn open_ws_url(
+    config: &DeepgramConfig,
+    url_str: &str,
+) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
+    let api_key = required_api_key(&config.api_key, BuiltInCredentialSetId::Deepgram)?;
     let request = tungstenite::http::Request::builder()
-        .uri(&url_str)
-        .header("Authorization", format!("Token {}", config.api_key))
+        .uri(url_str)
+        .header("Authorization", format!("Token {api_key}"))
         .header(
             "Sec-WebSocket-Key",
             tungstenite::handshake::client::generate_key(),
@@ -725,11 +732,57 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), 
 
     // Bounded connect: a stalled TLS/HTTP-upgrade handshake would otherwise hang
     // this future (and the reconnect ladder) forever — see `connect_async_bounded`.
+    // Status 400 can mean a malformed request, not just a model selector.
+    // https://developers.deepgram.com/docs/errors
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_error(&error))?;
+        .map_err(|error| deepgram_upgrade_error(&error))?;
 
     Ok(ws_stream.split())
+}
+
+fn deepgram_upgrade_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
+    if let tungstenite::Error::Http(response) = error
+        && let Some(diagnostic) = deepgram_http_auth_diagnostic(
+            response,
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Websocket),
+        )
+    {
+        return diagnostic.into();
+    }
+    websocket_upgrade_error(error, true)
+}
+
+pub(crate) fn deepgram_http_auth_diagnostic(
+    response: &tungstenite::http::Response<Option<Vec<u8>>>,
+    context: RuntimeDiagnosticContext,
+) -> Option<RuntimeErrorDiagnostic> {
+    // Both auth failures can return 401. Tungstenite supplies only the
+    // response bytes it read with the headers. Fall back to status if the
+    // body is missing, incomplete, oversized, or carries an unknown code.
+    // https://developers.deepgram.com/docs/errors
+    const MAX_AUTH_BODY_BYTES: usize = 4096;
+
+    #[derive(Deserialize)]
+    struct AuthErrorBody {
+        err_code: String,
+    }
+
+    if response.status() != tungstenite::http::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let body = response.body().as_deref()?;
+    if body.len() > MAX_AUTH_BODY_BYTES {
+        return None;
+    }
+    let body: AuthErrorBody = serde_json::from_slice(body).ok()?;
+    let context = context.with_status_class(RuntimeStatusClass::ClientError);
+    match body.err_code.as_str() {
+        "INVALID_AUTH" => Some(RuntimeErrorDiagnostic::credential_rejected(context)),
+        "INSUFFICIENT_PERMISSIONS" => Some(RuntimeErrorDiagnostic::permission_denied(context)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1176,13 @@ fn spawn_session_task(
 }
 
 async fn session_task(ctx: DeepgramSessionCtx) {
+    session_task_with_backoff(ctx, Duration::from_secs).await;
+}
+
+async fn session_task_with_backoff(
+    ctx: DeepgramSessionCtx,
+    backoff_duration: impl Fn(u64) -> Duration,
+) {
     let DeepgramSessionCtx {
         writer: initial_writer,
         reader: initial_reader,
@@ -1178,8 +1238,8 @@ async fn session_task(ctx: DeepgramSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("Deepgram session: content egress blocked: {message}");
-                let _ = event_tx.send(DeepgramEvent::Error { message });
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
+                let _ = event_tx.send(DeepgramEvent::Error { message });
                 break;
             }
             _ => {
@@ -1201,6 +1261,14 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                 // immediately re-disconnected and double-counted the attempt,
                 // double-firing Disconnected/Reconnecting and confusing the
                 // UI attempt counter (FA-2).
+                if let Err(message) =
+                    required_api_key(&config.api_key, BuiltInCredentialSetId::Deepgram)
+                {
+                    let _ = event_tx.send(DeepgramEvent::Error { message });
+                    break;
+                }
+
+                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -1215,9 +1283,9 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                             log::error!(
                                 "Deepgram session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            let _ = event_tx.send(DeepgramEvent::Error {
-                                message: websocket_diagnostic(Code::ProviderUnavailable),
-                            });
+                            let message = last_open_error
+                                .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
+                            let _ = event_tx.send(DeepgramEvent::Error { message });
                             break false;
                         }
                     };
@@ -1232,7 +1300,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 
                     // Sleep for the backoff window, but bail out early if the
                     // user cancels during the wait.
-                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    let sleep = tokio::time::sleep(backoff_duration(backoff));
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
@@ -1269,11 +1337,12 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                         }
                         Err(diag) => {
                             log::warn!("Deepgram session: {diag}");
+                            if is_terminal_reconnect_error(&diag) {
+                                let _ = event_tx.send(DeepgramEvent::Error { message: diag });
+                                break false;
+                            }
+                            last_open_error = Some(diag.clone());
                             let _ = event_tx.send(DeepgramEvent::Error { message: diag });
-                            // Stay in this inner loop: the next iteration drives
-                            // the following attempt inline (no run_io detour with
-                            // a dead socket), preserving the backoff ladder.
-                            continue;
                         }
                     }
                 };
@@ -1282,7 +1351,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                     // Resume run_io with the fresh socket halves.
                     continue;
                 }
-                // Budget exhausted: stop the session task.
+                // Terminal failure or exhausted budget: stop the session task.
                 break;
             }
         }
@@ -1766,7 +1835,10 @@ fn deepgram_error_diagnostic(parsed: &Value) -> RuntimeDiagnostic {
         .or_else(|| parsed.get("code"))
         .and_then(Value::as_str);
     websocket_diagnostic(match code {
-        Some("INVALID_AUTH" | "INSUFFICIENT_PERMISSIONS" | "BAD_REQUEST") => Code::RequestRejected,
+        // https://developers.deepgram.com/docs/errors
+        Some("INVALID_AUTH") => Code::CredentialRejected,
+        Some("INSUFFICIENT_PERMISSIONS") => Code::PermissionDenied,
+        Some("BAD_REQUEST") => Code::RequestRejected,
         Some("CLIENT_MESSAGE_TIMEOUT") => Code::Timeout,
         Some("RATE_LIMIT_EXCEEDED") => Code::RateLimited,
         _ => Code::Internal,
@@ -2018,6 +2090,162 @@ fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upgrade_reads_only_the_allowlisted_deepgram_auth_code() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades, wire_prose};
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+
+        for (wire_code, code, action) in [
+            (
+                "INSUFFICIENT_PERMISSIONS",
+                Code::PermissionDenied,
+                Action::ReviewConfiguration,
+            ),
+            (
+                "INVALID_AUTH",
+                Code::CredentialRejected,
+                Action::ReenterCredential,
+            ),
+            (
+                "INSUFFICIENT_PERMISSIONS extra",
+                Code::CredentialRejected,
+                Action::ReenterCredential,
+            ),
+        ] {
+            let body = serde_json::json!({
+                "err_code": wire_code,
+                "err_msg": wire_prose(),
+            });
+            let (url, server) = reject_upgrades(vec![(401, Some(body.to_string()))], true).await;
+            let diagnostic = open_ws_url(&test_config("nova-3"), &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(
+                &diagnostic,
+                (code, false, action, Some(RuntimeStatusClass::ClientError)),
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_auth_body_falls_back_for_invalid_or_oversized_input() {
+        use super::super::diagnostic_tests::assert_outcome;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+
+        let oversized = serde_json::json!({
+            "err_code": "INSUFFICIENT_PERMISSIONS",
+            "err_msg": "sample".repeat(1024),
+        });
+        for body in [
+            None,
+            Some(br#"{"err_code":"INSUFFICIENT_PERMISSIONS""#.to_vec()),
+            Some(serde_json::to_vec(&oversized).unwrap()),
+        ] {
+            let response = tungstenite::http::Response::builder()
+                .status(401)
+                .body(body)
+                .unwrap();
+            let diagnostic = deepgram_upgrade_error(&tungstenite::Error::Http(Box::new(response)));
+            assert_outcome(
+                &diagnostic,
+                (
+                    Code::CredentialRejected,
+                    false,
+                    Action::ReenterCredential,
+                    Some(RuntimeStatusClass::ClientError),
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_and_provider_error_outcomes() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action,
+            RuntimeStatusClass::{ClientError, ServerError},
+        };
+
+        let mut config = test_config("nova-3");
+        config.api_key = "sample credential".into();
+        for (status, code, retryable, action, status_class) in [
+            (
+                400,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                401,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Some(ClientError),
+            ),
+            (
+                403,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (408, Code::Timeout, true, Action::Retry, Some(ClientError)),
+            (
+                429,
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Some(ClientError),
+            ),
+            (
+                503,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Some(ServerError),
+            ),
+        ] {
+            let (url, server) = reject_upgrade(status, true).await;
+            let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                "INVALID_AUTH",
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                None,
+            ),
+            (
+                "INSUFFICIENT_PERMISSIONS",
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "BAD_REQUEST",
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "INVALID_AUTH extra",
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
+        ] {
+            let diagnostic = deepgram_error_diagnostic(&serde_json::json!({"err_code": wire_code}));
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::asr::ws_fixture;
 
     fn test_config(model: &str) -> DeepgramConfig {
@@ -2163,7 +2391,11 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(error))
+                if error.code == super::super::CredentialErrorCode::Missing
+                    && !error.retryable
+                    && error.recovery_action == super::super::CredentialSafeRecoveryAction::ReenterCredential
+                    && error.set_id == Some(super::super::CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram))
         ));
     }
 
@@ -3949,6 +4181,190 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::reject_upgrades;
+        use std::sync::atomic::AtomicUsize;
+
+        let cases: &[(bool, &[u16])] = &[(false, &[401]), (false, &[429, 401]), (true, &[])];
+        for &(missing_key, statuses) in cases {
+            let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+                websocket.close(None).await.unwrap();
+            })
+            .await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let (reconnect_url, upgrade_server) = reject_upgrades(
+                statuses.iter().map(|&status| (status, None)).collect(),
+                true,
+            )
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let url = reconnect_url.clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+
+            let mut config = test_config("nova-3");
+            if missing_key {
+                config.api_key.clear();
+            }
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            let task = tokio::spawn(session_task(DeepgramSessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(true)),
+                user_disconnected: Arc::new(AtomicBool::new(false)),
+                disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(AtomicUsize::new(0)),
+                reconnect_opener: Some(opener),
+                run_io_entries: None,
+            }));
+
+            tokio::time::timeout(Duration::from_secs(6), task)
+                .await
+                .expect("reconnect must end on a terminal failure")
+                .unwrap();
+            initial.await.unwrap();
+            upgrade_server.await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), statuses.len());
+
+            let events: Vec<_> = event_rx.try_iter().collect();
+            let reconnects: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reconnects, (1..=statuses.len() as u32).collect::<Vec<_>>());
+            let errors: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    DeepgramEvent::Error { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(errors.len(), statuses.len().max(1));
+            assert!(matches!(events.last(), Some(DeepgramEvent::Error { .. })));
+            if missing_key {
+                assert_eq!(
+                    *errors[0],
+                    super::super::missing_provider_credential(BuiltInCredentialSetId::Deepgram)
+                );
+            } else {
+                if statuses.len() == 2 {
+                    assert!(
+                        matches!(errors[0], RuntimeDiagnostic::Runtime(error) if error.code == Code::RateLimited && error.retryable)
+                    );
+                }
+                assert!(
+                    matches!(errors.last().unwrap(), RuntimeDiagnostic::Runtime(error) if error.code == Code::CredentialRejected && !error.retryable)
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhaustion_reports_last_open_error_from_the_current_outage() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (recovered_url, recovered) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
+        let mut statuses = vec![(429, None)];
+        statuses.extend(std::iter::repeat_n((503, None), budget - 1));
+        statuses.push((408, None));
+        let (reject_url, rejecting) = reject_upgrades(statuses, true).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                recovered_url.clone()
+            } else {
+                reject_url.clone()
+            };
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            session_task_with_backoff(
+                DeepgramSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config("nova-3"),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("second outage must exhaust the budget");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), budget + 2);
+        initial.await.unwrap();
+        recovered.await.unwrap();
+        rejecting.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        let reset = events
+            .iter()
+            .position(|event| matches!(event, DeepgramEvent::Reconnected))
+            .unwrap();
+        assert_eq!(reset, 4, "the first reconnect must succeed after the 429");
+        let second_outage = &events[reset + 1..];
+        assert!(matches!(
+            second_outage.first(),
+            Some(DeepgramEvent::Disconnected)
+        ));
+        let second_attempts = second_outage.iter().filter_map(|event| match event {
+            DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
+            _ => None,
+        });
+        assert!(
+            second_attempts.eq(1..=budget as u32),
+            "the second outage needs a fresh budget"
+        );
+        let [
+            ..,
+            DeepgramEvent::Error {
+                message: final_open,
+            },
+            DeepgramEvent::Error { message: exhausted },
+        ] = second_outage
+        else {
+            panic!("expected final open and exhaustion errors");
+        };
+        assert_eq!(final_open, exhausted);
+        assert_outcome(
+            exhausted,
+            (
+                Code::Timeout,
+                true,
+                Action::Retry,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

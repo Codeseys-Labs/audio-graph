@@ -21,7 +21,9 @@
 //! delivered back through `crossbeam_channel`.
 
 use super::{
-    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
+    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
+    websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -598,9 +600,7 @@ impl AssemblyAIClient {
     /// audio writing, server message reading, and automatic reconnection with
     /// exponential backoff if the WebSocket drops mid-session.
     pub fn connect(&mut self) -> Result<(), AppError> {
-        if self.config.api_key.is_empty() {
-            return Err(websocket_diagnostic(Code::RequestRejected).into());
-        }
+        required_api_key(&self.config.api_key, BuiltInCredentialSetId::Assemblyai)?;
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -608,7 +608,7 @@ impl AssemblyAIClient {
             .enable_all()
             .thread_name("assemblyai-ws-rt")
             .build()
-            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -830,10 +830,11 @@ async fn open_ws_url(
     config: &AssemblyAIConfig,
     url_str: &str,
 ) -> Result<(WsWriter, WsReader), RuntimeDiagnostic> {
+    let api_key = required_api_key(&config.api_key, BuiltInCredentialSetId::Assemblyai)?;
     // Build via the shared helper so the five mandatory WS upgrade headers are
     // injected (the old hand-built `http::Request` set only `Authorization` and
     // never handshook). The key stays in the header, never the URL query string.
-    let auth = tungstenite::http::HeaderValue::from_str(&config.api_key)
+    let auth = tungstenite::http::HeaderValue::from_str(api_key)
         .map_err(|_| websocket_diagnostic(Code::RequestRejected))?;
     let request = crate::ws_request::build_ws_upgrade_request(
         url_str,
@@ -845,7 +846,7 @@ async fn open_ws_url(
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_error(&error))?;
+        .map_err(|error| websocket_upgrade_error(&error, true))?;
 
     Ok(ws_stream.split())
 }
@@ -983,6 +984,15 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
 
                 log::warn!("AssemblyAI session: disconnected — {disconnect:?}");
 
+                if let Err(message) =
+                    required_api_key(&config.api_key, BuiltInCredentialSetId::Assemblyai)
+                {
+                    let _ = event_tx.send(AssemblyAIEvent::Error { message });
+                    emit_session_terminated_once(&event_tx, &terminated_emitted);
+                    break;
+                }
+
+                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -996,9 +1006,9 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                             log::error!(
                                 "AssemblyAI session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            let _ = event_tx.send(AssemblyAIEvent::Error {
-                                message: websocket_diagnostic(Code::ProviderUnavailable),
-                            });
+                            let message = last_open_error
+                                .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
+                            let _ = event_tx.send(AssemblyAIEvent::Error { message });
                             emit_session_terminated_once(&event_tx, &terminated_emitted);
                             break false;
                         }
@@ -1056,10 +1066,13 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                         }
                         Err(diag) => {
                             log::warn!("AssemblyAI session: {diag}");
+                            if is_terminal_reconnect_error(&diag) {
+                                let _ = event_tx.send(AssemblyAIEvent::Error { message: diag });
+                                emit_session_terminated_once(&event_tx, &terminated_emitted);
+                                break false;
+                            }
+                            last_open_error = Some(diag.clone());
                             let _ = event_tx.send(AssemblyAIEvent::Error { message: diag });
-                            // Stay in the reconnect ladder. Do not loop back
-                            // through run_io with the previous closed socket.
-                            continue;
                         }
                     }
                 };
@@ -1270,7 +1283,8 @@ fn emit_invalid_response(tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
 
 fn assemblyai_error_diagnostic(code: Option<u64>) -> RuntimeDiagnostic {
     // https://www.assemblyai.com/docs/streaming/common-session-errors-and-closures
-    // 1008 has several causes. Its numeric code alone cannot justify a retry.
+    // 1008 shares a code across auth, rate, and billing failures. It cannot
+    // establish credential rejection or expiration without provider prose.
     websocket_diagnostic(match code {
         Some(1008 | 3007) => Code::RequestRejected,
         Some(1011) => Code::ProviderUnavailable,
@@ -1303,6 +1317,204 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        for statuses in [&[401][..], &[429, 401], &[]] {
+            let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+                websocket.close(None).await.unwrap();
+            })
+            .await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let (reconnect_url, upgrade_server) = reject_upgrades(
+                statuses.iter().map(|&status| (status, None)).collect(),
+                true,
+            )
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let url = reconnect_url.clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+
+            let mut config = test_config();
+            if statuses.is_empty() {
+                config.api_key.clear();
+            }
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            let task = tokio::spawn(session_task(AssemblyAISessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(true)),
+                user_disconnected: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(AtomicUsize::new(0)),
+                reconnect_opener: Some(opener),
+                run_io_entries: None,
+            }));
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("reconnect must end on a terminal failure")
+                .unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), statuses.len());
+            initial.await.unwrap();
+            upgrade_server.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        ..,
+                        AssemblyAIEvent::Error { .. },
+                        AssemblyAIEvent::SessionTerminated
+                    ]
+                ),
+                "unexpected events: {events:?}"
+            );
+            if statuses == [401] {
+                assert!(matches!(
+                    events.as_slice(),
+                    [
+                        AssemblyAIEvent::Reconnecting { attempt: 1, .. },
+                        AssemblyAIEvent::Error { .. },
+                        AssemblyAIEvent::SessionTerminated,
+                    ]
+                ));
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AssemblyAIEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                (1..=statuses.len() as u32).collect::<Vec<_>>(),
+            );
+            let errors: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AssemblyAIEvent::Error { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            match statuses.len() {
+                0 => {
+                    assert_eq!(
+                        errors,
+                        [&super::super::missing_provider_credential(
+                            BuiltInCredentialSetId::Assemblyai
+                        )]
+                    );
+                }
+                1 | 2 => {
+                    assert_eq!(errors.len(), statuses.len());
+                    if statuses.len() == 2 {
+                        assert_outcome(
+                            errors[0],
+                            (
+                                Code::RateLimited,
+                                true,
+                                Action::RetryAfterDelay,
+                                Some(ClientError),
+                            ),
+                        );
+                    }
+                    assert_outcome(
+                        errors[statuses.len() - 1],
+                        (
+                            Code::CredentialRejected,
+                            false,
+                            Action::ReenterCredential,
+                            Some(ClientError),
+                        ),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_and_provider_error_outcomes() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action,
+            RuntimeStatusClass::{ClientError, ServerError},
+        };
+
+        let mut config = test_config();
+        config.api_key = "sample credential".into();
+        for (status, code, retryable, action, status_class) in [
+            (
+                400,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (
+                401,
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                Some(ClientError),
+            ),
+            (
+                403,
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                Some(ClientError),
+            ),
+            (408, Code::Timeout, true, Action::Retry, Some(ClientError)),
+            (
+                429,
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Some(ClientError),
+            ),
+            (
+                503,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Some(ServerError),
+            ),
+        ] {
+            let (url, server) = reject_upgrade(status, true).await;
+            let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
+            server.await.unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                1008,
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (1011, Code::ProviderUnavailable, true, Action::Retry, None),
+            (4999, Code::Internal, false, Action::None, None),
+        ] {
+            let diagnostic = assemblyai_error_diagnostic(Some(wire_code));
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::asr::ws_fixture;
 
     #[tokio::test]
@@ -1567,7 +1779,11 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(error))
+                if error.code == super::super::CredentialErrorCode::Missing
+                    && !error.retryable
+                    && error.recovery_action == super::super::CredentialSafeRecoveryAction::ReenterCredential
+                    && error.set_id == Some(super::super::CredentialSetId::BuiltIn(BuiltInCredentialSetId::Assemblyai))
         ));
     }
 

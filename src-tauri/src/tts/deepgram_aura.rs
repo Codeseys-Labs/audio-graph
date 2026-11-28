@@ -338,7 +338,7 @@ impl TtsSession for AuraSession {
         self.content_egress_policy
             .check_text(AURA_POLICY_PROVIDER)
             .map_err(|_| aura_error(Kind::BadRequest, Code::PolicyBlocked))?;
-        if text.len() > MAX_SPEAK_CHARS {
+        if text.chars().take(MAX_SPEAK_CHARS + 1).count() > MAX_SPEAK_CHARS {
             return Err(aura_error(Kind::BadRequest, Code::RequestRejected));
         }
         self.send_cmd(SessionCmd::Speak(text.to_string()))
@@ -432,12 +432,11 @@ pub(crate) fn build_aura_url(config: &TtsConfig) -> String {
 /// Open a fresh WebSocket against `url` with `Token <api_key>` auth.
 /// Used both for the initial connect and for reconnect attempts.
 pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsReader), TtsError> {
-    // For ws:// URLs (test mock server), we still set the Authorization
-    // header but the server is free to ignore it.
+    let api_key = api_key.trim();
+    let credential_sent = !api_key.is_empty();
     let host = extract_host(url).unwrap_or_else(|| "api.deepgram.com".to_string());
-    let request = tungstenite::http::Request::builder()
+    let mut request = tungstenite::http::Request::builder()
         .uri(url)
-        .header("Authorization", format!("Token {}", api_key))
         .header(
             "Sec-WebSocket-Key",
             tungstenite::handshake::client::generate_key(),
@@ -448,6 +447,12 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
         .header("Host", host)
         .body(())
         .map_err(|_| aura_error(Kind::BadRequest, Code::RequestRejected))?;
+    if credential_sent {
+        let auth = format!("Token {api_key}")
+            .parse()
+            .map_err(|_| aura_error(Kind::BadRequest, Code::RequestRejected))?;
+        request.headers_mut().insert("Authorization", auth);
+    }
 
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary transport error (routed through `classify_tungstenite_error`
@@ -457,9 +462,24 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
             let status = response.status().as_u16();
             // Tungstenite only returns Ok on a 101 upgrade, but be defensive.
             if status != 101 {
-                return Err(TtsError::from_http_status(status));
+                return Err(TtsError::from_http_status(status, credential_sent));
             }
             Ok(ws_stream.split())
+        }
+        Err(tungstenite::Error::Http(response)) => {
+            if credential_sent
+                && let Some(diagnostic) = crate::asr::deepgram::deepgram_http_auth_diagnostic(
+                    &response,
+                    RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
+                        .with_transport(RuntimeTransport::Http),
+                )
+            {
+                return Err(TtsError::new(Kind::Auth, diagnostic));
+            }
+            Err(TtsError::from_http_status(
+                response.status().as_u16(),
+                credential_sent,
+            ))
         }
         Err(e) => Err(classify_tungstenite_error(&e)),
     }
@@ -486,7 +506,6 @@ fn classify_tungstenite_error(error: &tungstenite::Error) -> TtsError {
     use tungstenite::Error;
 
     match error {
-        Error::Http(response) => TtsError::from_http_status(response.status().as_u16()),
         Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
             aura_error(Kind::Network, Code::Timeout)
         }
@@ -601,8 +620,8 @@ async fn session_task(ctx: SessionCtx) {
 
                 reconnect_attempts += 1;
                 let Some(backoff_secs) = backoff_for_attempt(reconnect_attempts) else {
-                    let _ =
-                        event_tx.send(aura_error(Kind::Exhausted, Code::CapacityExhausted).into());
+                    let _ = event_tx
+                        .send(aura_error(Kind::Exhausted, Code::ProviderUnavailable).into());
                     break;
                 };
 
@@ -911,8 +930,7 @@ pub(crate) fn handle_server_text(
             aura_error(kind, code).into()
         }
         _ => {
-            let error = aura_error(Kind::Protocol, Code::InvalidResponse);
-            log::debug!("Aura unhandled text frame: {error}");
+            log::debug!("Aura unhandled text frame");
             return;
         }
     };
@@ -926,7 +944,9 @@ fn classify_aura_code(frame: &Value) -> (Kind, Code) {
     // Exact tokens from Deepgram's API and TTS WebSocket references.
     // Descriptions and unknown code strings never participate in diagnostics.
     match code {
-        Some("INVALID_AUTH" | "INSUFFICIENT_PERMISSIONS") => (Kind::Auth, Code::RequestRejected),
+        // https://developers.deepgram.com/docs/errors
+        Some("INVALID_AUTH") => (Kind::Auth, Code::CredentialRejected),
+        Some("INSUFFICIENT_PERMISSIONS") => (Kind::Auth, Code::PermissionDenied),
         Some("MESSAGE-0000" | "DATA-0000" | "BIG-0000" | "BIG-0001") => {
             (Kind::BadRequest, Code::RequestRejected)
         }
@@ -1044,8 +1064,8 @@ mod tests {
         capture_tts_logs();
         let route = "/v1/speak?api_key=query-secret-12345&model=aura-generated-test";
         let url = format!("ws://{addr}{route}");
-        let api_key = "dg-http-test-key";
-        let body = r#"{"error":"provider body text","description":"generated speech text 音声","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
+        let api_key = "example credential";
+        let body = r#"{"err_code":"INSUFFICIENT_PERMISSIONS","error":"provider body text","description":"generated speech text 音声","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
         let body_for_server = body.to_string();
 
         let server = tokio::spawn(async move {
@@ -1091,9 +1111,9 @@ mod tests {
         assert_eq!(err.kind(), Kind::Auth);
         assert_eq!(
             err.diagnostic(),
-            TtsError::from_http_status(401).diagnostic()
+            TtsError::from_http_status(403, true).diagnostic()
         );
-        assert_eq!(err.to_string(), "runtime/request_rejected");
+        assert_eq!(err.to_string(), "runtime/permission_denied");
         let event: TtsEvent = err.clone().into();
         let exported = format!(
             "{err} {err:?} {event:?} {} {} {:?}",
@@ -1215,7 +1235,10 @@ mod tests {
         );
 
         let logs = take_tts_logs().join("\n");
-        assert!(logs.contains("Aura unhandled text frame: runtime/invalid_response"));
+        assert!(
+            logs.lines()
+                .any(|line| line.ends_with("Aura unhandled text frame"))
+        );
         assert_no_canaries(
             &logs,
             &[unknown_type, unknown_code, request_id, secret, "/v1/speak"],
@@ -1520,7 +1543,12 @@ mod tests {
     fn handle_server_text_classifies_allowlisted_codes_without_prose() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         for (wire_code, kind, code) in [
-            ("INVALID_AUTH", Kind::Auth, Code::RequestRejected),
+            ("INVALID_AUTH", Kind::Auth, Code::CredentialRejected),
+            (
+                "INSUFFICIENT_PERMISSIONS",
+                Kind::Auth,
+                Code::PermissionDenied,
+            ),
             ("DATA-0001", Kind::RateLimit, Code::RateLimited),
             ("BIG-0001", Kind::BadRequest, Code::RequestRejected),
             ("NET-0000", Kind::Server, Code::ProviderUnavailable),
@@ -1725,6 +1753,34 @@ mod tests {
         );
         drop(session);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_accepts_cjk_text_at_character_limit() {
+        let (listener, url) = bind_keep().await;
+        let text = "漢".repeat(MAX_SPEAK_CHARS);
+        let expected = text.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Some(Ok(Message::Text(frame))) = ws.next().await else {
+                panic!("expected Speak frame");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&frame).unwrap(),
+                serde_json::json!({"type": "Speak", "text": expected})
+            );
+        });
+        let session = start_allowed_session(url).await.unwrap();
+        assert_eq!(
+            session.speak(&format!("{text}漢")).unwrap_err().kind(),
+            Kind::BadRequest,
+        );
+        session.speak(&text).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must receive the Speak frame")
+            .unwrap();
     }
 
     /// Server stub that echoes the protocol skeleton: accepts a Speak frame,

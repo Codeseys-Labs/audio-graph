@@ -5,6 +5,10 @@
   "messages": [
     {
       "raw": "{\"type\":\"session.created\",\"session\":{}}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"session.updated\",\"session\":{}}",
       "expected_session_ready": true
     },
     {

@@ -137,9 +137,8 @@ impl GladiaLiveConfig {
     }
 
     pub fn init_url(&self) -> Result<url::Url, RuntimeDiagnostic> {
-        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT).map_err(|_| {
-            super::asr_diagnostic(Code::Internal, super::RuntimeTransport::Http, None)
-        })?;
+        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT)
+            .map_err(|_| super::asr_diagnostic(Code::Internal, super::RuntimeTransport::Http))?;
         if let Some(region) = self.region {
             url.query_pairs_mut()
                 .append_pair("region", region.query_value());

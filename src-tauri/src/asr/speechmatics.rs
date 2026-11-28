@@ -260,7 +260,10 @@ impl SpeechmaticsResponse {
     /// Only allowlisted error categories cross the parser boundary.
     fn error_diagnostic(&self) -> RuntimeDiagnostic {
         let code = match self.r#type.as_deref() {
-            Some("not_authorised" | "not_allowed" | "invalid_model") => Code::RequestRejected,
+            // https://docs.speechmatics.com/api-ref/realtime-transcription-websocket#error
+            Some("not_authorised") => Code::CredentialRejected,
+            Some("not_allowed") => Code::PermissionDenied,
+            Some("invalid_model") => Code::RequestRejected,
             Some("quota_exceeded") => Code::CapacityExhausted,
             _ => Code::Internal,
         };
@@ -460,12 +463,15 @@ impl SpeechmaticsRealtimeParser {
 }
 
 pub fn classify_close_code(code: u16) -> RuntimeDiagnostic {
+    // https://docs.speechmatics.com/api-ref/realtime-transcription-websocket#connection-close
     websocket_diagnostic(match code {
         1000 => Code::ProviderUnavailable,
         1003 => Code::ProtocolError,
         1008 => Code::PolicyBlocked,
         1011 | 4013 => Code::ProviderUnavailable,
-        4001 | 4003 | 4004 | 4006 => Code::RequestRejected,
+        4001 => Code::CredentialRejected,
+        4003 => Code::PermissionDenied,
+        4004 | 4006 => Code::RequestRejected,
         4005 => Code::CapacityExhausted,
         _ => Code::Internal,
     })
@@ -614,6 +620,45 @@ fn speechmatics_span_id(source_id: &str, segment_index: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_error_outcomes() {
+        use super::super::diagnostic_tests::assert_outcome;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+
+        for (wire_code, code, retryable, action, status_class) in [
+            (
+                "not_authorised",
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
+                None,
+            ),
+            (
+                "not_allowed",
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+                None,
+            ),
+            (
+                "not_allowed extra",
+                Code::Internal,
+                false,
+                Action::None,
+                None,
+            ),
+        ] {
+            let mut parser = SpeechmaticsRealtimeParser::new("mic");
+            let frame = serde_json::json!({"message": "Error", "type": wire_code});
+            let diagnostic = parser
+                .parse_message(&frame.to_string(), 1)
+                .unwrap()
+                .error
+                .unwrap();
+            assert_outcome(&diagnostic, (code, retryable, action, status_class));
+        }
+    }
     use crate::projections::{TranscriptEvent, TranscriptLedger};
     use std::collections::HashMap;
 
@@ -1017,13 +1062,13 @@ mod tests {
             (1011, Code::ProviderUnavailable, true, Recovery::Retry),
             (
                 4001,
-                Code::RequestRejected,
+                Code::CredentialRejected,
                 false,
-                Recovery::ReviewConfiguration,
+                Recovery::ReenterCredential,
             ),
             (
                 4003,
-                Code::RequestRejected,
+                Code::PermissionDenied,
                 false,
                 Recovery::ReviewConfiguration,
             ),
@@ -1052,8 +1097,13 @@ mod tests {
                 panic!("expected runtime diagnostic for {wire_code}");
             };
             assert_eq!(
-                (actual.code, actual.retryable, actual.recovery_action),
-                (code, retryable, recovery)
+                (
+                    actual.code,
+                    actual.retryable,
+                    actual.recovery_action,
+                    actual.context.status_class
+                ),
+                (code, retryable, recovery, None)
             );
         }
     }

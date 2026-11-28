@@ -266,8 +266,10 @@ fn replay_openai_realtime(fixture: &EventFixture, relative_path: &str) -> Vec<Va
     let mut accumulator = HashMap::new();
     let mut events = Vec::new();
     for (index, message) in fixture.messages.iter().enumerate() {
-        let session_ready =
-            openai_realtime::handle_server_message(&message.raw, &tx, &mut accumulator);
+        let session_ready = matches!(
+            openai_realtime::handle_server_message(&message.raw, &tx, &mut accumulator),
+            openai_realtime::ServerMessage::SessionUpdated
+        );
         if let Some(expected) = message.expected_session_ready {
             assert_eq!(
                 session_ready, expected,

@@ -110,9 +110,9 @@
       "message": {
         "kind": "runtime",
         "detail": {
-          "code": "request_rejected",
+          "code": "credential_rejected",
           "retryable": false,
-          "recovery_action": "review_configuration",
+          "recovery_action": "reenter_credential",
           "context": { "operation": "transcription", "transport": "websocket" }
         }
       }

@@ -8,9 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use audio_graph_ipc_contract::credential_contract::{
+    BuiltInCredentialSetId, CredentialError, CredentialErrorCode, CredentialSafeRecoveryAction,
+    CredentialSetId,
+};
 use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
-    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeStatusClass, RuntimeTransport,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
 };
 use tokio_tungstenite::tungstenite::{
     self, protocol::CloseFrame, protocol::frame::coding::CloseCode,
@@ -49,18 +53,27 @@ mod ws_fixture;
 
 /// Convert a structural ASR failure before it can reach an event or log.
 fn websocket_diagnostic(code: RuntimeErrorCode) -> RuntimeDiagnostic {
-    asr_diagnostic(code, RuntimeTransport::Websocket, None)
+    asr_diagnostic(code, RuntimeTransport::Websocket)
 }
 
-fn asr_diagnostic(
-    code: RuntimeErrorCode,
-    transport: RuntimeTransport,
-    status: Option<RuntimeStatusClass>,
-) -> RuntimeDiagnostic {
+fn asr_diagnostic(code: RuntimeErrorCode, transport: RuntimeTransport) -> RuntimeDiagnostic {
     use RuntimeErrorCode as Code;
     use RuntimeSafeRecoveryAction as Recovery;
 
+    let context =
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport);
     let (retryable, recovery) = match code {
+        Code::CredentialRejected => {
+            return RuntimeErrorDiagnostic::credential_rejected(context).into();
+        }
+        Code::CredentialExpired => {
+            return RuntimeErrorDiagnostic::credential_expired(context).into();
+        }
+        Code::PermissionDenied => return RuntimeErrorDiagnostic::permission_denied(context).into(),
+        Code::InvalidConfiguration => {
+            // OpenAI Realtime uses this when session.update itself is rejected.
+            return RuntimeErrorDiagnostic::invalid_configuration(context).into();
+        }
         Code::RateLimited => (true, Recovery::RetryAfterDelay),
         Code::NetworkUnreachable => (true, Recovery::CheckNetwork),
         Code::Timeout | Code::ProviderUnavailable => (true, Recovery::Retry),
@@ -68,35 +81,64 @@ fn asr_diagnostic(
         Code::PolicyBlocked => (false, Recovery::ReviewPolicy),
         _ => (false, Recovery::None),
     };
-    let mut context =
-        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport);
-    if let Some(status) = status {
-        context = context.with_status_class(status);
-    }
     RuntimeErrorDiagnostic::new(code, retryable, recovery, context).into()
 }
 
+fn required_api_key(
+    api_key: &str,
+    provider: BuiltInCredentialSetId,
+) -> Result<&str, RuntimeDiagnostic> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(missing_provider_credential(provider));
+    }
+    Ok(api_key)
+}
+
+fn missing_provider_credential(provider: BuiltInCredentialSetId) -> RuntimeDiagnostic {
+    CredentialError {
+        code: CredentialErrorCode::Missing,
+        retryable: false,
+        recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+        set_id: Some(CredentialSetId::BuiltIn(provider)),
+    }
+    .into()
+}
+
+fn is_terminal_reconnect_error(diagnostic: &RuntimeDiagnostic) -> bool {
+    use RuntimeErrorCode as Code;
+
+    match diagnostic {
+        RuntimeDiagnostic::Credential(error) => error.code == CredentialErrorCode::Missing,
+        // RequestRejected also covers ambiguous statuses such as 400. Keep
+        // the existing reconnect budget for these coarse failures.
+        RuntimeDiagnostic::Runtime(error) => matches!(
+            error.code,
+            Code::CredentialRejected
+                | Code::CredentialExpired
+                | Code::PermissionDenied
+                | Code::InvalidConfiguration
+        ),
+    }
+}
+
 fn websocket_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
+    websocket_upgrade_error(error, false)
+}
+
+fn websocket_upgrade_error(error: &tungstenite::Error, credential_sent: bool) -> RuntimeDiagnostic {
     use RuntimeErrorCode as Code;
     use tungstenite::Error;
 
     let code = match error {
         Error::Http(response) => {
-            let status = response.status();
-            let class = match status.as_u16() {
-                300..=399 => Some(RuntimeStatusClass::Redirect),
-                400..=499 => Some(RuntimeStatusClass::ClientError),
-                500..=599 => Some(RuntimeStatusClass::ServerError),
-                _ => None,
-            };
-            let code = match status.as_u16() {
-                408 | 504 => Code::Timeout,
-                429 => Code::RateLimited,
-                500..=599 => Code::ProviderUnavailable,
-                300..=499 => Code::RequestRejected,
-                _ => Code::Internal,
-            };
-            return asr_diagnostic(code, RuntimeTransport::Websocket, class);
+            return RuntimeErrorDiagnostic::from_http_status(
+                response.status().as_u16(),
+                credential_sent,
+                RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                    .with_transport(RuntimeTransport::Websocket),
+            )
+            .into();
         }
         Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Code::Timeout,
         Error::Io(_) | Error::ConnectionClosed | Error::AlreadyClosed => Code::NetworkUnreachable,
@@ -169,6 +211,7 @@ mod diagnostic_tests {
     use super::*;
     use crate::error::AppError;
     use crate::test_log_capture::ThreadLogCapture;
+    use audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass;
     use serde_json::json;
 
     pub(super) const SECRET: &str = "asr-secret-canary";
@@ -238,6 +281,76 @@ mod diagnostic_tests {
             "{diagnostic:?} {diagnostic} {app_error:?} {app_error}"
         ));
         assert_safe(&serde_json::to_string(&app_error).unwrap());
+    }
+
+    pub(super) fn assert_outcome(
+        diagnostic: &RuntimeDiagnostic,
+        expected: (
+            RuntimeErrorCode,
+            bool,
+            RuntimeSafeRecoveryAction,
+            Option<RuntimeStatusClass>,
+        ),
+    ) {
+        assert_diagnostic(diagnostic, expected.0);
+        let RuntimeDiagnostic::Runtime(detail) = diagnostic else {
+            unreachable!();
+        };
+        assert_eq!(
+            (
+                detail.code,
+                detail.retryable,
+                detail.recovery_action,
+                detail.context.status_class
+            ),
+            expected
+        );
+    }
+
+    pub(super) async fn reject_upgrade(
+        status: u16,
+        credential_sent: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        reject_upgrades(vec![(status, Some(wire_prose()))], credential_sent).await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite's upgrade callback requires an HTTP response as its error"
+    )]
+    pub(super) async fn reject_upgrades(
+        responses: Vec<(u16, Option<String>)>,
+        credential_sent: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/asr", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                    .await
+                    .expect("timed out waiting for the test upgrade")
+                    .unwrap();
+                let result = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &Request, _: Response| {
+                        assert_eq!(
+                            request.headers().contains_key("authorization"),
+                            credential_sent
+                        );
+                        Err(tungstenite::http::Response::builder()
+                            .status(status)
+                            .header("x-request-id", REQUEST_ID)
+                            .body(body)
+                            .unwrap())
+                    },
+                )
+                .await;
+                assert!(result.is_err(), "server must reject the upgrade");
+            }
+        });
+        (url, server)
     }
 
     fn assert_parse_error(error: AsrParseError, expected: AsrParseError) {
@@ -417,7 +530,7 @@ mod diagnostic_tests {
             ),
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                Code::Timeout,
+                Code::ProviderUnavailable,
                 RuntimeStatusClass::ServerError,
             ),
         ] {
@@ -587,7 +700,7 @@ mod diagnostic_tests {
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
         for (wire_code, code) in [
-            ("invalid_api_key", RuntimeErrorCode::RequestRejected),
+            ("invalid_api_key", RuntimeErrorCode::Internal),
             ("session_expired", RuntimeErrorCode::Timeout),
         ] {
             let payload =
@@ -621,7 +734,7 @@ mod diagnostic_tests {
         let parsed = parser.parse_message(&payload, 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
         assert_diagnostic(&parsed.error.unwrap(), RuntimeErrorCode::Internal);
-        soniox::handle_server_message(&payload, &tx, &mut parser);
+        soniox::handle_server_message(&payload, &tx, &mut parser).unwrap();
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         let soniox::SonioxEvent::Error { message } = event else {
@@ -634,7 +747,7 @@ mod diagnostic_tests {
             (504, RuntimeErrorCode::Timeout),
         ] {
             let payload = json!({"error_code": wire_code, "error_message": wire_prose()});
-            soniox::handle_server_message(&payload.to_string(), &tx, &mut parser);
+            soniox::handle_server_message(&payload.to_string(), &tx, &mut parser).unwrap();
             let soniox::SonioxEvent::Error { message } = rx.try_recv().unwrap() else {
                 panic!("expected Soniox error event");
             };
