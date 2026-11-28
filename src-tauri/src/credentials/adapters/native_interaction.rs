@@ -277,6 +277,9 @@ mod explicit_recovery {
     // Platform policy adapters load as lexical children so only they can name
     // the private recovery contract; their raw FFI cores stay capability-blind
     // siblings of this module.
+    #[cfg(target_os = "linux")]
+    #[path = "../../linux_secret_service_recovery.rs"]
+    mod linux_secret_service_recovery;
     mod macos_keychain;
     mod windows_credential_manager;
 

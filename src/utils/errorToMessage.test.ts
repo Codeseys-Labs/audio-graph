@@ -201,6 +201,113 @@ describe("errorToMessage", () => {
     expect(artifactTooLargeDetails("boom")).toBeNull();
   });
 
+  it.each([
+    ["no message", undefined],
+    ["a null message", null],
+    ["a string message", "too large"],
+    ["a missing class", { size_bytes: 1, ceiling_bytes: 1 }],
+    [
+      "an unexpected class",
+      { artifact_class: "../secret", size_bytes: 1, ceiling_bytes: 1 },
+    ],
+    [
+      "a negative size",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: -1,
+        ceiling_bytes: 1,
+      },
+    ],
+    [
+      "an infinite size",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: Number.POSITIVE_INFINITY,
+        ceiling_bytes: 1,
+      },
+    ],
+    [
+      "a NaN ceiling",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: 1,
+        ceiling_bytes: Number.NaN,
+      },
+    ],
+    [
+      "a size sent as a string",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: "1",
+        ceiling_bytes: 1,
+      },
+    ],
+  ])("artifactTooLargeDetails returns null, and never throws, for an artifact_too_large with %s", (_name, message) => {
+    expect(() =>
+      artifactTooLargeDetails({ code: "artifact_too_large", message }),
+    ).not.toThrow();
+    expect(
+      artifactTooLargeDetails({ code: "artifact_too_large", message }),
+    ).toBeNull();
+  });
+
+  it.each([
+    "materialized_graph",
+    "materialized_notes",
+    "projection_events",
+    "transcript_events",
+    "diarization_events",
+    "live_graph",
+  ])("artifactTooLargeDetails accepts the %s class", (artifact_class) => {
+    expect(
+      artifactTooLargeDetails({
+        code: "artifact_too_large",
+        message: { artifact_class, size_bytes: 0, ceiling_bytes: 0 },
+      }),
+    ).toEqual({ artifactClass: artifact_class, sizeBytes: 0, ceilingBytes: 0 });
+  });
+
+  it("errorToMessage never throws on a refusal-shaped error with no message, and stays localized", () => {
+    // The retained global artifact loaders pass whatever `invoke` rejected with.
+    const text = errorToMessage({ code: "artifact_too_large" });
+    expect(typeof text).toBe("string");
+    expect(text.length).toBeGreaterThan(0);
+    expect(() =>
+      errorToMessage({ code: "artifact_too_large", message: null }),
+    ).not.toThrow();
+    expect(() =>
+      errorToMessage({
+        get code(): string {
+          throw new Error("hostile getter");
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      errorToMessage({
+        toString() {
+          throw new Error("hostile toString");
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["an absurd finite size", 1e300],
+    ["a fractional size", 1.5],
+    ["an unsafe integer", 2 ** 60],
+  ])("artifactTooLargeDetails returns null for %s", (_name, size) => {
+    expect(
+      artifactTooLargeDetails({
+        code: "artifact_too_large",
+        message: {
+          artifact_class: "materialized_notes",
+          size_bytes: size,
+          ceiling_bytes: 1,
+        },
+      }),
+    ).toBeNull();
+  });
+
   it("falls back to String(e) for legacy bare-string rejections", () => {
     // Older invoke surfaces or JS code may still reject with a plain
     // string. Must still produce a readable message.

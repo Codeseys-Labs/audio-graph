@@ -25,6 +25,10 @@ import ForceGraph2D, {
   type NodeObject,
 } from "react-force-graph-2d";
 import { useTranslation } from "react-i18next";
+import {
+  useReviewSessionId,
+  useSessionInteractions,
+} from "../session/SessionViewProvider";
 import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { useAudioGraphStore } from "../store";
 import type { GraphLink, GraphNode } from "../types";
@@ -80,12 +84,18 @@ function KnowledgeGraphViewer() {
   // used to be hand-written inline here — it now lives in exactly one
   // place, `useActiveGraphSnapshot`, shared with `LiveGraphStrip`'s three
   // modes (see that hook's own doc comment for the exact rule).
-  const { snapshot: activeGraphSnapshot } = useActiveGraphSnapshot();
+  const { snapshot: activeGraphSnapshot, materialized } =
+    useActiveGraphSnapshot();
+  // Under a Review provider the viewer shows (and exports) that session's graph.
+  const reviewSessionId = useReviewSessionId();
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
   // Cross-component edge focus from the After seek-timeline's related-edges
   // badge (audio-graph-a2a7): the ids of the graph edges an utterance produced.
-  const graphEdgeFocus = useAudioGraphStore((s) => s.graphEdgeFocus);
+  // A Review pane reads its own focus target, not the Live store's.
+  const { graphEdgeFocus } = useSessionInteractions();
+  const graphEdgeFocusRef = useRef(graphEdgeFocus);
+  graphEdgeFocusRef.current = graphEdgeFocus;
   // Re-read theme-derived canvas colors whenever the explicit choice changes.
   // (System mode is handled by the prefers-color-scheme listener below.)
   const theme = useAudioGraphStore((s) => s.theme);
@@ -129,12 +139,30 @@ function KnowledgeGraphViewer() {
     setIsExporting(true);
     setExportError(null);
     try {
-      const json = await exportGraph();
+      // `export_graph` dumps the backend's CURRENT graph, which is the live
+      // session's; a reviewed session is serialized from its own graph (same
+      // shape the sample preview export uses).
+      const json =
+        reviewSessionId !== null
+          ? JSON.stringify(
+              {
+                session_id: reviewSessionId,
+                materialized_graph: materialized,
+                snapshot: activeGraphSnapshot,
+              },
+              null,
+              2,
+            )
+          : await exportGraph();
       let sessionId = "session";
-      try {
-        sessionId = await getSessionId();
-      } catch {
-        // Non-fatal — keep the fallback.
+      if (reviewSessionId !== null) {
+        sessionId = reviewSessionId;
+      } else {
+        try {
+          sessionId = await getSessionId();
+        } catch {
+          // Non-fatal — keep the fallback.
+        }
       }
       const filename = `graph-${sessionId}-${filenameTimestamp()}.json`;
       downloadAsFile(json, filename, "application/json");
@@ -143,7 +171,13 @@ function KnowledgeGraphViewer() {
     } finally {
       setIsExporting(false);
     }
-  }, [exportGraph, getSessionId]);
+  }, [
+    exportGraph,
+    getSessionId,
+    reviewSessionId,
+    materialized,
+    activeGraphSnapshot,
+  ]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -228,7 +262,7 @@ function KnowledgeGraphViewer() {
       setFocusedEdgeIds(new Set());
       return;
     }
-    const ids = useAudioGraphStore.getState().graphEdgeFocus?.edgeIds ?? [];
+    const ids = graphEdgeFocusRef.current?.edgeIds ?? [];
     setFocusedEdgeIds(new Set(ids));
     // A fresh edge focus supersedes any prior node highlight so the two
     // dimming modes never fight; the inspect panel is closed for the same reason.

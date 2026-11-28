@@ -6,6 +6,7 @@
 //! `TranscriptSegment`s.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use audio_graph_ipc_contract::credential_contract::{
@@ -50,6 +51,49 @@ pub mod speechmatics;
 mod transport;
 #[cfg(test)]
 mod ws_fixture;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+enum AsrStopReason {
+    UserRequested = 1,
+    BacklogTimeout = 2,
+}
+
+/// The first stop reason survives caller cleanup after a failed audio send.
+#[derive(Default)]
+struct AsrSessionStop(AtomicU8);
+
+impl AsrSessionStop {
+    fn reason(&self) -> Option<AsrStopReason> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            1 => Some(AsrStopReason::UserRequested),
+            2 => Some(AsrStopReason::BacklogTimeout),
+            _ => unreachable!("invalid ASR stop reason"),
+        }
+    }
+
+    fn request(&self, reason: AsrStopReason) {
+        let _ = self
+            .0
+            .compare_exchange(0, reason as u8, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn reset(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    async fn wait_for_backoff(&self, delay: Duration) {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        while self.reason().is_none() {
+            tokio::select! {
+                _ = &mut sleep => break,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    }
+}
 
 /// Convert a structural ASR failure before it can reach an event or log.
 fn websocket_diagnostic(code: RuntimeErrorCode) -> RuntimeDiagnostic {
@@ -350,13 +394,13 @@ mod diagnostic_tests {
         credential_sent: bool,
     ) -> FreshOutage {
         let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
-        let mut statuses = vec![(429, None)];
+        let mut statuses = vec![(503, None), (429, None)];
         statuses.extend(std::iter::repeat_n((503, None), budget - 1));
         statuses.push((408, None));
         let (reject_url, rejections) = reject_upgrades(statuses, credential_sent).await;
         let (recovery_url, recovery) = ws_fixture::spawn_scripted_server(recovery_steps).await;
-        let mut endpoints = vec![reject_url; budget + 2];
-        endpoints[1] = recovery_url;
+        let mut endpoints = vec![reject_url; budget + 3];
+        endpoints[2] = recovery_url;
         FreshOutage {
             endpoints,
             recovery,
@@ -373,7 +417,7 @@ mod diagnostic_tests {
         use RuntimeErrorCode as Code;
         use RuntimeSafeRecoveryAction as Action;
         let (prior, recovered) = events.split_at(events.iter().position(reconnected).unwrap());
-        assert!(prior.iter().filter_map(&attempt).eq([1, 2]));
+        assert!(prior.iter().filter_map(&attempt).eq([1, 2, 3]));
         assert_outcome(
             prior.iter().filter_map(&error).next_back().unwrap(),
             (

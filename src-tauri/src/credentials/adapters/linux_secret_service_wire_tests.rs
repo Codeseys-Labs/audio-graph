@@ -13,27 +13,29 @@ use tokio::sync::oneshot;
 use zbus::message::{Flags, Type};
 use zbus::{Message, MessageStream};
 
-const GUARD: Duration = Duration::from_secs(15);
-const ITEM_PATH: &str = "/org/freedesktop/secrets/collection/locator_canary/first";
+pub(in crate::credentials::adapters) const GUARD: Duration = Duration::from_secs(15);
+pub(in crate::credentials::adapters) const ITEM_PATH: &str =
+    "/org/freedesktop/secrets/collection/locator_canary/first";
 const OTHER_ITEM: &str = "/org/freedesktop/secrets/collection/locator_canary/other";
-const COLLECTION: &str = "/org/freedesktop/secrets/collection/locator_canary";
+pub(in crate::credentials::adapters) const COLLECTION: &str =
+    "/org/freedesktop/secrets/collection/locator_canary";
 const SESSION: &str = "/org/freedesktop/secrets/session/locator_canary";
-const SECRET: &str = "secret canary marmalade";
-const ATTRIBUTE: &str = "attribute canary thyme";
-const LOCATOR: &str = "locator_canary";
+pub(in crate::credentials::adapters) const SECRET: &str = "secret canary marmalade";
+pub(in crate::credentials::adapters) const ATTRIBUTE: &str = "attribute canary thyme";
+pub(in crate::credentials::adapters) const LOCATOR: &str = "locator_canary";
 
-fn wanted() -> Attributes {
+pub(in crate::credentials::adapters) fn wanted() -> Attributes {
     Attributes::from([("slot".to_owned(), ATTRIBUTE.to_owned())])
 }
 
-struct Bus {
+pub(in crate::credentials::adapters) struct Bus {
     root: PathBuf,
     daemon: Option<Child>,
     address: String,
 }
 
 impl Bus {
-    fn start() -> Self {
+    pub(in crate::credentials::adapters) fn start() -> Self {
         let root = std::env::temp_dir().join(format!("ag-bus-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).expect("create private bus directory");
         let mut bus = Self {
@@ -97,8 +99,12 @@ impl Bus {
         bus
     }
 
-    fn address(&self) -> Address {
+    pub(in crate::credentials::adapters) fn address(&self) -> Address {
         self.address.parse().expect("private bus address")
+    }
+
+    pub(in crate::credentials::adapters) fn activation_attempted(&self) -> bool {
+        self.root.join("started").exists()
     }
 }
 
@@ -113,7 +119,7 @@ impl Drop for Bus {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Scenario {
+pub(in crate::credentials::adapters) enum Scenario {
     Found,
     Absent,
     Superset,
@@ -138,7 +144,7 @@ enum Scenario {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Call {
+pub(in crate::credentials::adapters) enum Call {
     Alias,
     Search,
     Attributes,
@@ -225,11 +231,9 @@ impl Drop for Peer {
     }
 }
 
-fn inspect_call(message: &Message) -> Call {
+pub(in crate::credentials::adapters) fn inspect_call(message: &Message) -> Call {
+    assert_flags(message);
     let header = message.header();
-    let flags = header.primary().flags();
-    assert!(flags.contains(Flags::NO_AUTO_START));
-    assert!(!flags.contains(Flags::ALLOW_INTERACTIVE_AUTH));
     match (
         header.interface().map(|i| i.as_str()),
         header.member().map(|m| m.as_str()),
@@ -254,6 +258,27 @@ fn inspect_call(message: &Message) -> Call {
         }
         // This fails on Unlock, Prompt, or any unexpected message.
         _ => panic!("unexpected method received by Secret Service"),
+    }
+}
+
+pub(in crate::credentials::adapters) fn assert_flags(message: &Message) {
+    let flags = message.header().primary().flags();
+    assert!(flags.contains(Flags::NO_AUTO_START));
+    assert!(!flags.contains(Flags::ALLOW_INTERACTIVE_AUTH));
+}
+
+#[derive(Default)]
+pub(in crate::credentials::adapters) struct ScriptSession(Option<super::super::crypto::SessionKey>);
+
+impl ScriptSession {
+    pub(in crate::credentials::adapters) async fn respond(
+        &mut self,
+        connection: &Connection,
+        message: &Message,
+        call: Call,
+        scenario: Scenario,
+    ) {
+        serve(connection, message, call, scenario, &mut self.0, &[]).await;
     }
 }
 
@@ -408,7 +433,7 @@ async fn reply_error(connection: &Connection, message: &Message, name: &str) {
         .expect("scripted error reply");
 }
 
-fn assert_redacted(rendered: &str) {
+pub(in crate::credentials::adapters) fn assert_redacted(rendered: &str) {
     for canary in [SECRET, ATTRIBUTE, LOCATOR] {
         assert!(!rendered.contains(canary), "private canary escaped");
     }

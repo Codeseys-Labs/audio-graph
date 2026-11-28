@@ -75,7 +75,13 @@ export function loadedSession(
  * A promise settled by hand. (`Promise.withResolvers` is not in this
  * project's TS `lib`, so this is the executor form behind a typed handle.)
  */
-export function deferred<T>() {
+export interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+}
+
+export function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
   const promise = new Promise<T>((res, rej) => {

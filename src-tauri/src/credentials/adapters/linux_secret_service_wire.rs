@@ -31,6 +31,7 @@ mod linux {
     const SERVICE_NAME: &str = "org.freedesktop.secrets";
     const SERVICE_PATH: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
+    const COLLECTION: &str = "org.freedesktop.Secret.Collection";
     const SESSION_INTERFACE: &str = "org.freedesktop.Secret.Session";
     const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
     const DEADLINE: Duration = Duration::from_secs(5);
@@ -128,7 +129,7 @@ mod linux {
         zbus::block_on(work(Instant::now() + timeout))
     }
 
-    async fn until<T>(
+    pub(in super::super) async fn until<T>(
         deadline: Instant,
         work: impl Future<Output = WireResult<T>>,
     ) -> WireResult<T> {
@@ -232,6 +233,17 @@ mod linux {
             attributes: &Attributes,
             allow_disappeared: bool,
         ) -> WireResult<Option<OwnedObjectPath>> {
+            match self.exact_candidate(attributes, allow_disappeared).await? {
+                Some((_, true)) => Err(Failure::Locked.into()),
+                candidate => Ok(candidate.map(|(item, _)| item)),
+            }
+        }
+
+        async fn exact_candidate(
+            &self,
+            attributes: &Attributes,
+            allow_disappeared: bool,
+        ) -> WireResult<Option<(OwnedObjectPath, bool)>> {
             let (unlocked, locked): SearchResults =
                 self.service_call("SearchItems", &(attributes,)).await?;
             let mut candidate = None;
@@ -254,13 +266,7 @@ mod linux {
                     }
                 }
             }
-            let Some((item, was_locked)) = candidate else {
-                return Ok(None);
-            };
-            if was_locked {
-                return Err(Failure::Locked.into());
-            }
-            Ok(Some(item))
+            Ok(candidate)
         }
 
         async fn read_exact(&mut self, attributes: &Attributes) -> WireResult<Option<SecretBytes>> {
@@ -289,13 +295,17 @@ mod linux {
             path: &OwnedObjectPath,
             interface: &str,
         ) -> WireResult<()> {
-            let locked: OwnedVariant = self
-                .call(path.as_str(), PROPERTIES, "Get", &(interface, "Locked"))
-                .await?;
-            if bool::try_from(locked).map_err(|_| Failure::CorruptRecord)? {
+            if self.locked(path, interface).await? {
                 return Err(Failure::Locked.into());
             }
             Ok(())
+        }
+
+        async fn locked(&self, path: &OwnedObjectPath, interface: &str) -> WireResult<bool> {
+            let locked: OwnedVariant = self
+                .call(path.as_str(), PROPERTIES, "Get", &(interface, "Locked"))
+                .await?;
+            bool::try_from(locked).map_err(|_| Failure::CorruptRecord.into())
         }
 
         async fn open_session(&mut self) -> WireResult<SessionKey> {
@@ -400,7 +410,7 @@ mod linux {
         }
     }
 
-    fn map_error(error: zbus::Error) -> WireError {
+    pub(in super::super) fn map_error(error: zbus::Error) -> WireError {
         use zbus::Error as Z;
         match error {
             Z::MethodError(name, _, _) => match name.as_str() {
@@ -434,12 +444,27 @@ mod linux {
 
     #[path = "linux_secret_service_mutations.rs"]
     mod mutations;
+    #[path = "linux_secret_service_recovery_target.rs"]
+    mod recovery_target;
     #[cfg(test)]
     #[path = "linux_secret_service_wire_tests.rs"]
-    mod tests;
+    pub(in super::super) mod tests;
     pub(in super::super) use mutations::{MutationOutcome, delete_exact, write_exact};
+    #[cfg(test)]
+    pub(in super::super) use recovery_target::locked_target_at;
+    pub(in super::super) use recovery_target::{LockedTarget, RecoveryScope, locked_target};
 }
 
+#[cfg(all(target_os = "linux", test))]
+pub(super) use linux::locked_target_at;
+#[cfg(all(target_os = "linux", test))]
+pub(super) use linux::tests as scripted_peer;
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)] // The factory remains dormant.
+pub(super) use linux::{
+    LockedTarget, RecoveryScope, WireError, locked_target, map_error as recovery_error,
+    until as recovery_until,
+};
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.
 pub(super) use linux::{MutationOutcome, delete_exact, write_exact};

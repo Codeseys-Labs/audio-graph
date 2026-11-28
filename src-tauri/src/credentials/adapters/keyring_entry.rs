@@ -31,6 +31,14 @@ impl EntryLocator {
         ))
     }
 
+    /// Written before any staging record of `set_id` and deleted after it. A
+    /// staging record is named by its operation, which only the journal
+    /// records; the guard is named by its set, so a staging remnant can be
+    /// found even when the journal is lost.
+    pub(super) fn staging_guard(set_id: &CredentialSetId) -> Self {
+        Self::from_account(format!("v2-staging-guard/{}", set_id.as_str()))
+    }
+
     pub(super) fn authority() -> Self {
         Self::from_account(AUTHORITY_ACCOUNT.to_owned())
     }
