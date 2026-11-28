@@ -521,13 +521,36 @@ pub(crate) struct CredentialService {
     events: Mutex<CredentialEventLog>,
     settings_activation: Arc<dyn CredentialSettingsActivationPort>,
     #[cfg(test)]
-    event_snapshot_test_hook: Mutex<Option<EventSnapshotTestHook>>,
+    event_snapshot_test_hook: Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    recovery_release_test_hook: Mutex<Option<TestPause>>,
+}
+
+/// A test-only stop: signals `reached`, then waits for `resume`.
+#[cfg(test)]
+struct TestPause {
+    reached: Sender<()>,
+    resume: Receiver<()>,
 }
 
 #[cfg(test)]
-struct EventSnapshotTestHook {
-    snapshot_captured: Sender<()>,
-    resume: Receiver<()>,
+impl TestPause {
+    fn run(slot: &Mutex<Option<Self>>) {
+        let pause = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(pause) = pause {
+            pause
+                .reached
+                .send(())
+                .expect("test pause receiver remains connected");
+            pause
+                .resume
+                .recv()
+                .expect("test pause sender resumes the paused caller");
+        }
+    }
 }
 
 impl CredentialService {
@@ -586,6 +609,8 @@ impl CredentialService {
             settings_activation,
             #[cfg(test)]
             event_snapshot_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            recovery_release_test_hook: Mutex::new(None),
         }
     }
 
@@ -634,31 +659,26 @@ impl CredentialService {
     }
 
     #[cfg(test)]
-    fn pause_next_event_snapshot(&self, snapshot_captured: Sender<()>, resume: Receiver<()>) {
+    fn pause_next_event_snapshot(&self, reached: Sender<()>, resume: Receiver<()>) {
         *self
             .event_snapshot_test_hook
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EventSnapshotTestHook {
-            snapshot_captured,
-            resume,
-        });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TestPause { reached, resume });
     }
 
     #[cfg(test)]
     fn run_event_snapshot_test_hook(&self) {
-        let hook = self
-            .event_snapshot_test_hook
+        TestPause::run(&self.event_snapshot_test_hook);
+    }
+
+    /// Pauses the next settings-activation recovery right after it has
+    /// released its worker permit.
+    #[cfg(test)]
+    fn pause_after_next_recovery_release(&self, reached: Sender<()>, resume: Receiver<()>) {
+        *self
+            .recovery_release_test_hook
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(hook) = hook {
-            hook.snapshot_captured
-                .send(())
-                .expect("event snapshot test receiver remains connected");
-            hook.resume
-                .recv()
-                .expect("event snapshot test sender resumes the reader");
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TestPause { reached, resume });
     }
 
     fn publish_committed_change(&self, receipt: CredentialMutationReceipt, global_epoch: u64) {
@@ -2121,7 +2141,8 @@ impl CredentialService {
                 session
                     .commit_journal(&journal)
                     .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-                Ok((journal, receipt, true))
+                self.cache_journal(journal, JournalOrigin::ThisService);
+                Ok((receipt, true))
             } else if expected_active_is_authoritative {
                 self.settings_activation
                     .restore_settings_backup(
@@ -2159,7 +2180,8 @@ impl CredentialService {
                 session
                     .commit_journal(&journal)
                     .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-                Ok((journal, receipt, false))
+                self.cache_journal(journal, JournalOrigin::ThisService);
+                Ok((receipt, false))
             } else {
                 Err(content_free_error(
                     CredentialErrorCode::RecoveryRequired,
@@ -2168,14 +2190,13 @@ impl CredentialService {
                 ))
             }
         }?;
-        let (recovered_journal, receipt, publish) = recovery;
-        let global_epoch = recovered_journal.global_epoch;
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = recovered_journal;
+        // The cache was updated above, under the permit: written after the
+        // permit's release, it could replace a journal another caller
+        // committed in between.
+        #[cfg(test)]
+        TestPause::run(&self.recovery_release_test_hook);
+        let (receipt, publish) = recovery;
         if publish {
-            debug_assert_eq!(global_epoch, self.snapshot_status().global_epoch);
             return self.complete_activation_cleanup(&prepared, receipt);
         }
         Ok(receipt)
@@ -5593,5 +5614,84 @@ mod tests {
             assert_eq!(store.active_write_count(), active_writes, "{mutation}");
             assert_eq!(store.staging_count(), 0, "{mutation}");
         }
+    }
+
+    /// A recovery and a replace on one service, called directly and
+    /// concurrently. The recovery clears its activation at epoch N; once its
+    /// worker permit is released, the replace commits N+1. Whatever order
+    /// the two then finish in, the observed epoch must stay at N+1, so a
+    /// later restoration of the journal to N is still refused as a rollback.
+    #[test]
+    fn a_recovery_racing_a_commit_never_moves_the_observed_epoch_backwards() {
+        let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = Arc::new(CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            Arc::new(FakeSettingsActivationPort::new(60)),
+        ));
+        let prepared = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: deepgram.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("racing-activation").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 60,
+                proposed_settings_revision: 61,
+                idempotency_token: idempotency("5d5d5d5d-5d5d-4d5d-8d5d-5d5d5d5d5d5d"),
+            })
+            .expect("stage an activation");
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        service.pause_after_next_recovery_release(reached_tx, resume_rx);
+        let recovering = Arc::clone(&service);
+        let operation_id = prepared.operation_id.clone();
+        let recovery =
+            std::thread::spawn(move || recovering.recover_settings_activation(&operation_id));
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the recovery released its permit");
+        let cleared = store.journal_snapshot();
+        assert!(cleared.pending_activation.is_none());
+
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("racing-commit").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("5e5e5e5e-5e5e-4e5e-8e5e-5e5e5e5e5e5e"),
+            })
+            .expect("the other caller commits the next epoch");
+        resume_tx.send(()).expect("resume the recovery");
+        assert_eq!(
+            recovery
+                .join()
+                .expect("recovery thread does not panic")
+                .expect("the recovery rolls the activation back")
+                .result_code,
+            CredentialMutationResultCode::NoChange
+        );
+
+        assert_eq!(
+            service.snapshot_status().global_epoch,
+            cleared.global_epoch + 1
+        );
+        store.restore_journal(cleared);
+        assert_eq!(
+            service
+                .replace_set(ReplaceCredentialSet {
+                    set_id: deepgram,
+                    auth_method_id: AuthMethodId::ApiKey,
+                    material: StoredSecretBundle::api_key("over-a-rollback").expect("API key"),
+                    expected_revision: None,
+                    idempotency_token: idempotency("5f5f5f5f-5f5f-4f5f-8f5f-5f5f5f5f5f5f"),
+                })
+                .expect_err("the restored journal is older than the observed epoch")
+                .code,
+            CredentialErrorCode::RecoveryRequired
+        );
     }
 }
