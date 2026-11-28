@@ -26775,6 +26775,7 @@ mod tests {
     }
 
     /// Every frame the stream sent, up to and including its terminal frame.
+    /// Nothing may follow the terminal frame: the channel then closes.
     async fn chat_frames_through_terminal(frames: &mut ChatFrames) -> Vec<serde_json::Value> {
         let mut seen = Vec::new();
         loop {
@@ -26785,6 +26786,10 @@ mod tests {
             let terminal = frame["event"] != "delta";
             seen.push(frame);
             if terminal {
+                let after = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+                    .await
+                    .expect("the stream closes its channel");
+                assert_eq!(after, None, "a frame after the terminal frame");
                 return seen;
             }
         }
