@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic, RuntimeOperation,
+    RuntimeSafeRecoveryAction,
+};
 use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 
@@ -1471,78 +1475,6 @@ fn api_config_from_runtime_settings(settings: &crate::settings::AppSettings) -> 
     })
 }
 
-fn sync_llm_clients_from_settings_cache(
-    settings_cache: &RwLock<crate::settings::AppSettings>,
-    api_client: &Mutex<Option<ApiClient>>,
-    openrouter_client: &Mutex<Option<OpenRouterClient>>,
-) -> Result<(), String> {
-    let (api_config, api_policy, openrouter_config, openrouter_policy) = {
-        let settings = settings_cache
-            .read()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        (
-            api_config_from_runtime_settings(&settings),
-            provider_content_egress_policy_from_settings(
-                &settings,
-                settings.llm_provider.requires_cloud_content_transfer(),
-            ),
-            openrouter_config_from_runtime_settings(&settings),
-            provider_content_egress_policy_from_settings(&settings, true),
-        )
-    };
-
-    sync_api_client(api_client, api_config, api_policy)?;
-    sync_openrouter_client(openrouter_client, openrouter_config, openrouter_policy)
-}
-
-async fn sync_llm_clients(state: &AppState) -> AppResult<()> {
-    let settings = state.app_settings.clone();
-    let api_client = state.api_client.clone();
-    let openrouter_client = state.openrouter_client.clone();
-    // Both caches own reqwest blocking clients. Keep construction and the
-    // destruction of replaced or cleared clients on the blocking pool.
-    tokio::task::spawn_blocking(move || {
-        sync_llm_clients_from_settings_cache(&settings, &api_client, &openrouter_client)
-    })
-    .await
-    .map_err(|error| AppError::Unknown(format!("LLM client sync task failed: {error}")))?
-    .map_err(AppError::Unknown)
-}
-
-fn sync_api_client(
-    api_client: &Mutex<Option<ApiClient>>,
-    next_config: Option<ApiConfig>,
-    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
-) -> Result<(), String> {
-    let mut guard = api_client
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
-
-    match next_config {
-        Some(config) => {
-            let already_current = guard
-                .as_ref()
-                .map(|client| {
-                    client.config() == &config
-                        && client.content_egress_policy() == content_egress_policy
-                })
-                .unwrap_or(false);
-            if !already_current {
-                *guard =
-                    Some(ApiClient::new(config).with_content_egress_policy(content_egress_policy));
-                log::info!("LLM API client synced from runtime settings");
-            }
-        }
-        None => {
-            if guard.take().is_some() {
-                log::info!("LLM API client cleared because the active provider is not configured");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn openrouter_config_from_runtime_settings(
     settings: &crate::settings::AppSettings,
 ) -> Option<OpenRouterConfig> {
@@ -1582,41 +1514,256 @@ fn openrouter_config_from_runtime_settings(
     })
 }
 
-fn sync_openrouter_client(
-    openrouter_client: &Mutex<Option<OpenRouterClient>>,
-    next_config: Option<OpenRouterConfig>,
-    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
-) -> Result<(), String> {
-    let mut guard = openrouter_client
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+type ClientTarget<C> = Option<(
+    <C as CachedLlmClient>::Config,
+    crate::asr::ProviderContentEgressPolicy,
+)>;
 
-    match next_config {
-        Some(config) => {
-            let already_current = guard
-                .as_ref()
-                .map(|client| {
-                    client.config() == &config
-                        && client.content_egress_policy() == content_egress_policy
-                })
-                .unwrap_or(false);
-            if !already_current {
-                *guard = Some(
-                    OpenRouterClient::new(config).with_content_egress_policy(content_egress_policy),
-                );
-                log::info!("OpenRouter client synced from runtime settings");
-            }
-        }
-        None => {
-            if guard.take().is_some() {
-                log::info!(
-                    "OpenRouter client cleared because the active provider is not OpenRouter"
-                );
-            }
-        }
+/// One `AppState` LLM client cache slot. Both slots wrap a reqwest blocking
+/// client, so building or dropping one must stay off the async executor.
+trait CachedLlmClient: Sized {
+    type Config: Clone + PartialEq;
+    const NAME: &'static str;
+    fn build(config: Self::Config, policy: crate::asr::ProviderContentEgressPolicy) -> Self;
+    fn is_current(
+        &self,
+        config: &Self::Config,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool;
+}
+
+impl CachedLlmClient for ApiClient {
+    type Config = ApiConfig;
+    const NAME: &'static str = "LLM API client";
+
+    fn build(config: ApiConfig, policy: crate::asr::ProviderContentEgressPolicy) -> Self {
+        ApiClient::new(config).with_content_egress_policy(policy)
     }
 
-    Ok(())
+    fn is_current(
+        &self,
+        config: &ApiConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool {
+        self.config() == config && self.content_egress_policy() == policy
+    }
+}
+
+impl CachedLlmClient for OpenRouterClient {
+    type Config = OpenRouterConfig;
+    const NAME: &'static str = "OpenRouter client";
+
+    fn build(config: OpenRouterConfig, policy: crate::asr::ProviderContentEgressPolicy) -> Self {
+        OpenRouterClient::new(config).with_content_egress_policy(policy)
+    }
+
+    fn is_current(
+        &self,
+        config: &OpenRouterConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool {
+        self.config() == config && self.content_egress_policy() == policy
+    }
+}
+
+/// The cache contents one settings snapshot calls for.
+#[derive(PartialEq)]
+struct LlmClientTargets {
+    api: ClientTarget<ApiClient>,
+    openrouter: ClientTarget<OpenRouterClient>,
+}
+
+impl LlmClientTargets {
+    fn from_settings(settings: &crate::settings::AppSettings) -> Self {
+        Self {
+            api: api_config_from_runtime_settings(settings).map(|config| {
+                let requires_cloud = settings.llm_provider.requires_cloud_content_transfer();
+                (
+                    config,
+                    provider_content_egress_policy_from_settings(settings, requires_cloud),
+                )
+            }),
+            openrouter: openrouter_config_from_runtime_settings(settings).map(|config| {
+                (
+                    config,
+                    provider_content_egress_policy_from_settings(settings, true),
+                )
+            }),
+        }
+    }
+}
+
+/// Replacement clients built for one snapshot, outside every lock.
+struct PreparedLlmClients {
+    api: Option<ApiClient>,
+    openrouter: Option<OpenRouterClient>,
+}
+
+impl PreparedLlmClients {
+    fn build(
+        api_client: &Mutex<Option<ApiClient>>,
+        openrouter_client: &Mutex<Option<OpenRouterClient>>,
+        targets: &LlmClientTargets,
+    ) -> Self {
+        Self {
+            api: prepare_client(api_client, &targets.api),
+            openrouter: prepare_client(openrouter_client, &targets.openrouter),
+        }
+    }
+}
+
+fn lock_client_cache<C>(cache: &Mutex<Option<C>>) -> std::sync::MutexGuard<'_, Option<C>> {
+    // A slot is only ever replaced whole, so a poisoned guard still holds a
+    // valid value. Recover it so one panic cannot pin either cache.
+    cache.lock().unwrap_or_else(|poisoned| {
+        cache.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn client_is_current<C: CachedLlmClient>(slot: &Option<C>, target: &ClientTarget<C>) -> bool {
+    match (slot, target) {
+        (None, None) => true,
+        (Some(client), Some((config, policy))) => client.is_current(config, *policy),
+        _ => false,
+    }
+}
+
+fn prepare_client<C: CachedLlmClient>(
+    cache: &Mutex<Option<C>>,
+    target: &ClientTarget<C>,
+) -> Option<C> {
+    let (config, policy) = target.as_ref()?;
+    let current = client_is_current(&lock_client_cache(cache), target);
+    (!current).then(|| C::build(config.clone(), *policy))
+}
+
+fn can_publish<C: CachedLlmClient>(
+    slot: &Option<C>,
+    target: &ClientTarget<C>,
+    prepared: &Option<C>,
+) -> bool {
+    target.is_none() || prepared.is_some() || client_is_current(slot, target)
+}
+
+fn publish_client<C: CachedLlmClient>(
+    slot: &mut Option<C>,
+    target: &ClientTarget<C>,
+    prepared: &mut Option<C>,
+) -> Option<C> {
+    if client_is_current(slot, target) {
+        return None;
+    }
+    let next = prepared.take();
+    if next.is_some() {
+        log::info!("{} synced from runtime settings", C::NAME);
+    } else {
+        log::info!(
+            "{} cleared because the active provider does not use it",
+            C::NAME
+        );
+    }
+    std::mem::replace(slot, next)
+}
+
+/// Publish `prepared` only while `targets` still describes the cached
+/// settings. Returns `false` when the settings or a cache moved on, so the
+/// caller rebuilds from the newer snapshot.
+fn try_publish_llm_clients(
+    settings_cache: &RwLock<crate::settings::AppSettings>,
+    api_client: &Mutex<Option<ApiClient>>,
+    openrouter_client: &Mutex<Option<OpenRouterClient>>,
+    targets: &LlmClientTargets,
+    mut prepared: PreparedLlmClients,
+) -> Result<bool, String> {
+    // Lock order: settings, API cache, OpenRouter cache. Holding the settings
+    // read guard across the swap means a concurrent save cannot finish its own
+    // sync between this snapshot and this write.
+    let settings = settings_cache
+        .read()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    if LlmClientTargets::from_settings(&settings) != *targets {
+        return Ok(false);
+    }
+    let mut api_slot = lock_client_cache(api_client);
+    let mut openrouter_slot = lock_client_cache(openrouter_client);
+    if !can_publish(&api_slot, &targets.api, &prepared.api)
+        || !can_publish(&openrouter_slot, &targets.openrouter, &prepared.openrouter)
+    {
+        return Ok(false);
+    }
+    let retired = (
+        publish_client(&mut api_slot, &targets.api, &mut prepared.api),
+        publish_client(
+            &mut openrouter_slot,
+            &targets.openrouter,
+            &mut prepared.openrouter,
+        ),
+    );
+    drop(openrouter_slot);
+    drop(api_slot);
+    drop(settings);
+    // Replaced clients and unused builds are destroyed after every lock is
+    // released. Early returns get the same order: parameters drop last.
+    drop(retired);
+    drop(prepared);
+    Ok(true)
+}
+
+/// Bring both LLM client caches in line with the cached settings. Both slots
+/// change together from one settings snapshot that is still current when
+/// they are written.
+fn sync_llm_clients_from_settings_cache(
+    settings_cache: &RwLock<crate::settings::AppSettings>,
+    api_client: &Mutex<Option<ApiClient>>,
+    openrouter_client: &Mutex<Option<OpenRouterClient>>,
+) -> Result<(), String> {
+    loop {
+        let targets = {
+            let settings = settings_cache
+                .read()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            LlmClientTargets::from_settings(&settings)
+        };
+        // Construction can panic and takes milliseconds: build without any
+        // lock held so it neither poisons a cache nor stalls a settings save.
+        let prepared = PreparedLlmClients::build(api_client, openrouter_client, &targets);
+        if try_publish_llm_clients(
+            settings_cache,
+            api_client,
+            openrouter_client,
+            &targets,
+            prepared,
+        )? {
+            return Ok(());
+        }
+    }
+}
+
+async fn sync_llm_clients(state: &AppState) -> AppResult<()> {
+    let settings = state.app_settings.clone();
+    let api_client = state.api_client.clone();
+    let openrouter_client = state.openrouter_client.clone();
+    tokio::task::spawn_blocking(move || {
+        sync_llm_clients_from_settings_cache(&settings, &api_client, &openrouter_client)
+    })
+    .await
+    .map_err(|error| -> AppError {
+        // A JoinError's Display carries the panic payload; keep it off IPC.
+        let context = RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference);
+        if error.is_cancelled() {
+            RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::Cancelled,
+                false,
+                RuntimeSafeRecoveryAction::None,
+                context,
+            )
+            .into()
+        } else {
+            RuntimeErrorDiagnostic::internal(context).into()
+        }
+    })?
+    .map_err(AppError::Unknown)
 }
 
 // ---------------------------------------------------------------------------
@@ -18435,23 +18582,45 @@ mod tests {
         use tauri::ipc::{CallbackFn, InvokeBody, InvokeError, InvokeResponse};
 
         const IPC_DIR: &str = "AUDIOGRAPH_TEST_IPC_DIR";
+        const COMPLETED: &str = "ipc-matrix.completed";
         let Some(dir) = std::env::var_os(IPC_DIR).map(std::path::PathBuf::from) else {
             // The real handler takes AppHandle<Wry>, not MockRuntime. Isolate
             // its event loop from the shared Wry app used by other tests.
             let dir = unique_tempdir("provider-ipc");
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "--exact",
                     "commands::tests::provider_deferred_registered_ipc_matrix",
+                    "--exact",
+                    "--include-ignored",
                     "--nocapture",
                 ])
                 .env(IPC_DIR, &dir)
                 .env(crate::user_data::DATA_DIR_ENV, &dir)
                 .env("XDG_CONFIG_HOME", &dir)
-                .status()
+                .spawn()
                 .expect("launch isolated Wry IPC test");
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(status.success(), "Wry IPC test failed: {status}");
+            // Bounds WebView startup, every invoke, and shutdown.
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll Wry IPC test") {
+                    break Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            // A filter that matches nothing also exits 0. Only the marker
+            // written after the last assertion proves the matrix ran.
+            let completed = dir.join(COMPLETED).is_file();
+            let _ = std::fs::remove_dir_all(&dir);
+            let status = status.expect("Wry IPC test exceeded its deadline");
+            assert!(
+                status.success() && completed,
+                "Wry IPC matrix did not complete: {status}, marker: {completed}"
+            );
             return;
         };
 
@@ -18513,7 +18682,41 @@ mod tests {
                 loaded.status,
                 crate::settings::SettingsLoadStatus::CanonicalOk
             );
-            *state.app_settings.write().unwrap() = loaded.settings;
+            // Disk settings are redacted. Hydrate a synthetic runtime key so a
+            // premature client sync would populate a cache.
+            let mut runtime = loaded.settings;
+            if let LlmProvider::Api { api_key, .. } | LlmProvider::OpenRouter { api_key, .. } =
+                &mut runtime.llm_provider
+            {
+                *api_key = "synthetic-runtime-key".into();
+            }
+            *state.app_settings.write().unwrap() = runtime;
+        };
+        // A rejected start must leave capture, clients, chat history, and
+        // realtime transports exactly as they were.
+        let assert_no_start_side_effects = |row: &str| {
+            assert!(state.api_client.lock().unwrap().is_none(), "{row}");
+            assert!(state.openrouter_client.lock().unwrap().is_none(), "{row}");
+            assert!(state.gemini_client.lock().unwrap().is_none(), "{row}");
+            assert!(
+                state.openai_realtime_client.lock().unwrap().is_none(),
+                "{row}"
+            );
+            assert!(!*state.is_gemini_active.read().unwrap(), "{row}");
+            assert!(!*state.is_converse_active.read().unwrap(), "{row}");
+            assert!(!*state.is_openai_realtime_active.read().unwrap(), "{row}");
+            assert!(!state.is_transcribing.load(Ordering::SeqCst), "{row}");
+            assert!(
+                state.speech_processor_thread.lock().unwrap().is_none(),
+                "{row}"
+            );
+            assert!(state.chat_history.read().unwrap().is_empty(), "{row}");
+            assert!(*state.is_capturing.read().unwrap(), "{row}");
+            assert_eq!(
+                state.capture_manager.lock().unwrap().active_captures(),
+                ["system"],
+                "{row}"
+            );
         };
 
         *state.is_capturing.write().unwrap() = true;
@@ -18554,22 +18757,8 @@ mod tests {
                 })),
                 "{command}"
             );
+            assert_no_start_side_effects(command);
         }
-        assert!(state.api_client.lock().unwrap().is_none());
-        assert!(state.openrouter_client.lock().unwrap().is_none());
-        assert!(state.gemini_client.lock().unwrap().is_none());
-        assert!(state.openai_realtime_client.lock().unwrap().is_none());
-        assert!(!*state.is_gemini_active.read().unwrap());
-        assert!(!*state.is_converse_active.read().unwrap());
-        assert!(!*state.is_openai_realtime_active.read().unwrap());
-        assert!(!state.is_transcribing.load(Ordering::SeqCst));
-        assert!(state.speech_processor_thread.lock().unwrap().is_none());
-        assert!(state.chat_history.read().unwrap().is_empty());
-        assert!(*state.is_capturing.read().unwrap());
-        assert_eq!(
-            state.capture_manager.lock().unwrap().active_captures(),
-            ["system"]
-        );
 
         for command in [
             "stop_transcribe",
@@ -18609,13 +18798,16 @@ mod tests {
             settings.llm_provider = provider;
             settings.privacy_mode = PrivacyMode::ByokCloud;
             persist(&settings);
+            let row = format!("start_transcribe with {:?}", settings.llm_provider);
             assert_eq!(
                 invoke("start_transcribe", json!({})),
                 Err(json!({
                     "code": "credential_missing",
                     "message": { "key": "deepgram_api_key" }
-                }))
+                })),
+                "{row}"
             );
+            assert_no_start_side_effects(&row);
 
             settings.privacy_mode = PrivacyMode::LocalOnly;
             persist(&settings);
@@ -18632,9 +18824,11 @@ mod tests {
                 ),
                 ("synthesize_notes", json!({}), "notes_synthesis"),
             ] {
+                let row = format!("{command} with {:?}", settings.llm_provider);
                 let err = invoke(command, payload).unwrap_err();
-                assert_eq!(err["code"], "privacy_policy_blocked", "{command}: {err}");
-                assert_eq!(err["message"]["action"], action, "{command}: {err}");
+                assert_eq!(err["code"], "privacy_policy_blocked", "{row}: {err}");
+                assert_eq!(err["message"]["action"], action, "{row}: {err}");
+                assert_no_start_side_effects(&row);
             }
         }
 
@@ -18658,14 +18852,13 @@ mod tests {
         assert_eq!(err["code"], "privacy_policy_blocked");
         assert_eq!(err["message"]["action"], "tts_speak_aloud");
         assert_eq!(err["message"]["provider"], "tts.deepgram_aura");
-        assert!(state.chat_history.read().unwrap().is_empty());
-        assert!(state.api_client.lock().unwrap().is_none());
-        assert!(state.openrouter_client.lock().unwrap().is_none());
+        assert_no_start_side_effects("start_streaming_chat with speak-aloud");
 
         drain_test_writers(&state);
         let path = crate::settings::get_settings_path(app.handle()).unwrap();
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_dir(path.parent().unwrap());
+        std::fs::write(dir.join(COMPLETED), b"completed").unwrap();
     }
 
     #[test]
@@ -21812,6 +22005,90 @@ mod tests {
         .expect("clear sync must succeed");
 
         assert!(state.api_client.lock().expect("lock poisoned").is_none());
+    }
+
+    #[test]
+    fn stale_llm_client_sync_cannot_undo_a_newer_privacy_mode() {
+        let state = AppState::new();
+        let cloud = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                api_key: "fixture".into(),
+                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+            },
+            privacy_mode: crate::settings::PrivacyMode::ByokCloud,
+            ..Default::default()
+        };
+        let local_only = crate::settings::AppSettings {
+            privacy_mode: crate::settings::PrivacyMode::LocalOnly,
+            ..cloud.clone()
+        };
+        *state.app_settings.write().unwrap() = cloud;
+
+        // Old reader: snapshot and build under ByokCloud, then stall.
+        let stale = LlmClientTargets::from_settings(&state.app_settings.read().unwrap());
+        let prepared =
+            PreparedLlmClients::build(&state.api_client, &state.openrouter_client, &stale);
+        // New writer: switch to LocalOnly and finish its own sync.
+        *state.app_settings.write().unwrap() = local_only.clone();
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+        // Old reader resumes: its publish must be refused.
+        assert!(
+            !try_publish_llm_clients(
+                &state.app_settings,
+                &state.api_client,
+                &state.openrouter_client,
+                &stale,
+                prepared,
+            )
+            .unwrap()
+        );
+
+        let (config, policy) = LlmClientTargets::from_settings(&local_only).api.unwrap();
+        let client = state.api_client.lock().unwrap().take().unwrap();
+        assert!(client.is_current(&config, policy));
+        assert_ne!(
+            Some(client.content_egress_policy()),
+            stale.api.map(|(_, policy)| policy)
+        );
+    }
+
+    #[test]
+    fn llm_client_sync_recovers_a_poisoned_cache() {
+        let state = AppState::new();
+        let cache = state.api_client.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = cache.lock().unwrap();
+            panic!("poison the API client cache");
+        })
+        .join();
+        assert!(state.api_client.is_poisoned());
+        *state.app_settings.write().unwrap() = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::OpenRouter {
+                model: "fixture-model".into(),
+                base_url: crate::llm::openrouter::DEFAULT_BASE_URL.into(),
+                provider_order: None,
+                include_usage_in_stream: true,
+                api_key: "fixture".into(),
+            },
+            ..Default::default()
+        };
+
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+
+        assert!(!state.api_client.is_poisoned());
+        assert!(state.api_client.lock().unwrap().is_none());
+        assert!(state.openrouter_client.lock().unwrap().take().is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25168,6 +25445,13 @@ mod tests {
                 assert!(!serialized.contains("deadline moved"));
             }
         });
+        // The detached llm-executor thread co-owns this cache; release the
+        // fixture client now, outside the runtime.
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4): the same
@@ -25292,6 +25576,11 @@ mod tests {
                 assert!(!serialized.contains("Nothing has been discussed"));
             }
         });
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     // Keep the process-wide test home lock outside the async body.
@@ -25374,6 +25663,11 @@ mod tests {
             assert_eq!(answer.status, events::CardAnswerStatus::Answered);
             assert_eq!(answer.text, "Manual retry answer.");
         });
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     #[test]
