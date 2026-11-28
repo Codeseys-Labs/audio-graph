@@ -25151,12 +25151,6 @@ mod tests {
             let app = crate::speech::shared_test_app_handle();
             runtime.block_on(async {
                 let state = manager.state::<AppState>();
-                *state.is_capturing.write().unwrap() = true;
-                let finished = state
-                    .capture_manager
-                    .lock()
-                    .unwrap()
-                    .insert_synthetic_handle("system", false);
                 {
                     let mut settings = state.app_settings.write().unwrap();
                     settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
@@ -25179,15 +25173,31 @@ mod tests {
                         model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
                     };
                 }
+                let controls = script_capture(
+                    state.inner(),
+                    vec![ScriptedStart::Ready],
+                    SCRIPTED_BOUND,
+                    SCRIPTED_BOUND,
+                );
+                start_capture_impl(
+                    capture_requests(&["system"]),
+                    &start_id(),
+                    state.inner(),
+                    &app,
+                )
+                .await
+                .expect("the capture acknowledges");
+                let worker = controls.next_worker(SCRIPTED_BOUND);
                 // Stand in for the audio consumer while the real Start runs.
                 *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
                 crate::test_log_capture::install();
                 let before = attaching_records();
 
                 // Hold the scheduler lock the command takes right after its
-                // final capture check; lose the source once that check passed.
+                // final capture check; lose the source once that check passed,
+                // and release the lock once the loss was reported.
                 let schedulers = state.projection_schedulers.clone();
-                let dying = Arc::clone(&finished);
+                let exit_requests = controls.exit_requests.clone();
                 let (held_tx, held) = std::sync::mpsc::channel();
                 let holder = std::thread::spawn(move || {
                     let _schedulers = schedulers.lock().unwrap();
@@ -25200,22 +25210,27 @@ mod tests {
                         );
                         std::thread::yield_now();
                     }
-                    dying.store(true, Ordering::SeqCst);
+                    worker.lose_stream();
+                    exit_requests
+                        .recv_timeout(SCRIPTED_BOUND)
+                        .expect("the lost stream requests reconciliation")
                 });
                 held.recv_timeout(SCRIPTED_BOUND).unwrap();
 
                 start_transcribe(manager.state::<AppState>(), app.clone())
                     .await
                     .expect("transcription attached before the loss was observed");
-                holder.join().unwrap();
+                let (source_id, finished) = holder.join().unwrap();
+                assert_eq!(source_id, "system");
                 assert!(state.is_transcribing.load(Ordering::SeqCst));
 
                 // The dead source's reconciliation tears transcription down.
-                stop_capture_impl("system".into(), state.inner(), &app, Some(finished), None)
+                stop_capture_impl(source_id, state.inner(), &app, Some(finished), None)
                     .await
                     .unwrap();
                 assert!(state.speech_processor_thread.lock().unwrap().is_none());
                 assert_capture_idle(state.inner());
+                assert_eq!(capture_lifecycle_rows(state.inner()), (1, 1));
                 drain_test_writers(state.inner());
             });
         });
