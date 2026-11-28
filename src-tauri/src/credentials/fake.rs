@@ -4,10 +4,12 @@ use super::domain::{
     AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure, EncodedCredentialRecord,
 };
 use super::service::{
-    AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
-    CredentialSettingsActivationPort,
+    AuthoritativeActiveRead, AuthoritativeRepair, CredentialEntryStore, CredentialMutationSession,
+    CredentialSettingsActivationPort, UntrackedRecordOutcome, UntrackedRecordRepair,
 };
-use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
+use audio_graph_ipc_contract::credential_contract::{
+    BUILT_IN_CREDENTIAL_SET_IDS, CredentialOperationId, CredentialSetId,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
@@ -26,6 +28,7 @@ pub(crate) enum FakeStoreCall {
     DeleteStaging,
     CommitJournal,
     EndMutation,
+    RepairUntracked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +211,51 @@ impl CredentialEntryStore for FakeCredentialStore {
             state,
             active_writes: &self.active_writes,
         }))
+    }
+
+    /// Models the native repair without guards: every staging record of a
+    /// set is untracked except the one of the journal's pending activation.
+    fn repair_untracked_records(
+        &self,
+        may_repair: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<AuthoritativeRepair, CredentialStoreFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_call(FakeStoreCall::RepairUntracked)?;
+        let journal = state.journal.clone();
+        if !may_repair(&journal) {
+            return Ok(AuthoritativeRepair {
+                journal,
+                sets: None,
+            });
+        }
+        let mut sets = Vec::with_capacity(BUILT_IN_CREDENTIAL_SET_IDS.len());
+        for built_in in BUILT_IN_CREDENTIAL_SET_IDS {
+            let set_id = CredentialSetId::BuiltIn(*built_in);
+            let tracked = journal
+                .pending_activation
+                .as_ref()
+                .filter(|pending| pending.set_id == set_id)
+                .map(|pending| pending.operation_id.clone());
+            let before = state.staging.len();
+            state.staging.retain(|(operation_id, staged, _)| {
+                *staged != set_id || tracked.as_ref() == Some(operation_id)
+            });
+            let outcome = if state.staging.len() != before {
+                UntrackedRecordOutcome::Removed
+            } else if tracked.is_some() {
+                UntrackedRecordOutcome::Tracked
+            } else {
+                UntrackedRecordOutcome::Clean
+            };
+            sets.push(UntrackedRecordRepair { set_id, outcome });
+        }
+        Ok(AuthoritativeRepair {
+            journal,
+            sets: Some(sets),
+        })
     }
 }
 

@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
   STA/COM and `SILENT` buffer fixes, PipeWire `DONT_RECONNECT` on Linux,
   and system-capture capability reporting for macOS 14.4 and later.
+- Dormant credential v2 authority journal (#521, not yet reachable from the
+  app): its roots are held for the store's lifetime and must pass the
+  filesystem evidence gate before the lock file or any native call exists,
+  which refuses every root until evidence profiles ship (#210). Windows
+  replaces the journal with POSIX rename semantics and flushes the file and
+  directory afterwards; a program holding the journal open without sharing
+  delete now yields a retryable store error instead of a process-wide stall.
+  New directories are synced into their parent. One explicit repair takes
+  ownership of a refused journal root (Windows) and removes staging records
+  and guards the journal does not track.
 
 ### Fixed
 

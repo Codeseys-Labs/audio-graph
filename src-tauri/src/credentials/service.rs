@@ -66,9 +66,53 @@ pub(crate) struct AuthoritativeActiveRead {
     pub(crate) record: Option<EncodedCredentialRecord>,
 }
 
-/// Entry reads and mutation-session creation are the only core-visible store
-/// operations. Every write lives on the opaque session, so a concrete adapter
-/// must retain its cooperating-process lock until that session is dropped.
+/// What an explicit repair did about one built-in set's native records that
+/// the authority journal does not track. It names no operation, revision or
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UntrackedRecordOutcome {
+    /// Nothing the journal does not track was found.
+    Clean,
+    /// Untracked staging records, the set's staging guard, or both were
+    /// removed.
+    Removed,
+    /// Nothing untracked was found, and the journal's pending activation of
+    /// this set keeps its own staging record. Repair again once that
+    /// activation completes or is recovered.
+    Tracked,
+    /// The set's staging guard holds bytes no AudioGraph version writes. It
+    /// was left in place, and so was every staging record of the set.
+    Unrecognized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UntrackedRecordRepair {
+    pub(crate) set_id: CredentialSetId,
+    pub(crate) outcome: UntrackedRecordOutcome,
+}
+
+/// An untracked-record repair taken under one cooperating-process lock: the
+/// journal it was decided on and, unless the caller refused that journal,
+/// what was done for each built-in set.
+pub(crate) struct AuthoritativeRepair {
+    pub(crate) journal: AuthorityJournal,
+    /// `None` when the journal was refused and nothing was touched.
+    pub(crate) sets: Option<Vec<UntrackedRecordRepair>>,
+}
+
+/// What an explicit ownership repair of a store's authority state changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreOwnershipRepair {
+    /// Every owner was already trusted, or the platform cannot change one.
+    Unchanged,
+    /// This user took ownership of state another principal owned.
+    Repaired,
+}
+
+/// Entry reads, mutation-session creation and explicit repair are the only
+/// core-visible store operations. Every ordinary write lives on the opaque
+/// session, so a concrete adapter must retain its cooperating-process lock
+/// until that session is dropped.
 pub(crate) trait CredentialEntryStore: Send + Sync {
     /// Reads the authoritative journal and, only if `may_read` admits that
     /// journal, `set_id`'s active record, both under one lock. A read the
@@ -84,6 +128,14 @@ pub(crate) trait CredentialEntryStore: Send + Sync {
         operation_id: &CredentialOperationId,
         set_id: &CredentialSetId,
     ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure>;
+
+    /// Explicit repair only; no ordinary operation calls it. Reads the
+    /// authoritative journal and, only if `may_repair` admits that journal,
+    /// removes the native records it does not track, both under one lock.
+    fn repair_untracked_records(
+        &self,
+        may_repair: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<AuthoritativeRepair, CredentialStoreFailure>;
 }
 
 fn verify_exact_store_readback(
@@ -439,8 +491,17 @@ impl WorkerAdmission {
         operation_id: &CredentialOperationId,
         set_id: &CredentialSetId,
     ) -> Result<WorkerPermit<'_>, CredentialError> {
+        self.admit_for(operation_id, Some(set_id))
+    }
+
+    /// Admits an operation on `set_id`, or on the whole store for `None`.
+    fn admit_for(
+        &self,
+        operation_id: &CredentialOperationId,
+        set_id: Option<&CredentialSetId>,
+    ) -> Result<WorkerPermit<'_>, CredentialError> {
         if self.status().state == CredentialWorkerState::Stalled {
-            return Err(CredentialStoreFailure::StalledWorker.into_public(Some(set_id.clone())));
+            return Err(CredentialStoreFailure::StalledWorker.into_public(set_id.cloned()));
         }
         let serial = self
             .serial
@@ -451,12 +512,12 @@ impl WorkerAdmission {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if status.state == CredentialWorkerState::Stalled {
-            return Err(CredentialStoreFailure::StalledWorker.into_public(Some(set_id.clone())));
+            return Err(CredentialStoreFailure::StalledWorker.into_public(set_id.cloned()));
         }
         *status = CredentialWorkerStatus {
             state: CredentialWorkerState::Busy,
             operation_id: Some(operation_id.clone()),
-            set_id: Some(set_id.clone()),
+            set_id: set_id.cloned(),
         };
         drop(status);
         Ok(WorkerPermit {
@@ -974,6 +1035,48 @@ impl CredentialService {
             | CredentialSetRecoveryState::CommitUnknown => false,
         };
         state_matches && recovery_allows
+    }
+
+    /// Explicit, user-invoked repair of native records the authority journal
+    /// does not track: an orphaned staging record and its guard, a guard in
+    /// the format written before guards named their operation, or staging
+    /// that survived a lost journal publication. No ordinary operation calls
+    /// it. It is decided on the journal the store reads under its lock, and
+    /// refused before any record is touched when that journal is older than
+    /// the one this service observed: a restored journal can omit staging
+    /// that is still in use. It changes no journal, so it emits no event.
+    pub(crate) fn repair_untracked_records(
+        &self,
+    ) -> Result<Vec<UntrackedRecordRepair>, CredentialError> {
+        let operation_id = self.token_source.next_operation_id();
+        let _permit = self.worker.admit_for(&operation_id, None)?;
+        let repair = self
+            .store
+            .repair_untracked_records(&|journal| {
+                journal.global_epoch
+                    >= self
+                        .journal
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .global_epoch
+            })
+            .map_err(|failure| {
+                if failure == CredentialStoreFailure::StalledWorker {
+                    self.worker.mark_stalled();
+                }
+                failure.into_public(None)
+            })?;
+        let store_wide_recovery = || {
+            content_free_error(
+                CredentialErrorCode::RecoveryRequired,
+                CredentialSafeRecoveryAction::Reconcile,
+                None,
+            )
+        };
+        if !self.cache_journal(repair.journal, JournalOrigin::Authority) {
+            return Err(store_wide_recovery());
+        }
+        repair.sets.ok_or_else(store_wide_recovery)
     }
 
     pub(crate) fn resolve_for_use(
@@ -2251,10 +2354,11 @@ impl CredentialService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
-        CredentialResolution, CredentialService, CredentialSettingsActivationPort,
-        CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
-        ReplaceCredentialSet, verify_exact_store_readback,
+        AuthoritativeActiveRead, AuthoritativeRepair, CredentialEntryStore,
+        CredentialMutationSession, CredentialResolution, CredentialService,
+        CredentialSettingsActivationPort, CredentialUseRequest, DeleteCredentialSet,
+        PrepareCredentialActivation, ReplaceCredentialSet, UntrackedRecordOutcome,
+        verify_exact_store_readback,
     };
     use crate::credentials::domain::{
         AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure,
@@ -2336,6 +2440,13 @@ mod tests {
                 inner: self.inner.begin_mutation(operation_id, set_id)?,
                 successful_commits_before_failure: &self.successful_commits_before_failure,
             }))
+        }
+
+        fn repair_untracked_records(
+            &self,
+            may_repair: &dyn Fn(&AuthorityJournal) -> bool,
+        ) -> Result<AuthoritativeRepair, CredentialStoreFailure> {
+            self.inner.repair_untracked_records(may_repair)
         }
     }
 
@@ -5693,5 +5804,136 @@ mod tests {
                 .code,
             CredentialErrorCode::RecoveryRequired
         );
+    }
+
+    fn activation_request(
+        set_id: BuiltInCredentialSetId,
+        token: &str,
+    ) -> PrepareCredentialActivation {
+        PrepareCredentialActivation {
+            set_id: set_id.into(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("repair-activation").expect("API key"),
+            expected_revision: None,
+            expected_settings_revision: 1,
+            proposed_settings_revision: 2,
+            idempotency_token: idempotency(token),
+        }
+    }
+
+    fn outcome_of(
+        sets: &[super::UntrackedRecordRepair],
+        set_id: BuiltInCredentialSetId,
+    ) -> UntrackedRecordOutcome {
+        sets.iter()
+            .find(|repaired| repaired.set_id == CredentialSetId::from(set_id))
+            .expect("every built-in set is reported")
+            .outcome
+    }
+
+    /// A staging record whose recording journal publication was lost is
+    /// removed by the explicit repair, while the staging record a pending
+    /// activation still owns is kept. Neither ordinary operations nor the
+    /// repair emit an event, and the repair itself is a single store call.
+    #[test]
+    fn explicit_repair_removes_staging_the_journal_lost_and_keeps_tracked_staging() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let unrecorded = store.journal_snapshot();
+        service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Deepgram,
+                "60606060-6060-4060-8060-606060606060",
+            ))
+            .expect("prepare the activation whose publication is lost");
+        store.restore_journal(unrecorded);
+        service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Openai,
+                "61616161-6161-4161-8161-616161616161",
+            ))
+            .expect("prepare a tracked activation");
+        assert_eq!(store.staging_count(), 2);
+        assert!(!store.calls().contains(&FakeStoreCall::RepairUntracked));
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Deepgram),
+            UntrackedRecordOutcome::Removed
+        );
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Openai),
+            UntrackedRecordOutcome::Tracked
+        );
+        assert_eq!(store.staging_count(), 1);
+        assert_eq!(
+            store
+                .calls()
+                .iter()
+                .filter(|call| **call == FakeStoreCall::RepairUntracked)
+                .count(),
+            1
+        );
+        assert!(service.events_since(0).events.is_empty());
+    }
+
+    /// A journal older than the one this service observed can omit staging
+    /// that is still in use, so the repair is refused on it before any
+    /// record is touched, and runs once the authoritative journal is back.
+    #[test]
+    fn explicit_repair_is_refused_on_a_rolled_back_journal_before_any_record_is_touched() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let unrecorded = store.journal_snapshot();
+        service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Deepgram,
+                "62626262-6262-4262-8262-626262626262",
+            ))
+            .expect("prepare the activation whose publication is lost");
+        store.restore_journal(unrecorded.clone());
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: BuiltInCredentialSetId::Openai.into(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("advance-epoch").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("63636363-6363-4363-8363-636363636363"),
+            })
+            .expect("commit the next epoch");
+        let authoritative = store.journal_snapshot();
+        store.restore_journal(unrecorded);
+
+        let refused = service
+            .repair_untracked_records()
+            .expect_err("a rolled-back journal is refused");
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(refused.set_id, None);
+        assert_eq!(store.staging_count(), 1);
+
+        store.restore_journal(authoritative);
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair on the authoritative journal");
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Deepgram),
+            UntrackedRecordOutcome::Removed
+        );
+        assert_eq!(store.staging_count(), 0);
     }
 }

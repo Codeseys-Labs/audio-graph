@@ -52,7 +52,11 @@ Expose `dormant`, `opening`, `uninitialized`, `ready`, `recovery_required`,
 never enqueues work. Ordinary operations must not prompt. Explicit diagnosis
 or unlock is the only interactive path; successful recovery is followed by a
 noninteractive reopen. A recovery-required or unavailable authority does not
-fall back to v1 or to a plaintext store.
+fall back to v1 or to a plaintext store. One explicit, noninteractive repair
+request takes ownership of refused authority state where the platform allows
+it and removes native records the authority journal does not track; it
+reopens only after it changed an owner or when such a record closed the
+runtime, and no ordinary operation runs any part of it.
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries

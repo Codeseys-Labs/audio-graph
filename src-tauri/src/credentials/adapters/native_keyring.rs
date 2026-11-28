@@ -1,7 +1,7 @@
 use super::authority_journal::{
     AuthorityJournalBoundary, AuthorityMutationLock, FileAuthorityJournalBoundary,
     decode_authority_journal, decode_authority_marker, encode_authority_journal,
-    encode_authority_marker, new_authority_instance_id,
+    encode_authority_marker, new_authority_instance_id, repair_root_ownership,
 };
 #[cfg(test)]
 use super::keyring_entry::KeyringBoundary;
@@ -13,7 +13,8 @@ use crate::credentials::domain::{
     AuthorityJournal, CredentialStoreFailure, EncodedCredentialRecord,
 };
 use crate::credentials::service::{
-    AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+    AuthoritativeActiveRead, AuthoritativeRepair, CredentialEntryStore, CredentialMutationSession,
+    StoreOwnershipRepair, UntrackedRecordOutcome, UntrackedRecordRepair,
 };
 use audio_graph_ipc_contract::credential_contract::{
     BUILT_IN_CREDENTIAL_SET_IDS, CredentialBackendKind, CredentialOperationId, CredentialSetId,
@@ -79,13 +80,32 @@ struct NativeCredentialMutationSession<'a> {
 impl NativeKeyringCredentialStore {
     /// Fails with `Unsupported` before journal or native I/O when this platform
     /// has no reviewed no-prompt boundary; it never selects a fallback store.
+    /// The journal root and the namespace lock root must qualify, on their
+    /// held handles, before the lock file exists or any native call runs.
     pub(crate) fn open(
         root: impl Into<PathBuf>,
     ) -> Result<NativeCredentialStoreOpen, CredentialStoreFailure> {
+        let entries = KeyringEntryAdapter::production()?;
         Self::open_with_adapters(
-            KeyringEntryAdapter::production()?,
-            Arc::new(FileAuthorityJournalBoundary::new(root)?),
+            entries,
+            Arc::new(FileAuthorityJournalBoundary::open_qualified(root)?),
         )
+    }
+
+    /// Explicit, user-invoked repair for an `open` that hardening refused
+    /// with `PermissionHardeningFailed` because another principal owns the
+    /// journal root, the namespace lock root, or a file in either. Where
+    /// the platform lets this user take ownership (Windows, given
+    /// `WRITE_OWNER`), it does and hardens; elsewhere the refusal stands. It
+    /// performs no native credential I/O.
+    pub(crate) fn repair_journal_ownership(
+        root: impl Into<PathBuf>,
+    ) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+        Ok(if repair_root_ownership(root)? {
+            StoreOwnershipRepair::Repaired
+        } else {
+            StoreOwnershipRepair::Unchanged
+        })
     }
 
     #[cfg(test)]
@@ -359,6 +379,99 @@ fn guarded_operation(bytes: &[u8]) -> Option<CredentialOperationId> {
     CredentialOperationId::parse(named).ok()
 }
 
+/// The bytes every guard held before guards named their operation (written
+/// only by development builds of #553). Such a guard cannot say which
+/// staging record it stands for.
+const LEGACY_STAGING_GUARD: &[u8] = b"audiograph.credential-v2.staging-guard";
+
+/// What a set's staging guard says, as far as repair is concerned.
+enum StagingGuard {
+    Absent,
+    Names(CredentialOperationId),
+    Legacy,
+    Unrecognized,
+}
+
+impl StagingGuard {
+    fn classify(bytes: Option<&[u8]>) -> Self {
+        match bytes {
+            None => Self::Absent,
+            Some(LEGACY_STAGING_GUARD) => Self::Legacy,
+            Some(bytes) => guarded_operation(bytes).map_or(Self::Unrecognized, Self::Names),
+        }
+    }
+}
+
+impl NativeKeyringCredentialStore {
+    /// Removes `set_id`'s native staging records and staging guard that
+    /// `journal` does not track. Run under the interaction lease and the
+    /// mutation lock, on the journal read under them. Every cooperating
+    /// process records an activation in the journal before it stages and
+    /// before it releases that lock, so the only staging a live operation
+    /// owns is that of the journal's pending activation for the set; that
+    /// staging record, and a guard naming it, are never touched.
+    ///
+    /// Candidates are the operation the guard names and every operation the
+    /// journal's history records for the set, which also finds staging a
+    /// guard in the legacy format stood for. Staging records go before the
+    /// guard, so a staging record never outlives its guard. An unrecognized
+    /// guard leaves the set untouched.
+    fn repair_set_unlocked(
+        &self,
+        interaction: &mut NativeInteractionLease<'_>,
+        journal: &AuthorityJournal,
+        set_id: &CredentialSetId,
+    ) -> Result<UntrackedRecordOutcome, CredentialStoreFailure> {
+        let tracked = journal
+            .pending_activation
+            .as_ref()
+            .filter(|pending| pending.set_id == *set_id)
+            .map(|pending| &pending.operation_id);
+        let guard_locator = EntryLocator::staging_guard(set_id);
+        let guard_bytes = self.entries.read(interaction, &guard_locator)?;
+        let guard = StagingGuard::classify(guard_bytes.as_deref().map(Vec::as_slice));
+        let mut candidates: Vec<CredentialOperationId> = journal
+            .idempotency_history
+            .iter()
+            .filter(|entry| entry.set_id == *set_id)
+            .map(|entry| entry.receipt.operation_id.clone())
+            .collect();
+        let guard_is_tracked = match &guard {
+            StagingGuard::Unrecognized => return Ok(UntrackedRecordOutcome::Unrecognized),
+            StagingGuard::Names(operation_id) => {
+                candidates.push(operation_id.clone());
+                tracked == Some(operation_id)
+            }
+            StagingGuard::Absent | StagingGuard::Legacy => false,
+        };
+        candidates.retain(|operation_id| tracked != Some(operation_id));
+        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        candidates.dedup();
+
+        let mut removed = false;
+        for operation_id in &candidates {
+            let staging = EntryLocator::staging(operation_id, set_id);
+            if self.entries.read(interaction, &staging)?.is_some() {
+                self.entries
+                    .delete_and_verify_absent(interaction, &staging)?;
+                removed = true;
+            }
+        }
+        if !matches!(guard, StagingGuard::Absent) && !guard_is_tracked {
+            self.entries
+                .delete_and_verify_absent(interaction, &guard_locator)?;
+            removed = true;
+        }
+        Ok(if removed {
+            UntrackedRecordOutcome::Removed
+        } else if tracked.is_some() {
+            UntrackedRecordOutcome::Tracked
+        } else {
+            UntrackedRecordOutcome::Clean
+        })
+    }
+}
+
 impl CredentialEntryStore for NativeKeyringCredentialStore {
     fn read_active(
         &self,
@@ -393,6 +506,34 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
             expected_staging_readback: None,
             _mutation_lock: mutation_lock,
         }))
+    }
+
+    /// Decided on the bound authority's journal read under the lock; a
+    /// journal `may_repair` refuses, or one that is not the bound
+    /// authority's, touches no record.
+    fn repair_untracked_records(
+        &self,
+        may_repair: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<AuthoritativeRepair, CredentialStoreFailure> {
+        let mut interaction = self.interaction_gate.acquire()?;
+        let _mutation_lock = self.journal.acquire_mutation_lock()?;
+        let journal = *self.require_bound_authority_unlocked(&mut interaction)?;
+        if !may_repair(&journal) {
+            return Ok(AuthoritativeRepair {
+                journal,
+                sets: None,
+            });
+        }
+        let mut sets = Vec::with_capacity(BUILT_IN_CREDENTIAL_SET_IDS.len());
+        for built_in in BUILT_IN_CREDENTIAL_SET_IDS {
+            let set_id = CredentialSetId::BuiltIn(*built_in);
+            let outcome = self.repair_set_unlocked(&mut interaction, &journal, &set_id)?;
+            sets.push(UntrackedRecordRepair { set_id, outcome });
+        }
+        Ok(AuthoritativeRepair {
+            journal,
+            sets: Some(sets),
+        })
     }
 }
 
@@ -677,7 +818,8 @@ mod tests {
     };
     use crate::credentials::service::{
         AuthoritativeActiveRead, CredentialEntryStore, CredentialService, CredentialUseRequest,
-        DeleteCredentialSet, ReplaceCredentialSet,
+        DeleteCredentialSet, PrepareCredentialActivation, ReplaceCredentialSet,
+        UntrackedRecordOutcome, UntrackedRecordRepair,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
@@ -2566,10 +2708,13 @@ mod tests {
             uuid::Uuid::new_v4().hyphenated()
         ));
         let keyring = Arc::new(MemoryKeyringBoundary::default());
-        let journal_boundary = Arc::new(FileAuthorityJournalBoundary::with_namespace_lock_root(
-            root.join("journal"),
-            root.join("namespace"),
-        ));
+        let journal_boundary = Arc::new(
+            FileAuthorityJournalBoundary::open_for_test(
+                root.join("journal"),
+                root.join("namespace"),
+            )
+            .expect("open journal boundary"),
+        );
         let opened = NativeKeyringCredentialStore::open_with_adapters(
             KeyringEntryAdapter::new(keyring),
             journal_boundary.clone(),
@@ -2604,6 +2749,7 @@ mod tests {
             .expect("session drop releases file lock");
         drop(reacquired);
         drop(store);
+        drop(journal_boundary);
         std::fs::remove_dir_all(&root).expect("remove isolated session-lock test directory");
     }
 
@@ -3031,10 +3177,13 @@ mod tests {
         let open = || {
             NativeKeyringCredentialStore::open_with_boundaries_and_gate(
                 keyring.clone(),
-                Arc::new(FileAuthorityJournalBoundary::with_namespace_lock_root(
-                    root.join("journal"),
-                    root.join("namespace"),
-                )),
+                Arc::new(
+                    FileAuthorityJournalBoundary::open_for_test(
+                        root.join("journal"),
+                        root.join("namespace"),
+                    )
+                    .expect("open journal boundary"),
+                ),
                 gate,
             )
         };
@@ -3468,5 +3617,349 @@ mod tests {
         .expect("decode active tombstone");
         assert!(active.is_tombstone());
         assert_eq!(keyring.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    fn plant(keyring: &MemoryKeyringBoundary, account: &str, bytes: &[u8]) {
+        let mut entries = keyring.entries.lock().expect("memory keyring lock");
+        entries.retain(|(candidate, _)| candidate != account);
+        entries.push((account.to_owned(), bytes.to_vec()));
+    }
+
+    /// Stages for `operation` in a session of its own and reads the staging
+    /// record back, as an activation does; `Err` when staging is refused.
+    fn try_stage(
+        store: &NativeKeyringCredentialStore,
+        operation: &CredentialOperationId,
+        set_id: &CredentialSetId,
+    ) -> Result<(), CredentialStoreFailure> {
+        let mut session = store.begin_mutation(operation, set_id)?;
+        session.load_journal()?;
+        session.write_staging(operation, set_id, remnant_record(set_id, operation))?;
+        session.read_staging(operation, set_id).map(|_| ())
+    }
+
+    fn repaired_outcomes(
+        sets: &[UntrackedRecordRepair],
+        expected: &[(BuiltInCredentialSetId, UntrackedRecordOutcome)],
+    ) {
+        assert_eq!(sets.len(), BUILT_IN_CREDENTIAL_SET_IDS.len());
+        for repaired in sets {
+            let outcome = expected
+                .iter()
+                .find(|(set_id, _)| CredentialSetId::from(*set_id) == repaired.set_id)
+                .map_or(UntrackedRecordOutcome::Clean, |(_, outcome)| *outcome);
+            assert_eq!(repaired.outcome, outcome, "{:?}", repaired.set_id);
+        }
+    }
+
+    /// The Windows power-loss case: the journal publication that recorded an
+    /// activation was lost while its guard and staging record survived. No
+    /// journal tracks that operation, yet its guard refuses every later
+    /// staging for the set. Ordinary operations leave it in place; the
+    /// explicit repair removes it, for that set only, and reports nothing
+    /// but closed outcomes.
+    #[test]
+    fn an_untracked_staging_record_blocks_staging_until_the_explicit_repair_removes_it() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let store = ready_store_with_gate(
+            keyring.clone(),
+            Arc::new(MemoryJournalBoundary::default()),
+            NativeInteractionGate::isolated_for_test(),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let orphan = stage_and_leave(&store, "71717171-7171-4171-8171-717171717171", &set_id);
+        let next = CredentialOperationId::parse("72727272-7272-4272-8272-727272727272")
+            .expect("canonical operation id");
+        let orphan_account = EntryLocator::staging(&orphan, &set_id).account().to_owned();
+
+        for _ in 0..2 {
+            assert_eq!(
+                try_stage(&store, &next, &set_id),
+                Err(CredentialStoreFailure::CorruptRecord)
+            );
+        }
+        assert!(native_entry(&keyring, &orphan_account).is_some());
+
+        let repair = store
+            .repair_untracked_records(&|_| true)
+            .expect("repair untracked records");
+        let sets = repair.sets.expect("the journal is admitted");
+        repaired_outcomes(
+            &sets,
+            &[(
+                BuiltInCredentialSetId::Deepgram,
+                UntrackedRecordOutcome::Removed,
+            )],
+        );
+        let report = format!("{sets:?}");
+        assert!(!report.contains(orphan.as_str()) && !report.contains("remnant-canary"));
+        assert_eq!(native_entry(&keyring, &orphan_account), None);
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging_guard(&set_id).account()),
+            None
+        );
+        assert_eq!(try_stage(&store, &next, &set_id), Ok(()));
+    }
+
+    /// A guard in the format written before guards named their operation
+    /// cannot be claimed, so staging for its set is refused. Through the
+    /// service, the explicit repair removes it, with the staging record the
+    /// journal's history names for the set, and staging works again.
+    #[test]
+    fn a_pre_fix_guard_is_removed_by_the_explicit_repair_with_the_staging_its_history_names() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let opened = NativeKeyringCredentialStore::open_with_boundaries(
+            keyring.clone(),
+            Arc::new(MemoryJournalBoundary::default()),
+        )
+        .expect("open absent authority");
+        let NativeCredentialStoreOpen::Uninitialized(store) = opened else {
+            panic!("expected uninitialized authority");
+        };
+        let NativeCredentialStoreOpen::Ready { store, journal } = store
+            .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+            .expect("initialize native authority")
+        else {
+            panic!("expected ready authority");
+        };
+        let store = Arc::new(store);
+        let service = CredentialService::new(
+            store.clone(),
+            *journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let receipt = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("history-canary").expect("API key"),
+                expected_revision: None,
+                idempotency_token: CredentialIdempotencyToken::parse(
+                    "73737373-7373-4373-8373-737373737373",
+                )
+                .expect("canonical idempotency token"),
+            })
+            .expect("replace credential set");
+        let pre_guard_staging = EntryLocator::staging(&receipt.operation_id, &set_id)
+            .account()
+            .to_owned();
+        plant(
+            &keyring,
+            &pre_guard_staging,
+            remnant_record(&set_id, &receipt.operation_id).as_bytes(),
+        );
+        plant(
+            &keyring,
+            EntryLocator::staging_guard(&set_id).account(),
+            super::LEGACY_STAGING_GUARD,
+        );
+        let next = CredentialOperationId::parse("74747474-7474-4474-8474-747474747474")
+            .expect("canonical operation id");
+        assert_eq!(
+            try_stage(&store, &next, &set_id),
+            Err(CredentialStoreFailure::CorruptRecord)
+        );
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+
+        repaired_outcomes(
+            &sets,
+            &[(
+                BuiltInCredentialSetId::Deepgram,
+                UntrackedRecordOutcome::Removed,
+            )],
+        );
+        assert_eq!(native_entry(&keyring, &pre_guard_staging), None);
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging_guard(&set_id).account()),
+            None
+        );
+        assert!(native_entry(&keyring, "v2/deepgram").is_some());
+        assert_eq!(try_stage(&store, &next, &set_id), Ok(()));
+    }
+
+    /// The repair never touches the staging record of the journal's pending
+    /// activation or the guard naming it, leaves a guard it cannot read in
+    /// place, and touches nothing at all when the caller refuses the journal
+    /// it read under the lock.
+    #[test]
+    fn repair_spares_tracked_staging_unreadable_guards_and_refused_journals() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let opened = NativeKeyringCredentialStore::open_with_boundaries(
+            keyring.clone(),
+            Arc::new(MemoryJournalBoundary::default()),
+        )
+        .expect("open absent authority");
+        let NativeCredentialStoreOpen::Uninitialized(store) = opened else {
+            panic!("expected uninitialized authority");
+        };
+        let NativeCredentialStoreOpen::Ready { store, journal } = store
+            .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+            .expect("initialize native authority")
+        else {
+            panic!("expected ready authority");
+        };
+        let store = Arc::new(store);
+        let service = CredentialService::new(
+            store.clone(),
+            *journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::from(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("tracked-canary").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 1,
+                proposed_settings_revision: 2,
+                idempotency_token: CredentialIdempotencyToken::parse(
+                    "75757575-7575-4575-8575-757575757575",
+                )
+                .expect("canonical idempotency token"),
+            })
+            .expect("prepare activation");
+        let openai = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        plant(
+            &keyring,
+            EntryLocator::staging_guard(&openai).account(),
+            b"not-a-guard",
+        );
+        let snapshot = || keyring.entries.lock().expect("memory keyring lock").clone();
+        let before = snapshot();
+
+        let refused = store
+            .repair_untracked_records(&|_| false)
+            .expect("a refused journal is not a failure");
+        assert!(refused.sets.is_none());
+        assert_eq!(snapshot(), before);
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+        repaired_outcomes(
+            &sets,
+            &[
+                (
+                    BuiltInCredentialSetId::Deepgram,
+                    UntrackedRecordOutcome::Tracked,
+                ),
+                (
+                    BuiltInCredentialSetId::Openai,
+                    UntrackedRecordOutcome::Unrecognized,
+                ),
+            ],
+        );
+        assert_eq!(snapshot(), before);
+        assert!(
+            before
+                .iter()
+                .any(|(account, _)| account.starts_with("v2-staging/")
+                    && account.ends_with("/deepgram")),
+            "the pending activation staged nothing"
+        );
+    }
+
+    /// Another program holding the journal open no longer stalls the store.
+    /// A reader that shares delete does not block a replacement at all. One
+    /// that refuses to share delete makes the replacement a definite store
+    /// failure before any native write, and nothing is latched: once it lets
+    /// go, the same service replaces without a restart. Only the scratch
+    /// journal directory and the in-memory keyring are touched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_journal_another_program_holds_open_never_latches_the_store() {
+        use ::windows::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "audio-graph-521-open-target-{}",
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let journal_boundary = Arc::new(
+            FileAuthorityJournalBoundary::open_for_test(
+                root.join("journal"),
+                root.join("namespace"),
+            )
+            .expect("open journal boundary"),
+        );
+        let NativeCredentialStoreOpen::Uninitialized(store) =
+            NativeKeyringCredentialStore::open_with_boundaries_and_gate(
+                keyring.clone(),
+                journal_boundary.clone(),
+                NativeInteractionGate::isolated_for_test(),
+            )
+            .expect("open absent authority")
+        else {
+            panic!("expected uninitialized authority");
+        };
+        let NativeCredentialStoreOpen::Ready { store, journal } = store
+            .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+            .expect("initialize native authority")
+        else {
+            panic!("expected ready authority");
+        };
+        let service = CredentialService::new(
+            Arc::new(store),
+            *journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let replace = |expected_revision: Option<CredentialRevision>, token: &str| {
+            service.replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("open-target-canary").expect("API key"),
+                expected_revision,
+                idempotency_token: CredentialIdempotencyToken::parse(token)
+                    .expect("canonical idempotency token"),
+            })
+        };
+        let open_journal = |share: u32| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(share)
+                .open(root.join("journal").join("state.json"))
+                .expect("open the journal as another program")
+        };
+
+        let sharing = open_journal(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+        let first = replace(None, "76767676-7676-4676-8676-767676767676")
+            .expect("a reader that shares delete does not block");
+        drop(sharing);
+
+        let refusing = open_journal(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
+        let writes = keyring.writes.load(Ordering::SeqCst);
+        let refused = replace(
+            first.new_revision.clone(),
+            "77777777-7777-4777-8777-777777777777",
+        )
+        .expect_err("a reader that refuses to share delete blocks the intent");
+        assert_eq!(refused.code, CredentialErrorCode::StoreUnavailable);
+        assert_eq!(keyring.writes.load(Ordering::SeqCst), writes);
+        assert_eq!(
+            service.snapshot_status().global_epoch,
+            1,
+            "the refused intent changed the observed journal"
+        );
+        drop(refusing);
+
+        let second = replace(
+            first.new_revision.clone(),
+            "77777777-7777-4777-8777-777777777777",
+        )
+        .expect("the same service replaces once the reader lets go");
+        assert_eq!(second.previous_revision, first.new_revision);
+        assert_eq!(service.snapshot_status().global_epoch, 2);
+
+        drop(service);
+        drop(journal_boundary);
+        std::fs::remove_dir_all(&root).expect("remove isolated open-target directory");
     }
 }
