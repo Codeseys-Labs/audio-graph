@@ -1,7 +1,9 @@
 use super::*;
+use crate::credentials::adapters::keyring_entry::EntryLocator;
 use crate::credentials::adapters::linux_secret_service_wire::{
-    RecoveryScope, locked_target_at, scripted_peer as script,
+    locked_target_at, scripted_peer as script,
 };
+use crate::credentials::adapters::native_interaction::NativeInteractionGate;
 use crate::test_log_capture;
 use std::sync::mpsc;
 use std::thread;
@@ -25,6 +27,19 @@ enum Behavior {
     VerificationFails,
     VerificationDenied,
     ChangedTarget,
+    QueuedApproval,
+    Panic,
+    ForgedSender,
+    ForgedPath,
+    KWallet,
+    Stalled,
+    CommitUnknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryScope {
+    Item,
+    DefaultCollection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +62,7 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
     let expected_window = window.unwrap_or_default().to_owned();
     let scripted = thread::spawn(move || {
         zbus::block_on(async {
-            let connection = Builder::address(address).build().await.unwrap();
+            let connection = Builder::address(address.clone()).build().await.unwrap();
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
             ready.send(()).unwrap();
@@ -74,7 +89,7 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                     header.interface().map(|name| name.as_str()),
                     header.member().map(|name| name.as_str()),
                 ) {
-                    (Some(SERVICE), Some("Unlock")) => {
+                    (Some(SERVICE), Some(UNLOCK_METHOD)) => {
                         assert_eq!(path, SERVICE_PATH);
                         assert_ne!(sender, probe);
                         assert!(interactive.replace(sender.to_owned()).is_none());
@@ -101,13 +116,33 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                             .unwrap();
                         Event::Unlock
                     }
-                    (Some(PROMPT), Some("Prompt")) => {
+                    (Some(PROMPT), Some(PROMPT_METHOD)) => {
                         assert_eq!(path, PROMPT_PATH);
                         assert_eq!(interactive.as_deref(), Some(sender));
                         assert!(!shown);
                         let window: String = message.body().deserialize().unwrap();
                         assert!(window == expected_window);
                         shown = true;
+                        if behavior == Behavior::ForgedSender {
+                            let other = Builder::address(address.clone()).build().await.unwrap();
+                            emit_completion_at(&other, Some(sender), PROMPT_PATH, false).await;
+                            // A bus-driver round trip ensures the forged signal was sent
+                            // before the genuine completion.
+                            other
+                                .call_method(
+                                    Some(BUS),
+                                    "/org/freedesktop/DBus",
+                                    Some(BUS),
+                                    "GetId",
+                                    &(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        if behavior == Behavior::ForgedPath {
+                            emit_completion_at(&connection, Some(sender), "/other_prompt", false)
+                                .await;
+                        }
                         if matches!(
                             behavior,
                             Behavior::Accept
@@ -115,16 +150,29 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                                 | Behavior::StillLocked
                                 | Behavior::VerificationFails
                                 | Behavior::VerificationDenied
+                                | Behavior::QueuedApproval
+                                | Behavior::ForgedSender
+                                | Behavior::ForgedPath
                         ) {
                             unlocked = matches!(
                                 behavior,
                                 Behavior::Accept
                                     | Behavior::VerificationFails
                                     | Behavior::VerificationDenied
+                                    | Behavior::QueuedApproval
                             );
                             // Broadcast and emit before replying. The private bus
                             // only routes this signal if AddMatch preceded Prompt.
-                            emit_completion(&connection, behavior == Behavior::UserDismisses).await;
+                            emit_completion(
+                                &connection,
+                                matches!(
+                                    behavior,
+                                    Behavior::UserDismisses
+                                        | Behavior::ForgedSender
+                                        | Behavior::ForgedPath,
+                                ),
+                            )
+                            .await;
                             shown = false;
                         }
                         connection.reply(&header, &()).await.unwrap();
@@ -180,6 +228,8 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
                                 script::Scenario::RelockAtGet
                             } else if retired && behavior == Behavior::VerificationDenied {
                                 script::Scenario::Denied
+                            } else if scope == RecoveryScope::DefaultCollection {
+                                script::Scenario::Absent
                             } else if unlocked {
                                 script::Scenario::Found
                             } else {
@@ -200,26 +250,50 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
     let gate = NativeInteractionGate::isolated_for_test();
     let target = {
         let lease = gate.acquire().unwrap();
-        locked_target_at(
+        let target = locked_target_at(
             bus.address(),
             lease.forbid_prompt(),
-            script::wanted(),
-            scope,
+            &EntryLocator::authority(),
         )
         .unwrap()
-        .expect("an exact locked target")
+        .expect("an exact locked target");
+        if behavior == Behavior::Stalled {
+            assert_eq!(
+                crate::credentials::adapters::native_interaction::latch_forbid_uncertainty(
+                    lease.forbid_prompt()
+                ),
+                Failure::StalledWorker
+            );
+        }
+        target
     };
+    if behavior == Behavior::CommitUnknown {
+        let mut lease = gate.acquire().unwrap();
+        assert_eq!(
+            lease.mutation_capabilities().1.latch_commit_unknown(),
+            Failure::CommitUnknown
+        );
+    }
     let budget = if behavior == Behavior::NeverCompletes {
         Duration::from_secs(2)
     } else {
         Duration::from_secs(4)
     };
     let outcome = recover_exact(
-        gate,
         target,
         window.map(str::to_owned),
         budget,
         &cancellation,
+        TestOptions {
+            gate: Some(gate),
+            daemon: Some(if behavior == Behavior::KWallet {
+                "ksecretd"
+            } else {
+                "gnome-keyring-daemon"
+            }),
+            cancel_with_queued_completion: behavior == Behavior::QueuedApproval,
+            panic_after_prompt: behavior == Behavior::Panic,
+        },
     );
     let _ = stop.send(());
     let events = scripted.join().unwrap();
@@ -238,10 +312,19 @@ fn run(behavior: Behavior, scope: RecoveryScope, window: Option<&str>) -> (Outco
 }
 
 async fn emit_completion(connection: &Connection, dismissed: bool) {
+    emit_completion_at(connection, None, PROMPT_PATH, dismissed).await;
+}
+
+async fn emit_completion_at(
+    connection: &Connection,
+    destination: Option<&str>,
+    path: &str,
+    dismissed: bool,
+) {
     connection
         .emit_signal(
-            None::<&str>,
-            PROMPT_PATH,
+            destination,
+            path,
             PROMPT,
             "Completed",
             &(
@@ -262,7 +345,7 @@ fn interactive_events(events: &[Event]) -> Vec<Event> {
 }
 
 #[test]
-fn subscribes_before_prompt_and_verifies_encrypted_read_on_a_retired_connection() {
+fn subscribes_before_prompt_and_retires_before_fresh_verification() {
     for (scope, window) in [
         (RecoveryScope::Item, Some(WINDOW)),
         (RecoveryScope::DefaultCollection, None),
@@ -273,7 +356,10 @@ fn subscribes_before_prompt_and_verifies_encrypted_read_on_a_retired_connection(
             interactive_events(&events),
             [Event::Unlock, Event::Prompt, Event::Verification]
         );
-        assert_eq!(events.last(), Some(&Event::Ordinary(script::Call::Close)));
+        if scope == RecoveryScope::Item {
+            assert_eq!(events.last(), Some(&Event::Ordinary(script::Call::Close)));
+            assert!(!events.contains(&Event::Ordinary(script::Call::Alias)));
+        }
     }
 }
 
@@ -289,15 +375,15 @@ fn cancel_and_deadline_dismiss_and_report_unconfirmed_settlement() {
     for (behavior, expected) in [
         (
             Behavior::CancelOnPrompt,
-            Outcome::Cancelled(Dismissal::Completed),
+            Outcome::Cancelled(Dismissal::ServiceAcknowledged),
         ),
         (
             Behavior::NeverCompletes,
-            Outcome::TimedOut(Dismissal::Completed),
+            Outcome::TimedOut(Dismissal::ServiceAcknowledged),
         ),
         (
             Behavior::IgnoresDismiss,
-            Outcome::Cancelled(Dismissal::Unconfirmed),
+            Outcome::Cancelled(Dismissal::Unacknowledged),
         ),
     ] {
         let (actual, events) = run(behavior, RecoveryScope::Item, None);
@@ -342,4 +428,55 @@ fn changed_target_never_reaches_interactive_methods() {
     let (outcome, events) = run(Behavior::ChangedTarget, RecoveryScope::Item, None);
     assert_eq!(outcome, Outcome::Failed(Failure::AmbiguousMatch));
     assert!(interactive_events(&events).is_empty());
+}
+
+#[test]
+fn queued_approval_wins_cancellation_and_is_verified() {
+    let (outcome, events) = run(Behavior::QueuedApproval, RecoveryScope::Item, None);
+    assert_eq!(outcome, Outcome::Verified);
+    assert_eq!(
+        interactive_events(&events),
+        [Event::Unlock, Event::Prompt, Event::Verification]
+    );
+}
+
+#[test]
+fn forged_completions_from_other_sender_or_path_cannot_approve() {
+    for behavior in [Behavior::ForgedSender, Behavior::ForgedPath] {
+        let (outcome, events) = run(behavior, RecoveryScope::Item, None);
+        assert_eq!(outcome, Outcome::DismissedByUser);
+        assert_eq!(interactive_events(&events), [Event::Unlock, Event::Prompt]);
+    }
+}
+
+#[test]
+fn a_prompt_panic_attempts_dismissal_and_reports_possible_open_dialog() {
+    let (outcome, events) = run(Behavior::Panic, RecoveryScope::Item, None);
+    assert_eq!(
+        outcome,
+        Outcome::PromptMayStillBeOpen(Dismissal::ServiceAcknowledged)
+    );
+    assert_eq!(
+        interactive_events(&events),
+        [Event::Unlock, Event::Prompt, Event::Dismiss]
+    );
+}
+
+#[test]
+fn kwallet_and_latched_gates_never_dispatch_recovery() {
+    for (behavior, expected) in [
+        (Behavior::KWallet, Outcome::Unsupported),
+        (Behavior::Stalled, Outcome::Failed(Failure::StalledWorker)),
+        (
+            Behavior::CommitUnknown,
+            Outcome::Failed(Failure::StalledWorker),
+        ),
+    ] {
+        let (outcome, events) = run(behavior, RecoveryScope::Item, None);
+        assert_eq!(outcome, expected);
+        assert!(interactive_events(&events).is_empty());
+    }
+    for name in ["ksecretd", "kwalletd5", "kwalletd6", "keepassxc", "unknown"] {
+        assert!(!allows_interactive_recovery(Path::new(name)));
+    }
 }
