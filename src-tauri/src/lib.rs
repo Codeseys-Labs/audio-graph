@@ -87,6 +87,8 @@ mod aec_vad_fixtures;
 mod audio_signal_fixtures;
 #[cfg(test)]
 mod source_separation_fixtures;
+#[cfg(test)]
+pub(crate) mod test_log_capture;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

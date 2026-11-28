@@ -168,8 +168,8 @@ impl std::error::Error for AsrParseError {}
 mod diagnostic_tests {
     use super::*;
     use crate::error::AppError;
+    use crate::test_log_capture::ThreadLogCapture;
     use serde_json::json;
-    use std::{cell::RefCell, sync::Once};
 
     pub(super) const SECRET: &str = "asr-secret-canary";
     pub(super) const REQUEST_ID: &str = "asr-request-id-canary";
@@ -180,52 +180,21 @@ mod diagnostic_tests {
     const BODY_CHARS: usize = 379;
     const BODY_BYTES: usize = 691;
 
-    thread_local! {
-        static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    }
-
-    struct CaptureLogger;
-
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            let asr_module = module_path!().strip_suffix("::diagnostic_tests").unwrap();
-            metadata.target().starts_with(asr_module)
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if self.enabled(record.metadata()) {
-                CAPTURE.with_borrow_mut(|capture| {
-                    if let Some(lines) = capture {
-                        lines.push(record.args().to_string());
-                    }
-                });
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    pub(super) struct LogCapture;
+    pub(super) struct LogCapture(ThreadLogCapture);
 
     impl LogCapture {
         pub(super) fn start() -> Self {
-            static INIT: Once = Once::new();
-            INIT.call_once(|| {
-                log::set_logger(&CaptureLogger).expect("install ASR test logger");
-                log::set_max_level(log::LevelFilter::Trace);
-            });
-            CAPTURE.with_borrow_mut(|capture| assert!(capture.replace(Vec::new()).is_none()));
-            Self
+            Self(ThreadLogCapture::start())
         }
 
         pub(super) fn finish(self) -> Vec<String> {
-            CAPTURE.with_borrow_mut(|capture| capture.take().expect("active capture"))
-        }
-    }
-
-    impl Drop for LogCapture {
-        fn drop(&mut self) {
-            CAPTURE.with_borrow_mut(|capture| *capture = None);
+            let asr_module = module_path!().strip_suffix("::diagnostic_tests").unwrap();
+            self.0
+                .finish()
+                .into_iter()
+                .filter(|record| record.target.starts_with(asr_module))
+                .map(|record| record.message)
+                .collect()
         }
     }
 
