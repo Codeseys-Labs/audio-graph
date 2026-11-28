@@ -1586,11 +1586,19 @@
       "protocol_error": "The app could not communicate with the provider.",
       "invalid_response": "The provider returned an invalid response.",
       "request_rejected": "The provider rejected the request.",
+      "credential_rejected": "The provider rejected the credential. Re-enter it in Settings.",
+      "credential_expired": "The provider credential expired. Refresh it before trying again.",
+      "permission_denied": "The provider denied access to this operation. Check your account permissions or plan.",
+      "invalid_configuration": "The provider configuration is invalid. Check the model, region, or endpoint in Settings.",
       "capacity_exhausted": "The provider is at capacity. Try again later.",
       "policy_blocked": "The current policy blocks this operation.",
       "unsupported": "The provider does not support this operation.",
       "cancelled": "The operation was cancelled.",
       "internal": "The operation failed unexpectedly."
+    },
+    "recovery": {
+      "reenter_credential": "Re-enter the credential in Settings.",
+      "refresh_credential": "Refresh the provider credential."
     }
   },
   "errors": {

@@ -4,12 +4,17 @@ import {
   RUNTIME_DIAGNOSTIC_CONTRACT,
   type RuntimeDiagnostic,
   type RuntimeDiagnosticAppError,
+  type RuntimeErrorCode,
+  type RuntimeSafeRecoveryAction,
 } from "../generated/runtimeDiagnostic";
+import type en from "../i18n/locales/en.json";
+import type pt from "../i18n/locales/pt.json";
 import {
   normalizeRuntimeDiagnostic,
   parseRuntimeDiagnostic,
   parseRuntimeDiagnosticAppError,
   type RuntimeDiagnosticTranslationKey,
+  type RuntimeRecoveryTranslationKey,
   runtimeDiagnosticPresentation,
   SAFE_INTERNAL_RUNTIME_DIAGNOSTIC,
 } from "./runtimeDiagnostic";
@@ -39,9 +44,10 @@ const runtimeDiagnostic = (code = "timeout") => ({
 });
 
 describe("generated runtime diagnostic contract", () => {
-  it("exports the exact closed ec13 vocabularies", () => {
-    expect(RUNTIME_DIAGNOSTIC_CONTRACT.error_codes).toHaveLength(12);
-    expect(RUNTIME_DIAGNOSTIC_CONTRACT.recovery_actions).toHaveLength(8);
+  it("exports the closed runtime diagnostic vocabularies", () => {
+    expect(RUNTIME_DIAGNOSTIC_CONTRACT.schema_version).toBe(1);
+    expect(RUNTIME_DIAGNOSTIC_CONTRACT.error_codes).toHaveLength(16);
+    expect(RUNTIME_DIAGNOSTIC_CONTRACT.recovery_actions).toHaveLength(10);
     expect(RUNTIME_DIAGNOSTIC_CONTRACT.operations).toHaveLength(7);
     expect(RUNTIME_DIAGNOSTIC_CONTRACT.transports).toEqual([
       "native",
@@ -71,6 +77,17 @@ describe("generated runtime diagnostic contract", () => {
       | `runtimeDiagnostics.credential.${(typeof CREDENTIAL_CONTRACT.vocabulary.error_codes)[number]}`
       | `runtimeDiagnostics.runtime.${(typeof RUNTIME_DIAGNOSTIC_CONTRACT.error_codes)[number]}`
     >();
+  });
+
+  it("provides locale keys for all runtime codes and credential recovery actions", () => {
+    expectTypeOf<
+      keyof typeof en.runtimeDiagnostics.runtime
+    >().toEqualTypeOf<RuntimeErrorCode>();
+    expectTypeOf<
+      keyof typeof pt.runtimeDiagnostics.runtime
+    >().toEqualTypeOf<RuntimeErrorCode>();
+    expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof en.runtimeDiagnostics.recovery}`>();
+    expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof pt.runtimeDiagnostics.recovery}`>();
   });
 });
 
@@ -220,6 +237,13 @@ describe("runtime diagnostic trust boundary", () => {
         ...runtimeDiagnostic(),
         detail: {
           ...runtimeDiagnostic().detail,
+          recovery_action: "unknown_provider_action",
+        },
+      },
+      {
+        ...runtimeDiagnostic(),
+        detail: {
+          ...runtimeDiagnostic().detail,
           context: { operation: "/private/path/canary" },
         },
       },
@@ -232,7 +256,45 @@ describe("runtime diagnostic trust boundary", () => {
       expect(JSON.stringify(normalizeRuntimeDiagnostic(value))).not.toContain(
         "canary",
       );
+      expect(runtimeDiagnosticPresentation(value).translationKey).toBe(
+        "runtimeDiagnostics.runtime.internal",
+      );
     }
+  });
+
+  it.each([
+    [
+      "credential_rejected",
+      "reenter_credential",
+      "runtimeDiagnostics.recovery.reenter_credential",
+    ],
+    [
+      "credential_expired",
+      "refresh_credential",
+      "runtimeDiagnostics.recovery.refresh_credential",
+    ],
+    ["permission_denied", "review_configuration", undefined],
+    ["invalid_configuration", "review_configuration", undefined],
+  ] satisfies [
+    RuntimeErrorCode,
+    RuntimeSafeRecoveryAction,
+    RuntimeRecoveryTranslationKey | undefined,
+  ][])("presents localized provider failure %s", (code, recoveryAction, recoveryTranslationKey) => {
+    const input = runtimeDiagnostic(code);
+    const presentation = runtimeDiagnosticPresentation({
+      ...input,
+      detail: {
+        ...input.detail,
+        retryable: false,
+        recovery_action: recoveryAction,
+      },
+    });
+    expect(presentation).toMatchObject({
+      translationKey: `runtimeDiagnostics.runtime.${code}`,
+      recoveryAction,
+      retryable: false,
+    });
+    expect(presentation.recoveryTranslationKey).toBe(recoveryTranslationKey);
   });
 
   it("returns only closed localization and recovery metadata", () => {
