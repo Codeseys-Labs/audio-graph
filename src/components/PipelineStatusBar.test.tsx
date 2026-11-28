@@ -35,6 +35,10 @@ function allIdle(): PipelineStatus {
   };
 }
 
+function publish(status: PipelineStatus) {
+  act(() => useAudioGraphStore.getState().setPipelineStatus(status));
+}
+
 // SHELL-R3 (plan §R3, ADR-0046, folds audio-graph-50e3): the footer
 // collapses to a single composite row only while CAPTURING and
 // `computeCompositeHealth` classifies as "healthy" — which a bare `Running`
@@ -110,13 +114,21 @@ describe("PipelineStatusBar", () => {
       "write_failed",
       "A transcrição não está sendo salva porque houve uma falha na gravação",
     ],
+    [
+      "en",
+      "confirmation_delayed",
+      "Waiting for confirmation that the transcript was saved",
+    ],
+    [
+      "pt",
+      "confirmation_delayed",
+      "Aguardando confirmação de que a transcrição foi salva",
+    ],
   ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
     const previous = i18n.language;
     await i18n.changeLanguage(locale);
     const view = render(<PipelineStatusBar />);
     try {
-      const publish = (status: PipelineStatus) =>
-        act(() => useAudioGraphStore.getState().setPipelineStatus(status));
       publish({ ...allIdle(), transcript_not_saving: reason });
       const bar = screen.getByRole("status");
       expect(bar).toHaveAttribute("aria-live", "polite");
@@ -129,6 +141,30 @@ describe("PipelineStatusBar", () => {
       expect(within(bar).getByText(sentence)).toBe(warning);
       publish(allIdle());
       expect(within(bar).queryByText(sentence)).toBeNull();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
+  });
+
+  it.each([
+    ["en", "Transcript saved. Crash recovery is unverified on this storage."],
+    [
+      "pt",
+      "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
+    ],
+  ])("keeps the %s storage qualification notice visible while recording", async (locale, message) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    resetStore({ isCapturing: true });
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({ ...allIdle(), transcript_crash_safety_unverified: true });
+      const notice = screen.getByText(message);
+      publish({ ...allIdle(), transcript_crash_safety_unverified: true });
+      expect(screen.getByText(message)).toBe(notice);
+      publish(allIdle());
+      expect(notice).not.toBeInTheDocument();
     } finally {
       view.unmount();
       await i18n.changeLanguage(previous);

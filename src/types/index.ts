@@ -668,7 +668,12 @@ interface PipelineStages {
 }
 
 export interface PipelineStatus extends PipelineStages {
-  transcript_not_saving?: "writer_absent" | "storage_full" | "write_failed";
+  transcript_not_saving?:
+    | "writer_absent"
+    | "storage_full"
+    | "write_failed"
+    | "confirmation_delayed";
+  transcript_crash_safety_unverified?: boolean;
 }
 
 /**

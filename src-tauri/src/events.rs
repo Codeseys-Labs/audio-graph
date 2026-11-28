@@ -237,6 +237,7 @@ pub enum StageStatus {
 pub enum TranscriptSavingFailure {
     WriterAbsent,
     StorageFull,
+    ConfirmationDelayed,
     WriteFailed,
 }
 
@@ -245,6 +246,9 @@ pub enum TranscriptSavingFailure {
 pub struct PipelineStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_not_saving: Option<TranscriptSavingFailure>,
+    /// File sync succeeded on storage without a qualified crash-durability tier.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript_crash_safety_unverified: bool,
     pub capture: StageStatus,
     pub pipeline: StageStatus,
     pub asr: StageStatus,

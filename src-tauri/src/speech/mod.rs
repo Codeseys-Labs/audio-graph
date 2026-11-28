@@ -1061,10 +1061,10 @@ fn emit_asr_partial_with_meta(
     end_time: f64,
     confidence: f32,
     meta: AsrRevisionMeta,
-) {
+) -> bool {
     let text = text.into();
     if text.trim().is_empty() {
-        return;
+        return false;
     }
 
     let source_id = source_id.into();
@@ -1104,7 +1104,7 @@ fn emit_asr_partial_with_meta(
         Some(&ctx.projection_dispatch_context()),
         &asr_payload,
     ) {
-        return;
+        return false;
     }
     emit_asr_span_revision(&ctx.app_handle, asr_payload);
 
@@ -1121,6 +1121,7 @@ fn emit_asr_partial_with_meta(
             timestamp_ms: received_at_ms,
         },
     );
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -2878,61 +2879,106 @@ fn record_asr_span_revision_event(
     )
 }
 
+type LiveTranscriptResult = Result<
+    (bool, crate::persistence::canonical_log::TranscriptReceipt),
+    crate::persistence::canonical_log::TranscriptCommitError,
+>;
+
+fn transcript_saving_failure(
+    error: &crate::persistence::canonical_log::TranscriptCommitError,
+) -> Option<events::TranscriptSavingFailure> {
+    use crate::persistence::canonical_log::TranscriptCommitError as Error;
+    use events::TranscriptSavingFailure as Saving;
+    match error {
+        Error::InvalidAddress
+        | Error::InvalidRevision
+        | Error::LiveHeadChanged
+        | Error::ConflictingAttempt
+        | Error::Frame(_) => None,
+        Error::AckTimeout | Error::ReplyLost => Some(Saving::ConfirmationDelayed),
+        Error::WriterAbsent => Some(Saving::WriterAbsent),
+        _ if error.is_storage_full() => Some(Saving::StorageFull),
+        Error::QueueFull
+        | Error::UnsupportedRepository
+        | Error::SessionFloorUnavailable
+        | Error::InvalidHistory
+        | Error::Qualification(_)
+        | Error::Coordination(_)
+        | Error::Rejected(_)
+        | Error::Indeterminate(_)
+        | Error::Io { .. } => Some(Saving::WriteFailed),
+    }
+}
+
+/// Returns true when the visible storage status changed.
+fn update_transcript_saving_status(
+    status: &mut PipelineStatus,
+    result: &LiveTranscriptResult,
+) -> bool {
+    use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+
+    let was = (
+        status.transcript_not_saving,
+        status.transcript_crash_safety_unverified,
+    );
+    match result {
+        Ok((_, receipt)) => {
+            status.transcript_not_saving = None;
+            status.transcript_crash_safety_unverified =
+                receipt.barrier == CanonicalDurabilityBarrier::SyncedUnqualified;
+        }
+        Err(error) => {
+            let Some(failure) = transcript_saving_failure(error) else {
+                return false;
+            };
+            status.transcript_not_saving = Some(failure);
+        }
+    }
+    was != (
+        status.transcript_not_saving,
+        status.transcript_crash_safety_unverified,
+    )
+}
+
 fn report_transcript_commit(
-    receipt: Result<bool, crate::persistence::canonical_log::TranscriptCommitError>,
+    result: LiveTranscriptResult,
     status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
 ) -> bool {
-    use crate::persistence::canonical_log::TranscriptCommitError;
-
-    let failure = receipt.as_ref().err().map(|error| match error {
-        TranscriptCommitError::WriterAbsent => events::TranscriptSavingFailure::WriterAbsent,
-        error if error.is_storage_full() => events::TranscriptSavingFailure::StorageFull,
-        _ => events::TranscriptSavingFailure::WriteFailed,
-    });
     if let Some((app, status)) = status {
-        let mut status = status
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if status.transcript_not_saving != failure {
-            status.transcript_not_saving = failure;
+        let mut status = status.write().unwrap_or_else(|p| p.into_inner());
+        if update_transcript_saving_status(&mut status, &result) {
             let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
         }
     }
-    receipt.unwrap_or_else(|error| {
-        log::warn!("transcript commit refused: {error:?}");
-        false
-    })
+    match result {
+        Ok((publish, _)) => publish,
+        Err(error) if transcript_saving_failure(&error).is_none() => {
+            log::debug!("transcript revision declined: {error:?}");
+            false
+        }
+        Err(error) => {
+            log::warn!("transcript commit refused: {error:?}");
+            false
+        }
+    }
 }
 
-/// Commit the proposed ledger only after the writer returns a durable receipt.
-/// The returned failure is content-free, including validation failures.
+/// The worker serializes head checks and live publication around the file
+/// operation. Only take the writer-slot lock to copy its submit handle.
 fn commit_asr_span_revision(
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     payload: &events::AsrSpanRevisionPayload,
-) -> Result<bool, crate::persistence::canonical_log::TranscriptCommitError> {
+) -> LiveTranscriptResult {
     use crate::persistence::canonical_log::TranscriptCommitError;
 
-    let event = crate::projections::TranscriptEvent::from(payload.clone());
-    let mut ledger = transcript_ledger
+    let client = transcript_event_writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut next_ledger = ledger.clone();
-    next_ledger
-        .apply_event(event.clone())
-        .map_err(|_| TranscriptCommitError::InvalidRevision)?;
-    let writer = transcript_event_writer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let receipt = writer
+        .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .ok_or(TranscriptCommitError::WriterAbsent)?
-        .append_after(&event, Some(ledger.accepted_event_count))?;
-    if receipt.already_accepted && receipt.sequence <= ledger.accepted_event_count {
-        return Ok(false);
-    }
-    *ledger = next_ledger;
-    Ok(true)
+        .client();
+    client.append_live(&payload.clone().into(), transcript_ledger.clone())
 }
 
 fn record_asr_span_revision_event_and_observe_projection(
@@ -2943,9 +2989,17 @@ fn record_asr_span_revision_event_and_observe_projection(
     projection_dispatch: Option<&ProjectionDispatchContext>,
     payload: &events::AsrSpanRevisionPayload,
 ) -> bool {
+    let expected_session = transcript_ledger
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .session_id
+        .clone();
     let receipt = commit_asr_span_revision(transcript_ledger, transcript_event_writer, payload);
-    if !report_transcript_commit(receipt, status) {
-        return false;
+    {
+        let ledger = transcript_ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if ledger.session_id != expected_session || !report_transcript_commit(receipt, status) {
+            return false;
+        }
     }
     observe_projection_schedulers_for_asr_revision(
         transcript_ledger,
@@ -7390,6 +7444,106 @@ fn promote_pending_interim(
     }
 }
 
+/// Flux lifecycle messages can be the only source of transcript text. Track
+/// an observed turn for messages without provider identity or audio offsets.
+struct FluxTurnClock {
+    origin: Instant,
+    active: HashMap<String, (String, f64)>,
+}
+impl Default for FluxTurnClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            active: HashMap::new(),
+        }
+    }
+}
+impl FluxTurnClock {
+    fn revision(
+        &mut self,
+        turn: &TurnEventInput,
+        revisions: &mut HashMap<String, u64>,
+    ) -> Option<events::AsrSpanRevisionPayload> {
+        if matches!(
+            turn.kind,
+            events::TurnEventKind::SpeechStarted
+                | events::TurnEventKind::UtteranceEnd
+                | events::TurnEventKind::SpeechFinal
+        ) {
+            return None;
+        }
+        if matches!(turn.kind, events::TurnEventKind::TurnResumed) && turn.text.is_none() {
+            return None;
+        }
+        let now = self.origin.elapsed().as_secs_f64();
+        if matches!(turn.kind, events::TurnEventKind::StartOfTurn) {
+            self.active.remove(&turn.source_id);
+        }
+        let anchored = turn
+            .turn_index
+            .map(|i| provider_sequence_span_id("deepgram", &turn.source_id, "turn", i))
+            .or_else(|| {
+                turn.start_time
+                    .map(|t| provider_start_span_id("deepgram", &turn.source_id, t))
+            });
+        let active = self.active.entry(turn.source_id.clone());
+        let (span_id, first_seen) = active.or_insert_with(|| {
+            (
+                anchored.clone().unwrap_or_else(|| {
+                    provider_item_span_id(
+                        "deepgram",
+                        &turn.source_id,
+                        &uuid::Uuid::new_v4().to_string(),
+                    )
+                }),
+                now,
+            )
+        });
+        if let Some(id) = anchored
+            && id != *span_id
+        {
+            *span_id = id;
+            *first_seen = now;
+        }
+        let start_time = turn.start_time.unwrap_or(*first_seen);
+        let span_id = span_id.clone();
+        let is_final = matches!(turn.kind, events::TurnEventKind::EndOfTurn);
+        if is_final {
+            self.active.remove(&turn.source_id);
+        }
+        let text = turn.text.clone()?;
+        let (revision_number, supersedes) = next_span_revision(revisions, &span_id);
+        Some(events::AsrSpanRevisionPayload {
+            provider: "deepgram".into(),
+            source_id: turn.source_id.clone(),
+            provider_item_id: turn.turn_index.map(|i| format!("turn-{i}")),
+            transcript_segment_id: is_final.then(|| format!("{span_id}@final")),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text,
+            start_time,
+            end_time: turn.end_time.unwrap_or(now.max(start_time)),
+            confidence: turn.confidence.unwrap_or_default(),
+            is_final,
+            stability: if is_final {
+                events::AsrSpanStability::Final
+            } else {
+                events::AsrSpanStability::Partial
+            },
+            revision_number,
+            supersedes,
+            turn_id: turn.turn_index.map(|i| format!("turn-{i}")),
+            end_of_turn: is_final,
+            raw_event_ref: Some("deepgram.flux.turn".into()),
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: current_unix_millis(),
+            span_id,
+        })
+    }
+}
+
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
@@ -7450,6 +7604,9 @@ fn run_deepgram_event_receiver(
     let mut pending_interims_by_span: HashMap<String, PendingInterimSpan> = HashMap::new();
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    let mut saved_speech_final: Option<TurnEventInput> = None;
+    let mut flux = FluxTurnClock::default();
 
     let ctx = shared_to_transcript_context(
         shared,
@@ -7524,7 +7681,7 @@ fn run_deepgram_event_receiver(
                 text,
                 confidence,
                 is_final,
-                speech_final: _,
+                speech_final,
                 start,
                 duration,
                 words,
@@ -7533,6 +7690,17 @@ fn run_deepgram_event_receiver(
                 let end_time = start + duration;
                 let span_id = provider_start_span_id("deepgram", &source_id, start);
 
+                saved_speech_final = None;
+                let paired_turn = speech_final.then(|| TurnEventInput {
+                    provider: "deepgram",
+                    source_id: source_id.clone(),
+                    kind: events::TurnEventKind::SpeechFinal,
+                    text: Some(text.clone()),
+                    start_time: Some(start),
+                    end_time: Some(end_time),
+                    confidence: Some(confidence),
+                    turn_index: None,
+                });
                 // Only process final transcripts to avoid duplicates.
                 if !is_final {
                     let (revision_number, supersedes) =
@@ -7575,7 +7743,7 @@ fn run_deepgram_event_receiver(
                             retained_at: std::time::Instant::now(),
                         },
                     );
-                    emit_asr_partial_with_meta(
+                    if emit_asr_partial_with_meta(
                         &ctx,
                         "deepgram",
                         source_id,
@@ -7591,7 +7759,9 @@ fn run_deepgram_event_receiver(
                             raw_event_ref: Some("deepgram.results.interim".to_string()),
                             ..AsrRevisionMeta::default()
                         },
-                    );
+                    ) {
+                        saved_speech_final = paired_turn;
+                    }
                     continue;
                 }
 
@@ -7683,7 +7853,7 @@ fn run_deepgram_event_receiver(
                         final_segment.speaker_label.is_some(),
                     );
 
-                    emit_transcript_and_extract_with_meta(
+                    if emit_transcript_and_extract_with_meta(
                         final_segment,
                         None,
                         &ctx,
@@ -7698,7 +7868,9 @@ fn run_deepgram_event_receiver(
                             raw_event_ref: Some("deepgram.results.final".to_string()),
                             ..AsrRevisionMeta::default()
                         },
-                    );
+                    ) {
+                        saved_speech_final = paired_turn;
+                    }
                 } else {
                     // Multi-speaker final: emit one TranscriptSegment per
                     // same-speaker run. Run 0 keeps the final's own `span_id`
@@ -7726,6 +7898,8 @@ fn run_deepgram_event_receiver(
                     // of within one span. Left as a follow-up; reconciling it
                     // needs tracking which span_ids a given final `start` has
                     // previously emitted, not just per-span revision counters.
+                    let mut all_committed = true;
+                    let mut committed_words = Vec::new();
                     let run_count = runs.len();
                     let mut used_span_ids: std::collections::HashSet<String> =
                         std::collections::HashSet::with_capacity(run_count);
@@ -7790,6 +7964,9 @@ fn run_deepgram_event_receiver(
                             format!("Speaker {}", id)
                         });
 
+                        if speech_final {
+                            committed_words.push(run_text.clone());
+                        }
                         let final_run_segment = TranscriptSegment {
                             id: uuid::Uuid::new_v4().to_string(),
                             source_id: source_id.clone(),
@@ -7814,7 +7991,7 @@ fn run_deepgram_event_receiver(
                             run_count,
                         );
 
-                        emit_transcript_and_extract_with_meta(
+                        all_committed &= emit_transcript_and_extract_with_meta(
                             final_run_segment,
                             None,
                             &ctx,
@@ -7832,6 +8009,9 @@ fn run_deepgram_event_receiver(
                                 ..AsrRevisionMeta::default()
                             },
                         );
+                    }
+                    if all_committed && speech_final && committed_words.join(" ") == text {
+                        saved_speech_final = paired_turn;
                     }
                 }
             }
@@ -7854,19 +8034,50 @@ fn run_deepgram_event_receiver(
                     DeepgramTurnKind::TurnResumed => events::TurnEventKind::TurnResumed,
                 };
                 let source_id = source_hint_or_fallback(&source_id_hint, "deepgram-stream");
-                emit_turn_event(
-                    &ctx.app_handle,
-                    TurnEventInput {
-                        provider: "deepgram",
-                        source_id,
-                        kind: normalized_kind,
-                        text,
-                        start_time: start,
-                        end_time: end,
-                        confidence,
-                        turn_index,
-                    },
-                );
+                let mut turn = TurnEventInput {
+                    provider: "deepgram",
+                    source_id,
+                    kind: normalized_kind,
+                    text,
+                    start_time: start,
+                    end_time: end,
+                    confidence,
+                    turn_index,
+                };
+                if matches!(turn.kind, events::TurnEventKind::SpeechFinal) {
+                    // Nova emits the transcript first, then its lifecycle event.
+                    // Never pass through text from a different or refused result.
+                    let accepted = saved_speech_final.take().is_some_and(|saved| {
+                        saved.source_id == turn.source_id
+                            && saved.start_time == start
+                            && saved.end_time == end
+                            && saved.text == turn.text
+                    });
+                    if !accepted {
+                        turn.text = None;
+                    }
+                } else {
+                    let accepted = flux
+                        .revision(&turn, &mut revision_numbers_by_span)
+                        .is_some_and(|revision| {
+                            let final_count = u64::from(revision.is_final);
+                            let accepted = emit_provider_span_revision_payload(
+                                revision,
+                                &ctx,
+                                asr_count + final_count,
+                                &extraction_count,
+                                &graph_update_count,
+                            );
+                            if accepted {
+                                asr_count += final_count;
+                            }
+                            accepted
+                        });
+                    if !accepted {
+                        turn.text = None;
+                    }
+                }
+                emit_turn_event(&ctx.app_handle, turn);
             }
             DeepgramEvent::Error {
                 message: diagnostic,
@@ -12439,6 +12650,120 @@ mod tests_status {
     }
 
     #[test]
+    fn transcript_admission_rejections_preserve_saving_status() {
+        use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+        use crate::persistence::canonical_log::{
+            CanonicalAppendRejection, TranscriptCommitError as Error, TranscriptReceipt,
+        };
+        let mut status = PipelineStatus::default();
+        for previous in [None, Some(events::TranscriptSavingFailure::StorageFull)] {
+            status.transcript_not_saving = previous;
+            for error in [
+                Error::InvalidRevision,
+                Error::InvalidAddress,
+                Error::LiveHeadChanged,
+                Error::ConflictingAttempt,
+                Error::Frame(CanonicalAppendRejection::EventIdConflict),
+            ] {
+                assert!(!super::update_transcript_saving_status(
+                    &mut status,
+                    &Err(error)
+                ));
+                assert_eq!(status.transcript_not_saving, previous);
+            }
+        }
+        let receipt = TranscriptReceipt {
+            sequence: 1,
+            already_accepted: false,
+            barrier: CanonicalDurabilityBarrier::SyncedUnqualified,
+        };
+        assert!(super::update_transcript_saving_status(
+            &mut status,
+            &Ok((true, receipt))
+        ));
+        assert!(status.transcript_crash_safety_unverified);
+        assert_eq!(status.transcript_not_saving, None);
+        assert!(!super::update_transcript_saving_status(
+            &mut status,
+            &Ok((true, receipt))
+        ));
+        assert!(super::update_transcript_saving_status(
+            &mut status,
+            &Err(Error::AckTimeout)
+        ));
+        assert_eq!(
+            status.transcript_not_saving,
+            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
+    fn deepgram_nova_and_flux_turn_text_reach_the_listener_only_after_a_receipt() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("flux-receipt");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let app_handle = super::shared_test_app_handle();
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let observed = turns.clone();
+        let listener = app_handle.listen_any(events::TURN_EVENT, move |e| {
+            let turn: events::TurnEventPayload = serde_json::from_str(e.payload()).unwrap();
+            if turn.source_id == "flux-receipt-source" {
+                observed.lock().unwrap().push(turn.text);
+            }
+        });
+        let run = |flux_word: &str, nova_word: &str, turn: u64| {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            crate::asr::deepgram::handle_server_message(&serde_json::json!({
+                "type":"TurnInfo","event":"EagerEndOfTurn","transcript":flux_word,"turn_index":turn,"start":1.0,"end":2.0
+            }).to_string(), &tx);
+            crate::asr::deepgram::handle_server_message(&serde_json::json!({
+                "type":"Results", "is_final":true,"speech_final":true,"start":3.0,"duration":1.0,
+                "channel":{"alternatives":[{"transcript":nova_word,"confidence":0.9,"words":[]}]}
+            }).to_string(), &tx);
+            drop(tx);
+            super::run_deepgram_event_receiver(
+                rx,
+                moonshine_shared_for_app(&app, app_handle.clone()),
+                moonshine_speech_config(dir.clone()),
+                Arc::new(RwLock::new(Some("flux-receipt-source".into()))),
+                0,
+                false,
+            );
+        };
+        run("pond", "leaf", 1);
+        assert_eq!(
+            load_transcript_events(&app.current_session_id())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            turns.lock().unwrap().as_slice(),
+            &[Some("pond".to_owned()), Some("leaf".to_owned())]
+        );
+        let writer = app.transcript_event_writer.lock().unwrap().take().unwrap();
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(5)));
+        run("branch", "fern", 2);
+        assert_eq!(
+            turns.lock().unwrap().as_slice(),
+            &[Some("pond".to_owned()), Some("leaf".to_owned()), None, None]
+        );
+        let events = load_transcript_events(&app.current_session_id()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].text, "pond");
+        assert_eq!(events[1].text, "leaf");
+        app_handle.unlisten(listener);
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
     fn deepgram_receiver_updates_stage_across_disconnects_and_recovery() {
         use crate::asr::deepgram::DeepgramEvent as Event;
@@ -13020,7 +13345,7 @@ mod tests_status {
 
     #[test]
     fn transcript_live_snapshot_and_scheduled_basis_follow_the_durable_log() {
-        use crate::persistence::canonical_durability::CanonicalFilesystemQualification;
+        use crate::persistence::canonical_durability::transcript_coordination_path;
 
         let session = "session-receipts";
         let fixture = AcceptingTranscriptEventWriterFixture::new(session);
@@ -13050,20 +13375,23 @@ mod tests_status {
 
         // Fail inside the real writer after queue admission. A final cannot
         // publish to the ledger, schedule a snapshot, or disclose its input.
-        let dir = fixture.root.join("transcripts");
-        let (qualification, durability) =
-            CanonicalFilesystemQualification::for_existing_managed_root(&dir).unwrap();
-        let guard = durability
-            .try_lock_exclusive_qualified(&dir, &qualification)
-            .unwrap();
+        let source = fixture
+            .root
+            .join("transcripts")
+            .join(format!("{session}.events.jsonl"));
+        let lock = transcript_coordination_path(&source);
+        let saved_lock = lock.with_added_extension("held");
+        std::fs::rename(&lock, &saved_lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
         let logs = crate::test_log_capture::ThreadLogCapture::start();
         assert!(!publish(&final_revision));
         let refusal = crate::test_log_capture::render(&logs.finish());
-        assert!(refusal.contains("Coordination(Contended)"));
+        assert!(refusal.contains("Coordination("), "{refusal}");
         for canary in ["orchard path", "quiet pond", fixture.root.to_str().unwrap()] {
             assert!(!refusal.contains(canary));
         }
-        drop(guard);
+        std::fs::remove_dir(&lock).unwrap();
+        std::fs::rename(saved_lock, &lock).unwrap();
         assert_eq!(ledger.lock().unwrap().accepted_event_count, 1);
         assert_eq!(*ledger.lock().unwrap(), replay());
         assert!(schedulers.lock().unwrap().notes().in_flight_job().is_none());
