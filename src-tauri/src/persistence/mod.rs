@@ -40,11 +40,15 @@ pub(crate) mod speaker_log;
 pub(crate) const MAX_DIARIZATION_EVENTS_BYTES: u64 = 4 * 1024 * 1024;
 pub mod data_movement;
 pub mod io;
+mod live_receipt;
 pub mod session_artifact_manifest;
 pub mod session_semantics;
 #[cfg(feature = "surrealdb-embedded")]
 pub mod surreal;
 mod transcript_batch;
+use live_receipt::LiveReply;
+pub(crate) use live_receipt::PendingLiveTranscript;
+pub(crate) mod transcript_startup;
 pub use data_movement::{DataMovementLedgerBuilder, hash_artifact_path};
 pub use io::write_or_emit_storage_full;
 
@@ -1914,16 +1918,14 @@ pub enum TranscriptWriteMsg {
 // Channel message enum: boxing the large `Append` variant would ripple
 // through every send and match site for negligible benefit.
 #[allow(clippy::large_enum_variant)]
-pub enum TranscriptEventWriteMsg {
+pub(crate) enum TranscriptEventWriteMsg {
     #[cfg(test)]
     SimulateDiskFull,
     #[cfg(test)]
+    FailSync(mpsc::Receiver<()>, mpsc::Sender<()>, mpsc::Receiver<()>),
+    #[cfg(test)]
     GroupCounts(mpsc::Sender<Result<(usize, usize), canonical_log::TranscriptCommitError>>),
-    Live(
-        TranscriptEvent,
-        Arc<Mutex<TranscriptLedger>>,
-        mpsc::Sender<LiveTranscriptResult>,
-    ),
+    Live(TranscriptEvent, Arc<Mutex<TranscriptLedger>>, LiveReply),
     /// Append a framed revision and return its durability receipt.
     Append(
         TranscriptEvent,
@@ -2360,9 +2362,6 @@ impl<T> PendingTranscriptReceipt<T> {
     }
 }
 
-pub(crate) type PendingLiveTranscript =
-    PendingTranscriptReceipt<(bool, canonical_log::TranscriptReceipt)>;
-
 #[derive(Clone)]
 pub(crate) struct TranscriptCommitClient {
     tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
@@ -2384,9 +2383,37 @@ impl TranscriptCommitClient {
         event: &TranscriptEvent,
         ledger: Arc<Mutex<TranscriptLedger>>,
     ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
-        self.enqueue(TRANSCRIPT_ACK_TIMEOUT, |reply| {
-            TranscriptEventWriteMsg::Live(event.clone(), ledger, reply)
-        })
+        self.submit_live_with_timeout(event, ledger, TRANSCRIPT_ACK_TIMEOUT)
+    }
+
+    fn submit_live_with_timeout(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        timeout: std::time::Duration,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        self.submit_live_observed(event, ledger, timeout, None)
+    }
+
+    pub(crate) fn submit_live_with_publication(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        publication: live_receipt::LatePublication,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        self.submit_live_observed(event, ledger, TRANSCRIPT_ACK_TIMEOUT, Some(publication))
+    }
+
+    pub(crate) fn submit_live_observed(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        timeout: std::time::Duration,
+        publication: Option<live_receipt::LatePublication>,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        let (reply, ticket) = live_receipt::channel(timeout, publication);
+        self.send(TranscriptEventWriteMsg::Live(event.clone(), ledger, reply))?;
+        Ok(ticket)
     }
 
     fn request<T>(
@@ -2415,9 +2442,20 @@ impl TranscriptCommitClient {
             mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
         ) -> TranscriptEventWriteMsg,
     ) -> Result<PendingTranscriptReceipt<T>, canonical_log::TranscriptCommitError> {
-        use canonical_log::TranscriptCommitError as Error;
         let (reply, ack) = mpsc::channel();
-        match self.tx.try_send(message(reply)) {
+        self.send(message(reply))?;
+        Ok(PendingTranscriptReceipt {
+            reply: ack,
+            deadline: std::time::Instant::now() + timeout,
+        })
+    }
+
+    fn send(
+        &self,
+        message: TranscriptEventWriteMsg,
+    ) -> Result<(), canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        match self.tx.try_send(message) {
             Ok(()) => {
                 note_event_writer_enqueue_success(
                     "transcript_event",
@@ -2425,10 +2463,7 @@ impl TranscriptCommitClient {
                     &self.dropped_event_count,
                     &self.queue_full_active,
                 );
-                Ok(PendingTranscriptReceipt {
-                    reply: ack,
-                    deadline: std::time::Instant::now() + timeout,
-                })
+                Ok(())
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 note_event_writer_queue_full(
@@ -2548,9 +2583,6 @@ impl TranscriptEventWriter {
     ) -> Option<Self> {
         let session_id = session_id.into();
         let path = repository.transcript_commit_path(&session_id).ok()?;
-        if let Err(error) = canonical_log::recover_previous_sessions(path.parent()?, &session_id) {
-            log::warn!("transcript recovery scan unavailable: {error:?}");
-        }
         let storage = canonical_log::PreparedTranscriptStorage::open(&path, &session_id).ok()?;
         storage.ready().ok()?;
         let unqualified = storage.is_unqualified();
@@ -2584,6 +2616,19 @@ impl TranscriptEventWriter {
         self.client()
             .request(TranscriptEventWriteMsg::GroupCounts)
             .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_recovery_after_next_sync_failure(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (start, started) = mpsc::channel();
+        let (failed, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        self.tx
+            .send(TranscriptEventWriteMsg::FailSync(started, failed, resumed))
+            .unwrap();
+        (start, observed, resume)
     }
 
     #[cfg(test)]

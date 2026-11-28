@@ -194,19 +194,25 @@ This boundary is reversible until the first release is published: if a build
 that predates the precise reader turns out to have been distributed, it must
 be reconsidered first. Release qualification is tracked in #176.
 
-The following disposition of interrupted writes is decided here ahead of the
-durable-receipt writer that implements it (#139); it does not describe the
-reader-only change that carries this amendment. While a writer is alive it
-retains the exact attempted frame for retry. After restart, recovery verifies
-the preceding head. A complete matching frame crosses a fresh durability
-barrier and replays once. An interrupted attempt with only a torn suffix
-preserves those bytes as evidence outside replay. Recovery restores the
-verified prefix (including original absence), durably records a typed gap,
-and admits the next event at the sequence following that prefix. Presenting
-that gap in load, timeline and export is tracked on #139. Exact provider
-redelivery after process death cannot be required because the provider
-connection and source audio may both be gone. Conflicting history remains a
-typed refusal.
+Whenever a writer resolves an interrupted attempt, in-process or after
+restart, recovery verifies the descriptor's preceding head. It walks the
+members in order and keeps the longest contiguous prefix matching their
+recorded lengths and hashes. A singleton has one member. A caller error,
+timeout or supersession never revokes a complete matching frame; every
+resolution applies the same verification.
+
+Recovery rewrites the complete matching members and crosses a fresh storage
+barrier. Each receives its original sequence and a recovery receipt at the
+barrier tier actually reached. An unresolved barrier leaves the attempt
+pending. At the first incomplete or mismatched member, recovery preserves
+the remaining bytes outside replay and records a typed gap after the last
+kept member. Previously published quarantine stays authoritative on retry.
+An empty attempt restores the verified prefix, including original absence.
+The next event follows the verified sequence. A final refusal and a pending
+save confirmation have distinct user-visible statuses. A kept revision can
+appear late in its span's position. Exact provider redelivery after process
+death cannot be required because the provider connection and source audio
+may both be gone. Conflicting history remains a typed refusal.
 
 ## Consequences
 

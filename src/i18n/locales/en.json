@@ -1443,7 +1443,7 @@
     "stageAsr": "ASR",
     "transcriptCrashSafetyUnverified": "Transcript saved. Crash recovery is unverified on this storage.",
     "transcriptNotSaving": {
-      "confirmation_delayed": "Waiting for confirmation that the transcript was saved",
+      "confirmation_delayed": "Transcript save confirmation pending",
       "writer_absent": "Transcript is not being saved",
       "storage_full": "Transcript is not being saved because storage is full",
       "write_failed": "Transcript is not being saved because the write failed"

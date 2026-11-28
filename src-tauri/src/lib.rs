@@ -527,6 +527,10 @@ pub fn run() {
             // overrides the compiled-in default (Info) and is the level
             // every subsequent `set_log_level` command will persist to.
             let handle = app.handle();
+            // Historical loads must see recovered frames even if capture is
+            // never started. The receipt handler can now access managed state.
+            crate::persistence::register_app_handle(handle.clone());
+            crate::persistence::transcript_startup::recover_at_startup();
             let loaded_settings = crate::settings::load_settings_with_status(handle);
             let load_status = loaded_settings.status;
             let mut settings = loaded_settings.settings;

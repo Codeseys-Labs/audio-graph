@@ -117,12 +117,12 @@ describe("PipelineStatusBar", () => {
     [
       "en",
       "confirmation_delayed",
-      "Waiting for confirmation that the transcript was saved",
+      "Transcript save confirmation pending",
     ],
     [
       "pt",
       "confirmation_delayed",
-      "Aguardando confirmação de que a transcrição foi salva",
+      "Aguardando confirmação do salvamento da transcrição",
     ],
   ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
     const previous = i18n.language;

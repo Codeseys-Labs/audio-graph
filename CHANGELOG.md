@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Transcript recovery retains each complete, verified revision after an interrupted save, including a revision followed by newer speech. A pending save confirmation is shown while the outcome is uncertain. Recovery restores prior sessions before their first historical load (#139, #559).
 - A panic inside one LLM executor job no longer leaves other jobs waiting
   forever. That job and the jobs queued behind it end at once (notes synthesis
   and projection with an error, entity extraction with its rule-based

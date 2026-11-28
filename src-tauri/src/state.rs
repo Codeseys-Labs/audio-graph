@@ -198,6 +198,7 @@ pub struct AppState {
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
     /// Canonical transcript span ledger for projection-basis checks.
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 
     /// Provider-neutral diarization span ledger for the active session.
@@ -577,6 +578,7 @@ pub enum ProjectionRuntimeApplyError {
 pub struct ProjectionRuntimeHandle {
     session_id: Arc<RwLock<String>>,
     rotation_in_progress: Arc<AtomicBool>,
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
     projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
@@ -589,6 +591,7 @@ impl ProjectionRuntimeHandle {
         Self {
             session_id: Arc::new(RwLock::new(session_id.clone())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone()))),
             materialized_projection_state: Arc::new(Mutex::new(MaterializedProjectionState::new(
                 session_id,
@@ -980,6 +983,7 @@ impl AppState {
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
             display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
             transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
             speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),
             materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
@@ -1055,6 +1059,7 @@ impl AppState {
         ProjectionRuntimeHandle {
             session_id: self.session_id.clone(),
             rotation_in_progress: self.rotation_in_progress.clone(),
+            transcript_publication: self.transcript_publication.clone(),
             transcript_ledger: self.transcript_ledger.clone(),
             materialized_projection_state: self.materialized_projection_state.clone(),
             projection_event_writer: self.projection_event_writer.clone(),
@@ -1185,6 +1190,10 @@ impl AppState {
         // Keep the old id published until every session-scoped aggregate and
         // canonical writer has been reset. The graph autosave loop also sees
         // `rotation_in_progress` and skips this entire transition.
+        let publication = self
+            .transcript_publication
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = self.current_session_id();
 
         {
@@ -1310,6 +1319,18 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .replace(new_projection_event_writer);
+        // Publish the new ownership epoch last. Readers can observe either the
+        // complete old session or the complete new session, never a new id with
+        // old writers/graphs/buffers.
+        {
+            let mut guard = match self.session_id.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = new_session_id.to_string();
+        }
+
+        drop(publication);
         if let Some(old) = old_display
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
@@ -1324,17 +1345,6 @@ impl AppState {
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
             log::warn!("Previous projection event writer has not finished shutdown");
-        }
-
-        // Publish the new ownership epoch last. Readers can observe either the
-        // complete old session or the complete new session, never a new id with
-        // old writers/graphs/buffers.
-        {
-            let mut guard = match self.session_id.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = new_session_id.to_string();
         }
 
         RotateOutcome::Rotated(prev)
