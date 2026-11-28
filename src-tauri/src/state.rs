@@ -1351,8 +1351,12 @@ impl Default for AppState {
 // belt-and-braces proof for a human spot-check.
 
 #[cfg(test)]
+pub(crate) use rotation_tests::snapshot_replace_child;
+
+#[cfg(test)]
 mod rotation_tests {
     include!("state/projection_receipt_tests.rs");
+    include!("state/projection_fault_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2292,6 +2296,115 @@ mod rotation_tests {
         // Drain any spawned writers so their threads don't linger past the test.
         drain_writers(&app);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rotation_releases_both_old_attempts_to_historical_replay_without_restart() {
+        use crate::persistence::canonical_durability::transcript_coordination_path;
+        use crate::persistence::canonical_log::TranscriptCommitError;
+        use std::{fs::File, sync::mpsc};
+
+        let _serial = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("retirement");
+        let _home = HomeGuard::set(&dir);
+        let app = AppState::new();
+        let old = app.current_session_id();
+        crate::sessions::register_session(&old).unwrap();
+        let repo = FileMemoryRepository::user_data();
+        let path = crate::user_data::resolve_transcript_events_path(&old).unwrap();
+        let projections = crate::user_data::resolve_projection_events_path(&old).unwrap();
+        let seed = projection_transcript_event("fern", 1, "green");
+        let kept = projection_transcript_event("stem", 1, "leaf");
+        let limit = Duration::from_secs(20);
+        let writer_slot = app.transcript_event_writer.lock().unwrap();
+        let writer = writer_slot.as_ref().unwrap();
+        let client = writer.client();
+        client
+            .append_live(&seed, app.transcript_ledger.clone())
+            .unwrap();
+        let patch = runtime_note_patch(
+            1,
+            app.transcript_ledger.lock().unwrap().current_basis(),
+            "reed",
+            "blue",
+        );
+        {
+            let slot = app.projection_event_writer.lock().unwrap();
+            let projection = slot.as_ref().unwrap();
+            projection.fail_next_projection_sync();
+            assert!(!projection.append(&patch));
+        }
+        let (start, stopped, resume) = writer.pause_recovery_after_next_sync_failure();
+        start.send(()).unwrap();
+        let confirmation = client
+            .submit_live_observed(&kept, app.transcript_ledger.clone(), limit, None)
+            .unwrap();
+        stopped.recv_timeout(limit).unwrap();
+        assert_eq!(
+            confirmation.wait(),
+            Err(TranscriptCommitError::ConfirmationPending)
+        );
+
+        // The old worker's final attempt cannot take this exclusive stream lock.
+        // The two real OS attempt leases keep deletion out until recovery settles.
+        let shared = File::open(transcript_coordination_path(&path)).unwrap();
+        shared.lock_shared().unwrap();
+        for source in [&path, &projections] {
+            let owner = File::open(source.with_added_extension("attempt-lock")).unwrap();
+            assert!(matches!(
+                owner.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        assert_eq!(
+            repo.load_transcript_events(&old).unwrap().as_slice(),
+            std::slice::from_ref(&seed)
+        );
+        writer.shutdown();
+        resume.send(()).unwrap();
+        drop(writer_slot);
+        assert_eq!(
+            app.rotate_session("meadow"),
+            RotateOutcome::Rotated(old.clone())
+        );
+        assert!(path.with_added_extension("attempt").exists());
+        assert!(projections.with_added_extension("attempt").exists());
+        drop(shared);
+
+        // Lock release is the completion witness. The deadline bounds a hang
+        // on the regression, without polling or guessing when the disk recovered.
+        let leases = [&path, &projections]
+            .map(|p| File::open(p.with_added_extension("attempt-lock")).unwrap());
+        let (settled, completion) = mpsc::channel();
+        let wait = std::thread::spawn(move || {
+            for lease in leases {
+                lease.lock().unwrap();
+            }
+            let _ = settled.send(());
+        });
+        completion.recv_timeout(limit).unwrap();
+        wait.join().unwrap();
+        assert_eq!(repo.load_transcript_events(&old).unwrap(), [seed, kept]);
+        assert_eq!(repo.load_projection_patches(&old).unwrap(), [patch]);
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        assert_eq!(
+            app.materialized_projection_state
+                .lock()
+                .unwrap()
+                .notes
+                .last_sequence,
+            0
+        );
+        let deletion = crate::sessions::permanently_delete_session(&old).unwrap();
+        assert!(deletion.failed_files.is_empty());
+        assert!(!path.exists() && !projections.exists());
+        drain_writers(&app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
