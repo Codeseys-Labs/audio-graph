@@ -163,6 +163,8 @@ const MOCK_SOURCE: AudioSourceInfo = {
  * e2e mock sequence at lines 311-314 (`mockResolvedValueOnce` then
  * `mockRejectedValueOnce`). */
 let startCaptureCalls = 0;
+/** Never reset: the store accepts only ever-newer acknowledged generations. */
+let captureGeneration = 0;
 
 function installInvokeMocks() {
   startCaptureCalls = 0;
@@ -186,7 +188,8 @@ function installInvokeMocks() {
       case "start_capture":
         startCaptureCalls += 1;
         if (startCaptureCalls === 1) {
-          return { generation: 1, sources: [MOCK_SOURCE.id] };
+          captureGeneration += 1;
+          return { generation: captureGeneration, sources: [MOCK_SOURCE.id] };
         }
         throw new Error("e2e-mocked-capture-failure");
       case "stop_capture":

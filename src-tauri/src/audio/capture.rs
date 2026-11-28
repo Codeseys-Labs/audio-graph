@@ -1794,10 +1794,20 @@ pub struct AudioCaptureManager {
     generation: u64,
     /// Set by app shutdown; no start may commit afterwards.
     shutting_down: bool,
+    /// Start ids a Stop named before their start registered (bounded): such
+    /// a start is refused before it prepares anything.
+    stopped_start_ids: std::collections::VecDeque<String>,
+    /// The session whose CaptureStarted row may or may not be on the ledger
+    /// because its append failed. The next start resolves it first.
+    uncertain_capture_start: Option<String>,
 }
+
+/// How many Stop-before-registration start ids are remembered.
+const STOPPED_START_IDS_KEPT: usize = 32;
 
 struct PendingCaptureStart {
     attempt: u64,
+    start_id: String,
     /// Dropped to cancel, so a cancel is sticky and wakes the waiting start.
     cancel_tx: Option<crossbeam_channel::Sender<()>>,
 }
@@ -1882,6 +1892,8 @@ impl AudioCaptureManager {
             next_attempt: 0,
             generation: 0,
             shutting_down: false,
+            stopped_start_ids: std::collections::VecDeque::new(),
+            uncertain_capture_start: None,
         }
     }
 
@@ -1975,11 +1987,12 @@ impl AudioCaptureManager {
 
     /// Register a capture start before it waits for the session lifecycle,
     /// so a Stop or shutdown issued from then on cancels it. Refuses a second
-    /// concurrent start.
+    /// concurrent start, and a start a Stop already named.
     pub(crate) fn register_capture_start(
         &mut self,
+        start_id: &str,
     ) -> Result<CaptureStartTicket, CaptureFailureReason> {
-        if self.shutting_down {
+        if self.shutting_down || self.stopped_start_ids.iter().any(|id| id == start_id) {
             return Err(CaptureFailureReason::Cancelled);
         }
         if self.pending_start.is_some() {
@@ -1989,6 +2002,7 @@ impl AudioCaptureManager {
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         self.pending_start = Some(PendingCaptureStart {
             attempt: self.next_attempt,
+            start_id: start_id.to_string(),
             cancel_tx: Some(cancel_tx),
         });
         Ok(CaptureStartTicket {
@@ -2009,10 +2023,25 @@ impl AudioCaptureManager {
         }
     }
 
-    /// Cancel the pending start, whichever source the Stop names: before the
-    /// acknowledgement the caller may not know the canonical ids. Returns
-    /// whether a start was pending; it then rolls back every source.
-    pub(crate) fn cancel_pending_start(&mut self) -> bool {
+    /// Cancel a start on behalf of a Stop. With `start_id`, a pending start of
+    /// that id is cancelled, and an id not yet registered is remembered so
+    /// that start is refused when it arrives: whichever command reaches the
+    /// backend first, the start does not end up capturing. Without it, any
+    /// pending start is cancelled. Returns whether a pending start was.
+    pub(crate) fn cancel_pending_start(&mut self, start_id: Option<&str>) -> bool {
+        if let Some(start_id) = start_id {
+            let pending_matches = self
+                .pending_start
+                .as_ref()
+                .is_some_and(|pending| pending.start_id == start_id);
+            if !pending_matches {
+                if self.stopped_start_ids.len() == STOPPED_START_IDS_KEPT {
+                    self.stopped_start_ids.pop_front();
+                }
+                self.stopped_start_ids.push_back(start_id.to_string());
+                return false;
+            }
+        }
         match self.pending_start.as_mut() {
             Some(pending) => {
                 pending.cancel_tx = None;
@@ -2020,6 +2049,17 @@ impl AudioCaptureManager {
             }
             None => false,
         }
+    }
+
+    /// Take the session whose CaptureStarted row is uncertain, if any.
+    pub(crate) fn take_uncertain_capture_start(&mut self) -> Option<String> {
+        self.uncertain_capture_start.take()
+    }
+
+    /// Record that `session_id`'s CaptureStarted row may or may not be on
+    /// the ledger, for the next start to resolve.
+    pub(crate) fn mark_capture_start_uncertain(&mut self, session_id: String) {
+        self.uncertain_capture_start = Some(session_id);
     }
 
     /// Refuse a start the current ownership cannot accept, before the caller
@@ -2056,19 +2096,24 @@ impl AudioCaptureManager {
     /// so Stop's cancel, shutdown and listing see it whole:
     /// 1. refuse if the start was cancelled or the app is shutting down;
     /// 2. commit every worker's gate, refusing if one stopped waiting or died;
-    /// 3. `record_started` (the CaptureStarted row; on failure
-    ///    `close_uncertain_start` closes a row that may be durable anyway);
-    /// 4. release every worker at once and take ownership.
+    /// 3. `record_started` (the CaptureStarted row);
+    /// 4. refuse if any member died meanwhile, closing the row with
+    ///    `record_stopped`;
+    /// 5. release every worker at once and take ownership.
     ///
     /// Nothing is recorded and no worker forwards audio unless all of these
-    /// hold. A refusal stops every worker, joining or retiring it. No step
-    /// waits on a worker.
+    /// hold, and a start never succeeds with a member known to be dead at
+    /// the release. A refusal stops every worker, joining or retiring it. No
+    /// step waits on a worker. A row whose append failed, or whose closing
+    /// append failed, is marked uncertain under `ledger_session` instead of
+    /// being closed blindly.
     pub(crate) fn commit_prepared_captures<E>(
         &mut self,
         attempt: u64,
         prepared: PreparedCaptures,
+        ledger_session: &str,
         record_started: impl FnOnce() -> Result<(), E>,
-        close_uncertain_start: impl FnOnce(),
+        record_stopped: impl FnOnce() -> bool,
     ) -> Result<u64, CaptureCommitError<E>> {
         let PreparedCaptures {
             captures,
@@ -2081,6 +2126,18 @@ impl AudioCaptureManager {
                 .as_ref()
                 .is_some_and(|pending| pending.attempt == attempt && pending.cancel_tx.is_some());
         self.release_capture_start(attempt);
+        let dead_member = |captures: &[PreparedCapture]| {
+            captures
+                .iter()
+                .find(|capture| capture.finished.load(Ordering::Acquire))
+                .map(|capture| {
+                    CaptureStartFailure::during_commit(
+                        Some(capture.index),
+                        CaptureFailureReason::WorkerExited,
+                        count,
+                    )
+                })
+        };
         let refusal = if cancelled {
             Some(CaptureStartFailure::during_commit(
                 None,
@@ -2088,33 +2145,46 @@ impl AudioCaptureManager {
                 count,
             ))
         } else {
-            captures.iter().find_map(|capture| {
-                let committed = capture
-                    .commit_gate
-                    .compare_exchange(
-                        GATE_WAITING,
-                        GATE_COMMITTED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok();
-                (!committed || capture.finished.load(Ordering::Acquire)).then(|| {
+            captures
+                .iter()
+                .find(|capture| {
+                    capture
+                        .commit_gate
+                        .compare_exchange(
+                            GATE_WAITING,
+                            GATE_COMMITTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                })
+                .map(|capture| {
                     CaptureStartFailure::during_commit(
                         Some(capture.index),
                         CaptureFailureReason::WorkerExited,
                         count,
                     )
                 })
-            })
+                .or_else(|| dead_member(&captures))
         };
         if let Some(failure) = refusal {
             self.stop_uncommitted(captures, release);
             return Err(CaptureCommitError::Refused(failure));
         }
         if let Err(error) = record_started() {
+            // The row may or may not be durable: never close it blindly.
             self.stop_uncommitted(captures, release);
-            close_uncertain_start();
+            self.uncertain_capture_start = Some(ledger_session.to_string());
             return Err(CaptureCommitError::Record(error));
+        }
+        // Liveness at the release: a member that died during the append
+        // fails the whole start, before any worker forwards audio.
+        if let Some(failure) = dead_member(&captures) {
+            self.stop_uncommitted(captures, release);
+            if !record_stopped() {
+                self.uncertain_capture_start = Some(ledger_session.to_string());
+            }
+            return Err(CaptureCommitError::Refused(failure));
         }
         // Parent-side publication before the release: a worker lost from
         // here on is an acknowledged source and reconciles normally.
@@ -2123,8 +2193,9 @@ impl AudioCaptureManager {
         }
         release.decide(true);
         for capture in captures {
-            // Lost between its commit and the release: its own report ran
-            // before it was acknowledged, so request reconciliation here.
+            // Lost in the instant between the check above and its
+            // acknowledgement: its own report found it unacknowledged, so
+            // request reconciliation here.
             if capture.finished.load(Ordering::Acquire) {
                 capture.stream_loss.report();
             }
@@ -2828,6 +2899,8 @@ pub(crate) mod scripted {
     pub(crate) enum ScriptedStart {
         /// Report Ready, wait for the release, then run until stopped or lost.
         Ready,
+        /// As `Ready`, but report only once the test calls `release()`.
+        ReadyOnRelease,
         /// Fail build/start/subscribe with this rsac error.
         Fail(AudioError),
         /// Block as in a stuck OS call, ignoring Stop, until released; then
@@ -2859,7 +2932,7 @@ pub(crate) mod scripted {
     }
 
     impl ScriptedWorker {
-        /// Let a `Hang` or `AbandonThenWedge` worker return.
+        /// Let a `Hang`, `ReadyOnRelease` or `AbandonThenWedge` worker go on.
         pub(crate) fn release(&self) {
             let _ = self.release.try_send(());
         }
@@ -2954,7 +3027,10 @@ pub(crate) mod scripted {
                     }
                     false
                 }
-                ScriptedStart::Ready => {
+                ScriptedStart::Ready | ScriptedStart::ReadyOnRelease => {
+                    if matches!(script, ScriptedStart::ReadyOnRelease) {
+                        let _ = release_rx.recv();
+                    }
                     if !reported(report_startup(&context, Ok(None)))
                         || !await_capture_release(&context)
                     {
@@ -3274,6 +3350,42 @@ mod handle_lifecycle_tests {
         }
         // (If rsac enumeration returns no 'system-default' on the CI box the
         // overlay path is still exercised via active_captures tests above.)
+    }
+
+    #[test]
+    fn a_stop_naming_a_start_refuses_that_start_and_leaves_any_other_alone() {
+        let mut mgr = AudioCaptureManager::new();
+        // The Stop reaches the manager before its start registers.
+        assert!(!mgr.cancel_pending_start(Some("start-a")));
+        assert_eq!(
+            mgr.register_capture_start("start-a").err(),
+            Some(CaptureFailureReason::Cancelled)
+        );
+
+        let ticket = mgr.register_capture_start("start-b").unwrap();
+        // A late Stop for another start does not cancel this one.
+        assert!(!mgr.cancel_pending_start(Some("start-a")));
+        assert!(matches!(
+            ticket.cancel_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        assert!(mgr.cancel_pending_start(Some("start-b")));
+        assert!(matches!(
+            ticket.cancel_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        mgr.release_capture_start(ticket.attempt);
+
+        // The remembered ids are bounded; the oldest is forgotten first.
+        for index in 0..STOPPED_START_IDS_KEPT {
+            mgr.cancel_pending_start(Some(&format!("stale-{index}")));
+        }
+        let forgotten = mgr.register_capture_start("start-a").unwrap();
+        mgr.release_capture_start(forgotten.attempt);
+        assert_eq!(
+            mgr.register_capture_start("stale-0").err(),
+            Some(CaptureFailureReason::Cancelled)
+        );
     }
 }
 

@@ -1406,11 +1406,12 @@ fn validate_asr_capture_selection(
             let provider_name = descriptor
                 .source_policy_label
                 .unwrap_or(descriptor.display_name);
+            // Content-free: the count, never the source ids or device names.
             Err(format!(
                 "{provider_name} currently supports one active audio source at a time. \
                  Stop extra sources or switch to a provider with multi-source capture support \
-                 before transcribing. Active sources: {}",
-                source_ids.into_iter().collect::<Vec<_>>().join(", ")
+                 before transcribing ({} sources are active).",
+                source_ids.len()
             ))
         }
         crate::provider_registry::ProviderSourcePolicy::SingleSession
@@ -2279,10 +2280,11 @@ pub struct CaptureStartAck {
 #[tauri::command]
 pub async fn start_capture(
     sources: Vec<CaptureSourceRequest>,
+    start_id: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> AppResult<CaptureStartAck> {
-    start_capture_impl(sources, state.inner(), &app).await
+    start_capture_impl(sources, &start_id, state.inner(), &app).await
 }
 
 fn capture_start_failed(failure: crate::audio::capture::CaptureStartFailure) -> AppError {
@@ -2309,6 +2311,7 @@ impl Drop for CaptureStartRegistration<'_> {
 /// can be exercised from tests without constructing a per-test Tauri/tao app.
 async fn start_capture_impl(
     requests: Vec<CaptureSourceRequest>,
+    start_id: &str,
     state: &AppState,
     app: &tauri::AppHandle,
 ) -> AppResult<CaptureStartAck> {
@@ -2351,12 +2354,13 @@ async fn start_capture_impl(
     let source_ids: Vec<String> = starts.iter().map(|start| start.source_id.clone()).collect();
 
     // Registered before waiting for the lifecycle lock, so a Stop or app
-    // shutdown from here on cancels this start.
+    // shutdown from here on cancels this start; a Stop that named this
+    // start's id before it got here refuses it now.
     let ticket = state
         .capture_manager
         .lock()
         .map_err(|error| format!("Capture manager lock error: {error}"))?
-        .register_capture_start()
+        .register_capture_start(start_id)
         .map_err(|reason| capture_start_failed(CaptureStartFailure::refused(reason, count)))?;
     let _registration = CaptureStartRegistration {
         manager: &state.capture_manager,
@@ -2374,6 +2378,9 @@ async fn start_capture_impl(
         .map_err(|error| format!("Capture manager lock error: {error}"))?
         .validate_capture_start()
         .map_err(|reason| capture_start_failed(CaptureStartFailure::refused(reason, count)))?;
+    // A previous start's CaptureStarted row whose append failed is resolved
+    // before this start records anything.
+    close_uncertain_capture_start(state)?;
 
     // Resolve the user-configured capture format from the in-memory settings
     // cache, falling back to defaults if the cache is uninitialised or the
@@ -2440,10 +2447,11 @@ async fn start_capture_impl(
     };
 
     // The single commit transition, under the manager lock: cancel versus
-    // commit, the CaptureStarted row, releasing every worker at once, the
-    // Running flag and the Running event. Stop's cancel and app shutdown go
-    // through this lock, so they see either no row and nothing owned, or a
-    // published capture.
+    // commit, the CaptureStarted row, liveness at the release, releasing every
+    // worker at once, and the decision to publish Running. Stop's cancel and
+    // app shutdown go through this lock, so they see either no row and
+    // nothing owned, or a published capture.
+    let ledger_session = state.current_session_id();
     let generation = {
         let mut manager = state
             .capture_manager
@@ -2453,6 +2461,7 @@ async fn start_capture_impl(
             .commit_prepared_captures(
                 ticket.attempt,
                 prepared,
+                &ledger_session,
                 || {
                     append_capture_lifecycle_movement(
                         state,
@@ -2462,17 +2471,13 @@ async fn start_capture_impl(
                         AppError::Unknown("Failed to record the capture start".to_string())
                     })
                 },
-                // A failed append is an uncertain commit: the Started bytes may
-                // be durable, so close the lifecycle no audio ever reached.
+                // The Started row is known to be on the ledger here.
                 || {
-                    if append_capture_lifecycle_movement(
+                    append_capture_lifecycle_movement(
                         state,
                         crate::persistence::DataMovementEventType::CaptureStopped,
                     )
-                    .is_err()
-                    {
-                        log::error!("Failed to append the compensating capture stop");
-                    }
+                    .is_ok()
                 },
             )
             .map_err(|error| match error {
@@ -2488,17 +2493,79 @@ async fn start_capture_impl(
             status.capture = StageStatus::Running { processed_count: 0 };
             status.pipeline = StageStatus::Running { processed_count: 0 };
         }
-        if let Ok(status) = state.pipeline_status.read() {
-            let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
-        }
         generation
     };
+
+    // Deliver Running only after the manager lock is released, so a blocking
+    // event sink cannot stall shutdown or listing. The lifecycle lock is still
+    // held, so no Stop's Idle can be delivered ahead of it; and it is sent only
+    // if this generation is still the live capture at that moment.
+    let still_live = state
+        .capture_manager
+        .lock()
+        .map(|manager| {
+            manager
+                .acknowledged_capture()
+                .is_some_and(|capture| capture.generation == generation)
+        })
+        .unwrap_or(false);
+    if still_live && let Ok(status) = state.pipeline_status.read() {
+        let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
+    }
 
     log::info!("Started capture of {count} source(s)");
     Ok(CaptureStartAck {
         generation,
         sources: source_ids,
     })
+}
+
+/// Close a previous start's CaptureStarted row whose append failed, if it
+/// did reach the ledger: count the session's lifecycle rows, and append a
+/// CaptureStopped only for a Started row that is actually there. Leaves the
+/// uncertainty recorded (and refuses the start) when the ledger cannot be read
+/// or the closing row cannot be written.
+fn close_uncertain_capture_start(state: &AppState) -> AppResult<()> {
+    use crate::persistence::DataMovementEventType as Movement;
+    let Some(session_id) = state
+        .capture_manager
+        .lock()
+        .map_err(|error| format!("Capture manager lock error: {error}"))?
+        .take_uncertain_capture_start()
+    else {
+        return Ok(());
+    };
+    let privacy_mode = state
+        .app_settings
+        .read()
+        .map(|settings| settings.privacy_mode)
+        .unwrap_or_default();
+    let resolved = crate::persistence::load_data_movement_events(&session_id).and_then(|events| {
+        let count = |kind: Movement| {
+            events
+                .iter()
+                .filter(|event| event.event_type == kind)
+                .count()
+        };
+        if count(Movement::CaptureStarted) > count(Movement::CaptureStopped) {
+            append_capture_lifecycle_movement_for(
+                &session_id,
+                privacy_mode,
+                Movement::CaptureStopped,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    });
+    if resolved.is_err() {
+        if let Ok(mut manager) = state.capture_manager.lock() {
+            manager.mark_capture_start_uncertain(session_id);
+        }
+        return Err(AppError::Unknown(
+            "Failed to record the capture start".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Stop capturing audio from the specified source.
@@ -2508,10 +2575,11 @@ async fn start_capture_impl(
 #[tauri::command]
 pub async fn stop_capture(
     source_id: String,
+    start_id: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> AppResult<()> {
-    stop_capture_impl(source_id, state.inner(), &app, None).await
+    stop_capture_impl(source_id, state.inner(), &app, None, start_id.as_deref()).await
 }
 
 /// Reconcile an acknowledged capture worker that exited without a Stop request.
@@ -2532,6 +2600,7 @@ pub(crate) fn schedule_capture_exit_reconciliation(
             state.inner(),
             &app,
             Some(expected_finished),
+            None,
         )
         .await
         {
@@ -2549,16 +2618,18 @@ async fn stop_capture_impl(
     state: &AppState,
     app: &tauri::AppHandle,
     expected_finished: Option<Arc<AtomicBool>>,
+    start_id: Option<&str>,
 ) -> AppResult<()> {
     log::info!("stop_capture called");
-    // An explicit Stop cancels a start still preparing, whichever alias it
-    // names, before waiting for the lifecycle lock that start holds.
+    // An explicit Stop cancels the start it was issued during, before waiting
+    // for the lifecycle lock that start holds. Naming the start's id covers a
+    // Stop that reaches the backend before that start registers.
     if expected_finished.is_none() {
         let cancelled = state
             .capture_manager
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?
-            .cancel_pending_start();
+            .cancel_pending_start(start_id);
         if cancelled {
             log::info!("Stop cancelled a capture start still in progress");
         }
@@ -3167,6 +3238,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
         // The last stream can die during that read: check once more,
         // immediately before anything is reseeded or started.
         ensure_capture_still_acknowledged(state.inner(), &capture, TRANSCRIPTION_CAPTURE_LOST)?;
+        log::info!("Transcription attaching to the acknowledged capture");
         let heads = crate::projection_scheduler::derive_coverage_heads(&accepted_patches);
         let mut schedulers = state
             .projection_schedulers
@@ -23776,8 +23848,10 @@ mod tests {
                 err
             );
             assert!(
-                err.contains("system-default") && err.contains("device:mic"),
-                "error should list active and pending sources, got: {}",
+                err.contains("2 sources are active")
+                    && !err.contains("system-default")
+                    && !err.contains("device:mic"),
+                "error should count the sources without naming them, got: {}",
                 err
             );
         }
@@ -23820,7 +23894,8 @@ mod tests {
         .expect_err("starting transcription with multiple sources should be rejected");
 
         assert!(err.contains("AssemblyAI streaming"));
-        assert!(err.contains("system-default") && err.contains("device:mic"));
+        assert!(err.contains("2 sources are active"));
+        assert!(!err.contains("system-default") && !err.contains("device:mic"));
     }
 
     #[test]
@@ -23952,16 +24027,75 @@ mod tests {
     // Start tests drive `start_capture_impl` with scripted capture workers:
     // the worker body follows the production startup handshake without
     // opening rsac, so ownership, rollback, the movement ledger, the gates
-    // and status events are all production code.
+    // and status events are all production code. Every scenario runs on its
+    // own thread, bounded whole, so a regression fails instead of hanging.
     // -----------------------------------------------------------------------
 
-    use crate::audio::capture::scripted::{ScriptedControls, ScriptedStart, scripted_hooks};
+    use crate::audio::capture::scripted::{
+        ScriptedControls, ScriptedEvent, ScriptedStart, scripted_hooks,
+    };
     use crate::audio::capture::{CaptureFailureReason, CaptureSourceOutcome, CaptureStartFailure};
 
     /// Bounds a scripted worker never reaches unless the test means it to.
     const SCRIPTED_BOUND: Duration = Duration::from_secs(10);
     /// For a worker the test keeps stuck: any bound retires it.
     const STUCK_WORKER_BOUND: Duration = Duration::from_millis(50);
+    /// A whole scenario; each wait inside it is bounded on its own.
+    const CAPTURE_SCENARIO_BOUND: Duration = Duration::from_secs(60);
+
+    /// Run `work` on its own thread and fail if it has not returned in
+    /// `limit`, surfacing its panic if it panicked.
+    fn run_bounded<T: Send + 'static>(
+        limit: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, outcome) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        match outcome.recv_timeout(limit) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("no result within {limit:?}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => unreachable!("the work returned without a result"),
+            },
+        }
+    }
+
+    /// One capture scenario with a fresh HOME and `AppState`, on its own
+    /// current-thread runtime and thread, bounded whole. The HOME lock and
+    /// guard stay on the test thread.
+    fn capture_scenario<F, Fut>(label: &str, scenario: F)
+    where
+        F: FnOnce(Arc<AppState>, tauri::AppHandle) -> Fut + Send + 'static,
+        Fut: Future<Output = ()>,
+    {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir(label);
+        let _guard = HomeGuard::set(&dir);
+        run_bounded(CAPTURE_SCENARIO_BOUND, move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a scenario runtime");
+            let state = Arc::new(AppState::new());
+            runtime.block_on(scenario(
+                Arc::clone(&state),
+                crate::speech::shared_test_app_handle(),
+            ));
+            drain_test_writers(&state);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A start id no other start in the process uses.
+    fn start_id() -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!("test-start-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 
     fn capture_requests(source_ids: &[&str]) -> Vec<CaptureSourceRequest> {
         source_ids
@@ -23996,21 +24130,26 @@ mod tests {
         }
     }
 
+    /// The session's capture lifecycle rows in ledger order: `true` for
+    /// CaptureStarted, `false` for CaptureStopped.
+    fn capture_lifecycle_sequence(state: &AppState) -> Vec<bool> {
+        use crate::persistence::DataMovementEventType as Movement;
+        crate::persistence::load_data_movement_events(&state.current_session_id())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|event| match event.event_type {
+                Movement::CaptureStarted => Some(true),
+                Movement::CaptureStopped => Some(false),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// (CaptureStarted, CaptureStopped) rows in the session's movement ledger.
     fn capture_lifecycle_rows(state: &AppState) -> (usize, usize) {
-        use crate::persistence::DataMovementEventType as Movement;
-        let events = crate::persistence::load_data_movement_events(&state.current_session_id())
-            .unwrap_or_default();
-        let count = |kind: Movement| {
-            events
-                .iter()
-                .filter(|event| event.event_type == kind)
-                .count()
-        };
-        (
-            count(Movement::CaptureStarted),
-            count(Movement::CaptureStopped),
-        )
+        let sequence = capture_lifecycle_sequence(state);
+        let started = sequence.iter().filter(|started| **started).count();
+        (started, sequence.len() - started)
     }
 
     fn assert_capture_idle(state: &AppState) {
@@ -24023,356 +24162,315 @@ mod tests {
         assert!(acknowledged_capture(state, "refused").is_err());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    // `_lock` is deliberately held across `.await`s to serialize process-global
-    // HOME mutation across tests on the single-threaded runtime.
-    #[allow(clippy::await_holding_lock)]
-    async fn start_capture_acknowledges_every_source_before_running_and_restarts() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-acknowledged");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![
-                ScriptedStart::Ready,
-                ScriptedStart::Ready,
-                ScriptedStart::Ready,
-            ],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-
-        let first = start_capture_impl(capture_requests(&["system", "device:mic"]), &state, &app)
-            .await
-            .expect("both sources acknowledge");
-        assert_eq!(first.sources, ["system", "device:mic"]);
-        assert!(*state.is_capturing.read().unwrap());
-        assert!(matches!(
-            state.pipeline_status.read().unwrap().capture,
-            StageStatus::Running { .. }
-        ));
-        let mut acknowledged = acknowledged_capture(&state, "refused").unwrap();
-        acknowledged.sources.sort();
-        assert_eq!(acknowledged.generation, first.generation);
-        assert_eq!(acknowledged.sources, ["device:mic", "system"]);
-        assert_eq!(capture_lifecycle_rows(&state), (1, 0));
-
-        for source_id in &first.sources {
-            stop_capture_impl(source_id.clone(), &state, &app, None)
-                .await
-                .unwrap();
-        }
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (1, 1));
-
-        // A successful restart is a new acknowledged generation.
-        let second = start_capture_impl(capture_requests(&["system"]), &state, &app)
-            .await
-            .expect("restart acknowledges");
-        assert!(second.generation > first.generation);
-        assert_eq!(
-            acknowledged_capture(&state, "refused").unwrap().generation,
-            second.generation
-        );
-        stop_capture_impl("system".into(), &state, &app, None)
-            .await
-            .unwrap();
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (2, 2));
-        assert_eq!(controls.workers.try_iter().count(), 3);
-        assert_eq!(
-            state.capture_manager.lock().unwrap().retired_worker_count(),
-            0,
-            "every stopped worker was joined"
-        );
-
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_source_that_fails_to_open_fails_the_start_with_a_closed_reason() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-open-failure");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let _controls = script_capture(
-            &state,
-            vec![
-                ScriptedStart::Fail(rsac::AudioError::PermissionDenied {
-                    operation: "canary-op-7341".into(),
-                    details: Some("canary-detail-7341".into()),
-                }),
-                ScriptedStart::Fail(rsac::AudioError::DeviceNotFound {
-                    device_id: "canary-device-7341".into(),
-                }),
-            ],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-        crate::test_log_capture::install();
-
-        for expected in [
-            CaptureFailureReason::PermissionDenied,
-            CaptureFailureReason::DeviceUnavailable,
-        ] {
-            let error = start_capture_impl(capture_requests(&["system"]), &state, &app)
-                .await
-                .unwrap_err();
-            let wire = serde_json::to_string(&error).unwrap();
-            assert!(!wire.contains("canary"), "{wire}");
-            assert!(!error.to_string().contains("canary"), "{error}");
-            let failure = capture_start_failure(error);
-            assert_eq!(failure.reason, expected);
-            assert_eq!(failure.source_index, Some(0));
-            assert_eq!(
-                failure.sources,
-                [CaptureSourceOutcome::Failed { reason: expected }]
+    fn start_capture_acknowledges_every_source_before_running_and_restarts() {
+        capture_scenario("start-capture-acknowledged", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![
+                    ScriptedStart::Ready,
+                    ScriptedStart::Ready,
+                    ScriptedStart::Ready,
+                ],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
             );
-            assert_capture_idle(&state);
-            assert_eq!(capture_lifecycle_rows(&state), (0, 0));
-        }
-        crate::test_log_capture::assert_process_logs_exclude(&[
-            "canary-op-7341",
-            "canary-detail-7341",
-            "canary-device-7341",
-        ]);
-        assert_eq!(
-            state.capture_manager.lock().unwrap().retired_worker_count(),
-            0
-        );
 
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_bad_descriptor_is_refused_before_any_worker_or_preflight() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-bad-descriptor");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(&state, Vec::new(), SCRIPTED_BOUND, SCRIPTED_BOUND);
-
-        for requests in [
-            capture_requests(&["system", "app:canary-7341"]),
-            capture_requests(&["system", "unknown-canary-7341"]),
-            // Two aliases of one target would capture the device twice.
-            capture_requests(&["system", "system-default"]),
-        ] {
-            let error = start_capture_impl(requests, &state, &app)
-                .await
-                .unwrap_err();
-            assert!(!serde_json::to_string(&error).unwrap().contains("canary"));
-            let failure = capture_start_failure(error);
-            assert_eq!(failure.reason, CaptureFailureReason::InvalidSource);
-            assert_eq!(failure.source_index, Some(1));
-            assert_eq!(
-                failure.sources,
-                [
-                    CaptureSourceOutcome::NotAttempted,
-                    CaptureSourceOutcome::Failed {
-                        reason: CaptureFailureReason::InvalidSource
-                    },
-                ]
-            );
-        }
-        let empty = capture_start_failure(
-            start_capture_impl(Vec::new(), &state, &app)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(empty.reason, CaptureFailureReason::InvalidSource);
-        assert!(controls.workers.try_recv().is_err(), "no worker spawned");
-        assert!(state.pipeline_thread.lock().unwrap().is_none());
-        assert!(state.dispatcher_thread.lock().unwrap().is_none());
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (0, 0));
-
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
-    #[allow(clippy::await_holding_lock)]
-    async fn one_failing_source_of_three_rolls_back_the_ready_one_and_skips_the_rest() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-one-of-many");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![
-                ScriptedStart::Ready,
-                ScriptedStart::Fail(rsac::AudioError::StreamStartFailed {
-                    reason: "canary-7341".into(),
-                }),
-            ],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-
-        let failure = capture_start_failure(
-            start_capture_impl(
-                capture_requests(&["system", "device:mic", "device:speakers"]),
+            let first = start_capture_impl(
+                capture_requests(&["system", "device:mic"]),
+                &start_id(),
                 &state,
                 &app,
             )
             .await
-            .unwrap_err(),
-        );
-        assert_eq!(failure.reason, CaptureFailureReason::BackendUnavailable);
-        assert_eq!(failure.source_index, Some(1));
-        assert_eq!(
-            failure.sources,
-            [
-                CaptureSourceOutcome::RolledBack,
-                CaptureSourceOutcome::Failed {
-                    reason: CaptureFailureReason::BackendUnavailable
-                },
-                CaptureSourceOutcome::NotAttempted,
-            ]
-        );
-        assert_eq!(
-            controls.workers.try_iter().count(),
-            2,
-            "the third source was never attempted"
-        );
-        assert_eq!(
-            state.capture_manager.lock().unwrap().retired_worker_count(),
-            0,
-            "the ready worker was joined, not leaked"
-        );
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+            .expect("both sources acknowledge");
+            assert_eq!(first.sources, ["system", "device:mic"]);
+            assert!(*state.is_capturing.read().unwrap());
+            assert!(matches!(
+                state.pipeline_status.read().unwrap().capture,
+                StageStatus::Running { .. }
+            ));
+            let mut acknowledged = acknowledged_capture(&state, "refused").unwrap();
+            acknowledged.sources.sort();
+            assert_eq!(acknowledged.generation, first.generation);
+            assert_eq!(acknowledged.sources, ["device:mic", "system"]);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 0));
 
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+            for source_id in &first.sources {
+                stop_capture_impl(source_id.clone(), &state, &app, None, None)
+                    .await
+                    .unwrap();
+            }
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+
+            // A successful restart is a new acknowledged generation.
+            let second =
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .expect("restart acknowledges");
+            assert!(second.generation > first.generation);
+            assert_eq!(
+                acknowledged_capture(&state, "refused").unwrap().generation,
+                second.generation
+            );
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (2, 2));
+            assert_eq!(controls.workers.try_iter().count(), 3);
+            assert_eq!(
+                state.capture_manager.lock().unwrap().retired_worker_count(),
+                0,
+                "every stopped worker was joined"
+            );
+        });
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_start_that_times_out_retires_its_stuck_worker_and_fences_the_next_start() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-timeout");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![ScriptedStart::Hang],
-            STUCK_WORKER_BOUND,
-            STUCK_WORKER_BOUND,
-        );
+    fn a_source_that_fails_to_open_fails_the_start_with_a_closed_reason() {
+        capture_scenario("start-capture-open-failure", |state, app| async move {
+            let _controls = script_capture(
+                &state,
+                vec![
+                    ScriptedStart::Fail(rsac::AudioError::PermissionDenied {
+                        operation: "canary-op-7341".into(),
+                        details: Some("canary-detail-7341".into()),
+                    }),
+                    ScriptedStart::Fail(rsac::AudioError::DeviceNotFound {
+                        device_id: "canary-device-7341".into(),
+                    }),
+                ],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            crate::test_log_capture::install();
 
-        let failure = capture_start_failure(
-            start_capture_impl(capture_requests(&["system"]), &state, &app)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(failure.reason, CaptureFailureReason::StartupTimeout);
-        assert_eq!(failure.source_index, Some(0));
-        assert_capture_idle(&state);
-        assert_eq!(
-            state.capture_manager.lock().unwrap().retired_worker_count(),
-            1
-        );
-
-        let fenced = capture_start_failure(
-            start_capture_impl(capture_requests(&["system"]), &state, &app)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(fenced.reason, CaptureFailureReason::PreviousCaptureStopping);
-        assert_eq!(fenced.source_index, None);
-
-        controls.next_worker(SCRIPTED_BOUND).release();
-        state
-            .capture_manager
-            .lock()
-            .unwrap()
-            .join_retired_workers(SCRIPTED_BOUND);
-        let _restart = script_capture(
-            &state,
-            vec![ScriptedStart::Ready],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-        start_capture_impl(capture_requests(&["system"]), &state, &app)
-            .await
-            .expect("the next start succeeds once the stuck worker exited");
-        stop_capture_impl("system".into(), &state, &app, None)
-            .await
-            .unwrap();
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (1, 1));
-
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+            for expected in [
+                CaptureFailureReason::PermissionDenied,
+                CaptureFailureReason::DeviceUnavailable,
+            ] {
+                let error =
+                    start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                        .await
+                        .unwrap_err();
+                let wire = serde_json::to_string(&error).unwrap();
+                assert!(!wire.contains("canary"), "{wire}");
+                assert!(!error.to_string().contains("canary"), "{error}");
+                let failure = capture_start_failure(error);
+                assert_eq!(failure.reason, expected);
+                assert_eq!(failure.source_index, Some(0));
+                assert_eq!(
+                    failure.sources,
+                    [CaptureSourceOutcome::Failed { reason: expected }]
+                );
+                assert_capture_idle(&state);
+                assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+            }
+            crate::test_log_capture::assert_process_logs_exclude(&[
+                "canary-op-7341",
+                "canary-detail-7341",
+                "canary-device-7341",
+            ]);
+            assert_eq!(
+                state.capture_manager.lock().unwrap().retired_worker_count(),
+                0
+            );
+        });
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_stop_during_start_cancels_it_and_leaves_nothing_running() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-cancel");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![ScriptedStart::Ready, ScriptedStart::Hang],
-            SCRIPTED_BOUND,
-            STUCK_WORKER_BOUND,
-        );
-        let workers = controls.workers.clone();
+    fn a_bad_descriptor_is_refused_before_any_worker_or_preflight() {
+        capture_scenario("start-capture-bad-descriptor", |state, app| async move {
+            let controls = script_capture(&state, Vec::new(), SCRIPTED_BOUND, SCRIPTED_BOUND);
 
-        let (started, (stuck, stopped)) = tokio::time::timeout(SCRIPTED_BOUND, async {
-            tokio::join!(
-                start_capture_impl(capture_requests(&["system", "device:mic"]), &state, &app),
+            for requests in [
+                capture_requests(&["system", "app:canary-7341"]),
+                capture_requests(&["system", "unknown-canary-7341"]),
+                // Two aliases of one target would capture the device twice.
+                capture_requests(&["system", "system-default"]),
+            ] {
+                let error = start_capture_impl(requests, &start_id(), &state, &app)
+                    .await
+                    .unwrap_err();
+                assert!(!serde_json::to_string(&error).unwrap().contains("canary"));
+                let failure = capture_start_failure(error);
+                assert_eq!(failure.reason, CaptureFailureReason::InvalidSource);
+                assert_eq!(failure.source_index, Some(1));
+                assert_eq!(
+                    failure.sources,
+                    [
+                        CaptureSourceOutcome::NotAttempted,
+                        CaptureSourceOutcome::Failed {
+                            reason: CaptureFailureReason::InvalidSource
+                        },
+                    ]
+                );
+            }
+            let empty = capture_start_failure(
+                start_capture_impl(Vec::new(), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(empty.reason, CaptureFailureReason::InvalidSource);
+            assert!(controls.workers.try_recv().is_err(), "no worker spawned");
+            assert!(state.pipeline_thread.lock().unwrap().is_none());
+            assert!(state.dispatcher_thread.lock().unwrap().is_none());
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn one_failing_source_of_three_rolls_back_the_ready_one_and_skips_the_rest() {
+        capture_scenario("start-capture-one-of-many", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![
+                    ScriptedStart::Ready,
+                    ScriptedStart::Fail(rsac::AudioError::StreamStartFailed {
+                        reason: "canary-7341".into(),
+                    }),
+                ],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+
+            let failure = capture_start_failure(
+                start_capture_impl(
+                    capture_requests(&["system", "device:mic", "device:speakers"]),
+                    &start_id(),
+                    &state,
+                    &app,
+                )
+                .await
+                .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::BackendUnavailable);
+            assert_eq!(failure.source_index, Some(1));
+            assert_eq!(
+                failure.sources,
+                [
+                    CaptureSourceOutcome::RolledBack,
+                    CaptureSourceOutcome::Failed {
+                        reason: CaptureFailureReason::BackendUnavailable
+                    },
+                    CaptureSourceOutcome::NotAttempted,
+                ]
+            );
+            assert_eq!(
+                controls.workers.try_iter().count(),
+                2,
+                "the third source was never attempted"
+            );
+            assert_eq!(
+                state.capture_manager.lock().unwrap().retired_worker_count(),
+                0,
+                "the ready worker was joined, not leaked"
+            );
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_start_that_times_out_retires_its_stuck_worker_and_fences_the_next_start() {
+        capture_scenario("start-capture-timeout", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Hang],
+                STUCK_WORKER_BOUND,
+                STUCK_WORKER_BOUND,
+            );
+
+            let failure = capture_start_failure(
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::StartupTimeout);
+            assert_eq!(failure.source_index, Some(0));
+            assert_capture_idle(&state);
+            assert_eq!(
+                state.capture_manager.lock().unwrap().retired_worker_count(),
+                1
+            );
+
+            let fenced = capture_start_failure(
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(fenced.reason, CaptureFailureReason::PreviousCaptureStopping);
+            assert_eq!(fenced.source_index, None);
+
+            controls.next_worker(SCRIPTED_BOUND).release();
+            state
+                .capture_manager
+                .lock()
+                .unwrap()
+                .join_retired_workers(SCRIPTED_BOUND);
+            let _restart = script_capture(
+                &state,
+                vec![ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                .await
+                .expect("the next start succeeds once the stuck worker exited");
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_stop_during_start_cancels_it_and_leaves_nothing_running() {
+        capture_scenario("start-capture-cancel", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready, ScriptedStart::Hang],
+                SCRIPTED_BOUND,
+                STUCK_WORKER_BOUND,
+            );
+            let workers = controls.workers.clone();
+            let start = start_id();
+
+            let (started, (stuck, stopped)) = tokio::join!(
+                start_capture_impl(
+                    capture_requests(&["system", "device:mic"]),
+                    &start,
+                    &state,
+                    &app
+                ),
                 async {
                     // Stop once the second worker is stuck before acknowledging.
                     let stuck = tokio::task::spawn_blocking(move || {
@@ -24382,49 +24480,87 @@ mod tests {
                     .await
                     .unwrap();
                     // Named by a selection alias the start never registered:
-                    // a Stop cancels the pending start whichever id it names.
-                    let stopped = stop_capture_impl("mic-row".into(), &state, &app, None).await;
+                    // the start id, not the source, picks the start.
+                    let stopped =
+                        stop_capture_impl("mic-row".into(), &state, &app, None, Some(&start)).await;
                     (stuck, stopped)
                 }
-            )
-        })
-        .await
-        .expect("the cancelled start and the Stop both finish");
-        let failure = capture_start_failure(started.unwrap_err());
-        assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
-        assert_eq!(failure.source_index, None);
-        assert_eq!(
-            failure.sources,
-            [
-                CaptureSourceOutcome::RolledBack,
-                CaptureSourceOutcome::Failed {
-                    reason: CaptureFailureReason::Cancelled
-                },
-            ]
-        );
-        stopped.expect("a Stop that cancelled the start succeeds");
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (0, 0));
-        assert!(
-            state.capture_manager.lock().unwrap().retired_worker_count() >= 1,
-            "the stuck worker is retained, not leaked"
-        );
-        stuck.release();
-        state
-            .capture_manager
-            .lock()
-            .unwrap()
-            .join_retired_workers(SCRIPTED_BOUND);
-        assert!(
-            !state
+            );
+            let failure = capture_start_failure(started.unwrap_err());
+            assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
+            assert_eq!(failure.source_index, None);
+            assert_eq!(
+                failure.sources,
+                [
+                    CaptureSourceOutcome::RolledBack,
+                    CaptureSourceOutcome::Failed {
+                        reason: CaptureFailureReason::Cancelled
+                    },
+                ]
+            );
+            stopped.expect("a Stop that cancelled the start succeeds");
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+            assert!(
+                state.capture_manager.lock().unwrap().retired_worker_count() >= 1,
+                "the stuck worker is retained, not leaked"
+            );
+            stuck.release();
+            state
                 .capture_manager
                 .lock()
                 .unwrap()
-                .has_unquiesced_workers()
-        );
+                .join_retired_workers(SCRIPTED_BOUND);
+            assert!(
+                !state
+                    .capture_manager
+                    .lock()
+                    .unwrap()
+                    .has_unquiesced_workers()
+            );
+        });
+    }
 
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_stop_that_reaches_the_backend_before_its_start_refuses_that_start() {
+        capture_scenario("start-capture-stop-first", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            let overtaken = start_id();
+
+            stop_capture_impl("system".into(), &state, &app, None, Some(&overtaken))
+                .await
+                .expect("a Stop with nothing owned succeeds");
+            let failure = capture_start_failure(
+                start_capture_impl(capture_requests(&["system"]), &overtaken, &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
+            assert_eq!(failure.source_index, None);
+            assert_eq!(failure.sources, [CaptureSourceOutcome::NotAttempted]);
+            assert!(controls.workers.try_recv().is_err(), "no worker spawned");
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (0, 0));
+
+            // The next start, under its own id, is unaffected.
+            start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                .await
+                .expect("a new start acknowledges");
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+        });
     }
 
     /// A manager with a registered start whose `sources` were prepared by
@@ -24443,7 +24579,7 @@ mod tests {
         let (pipeline_tx, _pipeline_rx) = crossbeam_channel::bounded(4);
         let (hooks, controls) = scripted_hooks(scripts, SCRIPTED_BOUND, join_timeout);
         manager.set_worker_hooks(hooks);
-        let ticket = manager.register_capture_start().unwrap();
+        let ticket = manager.register_capture_start(&start_id()).unwrap();
         let requests = sources
             .iter()
             .map(|source_id| crate::audio::capture::CaptureSourceStart {
@@ -24473,40 +24609,46 @@ mod tests {
         }
     }
 
+    /// The movement-ledger session a manager-level commit records under.
+    const LEDGER_SESSION: &str = "ledger-session";
+
     #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn a_cancel_that_lands_once_every_source_is_ready_stops_them_all_at_commit() {
-        let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
-            vec![ScriptedStart::Ready, ScriptedStart::Ready],
-            &["system", "device:mic"],
-            SCRIPTED_BOUND,
-        );
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
+                vec![ScriptedStart::Ready, ScriptedStart::Ready],
+                &["system", "device:mic"],
+                SCRIPTED_BOUND,
+            );
 
-        assert!(manager.cancel_pending_start());
-        let recorded = std::cell::Cell::new(false);
-        let failure = commit_refusal(
-            manager
-                .commit_prepared_captures(
-                    attempt,
-                    prepared,
-                    || {
-                        recorded.set(true);
-                        Ok(())
-                    },
-                    || {},
-                )
-                .unwrap_err(),
-        );
-        assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
-        assert_eq!(failure.sources, [CaptureSourceOutcome::RolledBack; 2]);
-        assert!(!recorded.get(), "a refused start records no lifecycle row");
-        assert_eq!(manager.owned_capture_count(), 0);
-        assert_eq!(manager.retired_worker_count(), 0);
-        assert_eq!(controls.workers.try_iter().count(), 2);
-        assert!(controls.exit_requests.try_recv().is_err());
+            assert!(manager.cancel_pending_start(None));
+            let recorded = std::cell::Cell::new(false);
+            let failure = commit_refusal(
+                manager
+                    .commit_prepared_captures(
+                        attempt,
+                        prepared,
+                        LEDGER_SESSION,
+                        || {
+                            recorded.set(true);
+                            Ok(())
+                        },
+                        || panic!("no row to close"),
+                    )
+                    .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
+            assert_eq!(failure.sources, [CaptureSourceOutcome::RolledBack; 2]);
+            assert!(!recorded.get(), "a refused start records no lifecycle row");
+            assert_eq!(manager.owned_capture_count(), 0);
+            assert_eq!(manager.retired_worker_count(), 0);
+            assert_eq!(controls.workers.try_iter().count(), 2);
+            assert!(controls.exit_requests.try_recv().is_err());
+        });
     }
 
     #[test]
@@ -24515,55 +24657,119 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn a_source_lost_between_ready_and_commit_fails_the_commit_before_any_release() {
-        let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
-            vec![ScriptedStart::Ready, ScriptedStart::ReadyThenExit],
-            &["system", "device:mic"],
-            SCRIPTED_BOUND,
-        );
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
+                vec![ScriptedStart::Ready, ScriptedStart::ReadyThenExit],
+                &["system", "device:mic"],
+                SCRIPTED_BOUND,
+            );
 
-        let _first = controls.next_worker(SCRIPTED_BOUND);
-        let second = controls.next_worker(SCRIPTED_BOUND);
-        second.lose_stream();
-        second.wait_for(
-            crate::audio::capture::scripted::ScriptedEvent::Lost,
-            SCRIPTED_BOUND,
-        );
-        let recorded = std::cell::Cell::new(false);
-        let failure = commit_refusal(
-            manager
-                .commit_prepared_captures(
-                    attempt,
-                    prepared,
-                    || {
-                        recorded.set(true);
-                        Ok(())
+            let _first = controls.next_worker(SCRIPTED_BOUND);
+            let second = controls.next_worker(SCRIPTED_BOUND);
+            second.lose_stream();
+            second.wait_for(ScriptedEvent::Lost, SCRIPTED_BOUND);
+            let recorded = std::cell::Cell::new(false);
+            let failure = commit_refusal(
+                manager
+                    .commit_prepared_captures(
+                        attempt,
+                        prepared,
+                        LEDGER_SESSION,
+                        || {
+                            recorded.set(true);
+                            Ok(())
+                        },
+                        || panic!("no row to close"),
+                    )
+                    .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
+            assert_eq!(failure.source_index, Some(1));
+            assert_eq!(
+                failure.sources,
+                [
+                    CaptureSourceOutcome::RolledBack,
+                    CaptureSourceOutcome::Failed {
+                        reason: CaptureFailureReason::WorkerExited
                     },
-                    || {},
-                )
-                .unwrap_err(),
-        );
-        assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
-        assert_eq!(failure.source_index, Some(1));
-        assert_eq!(
-            failure.sources,
-            [
-                CaptureSourceOutcome::RolledBack,
-                CaptureSourceOutcome::Failed {
-                    reason: CaptureFailureReason::WorkerExited
-                },
-            ]
-        );
-        assert!(
-            !recorded.get(),
-            "no row for an aggregate that never committed"
-        );
-        assert_eq!(manager.owned_capture_count(), 0);
-        assert!(manager.acknowledged_capture().is_none());
-        assert_eq!(manager.retired_worker_count(), 0, "both workers joined");
-        assert!(
-            controls.exit_requests.try_recv().is_err(),
-            "an unreleased worker is not a lost stream"
-        );
+                ]
+            );
+            assert!(
+                !recorded.get(),
+                "no row for an aggregate that never committed"
+            );
+            assert_eq!(manager.owned_capture_count(), 0);
+            assert!(manager.acknowledged_capture().is_none());
+            assert_eq!(manager.retired_worker_count(), 0, "both workers joined");
+            assert!(
+                controls.exit_requests.try_recv().is_err(),
+                "an unreleased worker is not a lost stream"
+            );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_member_that_dies_while_the_start_row_is_recorded_fails_the_start_before_release() {
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            for closing_row_written in [true, false] {
+                let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
+                    vec![ScriptedStart::Ready, ScriptedStart::ReadyThenExit],
+                    &["system", "device:mic"],
+                    SCRIPTED_BOUND,
+                );
+                let _first = controls.next_worker(SCRIPTED_BOUND);
+                let second = controls.next_worker(SCRIPTED_BOUND);
+
+                let closed = std::cell::Cell::new(0);
+                let failure = commit_refusal(
+                    manager
+                        .commit_prepared_captures(
+                            attempt,
+                            prepared,
+                            LEDGER_SESSION,
+                            // The device disappears while the row is written.
+                            || {
+                                second.lose_stream();
+                                second.wait_for(ScriptedEvent::Lost, SCRIPTED_BOUND);
+                                Ok(())
+                            },
+                            || {
+                                closed.set(closed.get() + 1);
+                                closing_row_written
+                            },
+                        )
+                        .unwrap_err(),
+                );
+                assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
+                assert_eq!(failure.source_index, Some(1));
+                assert_eq!(
+                    failure.sources,
+                    [
+                        CaptureSourceOutcome::RolledBack,
+                        CaptureSourceOutcome::Failed {
+                            reason: CaptureFailureReason::WorkerExited
+                        },
+                    ]
+                );
+                assert_eq!(closed.get(), 1, "the written Started row is closed once");
+                assert_eq!(manager.owned_capture_count(), 0);
+                assert!(manager.acknowledged_capture().is_none());
+                assert_eq!(manager.retired_worker_count(), 0, "both workers joined");
+                assert!(
+                    controls.exit_requests.try_recv().is_err(),
+                    "a start that never released is not a lost stream"
+                );
+                assert_eq!(
+                    manager.take_uncertain_capture_start(),
+                    (!closing_row_written).then(|| LEDGER_SESSION.to_string()),
+                    "only a failed closing row leaves the start uncertain"
+                );
+            }
+        });
     }
 
     #[test]
@@ -24572,50 +24778,50 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn a_worker_that_stopped_waiting_and_wedged_fails_the_commit_without_blocking_it() {
-        let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
-            vec![ScriptedStart::AbandonThenWedge],
-            &["system"],
-            STUCK_WORKER_BOUND,
-        );
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
+                vec![ScriptedStart::AbandonThenWedge],
+                &["system"],
+                STUCK_WORKER_BOUND,
+            );
 
-        let worker = controls.next_worker(SCRIPTED_BOUND);
-        worker.wait_for(
-            crate::audio::capture::scripted::ScriptedEvent::Abandoned,
-            SCRIPTED_BOUND,
-        );
-        // The worker's teardown is wedged: the commit must neither wait on
-        // it nor record anything.
-        let recorded = std::cell::Cell::new(false);
-        let failure = commit_refusal(
-            manager
-                .commit_prepared_captures(
-                    attempt,
-                    prepared,
-                    || {
-                        recorded.set(true);
-                        Ok(())
-                    },
-                    || {},
-                )
-                .unwrap_err(),
-        );
-        assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
-        assert_eq!(failure.source_index, Some(0));
-        assert!(!recorded.get());
-        assert_eq!(manager.owned_capture_count(), 0);
-        assert_eq!(
-            manager.retired_worker_count(),
-            1,
-            "the wedged worker fences the next start"
-        );
-        assert_eq!(
-            manager.validate_capture_start(),
-            Err(CaptureFailureReason::PreviousCaptureStopping)
-        );
+            let worker = controls.next_worker(SCRIPTED_BOUND);
+            worker.wait_for(ScriptedEvent::Abandoned, SCRIPTED_BOUND);
+            // The worker's teardown is wedged: the commit must neither wait on
+            // it nor record anything.
+            let recorded = std::cell::Cell::new(false);
+            let failure = commit_refusal(
+                manager
+                    .commit_prepared_captures(
+                        attempt,
+                        prepared,
+                        LEDGER_SESSION,
+                        || {
+                            recorded.set(true);
+                            Ok(())
+                        },
+                        || panic!("no row to close"),
+                    )
+                    .unwrap_err(),
+            );
+            assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
+            assert_eq!(failure.source_index, Some(0));
+            assert!(!recorded.get());
+            assert_eq!(manager.owned_capture_count(), 0);
+            assert_eq!(
+                manager.retired_worker_count(),
+                1,
+                "the wedged worker fences the next start"
+            );
+            assert_eq!(
+                manager.validate_capture_start(),
+                Err(CaptureFailureReason::PreviousCaptureStopping)
+            );
 
-        worker.release();
-        manager.join_retired_workers(SCRIPTED_BOUND);
-        assert_eq!(manager.validate_capture_start(), Ok(()));
+            worker.release();
+            manager.join_retired_workers(SCRIPTED_BOUND);
+            assert_eq!(manager.validate_capture_start(), Ok(()));
+        });
     }
 
     #[test]
@@ -24623,203 +24829,396 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    fn a_start_row_that_fails_to_record_stops_every_worker_and_closes_the_row() {
-        let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
-            vec![ScriptedStart::Ready, ScriptedStart::Ready],
-            &["system", "device:mic"],
-            SCRIPTED_BOUND,
-        );
-
-        let closed = std::cell::Cell::new(0);
-        let error = manager
-            .commit_prepared_captures(
-                attempt,
-                prepared,
-                || Err::<(), _>("disk full"),
-                || closed.set(closed.get() + 1),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::audio::capture::CaptureCommitError::Record("disk full")
-        ));
-        assert_eq!(closed.get(), 1, "an uncertain Started row is closed once");
-        assert_eq!(manager.owned_capture_count(), 0);
-        assert!(manager.acknowledged_capture().is_none());
-        assert_eq!(manager.retired_worker_count(), 0);
-        assert!(controls.exit_requests.try_recv().is_err());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_stop_after_every_source_is_ready_leaves_no_lifecycle_row() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-late-cancel");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![ScriptedStart::Ready, ScriptedStart::Ready],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-
-        // Another thread holds the manager lock from the first worker's spawn
-        // (past validation; preparing never takes this lock) until the last
-        // Ready report was consumed, then cancels under it. The command's
-        // commit, which needs the lock, can only run after the cancel.
-        let manager = Arc::clone(&state.capture_manager);
-        let canceller = std::thread::spawn(move || {
-            let _first = controls.next_worker(SCRIPTED_BOUND);
-            let mut guard = manager.lock().unwrap();
-            controls.next_worker(SCRIPTED_BOUND).wait_for(
-                crate::audio::capture::scripted::ScriptedEvent::Reported,
+    fn a_start_row_that_fails_to_record_stops_every_worker_and_closes_nothing() {
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            let (mut manager, attempt, prepared, controls) = prepared_scripted_start(
+                vec![ScriptedStart::Ready, ScriptedStart::Ready],
+                &["system", "device:mic"],
                 SCRIPTED_BOUND,
             );
-            assert!(guard.cancel_pending_start());
+
+            let error = manager
+                .commit_prepared_captures(
+                    attempt,
+                    prepared,
+                    LEDGER_SESSION,
+                    || Err::<(), _>("disk full"),
+                    || panic!("a Started row not known to be written is never closed blindly"),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::audio::capture::CaptureCommitError::Record("disk full")
+            ));
+            assert_eq!(manager.owned_capture_count(), 0);
+            assert!(manager.acknowledged_capture().is_none());
+            assert_eq!(manager.retired_worker_count(), 0);
+            assert!(controls.exit_requests.try_recv().is_err());
+            assert_eq!(
+                manager.take_uncertain_capture_start().as_deref(),
+                Some(LEDGER_SESSION),
+                "the next start resolves the uncertain row"
+            );
         });
-        let failure = capture_start_failure(
-            tokio::time::timeout(
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_start_row_that_fails_to_append_leaves_no_orphan_stop_on_the_ledger() {
+        capture_scenario("start-capture-append-failure", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready, ScriptedStart::Ready],
                 SCRIPTED_BOUND,
-                start_capture_impl(capture_requests(&["system", "device:mic"]), &state, &app),
-            )
-            .await
-            .expect("the start finishes")
-            .unwrap_err(),
-        );
-        canceller.join().unwrap();
+                SCRIPTED_BOUND,
+            );
+            let ledger = crate::persistence::data_movement_ledger_path(&state.current_session_id())
+                .expect("a movement ledger path");
+            // A directory where the ledger file belongs: every append and
+            // every read fails.
+            std::fs::create_dir_all(&ledger).unwrap();
 
-        assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
-        assert_eq!(failure.sources, [CaptureSourceOutcome::RolledBack; 2]);
-        assert_capture_idle(&state);
-        assert_eq!(
-            capture_lifecycle_rows(&state),
-            (0, 0),
-            "a start refused at commit writes no lifecycle row"
-        );
+            let error =
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(&error, AppError::Unknown(message) if message == "Failed to record the capture start"),
+                "{error:?}"
+            );
+            assert_capture_idle(&state);
+            // The next start must resolve that row first; the ledger is still
+            // unreadable, so it refuses before preparing anything.
+            let unresolved =
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(&unresolved, AppError::Unknown(message) if message == "Failed to record the capture start"),
+                "{unresolved:?}"
+            );
+            assert_eq!(
+                controls.workers.try_iter().count(),
+                1,
+                "the unresolved start spawned no worker"
+            );
 
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&ledger).unwrap();
+            // Readable again: no Started row reached it, so nothing is closed,
+            // and this start records its own row.
+            start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                .await
+                .expect("the start succeeds once the ledger is writable");
+            assert_eq!(
+                capture_lifecycle_sequence(&state),
+                [true],
+                "no orphan Stopped row"
+            );
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_sequence(&state), [true, false]);
+        });
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_second_start_is_refused_without_disturbing_the_running_capture() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-double-start");
-        let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![ScriptedStart::Ready],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-
-        // Two concurrent starts: the second is refused at registration.
-        let (first, concurrent) = tokio::time::timeout(SCRIPTED_BOUND, async {
-            tokio::join!(
-                start_capture_impl(capture_requests(&["system"]), &state, &app),
-                start_capture_impl(capture_requests(&["device:mic"]), &state, &app),
+    fn an_uncertain_start_row_on_the_ledger_is_closed_before_the_next_start_records() {
+        capture_scenario("start-capture-uncertain-row", |state, app| async move {
+            let _controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            // A previous start's Started row reached the ledger although its
+            // append reported a failure.
+            append_capture_lifecycle_movement(
+                &state,
+                crate::persistence::DataMovementEventType::CaptureStarted,
             )
-        })
-        .await
-        .expect("both starts finish");
-        let first = first.expect("the first start acknowledges");
-        let concurrent = capture_start_failure(concurrent.unwrap_err());
-        assert_eq!(concurrent.reason, CaptureFailureReason::AlreadyRunning);
-
-        // A start while capturing is refused before any side effect.
-        let later = capture_start_failure(
-            start_capture_impl(capture_requests(&["device:mic"]), &state, &app)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(later.reason, CaptureFailureReason::AlreadyRunning);
-        assert_eq!(later.source_index, None);
-        let running = acknowledged_capture(&state, "refused").unwrap();
-        assert_eq!(running.generation, first.generation);
-        assert_eq!(running.sources, ["system"]);
-        assert_eq!(controls.workers.try_iter().count(), 1);
-        assert_eq!(capture_lifecycle_rows(&state), (1, 0));
-
-        stop_capture_impl("system".into(), &state, &app, None)
-            .await
             .unwrap();
-        assert_capture_idle(&state);
+            state
+                .capture_manager
+                .lock()
+                .unwrap()
+                .mark_capture_start_uncertain(state.current_session_id());
 
-        drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+            start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                .await
+                .expect("the start closes the uncertain row, then acknowledges");
+            assert_eq!(
+                capture_lifecycle_sequence(&state),
+                [true, false, true],
+                "the uncertain row is closed before this start's own"
+            );
+            assert!(
+                state
+                    .capture_manager
+                    .lock()
+                    .unwrap()
+                    .take_uncertain_capture_start()
+                    .is_none()
+            );
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (2, 2));
+        });
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    #[allow(clippy::await_holding_lock)]
-    async fn a_device_that_disappears_after_acknowledgement_is_reconciled_to_idle() {
+    fn a_stop_after_every_source_is_ready_leaves_no_lifecycle_row() {
+        capture_scenario("start-capture-late-cancel", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready, ScriptedStart::ReadyOnRelease],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+
+            // Another thread holds the manager lock (preparing never takes it)
+            // across the last Ready report, then cancels under it. The
+            // command's commit needs this lock, so it runs only after the
+            // cancel.
+            let manager = Arc::clone(&state.capture_manager);
+            let canceller = std::thread::spawn(move || {
+                let _first = controls.next_worker(SCRIPTED_BOUND);
+                let second = controls.next_worker(SCRIPTED_BOUND);
+                let mut guard = manager.lock().unwrap();
+                second.release();
+                second.wait_for(ScriptedEvent::Reported, SCRIPTED_BOUND);
+                assert!(guard.cancel_pending_start(None));
+            });
+            let failure = capture_start_failure(
+                start_capture_impl(
+                    capture_requests(&["system", "device:mic"]),
+                    &start_id(),
+                    &state,
+                    &app,
+                )
+                .await
+                .unwrap_err(),
+            );
+            canceller.join().unwrap();
+
+            assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
+            assert_eq!(failure.sources, [CaptureSourceOutcome::RolledBack; 2]);
+            assert_capture_idle(&state);
+            assert_eq!(
+                capture_lifecycle_rows(&state),
+                (0, 0),
+                "a start refused at commit writes no lifecycle row"
+            );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_second_start_is_refused_without_disturbing_the_running_capture() {
+        capture_scenario("start-capture-double-start", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+
+            // Two concurrent starts: the second is refused at registration.
+            let (first_id, second_id) = (start_id(), start_id());
+            let (first, concurrent) = tokio::join!(
+                start_capture_impl(capture_requests(&["system"]), &first_id, &state, &app),
+                start_capture_impl(capture_requests(&["device:mic"]), &second_id, &state, &app),
+            );
+            let first = first.expect("the first start acknowledges");
+            let concurrent = capture_start_failure(concurrent.unwrap_err());
+            assert_eq!(concurrent.reason, CaptureFailureReason::AlreadyRunning);
+
+            // A start while capturing is refused before any side effect.
+            let later = capture_start_failure(
+                start_capture_impl(capture_requests(&["device:mic"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(later.reason, CaptureFailureReason::AlreadyRunning);
+            assert_eq!(later.source_index, None);
+            let running = acknowledged_capture(&state, "refused").unwrap();
+            assert_eq!(running.generation, first.generation);
+            assert_eq!(running.sources, ["system"]);
+            assert_eq!(controls.workers.try_iter().count(), 1);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 0));
+
+            stop_capture_impl("system".into(), &state, &app, None, None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_device_that_disappears_after_acknowledgement_is_reconciled_to_idle() {
+        capture_scenario("start-capture-device-lost", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            start_capture_impl(capture_requests(&["device:mic"]), &start_id(), &state, &app)
+                .await
+                .unwrap();
+
+            controls.next_worker(SCRIPTED_BOUND).lose_stream();
+            let (source_id, finished) = controls
+                .exit_requests
+                .recv_timeout(SCRIPTED_BOUND)
+                .expect("a lost stream requests reconciliation");
+            assert_eq!(source_id, "device:mic");
+            // Until reconciliation runs, nothing may attach to the dead capture,
+            // and no new capture may start over it.
+            assert!(acknowledged_capture(&state, "refused").is_err());
+            let fenced = capture_start_failure(
+                start_capture_impl(capture_requests(&["system"]), &start_id(), &state, &app)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(
+                fenced.reason,
+                CaptureFailureReason::PreviousCaptureReconciling
+            );
+
+            stop_capture_impl(source_id, &state, &app, Some(finished), None)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+            assert!(
+                controls.exit_requests.try_recv().is_err(),
+                "reconciliation is requested once"
+            );
+        });
+    }
+
+    /// Transcription can attach in the instant after the last source's
+    /// final check passed and before it activates (accepted, bounded): the
+    /// dead source's reconciliation, which waits for the same lifecycle
+    /// lock, then tears transcription down.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn transcription_that_attaches_as_the_last_source_dies_is_torn_down_by_reconciliation() {
+        const ATTACHING: &str = "Transcription attaching to the acknowledged capture";
+        fn attaching_records() -> usize {
+            crate::test_log_capture::process_records()
+                .iter()
+                .filter(|record| record.message == ATTACHING)
+                .count()
+        }
+
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("start-capture-device-lost");
+        let dir = unique_tempdir("transcribe-attach-as-source-dies");
         let _guard = HomeGuard::set(&dir);
-        let state = AppState::new();
-        let app = crate::speech::shared_test_app_handle();
-        let controls = script_capture(
-            &state,
-            vec![ScriptedStart::Ready],
-            SCRIPTED_BOUND,
-            SCRIPTED_BOUND,
-        );
-        start_capture_impl(capture_requests(&["device:mic"]), &state, &app)
-            .await
-            .unwrap();
+        run_bounded(CAPTURE_SCENARIO_BOUND, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a scenario runtime");
+            let manager = tauri::test::mock_app();
+            manager.manage(AppState::new());
+            let app = crate::speech::shared_test_app_handle();
+            runtime.block_on(async {
+                let state = manager.state::<AppState>();
+                *state.is_capturing.write().unwrap() = true;
+                let finished = state
+                    .capture_manager
+                    .lock()
+                    .unwrap()
+                    .insert_synthetic_handle("system", false);
+                {
+                    let mut settings = state.app_settings.write().unwrap();
+                    settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
+                    settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+                        api_key: "fixture".into(),
+                        model: "nova-3".into(),
+                        enable_diarization: true,
+                        endpointing_ms: 300,
+                        utterance_end_ms: 1000,
+                        vad_events: true,
+                        eot_threshold: 0.5,
+                        eager_eot_threshold: 0.0,
+                        eot_timeout_ms: 0,
+                        max_speakers: 2,
+                        keyterms: vec![],
+                    };
+                    settings.llm_provider = crate::settings::LlmProvider::Api {
+                        endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                        api_key: "fixture".into(),
+                        model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+                    };
+                }
+                // Stand in for the audio consumer while the real Start runs.
+                *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+                crate::test_log_capture::install();
+                let before = attaching_records();
 
-        controls.next_worker(SCRIPTED_BOUND).lose_stream();
-        let (source_id, finished) = controls
-            .exit_requests
-            .recv_timeout(SCRIPTED_BOUND)
-            .expect("a lost stream requests reconciliation");
-        assert_eq!(source_id, "device:mic");
-        // Until reconciliation runs, nothing may attach to the dead capture,
-        // and no new capture may start over it.
-        assert!(acknowledged_capture(&state, "refused").is_err());
-        let fenced = capture_start_failure(
-            start_capture_impl(capture_requests(&["system"]), &state, &app)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(
-            fenced.reason,
-            CaptureFailureReason::PreviousCaptureReconciling
-        );
+                // Hold the scheduler lock the command takes right after its
+                // final capture check; lose the source once that check passed.
+                let schedulers = state.projection_schedulers.clone();
+                let dying = Arc::clone(&finished);
+                let (held_tx, held) = std::sync::mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    let _schedulers = schedulers.lock().unwrap();
+                    held_tx.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + SCRIPTED_BOUND;
+                    while attaching_records() == before {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "transcription never passed its final capture check"
+                        );
+                        std::thread::yield_now();
+                    }
+                    dying.store(true, Ordering::SeqCst);
+                });
+                held.recv_timeout(SCRIPTED_BOUND).unwrap();
 
-        stop_capture_impl(source_id, &state, &app, Some(finished))
-            .await
-            .unwrap();
-        assert_capture_idle(&state);
-        assert_eq!(capture_lifecycle_rows(&state), (1, 1));
-        assert!(
-            controls.exit_requests.try_recv().is_err(),
-            "reconciliation is requested once"
-        );
+                start_transcribe(manager.state::<AppState>(), app.clone())
+                    .await
+                    .expect("transcription attached before the loss was observed");
+                holder.join().unwrap();
+                assert!(state.is_transcribing.load(Ordering::SeqCst));
 
-        drain_test_writers(&state);
+                // The dead source's reconciliation tears transcription down.
+                stop_capture_impl("system".into(), state.inner(), &app, Some(finished), None)
+                    .await
+                    .unwrap();
+                assert!(state.speech_processor_thread.lock().unwrap().is_none());
+                assert_capture_idle(state.inner());
+                drain_test_writers(state.inner());
+            });
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -25041,7 +25440,7 @@ mod tests {
             }
         });
 
-        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None, None)
             .await
             .expect("final source stop should succeed");
 
@@ -25207,7 +25606,7 @@ mod tests {
             "precondition: the graph lane's deferral must be armed before Stop"
         );
 
-        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None, None)
             .await
             .expect("final source stop should succeed even with an abandoned deferral");
 
@@ -25291,7 +25690,7 @@ mod tests {
             .display_transcript_write_misses
             .store(2, Ordering::SeqCst);
 
-        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None, None)
             .await
             .expect("final source stop should succeed even with pending display-row misses");
 
@@ -25693,7 +26092,7 @@ mod tests {
             }
         });
 
-        stop_capture_impl("system".to_string(), &state, &app_handle, None)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None, None)
             .await
             .expect("stop should succeed while other sources remain");
 

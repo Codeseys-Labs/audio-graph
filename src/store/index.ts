@@ -144,14 +144,34 @@ const idleStage: StageStatus = { type: "Idle" };
 let historicalLoadGeneration = 0;
 
 /**
- * Capture-status transitions seen while a start is in flight. The Running
- * event and a fatal reconciliation's Idle can both reach the store before
- * the start's own response; a success that arrives after its capture already
- * ended must not mark it running again.
+ * The capture start in flight: the id it was sent with, and the
+ * capture-status transitions and Stops seen meanwhile. The Running event and
+ * a fatal reconciliation's Idle can both reach the store before the start's
+ * own response; a success that arrives after its capture already ended, or
+ * after a Stop was issued for it, must not mark it running.
  */
-let pendingCaptureStart: { runningSeen: boolean; ended: boolean } | null = null;
+let pendingCaptureStart: {
+  startId: string;
+  runningSeen: boolean;
+  ended: boolean;
+  stopRequested: boolean;
+} | null = null;
 
-/** A well-formed acknowledgement of exactly the sources requested. */
+/** The highest acknowledged generation this renderer has seen. */
+let highestCaptureGeneration = 0;
+let captureStartCount = 0;
+
+/** A start id unique to this renderer, sent with the start and its Stops. */
+function nextCaptureStartId(): string {
+  captureStartCount += 1;
+  return `${Date.now().toString(36)}-${captureStartCount}`;
+}
+
+/**
+ * A well-formed acknowledgement of exactly the sources requested: one
+ * distinct, non-empty id per source, and a generation newer than any this
+ * renderer has seen.
+ */
 function isCaptureStartAck(
   value: unknown,
   sourceCount: number,
@@ -160,11 +180,30 @@ function isCaptureStartAck(
   const ack = value as Partial<CaptureStartAck>;
   return (
     typeof ack.generation === "number" &&
-    Number.isFinite(ack.generation) &&
+    Number.isSafeInteger(ack.generation) &&
+    ack.generation > highestCaptureGeneration &&
     Array.isArray(ack.sources) &&
     ack.sources.length === sourceCount &&
-    ack.sources.every((id) => typeof id === "string" && id.length > 0)
+    ack.sources.every((id) => typeof id === "string" && id.length > 0) &&
+    new Set(ack.sources).size === ack.sources.length
   );
+}
+
+/**
+ * Stop sources a start may own after the user stopped it or its answer was
+ * unusable. Best effort: the start's own outcome is what the user sees.
+ */
+async function stopStartedCapture(
+  sourceIds: readonly string[],
+  startId: string,
+): Promise<void> {
+  for (const sourceId of sourceIds) {
+    try {
+      await invoke("stop_capture", { sourceId, startId });
+    } catch {
+      // Keep stopping the rest.
+    }
+  }
 }
 
 /**
@@ -3126,26 +3165,44 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         const source = sourcesBySelectionId.get(sourceId);
         return source ? { sourceId, source } : { sourceId };
       });
-    const watch = { runningSeen: false, ended: false };
+    const watch = {
+      startId: nextCaptureStartId(),
+      runningSeen: false,
+      ended: false,
+      stopRequested: false,
+    };
     pendingCaptureStart = watch;
     // The ids the backend resolves them to, so a Stop before the
     // acknowledgement names what the backend owns, not a selection alias.
-    set({
-      captureSourceIds: sources.map(
-        (entry) => entry.source?.capture_target ?? entry.sourceId,
-      ),
-    });
+    const requestedSourceIds = sources.map(
+      (entry) => entry.source?.capture_target ?? entry.sourceId,
+    );
+    set({ captureSourceIds: requestedSourceIds });
     try {
       // One aggregate start: the backend acknowledges every source or rolls
       // all of them back, so there is nothing to undo here on failure.
-      const ack = await invoke<unknown>("start_capture", { sources });
+      const ack = await invoke<unknown>("start_capture", {
+        sources,
+        startId: watch.startId,
+      });
       if (pendingCaptureStart === watch) pendingCaptureStart = null;
       if (!isCaptureStartAck(ack, sources.length)) {
+        // An answer this renderer cannot trust: whatever it started is
+        // stopped, under the ids it was asked to start.
         set({
           captureStarting: false,
           captureSourceIds: [],
           error: captureStartFailureMessage(undefined),
         });
+        await stopStartedCapture(requestedSourceIds, watch.startId);
+        return;
+      }
+      highestCaptureGeneration = ack.generation;
+      if (watch.stopRequested) {
+        // The user stopped this start while it was pending, and the backend
+        // committed it first: stop what it acknowledged.
+        set({ captureStarting: false, captureSourceIds: [] });
+        await stopStartedCapture(ack.sources, watch.startId);
         return;
       }
       if (watch.ended) {
@@ -3223,6 +3280,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // crashing the stop flow.
   stopCapture: async () => {
     const { selectedSourceIds, captureSourceIds, getSessionId } = get();
+    // A Stop issued while a start is pending names that start, so the
+    // backend cancels it whichever command reaches it first, and its late
+    // success is not taken as Running.
+    const pendingStart = pendingCaptureStart;
+    if (pendingStart) pendingStart.stopRequested = true;
     // The acknowledged capture's canonical ids, which are what the backend
     // owns; the selection can name a source by another alias.
     const sourceIds =
@@ -3237,7 +3299,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
     try {
       for (const sourceId of sourceIds) {
-        await invoke("stop_capture", { sourceId });
+        await invoke(
+          "stop_capture",
+          pendingStart
+            ? { sourceId, startId: pendingStart.startId }
+            : { sourceId },
+        );
       }
       set((state) => ({
         isCapturing: false,

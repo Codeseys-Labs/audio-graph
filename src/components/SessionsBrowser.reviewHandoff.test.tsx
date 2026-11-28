@@ -45,6 +45,12 @@ vi.mock("../utils/download", async (importOriginal) => ({
 
 const mockedInvoke = vi.mocked(invoke);
 const mockedDownload = vi.mocked(downloadAsFile);
+/** Never reset: the store accepts only ever-newer acknowledged generations. */
+let captureGeneration = 0;
+function captureAck(sources: string[]) {
+  captureGeneration += 1;
+  return { generation: captureGeneration, sources };
+}
 
 /**
  * Review across Start and Stop (PR #536 review rounds 1 and 2).
@@ -407,7 +413,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
 
     // Acknowledged: Capture would mount with none of A's data resident.
     await act(async () => {
-      startAck.resolve({ generation: 1, sources: ["system-default"] });
+      startAck.resolve(captureAck(["system-default"]));
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),
@@ -458,7 +464,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
 
     await act(async () => {
-      startAck.resolve({ generation: 1, sources: ["system-default"] });
+      startAck.resolve(captureAck(["system-default"]));
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),

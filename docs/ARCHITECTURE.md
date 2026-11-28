@@ -797,7 +797,9 @@ sequenceDiagram
     participant Graph as Knowledge Graph
     participant Audit as Movement Ledger
 
-    UI->>Main: start_capture(sources[])
+    UI->>Main: start_capture(sources[], startId)
+    Note over UI,Main: A Stop carries the pending start's startId; whichever reaches Main first, that start does not capture
+    Main->>Main: close a previous start's uncertain CaptureStarted row, if any
     Main->>Pipe: ResetSession barrier
     Pipe->>Disp: ordered processed reset
     Disp-->>Main: outgoing prefix handled
@@ -808,8 +810,9 @@ sequenceDiagram
     end
     Note over Main,Cap: Any failure or Stop: stop and join every prepared worker; nothing published
     Main->>Audit: flush/sync CaptureStarted (not ADR-0027 Accepted)
+    Note over Main,Audit: A member that died meanwhile fails the start; its CaptureStarted is closed
     Main->>Cap: Commit every source / release receive loops
-    Main-->>UI: acknowledged generation; capture Running
+    Main-->>UI: Running event (still the live generation), then acknowledged generation
 
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)
