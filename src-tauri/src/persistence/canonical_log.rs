@@ -1846,6 +1846,11 @@ struct PendingAppend {
 }
 
 mod transcript_commit;
+
+pub(super) fn remember_speaker_head(path: &Path, file: &File, head: Option<&CanonicalStreamHead>) {
+    transcript_commit::remember_speaker_head(path, file, head);
+}
+
 #[cfg(test)]
 pub(crate) use transcript_commit::tests::interrupted_historical_caption;
 pub use transcript_commit::tier::StreamReceiptEvidence;
@@ -2681,10 +2686,22 @@ fn parse_structural_records(
     stream_id: &str,
     domain_schema_version: u32,
 ) -> Result<RawSnapshot, StructuralFailure> {
+    parse_structural_suffix(bytes, session_id, stream_id, domain_schema_version, None)
+}
+
+fn parse_structural_suffix(
+    bytes: &[u8],
+    session_id: &str,
+    stream_id: &str,
+    domain_schema_version: u32,
+    after: Option<(usize, &str, CanonicalRecordEncoding, u32)>,
+) -> Result<RawSnapshot, StructuralFailure> {
     let mut records = Vec::new();
     let mut event_ids = HashSet::new();
     let mut offset = 0;
-    let mut framed_seen = false;
+    let mut framed_seen =
+        after.is_some_and(|(_, _, enc, _)| enc == CanonicalRecordEncoding::FramedV1);
+    let prior = after.map_or(0, |a| a.0);
 
     while offset < bytes.len() {
         let newline = bytes[offset..]
@@ -2698,7 +2715,7 @@ fn parse_structural_records(
                 valid_up_to: offset,
                 repairable_unterminated_tail: true,
                 error: CanonicalLogError::CorruptRecord {
-                    record_index: records.len() + 1,
+                    record_index: prior + records.len() + 1,
                     reason: CanonicalCorruptionReason::InvalidFrame,
                     newline_terminated: false,
                 },
@@ -2716,13 +2733,12 @@ fn parse_structural_records(
             continue;
         }
 
-        let record_index = records.len() + 1;
+        let record_index = prior + records.len() + 1;
         let expected_sequence = record_index as u64;
-        let previous_hash = records
-            .last()
-            .map_or(ZERO_HASH, |record: &RawCanonicalRecord| {
-                record.record_hash.as_str()
-            });
+        let previous_hash = records.last().map_or(
+            after.map_or(ZERO_HASH, |a| a.1),
+            |record: &RawCanonicalRecord| record.record_hash.as_str(),
+        );
 
         match parse_structural_record(
             line,
@@ -2735,9 +2751,11 @@ fn parse_structural_records(
         ) {
             Ok(record) => {
                 if mixed_speaker_versions(stream_id, domain_schema_version)
-                    && records.last().is_some_and(|prev| {
-                        prev.domain_schema_version > record.domain_schema_version
-                    })
+                    && records
+                        .last()
+                        .map(|prev| prev.domain_schema_version)
+                        .or_else(|| after.map(|a| a.3))
+                        .is_some_and(|version| version > record.domain_schema_version)
                 {
                     return Err(StructuralFailure {
                         valid_up_to: offset,

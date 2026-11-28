@@ -57,9 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Notes and Graph now publish changes after their projection log confirms the
-  write. Review shows when either artifact trails its transcript or needs a
-  repair after an interrupted write. Export includes recorded storage tiers
-  and projection recovery evidence (#139).
+  write. Historical Review shows when an existing projection trails its
+  transcript or needs repair after an interrupted write. Export includes
+  recorded storage tiers and projection recovery evidence (#139).
 - Transcript recovery retains each complete, verified revision after an interrupted save, including a revision followed by newer speech. A pending save confirmation is shown while the outcome is uncertain. Recovery restores prior sessions before their first historical load (#139, #559).
 - A panic inside one LLM executor job no longer leaves other jobs waiting
   forever. That job and the jobs queued behind it end at once (notes synthesis

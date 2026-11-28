@@ -21,12 +21,22 @@ beforeEach(async () => {
   await i18n.changeLanguage("en");
 });
 
+function pane(kind: "notes" | "graph", session: string) {
+  return (
+    <SessionViewProvider reviewSessionId={session} reviewLens={kind}>
+      <ReviewLensGate kind={kind}>
+        <span>{session}</span>
+      </ReviewLensGate>
+    </SessionViewProvider>
+  );
+}
+
 function show(kind: "notes" | "graph", fields: object) {
   const command =
     kind === "notes"
       ? "load_session_notes_artifacts_cmd"
       : "load_session_graph_artifact_cmd";
-  backend.mockImplementation(async (name) => {
+  backend.mockImplementation(async (name, args) => {
     if (name === "load_session")
       return {
         transcript: [],
@@ -38,19 +48,18 @@ function show(kind: "notes" | "graph", fields: object) {
           stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
         },
       };
-    if (name === command)
+    if (name === command) {
+      const session = args && "sessionId" in args ? args.sessionId : null;
+      if (session === "untouched")
+        return kind === "notes" ? { notes: null, projection_events: [] } : null;
+      const statuses = session === "active" ? {} : fields;
       return kind === "notes"
-        ? { notes: { notes: [], ...fields }, projection_events: [] }
-        : { nodes: [], edges: [], ...fields };
+        ? { notes: { notes: [], ...statuses }, projection_events: [] }
+        : { nodes: [], edges: [], ...statuses };
+    }
     throw new Error("unexpected command");
   });
-  return render(
-    <SessionViewProvider reviewSessionId="orchard" reviewLens={kind}>
-      <ReviewLensGate kind={kind}>
-        <span>orchard</span>
-      </ReviewLensGate>
-    </SessionViewProvider>,
-  );
+  return render(pane(kind, "orchard"));
 }
 
 it("shows that historical notes trail the transcript", async () => {
@@ -121,4 +130,23 @@ it("renders the verified view without a notice for a normal legacy reply", async
   show("notes", {});
   await screen.findByText("orchard");
   expect(screen.queryByRole("status")).toBeNull();
+});
+
+it("replaces the notice with its own round when an active or untouched session is selected", async () => {
+  const view = show("notes", { transcript_coverage: "behind_transcript" });
+  await screen.findByText("orchard");
+  expect(screen.getByRole("status")).toHaveTextContent(
+    i18n.t("sessions.review.projectionBehindTranscript"),
+  );
+  for (const session of ["active", "untouched"]) {
+    view.rerender(pane("notes", session));
+    await screen.findByText(session);
+    expect(screen.queryByRole("status")).toBeNull();
+  }
+  view.rerender(pane("notes", "orchard"));
+  await screen.findByText("orchard");
+  expect(screen.getByRole("status")).toHaveTextContent(
+    i18n.t("sessions.review.projectionBehindTranscript"),
+  );
+  expect(backend).toHaveBeenCalledTimes(8);
 });

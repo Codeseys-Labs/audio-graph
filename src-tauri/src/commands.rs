@@ -3040,29 +3040,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // reconciliation is still waiting for this command to release the lock.
     acknowledged_transcription_sources(state.inner())?;
 
-    // ADR-0045 decision 6 (audio-graph-5fd1): reseed each projection lane's
-    // coverage head from this session's accepted `projection_patches` log
-    // before the speech thread that drives the schedulers spawns below.
-    // `ProjectionSchedulers::restore_from_snapshot` no longer exists
-    // (audio-graph-464c) — `reseed_coverage_heads` is now the ONLY channel
-    // through which scheduler coverage state may come from disk. Cold start
-    // mints a fresh session id with no persisted patches (`AppState::new`),
-    // and `load_session_impl` never installs a historical ledger into
-    // `AppState`, so in every capture started today this loads an empty
-    // patch log and reseeds nothing — it exists so a future resume/reopen
-    // surface (audio-graph-9751-adjacent) cannot route around it the way the
-    // deleted snapshot restore could be.
-    //
-    // A corrupt/truncated `projection_patches` log must refuse
-    // transcribe-start loudly, not reseed nothing and silently replay
-    // duplicate work later — `StrictCanonicalRead` exists precisely so
-    // canonical-log corruption fails closed (review finding, 5fd1). `?`
-    // propagates via `From<String> for AppError` (`error.rs`), which wraps
-    // the message as `AppError::Unknown` unchanged; the message itself is
-    // already class-only and content-redacted by construction
-    // (`CanonicalReaderError`'s `Display` never includes a path, session id,
-    // event id, or payload value — see `persistence/canonical_reader.rs`).
-    crate::persistence::reseed_projection_capture(state.inner())?;
+    // ADR-0045: restore only verified projection coverage before speech starts.
+    // Unavailable projection history leaves its lanes behind and ASR available.
+    crate::persistence::reseed_projection_capture(state.inner());
 
     // 1. Start speech processor thread (ASR + Diarization orchestrator).
     //    The speech processor reads directly from the processed audio channel,
@@ -10312,7 +10292,7 @@ fn choose_projection_snapshot<T: Clone + PartialEq>(
     canonical: bool,
     head: impl Fn(&T) -> Option<&crate::persistence::canonical_log::VerifiedTranscriptHead>,
     lane_sequence: impl Fn(&T) -> u64,
-    behind: impl Fn(&T) -> bool,
+    has_gap: impl Fn(&T) -> bool,
 ) -> Option<T> {
     if !canonical && loaded.as_ref().is_some_and(|cache| head(cache).is_none()) {
         // Pre-log snapshots have no canonical basis. Preserve their historical
@@ -10320,12 +10300,20 @@ fn choose_projection_snapshot<T: Clone + PartialEq>(
         return loaded;
     }
     let refusal = loaded.as_ref().zip(replayed).and_then(|(cache, expected)| {
-        compare_projection_snapshot(cache, expected, canonical, head, lane_sequence)
+        compare_projection_snapshot(cache, expected, canonical, head, &lane_sequence)
     });
     if let Some(reason) = refusal {
         log::info!("projection_cache_rebuilt reason={reason:?}");
     }
-    replayed.filter(|view| canonical || behind(view)).cloned()
+    // A truncated source can leave a formerly populated lane with zero kept
+    // rows. Return its explicit empty replay while discarding the orphan cache.
+    let had_cached_lane = canonical
+        && loaded
+            .as_ref()
+            .is_some_and(|cache| lane_sequence(cache) > 0);
+    replayed
+        .filter(|view| lane_sequence(view) != 0 || has_gap(view) || had_cached_lane)
+        .cloned()
 }
 
 fn choose_materialized_notes(
@@ -10343,7 +10331,7 @@ fn choose_materialized_notes(
         canonical,
         |view| view.projection_log_head.as_ref(),
         |view| view.last_sequence,
-        |view| view.transcript_coverage.is_some(),
+        |view| view.projection_recovery.is_some(),
     )
 }
 
@@ -10362,7 +10350,7 @@ fn choose_materialized_graph(
         canonical,
         |view| view.projection_log_head.as_ref(),
         |view| view.last_sequence,
-        |view| view.transcript_coverage.is_some(),
+        |view| view.projection_recovery.is_some(),
     )
 }
 
@@ -10668,8 +10656,16 @@ fn rebuild_projection_view(
 #[tauri::command]
 pub async fn load_session_notes_artifacts_cmd(
     session_id: String,
+    state: State<'_, AppState>,
 ) -> AppResult<SessionNotesArtifacts> {
-    load_session_notes_artifacts_impl(session_id)
+    let mut result = load_session_notes_artifacts_impl(session_id.clone())?;
+    if state.current_session_id() == session_id
+        && let Some(view) = &mut result.notes
+    {
+        view.transcript_coverage = None;
+        view.projection_recovery = None;
+    }
+    Ok(result)
 }
 
 fn load_session_notes_artifacts_impl(session_id: String) -> AppResult<SessionNotesArtifacts> {
@@ -10739,8 +10735,16 @@ fn load_session_notes_artifacts_for_admitted_session(
 #[tauri::command]
 pub async fn load_session_graph_artifact_cmd(
     session_id: String,
+    state: State<'_, AppState>,
 ) -> AppResult<Option<crate::projections::MaterializedGraph>> {
-    load_session_graph_artifact_impl(session_id)
+    let mut result = load_session_graph_artifact_impl(session_id.clone())?;
+    if state.current_session_id() == session_id
+        && let Some(view) = &mut result
+    {
+        view.transcript_coverage = None;
+        view.projection_recovery = None;
+    }
+    Ok(result)
 }
 
 fn load_session_graph_artifact_impl(
@@ -15681,7 +15685,7 @@ mod tests {
         let body = start_transcribe_body_whitespace_stripped();
 
         let sweep_marker =
-            strip_whitespace("crate::persistence::reseed_projection_capture(state.inner())?;");
+            strip_whitespace("crate::persistence::reseed_projection_capture(state.inner());");
         let sweep_pos = find_unique_occurrence(
             &body,
             &sweep_marker,
@@ -16167,13 +16171,77 @@ mod tests {
         );
         let source = crate::user_data::resolve_projection_events_path(session).unwrap();
         std::fs::remove_file(source).unwrap();
-        let view = load();
-        assert!(view.notes.is_empty());
-        assert!(view.projection_log_head.is_none());
+        assert!(
+            load_session_notes_artifacts_impl(session.into())
+                .unwrap()
+                .notes
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_only_marks_a_previously_projected_historical_lane_behind() {
+        use crate::projections::ProjectionCoverageStatus;
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = unique_tempdir("lane-history");
+        let _guard = HomeGuard::set(&root);
+        let runtime = tauri::test::mock_builder()
+            .manage(AppState::new())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = runtime.state::<AppState>();
+        let session = state.current_session_id();
+        let repo = FileMemoryRepository::user_data();
+        let first = projection_status_test_event("reed");
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&first),
+        );
+        repo.append_transcript_event(&session, &first).unwrap();
+        let review = || {
+            tauri::async_runtime::block_on(async {
+                let n = load_session_notes_artifacts_cmd(session.clone(), state.clone())
+                    .await
+                    .unwrap();
+                let g = load_session_graph_artifact_cmd(session.clone(), state.clone())
+                    .await
+                    .unwrap();
+                (n.notes, g)
+            })
+        };
+        let (notes, graph) = review();
+        assert!(notes.is_none() && graph.is_none());
+        repo.append_projection_patch(&session, &report_note_patch(1, basis, "pond"))
+            .unwrap();
+        let mut second = projection_status_test_event("elm");
+        second.start_time = 3.0;
+        second.end_time = 4.0;
+        repo.append_transcript_event(&session, &second).unwrap();
+        let (notes, graph) = review();
+        assert!(graph.is_none());
+        let notes = notes.unwrap();
+        assert!(notes.projection_log_head.is_some());
+        assert!(notes.transcript_coverage.is_none());
+        assert!(matches!(
+            state.rotate_session("new-session"),
+            crate::state::RotateOutcome::Rotated(_)
+        ));
+        let (notes, graph) = review();
+        assert!(graph.is_none());
         assert_eq!(
-            view.transcript_coverage,
+            notes.unwrap().transcript_coverage,
             Some(ProjectionCoverageStatus::BehindTranscript)
         );
+        assert!(
+            session_export_bundle(&session)
+                .unwrap()
+                .materialized_graph
+                .is_none()
+        );
+        drain_test_writers(&state);
+        drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -16317,8 +16385,8 @@ mod tests {
     }
 
     #[test]
-    fn historical_unbound_snapshot_stays_readable_and_reports_uncovered_transcript() {
-        use crate::projections::{MaterializedNotes, ProjectionCoverageStatus};
+    fn historical_unbound_snapshot_stays_readable_without_claiming_verified_coverage() {
+        use crate::projections::MaterializedNotes;
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -16341,10 +16409,7 @@ mod tests {
             .unwrap();
         assert!(view.projection_log_head.is_none());
         assert_eq!(view.notes[0].body, "reed");
-        assert_eq!(
-            view.transcript_coverage,
-            Some(ProjectionCoverageStatus::BehindTranscript)
-        );
+        assert!(view.transcript_coverage.is_none());
         assert_eq!(std::fs::read(file).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -16927,8 +16992,7 @@ mod tests {
     /// corrupt/truncated `projection_patches` canonical log silently reseeded
     /// nothing instead of refusing to start — masking corruption exactly like
     /// the legacy-transcript-fallback bug this mirrors. This test pins the
-    /// loader itself failing closed; `start_transcribe` now propagates that
-    /// `Err` via `?` (`commands.rs`) instead of swallowing it.
+    /// strict loader's error. Capture separately reports unavailable coverage.
     #[test]
     fn strict_reader_corrupt_projection_patches_log_fails_closed_instead_of_reseeding_nothing() {
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -19749,7 +19813,8 @@ mod tests {
             4
         );
 
-        let empty_replay = crate::projections::MaterializedProjectionState::new("session-empty");
+        let mut empty_replay =
+            crate::projections::MaterializedProjectionState::new("session-empty");
         assert!(
             choose_materialized_notes(None, Some(&empty_replay), false).is_none(),
             "empty replay should not fabricate a notes artifact"
@@ -19766,6 +19831,13 @@ mod tests {
                 .expect("canonical empty state remains an explicit artifact");
         assert_eq!(selected.last_sequence, 0);
         assert!(selected.notes.is_empty());
+        // The very first patch can tear before this lane has a head. The gap
+        // remains visible to a historical reader even with zero kept patches.
+        let gap = Some(crate::projections::ProjectionRecoveryStatus::RecomputeRequired);
+        empty_replay.graph.projection_recovery = gap;
+        let graph = choose_materialized_graph(None, Some(&empty_replay), true).unwrap();
+        assert_eq!(graph.projection_recovery, gap);
+        assert!(graph.projection_log_head.is_none() && graph.transcript_coverage.is_none());
     }
 
     #[test]
@@ -24870,6 +24942,171 @@ mod tests {
             .expect("publish the committed fixture revision");
     }
 
+    fn prepare_projection_capture_source(state: &AppState) {
+        *state.is_capturing.write().unwrap() = true;
+        state
+            .capture_manager
+            .lock()
+            .unwrap()
+            .insert_synthetic_handle("system", false);
+        {
+            let mut settings = state.app_settings.write().unwrap();
+            settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
+            settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: "fixture".into(),
+                model: "nova-3".into(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 2,
+                keyterms: vec![],
+            };
+            settings.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                api_key: "fixture".into(),
+                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+            };
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    async fn start_transcribe_verifies_larger_projection_logs_than_review_can_load() {
+        verify_projection_reseed_during_start(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    async fn start_transcribe_with_a_projection_basis_mismatch_marks_lanes_behind_without_repair() {
+        verify_projection_reseed_during_start(true).await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn verify_projection_reseed_during_start(fork: bool) {
+        use crate::persistence::canonical_log::{
+            CanonicalAppendOutcome, CanonicalAppender, CanonicalBasisHead, CanonicalEventMetadata,
+            CanonicalTailRecovery,
+        };
+        use crate::projection_scheduler::ProjectionSchedulerDecision::Idle;
+        use crate::projections::ProjectionCoverageStatus::BehindTranscript;
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("capture-reseed");
+        let _home = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let session = state.current_session_id();
+        prepare_projection_capture_source(&state);
+        // Keep the fixture off real devices and networks while exercising start_transcribe.
+        *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+        seed_projection_basis(&state, projection_status_test_event("elm"));
+        let basis = state.transcript_ledger.lock().unwrap().current_basis();
+        let repo = FileMemoryRepository::user_data();
+        let source = repo.load_transcript_event_stream(&session).unwrap();
+        let anchor = &source.records()[0];
+        let mut meta = CanonicalEventMetadata::new("reed");
+        meta.basis_heads.insert(
+            "transcript_revisions".into(),
+            CanonicalBasisHead {
+                sequence: anchor.sequence,
+                event_id: anchor.event_id.clone(),
+                record_hash: if fork {
+                    "0".repeat(64)
+                } else {
+                    anchor.record_hash.clone()
+                },
+            },
+        );
+        let path = crate::user_data::projection_events_path(&session).unwrap();
+        std::fs::write(&path, []).unwrap();
+        let mut appender = CanonicalAppender::open(
+            &path,
+            &session,
+            "projection_patches",
+            1,
+            CanonicalTailRecovery::Strict,
+        )
+        .unwrap();
+        let note = if fork {
+            "leaf".into()
+        } else {
+            "a".repeat(MAX_PROJECTION_EVENTS_BYTES as usize)
+        };
+        assert!(matches!(
+            appender.append(&meta, &report_note_patch(1, basis, &note)),
+            CanonicalAppendOutcome::Accepted(_)
+        ));
+        drop(appender);
+        if fork {
+            // A prior capture could have left a pending gap. Its identity is no longer
+            // verified, so this resume must not dispatch it.
+            state
+                .projection_schedulers
+                .lock()
+                .unwrap()
+                .attach_capture(&session, (None, None), &["cedar".into()], &["larch".into()])
+                .unwrap();
+        } else {
+            assert!(path.metadata().unwrap().len() > MAX_PROJECTION_EVENTS_BYTES);
+            assert!(repo.read_projection_history(&session, false).is_err());
+        }
+        let logs = crate::test_log_capture::ThreadLogCapture::start();
+        start_transcribe(manager.state(), app.clone())
+            .await
+            .unwrap();
+        assert!(state.is_transcribing.load(Ordering::SeqCst));
+        let diagnostics: Vec<_> = logs
+            .records()
+            .into_iter()
+            .filter(|r| r.message.starts_with("projection_capture."))
+            .map(|r| r.message)
+            .collect();
+        if fork {
+            assert_eq!(diagnostics, ["projection_capture.coverage_unverified"]);
+        } else {
+            assert!(diagnostics.is_empty());
+        }
+        {
+            let view = state.materialized_projection_state.lock().unwrap();
+            assert_eq!(
+                view.notes.transcript_coverage,
+                fork.then_some(BehindTranscript)
+            );
+            assert_eq!(
+                view.graph.transcript_coverage,
+                fork.then_some(BehindTranscript)
+            );
+        }
+        {
+            let ledger = state.transcript_ledger.lock().unwrap();
+            let mut lanes = state.projection_schedulers.lock().unwrap();
+            let repairs = lanes.take_capture_repairs(&ledger, 1);
+            assert!(matches!((repairs.notes, repairs.graph), (Idle, Idle)));
+            if !fork {
+                assert!(
+                    matches!(lanes.observe_ledger(&ledger, 2).notes, Idle),
+                    "large verified notes log reseeds its completed basis"
+                );
+            }
+        }
+        stop_transcribe_impl(&state, &app).await.unwrap();
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn projection_notes_and_graph_commit_under_concurrent_asr_observation() {
         use crate::projection_scheduler::ProjectionSchedulerDecision::CompletedCurrent;
@@ -24973,35 +25210,8 @@ mod tests {
         let state = manager.state::<AppState>();
         let app = crate::speech::shared_test_app_handle();
         let session = state.current_session_id();
-        *state.is_capturing.write().unwrap() = true;
-        state
-            .capture_manager
-            .lock()
-            .unwrap()
-            .insert_synthetic_handle("system", false);
+        prepare_projection_capture_source(&state);
         state.is_transcribing.store(true, Ordering::SeqCst);
-        {
-            let mut settings = state.app_settings.write().unwrap();
-            settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
-            settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
-                api_key: "fixture".into(),
-                model: "nova-3".into(),
-                enable_diarization: true,
-                endpointing_ms: 300,
-                utterance_end_ms: 1000,
-                vad_events: true,
-                eot_threshold: 0.5,
-                eager_eot_threshold: 0.0,
-                eot_timeout_ms: 0,
-                max_speakers: 2,
-                keyterms: vec![],
-            };
-            settings.llm_provider = crate::settings::LlmProvider::Api {
-                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
-                api_key: "fixture".into(),
-                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
-            };
-        }
         let (notes, graph) = {
             seed_projection_basis(&state, projection_status_test_event("first"));
             let ledger = state.transcript_ledger.lock().unwrap();

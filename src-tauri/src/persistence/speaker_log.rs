@@ -166,7 +166,17 @@ pub(super) fn append(path: &Path, session_id: &str, row: SpeakerWrite<'_>) -> Re
         }
     };
     match outcome {
-        CanonicalAppendOutcome::Accepted(_) | CanonicalAppendOutcome::AlreadyAccepted(_) => Ok(()),
+        CanonicalAppendOutcome::Accepted(_) | CanonicalAppendOutcome::AlreadyAccepted(_) => {
+            // Pin this file while the appender still owns its lock. NTFS can
+            // finalize write/change times only when the write handle closes.
+            let pinned = std::fs::File::open(path).ok();
+            let head = writer.head().cloned();
+            drop(writer);
+            if let Some(file) = pinned {
+                super::canonical_log::remember_speaker_head(path, &file, head.as_ref());
+            }
+            Ok(())
+        }
         other => Err(format!("speaker append: {other:?}")),
     }
 }

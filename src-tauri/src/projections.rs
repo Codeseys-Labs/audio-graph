@@ -135,7 +135,7 @@ fn event_is_newer_or_tie_winner(candidate: &TranscriptEvent, current: &Transcrip
             && candidate.received_at_ms > current.received_at_ms)
 }
 
-fn projection_event_is_eligible(event: &TranscriptEvent) -> bool {
+pub(crate) fn projection_event_is_eligible(event: &TranscriptEvent) -> bool {
     event.is_final
         || event.end_of_turn
         || matches!(event.stability, TranscriptEventStability::Final)
@@ -1591,6 +1591,10 @@ pub(crate) struct TranscriptLiveIndex {
 }
 
 impl TranscriptLiveIndex {
+    pub(crate) fn position(&self, id: &str) -> Option<usize> {
+        self.positions.get(id).copied()
+    }
+
     pub(crate) fn apply(
         &mut self,
         ledger: &mut TranscriptLedger,
@@ -2468,9 +2472,7 @@ impl TranscriptLedger {
         &self,
         basis: Option<&ProjectionBasis>,
     ) -> Option<ProjectionCoverageStatus> {
-        let covered = basis
-            .map(|b| b.resolve_covered_events(&self.latest_spans))
-            .unwrap_or_default();
+        let covered = basis?.resolve_covered_events(&self.latest_spans);
         let identities: std::collections::BTreeSet<_> = covered
             .iter()
             .map(|e| (&e.span_id, e.revision_number))
@@ -4667,21 +4669,26 @@ pub(crate) fn resolve_claim_evidence_basis_events(
     patch_basis
         .resolve_covered_events(&ledger.latest_spans)
         .into_iter()
-        .map(|mut event| {
-            if let Some(winners) = attribution.as_ref()
-                && let Some(winner) = crate::timeline::resolve_speaker(
-                    event.source_id.as_str(),
-                    event.transcript_segment_id.as_deref(),
-                    event.span_id.as_str(),
-                    winners,
-                )
-            {
-                event.speaker_id = winner.speaker_id.clone();
-                event.speaker_label = winner.speaker_label.clone();
-            }
-            event
-        })
+        .map(|event| overlay_evidence_speaker(event, attribution.as_ref()))
         .collect()
+}
+
+pub(crate) fn overlay_evidence_speaker(
+    mut event: TranscriptEvent,
+    winners: Option<&std::collections::HashMap<String, &DiarizationSpanRevision>>,
+) -> TranscriptEvent {
+    if let Some(winners) = winners
+        && let Some(winner) = crate::timeline::resolve_speaker(
+            &event.source_id,
+            event.transcript_segment_id.as_deref(),
+            &event.span_id,
+            winners,
+        )
+    {
+        event.speaker_id.clone_from(&winner.speaker_id);
+        event.speaker_label.clone_from(&winner.speaker_label);
+    }
+    event
 }
 
 /// Resolve a node id referenced by a graph operation (edge endpoint,
@@ -5023,20 +5030,25 @@ pub fn transcript_events_hash_v1(events: &[TranscriptEvent]) -> String {
             .then(a.revision_number.cmp(&b.revision_number))
     });
 
-    let mut hash = 14_695_981_039_346_656_037u64;
+    let mut hash = TRANSCRIPT_HASH_V1_INITIAL;
     for event in ordered {
-        update_hash(&mut hash, &event.span_id);
-        update_hash(&mut hash, &event.provider);
-        update_hash(&mut hash, &event.source_id);
-        update_hash(&mut hash, event.speaker_id.as_deref().unwrap_or(""));
-        update_hash(&mut hash, event.speaker_label.as_deref().unwrap_or(""));
-        update_hash(&mut hash, &event.text);
-        update_hash(&mut hash, &millis(event.start_time).to_string());
-        update_hash(&mut hash, &millis(event.end_time).to_string());
-        update_hash(&mut hash, &event.revision_number.to_string());
-        update_hash(&mut hash, if event.is_final { "final" } else { "partial" });
+        update_transcript_hash_v1(&mut hash, event);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+pub(crate) const TRANSCRIPT_HASH_V1_INITIAL: u64 = 14_695_981_039_346_656_037;
+pub(crate) fn update_transcript_hash_v1(hash: &mut u64, event: &TranscriptEvent) {
+    update_hash(hash, &event.span_id);
+    update_hash(hash, &event.provider);
+    update_hash(hash, &event.source_id);
+    update_hash(hash, event.speaker_id.as_deref().unwrap_or(""));
+    update_hash(hash, event.speaker_label.as_deref().unwrap_or(""));
+    update_hash(hash, &event.text);
+    update_hash(hash, &millis(event.start_time).to_string());
+    update_hash(hash, &millis(event.end_time).to_string());
+    update_hash(hash, &event.revision_number.to_string());
+    update_hash(hash, if event.is_final { "final" } else { "partial" });
 }
 
 /// Compatibility name for callers written before transcript hash versions
@@ -10085,7 +10097,8 @@ mod tests {
 
         let state_source = include_str!("state/projection_apply.rs");
         assert!(
-            state_source.contains(".apply_validated_patch_reporting_currency(&ledger, &patch)"),
+            state_source.contains("storage.live_basis(&patch, observed_count)")
+                && state_source.contains("!patch.basis.diarization_span_revisions.is_empty()"),
             "live runtime apply must retain the transcript-only validation seam"
         );
         assert!(

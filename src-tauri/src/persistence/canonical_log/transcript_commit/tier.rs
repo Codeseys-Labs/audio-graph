@@ -39,12 +39,16 @@ impl ReceiptTierWitness {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Class {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Class {
     Qualified,
     SyncedUnqualified,
     RecoveredFromUnqualifiedAttempt,
 }
+
+/// At most one observation per tier. A process exit can lose evidence about a
+/// tier without changing which canonical frames are committed.
+pub(super) type DeferredWitnesses = std::cell::RefCell<Vec<(Class, ReceiptTierWitness)>>;
 
 impl Class {
     fn path(self, log: &Path) -> PathBuf {
@@ -151,7 +155,13 @@ impl<E: CommitPayload> Commit<'_, E> {
     /// Keep the existing floor-v1 descriptor readable by its predecessor. The
     /// optional companion belongs to a fresh attempt UUID, never to a payload.
     /// It is needed only until the stream has a confirmed weak observation.
-    pub(super) fn record_attempt_origin(
+    pub(super) fn record_attempt_origin(&self, intent: &Intent, prefix: &CachedStreamState) {
+        if self.try_record_attempt_origin(intent, prefix).is_err() {
+            log::warn!("receipt_evidence.origin_unavailable");
+        }
+    }
+
+    fn try_record_attempt_origin(
         &self,
         intent: &Intent,
         prefix: &CachedStreamState,
@@ -169,12 +179,15 @@ impl<E: CommitPayload> Commit<'_, E> {
         Ok(())
     }
 
-    pub(super) fn clear_attempt_origin(&self) -> Result<(), TranscriptCommitError> {
+    pub(super) fn clear_attempt_origin(&self) {
         let origin = self.path.with_added_extension("attempt-origin");
-        match fs::symlink_metadata(&origin) {
+        let result = match fs::symlink_metadata(&origin) {
             Ok(_) => self.unlink(&origin),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_failure(CanonicalAppendPhase::RecoveryRead, error)),
+        };
+        if result.is_err() {
+            log::warn!("receipt_evidence.origin_cleanup_deferred");
         }
     }
 
@@ -186,7 +199,14 @@ impl<E: CommitPayload> Commit<'_, E> {
         next: &ReceiptTierWitness,
         prefix: &CachedStreamState,
         interrupted: Option<&Intent>,
-    ) -> Result<(), TranscriptCommitError> {
+    ) {
+        let mut observations = self.deferred_witnesses.take();
+        observations.retain(|(_, w)| w == next || w.matches_cache(prefix));
+        let mut observe = |class| {
+            if !observations.iter().any(|(c, _)| *c == class) {
+                observations.push((class, next.clone()));
+            }
+        };
         let class = match self.guard {
             TranscriptGuard::Unqualified(_) => Class::SyncedUnqualified,
             TranscriptGuard::Qualified(..) => {
@@ -194,14 +214,23 @@ impl<E: CommitPayload> Commit<'_, E> {
                     let origin = checked_bytes_bounded(
                         &self.path.with_added_extension("attempt-origin"),
                         36,
-                    )?;
-                    if origin.as_deref() == Some(intent.attempt.as_bytes()) {
-                        self.witness(Class::RecoveredFromUnqualifiedAttempt, next, prefix)?;
+                    );
+                    match origin {
+                        Ok(Some(bytes)) if bytes == intent.attempt.as_bytes() => {
+                            observe(Class::RecoveredFromUnqualifiedAttempt)
+                        }
+                        Err(_) => log::warn!("receipt_evidence.origin_unavailable"),
+                        _ => {}
                     }
                 }
                 Class::Qualified
             }
         };
-        self.witness(class, next, prefix)
+        observe(class);
+        observations.retain(|(class, witness)| self.witness(*class, witness, prefix).is_err());
+        if !observations.is_empty() {
+            log::warn!("receipt_evidence.write_deferred");
+            self.deferred_witnesses.replace(observations);
+        }
     }
 }

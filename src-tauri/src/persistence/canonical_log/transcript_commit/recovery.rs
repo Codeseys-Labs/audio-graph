@@ -48,7 +48,7 @@ impl<E: CommitPayload> Commit<'_, E> {
         let path = self.path.with_added_extension("attempt");
         let Some(bytes) = checked_bytes_bounded(&path, 4096)? else {
             // A process can stop between origin and descriptor publication.
-            self.clear_attempt_origin()?;
+            self.clear_attempt_origin();
             let Some(pending) = &mut lease.pending else {
                 return Ok(false);
             };
@@ -159,7 +159,7 @@ impl<E: CommitPayload> Commit<'_, E> {
                 {
                     return Err(TranscriptCommitError::InvalidHistory);
                 }
-                if !event.recovery_basis(self.path, self.session, heads)? {
+                if !event.recovery_basis(self.path, self.session, heads, self.source_basis)? {
                     count = i;
                     length = members[..count].iter().map(|member| member.length).sum();
                     break;
@@ -187,7 +187,7 @@ impl<E: CommitPayload> Commit<'_, E> {
             // A second fsync alone can succeed after a failed writeback.
             write_frame(file, &suffix[..length])?;
             let barrier = self.sync_namespace()?;
-            self.record_barrier(&first, &preceding, Some(intent))?;
+            self.record_barrier(&first, &preceding, Some(intent));
             recovered.extend(rows.into_iter().map(|(sequence, record_hash, _, event)| {
                 RecoveredEvent {
                     record_hash,

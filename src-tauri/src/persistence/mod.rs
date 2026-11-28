@@ -130,20 +130,36 @@ pub fn transcript_events_path(session_id: &str) -> Option<PathBuf> {
     crate::user_data::transcript_events_path(session_id).ok()
 }
 
-/// Read the active session’s accepted coverage and pending repairs together.
-pub(crate) fn reseed_projection_capture(state: &crate::state::AppState) -> Result<(), String> {
+/// Only verified coverage can request a gap repair. The transcription worker
+/// can still accept new revisions when a derived stream cannot be verified.
+pub(crate) fn reseed_projection_capture(state: &crate::state::AppState) {
     let session = state.current_session_id();
-    let (heads, gaps) = FileMemoryRepository::user_data().projection_capture_coverage(&session)?;
-    let mut lanes = state
+    let coverage = FileMemoryRepository::user_data().projection_capture_coverage(&session);
+    let verified = coverage.is_ok();
+    let (heads, gaps) = coverage.unwrap_or_default();
+    let attached = state
         .projection_schedulers
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    lanes.attach_capture(
-        &session,
-        heads,
-        gaps.for_kind(&crate::projections::ProjectionKind::Notes),
-        gaps.for_kind(&crate::projections::ProjectionKind::Graph),
-    )
+        .unwrap_or_else(|p| p.into_inner())
+        .attach_capture(
+            &session,
+            heads,
+            gaps.for_kind(&crate::projections::ProjectionKind::Notes),
+            gaps.for_kind(&crate::projections::ProjectionKind::Graph),
+        );
+    if !verified || attached.is_err() {
+        log::warn!("projection_capture.coverage_unverified");
+        let mut view = state
+            .materialized_projection_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if view.session_id == session {
+            view.notes.transcript_coverage =
+                Some(crate::projections::ProjectionCoverageStatus::BehindTranscript);
+            view.graph.transcript_coverage =
+                Some(crate::projections::ProjectionCoverageStatus::BehindTranscript);
+        }
+    }
 }
 
 /// Resolve the projection event-log path for a session.
@@ -1055,17 +1071,28 @@ impl FileMemoryRepository {
         ),
         String,
     > {
+        self.read_projection_history_with_limit(session_id, portable, MAX_PROJECTION_EVENTS_BYTES)
+    }
+
+    fn read_projection_history_with_limit(
+        &self,
+        session_id: &str,
+        portable: bool,
+        byte_limit: u64,
+    ) -> Result<
+        (
+            ProjectionHistory,
+            Option<canonical_log::transcript_export::TranscriptRecoveryExport>,
+        ),
+        String,
+    > {
         let path = self.resolve_projection_events_path(session_id)?;
         let (captured, recovery) = canonical_log::transcript_export::capture_projection(
             &path,
-            MAX_PROJECTION_EVENTS_BYTES,
+            byte_limit,
             || {
-                canonical_log::capture_committed_projection_bounded(
-                    &path,
-                    session_id,
-                    MAX_PROJECTION_EVENTS_BYTES,
-                )
-                .map_err(|error| error.to_string())
+                canonical_log::capture_committed_projection_bounded(&path, session_id, byte_limit)
+                    .map_err(|error| error.to_string())
             },
             portable,
         )?;
@@ -1086,7 +1113,9 @@ impl FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<projection_history::ProjectionCaptureCoverage, String> {
-        let (history, _) = self.read_projection_history(session_id, false)?;
+        // Review and portable exports bound their response sizes. Live capture
+        // verifies the complete source, including sessions larger than that limit.
+        let (history, _) = self.read_projection_history_with_limit(session_id, false, u64::MAX)?;
         history.verify_source(
             "transcript_revisions",
             self.load_transcript_event_stream(session_id)?.records(),
@@ -2076,6 +2105,32 @@ pub(crate) enum ProjectionEventWriteMsg {
 /// CPU when no segments are arriving.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Queue polling stays responsive to shutdown while a failing storage device rests.
+struct RecoveryBackoff {
+    delay: std::time::Duration,
+    next: std::time::Instant,
+}
+
+impl RecoveryBackoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self {
+            delay: Self::INITIAL,
+            next: std::time::Instant::now(),
+        }
+    }
+
+    fn record(&mut self, now: std::time::Instant, resolved: bool) {
+        self.delay = if resolved {
+            Self::INITIAL
+        } else {
+            (self.delay * 2).min(std::time::Duration::from_secs(5))
+        };
+        self.next = now + self.delay;
+    }
+}
+
 /// Maximum queued transcript/projection events per durable event writer.
 ///
 /// The policy is drop-new-on-full: producers never block the ASR/projection
@@ -2193,11 +2248,16 @@ fn projection_worker(
     shutdown: &AtomicBool,
 ) {
     let mut pending: Option<crate::state::PendingProjectionApply> = None;
+    let mut retry = RecoveryBackoff::new();
     loop {
         if let Some(in_flight) = pending.as_mut()
-            && in_flight.resolve(&storage)
+            && std::time::Instant::now() >= retry.next
         {
-            pending = None;
+            let resolved = in_flight.resolve(&storage);
+            retry.record(std::time::Instant::now(), resolved);
+            if resolved {
+                pending = None;
+            }
         }
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(ProjectionEventWriteMsg::Apply(apply)) => {
@@ -3711,6 +3771,22 @@ mod shutdown_tests {
             Err(canonical_log::TranscriptCommitError::ReplyLost)
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_retries_back_off_to_five_seconds_and_reset_after_success() {
+        let mut retry = super::RecoveryBackoff::new();
+        let start = retry.next;
+        for delay_ms in [200, 400, 800, 1600, 3200, 5000, 5000] {
+            let previous = retry.next;
+            retry.record(previous, false);
+            assert_eq!(
+                retry.next.duration_since(previous),
+                std::time::Duration::from_millis(delay_ms)
+            );
+        }
+        retry.record(start, true);
+        assert_eq!(retry.next - start, super::RecoveryBackoff::INITIAL);
     }
 
     #[test]

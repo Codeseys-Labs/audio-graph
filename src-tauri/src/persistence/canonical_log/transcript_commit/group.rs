@@ -189,14 +189,14 @@ impl Commit<'_> {
             frame_hash: digest(&plan.bytes),
             members: plan.members.clone(),
         };
-        self.record_attempt_origin(&intent, &prefix.stream)?;
+        self.record_attempt_origin(&intent, &prefix.stream);
         let descriptor =
             serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
         self.publish_intent(&mut lease, &intent_path, &descriptor)?;
         #[cfg(test)]
         kill_at(Cut::KillIntent);
         let receipts = self.write_group(&intent, &plan, &mut file)?;
-        self.record_barrier(&witness, &prefix.stream, None)?;
+        self.record_barrier(&witness, &prefix.stream, None);
         if let Err(error) = self.finish_intent(&self.path.with_added_extension("attempt")) {
             lease.pending.as_mut().unwrap().retiring = Some(
                 events
@@ -239,6 +239,11 @@ impl Commit<'_> {
         prefix.stamp = File::open(self.path)
             .ok()
             .and_then(|f| SourceStamp::read(&f).ok());
+        domain::remember_head(
+            self.path,
+            prefix.stamp.as_ref(),
+            prefix.stream.head.as_ref(),
+        );
         Ok(Some(receipts))
     }
 

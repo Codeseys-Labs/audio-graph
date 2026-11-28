@@ -213,10 +213,14 @@ or damaged remainder produces one gap identifying the affected lanes. The
 quarantine retains the suffix for evidence. Review and export can present
 the last verified view with `BehindTranscript` for uncovered transcript
 revisions or `RecomputeRequired` for an unresolved projection gap. Reading
-history performs local replay only.
+history performs local replay only. Review shows these notices for the owning
+historical session. A lane that never ran has no coverage to report.
 
 Resuming capture can admit one repair per affected lane through the ordinary
 projection executor under current consent, routing and provider settings.
+The live coverage check is independent of the Review byte ceiling. If it
+cannot verify history, transcription starts, the live views are marked
+behind, and the scheduler skips gap repairs for that resume.
 The accepted repair references the gap it covers. If the job fails, the gap
 remains visible. A previously captured session requires an explicit user
 action before its content can enter a model again.

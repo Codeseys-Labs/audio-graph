@@ -153,7 +153,7 @@ impl ProjectionApplyCommand {
             savers,
             reply,
         } = self;
-        let (mut candidate, ledger) = {
+        let (mut candidate, observed_count) = {
             let _epoch = target.publication.read().unwrap_or_else(|p| p.into_inner());
             if !target.current() {
                 let actual = target
@@ -174,21 +174,17 @@ impl ProjectionApplyCommand {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
-            let ledger = target
-                .ledger
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
+            let ledger = target.ledger.lock().unwrap_or_else(|p| p.into_inner());
             if ledger.session_id != target.session || candidate.session_id != target.session {
                 let _ = reply.send(Err(ProjectionRuntimeApplyError::SessionMismatch {
                     expected_session_id: target.session.clone(),
                     current_session_id: target.session.clone(),
-                    ledger_session_id: ledger.session_id,
+                    ledger_session_id: ledger.session_id.clone(),
                     materialized_session_id: candidate.session_id,
                 }));
                 return None;
             }
-            (candidate, ledger)
+            (candidate, ledger.accepted_event_count)
         };
         // Exact retries identify the physical record even when its generated
         // timing differed. They publish neither a second event nor a new row.
@@ -233,9 +229,35 @@ impl ProjectionApplyCommand {
         }
         let started = std::time::Instant::now();
         let original = patch.clone();
-        let (outcome, currency) =
-            match candidate.apply_validated_patch_reporting_currency(&ledger, &patch) {
-                Ok(v) => v,
+        // The receipt-backed live ledger contributes its observed position.
+        // Read and validate that physical prefix on the actor, outside ASR locks.
+        if !patch.basis.diarization_span_revisions.is_empty() {
+            let error = ProjectionApplyError::StaleBasis {
+                staleness:
+                    crate::projections::ProjectionBasisStaleness::DiarizationBasisUnavailable {
+                        count: patch.basis.diarization_span_revisions.len(),
+                    },
+            };
+            let _ = reply.send(Err(ProjectionRuntimeApplyError::Apply { error }));
+            return None;
+        }
+        let proof = match storage.live_basis(&patch, observed_count) {
+            Ok(proof) => proof,
+            Err(error) => {
+                let _ = reply.send(Err(failed(error)));
+                return None;
+            }
+        };
+        let currency = match proof.currency() {
+            Ok(currency) => currency,
+            Err(error) => {
+                let _ = reply.send(Err(ProjectionRuntimeApplyError::Apply { error }));
+                return None;
+            }
+        };
+        let outcome =
+            match candidate.apply_replayed_patch(&patch, Some(&proof.evidence_for(&patch))) {
+                Ok(outcome) => outcome,
                 Err(error) => {
                     let _ = reply.send(Err(ProjectionRuntimeApplyError::Apply { error }));
                     return None;
@@ -246,9 +268,10 @@ impl ProjectionApplyCommand {
             .get_or_insert(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         let mut result = storage.commit_at_lane(
             &patch,
-            Some(ledger.accepted_event_count),
+            Some(observed_count),
             &repair_ids,
             Some(last),
+            Some(proof.heads()),
         );
         if matches!(
             result,
@@ -268,6 +291,7 @@ impl ProjectionApplyCommand {
         let mut waiting = PendingProjectionApply {
             target,
             candidate,
+            observed_count,
             patch,
             outcome,
             currency,
@@ -291,6 +315,7 @@ impl ProjectionApplyCommand {
 pub(crate) struct PendingProjectionApply {
     target: Target,
     candidate: MaterializedProjectionState,
+    observed_count: u64,
     patch: ProjectionPatch,
     outcome: MaterializedProjectionApplyOutcome,
     currency: AppliedBasisCurrency,
@@ -333,6 +358,19 @@ impl PendingProjectionApply {
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
             if self.target.current() {
+                let count = self
+                    .target
+                    .ledger
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .accepted_event_count;
+                let coverage = (count != self.observed_count
+                    || matches!(self.currency, AppliedBasisCurrency::AppendedTail { .. }))
+                .then_some(crate::projections::ProjectionCoverageStatus::BehindTranscript);
+                match self.patch.kind {
+                    ProjectionKind::Notes => self.candidate.notes.transcript_coverage = coverage,
+                    ProjectionKind::Graph => self.candidate.graph.transcript_coverage = coverage,
+                }
                 let mut live = self.target.state.lock().unwrap_or_else(|p| p.into_inner());
                 match self.patch.kind {
                     ProjectionKind::Notes => live.notes.clone_from(&self.candidate.notes),

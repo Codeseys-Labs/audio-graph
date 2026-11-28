@@ -1053,8 +1053,8 @@ impl AppState {
     ///    rotate returns `RotateOutcome::AlreadyRotating(current_id)` without
     ///    touching state.
     /// 2. Prepares transcript, transcript-event, and projection-event writers
-    ///    for the new session. Failure returns `RotateOutcome::Failed` while
-    ///    the current session remains published and unchanged.
+    ///    for the new session. Projection preparation retries once on failure.
+    ///    A persistent failure returns `RotateOutcome::Failed` with the old session active.
     /// 3. Shuts down and swaps the old writers, resets every active
     ///    session-scoped ledger/view/queue, then publishes the new session ID
     ///    last so readers cannot observe a new ID paired with old aggregates.
@@ -1065,6 +1065,14 @@ impl AppState {
     /// The guard in step 1 is released on return via an RAII guard, so the
     /// flag is cleared even on early returns / panics inside step 3.
     pub fn rotate_session(&self, new_session_id: &str) -> RotateOutcome {
+        self.rotate_session_with_projection_writer(new_session_id, ProjectionEventWriter::spawn)
+    }
+
+    fn rotate_session_with_projection_writer(
+        &self,
+        new_session_id: &str,
+        mut open_projection: impl FnMut(&str) -> Option<ProjectionEventWriter>,
+    ) -> RotateOutcome {
         // Step 1: concurrent-rotate guard. `compare_exchange(false, true)`
         // fails iff another thread already claimed it — in that case we skip
         // the rotation entirely and return the current ID. Using SeqCst to
@@ -1109,7 +1117,7 @@ impl AppState {
                 }
             };
         let new_projection_event_writer =
-            match crate::persistence::ProjectionEventWriter::spawn(new_session_id) {
+            match open_projection(new_session_id).or_else(|| open_projection(new_session_id)) {
                 Some(writer) => writer,
                 None => {
                     let _ = new_transcript_writer
@@ -2245,15 +2253,29 @@ mod rotation_tests {
 
     #[test]
     fn rotate_session_swaps_session_id_atomically() {
-        // Pure in-memory — we do NOT rely on HOME resolving to anything in
-        // particular. `AppState::new()` may or may not spawn a transcript
-        // writer depending on ambient HOME, but the id swap is independent.
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("atomic-rotation");
+        let _home = HomeGuard::set(&dir);
         let app = AppState::new();
         let original = app.current_session_id();
         assert!(!original.is_empty(), "session_id must be populated at init");
 
         let new_id = "rotated-session-aaa";
-        let outcome = app.rotate_session(new_id);
+        // A transient readiness refusal leaves all three old writers in place
+        // until the second preparation succeeds.
+        let mut attempts = 0;
+        let outcome = app.rotate_session_with_projection_writer(new_id, |id| {
+            attempts += 1;
+            assert_eq!(app.current_session_id(), original);
+            if attempts == 1 {
+                None
+            } else {
+                ProjectionEventWriter::spawn(id)
+            }
+        });
+        assert_eq!(attempts, 2);
         assert_eq!(
             outcome,
             RotateOutcome::Rotated(original.clone()),
@@ -2267,6 +2289,7 @@ mod rotation_tests {
 
         // Drain any spawned writers so their threads don't linger past the test.
         drain_writers(&app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

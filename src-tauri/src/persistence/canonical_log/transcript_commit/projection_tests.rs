@@ -74,6 +74,279 @@ impl Drop for Fixture {
     }
 }
 #[test]
+fn moving_transcript_and_speaker_bases_verify_only_new_frames() {
+    use crate::{
+        identity::tests::span,
+        persistence::speaker_log::{SpeakerWrite, append},
+        projections::SpeakerTimeline,
+    };
+    let fixture = Fixture::new();
+    let mut patch = fixture.seeded_patch();
+    let path = fixture
+        .transcript
+        .path
+        .with_file_name(format!("{SESSION}.speaker.jsonl"));
+    let speaker = span("reed", "mic");
+    append(
+        &path,
+        SESSION,
+        SpeakerWrite::SpanRevision { revision: &speaker },
+    )
+    .unwrap();
+    let mut timeline = SpeakerTimeline::replay(SESSION, [speaker]).unwrap();
+    patch.basis.diarization_span_revisions = timeline.current_basis_spans();
+    fixture.projection.commit_after(&patch, Some(1)).unwrap();
+    let before = fixture.projection.source_basis.borrow().source_work();
+    let next = transcript_event("twig", "leaf");
+    fixture.transcript.commit_after(&next, None).unwrap();
+    let speaker = span("fern", "mic");
+    append(
+        &path,
+        SESSION,
+        SpeakerWrite::SpanRevision { revision: &speaker },
+    )
+    .unwrap();
+    timeline.apply_event(speaker).unwrap();
+    patch.sequence = 2;
+    patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+        &[transcript_event("branch", "wood"), next],
+        &timeline.current_basis_spans(),
+    );
+    fixture.projection.commit_after(&patch, Some(2)).unwrap();
+    let after = fixture.projection.source_basis.borrow().source_work();
+    assert_eq!(
+        after,
+        [
+            (before[0].0, before[0].1 + 1),
+            (before[1].0, before[1].1 + 1)
+        ]
+    );
+}
+
+#[test]
+fn live_basis_matches_ledger_currency_and_cited_evidence_as_revisions_change() {
+    use crate::projections::{BasisCurrency, TranscriptEventStability, TranscriptLedger};
+    let f = Fixture::new();
+    let mut ledger = TranscriptLedger::new(SESSION);
+    let mut patch = projection_patch(1, "leaf");
+    let crate::projections::ProjectionOperation::UpsertNote { evidence, .. } =
+        &mut patch.operations[0]
+    else {
+        unreachable!()
+    };
+    // The claim-evidence gate trims a cited ID before looking up its span.
+    evidence.span_id = Some("  reed-1  ".into());
+    let mut older = Vec::new();
+    for n in 0..13 {
+        let mut event = transcript_event(&format!("reed-{n}"), "leaf");
+        event.start_time = n as f64;
+        if n % 3 == 0 {
+            event.is_final = false;
+            event.end_of_turn = false;
+            event.stability = TranscriptEventStability::Partial;
+        }
+        let mut changes = vec![event];
+        if n == 10 {
+            let mut correction = transcript_event("reed-1", "stem");
+            correction.start_time = 1.;
+            correction.revision_number = 2;
+            changes.push(correction);
+        }
+        for row in changes {
+            f.transcript.commit_after(&row, None).unwrap();
+            ledger.apply_event(row).unwrap();
+        }
+        older.push(ledger.current_basis());
+        older.push(ledger.current_projection_basis());
+        for basis in &older {
+            patch.basis = basis.clone();
+            let proof = f
+                .projection
+                .live_basis(&patch, ledger.accepted_event_count)
+                .unwrap();
+            let expected = ledger.classify_basis_currency(basis, None);
+            let actual = proof.currency();
+            match expected {
+                BasisCurrency::Current => assert_eq!(
+                    actual,
+                    Ok(crate::projections::AppliedBasisCurrency::Current)
+                ),
+                BasisCurrency::AppendOnlyStale(staleness) => assert_eq!(
+                    actual,
+                    Ok(crate::projections::AppliedBasisCurrency::AppendedTail { staleness })
+                ),
+                BasisCurrency::Revised(staleness) => {
+                    assert_eq!(
+                        actual,
+                        Err(crate::projections::ProjectionApplyError::StaleBasis { staleness })
+                    );
+                    continue;
+                }
+            }
+            let expected =
+                crate::projections::resolve_claim_evidence_basis_events(basis, &ledger, None);
+            assert_eq!(
+                proof.evidence_for(&patch).get("reed-1").copied(),
+                expected.iter().find(|e| e.span_id == "reed-1")
+            );
+        }
+    }
+    let valid = ledger.current_basis();
+    let mut bad_prefix = valid.clone();
+    bad_prefix
+        .covered_prefix
+        .as_mut()
+        .unwrap()
+        .content_hash
+        .push('x');
+    let mut bad_summary = valid.clone();
+    bad_summary.summarized_through_revision = Some(100);
+    let mut reordered = valid;
+    reordered.span_revisions.reverse();
+    for bad in [bad_prefix, bad_summary, reordered] {
+        patch.basis = bad;
+        let BasisCurrency::Revised(staleness) = ledger.classify_basis_currency(&patch.basis, None)
+        else {
+            panic!("malformed fixture");
+        };
+        assert_eq!(
+            f.projection
+                .live_basis(&patch, ledger.accepted_event_count)
+                .unwrap()
+                .currency(),
+            Err(crate::projections::ProjectionApplyError::StaleBasis { staleness })
+        );
+    }
+}
+
+#[test]
+fn replaced_or_rewritten_transcript_never_reuses_the_old_projection_proof() {
+    let f = Fixture::new();
+    let mut old = f.seeded_patch();
+    f.projection.commit_after(&old, Some(1)).unwrap();
+    old.sequence = 2;
+    let fork = Fixture::new();
+    let changed = transcript_event("branch", "sand");
+    fork.transcript.commit_after(&changed, None).unwrap();
+    // An external equal-height in-place rewrite, then a legitimate append.
+    fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
+    f.transcript
+        .commit_after(&transcript_event("stem", "reed"), None)
+        .unwrap();
+    assert_eq!(
+        f.projection.commit_after(&old, Some(1)),
+        Err(TranscriptCommitError::InvalidRevision)
+    );
+    // A replacement file with a shorter verified history invalidates the cursor too.
+    let moved = f.root.join("retired");
+    fs::rename(&f.transcript.path, &moved).unwrap();
+    fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
+    assert_eq!(
+        f.projection.commit_after(&old, Some(1)),
+        Err(TranscriptCommitError::InvalidRevision)
+    );
+    old.basis = ProjectionBasis::from_transcript_events(&[changed]);
+    assert_eq!(
+        f.projection
+            .commit_after(&old, Some(1))
+            .unwrap()
+            .head
+            .sequence,
+        2
+    );
+}
+
+#[test]
+fn projection_append_rechecks_the_candidate_head_but_accepts_later_appends() {
+    use crate::projections::{AppliedBasisCurrency, TranscriptEventStability};
+    let f = Fixture::new();
+    let patch = f.seeded_patch();
+    let mut tail = transcript_event("twig", "reed");
+    tail.start_time = 10.0;
+    tail.end_time = 11.0;
+    let mut partial = tail.clone();
+    partial.is_final = false;
+    partial.end_of_turn = false;
+    partial.stability = TranscriptEventStability::Partial;
+    f.transcript.commit_after(&partial, None).unwrap();
+    let old = f.projection.live_basis(&patch, 2).unwrap();
+    assert_eq!(old.currency(), Ok(AppliedBasisCurrency::Current));
+
+    let fork = Fixture::new();
+    fork.seeded_patch();
+    fork.transcript.commit_after(&tail, None).unwrap();
+    fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
+    let current = f.projection.live_basis(&patch, 2).unwrap();
+    assert!(matches!(
+        current.currency(),
+        Ok(AppliedBasisCurrency::AppendedTail { .. })
+    ));
+    assert_eq!(
+        f.projection
+            .commit_at_lane(&patch, Some(2), &[], Some(0), Some(old.heads())),
+        Err(TranscriptCommitError::InvalidRevision),
+    );
+    assert!(!f.projection.path.exists());
+    f.transcript
+        .commit_after(&transcript_event("moss", "green"), None)
+        .unwrap();
+    let result = f
+        .projection
+        .commit_at_lane(&patch, Some(2), &[], Some(0), Some(current.heads()))
+        .unwrap();
+    assert_eq!(result.head.sequence, 1);
+}
+
+#[test]
+fn an_invalid_semantic_tail_cannot_pollute_a_later_shorter_dependency_fold() {
+    let f = Fixture::new();
+    let patch = f.seeded_patch();
+    f.projection.live_basis(&patch, 1).unwrap();
+    // Valid physical legacy rows can carry a stale semantic revision.
+    let first = transcript_event("branch", "wood");
+    let mut second = transcript_event("leaf", "green");
+    second.revision_number = 2;
+    let stale = transcript_event("leaf", "fallen");
+    let mut bytes = Vec::new();
+    for event in [&first, &second, &stale] {
+        serde_json::to_writer(&mut bytes, event).unwrap();
+        bytes.push(b'\n');
+    }
+    fs::write(&f.transcript.path, bytes).unwrap();
+    assert!(matches!(
+        f.projection.live_basis(&patch, 3),
+        Err(TranscriptCommitError::InvalidHistory)
+    ));
+    let mut valid = patch;
+    valid.basis = ProjectionBasis::from_transcript_events(&[first, second]);
+    assert_eq!(
+        f.projection.live_basis(&valid, 2).unwrap().currency(),
+        Ok(crate::projections::AppliedBasisCurrency::Current)
+    );
+}
+
+#[test]
+fn a_dependency_lock_still_held_after_the_wait_reports_contention() {
+    use crate::persistence::canonical_durability::{
+        transcript_coordination_path, wait_for_transcript_lock,
+    };
+    let f = Fixture::new();
+    let patch = f.seeded_patch();
+    let held = wait_for_transcript_lock(
+        &transcript_coordination_path(&f.transcript.path),
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        f.projection.live_basis(&patch, 1),
+        Err(TranscriptCommitError::ConflictingAttempt)
+    ));
+    drop(held);
+    assert!(f.projection.live_basis(&patch, 1).is_ok());
+}
+
+#[test]
 fn projections_commit_in_physical_order_and_keep_the_original_basis_on_exact_retry() {
     let fixture = Fixture::new();
     let notes = fixture.seeded_patch();
@@ -101,6 +374,24 @@ fn projections_commit_in_physical_order_and_keep_the_original_basis_on_exact_ret
     assert_eq!(verified.records[1].basis_heads[STREAM].sequence, 2);
     assert_eq!(verified.records[1].record_hash, second.head.record_hash);
 }
+#[test]
+fn a_projection_receipt_survives_a_failed_witness_write() {
+    let fixture = Fixture::new();
+    let first = fixture.seeded_patch();
+    CUT.set(Some(Cut::WitnessWrite));
+    let receipt = fixture.projection.commit_after(&first, Some(1)).unwrap();
+    assert!(!receipt.already_accepted);
+    assert!(!fixture.projection.has_pending_attempt());
+    let verified =
+        read_committed_projection::<ProjectionPatch>(&fixture.projection.path, SESSION).unwrap();
+    assert_eq!(verified.records[0].record_hash, receipt.head.record_hash);
+    assert!(tier::receipt_evidence(&fixture.projection.path, &verified.records).is_empty());
+    let repeated = fixture.projection.commit_after(&first, Some(1)).unwrap();
+    assert!(repeated.already_accepted);
+    assert_eq!(receipt.head, repeated.head);
+    assert!(!tier::receipt_evidence(&fixture.projection.path, &verified.records).is_empty());
+}
+
 #[test]
 fn verified_projection_member_with_a_lost_transcript_basis_is_quarantined() {
     let fixture = Fixture::new();
@@ -224,12 +515,13 @@ fn late_projection_retry_cannot_skip_a_preceding_or_subsequent_commit_in_its_lan
     row.sequence = 3;
     f.projection.commit_after(&row, Some(1)).unwrap();
     assert_eq!(
-        f.projection.commit_at_lane(&row, Some(1), &[], Some(0)),
+        f.projection
+            .commit_at_lane(&row, Some(1), &[], Some(0), None),
         Err(TranscriptCommitError::LiveHeadChanged)
     );
     assert!(
         f.projection
-            .commit_at_lane(&row, Some(1), &[], Some(1))
+            .commit_at_lane(&row, Some(1), &[], Some(1), None)
             .unwrap()
             .already_accepted
     );
@@ -237,7 +529,8 @@ fn late_projection_retry_cannot_skip_a_preceding_or_subsequent_commit_in_its_lan
     row.sequence = 5;
     f.projection.commit_after(&row, Some(1)).unwrap();
     assert_eq!(
-        f.projection.commit_at_lane(&prior, Some(1), &[], Some(1)),
+        f.projection
+            .commit_at_lane(&prior, Some(1), &[], Some(1), None),
         Err(TranscriptCommitError::LiveHeadChanged)
     );
 }

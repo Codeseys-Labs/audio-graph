@@ -7,6 +7,14 @@ use crate::persistence::canonical_durability::{
 };
 use crate::projections::{ProjectionPatch, TranscriptEvent};
 mod domain;
+pub(super) fn remember_speaker_head(path: &Path, file: &File, head: Option<&CanonicalStreamHead>) {
+    if let Ok(stamp) = SourceStamp::read(file)
+        && let Ok(canonical) = fs::canonicalize(path)
+    {
+        domain::remember_head(&canonical, Some(&stamp), head);
+    }
+}
+
 use domain::CommitPayload;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -207,16 +215,48 @@ impl<E: CommitPayload> Drop for Lease<E> {
 /// A worker may reuse an index only under the stream lock and for the same
 /// file generation. Cooperative writers append or replace the file and leave
 /// an intent whenever a tail is mutable.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct SourceStamp {
     identity: super::super::canonical_durability::FilesystemIdentity,
     length: u64,
     modified: std::time::SystemTime,
+    change_time: Option<i128>,
 }
 impl SourceStamp {
     fn read(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
+        #[cfg(unix)]
+        let change_time = {
+            use std::os::unix::fs::MetadataExt;
+            Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+        };
+        #[cfg(windows)]
+        let change_time = {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::HANDLE,
+                Storage::FileSystem::{
+                    FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+                },
+            };
+            let mut info = FILE_BASIC_INFO::default();
+            // SAFETY: the borrowed file owns this handle for the call. The
+            // output is a correctly sized FILE_BASIC_INFO, read only on success.
+            unsafe {
+                GetFileInformationByHandleEx(
+                    HANDLE(file.as_raw_handle()),
+                    FileBasicInfo,
+                    (&raw mut info).cast(),
+                    size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            }
+            .ok()
+            .map(|()| i128::from(info.ChangeTime))
+        };
+        #[cfg(not(any(unix, windows)))]
+        let change_time = None;
         Ok(Self {
+            change_time,
             identity: super::super::canonical_durability::handle_identity(file, &metadata)?,
             length: metadata.len(),
             modified: metadata.modified()?,
@@ -276,11 +316,14 @@ impl Drop for TranscriptGuard<'_> {
 }
 
 #[derive(Default)]
-struct CommitExpectation {
+struct CommitExpectation<'a> {
+    basis: Option<&'a CanonicalBasisHeadVector>,
     head: Option<u64>,
     lane: Option<u64>,
 }
 struct Commit<'a, E: CommitPayload = TranscriptEvent> {
+    source_basis: &'a std::cell::RefCell<domain::BasisCache>,
+    deferred_witnesses: &'a tier::DeferredWitnesses,
     path: &'a Path,
     session: &'a str,
     guard: TranscriptGuard<'a>,
@@ -319,7 +362,9 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             None => TranscriptGuard::Unqualified(lock),
         };
         Ok(Self {
+            source_basis: &storage.source_basis,
             recovered: &storage.recovered,
+            deferred_witnesses: &storage.deferred_witnesses,
             path: &storage.path,
             session: &storage.session,
             guard,
@@ -383,6 +428,14 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                 }
                 _ => None,
             }
+        } else if CUT.get() == Some(Cut::WitnessWrite)
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("qualified-receipt" | "unqualified-receipt")
+            )
+        {
+            CUT.set(None);
+            Some(super::super::canonical_durability::CanonicalDurabilityStage::Write)
         } else {
             None
         };
@@ -570,7 +623,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
         event: Option<&E>,
         observed_transcript_count: Option<u64>,
         causal_ids: &[String],
-        expected: CommitExpectation,
+        expected: CommitExpectation<'_>,
         owner: &str,
         verified: &std::cell::RefCell<Option<VerifiedPrefix>>,
     ) -> Result<Option<TranscriptReceipt>, TranscriptCommitError> {
@@ -645,7 +698,13 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                 .cloned()
                 .unwrap_or_default()
         } else {
-            event.admit_basis(self.path, self.session, observed_transcript_count)?
+            event.admit_basis(
+                self.path,
+                self.session,
+                observed_transcript_count,
+                expected.basis,
+                self.source_basis,
+            )?
         };
         let basis = FrameBasis {
             session_id: self.session,
@@ -702,7 +761,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                     record_hash: r.record_hash,
                     event_id: metadata.event_id,
                 };
-                self.record_barrier(&observed, cache, None)?;
+                self.record_barrier(&observed, cache, None);
                 return Ok(Some(TranscriptReceipt {
                     sequence: r.sequence,
                     already_accepted: true,
@@ -728,7 +787,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                 frame_hash,
                 members: Vec::new(),
             };
-            self.record_attempt_origin(&intent, cache)?;
+            self.record_attempt_origin(&intent, cache);
             let descriptor =
                 serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
             self.publish_intent(&mut lease, &intent_path, &descriptor)?;
@@ -758,7 +817,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                 TranscriptGuard::Unqualified(_) => CanonicalDurabilityBarrier::SyncedUnqualified,
             }
         };
-        self.record_barrier(&witness, cache, None)?;
+        self.record_barrier(&witness, cache, None);
         if let Err(error) = self.finish_intent(&intent_path) {
             lease.pending.as_mut().unwrap().retiring = Some(vec![RecoveredEvent {
                 record_hash: frame.record_hash.clone(),
@@ -807,6 +866,9 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
         prefix.stamp = File::open(self.path)
             .ok()
             .and_then(|file| SourceStamp::read(&file).ok());
+        if E::STREAM == GapStream::TranscriptRevisions {
+            domain::remember_head(self.path, prefix.stamp.as_ref(), cache.head.as_ref());
+        }
         Ok(Some(TranscriptReceipt {
             sequence: frame.sequence,
             already_accepted: false,
@@ -868,7 +930,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
     }
 
     fn finish_intent(&self, path: &Path) -> Result<(), TranscriptCommitError> {
-        self.clear_attempt_origin()?;
+        self.clear_attempt_origin();
         #[cfg(test)]
         if CUT.get() == Some(Cut::RemovedWithoutBarrier) {
             CUT.set(None);
@@ -966,6 +1028,7 @@ fn valid_attempt(s: &str) -> bool {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cut {
+    WitnessWrite,
     Full,
     Short,
     Flush,
@@ -1190,6 +1253,8 @@ pub(crate) type PreparedTranscriptStorage = PreparedStorage<TranscriptEvent>;
 pub(crate) type PreparedProjectionStorage = PreparedStorage<ProjectionPatch>;
 
 pub(crate) struct PreparedStorage<E: CommitPayload> {
+    source_basis: std::cell::RefCell<domain::BasisCache>,
+    deferred_witnesses: tier::DeferredWitnesses,
     path: PathBuf,
     root: PathBuf,
     session: String,
@@ -1230,8 +1295,10 @@ impl<E: CommitPayload> PreparedStorage<E> {
             session: session.into(),
             store,
             tier,
+            source_basis: Default::default(),
             cache: Default::default(),
             recovered: Default::default(),
+            deferred_witnesses: Default::default(),
         })
     }
     pub(crate) fn is_unqualified(&self) -> bool {
@@ -1267,7 +1334,7 @@ impl<E: CommitPayload> PreparedStorage<E> {
             };
             if exists(&self.path)?
                 || exists(&self.path.with_added_extension("attempt"))?
-                || exists(&self.path.with_added_extension("attempt-origin"))?
+                || self.path.with_added_extension("attempt-origin").is_file()
                 || self.has_pending_attempt()
             {
                 commit.run(
@@ -1313,7 +1380,7 @@ impl PreparedTranscriptStorage {
                     &[],
                     CommitExpectation {
                         head: expected_head,
-                        lane: None,
+                        ..Default::default()
                     },
                     process_owner(),
                     &self.cache,
@@ -1368,10 +1435,16 @@ impl PreparedProjectionStorage {
                 .then(|| row.basis_heads.get(STREAM).map_or(0, |head| head.sequence));
             let expected =
                 (row.encoding == CanonicalRecordEncoding::FramedV1).then_some(&row.basis_heads);
-            let (_, currency) =
-                domain::projection_basis(&row.payload, &self.path, &self.session, basis, expected)?
-                    .ok_or(TranscriptCommitError::InvalidHistory)?;
-            let receipt = self.commit_at_lane(&row.payload, None, causes, previous_lane)?;
+            let (_, currency) = domain::projection_basis(
+                &row.payload,
+                &self.path,
+                &self.session,
+                basis,
+                expected,
+                &self.source_basis,
+            )?
+            .ok_or(TranscriptCommitError::InvalidHistory)?;
+            let receipt = self.commit_at_lane(&row.payload, None, causes, previous_lane, None)?;
             return Ok(Some((receipt, currency)));
         }
         Ok(None)
@@ -1389,7 +1462,7 @@ impl PreparedProjectionStorage {
         observed_transcript_count: Option<u64>,
         causal_ids: &[String],
     ) -> Result<ProjectionReceipt, TranscriptCommitError> {
-        self.commit_at_lane(patch, observed_transcript_count, causal_ids, None)
+        self.commit_at_lane(patch, observed_transcript_count, causal_ids, None, None)
     }
 
     pub(crate) fn commit_at_lane(
@@ -1398,6 +1471,7 @@ impl PreparedProjectionStorage {
         observed_transcript_count: Option<u64>,
         causal_ids: &[String],
         previous_lane: Option<u64>,
+        basis: Option<&CanonicalBasisHeadVector>,
     ) -> Result<ProjectionReceipt, TranscriptCommitError> {
         if causal_ids.iter().any(|id| {
             !id.strip_prefix("projection-gap-")
@@ -1414,6 +1488,7 @@ impl PreparedProjectionStorage {
                     CommitExpectation {
                         head: None,
                         lane: previous_lane,
+                        basis,
                     },
                     process_owner(),
                     &self.cache,
@@ -1584,8 +1659,13 @@ fn capture_with_hidden_prefix(
         Ok::<_, CanonicalReaderError>((bytes, intent))
     };
     let wait_and_copy = || {
-        let guard = wait_for_transcript_lock(&lock_path, true, false)
-            .map_err(|_| CanonicalReaderError::TranscriptAttemptUnreadable)?;
+        let guard =
+            wait_for_transcript_lock(&lock_path, true, false).map_err(|error| match error {
+                CanonicalCoordinationError::Contended => {
+                    CanonicalReaderError::TranscriptLockContended
+                }
+                _ => CanonicalReaderError::TranscriptAttemptUnreadable,
+            })?;
         coordinated(guard)
     };
     let (bytes, intent) = match try_shared_transcript_lock(&lock_path) {

@@ -15152,6 +15152,7 @@ mod tests_status {
 
     #[test]
     fn startup_recovers_a_historical_caption_for_review_and_export_without_live_dispatch() {
+        use tauri::Manager;
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -15194,12 +15195,14 @@ mod tests_status {
             });
         // Plugin initialization finishes during build. The first load can run
         // even before Tauri's application setup callback and see the receipt.
-        let _runtime = tauri::test::mock_builder()
+        let runtime = tauri::test::mock_builder()
             .plugin(crate::persistence::transcript_startup::plugin(
                 app.current_session_id(),
             ))
+            .manage(app)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
+        let app = runtime.state::<AppState>();
         let (review, portable, review_notes, review_graph) =
             tauri::async_runtime::block_on(async {
                 let review = crate::commands::load_session(historical.into())
@@ -15208,12 +15211,18 @@ mod tests_status {
                 let portable = crate::commands::export_session_bundle(historical.into())
                     .await
                     .unwrap();
-                let notes = crate::commands::load_session_notes_artifacts_cmd(historical.into())
-                    .await
-                    .unwrap();
-                let graph = crate::commands::load_session_graph_artifact_cmd(historical.into())
-                    .await
-                    .unwrap();
+                let notes = crate::commands::load_session_notes_artifacts_cmd(
+                    historical.into(),
+                    app.clone(),
+                )
+                .await
+                .unwrap();
+                let graph = crate::commands::load_session_graph_artifact_cmd(
+                    historical.into(),
+                    app.clone(),
+                )
+                .await
+                .unwrap();
                 (review, portable, notes, graph)
             });
         assert_eq!(
@@ -15230,23 +15239,9 @@ mod tests_status {
         assert_eq!(portable.transcript.len(), 1);
         assert_eq!(portable.transcript[0].text, revision.text);
         assert!(portable.diarization_events.is_empty() && portable.projection_events.is_empty());
-        let notes = portable.notes.as_ref().expect("historical Notes coverage");
-        let graph = portable
-            .materialized_graph
-            .as_ref()
-            .expect("historical Graph coverage");
-        assert_eq!(review_notes.notes.as_ref(), Some(notes));
-        assert_eq!(review_graph.as_ref(), Some(graph));
+        assert!(portable.notes.is_none() && portable.materialized_graph.is_none());
+        assert!(review_notes.notes.is_none() && review_graph.is_none());
         assert!(review_notes.projection_events.is_empty());
-        assert!(notes.notes.is_empty());
-        assert!(graph.nodes.is_empty() && graph.edges.is_empty());
-        for coverage in [notes.transcript_coverage, graph.transcript_coverage] {
-            assert_eq!(
-                coverage,
-                Some(crate::projections::ProjectionCoverageStatus::BehindTranscript)
-            );
-        }
-        assert!(notes.projection_log_head.is_none() && graph.projection_log_head.is_none());
         assert!(portable.graph.is_none());
         assert!(review.graph.nodes.is_empty() && review.graph.links.is_empty());
         assert!(app.transcript_buffer.read().unwrap().is_empty());
@@ -15262,7 +15257,7 @@ mod tests_status {
             false,
         );
         drain_app_writers(&app);
-        drop(app);
+        drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -15347,7 +15342,7 @@ mod tests_status {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        crate::persistence::reseed_projection_capture(&app).unwrap();
+        crate::persistence::reseed_projection_capture(&app);
         super::start_capture_projection_repairs(dispatch.clone());
         running.recv_timeout(Duration::from_secs(60)).unwrap();
         super::start_capture_projection_repairs(dispatch);

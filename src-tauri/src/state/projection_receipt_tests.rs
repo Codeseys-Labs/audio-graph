@@ -232,7 +232,7 @@ fn a_queued_projection_rechecks_cited_revisions_before_any_append() {
 #[test]
 #[ignore = "explicit release measurement of projection apply and cache save"]
 fn release_projection_receipt_latency() {
-    for depth in [1_usize, 1_000] {
+    for depth in [1_000_usize, 10_000, 50_000] {
         let prepared = std::time::Instant::now();
         let mut f = ReceiptFixture::new();
         let path = f
@@ -246,6 +246,7 @@ fn release_projection_receipt_latency() {
         .unwrap();
         storage.ready().unwrap();
         let mut done = 1;
+        let mut index = crate::projections::TranscriptLiveIndex::default();
         // Four ASR revisions per span, including partials before final. The
         // large setup is excluded from every materialization timing.
         let mut ledger = f.runtime.transcript_ledger.lock().unwrap();
@@ -279,57 +280,85 @@ fn release_projection_receipt_latency() {
                 }
             }
             for event in events {
-                ledger.apply_event(event).unwrap();
+                index.apply(&mut ledger, event).unwrap();
             }
             done += size;
         }
         f.basis = ledger.current_basis();
-        let observed = ledger.clone();
         drop(ledger);
-        let bytes = std::fs::metadata(&path).unwrap().len();
         let preparation = prepared.elapsed().as_millis();
-        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
-            let mut source = MaterializedProjectionState::new(ReceiptFixture::SESSION);
-            let baseline_dir = unique_tempdir("projection-cache-baseline");
-            let baseline_repo = FileMemoryRepository::with_data_root(&baseline_dir);
-            let mut baseline = Vec::new();
-            let mut activation = Vec::new();
-            for seq in 1..=52 {
-                let patch = match kind {
-                    ProjectionKind::Notes => {
-                        runtime_note_patch(seq, f.basis.clone(), "leaf", "green")
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let reader_repo = f.repo.clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut completed = 0;
+            let mut refused = 0;
+            let mut projection_completed = 0;
+            let mut projection_refused = 0;
+            loop {
+                match reader_repo.load_transcript_events(ReceiptFixture::SESSION) {
+                    Ok(s) => {
+                        assert!(!s.is_empty());
+                        completed += 1;
                     }
-                    ProjectionKind::Graph => runtime_graph_patch(seq, f.basis.clone()),
-                };
-                // Old foreground work: materialize and sync its derived cache.
-                let start = std::time::Instant::now();
-                source
-                    .apply_validated_patch_reporting_currency(&observed, &patch)
-                    .unwrap();
-                match kind {
-                    ProjectionKind::Notes => baseline_repo
-                        .save_materialized_notes(ReceiptFixture::SESSION, &source.notes),
-                    ProjectionKind::Graph => baseline_repo
-                        .save_materialized_graph(ReceiptFixture::SESSION, &source.graph),
+                    Err(_) => refused += 1,
                 }
-                .unwrap();
-                let previous = start.elapsed().as_micros();
-                let start = std::time::Instant::now();
-                let receipt = f.apply_patch(patch).unwrap();
-                let current = start.elapsed().as_micros();
-                assert!(receipt.materialized_snapshot_saved);
-                if seq > 2 {
-                    baseline.push(previous);
-                    activation.push(current);
+                match reader_repo.load_projection_patches(ReceiptFixture::SESSION) {
+                    Ok(_) => projection_completed += 1,
+                    Err(_) => projection_refused += 1,
+                }
+                if completed + refused == 1 {
+                    ready.send(()).unwrap();
+                }
+                if stop_reader.load(Ordering::Acquire) {
+                    return (completed, refused, projection_completed, projection_refused);
                 }
             }
-            baseline.sort_unstable();
-            activation.sort_unstable();
-            println!(
-                "projection_kind={kind:?} transcript_revisions={depth} transcript_bytes={bytes} prep_ms={preparation} warmups=2 samples=50 baseline_p50_us={} baseline_p95_us={} receipt_and_snapshot_p50_us={} receipt_and_snapshot_p95_us={}",
-                baseline[24], baseline[47], activation[24], activation[47]
-            );
-            let _ = std::fs::remove_dir_all(baseline_dir);
+        });
+        started.recv_timeout(Duration::from_secs(120)).unwrap();
+        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+            let mut sequence = 0;
+            for changing in [false, true] {
+                let mut samples = Vec::new();
+                for i in 0..52 {
+                    if changing {
+                        let mut row =
+                            projection_transcript_event(&format!("later-{done}"), 1, "reed");
+                        row.start_time = done as f64;
+                        row.end_time = row.start_time + 1.;
+                        storage.commit_after(&row, Some(done as u64)).unwrap();
+                        let mut ledger = f.runtime.transcript_ledger.lock().unwrap();
+                        index.apply(&mut ledger, row).unwrap();
+                        f.basis = ledger.current_basis();
+                        done += 1;
+                    }
+                    sequence += 1;
+                    let patch = match kind {
+                        ProjectionKind::Notes => {
+                            runtime_note_patch(sequence, f.basis.clone(), "leaf", "green")
+                        }
+                        ProjectionKind::Graph => runtime_graph_patch(sequence, f.basis.clone()),
+                    };
+                    let start = std::time::Instant::now();
+                    let result = f.apply_patch(patch).unwrap();
+                    let elapsed = start.elapsed().as_micros();
+                    assert!(result.materialized_snapshot_saved);
+                    if i >= 2 {
+                        samples.push(elapsed);
+                    }
+                }
+                samples.sort_unstable();
+                println!(
+                    "projection_latency kind={kind:?} starting_revisions={depth} changing_basis={changing} prep_ms={preparation} samples=50 p50_us={} p95_us={}",
+                    samples[24], samples[47]
+                );
+            }
         }
+        stop.store(true, Ordering::Release);
+        let (completed, refused, projection_completed, projection_refused) = reader.join().unwrap();
+        println!(
+            "projection_reader starting_revisions={depth} transcript_completed={completed} transcript_refused={refused} projection_completed={projection_completed} projection_refused={projection_refused}"
+        );
     }
 }

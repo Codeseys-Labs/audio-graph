@@ -97,6 +97,7 @@ impl<T> StrictCanonicalRead<T> {
 pub(crate) enum CanonicalReaderError {
     Canonical(CanonicalLogError),
     TranscriptAttemptUnreadable,
+    TranscriptLockContended,
     DataMovementSessionMismatch { record_index: usize },
     DataMovementSchemaVersionMismatch { record_index: usize },
 }
@@ -105,6 +106,7 @@ impl fmt::Display for CanonicalReaderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Canonical(error) => error.fmt(formatter),
+            Self::TranscriptLockContended => formatter.write_str("transcript coordination is busy"),
             Self::TranscriptAttemptUnreadable => {
                 formatter.write_str("transcript attempt requires verified recovery")
             }

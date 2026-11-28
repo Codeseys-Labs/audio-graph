@@ -1816,6 +1816,50 @@ fn exact_first_create_retry_keeps_its_namespace_receipt() {
 }
 
 #[test]
+fn a_failed_tier_witness_keeps_the_receipt_and_retries_the_verified_head() {
+    for force_weak in [false, true] {
+        let fixture = Fixture::new();
+        let mut storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        if force_weak {
+            storage.tier = None;
+        }
+        CUT.set(Some(Cut::WitnessWrite));
+        let first = storage
+            .commit_after(&transcript_event("seed", CONTENT), Some(0))
+            .unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(!storage.has_pending_attempt());
+        assert!(
+            !fixture
+                .path
+                .with_added_extension("attempt")
+                .try_exists()
+                .unwrap()
+        );
+        let records = fixture.replay().records;
+        assert_eq!(records.len(), 1);
+        assert!(tier::receipt_evidence(&fixture.path, &records).is_empty());
+        let next = storage
+            .commit_after(&transcript_event("leaf", CONTENT), Some(1))
+            .unwrap();
+        assert_eq!(next.sequence, 2);
+        let evidence = tier::receipt_evidence(&fixture.path, &fixture.replay().records);
+        let witnessed = if storage.is_unqualified() {
+            evidence.synced_unqualified
+        } else {
+            evidence.qualified
+        };
+        assert_eq!(
+            witnessed.unwrap(),
+            VerifiedTranscriptHead {
+                sequence: 1,
+                record_hash: records[0].record_hash.clone()
+            }
+        );
+    }
+}
+
+#[test]
 fn tier_witness_distinguishes_a_kept_weak_origin_from_a_successful_weak_sync() {
     let f = Fixture::new();
     let first = transcript_event("leaf", CONTENT);
