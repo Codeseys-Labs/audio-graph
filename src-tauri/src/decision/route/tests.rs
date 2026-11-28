@@ -727,6 +727,24 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
                 assert_eq!(again, read);
             }
         }
+        // A placement this build does not know reads as unmarked: by egress.
+        for unknown in [serde_json::json!("elsewhere"), serde_json::json!(false)] {
+            for (egress, expected) in [("local", local), ("cloud", remote)] {
+                let mut row = template.clone();
+                row["egress"] = egress.into();
+                row["served_model"] = stored.into();
+                row["model_pin"]["requested"] = stored.into();
+                row["model_placement"] = unknown.clone();
+                let read: DecisionRecord = serde_json::from_value(row)
+                    .expect("an unknown placement does not fail the record");
+                assert_eq!(
+                    read.served_model.as_deref(),
+                    Some(expected),
+                    "{stored} {unknown}"
+                );
+                assert_eq!(read.model_placement, None);
+            }
+        }
     }
 }
 
