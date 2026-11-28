@@ -60,7 +60,7 @@ fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
         confidence: 0.9,
         provenance: crate::projections::ProjectionProvenance {
             provider: "openrouter".into(),
-            model: "anthropic/claude-sonnet-4".into(),
+            model: "claude-sonnet-4".into(),
             prompt_id: "notes-v1".into(),
             route_id: None,
             model_source: crate::llm::route::ModelIdentitySource::Requested,
