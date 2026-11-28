@@ -28,6 +28,46 @@ use crate::projections::{
     ROLLING_SUMMARY_HOT_WINDOW_TURNS, TranscriptEvent, TranscriptLedger, ordered_for_window,
 };
 
+/// Session data captured together for the initial prompt, repair, and evidence judge.
+#[derive(Clone, Default)]
+pub struct ProjectionSnapshots {
+    pub notes: Option<MaterializedNotes>,
+    pub speakers: Option<std::sync::Arc<crate::projections::SpeakerTimeline>>,
+}
+
+impl From<Option<MaterializedNotes>> for ProjectionSnapshots {
+    fn from(notes: Option<MaterializedNotes>) -> Self {
+        Self {
+            notes,
+            speakers: None,
+        }
+    }
+}
+
+impl ProjectionSnapshots {
+    pub fn view(&self) -> ProjectionContext<'_> {
+        ProjectionContext {
+            notes: self.notes.as_ref(),
+            speakers: self.speakers.as_deref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProjectionContext<'a> {
+    pub notes: Option<&'a MaterializedNotes>,
+    pub speakers: Option<&'a crate::projections::SpeakerTimeline>,
+}
+
+impl<'a> From<Option<&'a MaterializedNotes>> for ProjectionContext<'a> {
+    fn from(notes: Option<&'a MaterializedNotes>) -> Self {
+        Self {
+            notes,
+            speakers: None,
+        }
+    }
+}
+
 pub const PROJECTION_PATCH_PROMPT_ID: &str = "projection_patch_v1";
 pub const PROJECTION_PATCH_REPAIR_PROMPT_ID: &str = "projection_patch_repair_v1";
 
@@ -36,8 +76,9 @@ pub const PROJECTION_PATCH_REPAIR_PROMPT_ID: &str = "projection_patch_repair_v1"
 ///
 /// The prompt is ordered static→dynamic: message 0 is the system block
 /// (instructions + operation guidance + output schema — identical every turn)
-/// and message 1 is the append-only stable-context block (pinned facts +
-/// rolling summary). The per-tick volatile metadata (basis hash, span count,
+/// and message 1 holds first-appearance speaker facts and the rolling summary.
+/// New speakers append in order. A corrected attribution intentionally changes
+/// the cached content for the affected prefix. The per-tick volatile metadata (basis hash, span count,
 /// job id) lives in the *last* message so it never busts the cached prefix.
 /// A provider cache breakpoint (`cache_control`) is placed after this many
 /// leading messages for cache-capable providers.
@@ -1348,13 +1389,14 @@ pub struct TrustedProjectionPatch {
 /// metadata only — so this parameter is the plumbing fix, threaded the same
 /// way `generate_projection_patch` already receives `notes_snapshot.clone()`
 /// from `run_projection_job`).
-pub fn trusted_projection_patch_from_model_json(
+pub fn trusted_projection_patch_from_model_json<'a>(
     raw: &str,
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    context_snapshot: impl Into<ProjectionContext<'a>>,
     context: ProjectionPatchBuildContext,
 ) -> Result<TrustedProjectionPatch, ProjectionPatchDraftError> {
+    let snapshot = context_snapshot.into();
     // The SAME basis-covered set the repair prompt (`projection_patch_repair_prompt_messages`)
     // and the original draft prompt (`projection_patch_prompt_messages`) were
     // built from — resolving evidence against anything else would let a
@@ -1374,13 +1416,14 @@ pub fn trusted_projection_patch_from_model_json(
     // also classifies `Revised`), but the route differs: `metrics.failed_jobs`
     // increments instead of `metrics.completed_jobs`, and the failure surfaces
     // as a typed draft error instead of a stale discard downstream.
-    let events = basis_events(job, ledger)?;
+    let events = basis_events(job, ledger, snapshot.speakers)?;
     let basis: BTreeMap<&str, &TranscriptEvent> = events
         .iter()
         .map(|event| (event.span_id.as_str(), event))
         .collect();
     let draft = parse_projection_patch_draft(raw, &job.kind, &basis)?;
-    let (operations, no_op_filtered_count) = filter_no_op_upsert_notes(draft.operations, notes);
+    let (operations, no_op_filtered_count) =
+        filter_no_op_upsert_notes(draft.operations, snapshot.notes);
     Ok(TrustedProjectionPatch {
         patch: ProjectionPatch {
             sequence: context.sequence,
@@ -1531,18 +1574,19 @@ pub fn projection_prompt_shape(
 /// ledger's one production caller of this shape — calls THIS function with
 /// the real live-dispatch snapshot, so
 /// `notes_snapshot_chars`/`notes_snapshot_entries` reach the ledger.
-pub fn projection_prompt_shape_with_notes(
+pub fn projection_prompt_shape_with_notes<'a>(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    context_snapshot: impl Into<ProjectionContext<'a>>,
 ) -> ProjectionPromptShape {
-    let Ok(events) = basis_events(job, ledger) else {
+    let snapshot = context_snapshot.into();
+    let Ok(events) = basis_events(job, ledger, snapshot.speakers) else {
         return ProjectionPromptShape::default();
     };
     let (older, _hot) = split_summary_window(&events);
     let pinned = pinned_typed_facts(&events);
     let pinned_chars: usize = pinned.iter().map(|line| line.chars().count()).sum();
-    let (notes_snapshot_chars, notes_snapshot_entries) = match notes {
+    let (notes_snapshot_chars, notes_snapshot_entries) = match snapshot.notes {
         Some(notes) if job.kind == ProjectionKind::Notes && !notes.notes.is_empty() => {
             let (block, shown) = render_document_outline_with_shown_count(notes);
             (block.chars().count() as u64, shown)
@@ -1572,16 +1616,17 @@ pub fn projection_prompt_shape_with_notes(
 /// yet)" that would be indistinguishable from a real empty session and would
 /// license the model to mint ids as if none existed. Graph kind never renders
 /// this block regardless of `notes` (seed e700's lane).
-pub fn projection_patch_prompt_messages(
+pub fn projection_patch_prompt_messages<'a>(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    context_snapshot: impl Into<ProjectionContext<'a>>,
 ) -> Result<Vec<ChatMessage>, ProjectionPatchDraftError> {
+    let snapshot = context_snapshot.into();
     ledger
         .validate_basis(&job.basis)
         .map_err(|staleness| ProjectionPatchDraftError::StaleBasis { staleness })?;
 
-    let events = basis_events(job, ledger)?;
+    let events = basis_events(job, ledger, snapshot.speakers)?;
     // ADR-0025 §2c (seed audio-graph-18ee): feed a rolling summary of older
     // turns + the last K turns verbatim, NOT the whole transcript. The summary
     // is folded incrementally (one line per turn leaving the hot window) and
@@ -1707,7 +1752,7 @@ pub fn projection_patch_prompt_messages(
     // indistinguishable from a real empty session and would license the
     // model to mint ids as if none existed.
     if job.kind == ProjectionKind::Notes
-        && let Some(notes) = notes
+        && let Some(notes) = snapshot.notes
     {
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -2101,14 +2146,15 @@ fn one_line_bounded(text: &str, max_chars: usize) -> String {
     }
 }
 
-pub fn projection_patch_repair_prompt_messages(
+pub fn projection_patch_repair_prompt_messages<'a>(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
-    notes: Option<&MaterializedNotes>,
+    context_snapshot: impl Into<ProjectionContext<'a>>,
     invalid_model_output: &str,
     error: &ProjectionPatchDraftError,
 ) -> Result<Vec<ChatMessage>, ProjectionPatchDraftError> {
-    let mut messages = projection_patch_prompt_messages(job, ledger, notes)?;
+    let snapshot = context_snapshot.into();
+    let mut messages = projection_patch_prompt_messages(job, ledger, snapshot)?;
     let schema = projection_patch_draft_json_schema()
         .map(|value| value.to_string())
         .unwrap_or_else(|_| {
@@ -2431,9 +2477,14 @@ fn operation_identity(operation: &ProjectionOperation) -> (&'static str, &str) {
 fn basis_events(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
+    speakers: Option<&crate::projections::SpeakerTimeline>,
 ) -> Result<Vec<TranscriptEvent>, ProjectionPatchDraftError> {
-    let events = job.basis.resolve_covered_events(&ledger.latest_spans);
+    // The summarized prefix is reconstructed and verified against raw ASR bytes.
+    let mut events = job.basis.resolve_covered_events(&ledger.latest_spans);
     if events.len() == job.basis.covered_span_count() {
+        let speakers = speakers
+            .filter(|s| s.session_id == job.session_id && s.session_id == ledger.session_id);
+        resolve_prompt_speakers(&mut events, speakers);
         return Ok(events);
     }
 
@@ -2463,6 +2514,58 @@ fn basis_events(
             .as_ref()
             .map_or(0, |prefix| prefix.span_count),
     })
+}
+
+/// Apply the same latest-wins, segment-then-span join as the session timeline.
+fn resolve_prompt_speakers(
+    events: &mut [TranscriptEvent],
+    speakers: Option<&crate::projections::SpeakerTimeline>,
+) {
+    let winners = speakers.map(crate::timeline::speaker_attribution_index);
+    // Old ASR rows can reuse a numbered placeholder on another source. Keep the
+    // first source's name stable when a second source starts speaking later.
+    let mut confirmed = BTreeSet::new();
+    for event in events.iter_mut() {
+        if let Some(winner) = winners.as_ref().and_then(|winners| {
+            crate::timeline::candidate_keys(event.transcript_segment_id.as_deref(), &event.span_id)
+                .iter()
+                .filter_map(|key| winners.get(key))
+                .find(|span| {
+                    span.source_id
+                        .as_deref()
+                        .is_none_or(|source| source == event.source_id)
+                        && (span.basis_asr_span_ids.is_empty()
+                            || span.basis_asr_span_ids.contains(&event.span_id))
+                })
+        }) {
+            event.speaker_id = winner.speaker_id.clone();
+            event.speaker_label = winner.speaker_label.clone();
+            if winner.identity.is_some() {
+                confirmed.insert(event.span_id.clone());
+            }
+        }
+    }
+    let mut first_sources = BTreeMap::new();
+    let mut overrides = BTreeMap::new();
+    for event in ordered_for_window(events) {
+        if let Some(label) = event.speaker_label.as_deref()
+            && label
+                .strip_prefix("Speaker ")
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+            && !confirmed.contains(&event.span_id)
+            && *first_sources.entry(label).or_insert(&event.source_id) != &event.source_id
+        {
+            overrides.insert(
+                event.span_id.clone(),
+                format!("{label} [{}]", hex::encode(&event.source_id)),
+            );
+        }
+    }
+    for event in events {
+        if let Some(label) = overrides.remove(&event.span_id) {
+            event.speaker_label = Some(label);
+        }
+    }
 }
 
 fn format_transcript_events_json(events: &[TranscriptEvent]) -> String {
@@ -3247,6 +3350,122 @@ mod tests {
         assert_ne!(
             first_patch.basis.transcript_hash,
             second_patch.basis.transcript_hash
+        );
+    }
+
+    #[test]
+    fn speaker_relabels_reach_pinned_facts_summary_and_hot_turns_without_changing_basis() {
+        use crate::identity::{ClusterRef, ManualEdit, manual_batch, tests::span};
+        use crate::projections::SpeakerTimeline;
+        let mut ledger = TranscriptLedger::new("session-1");
+        for index in 0..=ROLLING_SUMMARY_HOT_WINDOW_TURNS {
+            let mut turn = event(&format!("asr:{index:03}"), 1, &format!("turn {index}"));
+            turn.source_id = if index == 0 { "mic" } else { "system" }.into();
+            turn.start_time = index as f64;
+            turn.end_time = turn.start_time + 1.;
+            ledger.apply_event(turn).unwrap();
+        }
+        let mic = span("000", "mic");
+        let sys = span("001", "system");
+        let mut timeline =
+            SpeakerTimeline::replay("session-1", [mic.clone(), sys.clone()]).unwrap();
+        for (s, name) in [(mic, "Zoe"), (sys, "Ada")] {
+            let batch = manual_batch(
+                &timeline,
+                &ClusterRef::origin(&s).unwrap(),
+                ManualEdit::Name(name.into()),
+                10,
+                || unreachable!(),
+            )
+            .unwrap();
+            timeline.apply_batch(&batch).unwrap();
+        }
+        let snapshot = ProjectionContext {
+            notes: None,
+            speakers: Some(&timeline),
+        };
+        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+            let job = job(kind, &ledger);
+            assert!(job.basis.covered_prefix.is_some());
+            let messages = projection_patch_prompt_messages(&job, &ledger, snapshot).unwrap();
+            assert!(
+                messages[1]
+                    .content
+                    .contains("speaker: Zoe\nspeaker: Ada\nspeaker: Speaker 1")
+            );
+            assert!(messages[1].content.contains("[Zoe] turn 0"));
+            assert!(messages[2].content.contains("\"speaker_label\": \"Ada\""));
+            assert!(ledger.validate_basis(&job.basis).is_ok());
+
+            let mut foreign = timeline.clone();
+            foreign.session_id = "foreign".into();
+            let foreign_prompt = projection_patch_prompt_messages(
+                &job,
+                &ledger,
+                ProjectionContext {
+                    notes: None,
+                    speakers: Some(&foreign),
+                },
+            )
+            .unwrap();
+            assert!(
+                !foreign_prompt
+                    .iter()
+                    .any(|m| m.content.contains("speaker: Zoe")
+                        || m.content.contains("speaker: Ada"))
+            );
+        }
+    }
+
+    #[test]
+    fn reused_display_segment_cannot_override_another_sources_exact_turn() {
+        let mut events = Vec::new();
+        let mut spans = Vec::new();
+        for source in ["mic", "system", "unattributed"] {
+            let id = format!("assemblyai:{source}:turn-0");
+            let mut turn = event(&id, 1, source);
+            turn.source_id = source.into();
+            turn.transcript_segment_id = Some("turn-0@final".into());
+            events.push(turn);
+            if source != "unattributed" {
+                let mut span = crate::identity::tests::span(source, source);
+                span.basis_transcript_segment_ids = vec!["turn-0@final".into()];
+                span.basis_asr_span_ids = vec![id];
+                span.speaker_label = Some(format!("from {source}"));
+                spans.push(span);
+            }
+        }
+        let timeline = crate::projections::SpeakerTimeline::replay("session-1", spans).unwrap();
+        resolve_prompt_speakers(&mut events, Some(&timeline));
+        assert_eq!(events[0].speaker_label.as_deref(), Some("from mic"));
+        assert_eq!(events[1].speaker_label.as_deref(), Some("from system"));
+        assert_eq!(events[2].speaker_label.as_deref(), Some("Speaker 1"));
+    }
+
+    #[test]
+    fn repeated_provider_speaker_numbers_are_scoped_to_their_sources() {
+        let mut mic = event("mic-span", 1, "first");
+        mic.source_id = "mic".into();
+        let mut loopback = event("system-span", 1, "second");
+        loopback.source_id = "system".into();
+        let ledger = TranscriptLedger::replay("session-1", [mic, loopback]).unwrap();
+        let messages =
+            projection_patch_prompt_messages(&job(ProjectionKind::Graph, &ledger), &ledger, None)
+                .unwrap();
+        assert!(
+            messages[1]
+                .content
+                .contains("speaker: Speaker 1\nspeaker: Speaker 1 [73797374656d]")
+        );
+        assert!(
+            messages[2]
+                .content
+                .contains("\"speaker_label\": \"Speaker 1\"")
+        );
+        assert!(
+            messages[2]
+                .content
+                .contains("\"speaker_label\": \"Speaker 1 [73797374656d]\"")
         );
     }
 
