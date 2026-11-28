@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ASR sessions that fail soon after readiness now consume the reconnect budget.
+  Deepgram preserves an intentional stop during final transcript drain. Soniox
+  stops replaced connections and opens a fresh session after a duration limit.
+  WebSocket size and buffer errors no longer report account capacity exhaustion.
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
