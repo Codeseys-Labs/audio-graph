@@ -12528,15 +12528,6 @@ mod tests_status {
             error_after(vec![reconnecting(), Event::Disconnected]),
             disconnected
         );
-        assert!(matches!(
-            run(vec![
-                final_transcript(0.0),
-                Event::Disconnected,
-                reconnecting(),
-                Event::Reconnected
-            ]),
-            StageStatus::Running { processed_count: 1 }
-        ));
         assert_eq!(
             error_after(vec![
                 Event::Error {
@@ -12546,15 +12537,6 @@ mod tests_status {
             ]),
             unavailable
         );
-        assert!(matches!(
-            run(vec![
-                Event::Error {
-                    message: unavailable
-                },
-                final_transcript(1.0)
-            ]),
-            StageStatus::Running { processed_count: 1 }
-        ));
         // Draining a retained interim at channel close still publishes a final
         // transcript, even though the provider never recovered.
         let app_handle = super::shared_test_app_handle();
@@ -12582,11 +12564,11 @@ mod tests_status {
             },
             Event::Disconnected,
         ]);
+        let promoted = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("promoted interim emitted TRANSCRIPT_UPDATE");
         app_handle.unlisten(listener);
         assert_eq!(terminal, rejected);
-        let promoted = received
-            .try_recv()
-            .expect("promoted interim emitted TRANSCRIPT_UPDATE");
         assert!(
             app.transcript_buffer
                 .read()
@@ -12594,6 +12576,26 @@ mod tests_status {
                 .iter()
                 .any(|segment| segment.id == promoted.id)
         );
+
+        // Run genuine finals after the listener assertion: their background workers also emit events.
+        assert!(matches!(
+            run(vec![
+                final_transcript(0.0),
+                Event::Disconnected,
+                reconnecting(),
+                Event::Reconnected
+            ]),
+            StageStatus::Running { processed_count: 1 }
+        ));
+        assert!(matches!(
+            run(vec![
+                Event::Error {
+                    message: unavailable
+                },
+                final_transcript(1.0)
+            ]),
+            StageStatus::Running { processed_count: 1 }
+        ));
         drain_app_writers(&app);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
