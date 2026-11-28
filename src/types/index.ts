@@ -2894,7 +2894,6 @@ export interface LifetimeUsage {
 export type AppErrorPayload =
   | { code: "io"; message: string }
   | { code: "credential_missing"; message: { key: string } }
-  | { code: "credential_file_error"; message: { reason: string } }
   | { code: "aws_credential_expired"; message?: null }
   | { code: "aws_region_invalid"; message: { region: string } }
   | { code: "gemini_rate_limited"; message?: null }

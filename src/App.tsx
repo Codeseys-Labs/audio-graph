@@ -169,7 +169,10 @@ import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 import { hasConfiguredDurableNotesRoute } from "./utils/durableRoute";
 import "./styles/index.css";
 
-import { parseRuntimeDiagnosticAppError } from "./utils/runtimeDiagnostic";
+import {
+  parseRuntimeDiagnosticAppError,
+  runtimeDiagnosticPresentation,
+} from "./utils/runtimeDiagnostic";
 
 function isCredentialFileParseError(e: unknown): boolean {
   const diagnostic = parseRuntimeDiagnosticAppError(e)?.diagnostic;
@@ -965,9 +968,31 @@ function App() {
   const runCredentialProbe = useCallback(async () => {
     setProbeCompleted(false);
     try {
-      const presence = await invoke<CredentialPresence[]>(
-        "load_credential_presence_cmd",
-      );
+      const result = await invoke<
+        | CredentialPresence[]
+        | {
+            presence: CredentialPresence[];
+            legacy_file_warning:
+              | import("./generated/runtimeDiagnostic").RuntimeDiagnostic
+              | null;
+          }
+      >("load_credential_presence_cmd", { includeDiagnostics: true });
+      // Older backends return just the rows.
+      const presence = Array.isArray(result) ? result : result.presence;
+      const warning = Array.isArray(result) ? null : result.legacy_file_warning;
+      const store = useAudioGraphStore.getState();
+      const warningId = "legacy-credential-file";
+      store.dismissNotification(warningId);
+      if (warning) {
+        store.notify({
+          id: warningId,
+          sticky: true,
+          severity: "warning",
+          message: t("onboarding.legacyFileWarning", {
+            reason: t(runtimeDiagnosticPresentation(warning).translationKey),
+          }),
+        });
+      }
       // SHELL-R3 (plan §R3, ADR-0046): persisted (not just a local variable)
       // so NowStrip's planned-route chip can call the SAME
       // `hasConfiguredDurableNotesRoute` read this probe performs, rather
@@ -999,30 +1024,22 @@ function App() {
       // App startup is a passive configuration check. Active provider probes
       // belong to an acknowledged session/draft audit scope (ADR-0028).
       setExpressSetupVisible(
-        !hasConfiguredDurableNotesRoute(
-          settings,
-          presence,
-          modelStatus,
-          awsProfiles,
-        ),
+        !warning &&
+          !hasConfiguredDurableNotesRoute(
+            settings,
+            presence,
+            modelStatus,
+            awsProfiles,
+          ),
       );
     } catch (e) {
-      // Probe threw. cred-review m6: a fresh install returns an empty list (no
-      // throw), so a throw is either the backend not being ready yet
-      // (fresh-install race, keychain locked) OR the user's saved credentials
-      // being UNREADABLE (a malformed credentials-state.yaml makes
-      // load_with_source return Err). The two must not look identical: telling
-      // a user with saved-but-corrupt keys to "get started" invites
-      // ExpressSetup to re-prompt and overwrite. But the unreadable copy is
-      // reserved for a RECOGNIZED parse failure — the backend wraps keychain
-      // and I/O failures under the same code, and those recover via retry, not
-      // file review (see isCredentialFileParseError).
+      // A corrupt authoritative store needs repair. Other failures keep the retry action.
       setProbeUnreadable(isCredentialFileParseError(e));
       setProbeFailed(true);
     } finally {
       setProbeCompleted(true);
     }
-  }, []);
+  }, [t]);
   // Retry handler for the fallback: re-run the probe with an in-flight flag so
   // the button can show a "Retrying…" busy state; a successful retry clears the
   // fallback (setProbeFailed(false) inside runCredentialProbe).

@@ -6983,21 +6983,43 @@ pub fn save_settings_cmd(
     app: tauri::AppHandle,
     settings: crate::settings::AppSettings,
     state: State<'_, AppState>,
-) -> AppResult<()> {
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
     crate::settings::save_settings(&app, &settings)?;
-    let credentials = crate::credentials::load_credentials()?;
-    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
+    apply_saved_settings(
+        state.inner(),
+        &settings,
+        crate::credentials::load_credentials(),
+    )
+}
 
-    // Sync in-memory cache with runtime-only hydrated credentials.
-    if let Ok(mut cached) = state.app_settings.write() {
-        *cached = runtime_settings;
-    }
+fn apply_saved_settings(
+    state: &AppState,
+    settings: &crate::settings::AppSettings,
+    credentials: Result<
+        crate::credentials::CredentialStore,
+        crate::credentials::LegacyCredentialError,
+    >,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
+    let (runtime_settings, warning) = match credentials {
+        Ok(store) => (
+            crate::settings::hydrate_runtime_credentials(settings, &store),
+            None,
+        ),
+        Err(error) => {
+            log::warn!("Settings saved without credential hydration: {error}");
+            (crate::settings::redacted_settings(settings), Some(error))
+        }
+    };
+    *state
+        .app_settings
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = runtime_settings;
     sync_llm_clients_from_settings_cache(
         &state.app_settings,
         &state.api_client,
         &state.openrouter_client,
     )?;
-    Ok(())
+    Ok(warning)
 }
 
 /// Delete a downloaded model file by filename.
@@ -11149,26 +11171,43 @@ fn save_credential_impl(
 /// treats empty strings as a no-op (to avoid clobbering on blank form fields),
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
-pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResult<()> {
+pub fn delete_credential_cmd(
+    key: String,
+    state: State<'_, AppState>,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
     crate::credentials::validate_key(&key)?;
     crate::credentials::delete_credential(&key)?;
     bump_provider_credential_epoch();
+    refresh_after_delete(state.inner(), &key, crate::credentials::load_credentials())
+}
 
-    // Re-hydrate the in-memory settings cache from the (now-updated) credential
-    // store so a running session stops using the just-deleted key WITHOUT a
-    // restart. Symmetric to `save_credential_cmd`: the capture read-path
-    // (`read_settings_for_session_content`) clones this cache, and delete
-    // previously only wrote the keychain + bumped the readiness epoch, leaving
-    // the cache holding the OLD (now-revoked) key so the session kept
-    // transmitting it to the provider while the readiness chip already showed
-    // 'no key' (audio-graph-c4d0). Because the reloaded store no longer holds
-    // the key, `hydrate_runtime_credentials` leaves the cached provider api_key
-    // cleared. `state` is Tauri-injected, so `invoke('delete_credential_cmd',
-    // { key })` from the frontend is unchanged.
-    let store = crate::credentials::load_credentials()?;
-    rehydrate_app_settings_cache(state.inner(), &store, "delete_credential_cmd", &key);
-
-    Ok(())
+fn refresh_after_delete(
+    state: &AppState,
+    key: &str,
+    reload: Result<crate::credentials::CredentialStore, crate::credentials::LegacyCredentialError>,
+) -> AppResult<Option<crate::credentials::LegacyCredentialError>> {
+    let mut cached = state
+        .app_settings
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let warning = match reload {
+        Ok(store) => {
+            *cached = crate::settings::hydrate_runtime_credentials(&cached, &store);
+            None
+        }
+        Err(error) => {
+            crate::settings::redact_credential_fields(&mut cached, Some(key));
+            log::warn!("Credential deleted; refresh deferred: {error}");
+            Some(error)
+        }
+    };
+    drop(cached);
+    sync_llm_clients_from_settings_cache(
+        &state.app_settings,
+        &state.api_client,
+        &state.openrouter_client,
+    )?;
+    Ok(warning)
 }
 
 fn credential_is_present(
@@ -11178,15 +11217,35 @@ fn credential_is_present(
     store.is_present(key)
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum CredentialPresenceResponse {
+    Rows(Vec<CredentialPresence>),
+    WithDiagnostics {
+        presence: Vec<CredentialPresence>,
+        legacy_file_warning: Option<crate::credentials::LegacyCredentialError>,
+    },
+}
+
 /// Return non-secret credential presence for every allowlisted key.
 ///
 /// This is the normal Settings/readiness read path. It lets the UI enable saved
 /// providers and show "saved key present" state without receiving plaintext
 /// secret values over IPC.
 #[tauri::command]
-pub fn load_credential_presence_cmd() -> AppResult<Vec<CredentialPresence>> {
+pub fn load_credential_presence_cmd(
+    include_diagnostics: Option<bool>,
+) -> AppResult<CredentialPresenceResponse> {
     let snapshot = crate::credentials::try_load_credentials_with_source()?;
-    credential_presence_from_snapshot(&snapshot)
+    let presence = credential_presence_from_snapshot(&snapshot)?;
+    Ok(if include_diagnostics == Some(true) {
+        CredentialPresenceResponse::WithDiagnostics {
+            presence,
+            legacy_file_warning: snapshot.legacy_file_warning,
+        }
+    } else {
+        CredentialPresenceResponse::Rows(presence)
+    })
 }
 
 #[cfg(test)]
@@ -19604,6 +19663,77 @@ mod tests {
     /// while an epoch-asserting test sits between its before/after reads makes
     /// the assertion flake. Every test touching the epoch must hold this lock.
     static CREDENTIAL_EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn settings_save_applies_local_provider_even_when_hydration_is_locked() {
+        let state = AppState::new();
+        let settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::LocalWhisper,
+            llm_provider: crate::settings::LlmProvider::LocalLlama,
+            ..Default::default()
+        };
+        *state.app_settings.write().unwrap() = deepgram_settings_with_cached_key("canary-lark-old");
+        state.app_settings.write().unwrap().llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: "canary-lark-old".into(),
+            model: "model".into(),
+        };
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .unwrap();
+        assert!(state.api_client.lock().unwrap().is_some());
+        let locked = crate::credentials::LegacyCredentialError(
+            audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Locked,
+        );
+        assert_eq!(
+            apply_saved_settings(&state, &settings, Err(locked)).unwrap(),
+            Some(locked)
+        );
+        assert!(matches!(
+            state.app_settings.read().unwrap().asr_provider,
+            crate::settings::AsrProvider::LocalWhisper
+        ));
+        assert!(state.api_client.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_evicts_each_cached_copy_when_reload_fails() {
+        let state = AppState::new();
+        {
+            let mut cached = state.app_settings.write().unwrap();
+            cached.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: "canary-ash-deleted".into(),
+                model: "model".into(),
+            };
+            let crate::settings::OpenAiRealtimeAgentAuthMode::ApiKey { api_key } =
+                &mut cached.openai_realtime_agent.auth;
+            *api_key = "canary-ash-deleted".into();
+            cached.gemini.auth = crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "canary-ash-unrelated".into(),
+            };
+        }
+        let denied = crate::credentials::LegacyCredentialError(
+            audio_graph_ipc_contract::credential_contract::CredentialErrorCode::AccessDenied,
+        );
+        assert_eq!(
+            refresh_after_delete(&state, "openai_api_key", Err(denied)).unwrap(),
+            Some(denied)
+        );
+        let cached = state.app_settings.read().unwrap();
+        assert!(
+            matches!(&cached.llm_provider, crate::settings::LlmProvider::Api { api_key, .. } if api_key.is_empty())
+        );
+        let crate::settings::OpenAiRealtimeAgentAuthMode::ApiKey { api_key } =
+            &cached.openai_realtime_agent.auth;
+        assert!(api_key.is_empty());
+        assert!(
+            matches!(&cached.gemini.auth, crate::settings::GeminiAuthMode::ApiKey { api_key } if api_key == "canary-ash-unrelated")
+        );
+    }
 
     #[test]
     fn rejected_credential_save_emits_no_key_value_length_or_fingerprint() {

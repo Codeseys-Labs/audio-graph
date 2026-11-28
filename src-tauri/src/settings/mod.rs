@@ -1528,19 +1528,6 @@ fn aws_access_key_credentials_have_inline_secret(
         || option_non_empty_secret(session_token).is_some()
 }
 
-fn redact_aws_access_key_credentials(credential_source: &mut AwsCredentialSource) {
-    if let AwsCredentialSource::AccessKeys {
-        access_key,
-        secret_key,
-        session_token,
-    } = credential_source
-    {
-        access_key.clear();
-        *secret_key = None;
-        *session_token = None;
-    }
-}
-
 fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpdate> {
     let mut updates = Vec::new();
 
@@ -1722,52 +1709,78 @@ pub fn has_inline_credentials(settings: &AppSettings) -> bool {
 pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
     let mut redacted = settings.clone();
 
-    match &mut redacted.asr_provider {
-        AsrProvider::Api { api_key, .. }
-        | AsrProvider::DeepgramStreaming { api_key, .. }
-        | AsrProvider::AssemblyAI { api_key, .. }
-        | AsrProvider::Soniox { api_key, .. }
-        | AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => api_key.clear(),
+    redact_credential_fields(&mut redacted, None);
+    redacted
+}
+
+/// A persisted delete must evict all copies of its slot even if the subsequent
+/// read fails. The same traversal strips every secret for config and IPC.
+pub(crate) fn redact_credential_fields(settings: &mut AppSettings, only: Option<&str>) {
+    let matches = |key: &str| only.is_none_or(|slot| slot == key);
+    let clear = |key: &str, value: &mut String| {
+        if matches(key) {
+            value.clear();
+        }
+    };
+    let clear_optional = |key: &str, value: &mut Option<String>| {
+        if matches(key) {
+            *value = None;
+        }
+    };
+    let clear_aws = |source: &mut AwsCredentialSource| {
+        if let AwsCredentialSource::AccessKeys {
+            access_key,
+            secret_key,
+            session_token,
+        } = source
+        {
+            clear("aws_access_key", access_key);
+            clear_optional("aws_secret_key", secret_key);
+            clear_optional("aws_session_token", session_token);
+        }
+    };
+    match &mut settings.asr_provider {
+        AsrProvider::Api {
+            endpoint, api_key, ..
+        } => clear(credential_key_for_endpoint(endpoint), api_key),
+        AsrProvider::DeepgramStreaming { api_key, .. } => clear("deepgram_api_key", api_key),
+        AsrProvider::AssemblyAI { api_key, .. } => clear("assemblyai_api_key", api_key),
+        AsrProvider::Soniox { api_key, .. } => clear("soniox_api_key", api_key),
+        AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+            clear("openai_api_key", api_key)
+        }
         AsrProvider::AwsTranscribe {
             credential_source, ..
-        } => {
-            redact_aws_access_key_credentials(credential_source);
-        }
+        } => clear_aws(credential_source),
         AsrProvider::LocalWhisper
         | AsrProvider::SherpaOnnx { .. }
         | AsrProvider::Moonshine { .. } => {}
     }
-
-    match &mut redacted.llm_provider {
-        LlmProvider::Api { api_key, .. } | LlmProvider::OpenRouter { api_key, .. } => {
-            api_key.clear()
-        }
+    match &mut settings.llm_provider {
+        LlmProvider::Api {
+            endpoint, api_key, ..
+        } => clear(credential_key_for_endpoint(endpoint), api_key),
+        LlmProvider::OpenRouter { api_key, .. } => clear("openrouter_api_key", api_key),
         LlmProvider::AwsBedrock {
             credential_source, ..
-        } => {
-            redact_aws_access_key_credentials(credential_source);
-        }
+        } => clear_aws(credential_source),
         LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
     }
-
-    if let Some(config) = &mut redacted.llm_api_config {
-        config.api_key = None;
+    if let Some(config) = &mut settings.llm_api_config {
+        clear_optional(
+            credential_key_for_endpoint(&config.endpoint),
+            &mut config.api_key,
+        );
     }
-
-    if let GeminiAuthMode::ApiKey { api_key } = &mut redacted.gemini.auth {
-        api_key.clear();
-    } else if let GeminiAuthMode::VertexAI {
-        service_account_path,
-        ..
-    } = &mut redacted.gemini.auth
-    {
-        *service_account_path = None;
+    match &mut settings.gemini.auth {
+        GeminiAuthMode::ApiKey { api_key } => clear("gemini_api_key", api_key),
+        GeminiAuthMode::VertexAI {
+            service_account_path,
+            ..
+        } => clear_optional("google_service_account_path", service_account_path),
     }
-
-    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut redacted.openai_realtime_agent.auth;
-    api_key.clear();
-
-    redacted
+    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut settings.openai_realtime_agent.auth;
+    clear("openai_api_key", api_key);
 }
 
 /// Return a runtime-only copy with secrets filled from `credentials.yaml`.

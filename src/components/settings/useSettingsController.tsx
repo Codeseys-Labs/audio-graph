@@ -35,7 +35,10 @@ import type {
   ProviderReadiness,
   ProviderStage,
 } from "../../types";
-import { errorToMessage } from "../../utils/errorToMessage";
+import {
+  errorToMessage,
+  notifyCredentialWarning,
+} from "../../utils/errorToMessage";
 import type { AcceleratorPreset } from "../../utils/openrouterCatalog";
 import Icon from "../Icon";
 import type { CredentialPresenceLookup } from "../ProviderReadinessPanel";
@@ -2331,7 +2334,10 @@ export function useSettingsController() {
     const failures: { key: string; error: unknown }[] = [];
     for (const credentialKey of keys) {
       try {
-        await invoke("delete_credential_cmd", { key: credentialKey });
+        const warning = await invoke("delete_credential_cmd", {
+          key: credentialKey,
+        });
+        notifyCredentialWarning(warning, notify);
       } catch (e) {
         failures.push({ key: credentialKey, error: e });
         console.error(`Failed to clear ${credentialKey}:`, e);

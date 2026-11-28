@@ -462,7 +462,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expectNoPlaintextCredentialLoadback();
     expect(
@@ -684,7 +687,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
 
     expect(screen.getByRole("tab", { name: /ready/i })).toHaveAttribute(
@@ -960,7 +966,10 @@ describe("App — post-Express hand-off nudge (B20)", () => {
 
     // No ExpressSetup, no banner to start with.
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
@@ -1161,7 +1170,10 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
 
     // Probe still throws, but real content (the sample) owns the surface.
     await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_presence_cmd",
+        { includeDiagnostics: true },
+      ),
     );
     expect(
       screen.queryByTestId("get-started-fallback"),
@@ -1180,6 +1192,35 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     expect(
       screen.getByRole("button", { name: /visualizar sessão de exemplo/i }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps the keychain presence and shows the secondary file repair warning", async () => {
+    const rows = credentialPresence("openai_api_key");
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd")
+        return {
+          presence: rows,
+          legacy_file_warning: {
+            kind: "credential",
+            detail: {
+              code: "corrupt_record",
+              retryable: false,
+              recovery_action: "reconcile",
+            },
+          },
+        };
+      if (cmd === "load_settings_cmd") return startupSettings();
+      if (cmd === "get_model_status") return readyModels;
+      return undefined;
+    });
+    render(<App />);
+    expect(
+      await screen.findByText(/system keychain is available/i),
+    ).toBeInTheDocument();
+    expect(useAudioGraphStore.getState().credentialPresence).toEqual(rows);
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows a repair hint (not the first-run card) when saved credentials are unreadable", async () => {

@@ -11,7 +11,7 @@
  * remaining legacy codes can migrate here without changing callers.
  */
 import i18n from "../i18n";
-import type { AppErrorPayload } from "../types";
+import type { AppErrorPayload, NotifyOptions } from "../types";
 import { runtimeDiagnosticPresentation } from "./runtimeDiagnostic";
 
 /**
@@ -53,8 +53,6 @@ function formatAppError(err: AppErrorPayload): string {
       return `I/O error: ${err.message}`;
     case "credential_missing":
       return `Missing credential: ${err.message.key}. Open Settings to configure it.`;
-    case "credential_file_error":
-      return i18n.t("runtimeDiagnostics.credential.internal");
     case "aws_credential_expired":
       return "AWS credentials have expired. Please refresh them.";
     case "aws_region_invalid":
@@ -82,6 +80,20 @@ function formatAppError(err: AppErrorPayload): string {
       });
     case "unknown":
       return err.message;
+  }
+  return i18n.t("runtimeDiagnostics.runtime.internal");
+}
+
+/** A successful write can carry a typed warning when the credential refresh failed. */
+export function notifyCredentialWarning(
+  warning: unknown,
+  notify: (options: NotifyOptions) => string,
+) {
+  if (warning) {
+    notify({
+      severity: "warning",
+      message: i18n.t(runtimeDiagnosticPresentation(warning).translationKey),
+    });
   }
 }
 

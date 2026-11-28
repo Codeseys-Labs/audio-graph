@@ -117,6 +117,7 @@ import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import {
   artifactTooLargeDetails,
   errorToMessage,
+  notifyCredentialWarning,
 } from "../utils/errorToMessage";
 import { fuzzyEntityNameMatch } from "../utils/materializedGraph";
 import { createAnswerDraftsSlice } from "./answerDrafts";
@@ -3782,7 +3783,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   },
   saveSettings: async (settings: AppSettings) => {
     try {
-      await invoke("save_settings_cmd", { settings });
+      const warning = await invoke("save_settings_cmd", { settings });
+      notifyCredentialWarning(warning, get().notify);
       const redactedSettings = await invoke<AppSettings>("load_settings_cmd");
       set({ settings: redactedSettings, error: null });
     } catch (e) {
@@ -3825,7 +3827,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     await invoke("save_credential_cmd", { key, value });
   },
   deleteCredential: async (key: string) => {
-    await invoke("delete_credential_cmd", { key });
+    const warning = await invoke("delete_credential_cmd", { key });
+    notifyCredentialWarning(warning, get().notify);
   },
 
   // ── AWS profile discovery ─────────────────────────────────────────────
