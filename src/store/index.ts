@@ -2888,7 +2888,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             ? false
             : state.isCapturing;
       const transcriptionRunning =
-        status.asr.type === "Running"
+        status.asr.type === "Running" || status.asr.type === "Reconnecting"
           ? true
           : status.asr.type === "Idle"
             ? false

@@ -6,6 +6,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type { AppSettings, AudioSourceInfo, ProjectionPatch } from "../types";
 import NowStrip from "./NowStrip";
@@ -296,6 +297,40 @@ describe("NowStrip", () => {
   });
 
   // ── Composite health chip (50e3 fold) ────────────────────────────────────
+  it.each([
+    ["en", "Open system status", "Reconnecting to the provider."],
+    ["pt", "Abrir status do sistema", "Reconectando ao provedor."],
+  ])("labels ASR reconnecting with the degraded health tone in %s", async (locale, action, label) => {
+    resetStore({
+      isCapturing: true,
+      selectedSourceIds: ["system-default"],
+      pipelineStatus: {
+        ...useAudioGraphStore.getState().pipelineStatus,
+        capture: { type: "Running", processed_count: 0 },
+        pipeline: { type: "Idle" },
+        asr: {
+          type: "Reconnecting",
+          reason: "connection_lost",
+          retry_delay: "short",
+        },
+        diarization: { type: "Idle" },
+        entity_extraction: { type: "Idle" },
+        graph: { type: "Idle" },
+      },
+    });
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<NowStrip />);
+    try {
+      const chip = screen.getByRole("button", { name: action });
+      expect(chip).toHaveTextContent(label);
+      expect(chip).toHaveAttribute("data-tone", "warning");
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
+  });
+
   it("opens the System drawer from the health chip while capturing", () => {
     resetStore({
       isCapturing: true,

@@ -588,7 +588,11 @@ pub fn openai_event_to_signal(
             diagnostic: Some(message),
         }),
         // Connection lifecycle — handled at the transport layer, not the FSM.
-        E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected => None,
+        E::Connected
+        | E::Disconnected
+        | E::Reconnecting { .. }
+        | E::Reconnected
+        | E::Advisory { .. } => None,
     }
 }
 
@@ -1883,7 +1887,8 @@ mod tests {
         assert_eq!(
             openai_event_to_signal(E::Reconnecting {
                 attempt: 1,
-                backoff_secs: 2
+                backoff_secs: 2,
+                reason: crate::events::AsrReconnectReason::ConnectionLost,
             }),
             None
         );

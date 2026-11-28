@@ -59,7 +59,9 @@ export function computeCompositeHealth({
   if (
     transcript_crash_safety_unverified ||
     transcript_captions_lost ||
-    stages.some((stage) => stage.type === "Degraded") ||
+    stages.some(
+      (stage) => stage.type === "Degraded" || stage.type === "Reconnecting",
+    ) ||
     consumerDroppedChunks > 0 ||
     persistenceDropped > 0 ||
     backpressuredSourceCount > 0
