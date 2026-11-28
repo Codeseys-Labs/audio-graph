@@ -35,6 +35,29 @@ function baseInput() {
 }
 
 describe("computeCompositeHealth", () => {
+  it("treats a reconnect as degraded and preserves other stage failures", () => {
+    const pipelineStatus: PipelineStatus = {
+      ...idle,
+      asr: {
+        type: "Reconnecting",
+        reason: "provider_retry_later",
+        retry_delay: "medium",
+      },
+    };
+    expect(computeCompositeHealth({ ...baseInput(), pipelineStatus })).toBe(
+      "degraded",
+    );
+    expect(
+      computeCompositeHealth({
+        ...baseInput(),
+        pipelineStatus: {
+          ...pipelineStatus,
+          graph: { type: "Error", diagnostic },
+        },
+      }),
+    ).toBe("error");
+  });
+
   it("is healthy when every stage is idle and nothing is dropping", () => {
     expect(computeCompositeHealth(baseInput())).toBe("healthy");
   });

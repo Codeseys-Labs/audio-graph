@@ -21,7 +21,7 @@
 //! delivered back through `crossbeam_channel`.
 
 use super::{
-    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    AsrReconnectReason, AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
     is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
     websocket_error, websocket_upgrade_error, websocket_write_error,
 };
@@ -94,12 +94,19 @@ pub enum AssemblyAIEvent {
     /// stops its loop directly rather than round-tripping this variant.)
     #[serde(rename = "session_terminated")]
     SessionTerminated,
-    /// A non-fatal error occurred.
+    /// The session ended with a terminal diagnostic.
     #[serde(rename = "error")]
     Error { message: RuntimeDiagnostic },
+    /// A diagnostic that leaves streaming or reconnecting active.
+    #[serde(rename = "advisory")]
+    Advisory { message: RuntimeDiagnostic },
     /// The client detected a disconnect and is attempting to reconnect.
     #[serde(rename = "reconnecting")]
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     /// The client successfully re-established the WebSocket after a disconnect.
     #[serde(rename = "reconnected")]
     Reconnected,
@@ -1031,6 +1038,14 @@ async fn session_task_with_backoff(
                     break;
                 }
 
+                let initial_reason = match &disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic) => {
+                        AsrReconnectReason::from_diagnostic(diagnostic)
+                    }
+                    _ => AsrReconnectReason::ConnectionLost,
+                };
                 let reconnected = loop {
                     match stop_signal.reason() {
                         Some(AsrStopReason::UserRequested) => {
@@ -1073,6 +1088,9 @@ async fn session_task_with_backoff(
                     let _ = event_tx.send(AssemblyAIEvent::Reconnecting {
                         attempt,
                         backoff_secs: backoff,
+                        reason: last_open_error
+                            .as_ref()
+                            .map_or(initial_reason, AsrReconnectReason::from_diagnostic),
                     });
 
                     stop_signal
@@ -1107,7 +1125,7 @@ async fn session_task_with_backoff(
                                 break false;
                             }
                             last_open_error = Some(diag.clone());
-                            let _ = event_tx.send(AssemblyAIEvent::Error { message: diag });
+                            let _ = event_tx.send(AssemblyAIEvent::Advisory { message: diag });
                         }
                     }
                 };
@@ -1333,7 +1351,7 @@ fn handle_server_message_with_begin(
     } else if message_type == Some("Error") {
         let message = assemblyai_error_diagnostic(parsed.get("error_code").and_then(Value::as_u64));
         log::error!("AssemblyAI: server error: {message}");
-        let _ = tx.send(AssemblyAIEvent::Error { message });
+        let _ = tx.send(AssemblyAIEvent::Advisory { message });
     } else {
         log::debug!("AssemblyAI: unsupported server message");
     }
@@ -1343,7 +1361,7 @@ fn handle_server_message_with_begin(
 fn emit_invalid_response(tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
     let message = websocket_diagnostic(Code::InvalidResponse);
     log::warn!("AssemblyAI: {message}");
-    let _ = tx.send(AssemblyAIEvent::Error { message });
+    let _ = tx.send(AssemblyAIEvent::Advisory { message });
 }
 
 fn assemblyai_error_diagnostic(code: Option<u64>) -> RuntimeDiagnostic {
@@ -1599,7 +1617,9 @@ mod tests {
                 _ => None,
             },
             |event| match event {
-                AssemblyAIEvent::Error { message } => Some(message),
+                AssemblyAIEvent::Error { message } | AssemblyAIEvent::Advisory { message } => {
+                    Some(message)
+                }
                 _ => None,
             },
         );
@@ -1692,7 +1712,9 @@ mod tests {
             let errors: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    AssemblyAIEvent::Error { message } => Some(message),
+                    AssemblyAIEvent::Error { message } | AssemblyAIEvent::Advisory { message } => {
+                        Some(message)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1850,7 +1872,7 @@ mod tests {
                     _ => panic!("expected a peer close or IO failure"),
                 };
                 let events = collect_io_errors(event_rx, |event| {
-                    let AssemblyAIEvent::Error { message } = event else {
+                    let AssemblyAIEvent::Advisory { message } = event else {
                         panic!("expected only provider error events");
                     };
                     message
@@ -2001,7 +2023,7 @@ mod tests {
         );
 
         match rx.recv().expect("error event") {
-            AssemblyAIEvent::Error { message } => {
+            AssemblyAIEvent::Advisory { message } => {
                 for leaked in [
                     api_key,
                     "bearer-aai-secret",
@@ -2154,6 +2176,7 @@ mod tests {
             AssemblyAIEvent::Reconnecting {
                 attempt: 3,
                 backoff_secs: 5,
+                reason: AsrReconnectReason::ConnectionLost,
             },
             AssemblyAIEvent::Reconnected,
         ];
@@ -2738,6 +2761,7 @@ mod tests {
             AssemblyAIEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
@@ -2751,7 +2775,7 @@ mod tests {
         );
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
-            AssemblyAIEvent::Error { message } => {
+            AssemblyAIEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::NetworkUnreachable));
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
@@ -2760,6 +2784,7 @@ mod tests {
             AssemblyAIEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 2);
                 assert_eq!(backoff_secs, 2);
@@ -2892,6 +2917,7 @@ mod tests {
             AssemblyAIEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
