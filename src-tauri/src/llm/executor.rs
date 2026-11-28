@@ -167,7 +167,7 @@ enum Worker {
 /// there is nothing for a flag to select.
 ///
 /// `backends` is what the job runs with, taken when it entered the executor
-/// (see [`SharedBackends::admit`]). The worker has no other way to a client.
+/// (see [`SharedBackends::admit`]). The worker sends from no other client.
 // `ProjectionPatch` now carries an `Option<MaterializedNotes>` (seed
 // audio-graph-253c part 2), widening the size gap against `Extract`/`Chat`;
 // boxing it would ripple through every construction/match site for
@@ -258,7 +258,8 @@ pub struct ProjectionPatchAttempt {
 }
 
 /// The app's backend slots. A settings save replaces the two HTTP clients
-/// here. They are read only when a job enters the executor.
+/// here. A job copies its client from here when it enters the executor, and
+/// afterwards reads the slot only to learn that the client was replaced.
 struct SharedBackends {
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
@@ -269,11 +270,12 @@ struct SharedBackends {
 impl SharedBackends {
     /// The backends one job runs with.
     ///
-    /// The HTTP client the job's route sends through is copied now. Its
-    /// endpoint, key, model and routing policy are then the ones in force when
-    /// the job entered the executor: a settings save after this does not reach
-    /// the job, and a projection's draft and repair send from the same copy.
-    /// The two engines are local and stay shared.
+    /// The HTTP client the job's route sends through is copied now, and the
+    /// job sends from no other. Its endpoint, key, model, routing policy and
+    /// content policy are the ones in force when it entered the executor, for
+    /// a projection's draft and its repair alike. A settings save after this
+    /// can stop the job (see [`AdmittedClient::get`]) but cannot change what
+    /// it is sent under. The two engines are local and stay shared.
     fn admit(&self, provider: &LlmProvider) -> BackendHandles {
         let backend = crate::llm::route::resolve_route(provider).blocking_backend;
         BackendHandles {
@@ -305,7 +307,11 @@ struct BackendHandles {
 
 /// One HTTP client as it was when a job entered the executor.
 enum AdmittedClient<T> {
-    Present(T),
+    Present {
+        client: T,
+        /// Where `client` was copied from. Read again only to refuse the job.
+        slot: Arc<Mutex<Option<T>>>,
+    },
     /// Not configured, or not the client this job's route sends through.
     Absent,
     /// A panic unwound through the shared slot's lock, leaving the client in a
@@ -313,30 +319,84 @@ enum AdmittedClient<T> {
     Poisoned,
 }
 
-/// The shared slot was poisoned when the job was admitted.
-struct SlotPoisoned;
+/// Why a job may not send from its client.
+enum ClientRefused {
+    /// The shared slot is poisoned, or was when the job entered.
+    Poisoned,
+    /// A settings save has put another client in the slot, or emptied it,
+    /// since the job entered.
+    Replaced,
+}
 
-/// What a projection reports for a [`SlotPoisoned`] client.
-const POISONED_SLOT: &str = "LLM backend slot is poisoned";
+impl ClientRefused {
+    /// What chat returns, and projection as its string form.
+    fn diagnostic(&self) -> RuntimeDiagnostic {
+        match self {
+            Self::Poisoned => executor_failure(Code::Internal),
+            Self::Replaced => {
+                log::warn!("LLM job refused: its client was replaced after it was queued");
+                executor_failure(Code::PolicyBlocked)
+            }
+        }
+    }
+}
 
-impl<T> AdmittedClient<T> {
-    fn copy_of(slot: &Mutex<Option<T>>) -> Self
+/// Whether two clients send to the same place under the same terms.
+trait SendsAs {
+    fn sends_as(&self, other: &Self) -> bool;
+}
+
+impl SendsAs for ApiClient {
+    fn sends_as(&self, other: &Self) -> bool {
+        self.config() == other.config()
+            && self.content_egress_policy() == other.content_egress_policy()
+    }
+}
+
+impl SendsAs for OpenRouterClient {
+    fn sends_as(&self, other: &Self) -> bool {
+        self.config() == other.config()
+            && self.content_egress_policy() == other.content_egress_policy()
+    }
+}
+
+impl<T: SendsAs> AdmittedClient<T> {
+    fn copy_of(slot: &Arc<Mutex<Option<T>>>) -> Self
     where
         T: Clone,
     {
         match slot.lock() {
-            Ok(guard) => guard
-                .as_ref()
-                .map_or(Self::Absent, |client| Self::Present(client.clone())),
+            Ok(guard) => guard.as_ref().map_or(Self::Absent, |client| Self::Present {
+                client: client.clone(),
+                slot: slot.clone(),
+            }),
             Err(_) => Self::Poisoned,
         }
     }
 
-    fn get(&self) -> Result<Option<&T>, SlotPoisoned> {
+    /// The client the job entered with, while the app's slot still holds one
+    /// that sends as it does.
+    ///
+    /// The job never sends from the slot's client. The slot is read to refuse:
+    /// a save that tightened the routing or content policy while the job
+    /// waited stops it here, as it did when the worker read the slot at
+    /// dispatch. Every send asks again, so a save between a projection's draft
+    /// and its repair stops the repair.
+    fn get(&self) -> Result<Option<&T>, ClientRefused> {
         match self {
-            Self::Present(client) => Ok(Some(client)),
+            Self::Present { client, slot } => match slot.lock() {
+                Ok(current)
+                    if current
+                        .as_ref()
+                        .is_some_and(|current| current.sends_as(client)) =>
+                {
+                    Ok(Some(client))
+                }
+                Ok(_) => Err(ClientRefused::Replaced),
+                Err(_) => Err(ClientRefused::Poisoned),
+            },
             Self::Absent => Ok(None),
-            Self::Poisoned => Err(SlotPoisoned),
+            Self::Poisoned => Err(ClientRefused::Poisoned),
         }
     }
 }
@@ -460,7 +520,7 @@ impl LlmExecutor {
         admitted_routing_policy: Option<OpenRouterRoutingPolicy>,
     ) -> Result<ChatOutcome, RuntimeDiagnostic> {
         let backends = self.backends.admit(&provider);
-        if let AdmittedClient::Present(client) = &backends.openrouter_client {
+        if let AdmittedClient::Present { client, .. } = &backends.openrouter_client {
             // What a request admitted with that policy is sent under: the
             // policy, else the provider's legacy order.
             let admitted = admitted_routing_policy.or_else(|| match &provider {
@@ -1287,7 +1347,7 @@ fn projection_api(
     let client = handles
         .api_client
         .get()
-        .map_err(|SlotPoisoned| POISONED_SLOT.to_string())?
+        .map_err(|refused| refused.diagnostic().to_string())?
         .ok_or_else(|| "API LLM client is not configured".to_string())?;
     let live = api_route_for_client(route, client)?;
     // Stamped from the job's client endpoint, BEFORE the fallible network
@@ -1368,7 +1428,7 @@ fn projection_openrouter(
     let client = handles
         .openrouter_client
         .get()
-        .map_err(|SlotPoisoned| POISONED_SLOT.to_string())?
+        .map_err(|refused| refused.diagnostic().to_string())?
         .ok_or_else(|| "OpenRouter client is not configured".to_string())?;
     let live = openrouter_route_for_client(route, client)?;
     // OpenRouter has no loopback deployment, so unlike the API route above no
@@ -1588,13 +1648,20 @@ fn extraction_slot<T>(slot: &Mutex<Option<T>>) -> Option<std::sync::MutexGuard<'
     }
 }
 
-/// The job's client for extraction, refusing one whose slot was poisoned for
-/// the reason [`extraction_slot`] gives.
-fn extraction_client<T>(client: &AdmittedClient<T>) -> Option<&T> {
+/// The job's client for extraction. A poisoned slot is refused for the reason
+/// [`extraction_slot`] gives, and a replaced client for the reason
+/// [`AdmittedClient::get`] gives.
+fn extraction_client<T: SendsAs>(client: &AdmittedClient<T>) -> Option<&T> {
     match client.get() {
         Ok(client) => client,
-        Err(SlotPoisoned) => {
+        Err(ClientRefused::Poisoned) => {
             log::warn!("LLM extraction falling back: the backend slot is poisoned");
+            None
+        }
+        Err(ClientRefused::Replaced) => {
+            log::warn!(
+                "LLM extraction falling back: its client was replaced after the job was queued"
+            );
             None
         }
     }
@@ -1696,7 +1763,7 @@ fn chat_api(
     let client = handles
         .api_client
         .get()
-        .map_err(|SlotPoisoned| executor_failure(Code::Internal))?
+        .map_err(|refused| refused.diagnostic())?
         .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?;
     // A client pointed outside the authorized provider is refused.
     let live =
@@ -1720,7 +1787,7 @@ fn chat_openrouter(
     let client = handles
         .openrouter_client
         .get()
-        .map_err(|SlotPoisoned| executor_failure(Code::Internal))?
+        .map_err(|refused| refused.diagnostic())?
         .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?;
     let live = openrouter_route_for_client(route, client)
         .map_err(|_| executor_failure(Code::PolicyBlocked))?;
@@ -2862,12 +2929,20 @@ mod tests {
         .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
     }
 
+    /// A job's client whose slot still holds it.
+    fn present<T: Clone>(client: T) -> AdmittedClient<T> {
+        AdmittedClient::Present {
+            slot: Arc::new(Mutex::new(Some(client.clone()))),
+            client,
+        }
+    }
+
     fn handles_with_only_api_client(endpoint: &str) -> BackendHandles {
         BackendHandles {
             // Every OTHER backend handle is deliberately loaded-and-available-free:
             // if any fallback path survived, its "not loaded / not configured"
             // error would appear in the surfaced message.
-            api_client: AdmittedClient::Present(probe_api_client(endpoint)),
+            api_client: present(probe_api_client(endpoint)),
             ..empty_handles()
         }
     }
@@ -3185,7 +3260,7 @@ mod tests {
     #[test]
     fn a_mid_session_endpoint_repoint_fails_closed_instead_of_stamping_the_old_route() {
         // Critique finding 1: the job's `LlmProvider` is a session-start SNAPSHOT,
-        // while egress goes through the shared client handle that
+        // while egress goes through the job's copy of the shared client, which
         // `sync_llm_api_client_from_settings_cache` rebuilds on every settings
         // save. A snapshot authorized as Cerebras must not egress to a re-pointed
         // endpoint under the Cerebras route id and capability row.
@@ -3228,18 +3303,15 @@ mod tests {
 
     #[test]
     fn projection_api_repair_dial_does_not_erase_an_earlier_cloud_stamp() {
-        // Finding: `run_projection_patch_on_route` dials `projection_api`
-        // TWICE (draft, then same-route repair) against the SAME
-        // `attempted_route` out-param, and `projection_api` re-resolves the
-        // LIVE client on each call. Before `stamp_attempted_route` folded
-        // instead of overwrote, a draft dial that reached a cloud endpoint
-        // followed by a repair dial against a client re-pointed to loopback
-        // would have its cloud egress silently erased by the second stamp —
-        // exactly the case a mid-job settings save produces. This drives a
-        // REAL wire call for the second dial (against a loopback mock server)
-        // with the first dial's stamp pre-seeded, proving the fold survives
-        // through `projection_api` itself, not just the pure `fold` unit
-        // tests in `llm::route`.
+        // `run_projection_patch_on_route` dials `projection_api` TWICE (draft,
+        // then same-route repair) against the SAME `attempted_route`
+        // out-param. Both dials now send from the job's one client, so a
+        // repair cannot land on a re-pointed one: a mid-job settings save
+        // stops it instead. `stamp_attempted_route` still folds rather than
+        // overwrites, so a stamp can only widen. This drives a REAL wire call
+        // (against a loopback mock server) with a wider cloud stamp
+        // pre-seeded, proving the fold holds through `projection_api` itself,
+        // not just in the pure `fold` unit tests in `llm::route`.
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let body = serde_json::json!({
             "choices": [{
@@ -3920,11 +3992,6 @@ mod tests {
             ))),
             mistralrs_engine: Arc::new(Mutex::new(mistralrs_engine)),
         };
-        poison(&shared.llm_engine);
-        poison(&shared.api_client);
-        poison(&shared.openrouter_client);
-        poison(&shared.mistralrs_engine);
-
         let api_provider = LlmProvider::Api {
             endpoint: base.clone(),
             api_key: "sk-route-removal-probe".to_string(),
@@ -3941,9 +4008,14 @@ mod tests {
             authorize_route_dispatch(&api_provider).expect("the loopback endpoint is authorized");
         let openrouter_route =
             authorize_route_dispatch(&openrouter_provider).expect("OpenRouter is authorized");
-        // Each job takes the client its route sends through, and finds its
-        // slot poisoned.
+
+        // One job enters before the slots are poisoned and one after. Each
+        // takes the client its route sends through, and both are refused.
         let api_handles = shared.admit(&api_provider);
+        poison(&shared.llm_engine);
+        poison(&shared.api_client);
+        poison(&shared.openrouter_client);
+        poison(&shared.mistralrs_engine);
         let openrouter_handles = shared.admit(&openrouter_provider);
 
         let capture = ThreadLogCapture::start();
@@ -4042,6 +4114,59 @@ mod tests {
         .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum Queued {
+        Projection,
+        Extraction,
+        Chat,
+    }
+
+    /// Queue one job of `kind` from its own thread and describe how it ended.
+    fn queue_job(
+        executor: LlmExecutor,
+        kind: Queued,
+        provider: LlmProvider,
+        admitted_routing_policy: Option<OpenRouterRoutingPolicy>,
+    ) -> mpsc::Receiver<String> {
+        spawn_caller(move || match kind {
+            Queued::Projection => {
+                let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+                let attempt = executor.generate_projection_patch(
+                    job,
+                    ledger,
+                    None::<crate::projections::MaterializedNotes>,
+                    provider,
+                    1,
+                    100,
+                );
+                format!(
+                    "{:?}, route stamped: {}",
+                    attempt.outcome.map(|_| ()),
+                    attempt.attempted_route.is_some()
+                )
+            }
+            Queued::Extraction => {
+                let extracted = executor.extract_entities(
+                    "text".to_string(),
+                    "speaker".to_string(),
+                    String::new(),
+                    provider,
+                    LlmPriority::Background,
+                );
+                format!("extracted: {}", extracted.is_some())
+            }
+            Queued::Chat => {
+                let reply = executor.chat_with_history(
+                    Vec::new(),
+                    "context".to_string(),
+                    provider,
+                    admitted_routing_policy,
+                );
+                format!("{:?}", reply.map(|outcome| outcome.text))
+            }
+        })
+    }
+
     fn openrouter_provider(base: &str, provider_order: Option<Vec<String>>) -> LlmProvider {
         LlmProvider::OpenRouter {
             model: ADMISSION_MODEL.to_string(),
@@ -4116,159 +4241,166 @@ mod tests {
     const JOB_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[test]
-    fn a_projection_sends_its_draft_and_repair_under_the_policy_it_entered_with() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-
-        // A looser configuration is saved while the job waits for the worker.
-        {
-            let (base, requests) = rt.block_on(spawn_capturing_mock(vec![
-                unusable_patch_reply(),
-                unusable_patch_reply(),
-            ]));
-            let (shared, slot) =
-                shared_with_openrouter(openrouter_client(&base, Some(strict_routing())));
-            let (executor, taken, release) = gated_executor(shared);
-            let provider = openrouter_provider(&base, None);
-            let attempt = spawn_caller(move || {
-                let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-                executor.generate_projection_patch(
-                    job,
-                    ledger,
-                    None::<crate::projections::MaterializedNotes>,
-                    provider,
-                    1,
-                    100,
-                )
-            });
-            taken
-                .recv_timeout(JOB_WAIT)
-                .expect("the worker takes the job");
-            *slot.lock().unwrap() = Some(openrouter_client(&base, None));
-            release.send(()).expect("release the job");
-
-            let attempt = attempt.recv_timeout(JOB_WAIT).expect("the job is answered");
-            assert_eq!(
-                attempt.outcome.expect_err("the repair is still invalid"),
-                "runtime/invalid_response"
-            );
-            assert_sent_under_strict_routing(&requests, 2);
-        }
-
-        // A looser configuration is saved between the draft and the repair:
-        // after the draft's request arrived, before it is answered.
-        {
-            let slot: OpenRouterSlot = Arc::new(Mutex::new(None));
-            let replacement: OpenRouterSlot = Arc::new(Mutex::new(None));
-            let (base, requests) = rt.block_on(spawn_capturing_mock_with(
-                vec![unusable_patch_reply(), unusable_patch_reply()],
-                {
-                    let (slot, replacement) = (slot.clone(), replacement.clone());
-                    move |index| {
-                        if index == 0 {
-                            // Swapped, not dropped: a blocking client cannot
-                            // be dropped on the mock's runtime.
-                            std::mem::swap(
-                                &mut *slot.lock().unwrap(),
-                                &mut *replacement.lock().unwrap(),
-                            );
-                        }
-                    }
-                },
-            ));
-            *slot.lock().unwrap() = Some(openrouter_client(&base, Some(strict_routing())));
-            *replacement.lock().unwrap() = Some(openrouter_client(&base, None));
-            let executor = LlmExecutor::new(
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None)),
-                slot.clone(),
-                Arc::new(Mutex::new(None)),
-            );
-            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-
-            let attempt = executor.generate_projection_patch(
-                job,
-                ledger,
-                None::<crate::projections::MaterializedNotes>,
-                openrouter_provider(&base, None),
-                1,
-                100,
-            );
-
-            assert_eq!(
-                attempt.outcome.expect_err("the repair is still invalid"),
-                "runtime/invalid_response"
-            );
-            // Both clients are taken out here, on this thread, for the reason
-            // the swap gives. The slot held the looser one: the save happened.
-            let saved = slot.lock().unwrap().take().expect("a client in the slot");
-            assert_eq!(saved.config().routing_policy, None);
-            assert!(replacement.lock().unwrap().take().is_some());
-            assert_sent_under_strict_routing(&requests, 2);
-        }
-    }
-
-    #[test]
-    fn a_queued_extraction_is_sent_under_the_policy_it_entered_with() {
+    fn a_job_whose_client_was_replaced_while_it_waited_sends_nothing() {
         let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (base, requests) = rt.block_on(spawn_capturing_mock(vec![completed_reply("{}")]));
-        let (shared, slot) =
-            shared_with_openrouter(openrouter_client(&base, Some(strict_routing())));
-        let (executor, taken, release) = gated_executor(shared);
-        let provider = openrouter_provider(&base, None);
-        let extraction = spawn_caller(move || {
-            executor
-                .extract_entities(
-                    "text".to_string(),
-                    "speaker".to_string(),
-                    String::new(),
-                    provider,
-                    LlmPriority::Background,
-                )
-                .is_some()
-        });
-        taken
-            .recv_timeout(JOB_WAIT)
-            .expect("the worker takes the job");
-        *slot.lock().unwrap() = Some(openrouter_client(&base, None));
-        release.send(()).expect("release the job");
+        // An endpoint that would answer, so a request would be counted.
+        let (base, requests) = rt.block_on(spawn_counting_mock(vec![completed_reply("notes"); 9]));
+        let strict = Some(strict_routing());
+        let allow = crate::asr::ProviderContentEgressPolicy::allow();
+        let block = crate::asr::ProviderContentEgressPolicy::block("explicit_policy_required");
 
-        extraction
-            .recv_timeout(JOB_WAIT)
-            .expect("the job is answered");
+        // (the routing the job entered with, the routing and the content
+        // policy saved while it waited)
+        for (entered_with, saved_routing, saved_content) in [
+            // Routing loosened.
+            (strict.clone(), None, allow),
+            // Routing tightened.
+            (None, strict.clone(), allow),
+            // Cloud content blocked.
+            (strict.clone(), strict.clone(), block),
+        ] {
+            for kind in [Queued::Projection, Queued::Extraction, Queued::Chat] {
+                let (shared, slot) =
+                    shared_with_openrouter(openrouter_client(&base, entered_with.clone()));
+                let (executor, taken, release) = gated_executor(shared);
+                let ended = queue_job(
+                    executor,
+                    kind,
+                    openrouter_provider(&base, None),
+                    entered_with.clone(),
+                );
+                taken
+                    .recv_timeout(JOB_WAIT)
+                    .expect("the worker takes the job");
+                *slot.lock().unwrap() = Some(
+                    openrouter_client(&base, saved_routing.clone())
+                        .with_content_egress_policy(saved_content),
+                );
+                release.send(()).expect("release the job");
+
+                let refused = match kind {
+                    Queued::Projection => {
+                        "Err(\"runtime/policy_blocked\"), route stamped: false".to_string()
+                    }
+                    Queued::Extraction => "extracted: false".to_string(),
+                    Queued::Chat => format!(
+                        "{:?}",
+                        Err::<String, _>(executor_failure(Code::PolicyBlocked))
+                    ),
+                };
+                assert_eq!(
+                    ended.recv_timeout(JOB_WAIT).expect("the job is answered"),
+                    refused,
+                    "{kind:?}"
+                );
+            }
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_projection_whose_client_is_replaced_after_its_draft_sends_no_repair() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let slot: OpenRouterSlot = Arc::new(Mutex::new(None));
+        let replacement: OpenRouterSlot = Arc::new(Mutex::new(None));
+        // The save lands after the draft's request arrived and before it is
+        // answered.
+        let (base, requests) = rt.block_on(spawn_capturing_mock_with(
+            vec![unusable_patch_reply(), unusable_patch_reply()],
+            {
+                let (slot, replacement) = (slot.clone(), replacement.clone());
+                move |index| {
+                    if index == 0 {
+                        // Swapped, not dropped: a blocking client cannot be
+                        // dropped on the mock's runtime.
+                        std::mem::swap(
+                            &mut *slot.lock().unwrap(),
+                            &mut *replacement.lock().unwrap(),
+                        );
+                    }
+                }
+            },
+        ));
+        *slot.lock().unwrap() = Some(openrouter_client(&base, Some(strict_routing())));
+        *replacement.lock().unwrap() = Some(openrouter_client(&base, None));
+        let executor = LlmExecutor::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            slot.clone(),
+            Arc::new(Mutex::new(None)),
+        );
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+
+        let attempt = executor.generate_projection_patch(
+            job,
+            ledger,
+            None::<crate::projections::MaterializedNotes>,
+            openrouter_provider(&base, None),
+            1,
+            100,
+        );
+
+        assert_eq!(
+            attempt.outcome.expect_err("the repair is refused"),
+            "runtime/policy_blocked"
+        );
+        // The draft was dialled, so the attempt still names its route.
+        assert!(attempt.attempted_route.is_some());
+        // Both clients are taken out here, on this thread, for the reason the
+        // swap gives. The slot held the looser one: the save happened.
+        let saved = slot.lock().unwrap().take().expect("a client in the slot");
+        assert_eq!(saved.config().routing_policy, None);
+        assert!(replacement.lock().unwrap().take().is_some());
         assert_sent_under_strict_routing(&requests, 1);
     }
 
     #[test]
-    fn a_queued_chat_is_sent_under_the_policy_it_was_admitted_with() {
+    fn a_job_whose_client_was_rebuilt_unchanged_is_sent_under_the_policy_it_entered_with() {
+        let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (base, requests) = rt.block_on(spawn_capturing_mock(vec![completed_reply("notes")]));
-        let (shared, slot) =
-            shared_with_openrouter(openrouter_client(&base, Some(strict_routing())));
-        let (executor, taken, release) = gated_executor(shared);
-        let provider = openrouter_provider(&base, None);
-        let chat = spawn_caller(move || {
-            executor
-                .chat_with_history(
-                    Vec::new(),
-                    "context".to_string(),
-                    provider,
-                    Some(strict_routing()),
-                )
-                .map(|outcome| outcome.text)
-        });
-        taken
-            .recv_timeout(JOB_WAIT)
-            .expect("the worker takes the job");
-        *slot.lock().unwrap() = Some(openrouter_client(&base, None));
-        release.send(()).expect("release the job");
+        // In the order the jobs below send: a projection's draft and repair,
+        // an extraction, a chat.
+        let (base, requests) = rt.block_on(spawn_capturing_mock(vec![
+            unusable_patch_reply(),
+            unusable_patch_reply(),
+            completed_reply("{}"),
+            completed_reply("notes"),
+        ]));
 
-        assert_eq!(
-            chat.recv_timeout(JOB_WAIT).expect("the job is answered"),
-            Ok("notes".to_string())
-        );
-        assert_sent_under_strict_routing(&requests, 1);
+        for (kind, sent_as) in [
+            (
+                Queued::Projection,
+                Some("Err(\"runtime/invalid_response\"), route stamped: true"),
+            ),
+            // What an extraction makes of this reply is not the point.
+            (Queued::Extraction, None),
+            (Queued::Chat, Some("Ok(\"notes\")")),
+        ] {
+            let (shared, slot) =
+                shared_with_openrouter(openrouter_client(&base, Some(strict_routing())));
+            let (executor, taken, release) = gated_executor(shared);
+            let ended = queue_job(
+                executor,
+                kind,
+                openrouter_provider(&base, None),
+                Some(strict_routing()),
+            );
+            taken
+                .recv_timeout(JOB_WAIT)
+                .expect("the worker takes the job");
+            // A save that changes nothing still builds a new client.
+            *slot.lock().unwrap() = Some(openrouter_client(&base, Some(strict_routing())));
+            release.send(()).expect("release the job");
+
+            let ended = ended.recv_timeout(JOB_WAIT).expect("the job is answered");
+            if let Some(sent_as) = sent_as {
+                assert_eq!(ended, sent_as, "{kind:?}");
+            }
+        }
+        assert_sent_under_strict_routing(&requests, 4);
     }
 
     #[test]
