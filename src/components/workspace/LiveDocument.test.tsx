@@ -23,6 +23,7 @@ function note(
     title: overrides.title ?? "Untitled",
     body: overrides.body ?? "",
     tags: overrides.tags ?? [],
+    heading_level: overrides.heading_level ?? null,
     valid_until_ms: overrides.valid_until_ms ?? null,
     // Issue #255 fixture fields — defaults mirror a note materialized by an
     // `upsert_note` (no block history).
