@@ -1699,6 +1699,13 @@ impl ManifestWriteTransaction<'_> {
         proof_owned: bool,
     ) -> ManifestCasPreparationResult {
         let reject = ManifestCasPreparationResult::Rejected;
+        // A Windows replacement may have released the old head before an
+        // indeterminate rename. A fresh transaction must bind the current head.
+        if self.head.is_some() && self.head_file.is_none() {
+            return reject(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged,
+            ));
+        }
         if self
             .expected_session_id
             .is_some_and(|expected| expected != candidate.session_id)
@@ -1809,7 +1816,7 @@ impl ManifestWriteTransaction<'_> {
         &mut self,
         preparation: ManifestCasPreparation,
         disposition: ManifestInstallDisposition,
-        _injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
+        injected_fault: Option<super::canonical_durability::CanonicalDurabilityStage>,
     ) -> ManifestCasOutcome {
         let resume_temporary = !matches!(disposition, ManifestInstallDisposition::Fresh);
         let (candidate, bytes, recovery_key) = match preparation {
@@ -1822,54 +1829,24 @@ impl ManifestWriteTransaction<'_> {
                 return ManifestCasOutcome::AlreadyCompleted { manifest };
             }
         };
-        let expectation = self
-            .head_file
-            .as_ref()
-            .map_or(CanonicalSnapshotExpectation::Absent, |file| {
-                CanonicalSnapshotExpectation::Existing(file)
-            });
-        let outcome = if resume_temporary {
-            #[cfg(test)]
-            if let Some(injected_fault) = _injected_fault {
-                self.guard.install_snapshot_recovery_with_fault(
-                    &self.temporary_path,
-                    &self.manifest_path,
-                    &bytes,
-                    expectation,
-                    self.qualification,
-                    recovery_key,
-                    injected_fault,
-                )
-            } else {
-                self.guard.install_snapshot_recovery(
-                    &self.temporary_path,
-                    &self.manifest_path,
-                    &bytes,
-                    expectation,
-                    self.qualification,
-                    recovery_key,
-                )
-            }
-
-            #[cfg(not(test))]
-            self.guard.install_snapshot_recovery(
-                &self.temporary_path,
-                &self.manifest_path,
-                &bytes,
-                expectation,
-                self.qualification,
-                recovery_key,
-            )
-        } else {
-            self.guard.install_snapshot(
-                &self.temporary_path,
-                &self.manifest_path,
-                &bytes,
-                expectation,
-                self.qualification,
-                recovery_key,
-            )
-        };
+        let mut expectation = self.head_file.take().map_or(
+            CanonicalSnapshotExpectation::Absent,
+            CanonicalSnapshotExpectation::ExistingOwned,
+        );
+        let outcome = self.guard.install_manifest_snapshot(
+            &self.temporary_path,
+            &self.manifest_path,
+            &bytes,
+            &mut expectation,
+            self.qualification,
+            recovery_key,
+            resume_temporary,
+            injected_fault,
+        );
+        // A pre-rename refusal leaves the exact head available for a retry.
+        if let CanonicalSnapshotExpectation::ExistingOwned(file) = expectation {
+            self.head_file = Some(file);
+        }
         match outcome {
             CanonicalDurabilityOutcome::Accepted(durability) => {
                 match load_manifest_file(&self.manifest_path) {
@@ -3519,7 +3496,12 @@ mod tests {
     fn unqualified_absent_checked_read_refuses_before_reader_when_aba_is_unobservable() {
         use std::cell::Cell;
 
-        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+        for platform in [
+            CanonicalPlatform::Linux,
+            CanonicalPlatform::MacOs,
+            CanonicalPlatform::Windows,
+            CanonicalPlatform::Other,
+        ] {
             for transient in ["manifest", "lock"] {
                 let root = root(&format!("unqualified-{platform:?}-{transient}-aba-refusal"));
                 let store = SessionArtifactManifestStore::for_test_session_platform(
@@ -3543,7 +3525,12 @@ mod tests {
                     Ok::<_, ()>("manifest-or-lock ABA must not escape")
                 });
 
-                assert_eq!(outcome, Err(CheckedManifestReadError::UncoordinatedAbsence));
+                let expected = if platform == CanonicalPlatform::Other {
+                    CheckedManifestReadError::UncoordinatedAbsence
+                } else {
+                    CheckedManifestReadError::NamespaceQualificationRequired
+                };
+                assert_eq!(outcome, Err(expected));
                 assert!(!reader_invoked.get());
                 assert!(
                     std::fs::read_dir(&root)
@@ -3557,8 +3544,13 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_windows_other_checked_read_uses_existing_global_shared_guard() {
-        for platform in [CanonicalPlatform::Windows, CanonicalPlatform::Other] {
+    fn unqualified_present_checked_read_uses_existing_guard_only_on_unsupported_platforms() {
+        for platform in [
+            CanonicalPlatform::Linux,
+            CanonicalPlatform::MacOs,
+            CanonicalPlatform::Windows,
+            CanonicalPlatform::Other,
+        ] {
             let root = root(&format!("unqualified-{platform:?}-present-read"));
             let store = SessionArtifactManifestStore::for_test_session_platform(
                 &root,
@@ -3573,11 +3565,16 @@ mod tests {
                 &serde_json::to_vec(&present).expect("present manifest bytes"),
             );
 
-            let observed = store
-                .checked_read(Ok::<_, ()>)
-                .expect("guarded read-only present Session");
+            let observed = store.checked_read(Ok::<_, ()>);
+            if platform != CanonicalPlatform::Other {
+                assert_eq!(
+                    observed,
+                    Err(CheckedManifestReadError::NamespaceQualificationRequired)
+                );
+                continue;
+            }
             assert!(matches!(
-                observed,
+                observed.expect("guarded read-only present Session"),
                 ManifestLoadOutcome::Present(manifest)
                     if manifest.transition.idempotency_id == "present-head"
             ));
@@ -5696,45 +5693,116 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn cc9a_native_windows_qualified_existing_root_refuses_before_manifest_coordination_or_temp_mutation()
-     {
-        fn root_entries(root: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
-            let mut entries = std::fs::read_dir(root)
-                .expect("read fixture root")
-                .map(|entry| {
-                    let entry = entry.expect("read fixture entry");
-                    (
-                        entry.file_name(),
-                        std::fs::read(entry.path()).expect("read fixture entry bytes"),
-                    )
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            entries
+    fn cc9a_native_windows_manifest_requires_qualification_for_install_replacement_and_unlink() {
+        let root = root("native-ntfs-qualified-manifest");
+        let unqualified = SessionArtifactManifestStore::new(&root);
+        assert!(matches!(
+            unqualified.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
+        ));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root)
+            .expect("fixture requires writable fixed local NTFS");
+        let mut transaction = store.begin_write().expect("qualified transaction");
+        for (generation, id, digit, mutation) in [
+            (
+                0,
+                "ntfs-initial",
+                'a',
+                CanonicalMutation::InitialSnapshotInstall,
+            ),
+            (
+                1,
+                "ntfs-replacement",
+                'b',
+                CanonicalMutation::SnapshotReplacement,
+            ),
+        ] {
+            let outcome = transaction.compare_and_swap(generation, basic_candidate(id, digit));
+            let ManifestCasOutcome::Accepted {
+                manifest,
+                durability,
+            } = outcome
+            else {
+                panic!("qualified manifest install failed: {outcome:?}");
+            };
+            assert_eq!(manifest.generation, generation + 1);
+            assert_eq!(manifest.transition.idempotency_id, id);
+            assert_eq!(
+                durability,
+                CanonicalDurabilityReceipt {
+                    mutation,
+                    barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsWriteThroughNamespace,
+                }
+            );
         }
-
-        let root = root("cc9a-native-windows-production-refusal");
-        std::fs::write(root.join("sentinel.bin"), b"entry-identical").expect("write root sentinel");
-        let before_entries = root_entries(&root);
-        let error = match SessionArtifactManifestStore::qualified_existing_root(&root) {
-            Err(error) => error,
-            Ok(_) => panic!("Windows production qualification unexpectedly succeeded"),
-        };
-
+        // Abandon unlinks only the Session's staged temporary.
+        std::fs::write(store.temporary_path(), b"orphan").unwrap();
         assert_eq!(
-            error,
-            ManifestStoreError::Qualification(
-                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported {
-                    platform: CanonicalPlatform::Windows,
-                },
-            )
+            transaction.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::Unlink,
+                barrier: CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+            })
         );
-        let after_entries = root_entries(&root);
-        assert_eq!(after_entries, before_entries);
-        let manifest_path = root.join(MANIFEST_FILE_NAME);
-        assert!(!root.join(COORDINATION_FILE_NAME).exists());
-        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
-        assert!(!manifest_path.exists());
+        assert!(!store.temporary_path().exists());
+        drop(transaction);
+        assert!(
+            matches!(store.load().unwrap(), ManifestLoadOutcome::Present(head)
+            if head.generation == 2 && head.transition.idempotency_id == "ntfs-replacement")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_ntfs_replacement_retry_requires_the_validated_head() {
+        use super::super::canonical_durability::CanonicalDurabilityStage;
+        let root = root("ntfs-replacement-retry");
+        let store = SessionArtifactManifestStore::qualified_existing_root(&root).unwrap();
+        let mut writer = store.begin_write().unwrap();
+        assert!(matches!(
+            writer.compare_and_swap(0, basic_candidate("old", 'a')),
+            ManifestCasOutcome::Accepted { .. }
+        ));
+        std::fs::write(store.temporary_path(), b"orphan").unwrap();
+        let replacement = basic_candidate("new", 'b');
+        assert_eq!(
+            writer.compare_and_swap(1, replacement.clone()),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::SnapshotTempAlreadyExists
+            ))
+        );
+        assert!(matches!(
+            writer.abandon_staged_transition(),
+            CanonicalUnlinkOutcome::Unlinked(_)
+        ));
+
+        // The same writer can retry after the pre-mutation refusal. Cut after
+        // the retry's rename, when the old head has actually been released.
+        assert!(matches!(
+            writer.compare_and_swap_recovery_with_fault(
+                1,
+                replacement,
+                CanonicalDurabilityStage::ParentSync
+            ),
+            ManifestCasOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::ParentSync,
+                ..
+            })
+        ));
+        assert_eq!(
+            writer.compare_and_swap(1, basic_candidate("stale", 'c')),
+            ManifestCasOutcome::Rejected(ManifestCasRejection::Durability(
+                CanonicalDurabilityRejection::IdentityChanged
+            ))
+        );
+        assert!(!store.temporary_path().exists());
+        drop(writer);
+        assert!(
+            matches!(store.load().unwrap(), ManifestLoadOutcome::Present(head)
+            if head.generation == 2 && head.transition.idempotency_id == "new")
+        );
     }
 
     /// Keep the substrate contract that seed audio-graph-a58b closed.
@@ -6987,7 +7055,11 @@ mod tests {
             adopting.abandon_staged_transition(),
             CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::Unlink,
-                barrier: CanonicalDurabilityBarrier::ParentNamespace,
+                barrier: if cfg!(windows) {
+                    CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+                } else {
+                    CanonicalDurabilityBarrier::ParentNamespace
+                },
             })
         );
         assert!(!temporary_path.exists());

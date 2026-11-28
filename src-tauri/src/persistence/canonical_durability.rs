@@ -2382,7 +2382,7 @@ impl CanonicalExclusiveGuard {
         temporary: &Path,
         destination: &Path,
         bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
+        mut expectation: CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
@@ -2390,7 +2390,7 @@ impl CanonicalExclusiveGuard {
             temporary,
             destination,
             bytes,
-            expectation,
+            &mut expectation,
             qualification,
             recovery_key,
             false,
@@ -2399,7 +2399,9 @@ impl CanonicalExclusiveGuard {
         )
     }
 
-    /// Install a snapshot that may resume an already-existing exact temporary.
+    /// Install a manifest and optionally resume its exact staged temporary.
+    /// A refusal leaves the owned head in `expectation` for the caller's retry.
+    /// Windows releases that handle only when invoking the write-through move.
     ///
     /// `Rejected` means THIS operation mutated nothing — every refusal is proven
     /// before a byte or namespace entry moved. It is NOT a claim that the
@@ -2409,14 +2411,16 @@ impl CanonicalExclusiveGuard {
     /// `ManifestCasRejection::ManifestInstallRefusedAfterProofAndIntentDurable`
     /// is the worked example.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn install_snapshot_recovery(
+    pub(crate) fn install_manifest_snapshot(
         &self,
         temporary: &Path,
         destination: &Path,
         bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
+        expectation: &mut CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
+        resume_temporary: bool,
+        injected_fault: Option<CanonicalDurabilityStage>,
     ) -> CanonicalDurabilityOutcome {
         self.install_snapshot_inner(
             temporary,
@@ -2425,34 +2429,9 @@ impl CanonicalExclusiveGuard {
             expectation,
             qualification,
             recovery_key,
-            true,
+            resume_temporary,
             SnapshotDisposition::Install,
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn install_snapshot_recovery_with_fault(
-        &self,
-        temporary: &Path,
-        destination: &Path,
-        bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
-        qualification: Option<&CanonicalFilesystemQualification>,
-        recovery_key: CanonicalRecoveryKey,
-        injected_fault: CanonicalDurabilityStage,
-    ) -> CanonicalDurabilityOutcome {
-        self.install_snapshot_inner(
-            temporary,
-            destination,
-            bytes,
-            expectation,
-            qualification,
-            recovery_key,
-            true,
-            SnapshotDisposition::Install,
-            Some(injected_fault),
+            injected_fault,
         )
     }
 
@@ -2465,7 +2444,7 @@ impl CanonicalExclusiveGuard {
         temporary: &Path,
         destination: &Path,
         bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
+        mut expectation: CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
@@ -2473,7 +2452,7 @@ impl CanonicalExclusiveGuard {
             temporary,
             destination,
             bytes,
-            expectation,
+            &mut expectation,
             qualification,
             recovery_key,
             true,
@@ -2489,7 +2468,7 @@ impl CanonicalExclusiveGuard {
         temporary: &Path,
         destination: &Path,
         bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
+        mut expectation: CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
         injected_fault: CanonicalDurabilityStage,
@@ -2498,7 +2477,7 @@ impl CanonicalExclusiveGuard {
             temporary,
             destination,
             bytes,
-            expectation,
+            &mut expectation,
             qualification,
             recovery_key,
             true,
@@ -2513,7 +2492,7 @@ impl CanonicalExclusiveGuard {
         temporary: &Path,
         destination: &Path,
         bytes: &[u8],
-        expectation: CanonicalSnapshotExpectation<'_>,
+        expectation: &mut CanonicalSnapshotExpectation<'_>,
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
         resume_temporary: bool,
@@ -2708,9 +2687,12 @@ impl CanonicalExclusiveGuard {
         let mutation = validated_destination.mutation();
         #[cfg(test)]
         drop(validated_destination);
-        drop(expectation);
         if let Err(error) =
             self.checked_snapshot(CanonicalDurabilityStage::Rename, injected_fault, || {
+                #[cfg(windows)]
+                {
+                    *expectation = CanonicalSnapshotExpectation::Absent;
+                }
                 self.move_source(temporary, destination, true)
             })
         {
@@ -6636,13 +6618,15 @@ mod tests {
             )
         );
         assert_eq!(
-            guard.install_snapshot_recovery(
+            guard.install_manifest_snapshot(
                 &tmp,
                 &head,
                 b"candidate",
-                CanonicalSnapshotExpectation::Absent,
+                &mut CanonicalSnapshotExpectation::Absent,
                 proof,
-                key
+                key,
+                true,
+                None
             ),
             accepted(
                 M::InitialSnapshotInstall,

@@ -1888,33 +1888,19 @@ mod tests {
         assert!(successor.wait().success());
     }
 
-    /// The refusals proven here come from platform policy, not from the volume:
-    /// `namespace_supported_for` excludes Windows for every filesystem, so every
-    /// assertion below holds on NTFS, ReFS, or exFAT alike. That is why a fixture
-    /// volume whose filesystem could not be probed — the ordinary non-elevated
-    /// case, since `fsutil` needs elevation — still runs the whole proof and
-    /// gives up only the `filesystem=ntfs` claim in its evidence line. A probe
-    /// that runs and names a non-NTFS volume is a different matter and still
-    /// fails, inside `fixture_contract_is_qualified`.
     #[test]
     #[cfg(target_os = "windows")]
-    fn windows_ntfs_namespace_paths_refuse_before_temp_head_or_source_mutation() {
-        let root = TempRoot::new("windows-ntfs-refusal");
-        let filesystem_evidence =
-            match fixture_contract_is_qualified(root.path(), "windows-namespace-refusal") {
-                FixtureContract::Qualified => "ntfs",
-                FixtureContract::EvidenceUnavailable(reason) => reason,
-                FixtureContract::RefusedFilesystem => panic!(
-                    "this platform does not permit an explicit fixture refusal, so a probed \
-                     non-NTFS volume must already have failed the contract"
-                ),
-            };
-        fs::create_dir_all(root.path().join("streams")).expect("create stream fixture directory");
+    fn windows_ntfs_namespace_paths_require_qualification_before_mutation() {
+        use crate::persistence::canonical_durability::{
+            CanonicalDurabilityBarrier as Barrier, CanonicalDurabilityReceipt, CanonicalMutation,
+        };
+
+        let root = TempRoot::new("windows-ntfs-namespace");
         fs::create_dir_all(root.path().join("recovery"))
             .expect("create recovery fixture directory");
 
-        let source = root.path().join("streams/events.jsonl");
-        let rename_destination = root.path().join("streams/events-renamed.jsonl");
+        let source = root.path().join("events.jsonl");
+        let rename_destination = root.path().join("events-renamed.jsonl");
         let first_create = root.path().join("first-create.jsonl");
         let recovery_temporary = root.path().join("recovery/events.tmp");
         let recovery_destination = root.path().join("recovery/events.bin");
@@ -2004,11 +1990,71 @@ mod tests {
         contender.wait_for(&handshake("exclusive_contended_ok"));
         assert!(contender.wait().success());
         drop(guard);
+        let (proof, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(root.path())
+                .expect("fixture requires writable fixed local NTFS");
+        let qualified = durability
+            .try_lock_exclusive_qualified(root.path(), &proof)
+            .unwrap();
+        let proof = Some(&proof);
+        let accepted = |mutation, barrier| {
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt { mutation, barrier })
+        };
+        assert_eq!(
+            qualified.append(&first_create, b"created", proof, key),
+            accepted(
+                CanonicalMutation::FirstCreate,
+                Barrier::FileAndWindowsNtfsObservedNamespace
+            )
+        );
+        qualified
+            .preflight_recovery_namespace(
+                &source,
+                &recovery_temporary,
+                &recovery_destination,
+                proof,
+            )
+            .expect("qualified recovery paths");
+        for outcome in [
+            qualified.rename(&source, &rename_destination, proof, key),
+            qualified.rename_recovery(&recovery_temporary, &recovery_destination, proof, key),
+        ] {
+            assert_eq!(
+                outcome,
+                accepted(
+                    CanonicalMutation::Rename,
+                    Barrier::FileAndWindowsNtfsWriteThroughNamespace
+                )
+            );
+        }
+        assert_eq!(
+            qualified.install_snapshot(
+                &snapshot_temporary,
+                &snapshot_head,
+                b"installed",
+                CanonicalSnapshotExpectation::ExistingOwned(expected_head),
+                proof,
+                key
+            ),
+            accepted(
+                CanonicalMutation::SnapshotReplacement,
+                Barrier::FileAndWindowsNtfsWriteThroughNamespace
+            )
+        );
+        assert_eq!(fs::read(first_create).unwrap(), b"created");
+        assert_eq!(fs::read(rename_destination).unwrap(), b"stable-source");
+        assert_eq!(
+            fs::read(recovery_destination).unwrap(),
+            b"stable-recovery-temp"
+        );
+        assert_eq!(fs::read(snapshot_head).unwrap(), b"installed");
+        assert!(!source.exists() && !recovery_temporary.exists() && !snapshot_temporary.exists());
+        drop(qualified);
         let mut successor = spawn_root_child("try_exclusive_acquired", root.path(), None);
         successor.wait_for(&handshake("exclusive_acquired_ok"));
         assert!(successor.wait().success());
         println!(
-            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem={filesystem_evidence} first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
+            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem=ntfs qualification=unqualified first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
         );
     }
 }
