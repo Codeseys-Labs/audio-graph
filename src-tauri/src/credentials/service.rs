@@ -925,23 +925,13 @@ impl CredentialService {
             ));
         }
 
-        // A refusal the cached journal already proves costs no store I/O.
-        let cached_allows_read = Self::journal_allows_entry_read(
-            &self
-                .journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            &request.set_id,
-        );
-        if !cached_allows_read {
-            return Err(Self::recovery_required(&request.set_id));
-        }
-
         let operation_id = self.token_source.next_operation_id();
         let _permit = self.worker.admit(&operation_id, &request.set_id)?;
         // The decision is made on the journal read under the same lock as the
-        // record. The cache may predate another process's persisted intent,
-        // and an older journal of the same authority is refused by its epoch.
+        // record, never on the cache alone: the cache may predate another
+        // process's persisted intent, or still hold pending state that
+        // process has since recovered from. An older journal of the same
+        // authority is refused by its epoch.
         let read = self
             .store
             .read_active(&request.set_id)
@@ -5375,6 +5365,63 @@ mod tests {
             CredentialSetRecoveryState::PendingIntent,
             "the stale service adopts the authoritative journal it read"
         );
+    }
+
+    /// A refusal based on pending state the service cached is re-evaluated
+    /// against the journal: once the authority no longer holds the intent,
+    /// the service that saw it leases again instead of refusing forever.
+    #[test]
+    fn a_cached_pending_refusal_is_lifted_once_the_authority_recovers() {
+        let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let stale = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let created = configure_deepgram(&stale, "5b5b5b5b-5b5b-4b5b-8b5b-5b5b5b5b5b5b", None);
+        let interrupted = CredentialService::new(
+            store.clone(),
+            store.journal_snapshot(),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        store.fail_next(
+            FakeStoreCall::ReplaceActive,
+            CredentialStoreFailure::Unavailable,
+        );
+        interrupted
+            .replace_set(ReplaceCredentialSet {
+                set_id: deepgram.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("interrupted-generation").expect("API key"),
+                expected_revision: created.new_revision.clone(),
+                idempotency_token: idempotency("5c5c5c5c-5c5c-4c5c-8c5c-5c5c5c5c5c5c"),
+            })
+            .expect_err("the interrupted writer stops after persisting its intent");
+        assert_eq!(
+            stale
+                .resolve_for_use(deepgram_use_request())
+                .expect_err("a pending intent forbids a lease")
+                .code,
+            CredentialErrorCode::RecoveryRequired
+        );
+
+        let mut recovered = store.journal_snapshot();
+        recovered.pending_intents.clear();
+        recovered
+            .set_state_mut(&deepgram)
+            .expect("Deepgram state")
+            .recovery_state = CredentialSetRecoveryState::None;
+        recovered.global_epoch += 1;
+        store.restore_journal(recovered);
+
+        match stale.resolve_for_use(deepgram_use_request()) {
+            Ok(CredentialResolution::Stored(lease)) => {
+                assert_eq!(Some(lease.revision), created.new_revision);
+            }
+            _ => panic!("expected a lease once the authority recovered"),
+        }
     }
 
     /// The persisted journal is rolled back to an older copy of the same
