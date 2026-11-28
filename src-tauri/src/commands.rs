@@ -27788,15 +27788,10 @@ mod tests {
                 spawn_raw_http_mock(complete_sse_response("an answer nobody can store")).await,
             );
             let (channel, mut frames) = recording_chat_channel();
-            let dispatch = answer_question_card_impl(
-                card_id.to_string(),
-                false,
-                channel,
-                app_handle,
-                &state,
-            )
-            .await
-            .expect("the dispatch call itself must not error");
+            let dispatch =
+                answer_question_card_impl(card_id.to_string(), false, channel, app_handle, &state)
+                    .await
+                    .expect("the dispatch call itself must not error");
             assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
             let current = crate::user_data::resolve_live_assist_current_path(&session_id)
                 .expect("resolve the card file");
