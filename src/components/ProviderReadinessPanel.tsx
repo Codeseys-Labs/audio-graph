@@ -399,7 +399,7 @@ function providerSensitiveErrorPolicyLabel(
 // `load_credential_presence_cmd` IPC path (and the parity is enforced by
 // `credentialSourceContract.test.ts`). `error` is the one exception: it is a
 // DEFENSIVE UI fallback only — the live load path returns
-// `AppError::CredentialFileError` on a read failure rather than a presence row
+// `a typed credential diagnostic` on a read failure rather than a presence row
 // with `source: "error"`, so the backend never actually emits it today. The
 // label is kept so a future backend that does surface a per-key read error has
 // a localized string instead of a raw passthrough. (The only `"source":

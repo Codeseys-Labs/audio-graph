@@ -636,6 +636,59 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().error).toBeNull();
   });
 
+  it("warns that an old file entry can override a successful credential rotation", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      saved_with_warning: {
+        kind: "credential",
+        detail: {
+          code: "legacy_cleanup_required",
+          retryable: false,
+          recovery_action: "run_cleanup",
+        },
+      },
+    });
+    await useAudioGraphStore
+      .getState()
+      .saveCredential("openai_api_key", "canary-maple-value");
+    expect(useAudioGraphStore.getState().notifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          severity: "warning",
+          message: expect.stringContaining("An old value"),
+        }),
+      ]),
+    );
+  });
+
+  it("retains the saved settings and reports a locked credential refresh as a warning", async () => {
+    const settings = selectableSettings();
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "save_settings_cmd") {
+        return {
+          kind: "credential",
+          detail: {
+            code: "locked",
+            retryable: true,
+            recovery_action: "unlock_store",
+          },
+        };
+      }
+      return settings;
+    });
+    await useAudioGraphStore.getState().saveSettings(settings);
+    const state = useAudioGraphStore.getState();
+    expect(state.settings).toEqual(settings);
+    expect(state.error).toBeNull();
+    expect(state.notifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          severity: "warning",
+          message: "Unlock the credential store and try again.",
+        }),
+      ]),
+    );
+  });
+
   it("saveSettings sets the global error AND rethrows on a failed persist (seed 9289)", async () => {
     // Regression guard (Codex P2): saveSettings used to swallow the invoke
     // rejection after recording the global error, so the Settings controller

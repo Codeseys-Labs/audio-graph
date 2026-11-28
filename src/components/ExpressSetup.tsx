@@ -38,7 +38,10 @@ import type {
   LlmProvider,
   SettingsRoute,
 } from "../types";
-import { errorToMessage } from "../utils/errorToMessage";
+import {
+  errorToMessage,
+  notifyCredentialWarning,
+} from "../utils/errorToMessage";
 import IconButton from "./IconButton";
 import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 import {
@@ -599,7 +602,7 @@ function ExpressSetup({
         : asrChoice === "deepgram"
           ? "deepgram_api_key"
           : "assemblyai_api_key";
-    await invoke("save_credential_cmd", { key, value: asrKey });
+    await useAudioGraphStore.getState().saveCredential(key, asrKey);
   };
 
   const saveLlmCredential = async () => {
@@ -614,7 +617,7 @@ function ExpressSetup({
     // bearer token under whatever the endpoint expects.
     const key =
       llmChoice === "openrouter" ? "openrouter_api_key" : "openai_api_key";
-    await invoke("save_credential_cmd", { key, value: llmKey });
+    await useAudioGraphStore.getState().saveCredential(key, llmKey);
   };
 
   const handleSave = async () => {
@@ -674,7 +677,10 @@ function ExpressSetup({
 
       await saveAsrCredential();
       await saveLlmCredential();
-      await invoke("save_settings_cmd", { settings: nextSettings });
+      const warning = await invoke("save_settings_cmd", {
+        settings: nextSettings,
+      });
+      notifyCredentialWarning(warning, useAudioGraphStore.getState().notify);
       // Quick Setup configures the durable MVP only. Deferred realtime modes
       // remain inspectable in Advanced settings but cannot be newly selected.
       setConversationMode("notes");

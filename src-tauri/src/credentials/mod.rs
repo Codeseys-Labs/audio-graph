@@ -84,32 +84,154 @@ fn lock_credential_io() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Format a `serde_yaml` parse failure WITHOUT echoing file content.
-///
-/// audio-graph-4243 / cred-review M4: `credentials.yaml` holds plaintext API
-/// keys by design (legacy/fallback), and a `serde_yaml::Error`'s `Display`
-/// includes a snippet of the offending scalar (e.g. `invalid type: string
-/// "sk-live-abc…", expected a map at line 3 column 18`). That reason flows
-/// VERBATIM into `CredentialFileError.reason` → UI readiness banners, toasts,
-/// `console.error`, and the app log — so a malformed hand-edit can echo a key
-/// fragment into user-facing surfaces and bug-report logs.
-///
-/// This keeps ONLY the location (line/column, which serde_yaml computes but
-/// which reveals no content) and a fixed generic message. It never includes the
-/// underlying error's `Display`. Keeps the `Failed to parse {path}:` prefix so
-/// callers/tests can still recognize a parse failure.
-fn redacted_yaml_parse_error(path: &Path, err: &serde_yaml::Error) -> String {
-    match err.location() {
-        Some(loc) => format!(
-            "Failed to parse {}: invalid YAML at line {} column {} (content omitted)",
-            path.display(),
-            loc.line(),
-            loc.column()
-        ),
-        None => format!(
-            "Failed to parse {}: invalid YAML (content omitted)",
-            path.display()
-        ),
+use audio_graph_ipc_contract::credential_contract::{
+    CredentialError, CredentialErrorCode as Code, CredentialSafeRecoveryAction as Action,
+};
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+
+/// The v1 backend discards native errors at the adapter boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(into = "RuntimeDiagnostic")]
+pub struct LegacyCredentialError(pub(crate) Code);
+
+impl std::fmt::Display for LegacyCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "credential/{}", self.0.as_str())
+    }
+}
+
+impl std::error::Error for LegacyCredentialError {}
+
+impl From<LegacyCredentialError> for RuntimeDiagnostic {
+    fn from(error: LegacyCredentialError) -> Self {
+        let (retryable, recovery_action) = match error.0 {
+            Code::Locked => (true, Action::UnlockStore),
+            Code::AccessDenied | Code::PermissionHardeningFailed => {
+                (false, Action::RepairPermissions)
+            }
+            Code::Cancelled | Code::StoreUnavailable => (true, Action::Retry),
+            Code::StoreUnsupported => (false, Action::ChooseSupportedBackend),
+            Code::LegacyCleanupRequired => (false, Action::RunCleanup),
+            Code::CorruptRecord | Code::AmbiguousMatch | Code::CommitUnknown => {
+                (false, Action::Reconcile)
+            }
+            Code::Missing => (false, Action::ReenterCredential),
+            _ => (false, Action::None),
+        };
+        CredentialError {
+            code: error.0,
+            retryable,
+            recovery_action,
+            set_id: None,
+        }
+        .into()
+    }
+}
+
+impl From<LegacyCredentialError> for crate::error::AppError {
+    fn from(error: LegacyCredentialError) -> Self {
+        RuntimeDiagnostic::from(error).into()
+    }
+}
+
+impl From<LegacyCredentialError> for String {
+    fn from(error: LegacyCredentialError) -> Self {
+        error.to_string()
+    }
+}
+
+fn io_error(error: &std::io::Error) -> LegacyCredentialError {
+    use std::io::ErrorKind;
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION.
+        return LegacyCredentialError(Code::Locked);
+    }
+    LegacyCredentialError(match error.kind() {
+        ErrorKind::NotFound => Code::Missing,
+        ErrorKind::PermissionDenied => Code::AccessDenied,
+        ErrorKind::WouldBlock => Code::Locked,
+        ErrorKind::InvalidData => Code::CorruptRecord,
+        ErrorKind::NotConnected | ErrorKind::ConnectionRefused => Code::StoreUnavailable,
+        _ => Code::Internal,
+    })
+}
+
+fn keyring_error(error: keyring::Error) -> LegacyCredentialError {
+    use keyring::Error;
+    LegacyCredentialError(match error {
+        Error::NoEntry => Code::Missing,
+        Error::NoStorageAccess(native) => {
+            return native_error(native.as_ref(), Code::StoreUnavailable);
+        }
+        Error::PlatformFailure(native) => return native_error(native.as_ref(), Code::Internal),
+        Error::BadEncoding(_) | Error::BadDataFormat(_, _) | Error::BadStoreFormat(_) => {
+            Code::CorruptRecord
+        }
+        Error::NoDefaultStore => Code::StoreUnavailable,
+        Error::NotSupportedByStore(_) => Code::StoreUnsupported,
+        Error::Ambiguous(_) => Code::AmbiguousMatch,
+        Error::TooLong(_, _) => Code::PayloadTooLarge,
+        Error::Invalid(_, _) => Code::InvalidCredentialSet,
+        _ => Code::Internal,
+    })
+}
+
+fn native_error(
+    native: &(dyn std::error::Error + 'static),
+    fallback: Code,
+) -> LegacyCredentialError {
+    if let Some(error) = native.downcast_ref::<std::io::Error>() {
+        return io_error(error);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(error) = native.downcast_ref::<security_framework::base::Error>() {
+        return LegacyCredentialError(match error.code() {
+            -25308 => Code::Locked,             // errSecInteractionNotAllowed
+            -25293 | -61 => Code::AccessDenied, // errSecAuthFailed, wrPermErr
+            -128 => Code::Cancelled,            // errSecUserCanceled
+            -25291 | -25294 => Code::StoreUnavailable,
+            -25295 => Code::CorruptRecord,
+            _ => Code::Internal,
+        });
+    }
+    LegacyCredentialError(fallback)
+}
+
+pub(crate) fn validate_key(key: &str) -> Result<(), LegacyCredentialError> {
+    if is_allowed_key(key) {
+        Ok(())
+    } else {
+        Err(LegacyCredentialError(Code::InvalidCredentialSet))
+    }
+}
+
+fn read_yaml<T: serde::de::DeserializeOwned + Default>(
+    path: &Path,
+) -> Result<T, LegacyCredentialError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            serde_yaml::from_slice(&bytes).map_err(|_| LegacyCredentialError(Code::CorruptRecord))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+                Err(e) => Err(io_error(&e)),
+                Ok(_) => Err(LegacyCredentialError(Code::StoreUnavailable)),
+            }
+        }
+        Err(error) => Err(io_error(&error)),
+    }
+}
+
+fn harden_permissions(path: &Path) -> Result<(), LegacyCredentialError> {
+    crate::fs_util::try_set_owner_only(path)
+        .map_err(|_| LegacyCredentialError(Code::PermissionHardeningFailed))
+}
+
+fn harden_best_effort(path: &Path) {
+    if let Err(error) = harden_permissions(path) {
+        log::warn!("{error}");
     }
 }
 
@@ -234,6 +356,7 @@ pub struct CredentialSnapshot {
     pub store: CredentialStore,
     pub source: &'static str,
     pub key_sources: BTreeMap<&'static str, &'static str>,
+    pub legacy_file_warning: Option<LegacyCredentialError>,
 }
 
 impl CredentialSnapshot {
@@ -243,6 +366,7 @@ impl CredentialSnapshot {
             store,
             source,
             key_sources,
+            legacy_file_warning: None,
         }
     }
 
@@ -255,6 +379,7 @@ impl CredentialSnapshot {
             store,
             source,
             key_sources,
+            legacy_file_warning: None,
         }
     }
 
@@ -272,6 +397,9 @@ struct CredentialMigrationState {
     migrated_keys: BTreeSet<String>,
     #[serde(default)]
     deleted_keys: BTreeSet<String>,
+    /// Native writes supersede these legacy file entries until cleanup succeeds.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    superseded_keys: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for CredentialStore {
@@ -348,7 +476,7 @@ impl std::fmt::Debug for CredentialStore {
 }
 
 impl CredentialStore {
-    pub fn get(&self, key: &str) -> Result<Option<&str>, String> {
+    pub fn get(&self, key: &str) -> Result<Option<&str>, LegacyCredentialError> {
         let value = match key {
             "openai_api_key" => self.openai_api_key.as_deref(),
             "cerebras_api_key" => self.cerebras_api_key.as_deref(),
@@ -374,16 +502,16 @@ impl CredentialStore {
             "aws_session_token" => self.aws_session_token.as_deref(),
             "aws_profile" => self.aws_profile.as_deref(),
             "aws_region" => self.aws_region.as_deref(),
-            _ => return Err(format!("Unknown credential key: {}", key)),
+            _ => return Err(LegacyCredentialError(Code::InvalidCredentialSet)),
         };
         Ok(value)
     }
 
-    pub fn get_owned(&self, key: &str) -> Result<Option<String>, String> {
+    pub fn get_owned(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
         Ok(self.get(key)?.map(str::to_string))
     }
 
-    pub fn is_present(&self, key: &str) -> Result<bool, String> {
+    pub fn is_present(&self, key: &str) -> Result<bool, LegacyCredentialError> {
         Ok(self
             .get(key)?
             .map(str::trim)
@@ -455,7 +583,7 @@ impl CredentialMigrationState {
         }
     }
 
-    fn clear_tracked_keys(&self, store: &mut CredentialStore) -> Result<(), String> {
+    fn clear_tracked_keys(&self, store: &mut CredentialStore) -> Result<(), LegacyCredentialError> {
         for key in self.migrated_keys.iter().chain(self.deleted_keys.iter()) {
             if is_allowed_key(key) {
                 set_field(store, key, None)?;
@@ -464,7 +592,7 @@ impl CredentialMigrationState {
         Ok(())
     }
 
-    fn clear_deleted_keys(&self, store: &mut CredentialStore) -> Result<(), String> {
+    fn clear_deleted_keys(&self, store: &mut CredentialStore) -> Result<(), LegacyCredentialError> {
         for key in &self.deleted_keys {
             if is_allowed_key(key) {
                 set_field(store, key, None)?;
@@ -478,6 +606,7 @@ impl CredentialMigrationState {
             if store.is_present(key).unwrap_or(false) {
                 self.migrated_keys.remove(key);
                 self.deleted_keys.remove(key);
+                self.superseded_keys.remove(key);
             }
         }
     }
@@ -491,83 +620,42 @@ pub fn redacted_secret_presence(value: Option<&str>) -> &'static str {
     }
 }
 
-/// A stable, non-reversible fingerprint of a secret for LOG comparison only.
-///
-/// Emits `sha256:<8 hex chars> len=<n>` — the first 4 bytes (32 bits) of the
-/// SHA-256 of the value, plus its length. This lets two log lines (the SAVE end
-/// in `save_credential_cmd` and the CONNECT end in the Deepgram client) be
-/// compared to answer a single question: *did the key that reached the wire
-/// match the key that was just saved?* If the fingerprints differ, the in-memory
-/// settings cache served a stale key (the confirmed 401 root cause); if they
-/// match, a 401 is a genuine provider-side reject.
-///
-/// SECURITY: this is a one-way hash prefix. It reveals nothing usable about the
-/// secret — never the raw key, never a first-N/last-N slice (which would leak
-/// real characters). 4 bytes is ample to distinguish two distinct keys with
-/// negligible collision risk. An empty/missing value returns `<missing>` so we
-/// never fingerprint the empty string.
-pub fn secret_fingerprint(value: Option<&str>) -> String {
-    use sha2::{Digest, Sha256};
-
-    match value.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(v) => {
-            let digest = Sha256::digest(v.as_bytes());
-            format!("sha256:{} len={}", &hex::encode(digest)[..8], v.len())
-        }
-        None => "<missing>".to_string(),
-    }
-}
-
 fn redacted_presence(value: &Option<String>) -> &'static str {
     redacted_secret_presence(value.as_deref())
 }
 
-pub fn config_dir() -> Result<PathBuf, String> {
-    let base = dirs::config_dir().ok_or_else(|| "Cannot determine config directory".to_string())?;
+pub fn config_dir() -> Result<PathBuf, LegacyCredentialError> {
+    let base = dirs::config_dir().ok_or(LegacyCredentialError(Code::StoreUnavailable))?;
     let dir = base.join("audio-graph");
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| io_error(&e))?;
     Ok(dir)
 }
 
-pub fn credentials_path() -> Result<PathBuf, String> {
+pub fn credentials_path() -> Result<PathBuf, LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || {
         Ok(config_dir()?.join("credentials.yaml"))
     })
 }
 
-fn credential_state_path() -> Result<PathBuf, String> {
+fn credential_state_path() -> Result<PathBuf, LegacyCredentialError> {
     Ok(config_dir()?.join("credentials-state.yaml"))
 }
 
 pub trait CredentialBackend {
     fn source_label(&self) -> &'static str;
-    fn load(&self) -> Result<CredentialStore, String>;
-    fn save(&self, store: &CredentialStore) -> Result<(), String>;
+    fn load(&self) -> Result<CredentialStore, LegacyCredentialError>;
+    fn save(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError>;
 
-    fn load_or_default(&self) -> CredentialStore {
-        match self.load() {
-            Ok(store) => store,
-            Err(e) => {
-                log::error!(
-                    "Failed to load credentials from {} ({}): using empty credential store. \
-                         Backup your file and re-enter credentials in Settings.",
-                    self.source_label(),
-                    e
-                );
-                CredentialStore::default()
-            }
-        }
-    }
-
-    fn get(&self, key: &str) -> Result<Option<String>, String> {
+    fn get(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
         self.load()?.get_owned(key)
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
         // Empty (or whitespace-only) values are treated as "delete" to prevent
         // accidentally clobbering a valid stored credential when a user leaves a
         // form field blank after it was pre-populated from disk. Callers that
         // actually want to clear a credential should use `delete`.
+        validate_key(key)?;
         let trimmed = value.trim();
         if trimmed.is_empty() {
             // Upgraded to info-level so an empty-value skip is visible in the
@@ -579,22 +667,30 @@ pub trait CredentialBackend {
             );
             return Ok(());
         }
-        let mut store = self.load_or_default();
+        let mut store = self.load()?;
         set_field(&mut store, key, Some(trimmed.to_string()))?;
         self.save(&store)
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
-        let mut store = self.load_or_default();
+    fn set_with_warning(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<LegacyCredentialError>, LegacyCredentialError> {
+        self.set(key, value).map(|()| None)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), LegacyCredentialError> {
+        let mut store = self.load()?;
         set_field(&mut store, key, None)?;
         self.save(&store)
     }
 }
 
 trait KeychainStore {
-    fn get_key(&self, key: &str) -> Result<Option<String>, String>;
-    fn set_key(&self, key: &str, value: &str) -> Result<(), String>;
-    fn delete_key(&self, key: &str) -> Result<(), String>;
+    fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError>;
+    fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError>;
+    fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -605,7 +701,7 @@ struct KeychainCredentialBackend<S = OsKeychainStore> {
     store: S,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DefaultCredentialBackend<S = OsKeychainStore> {
     keychain: KeychainCredentialBackend<S>,
     yaml: YamlCredentialBackend,
@@ -614,12 +710,12 @@ struct DefaultCredentialBackend<S = OsKeychainStore> {
     fallback_to_yaml: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct YamlCredentialBackend {
     path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct CredentialMigrationStateBackend {
     path: Option<PathBuf>,
 }
@@ -631,10 +727,18 @@ impl YamlCredentialBackend {
         }
     }
 
-    pub fn resolved_path(&self) -> Result<PathBuf, String> {
+    pub fn resolved_path(&self) -> Result<PathBuf, LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || match &self.path {
             Some(path) => Ok(path.clone()),
             None => credentials_path(),
+        })
+    }
+
+    /// Only keychain mode may ignore an unreadable secondary import source.
+    fn load_secondary(&self) -> Result<CredentialStore, LegacyCredentialError> {
+        self.load().inspect_err(|error| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| log::warn!("Legacy credential file could not be read: {error}"));
         })
     }
 
@@ -653,18 +757,15 @@ impl YamlCredentialBackend {
     /// No-op when the file does not exist or already lacks the key, so a keychain
     /// save never *creates* a plaintext credentials file (nor needlessly rewrites
     /// one, bumping its mtime) just to clear an entry that was never there.
-    fn clear_key(&self, key: &str) -> Result<(), String> {
+    fn clear_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
-            let path = self.resolved_path()?;
-            if !path.exists() {
-                return Ok(());
-            }
-            let mut store = self.load()?;
+            let mut store = self.load_secondary()?;
             if store.get(key)?.is_none() {
                 return Ok(());
             }
             set_field(&mut store, key, None)?;
             self.save(&store)
+                .inspect_err(|error| log::warn!("Credential file cleanup deferred: {error}"))
         })
     }
 }
@@ -677,31 +778,25 @@ impl CredentialMigrationStateBackend {
         }
     }
 
-    fn resolved_path(&self) -> Result<PathBuf, String> {
+    fn resolved_path(&self) -> Result<PathBuf, LegacyCredentialError> {
         match &self.path {
             Some(path) => Ok(path.clone()),
             None => credential_state_path(),
         }
     }
 
-    fn load(&self) -> Result<CredentialMigrationState, String> {
+    fn load(&self) -> Result<CredentialMigrationState, LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
             let path = self.resolved_path()?;
-            if !path.exists() {
-                return Ok(CredentialMigrationState::default());
-            }
-            let contents = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            serde_yaml::from_str::<CredentialMigrationState>(&contents)
-                .map_err(|e| redacted_yaml_parse_error(&path, &e))
+            read_yaml(&path)
         })
     }
 
-    fn save(&self, state: &CredentialMigrationState) -> Result<(), String> {
+    fn save(&self, state: &CredentialMigrationState) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
             let path = self.resolved_path()?;
-            let yaml = serde_yaml::to_string(state)
-                .map_err(|e| format!("Failed to serialize credential migration state: {}", e))?;
+            let yaml =
+                serde_yaml::to_string(state).map_err(|_| LegacyCredentialError(Code::Internal))?;
             let tmp_path = path.with_extension("yaml.tmp");
 
             write_owner_only_temp_file(&tmp_path, &yaml)?;
@@ -711,13 +806,9 @@ impl CredentialMigrationStateBackend {
             // that regression spammed "Failed to finalize credential migration
             // state" every session and could drop presence-state writes. We still
             // attempt the hardening (security intent) and warn on failure.
-            crate::fs_util::set_owner_only(&tmp_path);
-            rename_with_retry(
-                &tmp_path,
-                &path,
-                "Failed to finalize credential migration state",
-            )?;
-            crate::fs_util::set_owner_only(&path);
+            harden_best_effort(&tmp_path);
+            rename_with_retry(&tmp_path, &path)?;
+            harden_best_effort(&path);
 
             Ok(())
         })
@@ -725,8 +816,8 @@ impl CredentialMigrationStateBackend {
 
     fn update(
         &self,
-        f: impl FnOnce(&mut CredentialMigrationState) -> Result<(), String>,
-    ) -> Result<(), String> {
+        f: impl FnOnce(&mut CredentialMigrationState) -> Result<(), LegacyCredentialError>,
+    ) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
             let mut state = self.load()?;
             f(&mut state)?;
@@ -734,21 +825,22 @@ impl CredentialMigrationStateBackend {
         })
     }
 
-    fn mark_migrated(&self, key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    fn mark_migrated(&self, key: &str) -> Result<(), LegacyCredentialError> {
         self.update(|state| {
             state.mark_migrated(key);
             Ok(())
         })
     }
 
-    fn mark_deleted(&self, key: &str) -> Result<(), String> {
+    fn mark_deleted(&self, key: &str) -> Result<(), LegacyCredentialError> {
         self.update(|state| {
             state.mark_deleted(key);
             Ok(())
         })
     }
 
-    fn mark_imported_keys(&self, keys: &[&str]) -> Result<(), String> {
+    fn mark_imported_keys(&self, keys: &[&str]) -> Result<(), LegacyCredentialError> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -760,14 +852,14 @@ impl CredentialMigrationStateBackend {
         })
     }
 
-    fn mark_store_snapshot(&self, store: &CredentialStore) -> Result<(), String> {
+    fn mark_store_snapshot(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError> {
         self.update(|state| {
             state.mark_store_snapshot(store);
             Ok(())
         })
     }
 
-    fn mark_present_keys(&self, store: &CredentialStore) -> Result<(), String> {
+    fn mark_present_keys(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError> {
         if store.present_count() == 0 {
             return Ok(());
         }
@@ -777,7 +869,10 @@ impl CredentialMigrationStateBackend {
         })
     }
 
-    fn mark_file_fallback_store(&self, store: &CredentialStore) -> Result<(), String> {
+    fn mark_file_fallback_store(
+        &self,
+        store: &CredentialStore,
+    ) -> Result<(), LegacyCredentialError> {
         if store.present_count() == 0 {
             return Ok(());
         }
@@ -793,29 +888,19 @@ impl CredentialBackend for YamlCredentialBackend {
         "credentials_yaml"
     }
 
-    fn load(&self) -> Result<CredentialStore, String> {
+    fn load(&self) -> Result<CredentialStore, LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileRead, || {
             let path = self.resolved_path()?;
-            if !path.exists() {
-                // File doesn't exist — this is normal on first run, not an error.
-                return Ok(CredentialStore::default());
-            }
-            let contents = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            // credentials.yaml holds plaintext keys by design — a serde_yaml error's
-            // Display echoes the offending scalar, so route it through the
-            // location-only formatter to keep key fragments out of the surfaced
-            // reason and logs (audio-graph-4243 / cred-review M4).
-            serde_yaml::from_str::<CredentialStore>(&contents)
-                .map_err(|e| redacted_yaml_parse_error(&path, &e))
+            read_yaml(&path)
         })
     }
 
-    fn save(&self, store: &CredentialStore) -> Result<(), String> {
+    fn save(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
             let path = self.resolved_path()?;
-            let yaml = serde_yaml::to_string(store)
-                .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
+            self.load()?;
+            let yaml =
+                serde_yaml::to_string(store).map_err(|_| LegacyCredentialError(Code::Internal))?;
             let tmp_path = path.with_extension("yaml.tmp");
 
             // The secret bytes are written under an owner-only temp file (0o600 on
@@ -830,20 +915,21 @@ impl CredentialBackend for YamlCredentialBackend {
 
             // Set restrictive permissions on the tmp file before rename, in case the
             // rename preserves the source file's permissions on some platforms.
-            crate::fs_util::set_owner_only(&tmp_path);
+            harden_best_effort(&tmp_path);
 
-            rename_with_retry(&tmp_path, &path, "Failed to finalize credentials")?;
+            rename_with_retry(&tmp_path, &path)?;
 
             // And again on the final file to be safe.
-            crate::fs_util::set_owner_only(&path);
+            harden_best_effort(&path);
 
-            log::info!("Credentials saved to {}", path.display());
+            log::info!("Credentials saved");
             Ok(())
         })
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
+            validate_key(key)?;
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 // Upgraded to info-level so an empty-value skip is visible in the
@@ -861,7 +947,7 @@ impl CredentialBackend for YamlCredentialBackend {
         })
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
+    fn delete(&self, key: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
             let mut store = self.load()?;
             set_field(&mut store, key, None)?;
@@ -881,42 +967,39 @@ impl Default for KeychainCredentialBackend {
 impl OsKeychainStore {
     const SERVICE: &'static str = "audio-graph";
 
-    fn entry(&self, key: &str) -> Result<keyring::Entry, String> {
+    fn entry(&self, key: &str) -> Result<keyring::Entry, LegacyCredentialError> {
         if !is_allowed_key(key) {
-            return Err(format!("Unknown credential key: {}", key));
+            return Err(LegacyCredentialError(Code::InvalidCredentialSet));
         }
-        keyring::Entry::new(Self::SERVICE, &format!("provider:{key}"))
-            .map_err(|e| format!("Failed to open OS credential entry {key}: {}", e))
+        keyring::Entry::new(Self::SERVICE, &format!("provider:{key}")).map_err(keyring_error)
     }
 }
 
 impl KeychainStore for OsKeychainStore {
-    fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+    fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::KeychainRead, || {
             let entry = self.entry(key)?;
             match entry.get_password() {
                 Ok(value) => Ok(Some(value)),
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(format!("Failed to read OS credential {key}: {}", e)),
+                Err(e) => Err(keyring_error(e)),
             }
         })
     }
 
-    fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::KeychainWrite, || {
             let entry = self.entry(key)?;
-            entry
-                .set_password(value)
-                .map_err(|e| format!("Failed to save OS credential {key}: {}", e))
+            entry.set_password(value).map_err(keyring_error)
         })
     }
 
-    fn delete_key(&self, key: &str) -> Result<(), String> {
+    fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::KeychainDelete, || {
             let entry = self.entry(key)?;
             match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(format!("Failed to delete OS credential {key}: {}", e)),
+                Err(e) => Err(keyring_error(e)),
             }
         })
     }
@@ -931,32 +1014,19 @@ impl<S: KeychainStore> KeychainCredentialBackend<S> {
     fn import_missing_from_yaml(
         &self,
         keychain_store: &mut CredentialStore,
-        yaml: &YamlCredentialBackend,
-        state_backend: &CredentialMigrationStateBackend,
-    ) -> Vec<&'static str> {
-        let Ok(file_store) = yaml.load() else {
-            return Vec::new();
-        };
-        let state = match state_backend.load() {
-            Ok(state) => state,
-            Err(e) => {
-                log::warn!(
-                    "Skipping credentials.yaml import because migration state is unreadable: {e}"
-                );
-                return Vec::new();
-            }
-        };
+        file_store: &CredentialStore,
+        state: &CredentialMigrationState,
+    ) -> Result<Vec<&'static str>, LegacyCredentialError> {
         let mut imported_keys = Vec::new();
-        for (key, value) in missing_credentials_from_yaml(keychain_store, &file_store, &state) {
-            if self.store.set_key(key, &value).is_ok() {
-                let _ = set_field(keychain_store, key, Some(value));
-                imported_keys.push(key);
+        for (key, value) in missing_credentials_from_yaml(keychain_store, file_store, state) {
+            match self.store.set_key(key, &value) {
+                Ok(()) => imported_keys.push(key),
+                Err(error) => log::warn!("Credential import deferred: {error}"),
             }
+            // YAML is still a valid source for this read if the native import failed.
+            set_field(keychain_store, key, Some(value))?;
         }
-        if let Err(e) = state_backend.mark_imported_keys(&imported_keys) {
-            log::warn!("Failed to record credential import state: {e}");
-        }
-        imported_keys
+        Ok(imported_keys)
     }
 }
 
@@ -965,7 +1035,7 @@ impl<S: KeychainStore> CredentialBackend for KeychainCredentialBackend<S> {
         "os_keychain"
     }
 
-    fn load(&self) -> Result<CredentialStore, String> {
+    fn load(&self) -> Result<CredentialStore, LegacyCredentialError> {
         let mut store = CredentialStore::default();
         for &key in ALLOWED_CREDENTIAL_KEYS {
             if let Some(value) = self.store.get_key(key)? {
@@ -975,7 +1045,8 @@ impl<S: KeychainStore> CredentialBackend for KeychainCredentialBackend<S> {
         Ok(store)
     }
 
-    fn save(&self, store: &CredentialStore) -> Result<(), String> {
+    fn save(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError> {
+        self.load()?;
         for &key in ALLOWED_CREDENTIAL_KEYS {
             match store.get(key)? {
                 Some(value) if !value.trim().is_empty() => self.store.set_key(key, value)?,
@@ -985,11 +1056,12 @@ impl<S: KeychainStore> CredentialBackend for KeychainCredentialBackend<S> {
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Result<Option<String>, String> {
+    fn get(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
         self.store.get_key(key)
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+    fn set(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
+        validate_key(key)?;
         let trimmed = value.trim();
         if trimmed.is_empty() {
             // Upgraded to info-level so an empty-value skip is visible in the
@@ -1004,7 +1076,7 @@ impl<S: KeychainStore> CredentialBackend for KeychainCredentialBackend<S> {
         self.store.set_key(key, trimmed)
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
+    fn delete(&self, key: &str) -> Result<(), LegacyCredentialError> {
         self.store.delete_key(key)
     }
 }
@@ -1022,7 +1094,20 @@ impl DefaultCredentialBackend<OsKeychainStore> {
 }
 
 impl<S: KeychainStore> DefaultCredentialBackend<S> {
-    fn load_with_source(&self) -> Result<CredentialSnapshot, String> {
+    // Always mask a superseded value in this snapshot. Retain the durable marker
+    // if either cleanup step fails, so the next read retries it.
+    fn finish_superseded(&self, key: &str) {
+        if self.yaml.clear_key(key).is_ok()
+            && let Err(error) = self.state.update(|state| {
+                state.superseded_keys.remove(key);
+                Ok(())
+            })
+        {
+            log::warn!("Credential cleanup bookkeeping deferred: {error}");
+        }
+    }
+
+    fn load_with_source(&self) -> Result<CredentialSnapshot, LegacyCredentialError> {
         // Serialize the probe's hidden read-modify-write (mark_present_keys +
         // import_missing_from_yaml) against concurrent set/delete/save so a
         // stale state snapshot written back here can't erase a tombstone or a
@@ -1044,15 +1129,41 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
                 state.clear_deleted_keys(&mut store)?;
                 let mut key_sources =
                     credential_source_map_from_store(&store, self.keychain.source_label());
-                if let Err(e) = self.state.mark_present_keys(&store) {
-                    log::warn!("Failed to record keychain credential presence state: {e}");
+                if let Err(error) = self.state.mark_present_keys(&store) {
+                    log::warn!("Credential presence bookkeeping deferred: {error}");
+                }
+                let mut file_store = match self.yaml.load_secondary() {
+                    Ok(file_store) => file_store,
+                    Err(warning) => {
+                        let mut snapshot = CredentialSnapshot::with_key_sources(
+                            store,
+                            self.keychain.source_label(),
+                            key_sources,
+                        );
+                        snapshot.legacy_file_warning = Some(warning);
+                        return Ok(snapshot);
+                    }
+                };
+                for key in state
+                    .superseded_keys
+                    .iter()
+                    .filter(|key| is_allowed_key(key))
+                {
+                    self.finish_superseded(key);
+                    set_field(&mut file_store, key, None)?;
                 }
                 let imported_keys =
                     self.keychain
-                        .import_missing_from_yaml(&mut store, &self.yaml, &self.state);
+                        .import_missing_from_yaml(&mut store, &file_store, &state)?;
+                if let Err(error) = self.state.mark_imported_keys(&imported_keys) {
+                    log::warn!("Credential import bookkeeping deferred: {error}");
+                }
                 for key in imported_keys {
-                    if store.is_present(key).unwrap_or(false) {
-                        key_sources.insert(key, "imported_file");
+                    key_sources.insert(key, "imported_file");
+                }
+                for &key in ALLOWED_CREDENTIAL_KEYS {
+                    if store.is_present(key)? {
+                        key_sources.entry(key).or_insert("file_fallback");
                     }
                 }
                 // A user who hand-edits credentials.yaml for a key that has
@@ -1064,7 +1175,9 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
                 // (handled above via clear_deleted_keys + the is_deleted guard
                 // inside migrated_overrides_from_yaml) so a delete can't be
                 // resurrected by a stale file value.
-                for (key, value) in self.migrated_overrides_from_yaml(&store, &state)? {
+                for (key, value) in
+                    self.migrated_overrides_from_yaml(&store, &state, &file_store)?
+                {
                     set_field(&mut store, key, Some(value))?;
                     key_sources.insert(key, "file_override");
                 }
@@ -1076,26 +1189,18 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             }
             Err(e) if self.fallback_to_yaml => {
                 log::warn!("OS credential store unavailable; using YAML credential fallback: {e}");
-                self.load_filtered_yaml_fallback()
-                    .map(|store| CredentialSnapshot::new(store, "file_fallback"))
+                let store = self.load_filtered_yaml_fallback()?;
+                Ok(CredentialSnapshot::new(store, "file_fallback"))
             }
             Err(e) => Err(e),
         }
     }
 
-    fn load_filtered_yaml_fallback(&self) -> Result<CredentialStore, String> {
+    fn load_filtered_yaml_fallback(&self) -> Result<CredentialStore, LegacyCredentialError> {
         let mut store = self.yaml.load()?;
         let state = self.state.load()?;
         state.clear_tracked_keys(&mut store)?;
         Ok(store)
-    }
-
-    fn get_filtered_yaml_fallback(&self, key: &str) -> Result<Option<String>, String> {
-        let state = self.state.load()?;
-        if state.is_tracked(key) {
-            return Ok(None);
-        }
-        self.yaml.get(key)
     }
 
     /// Collect plaintext `credentials.yaml` values that should OVERRIDE the
@@ -1114,10 +1219,8 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
         &self,
         keychain_store: &CredentialStore,
         state: &CredentialMigrationState,
-    ) -> Result<Vec<(&'static str, String)>, String> {
-        let Ok(file_store) = self.yaml.load() else {
-            return Ok(Vec::new());
-        };
+        file_store: &CredentialStore,
+    ) -> Result<Vec<(&'static str, String)>, LegacyCredentialError> {
         let mut overrides = Vec::new();
         for &key in ALLOWED_CREDENTIAL_KEYS {
             // Only migrated (not deleted) keys participate; freshly-imported or
@@ -1153,27 +1256,19 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // additionally surfaces `source: "file_override"` in the UI. Logs
             // the key name only, never either secret value.
             //
-            // Dedupe per key: this runs on EVERY probe (App mount, Settings
-            // hydrate, Retry, the a8db window-focus re-probe), so a standing
-            // shadow would re-log dozens of times per session. Warn once per
-            // DISTINCT condition — a non-secret fingerprint of the (keychain,
-            // file) value pair — and re-arm only when either side changes (a
-            // genuinely new condition). The fingerprint never contains a secret.
-            if file_override_shadows_keychain_value(keychain_value) {
-                let fingerprint = format!(
-                    "kc={} file={}",
-                    secret_fingerprint(keychain_value),
-                    secret_fingerprint(Some(file_value)),
-                );
-                if record_shadow_warning_is_new(shadow_warn_state(), key, fingerprint) {
-                    log::warn!(
-                        "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
+            if file_override_shadows_keychain_value(keychain_value)
+                && shadow_warn_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key)
+            {
+                log::warn!(
+                    "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
                          different value stored in the OS keychain. If you rotated this key in \
                          the app, the file edit is overriding your rotation (likely cause of \
                          repeating 401s). Remove or update the {key} entry in credentials.yaml, \
                          or re-save the key in Settings after clearing the file."
-                    );
-                }
+                );
             }
             overrides.push((key, file_value.to_string()));
         }
@@ -1192,11 +1287,11 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
         "credential_backend"
     }
 
-    fn load(&self) -> Result<CredentialStore, String> {
+    fn load(&self) -> Result<CredentialStore, LegacyCredentialError> {
         self.load_with_source().map(|snapshot| snapshot.store)
     }
 
-    fn save(&self, store: &CredentialStore) -> Result<(), String> {
+    fn save(&self, store: &CredentialStore) -> Result<(), LegacyCredentialError> {
         // Same critical section as the probe: the keychain write + the state
         // snapshot must not interleave with a concurrent probe's stale-state
         // write-back (audio-graph-cf22 / cred-review M1).
@@ -1205,9 +1300,7 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
             return self.yaml.save(store);
         }
         match self.keychain.save(store) {
-            Ok(()) => self.state.mark_store_snapshot(store).map_err(|e| {
-                format!("OS credentials saved, but failed to update migration state: {e}")
-            }),
+            Ok(()) => self.state.mark_store_snapshot(store),
             Err(e) if self.fallback_to_yaml => {
                 log::warn!(
                     "OS credential store unavailable; saving to YAML credential fallback: {e}"
@@ -1219,76 +1312,82 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
         }
     }
 
-    fn get(&self, key: &str) -> Result<Option<String>, String> {
+    fn get(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
+        let _io_guard = lock_credential_io();
         if self.file_backend {
             return self.yaml.get(key);
         }
         match self.keychain.get(key) {
-            Ok(Some(value)) => {
+            Ok(value) => {
                 let state = self.state.load()?;
+                if state.superseded_keys.contains(key) {
+                    self.finish_superseded(key);
+                    return Ok(value.filter(|_| !state.is_deleted(key)));
+                }
                 if state.is_deleted(key) {
                     return Ok(None);
                 }
-                // Honor a hand-edited credentials.yaml plaintext value for a
-                // migrated key (BUG 7fc5) so single-key reads match the
-                // snapshot loader's precedence: file override beats keychain.
-                if state.migrated_keys.contains(key)
-                    && let Some(file_value) = self.yaml.get(key).ok().flatten()
+                // An existing native value only takes a file override after migration.
+                // A missing native value only imports an untracked file entry.
+                let migrated = state.migrated_keys.contains(key);
+                let consult_file = matches!((&value, migrated), (Some(_), true) | (None, false));
+                if consult_file
+                    && let Ok(file) = self.yaml.load_secondary()
+                    && let Some(legacy) = file.get(key)?.map(str::trim).filter(|v| !v.is_empty())
                 {
-                    let file_value = file_value.trim();
-                    if !file_value.is_empty() {
-                        return Ok(Some(file_value.to_string()));
-                    }
+                    return Ok(Some(legacy.to_owned()));
                 }
-                Ok(Some(value))
+                Ok(value)
             }
-            Ok(None) => self.get_filtered_yaml_fallback(key),
-            Err(e) if self.fallback_to_yaml => {
+            Err(error) if self.fallback_to_yaml => {
                 log::warn!(
-                    "OS credential store unavailable; reading YAML credential fallback: {e}"
+                    "OS credential store unavailable; reading YAML credential fallback: {error}"
                 );
-                self.get_filtered_yaml_fallback(key)
+                self.load_filtered_yaml_fallback()?.get_owned(key)
             }
             Err(e) => Err(e),
         }
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), String> {
-        // Serialize the keychain write + `mark_migrated` against a concurrent
-        // probe so the probe's stale-state write-back can't drop this migration
-        // and re-arm a YAML import over the fresh value (cred-review M1).
+    fn set(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
+        self.set_with_warning(key, value)?.map_or(Ok(()), Err)
+    }
+
+    fn set_with_warning(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<LegacyCredentialError>, LegacyCredentialError> {
         let _io_guard = lock_credential_io();
         if self.file_backend {
-            return self.yaml.set(key, value);
+            return self.yaml.set(key, value).map(|()| None);
         }
         match self.keychain.set(key, value) {
+            Ok(()) if value.trim().is_empty() => Ok(None),
             Ok(()) => {
-                self.state.mark_migrated(key).map_err(|e| {
-                    format!("OS credential saved, but failed to update migration state: {e}")
-                })?;
-                // An empty/whitespace value is a no-op skip inside `keychain.set`
-                // (it deliberately preserves the stored key rather than clearing
-                // it — callers use `delete` to clear). It wrote nothing, so leave
-                // the file entry untouched too: clearing on a blank-field save
-                // would silently drop a user's plaintext credentials.yaml entry.
-                if value.trim().is_empty() {
-                    return Ok(());
+                let mut was_deleted = false;
+                if let Err(error) = self.state.update(|state| {
+                    was_deleted = state.is_deleted(key);
+                    state.mark_migrated(key);
+                    state.superseded_keys.insert(key.to_owned());
+                    Ok(())
+                }) {
+                    if was_deleted {
+                        // The durable tombstone still hides this write. Leave the native
+                        // value in place: a successful retry replaces it and clears the
+                        // tombstone without requiring a compensating keychain delete.
+                        return Err(error);
+                    }
+                    log::warn!("Credential saved without migration bookkeeping: {error}");
+                    let warning = if self.yaml.clear_key(key).is_err() {
+                        LegacyCredentialError(Code::LegacyCleanupRequired)
+                    } else {
+                        error
+                    };
+                    return Ok(Some(warning));
                 }
-                // audio-graph-79aa: clear any stale plaintext entry for this key
-                // from credentials.yaml in the SAME critical section as the
-                // keychain write. Without this, a `credentials.yaml` value left
-                // over from before migration permanently shadows the value we
-                // just wrote (`migrated_overrides_from_yaml` treats a non-empty
-                // file entry as a hand-edit that beats the keychain) — the exact
-                // Deepgram-401 loop where a user re-saves a rotated key and reads
-                // keep returning the old one. After clearing, `file_override` can
-                // only ever represent a hand-edit made AFTER this save.
-                self.yaml.clear_key(key).map_err(|e| {
-                    format!(
-                        "OS credential saved, but failed to clear the stale \
-                         credentials.yaml entry (it would still shadow the new value): {e}"
-                    )
-                })
+                self.finish_superseded(key);
+                Ok(None)
             }
             Err(e) if self.fallback_to_yaml => {
                 log::warn!(
@@ -1297,13 +1396,15 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
                 self.yaml.set(key, value)?;
                 let mut fallback_store = CredentialStore::default();
                 set_field(&mut fallback_store, key, Some(value.trim().to_string()))?;
-                self.state.mark_file_fallback_store(&fallback_store)
+                self.state
+                    .mark_file_fallback_store(&fallback_store)
+                    .map(|()| None)
             }
             Err(e) => Err(e),
         }
     }
 
-    fn delete(&self, key: &str) -> Result<(), String> {
+    fn delete(&self, key: &str) -> Result<(), LegacyCredentialError> {
         // The tombstone write (`mark_deleted`) is exactly what a racing probe's
         // stale-state write-back would erase, resurrecting the key. Serialize
         // the keychain delete + tombstone against the probe (cred-review M1).
@@ -1313,34 +1414,12 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
         }
         match self.keychain.delete(key) {
             Ok(()) => {
-                self.state.mark_deleted(key).map_err(|e| {
-                    format!("OS credential deleted, but failed to update migration state: {e}")
+                self.state.update(|state| {
+                    state.mark_deleted(key);
+                    state.superseded_keys.insert(key.to_owned());
+                    Ok(())
                 })?;
-                // audio-graph-79aa (symmetric writer, per review-check-symmetric-
-                // writers): clear the key's plaintext entry from credentials.yaml
-                // too. The tombstone alone already masks a stale file value on
-                // read (clear_deleted_keys + the is_deleted guard in
-                // migrated_overrides_from_yaml), but leaving the plaintext entry
-                // behind means a lost/reset credentials-state.yaml would re-import
-                // and resurrect the deleted key — and leaves a deleted secret
-                // sitting in plaintext on disk. Clearing it here makes the delete
-                // durable and removes the leftover plaintext, in the same
-                // critical section as the keychain delete + tombstone.
-                // Best-effort (Codex P2, PR #94): the tombstone written above
-                // already masks the yaml value on every read path, so this
-                // delete has semantically succeeded — a clear_key failure here
-                // (corrupt/unwritable legacy yaml) must not fail it and strand
-                // the caller's epoch-bump/cache-rehydrate. The warn keeps the
-                // signal for the lost-state-file resurrection edge case.
-                // Contrast set(): there a failed clear leaves the stale entry
-                // SHADOWING the value just saved — the save genuinely did not
-                // take effect for readers — so set() keeps propagating.
-                if let Err(e) = self.yaml.clear_key(key) {
-                    log::warn!(
-                        "OS credential deleted, but failed to clear its \
-                         credentials.yaml entry (a lost state file could resurrect it): {e}"
-                    );
-                }
+                self.finish_superseded(key);
                 Ok(())
             }
             Err(e) if self.fallback_to_yaml => {
@@ -1415,46 +1494,36 @@ fn file_override_shadows_keychain_value(keychain_value: Option<&str>) -> bool {
     keychain_value.map(str::trim).is_some_and(|v| !v.is_empty())
 }
 
-/// cred-review m1 (dedupe): per-key record of the last shadow condition we
-/// already warned about, so a *persistent* shadow doesn't re-log on every
-/// probe.
-///
-/// `load_with_source` (and therefore `migrated_overrides_from_yaml`) runs on
-/// every presence probe — App mount, Settings hydrate, Retry, and now the a8db
-/// window-focus re-probe — so a standing shadow condition (a stale
-/// `credentials.yaml` entry masking a rotated keychain key) would otherwise emit
-/// the identical warning dozens of times per session, drowning the signal in a
-/// bug-report log. The value stored per key is a NON-SECRET fingerprint of the
-/// (keychain, file) value pair; rotating either side changes the fingerprint and
-/// re-arms the warning (a genuinely new condition worth surfacing again).
-static SHADOW_WARN_STATE: OnceLock<Mutex<BTreeMap<&'static str, String>>> = OnceLock::new();
-
-fn shadow_warn_state() -> &'static Mutex<BTreeMap<&'static str, String>> {
-    SHADOW_WARN_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+/// Report an override once per allowlisted key per process.
+fn shadow_warn_state() -> &'static Mutex<BTreeSet<&'static str>> {
+    static WARNED: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    WARNED.get_or_init(Mutex::default)
 }
 
-/// Record that a shadow condition for `key` (identified by the non-secret
-/// `fingerprint` of its keychain/file value pair) is about to be reported, and
-/// return whether it is a NEW condition that should actually be logged.
-///
-/// Returns `true` (and records the fingerprint) the first time a given
-/// condition is seen and again whenever the fingerprint changes; returns
-/// `false` for an unchanged repeat so the caller can suppress a redundant warn.
-/// Takes the state map explicitly so unit tests can exercise the dedupe/re-arm
-/// logic on a local map without touching the process-wide static.
-fn record_shadow_warning_is_new(
-    state: &Mutex<BTreeMap<&'static str, String>>,
-    key: &'static str,
-    fingerprint: String,
-) -> bool {
-    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
-    match guard.get(key) {
-        Some(prev) if prev == &fingerprint => false,
-        _ => {
-            guard.insert(key, fingerprint);
-            true
+#[cfg(test)]
+thread_local! {
+    static COMMAND_TEST_BACKEND: std::cell::RefCell<Option<Box<dyn CredentialBackend>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_command_test_backend(backend: Box<dyn CredentialBackend>, test: impl FnOnce()) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMMAND_TEST_BACKEND.with_borrow_mut(|slot| *slot = None);
         }
     }
+    COMMAND_TEST_BACKEND.with_borrow_mut(|slot| assert!(slot.replace(backend).is_none()));
+    let _reset = Reset;
+    test();
+}
+
+fn with_backend<T>(op: impl FnOnce(&dyn CredentialBackend) -> T) -> T {
+    #[cfg(test)]
+    if COMMAND_TEST_BACKEND.with_borrow(Option::is_some) {
+        return COMMAND_TEST_BACKEND.with_borrow(|slot| op(slot.as_deref().unwrap()));
+    }
+    op(&default_backend())
 }
 
 fn missing_credentials_from_yaml(
@@ -1491,18 +1560,11 @@ fn missing_credentials_from_yaml(
 /// was removed out from under a running app) do not. Ensuring the parent here
 /// — in the shared temp writer — covers both `YamlCredentialBackend::save` and
 /// `CredentialMigrationStateBackend::save`.
-fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+fn ensure_parent_dir(path: &Path) -> Result<(), LegacyCredentialError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
     {
-        fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create credentials directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
+        fs::create_dir_all(parent).map_err(|e| io_error(&e))?;
     }
     Ok(())
 }
@@ -1513,7 +1575,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 /// handle to the freshly-written temp file, making `fs::rename` fail with a
 /// sharing violation. A short bounded retry turns those transient races into a
 /// success instead of a spurious save failure / WARN.
-fn rename_with_retry(from: &Path, to: &Path, context: &str) -> Result<(), String> {
+fn rename_with_retry(from: &Path, to: &Path) -> Result<(), LegacyCredentialError> {
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_err = None;
     for attempt in 0..MAX_ATTEMPTS {
@@ -1527,9 +1589,8 @@ fn rename_with_retry(from: &Path, to: &Path, context: &str) -> Result<(), String
             }
         }
     }
-    Err(format!(
-        "{context}: {}",
-        last_err.expect("at least one rename attempt failed")
+    Err(io_error(
+        &last_err.expect("at least one rename attempt failed"),
     ))
 }
 
@@ -1542,25 +1603,18 @@ fn rename_with_retry(from: &Path, to: &Path, context: &str) -> Result<(), String
 /// "remove-if-exists then create_new", NOT a blind truncate. If the path
 /// doesn't exist this is a no-op; a removal failure is surfaced so we don't
 /// silently paper over a locked / undeletable file.
-fn remove_stale_temp(path: &Path) -> Result<(), String> {
+fn remove_stale_temp(path: &Path) -> Result<(), LegacyCredentialError> {
     match fs::remove_file(path) {
         Ok(()) => {
-            log::warn!(
-                "Removed stale credentials temp {} left by a prior aborted write",
-                path.display()
-            );
+            log::warn!("Removed stale credentials temp file");
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "Failed to remove stale credentials temp {}: {}",
-            path.display(),
-            e
-        )),
+        Err(_) => Err(LegacyCredentialError(Code::LegacyCleanupRequired)),
     }
 }
 
-fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String> {
+fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), LegacyCredentialError> {
     // Ensure the destination directory exists before we create the temp file
     // (BUG 381c) — otherwise the create_new open below, and the caller's rename
     // onto a sibling path, fail with os error 2 on a missing parent.
@@ -1582,9 +1636,8 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
             .write(true)
             .mode(0o600)
             .open(path)
-            .map_err(|e| format!("Failed to create credentials temp: {}", e))?;
-        f.write_all(contents.as_bytes())
-            .map_err(|e| format!("Failed to write credentials: {}", e))?;
+            .map_err(|e| io_error(&e))?;
+        f.write_all(contents.as_bytes()).map_err(|e| io_error(&e))?;
     }
 
     #[cfg(not(unix))]
@@ -1593,7 +1646,7 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
             .create_new(true)
             .write(true)
             .open(path)
-            .map_err(|e| format!("Failed to create credentials temp: {}", e))?;
+            .map_err(|e| io_error(&e))?;
         // On Windows, `set_owner_only` applies an owner-only ACL via icacls.
         // Apply it before writing secret bytes so the temp file is empty during
         // the brief default-ACL window. BEST-EFFORT: a non-zero icacls result
@@ -1601,9 +1654,8 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
         // WARNs, and could drop the user's key write). We still attempt the
         // pre-write hardening and warn on failure — this is strictly better
         // than the pre-regression behaviour, which had no pre-write ACL at all.
-        crate::fs_util::set_owner_only(path);
-        f.write_all(contents.as_bytes())
-            .map_err(|e| format!("Failed to write credentials: {}", e))?;
+        harden_best_effort(path);
+        f.write_all(contents.as_bytes()).map_err(|e| io_error(&e))?;
     }
 
     Ok(())
@@ -1620,29 +1672,28 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
 // default API. Re-introduce a merge-on-save variant if a batch writer is ever
 // needed.
 
-pub fn load_credentials() -> CredentialStore {
+pub fn load_credentials() -> Result<CredentialStore, LegacyCredentialError> {
+    try_load_credentials()
+}
+
+/// Read the configured store. A missing first-run file is empty. Read failures propagate.
+pub fn try_load_credentials() -> Result<CredentialStore, LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-        default_backend().load_or_default()
+        with_backend(|backend| backend.load())
     })
 }
 
-/// Load credentials with detailed error reporting.
-/// Returns `Ok(store)` for success (including the missing-file case with an
-/// empty store), and `Err(reason)` only when the file exists but cannot be
-/// parsed or read.
-pub fn try_load_credentials() -> Result<CredentialStore, String> {
-    with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-        default_backend().load()
-    })
-}
-
-pub fn try_load_credentials_with_source() -> Result<CredentialSnapshot, String> {
+pub fn try_load_credentials_with_source() -> Result<CredentialSnapshot, LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
         default_backend().load_with_source()
     })
 }
 
-fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> Result<(), String> {
+fn set_field(
+    store: &mut CredentialStore,
+    key: &str,
+    value: Option<String>,
+) -> Result<(), LegacyCredentialError> {
     match key {
         "openai_api_key" => store.openai_api_key = value,
         "cerebras_api_key" => store.cerebras_api_key = value,
@@ -1668,20 +1719,29 @@ fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> R
         "aws_session_token" => store.aws_session_token = value,
         "aws_profile" => store.aws_profile = value,
         "aws_region" => store.aws_region = value,
-        _ => return Err(format!("Unknown credential key: {}", key)),
+        _ => return Err(LegacyCredentialError(Code::InvalidCredentialSet)),
     }
     Ok(())
 }
 
-pub fn set_credential(key: &str, value: &str) -> Result<(), String> {
+pub fn set_credential(key: &str, value: &str) -> Result<(), LegacyCredentialError> {
+    set_credential_with_warning(key, value)?.map_or(Ok(()), Err)
+}
+
+pub fn set_credential_with_warning(
+    key: &str,
+    value: &str,
+) -> Result<Option<LegacyCredentialError>, LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-        default_backend().set(key, value)
+        with_backend(|backend| backend.set_with_warning(key, value))
     })
 }
 
 /// Store the stdin-only Jev credential in the OS backend, never file fallback.
-/// Returns presence confirmation only; errors and input are never formatted.
-pub fn save_typesafe_credential_from_reader(reader: impl std::io::Read) -> bool {
+/// Verify the saved value by reading it back. Only a closed diagnostic leaves on failure.
+pub fn save_typesafe_credential_from_reader(
+    reader: impl std::io::Read,
+) -> Result<(), LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
         let backend = DefaultCredentialBackend {
             keychain: KeychainCredentialBackend::default(),
@@ -1697,7 +1757,7 @@ pub fn save_typesafe_credential_from_reader(reader: impl std::io::Read) -> bool 
 fn save_typesafe_from_reader(
     backend: &impl CredentialBackend,
     mut reader: impl std::io::Read,
-) -> bool {
+) -> Result<(), LegacyCredentialError> {
     const MAX_INPUT_BYTES: usize = 16 * 1024;
     const KEY: &str = "typesafe_api_key";
     let mut input = zeroize::Zeroizing::new([0_u8; MAX_INPUT_BYTES + 1]);
@@ -1708,36 +1768,36 @@ fn save_typesafe_from_reader(
             Ok(count) => {
                 used += count;
                 if used > MAX_INPUT_BYTES {
-                    return false;
+                    return Err(LegacyCredentialError(Code::PayloadTooLarge));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            Err(e) => return Err(io_error(&e)),
         }
     }
-    let Ok(value) = std::str::from_utf8(&input[..used]) else {
-        return false;
-    };
-    let value = value.trim();
+    let value = std::str::from_utf8(&input[..used])
+        .map_err(|_| LegacyCredentialError(Code::InvalidCredentialSet))?
+        .trim();
     if value.is_empty() || value.chars().any(char::is_control) {
-        return false;
+        return Err(LegacyCredentialError(Code::InvalidCredentialSet));
     }
-    if backend.set(KEY, value).is_err() {
-        return false;
+    backend.set(KEY, value)?;
+    let saved = backend.get(KEY)?.map(zeroize::Zeroizing::new);
+    if saved.as_ref().is_some_and(|saved| saved.as_str() == value) {
+        Ok(())
+    } else {
+        Err(LegacyCredentialError(Code::CommitUnknown))
     }
-    backend
-        .get(KEY)
-        .ok()
-        .flatten()
-        .map(zeroize::Zeroizing::new)
-        .is_some_and(|saved| saved.as_str() == value)
 }
 
-pub fn delete_credential(key: &str) -> Result<(), String> {
+pub fn delete_credential(key: &str) -> Result<(), LegacyCredentialError> {
     with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-        default_backend().delete(key)
+        with_backend(|backend| backend.delete(key))
     })
 }
+
+#[cfg(test)]
+pub(crate) use tests::{assert_closed, with_partially_locked_keychain};
 
 #[cfg(test)]
 mod tests {
@@ -1745,60 +1805,562 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    pub(crate) fn assert_closed(error: LegacyCredentialError, code: Code, canaries: &[&str]) {
+        assert_eq!(error.0, code);
+        let ipc_error = crate::error::AppError::from(error);
+        let wire = serde_json::to_value(&ipc_error).unwrap();
+        assert_eq!(wire["code"], "runtime_diagnostic");
+        assert_eq!(wire["diagnostic"]["detail"]["code"], code.as_str());
+        let sinks = [
+            error.to_string(),
+            format!("{error:?}"),
+            serde_json::to_string(&error).unwrap(),
+            ipc_error.to_string(),
+            format!("{ipc_error:?}"),
+            wire.to_string(),
+        ];
+        for canary in canaries {
+            assert!(sinks.iter().all(|sink| !sink.contains(canary)));
+        }
+        crate::test_log_capture::assert_process_logs_exclude(canaries);
+    }
+
     #[test]
-    fn secret_fingerprint_is_stable_non_secret_and_distinguishes_keys() {
-        // Deterministic: the same key always fingerprints identically (this is
-        // what lets the SAVE-end and CONNECT-end log lines be compared).
-        let a = secret_fingerprint(Some("deepgram-key-one"));
-        assert_eq!(a, secret_fingerprint(Some("deepgram-key-one")));
+    fn keyring_failures_drop_native_payloads_at_the_adapter() {
+        use std::io::{Error, ErrorKind};
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let canaries = [
+            "canary-prose-heron",
+            "canary-heron-path",
+            "canary-heron-value",
+        ];
+        let prose = canaries.join(" ");
+        for (native, expected) in [
+            (keyring::Error::NoEntry, Code::Missing),
+            (
+                keyring::Error::NoStorageAccess(Box::new(Error::new(
+                    ErrorKind::WouldBlock,
+                    prose.clone(),
+                ))),
+                Code::Locked,
+            ),
+            (
+                keyring::Error::PlatformFailure(Box::new(Error::new(
+                    ErrorKind::PermissionDenied,
+                    prose.clone(),
+                ))),
+                Code::AccessDenied,
+            ),
+            (
+                keyring::Error::NoStorageAccess(prose.clone().into()),
+                Code::StoreUnavailable,
+            ),
+            (
+                keyring::Error::BadDataFormat(prose.as_bytes().to_vec(), prose.clone().into()),
+                Code::CorruptRecord,
+            ),
+            (
+                keyring::Error::PlatformFailure(prose.into()),
+                Code::Internal,
+            ),
+        ] {
+            assert_closed(keyring_error(native), expected, &canaries);
+        }
+    }
 
-        // Two DIFFERENT keys produce DIFFERENT fingerprints — the whole point
-        // of the diagnostic (stale-cache 401 detection).
-        let b = secret_fingerprint(Some("deepgram-key-two-different"));
-        assert_ne!(a, b);
-
-        // Shape: `sha256:<8 hex chars> len=<n>` — exactly 8 hex chars (4 bytes)
-        // and the true length. NEVER the raw key, never a slice of it.
-        assert!(a.starts_with("sha256:"));
-        let hex_part = a
-            .strip_prefix("sha256:")
-            .and_then(|s| s.split(" len=").next())
-            .expect("fingerprint has the documented shape");
-        assert_eq!(hex_part.len(), 8, "must be 4 bytes = 8 hex chars: {a}");
-        assert!(
-            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
-            "hex prefix must be hex only: {a}"
+    #[test]
+    fn stale_temp_cleanup_failure_leaves_the_store_intact() {
+        let path = std::env::temp_dir().join(format!(
+            "canary-chestnut-path-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        let backend = YamlCredentialBackend::with_path(&path);
+        let tmp_path = path.with_extension("yaml.tmp");
+        let original = "aws_region: canary-chestnut-value";
+        fs::write(&path, original).unwrap();
+        fs::create_dir(&tmp_path).unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        assert_closed(
+            backend.delete("aws_region").unwrap_err(),
+            Code::LegacyCleanupRequired,
+            &["canary-chestnut-path", "canary-chestnut-value"],
         );
-        assert!(a.ends_with("len=16"), "must record the true length: {a}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(tmp_path).unwrap();
+    }
 
-        // Crucially, the fingerprint must NOT contain the raw secret or any
-        // contiguous slice of it — only the one-way hash prefix.
-        let secret = "deepgram-key-one";
-        assert!(
-            !a.contains(secret),
-            "fingerprint must not leak the key: {a}"
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_refuses_reads_and_writes_without_disclosing_its_path() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path =
+            std::env::temp_dir().join(format!("canary-maple-path-{}.yaml", uuid::Uuid::new_v4()));
+        let original = "aws_region: canary-maple-value";
+        fs::write(&path, original).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let backend = YamlCredentialBackend::with_path(&path);
+        for error in [
+            backend.load().unwrap_err(),
+            backend.save(&CredentialStore::default()).unwrap_err(),
+        ] {
+            assert_closed(
+                error,
+                Code::Locked,
+                &["canary-maple-path", "canary-maple-value"],
+            );
+        }
+        drop(lock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fallback_distinguishes_missing_empty_and_unreadable_files() {
+        let path =
+            std::env::temp_dir().join(format!("canary-finch-path-{}.yaml", uuid::Uuid::new_v4()));
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(path.with_extension("state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: true,
+        };
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        for contents in [None, Some(""), Some("{}")] {
+            if let Some(contents) = contents {
+                fs::write(&path, contents).unwrap();
+            }
+            let snapshot = backend.load_with_source().unwrap();
+            assert_eq!(snapshot.source, "file_fallback");
+            assert_eq!(snapshot.store.present_count(), 0);
+            assert_eq!(backend.get("aws_region").unwrap(), None);
+        }
+        fs::write(&path, "canary-finch-prose").unwrap();
+        for error in [
+            backend.load().unwrap_err(),
+            backend.get("aws_region").unwrap_err(),
+        ] {
+            assert_closed(
+                error,
+                Code::CorruptRecord,
+                &["canary-finch-path", "canary-finch-prose"],
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unknown_migration_names_survive_updates_but_invalid_state_remains_fatal() {
+        let path =
+            std::env::temp_dir().join(format!("canary-thrush-path-{}.yaml", uuid::Uuid::new_v4()));
+        let backend = CredentialMigrationStateBackend::with_path(&path);
+        fs::write(&path, "deleted_keys: [canary-thrush-field]").unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        backend.mark_migrated("aws_region").unwrap();
+        let persisted = backend.load().unwrap();
+        assert!(persisted.is_deleted("canary-thrush-field"));
+        assert!(persisted.migrated_keys.contains("aws_region"));
+        fs::write(&path, "canary-thrush-value").unwrap();
+        assert_closed(
+            backend.mark_deleted("aws_region").unwrap_err(),
+            Code::CorruptRecord,
+            &[
+                "canary-thrush-path",
+                "canary-thrush-value",
+                "canary-thrush-field",
+            ],
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "canary-thrush-value");
+        fs::remove_file(path).unwrap();
+    }
+
+    pub(crate) fn with_partially_locked_keychain(expected: Option<&str>, test: impl FnOnce()) {
+        let dir = std::env::temp_dir().join(format!("canary-cedar-path-{}", uuid::Uuid::new_v4()));
+        let fake = FakeKeychainStore {
+            unreadable_key: Some("aws_region"),
+            ..Default::default()
+        };
+        fake.set_initial("openai_api_key", "canary-cedar-old");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(dir.join("credentials.yaml")),
+            state: CredentialMigrationStateBackend::with_path(dir.join("state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        with_command_test_backend(Box::new(backend), test);
+        assert_eq!(fake.value("openai_api_key").as_deref(), expected);
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn repaired_file_cannot_override_a_rotation_or_resurrect_a_deletion() {
+        let dir = std::env::temp_dir().join(format!("canary-beech-path-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("credentials.yaml");
+        let state_path = dir.join("state.yaml");
+        let original = "aws_region: canary-beech-old\ngroq_api_key: canary-beech-deleted\ngemini_api_key: canary-beech-keep\n";
+        let malformed = format!("{original}[");
+        fs::write(&path, &malformed).unwrap();
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("groq_api_key", "canary-beech-deleted");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(&state_path),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        assert_eq!(
+            backend
+                .set_with_warning("aws_region", "canary-beech-new")
+                .unwrap(),
+            None
+        );
+        backend.delete("groq_api_key").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+        assert_eq!(
+            backend.state.load().unwrap().superseded_keys,
+            ["aws_region".to_owned(), "groq_api_key".to_owned()]
+                .into_iter()
+                .collect()
         );
         assert!(
-            !a.contains(&secret[..4]),
-            "fingerprint must not leak a prefix slice of the key: {a}"
+            !fs::read_to_string(&state_path)
+                .unwrap()
+                .contains("canary-beech")
+        );
+        fs::write(&path, original).unwrap();
+        let blocked_cleanup = path.with_extension("yaml.tmp");
+        fs::create_dir(&blocked_cleanup).unwrap();
+        assert_eq!(
+            backend.get("aws_region").unwrap().as_deref(),
+            Some("canary-beech-new")
+        );
+        assert_eq!(backend.get("groq_api_key").unwrap(), None);
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-beech-new")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(backend.state.load().unwrap().superseded_keys.len(), 2);
+        fs::remove_dir(blocked_cleanup).unwrap();
+        let store = backend.load().unwrap();
+        assert_eq!(store.aws_region.as_deref(), Some("canary-beech-new"));
+        assert_eq!(store.groq_api_key, None);
+        let file = backend.yaml.load().unwrap();
+        assert_eq!(file.aws_region, None);
+        assert_eq!(file.groq_api_key, None);
+        assert_eq!(file.gemini_api_key.as_deref(), Some("canary-beech-keep"));
+        assert!(backend.state.load().unwrap().superseded_keys.is_empty());
+        // A later hand edit is once again a genuine override.
+        backend
+            .yaml
+            .set("aws_region", "canary-beech-hand-edit")
+            .unwrap();
+        assert_eq!(
+            backend.get("aws_region").unwrap().as_deref(),
+            Some("canary-beech-hand-edit")
         );
 
-        // Empty / whitespace / missing all map to the missing sentinel so we
-        // never fingerprint (and thus never hash-log) the empty string.
-        assert_eq!(secret_fingerprint(None), "<missing>");
-        assert_eq!(secret_fingerprint(Some("")), "<missing>");
-        assert_eq!(secret_fingerprint(Some("   ")), "<missing>");
+        fs::write(&path, &malformed).unwrap();
+        fs::create_dir(state_path.with_extension("yaml.tmp")).unwrap();
+        let warning = backend
+            .set_with_warning("aws_region", "canary-beech-rotated")
+            .unwrap()
+            .unwrap();
+        assert_closed(warning, Code::LegacyCleanupRequired, &["canary-beech"]);
+        assert_eq!(
+            fake.value("aws_region").as_deref(),
+            Some("canary-beech-rotated")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn keychain_backend_in(dir: &Path) -> DefaultCredentialBackend<FakeKeychainStore> {
+        DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(dir.join("credentials.yaml")),
+            state: CredentialMigrationStateBackend::with_path(dir.join("state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        }
+    }
+
+    #[test]
+    fn failed_state_write_keeps_a_resaved_deleted_key_hidden() {
+        let dir = std::env::temp_dir().join(format!("canary-pear-path-{}", uuid::Uuid::new_v4()));
+        let backend = keychain_backend_in(&dir);
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "aws_region";
+        backend.set(key, "canary-pear-old").unwrap();
+        backend.delete(key).unwrap();
+        let blocked = dir.join("state.yaml.tmp");
+        fs::create_dir(&blocked).unwrap();
+
+        let result = backend.set_with_warning(key, "canary-pear-new");
+        assert_eq!(
+            backend.keychain.get(key).unwrap().as_deref(),
+            Some("canary-pear-new")
+        );
+        assert_eq!(backend.get(key).unwrap(), None);
+        assert_eq!(backend.load().unwrap().aws_region, None);
+        fs::remove_dir(blocked).unwrap();
+        assert_eq!(
+            backend.set_with_warning(key, "canary-pear-retry").unwrap(),
+            None
+        );
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-pear-retry")
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_closed(
+            result.unwrap_err(),
+            Code::LegacyCleanupRequired,
+            &["canary-pear"],
+        );
+    }
+
+    #[test]
+    fn failed_state_write_returns_a_warning_when_cleanup_makes_the_save_visible() {
+        let dir = std::env::temp_dir().join(format!("canary-plum-path-{}", uuid::Uuid::new_v4()));
+        let backend = keychain_backend_in(&dir);
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "aws_region";
+        backend.set(key, "canary-plum-old").unwrap();
+        backend.yaml.set(key, "canary-plum-file").unwrap();
+        fs::create_dir(dir.join("state.yaml.tmp")).unwrap();
+
+        let warning = backend
+            .set_with_warning(key, "canary-plum-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(backend.yaml.get(key).unwrap(), None);
+        assert_eq!(
+            backend.get(key).unwrap().as_deref(),
+            Some("canary-plum-new")
+        );
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-plum-new")
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_closed(warning, Code::LegacyCleanupRequired, &["canary-plum"]);
+    }
+
+    #[test]
+    fn unreadable_secondary_yaml_never_blocks_keychain_reads_or_writes() {
+        let path =
+            std::env::temp_dir().join(format!("canary-pine-path-{}.yaml", uuid::Uuid::new_v4()));
+        let state_path = path.with_extension("state.yaml");
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("aws_region", "canary-pine-old");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(&state_path),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        fs::write(&path, "canary-pine-prose").unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-pine-old")
+        );
+        let warning = backend
+            .load_with_source()
+            .unwrap()
+            .legacy_file_warning
+            .unwrap();
+        assert_closed(
+            warning,
+            Code::CorruptRecord,
+            &["canary-pine-path", "canary-pine-prose"],
+        );
+        backend.set("aws_region", "canary-pine-new").unwrap();
+        assert_eq!(
+            backend.get("aws_region").unwrap().as_deref(),
+            Some("canary-pine-new")
+        );
+        assert_eq!(backend.get("groq_api_key").unwrap(), None);
+        backend.delete("aws_region").unwrap();
+        assert_eq!(backend.get("aws_region").unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "canary-pine-prose");
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            "canary-pine-prose",
+            "canary-pine-path",
+            "canary-pine-new",
+        ]);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(state_path).unwrap();
+    }
+
+    #[test]
+    fn read_remains_usable_when_bookkeeping_or_one_import_fails() {
+        let path =
+            std::env::temp_dir().join(format!("canary-elm-path-{}.yaml", uuid::Uuid::new_v4()));
+        let state_path = path.with_extension("state.yaml");
+        let blocked = state_path.with_extension("yaml.tmp");
+        fs::create_dir(&blocked).unwrap();
+        let fake = FakeKeychainStore {
+            reject_import: Some("aws_session_token"),
+            ..Default::default()
+        };
+        fake.set_initial("openai_api_key", "canary-elm-native");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(&state_path),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        fs::write(
+            &path,
+            "aws_session_token: canary-elm-token\naws_region: canary-elm-region",
+        )
+        .unwrap();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let snapshot = backend.load_with_source().unwrap();
+        assert_eq!(snapshot.source_for("openai_api_key"), "os_keychain");
+        assert_eq!(snapshot.source_for("aws_session_token"), "file_fallback");
+        assert_eq!(
+            snapshot.store.aws_session_token.as_deref(),
+            Some("canary-elm-token")
+        );
+        assert_eq!(snapshot.source_for("aws_region"), "imported_file");
+        assert_eq!(
+            fake.value("aws_region").as_deref(),
+            Some("canary-elm-region")
+        );
+        assert!(fake.value("aws_session_token").is_none());
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(logs.contains("credential/payload_too_large"));
+        assert!(logs.contains(
+            "Credential presence bookkeeping deferred: credential/legacy_cleanup_required"
+        ));
+        assert!(logs.contains(
+            "Credential import bookkeeping deferred: credential/legacy_cleanup_required"
+        ));
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            "canary-elm-path",
+            "canary-elm-native",
+            "canary-elm-token",
+            "canary-elm-region",
+        ]);
+        fs::remove_dir(blocked).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_yaml_read_preserves_the_file() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+            Security::{
+                ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            },
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
+        };
+        let path =
+            std::env::temp_dir().join(format!("canary-birch-path-{}.yaml", uuid::Uuid::new_v4()));
+        let original = "aws_region: canary-birch-value";
+        fs::write(&path, original).unwrap();
+        // Hold the right to restore the ACL before denying subsequent read opens.
+        let file = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL.0 | WRITE_DAC.0)
+            .open(&path)
+            .unwrap();
+        let mut acl = ACL::default();
+        // SAFETY: the empty ACL lives through SetSecurityInfo and the borrowed handle
+        // belongs to our unique temp file. A present, empty DACL denies data access.
+        unsafe {
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION).unwrap();
+            SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&acl),
+                None,
+            )
+            .ok()
+            .unwrap();
+        }
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let backend = YamlCredentialBackend::with_path(&path);
+        let read = backend.load();
+        let delete = backend.delete("aws_region");
+        harden_permissions(&path).unwrap();
+        drop(file);
+        assert_closed(
+            read.unwrap_err(),
+            Code::AccessDenied,
+            &["canary-birch-path", "canary-birch-value"],
+        );
+        assert_closed(
+            delete.unwrap_err(),
+            Code::AccessDenied,
+            &["canary-birch-path", "canary-birch-value"],
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_yaml_read_preserves_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("canary-oak-path-{}.yaml", uuid::Uuid::new_v4()));
+        let original = "aws_region: canary-oak-value";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let backend = YamlCredentialBackend::with_path(&path);
+        // A privileged Unix runner can read mode 000. Exercise the denial where enforced.
+        if fs::File::open(&path).is_err() {
+            for err in [
+                backend.load().unwrap_err(),
+                backend.delete("aws_region").unwrap_err(),
+            ] {
+                assert_closed(
+                    err,
+                    Code::AccessDenied,
+                    &["canary-oak-path", "canary-oak-value"],
+                );
+            }
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+        drop(capture);
     }
 
     #[derive(Clone, Default)]
     struct FakeKeychainStore {
+        reject_import: Option<&'static str>,
+        unreadable_key: Option<&'static str>,
         values: Rc<RefCell<BTreeMap<String, String>>>,
     }
 
-    #[derive(Clone)]
-    struct FakeUnavailableKeychainStore {
-        reason: &'static str,
-    }
+    #[derive(Clone, Default)]
+    struct FakeUnavailableKeychainStore;
 
     #[derive(Clone)]
     struct ScopedOsKeychainStore {
@@ -1808,14 +2370,6 @@ mod tests {
 
     struct ScopedOsKeychainCleanup {
         store: ScopedOsKeychainStore,
-    }
-
-    impl Default for FakeUnavailableKeychainStore {
-        fn default() -> Self {
-            Self {
-                reason: "fake OS keychain unavailable",
-            }
-        }
     }
 
     impl FakeKeychainStore {
@@ -1831,16 +2385,22 @@ mod tests {
     }
 
     impl KeychainStore for FakeKeychainStore {
-        fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+        fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
+            if self.unreadable_key == Some(key) {
+                return Err(LegacyCredentialError(Code::Locked));
+            }
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             Ok(self.value(key))
         }
 
-        fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
+        fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
+            }
+            if self.reject_import == Some(key) {
+                return Err(LegacyCredentialError(Code::PayloadTooLarge));
             }
             self.values
                 .borrow_mut()
@@ -1848,9 +2408,9 @@ mod tests {
             Ok(())
         }
 
-        fn delete_key(&self, key: &str) -> Result<(), String> {
+        fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             self.values.borrow_mut().remove(key);
             Ok(())
@@ -1867,16 +2427,16 @@ mod tests {
     }
 
     impl KeychainStore for SharedKeychainStore {
-        fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+        fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             Ok(self.values.lock().unwrap().get(key).cloned())
         }
 
-        fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
+        fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             self.values
                 .lock()
@@ -1885,9 +2445,9 @@ mod tests {
             Ok(())
         }
 
-        fn delete_key(&self, key: &str) -> Result<(), String> {
+        fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             self.values.lock().unwrap().remove(key);
             Ok(())
@@ -1902,37 +2462,35 @@ mod tests {
             }
         }
 
-        fn entry(&self, key: &str) -> Result<keyring::Entry, String> {
+        fn entry(&self, key: &str) -> Result<keyring::Entry, LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
             keyring::Entry::new(&self.service, &format!("{}:{key}", self.account_namespace))
-                .map_err(|e| format!("Failed to open smoke OS credential entry {key}: {}", e))
+                .map_err(keyring_error)
         }
     }
 
     impl KeychainStore for ScopedOsKeychainStore {
-        fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+        fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
             let entry = self.entry(key)?;
             match entry.get_password() {
                 Ok(value) => Ok(Some(value)),
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(format!("Failed to read smoke OS credential {key}: {}", e)),
+                Err(e) => Err(keyring_error(e)),
             }
         }
 
-        fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
+        fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
             let entry = self.entry(key)?;
-            entry
-                .set_password(value)
-                .map_err(|e| format!("Failed to save smoke OS credential {key}: {}", e))
+            entry.set_password(value).map_err(keyring_error)
         }
 
-        fn delete_key(&self, key: &str) -> Result<(), String> {
+        fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
             let entry = self.entry(key)?;
             match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(format!("Failed to delete smoke OS credential {key}: {}", e)),
+                Err(e) => Err(keyring_error(e)),
             }
         }
     }
@@ -1945,32 +2503,26 @@ mod tests {
         }
     }
 
-    impl FakeUnavailableKeychainStore {
-        fn diagnostic(&self, operation: &str, key: &str) -> String {
-            format!("{operation} credential {key}: {}", self.reason)
-        }
-    }
-
     impl KeychainStore for FakeUnavailableKeychainStore {
-        fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+        fn get_key(&self, key: &str) -> Result<Option<String>, LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
-            Err(self.diagnostic("read", key))
+            Err(LegacyCredentialError(Code::StoreUnavailable))
         }
 
-        fn set_key(&self, key: &str, _value: &str) -> Result<(), String> {
+        fn set_key(&self, key: &str, _value: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
-            Err(self.diagnostic("save", key))
+            Err(LegacyCredentialError(Code::StoreUnavailable))
         }
 
-        fn delete_key(&self, key: &str) -> Result<(), String> {
+        fn delete_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
-                return Err(format!("Unknown credential key: {}", key));
+                return Err(LegacyCredentialError(Code::InvalidCredentialSet));
             }
-            Err(self.diagnostic("delete", key))
+            Err(LegacyCredentialError(Code::StoreUnavailable))
         }
     }
 
@@ -2056,10 +2608,7 @@ mod tests {
             file_backend: false,
             fallback_to_yaml: false,
         };
-        assert!(save_typesafe_from_reader(
-            &backend,
-            &b"  fixture-stdin-value \r\n"[..]
-        ));
+        assert!(save_typesafe_from_reader(&backend, &b"  fixture-stdin-value \r\n"[..]).is_ok());
         assert_eq!(
             backend.get("typesafe_api_key").unwrap().as_deref(),
             Some("fixture-stdin-value")
@@ -2078,16 +2627,15 @@ mod tests {
             &b"bad\0value"[..],
             &[0xff][..],
         ] {
-            assert!(!save_typesafe_from_reader(&backend, invalid));
+            assert!(save_typesafe_from_reader(&backend, invalid).is_err());
             assert_eq!(
                 backend.get("typesafe_api_key").unwrap().as_deref(),
                 Some("fixture-stdin-value")
             );
         }
-        assert!(!save_typesafe_from_reader(
-            &backend,
-            std::io::repeat(b'x').take(16 * 1024 + 1)
-        ));
+        assert!(
+            save_typesafe_from_reader(&backend, std::io::repeat(b'x').take(16 * 1024 + 1)).is_err()
+        );
         assert_eq!(
             backend.get("typesafe_api_key").unwrap().as_deref(),
             Some("fixture-stdin-value")
@@ -2104,16 +2652,13 @@ mod tests {
         ));
         let yaml_path = dir.join("credentials.yaml");
         let backend = DefaultCredentialBackend {
-            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
             yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
             state: CredentialMigrationStateBackend::with_path(dir.join("credentials-state.yaml")),
             file_backend: false,
             fallback_to_yaml: false,
         };
-        assert!(!save_typesafe_from_reader(
-            &backend,
-            &b"fixture-stdin-value"[..]
-        ));
+        assert!(save_typesafe_from_reader(&backend, &b"fixture-stdin-value"[..]).is_err());
         assert!(!yaml_path.exists());
         assert!(!dir.exists());
     }
@@ -2192,45 +2737,33 @@ mod tests {
 
         let err = backend.load().expect_err("malformed yaml is surfaced");
 
-        assert!(err.contains("Failed to parse"));
-        assert!(err.contains("credentials"));
+        assert_eq!(err.0, Code::CorruptRecord);
 
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn malformed_credentials_yaml_parse_error_never_leaks_key_fragments() {
-        // audio-graph-4243 / cred-review M4: a serde_yaml Display echoes the
-        // offending scalar. credentials.yaml holds plaintext keys, so a
-        // malformed hand-edit could echo a key fragment into the surfaced
-        // CredentialFileError.reason (UI banners + app log). The location-only
-        // formatter must strip that. A bare top-level scalar deserialized into
-        // the CredentialStore struct produces exactly the leaky shape
-        // (`invalid type: string "<value>", expected struct ...`).
-        const SENTINEL: &str = "LEAKCANARY-sk-not-real-abc123def456";
-        let path = std::env::temp_dir().join(format!(
-            "audio-graph-cred-leak-{}.yaml",
-            uuid::Uuid::new_v4()
-        ));
-        fs::write(&path, format!("\"{SENTINEL}\"\n")).expect("write leaky malformed yaml");
-        let backend = YamlCredentialBackend::with_path(path.clone());
-
-        let err = backend
-            .load()
-            .expect_err("bare scalar is not a valid CredentialStore");
-
-        // The surfaced reason must NOT contain the sentinel (nor a slice of it).
-        assert!(
-            !err.contains(SENTINEL),
-            "surfaced parse error leaked the key sentinel: {err}"
-        );
-        assert!(
-            !err.contains("LEAKCANARY"),
-            "surfaced parse error leaked a key fragment: {err}"
-        );
-        // It should still be recognizable as a parse failure with a location.
-        assert!(err.contains("Failed to parse"), "reason: {err}");
-        assert!(err.contains("content omitted"), "reason: {err}");
+        const SENTINEL: &str = "canary-walnut-record";
+        let path =
+            std::env::temp_dir().join(format!("canary-walnut-path-{}", uuid::Uuid::new_v4()));
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        fs::write(&path, SENTINEL).unwrap();
+        let backend = YamlCredentialBackend::with_path(&path);
+        for err in [
+            backend.load().unwrap_err(),
+            backend
+                .set("aws_region", "canary-walnut-value")
+                .unwrap_err(),
+            backend.delete("aws_region").unwrap_err(),
+        ] {
+            assert_closed(
+                err,
+                Code::CorruptRecord,
+                &[SENTINEL, "canary-walnut-path", "canary-walnut-value"],
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), SENTINEL);
+        }
 
         // Prove the leak was real: the raw serde_yaml Display DOES echo the
         // scalar, so the redaction is load-bearing, not a no-op on this input.
@@ -2371,7 +2904,7 @@ mod tests {
             .set("openai_api_key", "sk-new")
             .expect_err("set should reject malformed yaml");
 
-        assert!(err.contains("Failed to parse"));
+        assert_eq!(err.0, Code::CorruptRecord);
         assert_eq!(fs::read_to_string(&path).expect("read yaml"), original);
 
         let _ = fs::remove_file(&path);
@@ -2391,7 +2924,7 @@ mod tests {
             .delete("openai_api_key")
             .expect_err("delete should reject malformed yaml");
 
-        assert!(err.contains("Failed to parse"));
+        assert_eq!(err.0, Code::CorruptRecord);
         assert_eq!(fs::read_to_string(&path).expect("read yaml"), original);
 
         let _ = fs::remove_file(&path);
@@ -2403,7 +2936,7 @@ mod tests {
             .get("not_a_real_key")
             .expect_err("unknown key must be rejected by allowlist");
 
-        assert!(err.contains("Unknown credential key"));
+        assert_eq!(err.0, Code::InvalidCredentialSet);
     }
 
     #[test]
@@ -2415,7 +2948,7 @@ mod tests {
         let yaml_path = dir.join("credentials.yaml");
         let state_path = dir.join("credentials-state.yaml");
         let backend = DefaultCredentialBackend {
-            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
             yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
             state: CredentialMigrationStateBackend::with_path(state_path.clone()),
             file_backend: false,
@@ -2427,14 +2960,9 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(err.contains("fake OS keychain unavailable"));
-        assert!(err.contains("read credential openai_api_key"));
-        assert!(!err.contains("sk-"));
-        assert!(!err.contains("dummy"));
+        assert_eq!(err.0, Code::StoreUnavailable);
         assert!(!yaml_path.exists());
         assert!(!state_path.exists());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2587,7 +3115,7 @@ mod tests {
             .expect("mark migrated key");
         state.mark_deleted("aws_region").expect("mark deleted key");
         let backend = DefaultCredentialBackend {
-            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
             yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
             state,
             file_backend: false,
@@ -2617,7 +3145,7 @@ mod tests {
         fs::write(&yaml_path, "openai_api_key: dummy-yaml-key\n").expect("write yaml");
 
         let unavailable_backend = DefaultCredentialBackend {
-            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
             yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
             state: CredentialMigrationStateBackend::with_path(state_path.clone()),
             file_backend: false,
@@ -3089,7 +3617,7 @@ mod tests {
         let yaml_path = dir.join("credentials.yaml");
         let state_path = dir.join("credentials-state.yaml");
         let backend = DefaultCredentialBackend {
-            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore),
             yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
             state: CredentialMigrationStateBackend::with_path(state_path),
             file_backend: false,
@@ -3215,51 +3743,6 @@ mod tests {
         assert!(
             !file_override_shadows_keychain_value(Some("   ")),
             "a whitespace-only keychain value is not being meaningfully shadowed"
-        );
-    }
-
-    #[test]
-    fn shadow_warning_dedupes_per_key_and_rearms_on_rotation() {
-        // cred-review m1 (dedupe): the shadow warning must fire once per
-        // DISTINCT condition, not once per probe. `record_shadow_warning_is_new`
-        // returns true the first time a (key, fingerprint) pair is seen, false
-        // for an unchanged repeat, and true again when the fingerprint changes
-        // (either side rotated). Uses a local state map so the process-wide
-        // static and other tests are untouched.
-        let state = Mutex::new(BTreeMap::new());
-
-        let fp_v1 = "kc=sha256:aaaaaaaa len=10 file=sha256:bbbbbbbb len=10".to_string();
-        // First sighting of the condition: warn.
-        assert!(
-            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
-            "the first time a shadow condition is seen it must warn"
-        );
-        // Same condition on the next probe: suppressed.
-        assert!(
-            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
-            "an unchanged shadow condition must not re-warn on the next probe"
-        );
-        assert!(
-            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1),
-            "still suppressed on a third identical probe"
-        );
-
-        // Rotation changes the fingerprint → re-arm and warn again.
-        let fp_v2 = "kc=sha256:cccccccc len=12 file=sha256:bbbbbbbb len=10".to_string();
-        assert!(
-            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2.clone()),
-            "a rotated keychain value is a new condition and must re-warn"
-        );
-        assert!(
-            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2),
-            "the new condition is then itself deduped"
-        );
-
-        // A different key is tracked independently.
-        let other_fp = "kc=sha256:dddddddd len=8 file=sha256:eeeeeeee len=8".to_string();
-        assert!(
-            record_shadow_warning_is_new(&state, "openai_api_key", other_fp),
-            "a distinct key has its own dedupe slot and warns on first sighting"
         );
     }
 
@@ -3416,7 +3899,14 @@ mod tests {
         let keychain = KeychainCredentialBackend::with_store(fake.clone());
         let mut keychain_store = keychain.load().expect("load fake keychain");
 
-        let imported = keychain.import_missing_from_yaml(&mut keychain_store, &yaml, &state);
+        let imported = keychain
+            .import_missing_from_yaml(
+                &mut keychain_store,
+                &yaml.load().unwrap(),
+                &state.load().unwrap(),
+            )
+            .unwrap();
+        state.mark_imported_keys(&imported).unwrap();
 
         assert_eq!(fake.value("openai_api_key").as_deref(), Some("sk-keychain"));
         assert_eq!(fake.value("deepgram_api_key").as_deref(), Some("dg-yaml"));
@@ -3714,17 +4204,20 @@ mod tests {
     #[test]
     fn set_owner_only_is_best_effort_and_never_aborts() {
         let missing = std::env::temp_dir().join(format!(
-            "audio-graph-owner-only-best-effort-{}.tmp",
+            "canary-robin-permission-{}.tmp",
             uuid::Uuid::new_v4()
         ));
-        // A missing path makes the strict variant fail...
-        assert!(
-            crate::fs_util::try_set_owner_only(&missing).is_err(),
-            "strict hardening should fail on a missing path"
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        harden_best_effort(&missing);
+        assert_closed(
+            harden_permissions(&missing).unwrap_err(),
+            Code::PermissionHardeningFailed,
+            &["canary-robin-permission"],
         );
-        // ...but the best-effort variant used by the save paths returns unit and
-        // must not panic — proving an ACL failure cannot abort a save.
-        crate::fs_util::set_owner_only(&missing);
+        assert!(
+            crate::test_log_capture::render(&capture.finish())
+                .contains("credential/permission_hardening_failed")
+        );
     }
 
     /// FIX 2(a): a full credentials save completes even though the ACL step is

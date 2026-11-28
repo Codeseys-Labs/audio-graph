@@ -152,10 +152,9 @@ labels in
 
 The first six rows are real `source_for()` outputs the backend can stamp onto a
 `CredentialPresence` over `load_credential_presence_cmd`, and the contract test
-enforces that each one has a localized label. `error` is the exception: the live
-load path returns an `AppError::CredentialFileError` on a read failure rather
-than a presence row with `source: "error"`, so the backend never actually emits
-that value today. The label and `LOCALIZED_CREDENTIAL_SOURCES` entry are kept as
+enforces that each one has a localized label. `error` is the exception: an authoritative read failure returns a typed credential diagnostic.
+When only the secondary YAML file is unreadable, the diagnostic-enabled probe
+returns usable keychain rows alongside a typed repair warning. The label and `LOCALIZED_CREDENTIAL_SOURCES` entry are kept as
 a defensive fallback so a future backend that surfaces a per-key read error gets
 a localized string instead of a raw passthrough. (The only `"source": "error"`
 literal in `credentials/mod.rs` lives inside a `#[cfg(test)]` smoke test, which
