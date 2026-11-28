@@ -64,6 +64,7 @@ fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
             prompt_id: "notes-v1".into(),
             route_id: None,
             model_source: crate::llm::route::ModelIdentitySource::Requested,
+            model_placement: None,
         },
         queued_at_ms: None,
         generation_latency_ms: None,
