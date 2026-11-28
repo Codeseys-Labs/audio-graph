@@ -1519,9 +1519,15 @@ mod tests {
 
     /// A root someone else owns is refused before its DACL is touched: its
     /// owner keeps implicit `WRITE_DAC` and could undo any hardening.
-    /// Assigning another owner needs `SeRestorePrivilege`, so this fixture can
-    /// only be built by an elevated run; GitHub's Windows runners are elevated.
+    /// Assigning another owner needs `SeRestorePrivilege`, so the fixture can
+    /// only be built by an elevated run. It is compiled as ignored unless the
+    /// build runs under GitHub Actions, whose Windows runners are elevated;
+    /// run it elsewhere with `--ignored` from an elevated shell.
     #[cfg(windows)]
+    #[cfg_attr(
+        not(audiograph_github_actions),
+        ignore = "needs an elevated run to assign a foreign owner; runs under GitHub Actions"
+    )]
     #[test]
     fn windows_foreign_owned_root_is_refused_before_it_is_hardened() {
         let base = scratch("windows-foreign-owner");
@@ -1534,16 +1540,21 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .expect("run icacls")
-            .success();
-        if !assigned {
-            assert!(
-                std::env::var_os("GITHUB_ACTIONS").is_none(),
-                "the foreign-owner fixture must build on an elevated CI runner"
-            );
-            std::fs::remove_dir_all(&base).expect("remove isolated foreign-owner directory");
-            return;
-        }
+            .expect("run icacls");
+        assert!(
+            assigned.success(),
+            "assigning LocalService as owner needs an elevated run (icacls {assigned})"
+        );
+        // The production access mask still opens the fixture and its owner
+        // reads as untrusted, so the refusal below comes from the owner check
+        // and not from a denied open.
+        let opened = super::held_directory::open_directory_handle(&root)
+            .expect("the held-directory access mask opens the foreign-owned fixture");
+        assert!(
+            !crate::fs_util::owner_is_trusted(&opened).expect("read the fixture owner"),
+            "the fixture owner reads as trusted"
+        );
+        drop(opened);
         let dacl_before = windows_dacl(&root, &base);
 
         assert_eq!(

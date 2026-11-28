@@ -15,6 +15,8 @@ use std::io::Read;
 
 #[cfg(unix)]
 pub(in crate::credentials::adapters) use unix_held::{HeldDirectory, StagedFile};
+#[cfg(all(windows, test))]
+pub(in crate::credentials::adapters) use windows_held::open_directory_handle;
 #[cfg(windows)]
 pub(in crate::credentials::adapters) use windows_held::{
     HeldDirectory, StagedFile, token_profile_directory,
@@ -441,23 +443,30 @@ mod windows_held {
         }
     }
 
+    /// Opens `path` as a held directory: without following a final reparse
+    /// point, without `FILE_SHARE_DELETE`, and with `WRITE_DAC` for hardening.
+    pub(in crate::credentials::adapters) fn open_directory_handle(
+        path: &Path,
+    ) -> std::io::Result<File> {
+        OpenOptions::new()
+            .access_mode(
+                FILE_LIST_DIRECTORY.0
+                    | FILE_TRAVERSE.0
+                    | FILE_READ_ATTRIBUTES.0
+                    | READ_CONTROL.0
+                    | WRITE_DAC.0
+                    | SYNCHRONIZE.0,
+            )
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+    }
+
     impl HeldDirectory {
         pub(in crate::credentials::adapters) fn open_existing(
             path: &Path,
         ) -> Result<Option<Self>, CredentialStoreFailure> {
-            let handle = match OpenOptions::new()
-                .access_mode(
-                    FILE_LIST_DIRECTORY.0
-                        | FILE_TRAVERSE.0
-                        | FILE_READ_ATTRIBUTES.0
-                        | READ_CONTROL.0
-                        | WRITE_DAC.0
-                        | SYNCHRONIZE.0,
-                )
-                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-                .open(path)
-            {
+            let handle = match open_directory_handle(path) {
                 Ok(handle) => handle,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(open_failure(error.kind())),
