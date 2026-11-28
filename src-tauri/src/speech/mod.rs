@@ -885,11 +885,16 @@ fn internal_transcription_diagnostic(transport: RuntimeTransport) -> RuntimeDiag
     )
 }
 
-fn websocket_connect_diagnostic(error: crate::error::AppError) -> RuntimeDiagnostic {
-    match error {
+fn websocket_connect_diagnostic(
+    provider: &'static str,
+    error: crate::error::AppError,
+) -> RuntimeDiagnostic {
+    let diagnostic = match error {
         crate::error::AppError::RuntimeDiagnostic(diagnostic) => diagnostic,
         _ => internal_transcription_diagnostic(RuntimeTransport::Websocket),
-    }
+    };
+    log::error!("{provider} streaming: failed to connect diagnostic={diagnostic}");
+    diagnostic
 }
 
 fn reconnecting_transcription_diagnostic(
@@ -914,6 +919,23 @@ fn disconnected_transcription_diagnostic(transport: RuntimeTransport) -> Runtime
         RuntimeSafeRecoveryAction::CheckNetwork,
         transport,
     )
+}
+
+/// A terminal disconnect can immediately follow the adapter's specific error.
+fn mark_websocket_disconnected(app: &AppHandle, pipeline: &Arc<RwLock<PipelineStatus>>) {
+    {
+        let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
+        if let StageStatus::Error { diagnostic } = &status.asr {
+            let was_reconnecting = matches!(diagnostic, RuntimeDiagnostic::Runtime(d) if d.context.retry_delay.is_some());
+            if !was_reconnecting {
+                return;
+            }
+        }
+        status.asr = StageStatus::Error {
+            diagnostic: disconnected_transcription_diagnostic(RuntimeTransport::Websocket),
+        };
+    }
+    emit_pipeline_status(app, pipeline);
 }
 
 fn emit_asr_span_revision(app_handle: &AppHandle, payload: events::AsrSpanRevisionPayload) {
@@ -6727,8 +6749,7 @@ pub(crate) fn run_deepgram_speech_processor(
             log::info!("Deepgram streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = websocket_connect_diagnostic(e);
-            log::error!("Deepgram streaming: failed to connect diagnostic={diagnostic}");
+            let diagnostic = websocket_connect_diagnostic("Deepgram", e);
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
@@ -7811,15 +7832,7 @@ fn run_deepgram_event_receiver(
             }
             DeepgramEvent::Disconnected => {
                 log::info!("Deepgram event receiver: disconnected; waiting for reconnect or stop");
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: disconnected_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                        ),
-                    },
-                );
+                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
             DeepgramEvent::Connected => {
                 log::debug!("Deepgram event receiver: connected event received");
@@ -7931,8 +7944,7 @@ pub(crate) fn run_assemblyai_speech_processor(
             log::info!("AssemblyAI streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = websocket_connect_diagnostic(e);
-            log::error!("AssemblyAI streaming: failed to connect diagnostic={diagnostic}");
+            let diagnostic = websocket_connect_diagnostic("AssemblyAI", e);
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
@@ -8276,8 +8288,7 @@ pub(crate) fn run_soniox_speech_processor(
             log::info!("Soniox streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = websocket_connect_diagnostic(e);
-            log::error!("Soniox streaming: failed to connect diagnostic={diagnostic}");
+            let diagnostic = websocket_connect_diagnostic("Soniox", e);
             set_asr_status_and_emit(
                 &shared.app_handle,
                 &shared.pipeline_status,
@@ -8484,15 +8495,7 @@ fn run_soniox_event_receiver(
             }
             SonioxEvent::Disconnected => {
                 log::info!("Soniox event receiver: disconnected; waiting for reconnect or stop");
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: disconnected_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                        ),
-                    },
-                );
+                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
             SonioxEvent::Connected => {
                 log::debug!("Soniox event receiver: connected event received");
@@ -8567,8 +8570,7 @@ pub(crate) fn run_openai_realtime_speech_processor(
             log::info!("OpenAI Realtime streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = websocket_connect_diagnostic(e);
-            log::error!("OpenAI Realtime streaming: failed to connect diagnostic={diagnostic}");
+            let diagnostic = websocket_connect_diagnostic("OpenAI Realtime", e);
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
@@ -8904,15 +8906,7 @@ fn run_openai_realtime_event_receiver(
                 log::info!(
                     "OpenAI Realtime event receiver: disconnected; waiting for reconnect or stop"
                 );
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error {
-                        diagnostic: disconnected_transcription_diagnostic(
-                            RuntimeTransport::Websocket,
-                        ),
-                    },
-                );
+                mark_websocket_disconnected(&ctx.app_handle, &ctx.pipeline_status);
             }
             OpenAiRealtimeEvent::Reconnecting {
                 attempt,
@@ -12333,12 +12327,20 @@ mod tests_status {
                     "{log}"
                 );
             }
+            assert!(
+                log.contains("Deepgram streaming: failed to connect diagnostic=runtime/internal"),
+                "{log}"
+            );
             assert!(!log.contains("private provider prose"));
             return;
         }
         env_logger::Builder::new()
             .filter_module("audio_graph::speech", log::LevelFilter::Warn)
             .init();
+        super::websocket_connect_diagnostic(
+            "Deepgram",
+            crate::error::AppError::Unknown("private provider prose".into()),
+        );
         let dir = unique_tempdir("stage-adapter-errors");
         let _guard = DataDirGuard::set(&dir);
         let app = AppState::new();
@@ -12346,9 +12348,10 @@ mod tests_status {
             RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(RuntimeTransport::Websocket)
             .with_status_class(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::ClientError)
         ).into();
-        fn one<T>(event: T) -> crossbeam_channel::Receiver<T> {
+        fn events<T>(error: T, terminal: T) -> crossbeam_channel::Receiver<T> {
             let (tx, rx) = crossbeam_channel::unbounded();
-            tx.send(event).unwrap();
+            tx.send(error).unwrap();
+            tx.send(terminal).unwrap();
             rx
         }
         let running = || Arc::new(AtomicBool::new(true));
@@ -12359,9 +12362,12 @@ mod tests_status {
             set_asr_status(&app.pipeline_status, StageStatus::Idle);
             match provider {
                 "deepgram" => super::run_deepgram_event_receiver(
-                    one(crate::asr::deepgram::DeepgramEvent::Error {
-                        message: expected.clone(),
-                    }),
+                    events(
+                        crate::asr::deepgram::DeepgramEvent::Error {
+                            message: expected.clone(),
+                        },
+                        crate::asr::deepgram::DeepgramEvent::Disconnected,
+                    ),
                     shared,
                     config,
                     hint(),
@@ -12369,27 +12375,36 @@ mod tests_status {
                     false,
                 ),
                 "assemblyai" => super::run_assemblyai_event_receiver(
-                    one(crate::asr::assemblyai::AssemblyAIEvent::Error {
-                        message: expected.clone(),
-                    }),
+                    events(
+                        crate::asr::assemblyai::AssemblyAIEvent::Error {
+                            message: expected.clone(),
+                        },
+                        crate::asr::assemblyai::AssemblyAIEvent::SessionTerminated,
+                    ),
                     running(),
                     shared,
                     config,
                     hint(),
                 ),
                 "soniox" => super::run_soniox_event_receiver(
-                    one(crate::asr::soniox::SonioxEvent::Error {
-                        message: expected.clone(),
-                    }),
+                    events(
+                        crate::asr::soniox::SonioxEvent::Error {
+                            message: expected.clone(),
+                        },
+                        crate::asr::soniox::SonioxEvent::Disconnected,
+                    ),
                     running(),
                     shared,
                     config,
                     0,
                 ),
                 _ => super::run_openai_realtime_event_receiver(
-                    one(crate::asr::openai_realtime::OpenAiRealtimeEvent::Error {
-                        message: expected.clone(),
-                    }),
+                    events(
+                        crate::asr::openai_realtime::OpenAiRealtimeEvent::Error {
+                            message: expected.clone(),
+                        },
+                        crate::asr::openai_realtime::OpenAiRealtimeEvent::Disconnected,
+                    ),
                     running(),
                     shared,
                     config,
@@ -12409,15 +12424,17 @@ mod tests_status {
             RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(RuntimeTransport::Websocket)
         ).into();
         assert_eq!(
-            super::websocket_connect_diagnostic(crate::error::AppError::RuntimeDiagnostic(
-                expected.clone()
-            )),
+            super::websocket_connect_diagnostic(
+                "Deepgram",
+                crate::error::AppError::RuntimeDiagnostic(expected.clone())
+            ),
             expected
         );
         assert_eq!(
-            super::websocket_connect_diagnostic(crate::error::AppError::Unknown(
-                "private provider prose".into()
-            )),
+            super::websocket_connect_diagnostic(
+                "Deepgram",
+                crate::error::AppError::Unknown("private provider prose".into())
+            ),
             internal_transcription_diagnostic(RuntimeTransport::Websocket)
         );
     }

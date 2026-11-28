@@ -1468,6 +1468,28 @@ mod tests {
 
     #[test]
     fn auth_metadata_reaches_stage_toast_and_logs_without_private_fields() {
+        // The ASR logger installs a global logger and changes its level.
+        // Keep both operations private to this one test process.
+        const CHILD: &str = "AUDIOGRAPH_TRANSCRIBE_AUTH_LOG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         use RuntimeErrorCode as Code;
         use RuntimeSafeRecoveryAction as Action;
         for (metadata, code, action, toast) in [
@@ -1518,7 +1540,10 @@ mod tests {
                     (),
                 ));
             let records = logs.finish();
-            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records,
+                vec![format!("AWS Transcribe SDK error diagnostic=runtime/{code}"); 2]
+            );
             for failure in [start, stream] {
                 assert_runtime_diagnostic(
                     &failure,

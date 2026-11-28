@@ -664,7 +664,7 @@ mod tests {
     fn http_responses_produce_closed_diagnostics() {
         use RuntimeErrorCode as Code;
         use RuntimeSafeRecoveryAction as Action;
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         for (status, key, code, retryable, recovery) in [
             (
@@ -697,8 +697,23 @@ mod tests {
             config.api_key = key.into();
             let worker = std::thread::spawn(move || {
                 let (mut stream, _) = server.accept().unwrap();
-                let mut buf = [0; 4096];
-                let _ = stream.read(&mut buf).unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let headers: Vec<_> = request
+                    .by_ref()
+                    .lines()
+                    .map(Result::unwrap)
+                    .take_while(|line| !line.is_empty())
+                    .collect();
+                let header = |name: &str| {
+                    headers
+                        .iter()
+                        .filter_map(|h| h.split_once(':'))
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.trim())
+                };
+                assert_eq!(header("authorization").is_some(), !key.is_empty());
+                let length = header("content-length").unwrap().parse::<usize>().unwrap();
+                request.read_exact(&mut vec![0; length]).unwrap();
                 let body = "private provider prose";
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
