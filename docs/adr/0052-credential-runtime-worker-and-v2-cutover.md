@@ -110,11 +110,12 @@ the worker call, and it does not release admission. The worker reconciles a
 late definite commit into the cache and emits its one content-free event before
 releasing admission. An epoch another process committed, which this process
 only observed in the authority journal, emits one content-free signal with no
-receipt and no set, telling consumers to take a fresh snapshot. An unverified
-commit is not success and emits no commit event. An unhandled dispatch panic
-latches a terminal stall; dispatch enters the crash handler's credential
-redaction scope before `catch_unwind` so the panic hook sees the same boundary
-as the caller.
+receipt and no set, telling consumers to take a fresh snapshot; so does a
+reopen that adopts a journal past the last epoch the runtime reported. An
+unverified commit is not success and emits no commit event. An unhandled
+dispatch panic latches a terminal stall; dispatch enters the crash handler's
+credential redaction scope before `catch_unwind` so the panic hook sees the
+same boundary as the caller.
 
 ## Cutover and Consequences
 

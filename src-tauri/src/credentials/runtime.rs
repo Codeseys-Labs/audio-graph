@@ -1239,7 +1239,9 @@ impl RuntimeWorker {
     /// one this runtime first adopted, or decides on a journal older than
     /// the highest epoch the runtime observed. Either refusal is store-wide
     /// and recovery-required, leaves the runtime closed, and is reached the
-    /// same way through every reopen: ordinary, diagnosis or repair.
+    /// same way through every reopen: ordinary, diagnosis or repair. A
+    /// reopen past the event cursor emits one `ExternallyCommitted` for the
+    /// commits other processes made while the runtime was closed.
     fn adopt_service(
         &mut self,
         shared: &RuntimeShared,
@@ -1264,13 +1266,22 @@ impl RuntimeWorker {
             shared.remember_closed_error(error.clone());
             return Err(error);
         }
+        let epoch = snapshot.global_epoch;
+        let reopened_past_cursor = self.floor.is_some() && epoch > self.event_cursor;
         self.floor = Some(AuthorityFloor {
             authority: service.authority_instance().to_owned(),
-            epoch: snapshot.global_epoch,
+            epoch,
         });
-        self.event_cursor = snapshot.global_epoch;
+        self.event_cursor = epoch;
         shared.cache_service_while_admitted(snapshot);
         self.service = Some(service);
+        if reopened_past_cursor {
+            self.event_sink
+                .emit(CredentialRuntimeEvent::ExternallyCommitted {
+                    through_epoch: epoch,
+                })
+                .map_err(|_| runtime_stalled_error(None))?;
+        }
         Ok(())
     }
 
@@ -4044,5 +4055,72 @@ mod tests {
                 CredentialRuntimeLifecycle::RecoveryRequired
             );
         }
+    }
+
+    /// Commits another process made while the runtime was closed are not
+    /// lost across the reopen: the reopen past the event cursor emits one
+    /// `ExternallyCommitted` through the reopened epoch, with no receipt and
+    /// no set, after the runtime's own commit event.
+    #[tokio::test]
+    async fn a_reopen_past_the_cursor_signals_the_commits_it_skipped() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let (sender, events) = mpsc::channel();
+        runtime
+            .configure(
+                Box::new(ReopeningBackend {
+                    store: Arc::clone(&store),
+                    rebound: None,
+                }),
+                Arc::new(RecordingEventSink {
+                    sender: Mutex::new(sender),
+                    emitted: AtomicUsize::new(0),
+                }),
+            )
+            .expect("configure runtime");
+        runtime
+            .replace_set(
+                api_key_draft("00000000-0000-4000-8000-000000000921", None),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("commit epoch 1");
+        assert_eq!(
+            committed(events.try_recv().expect("the local commit event")).global_epoch,
+            1
+        );
+        store.fail_next(
+            FakeStoreCall::ReadActive,
+            CredentialStoreFailure::PermissionHardeningFailed,
+        );
+        runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("hardening refuses a record");
+        let mut advanced = store.journal_snapshot();
+        advanced.global_epoch = 3;
+        store.restore_journal(advanced);
+
+        runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect("the repair reopens past the cursor");
+
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("the skipped commits are signalled"),
+            CredentialRuntimeEvent::ExternallyCommitted { through_epoch: 3 }
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
     }
 }
