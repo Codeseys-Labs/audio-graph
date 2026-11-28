@@ -81,8 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer sent under provider settings saved after the work was queued. Saving
   looser OpenRouter routing while the work waited, or between a projection's
   draft and its repair, could send it without the restrictions it was queued
-  under. If the provider, routing or privacy settings change while such work
-  waits, it is stopped instead (#551).
+  under. A later save that changes the provider's endpoint, model, key,
+  routing or privacy setting now stops work that is still queued, and stops a
+  retry or a repair that has not been sent yet. A request already on its way
+  is not stopped. Notes synthesis is also refused when those settings change
+  between its approval and its start (#551).
 - A projection whose worker ended after its request was sent is now recorded
   under the destination it was sent to, not the one the session started with
   (#551).

@@ -15,9 +15,10 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
 use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
+use crate::llm::admission::{ClientSlot, SendRefused};
 use crate::llm::engine::{ChatMessage, ChatOutcome, engine_not_loaded};
-use crate::llm::openrouter::OpenRouterRoutingPolicy;
-use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
+use crate::llm::openrouter::OpenRouterConfig;
+use crate::llm::{ApiClient, ApiConfig, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::projection_llm::{
     PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionContext,
     ProjectionPatchBuildContext, ProjectionPatchDraftError, ProjectionSnapshots,
@@ -259,7 +260,8 @@ pub struct ProjectionPatchAttempt {
 
 /// The app's backend slots. A settings save replaces the two HTTP clients
 /// here. A job copies its client from here when it enters the executor, and
-/// afterwards reads the slot only to learn that the client was replaced.
+/// afterwards reads the slot only to learn that the client was replaced
+/// (see [`crate::llm::admission`]).
 struct SharedBackends {
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
@@ -307,11 +309,9 @@ struct BackendHandles {
 
 /// One HTTP client as it was when a job entered the executor.
 enum AdmittedClient<T> {
-    Present {
-        client: T,
-        /// Where `client` was copied from. Read again only to refuse the job.
-        slot: Arc<Mutex<Option<T>>>,
-    },
+    /// The job's copy. It remembers the slot it came from and asks it for
+    /// leave before every transport attempt.
+    Present(T),
     /// Not configured, or not the client this job's route sends through.
     Absent,
     /// A panic unwound through the shared slot's lock, leaving the client in a
@@ -319,58 +319,79 @@ enum AdmittedClient<T> {
     Poisoned,
 }
 
-/// Why a job may not send from its client.
-enum ClientRefused {
-    /// The shared slot is poisoned, or was when the job entered.
-    Poisoned,
-    /// A settings save has put another client in the slot, or emptied it,
-    /// since the job entered.
-    Replaced,
+/// What the executor needs of an HTTP client a job sends from.
+trait JobClient: Clone {
+    type Config;
+    fn sends_as(
+        &self,
+        config: &Self::Config,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool;
+    fn admitted_from(self, slot: ClientSlot<Self>) -> Self;
+    fn leave_to_send(&self) -> Result<(), SendRefused>;
 }
 
-impl ClientRefused {
-    /// What chat returns, and projection as its string form.
-    fn diagnostic(&self) -> RuntimeDiagnostic {
-        match self {
-            Self::Poisoned => executor_failure(Code::Internal),
-            Self::Replaced => {
-                log::warn!("LLM job refused: its client was replaced after it was queued");
-                executor_failure(Code::PolicyBlocked)
-            }
-        }
+impl JobClient for ApiClient {
+    type Config = ApiConfig;
+
+    fn sends_as(
+        &self,
+        config: &ApiConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool {
+        ApiClient::sends_as(self, config, policy)
+    }
+
+    fn admitted_from(self, slot: ClientSlot<Self>) -> Self {
+        ApiClient::admitted_from(self, slot)
+    }
+
+    fn leave_to_send(&self) -> Result<(), SendRefused> {
+        ApiClient::leave_to_send(self)
     }
 }
 
-/// Whether two clients send to the same place under the same terms.
-trait SendsAs {
-    fn sends_as(&self, other: &Self) -> bool;
-}
+impl JobClient for OpenRouterClient {
+    type Config = OpenRouterConfig;
 
-impl SendsAs for ApiClient {
-    fn sends_as(&self, other: &Self) -> bool {
-        self.config() == other.config()
-            && self.content_egress_policy() == other.content_egress_policy()
+    fn sends_as(
+        &self,
+        config: &OpenRouterConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool {
+        OpenRouterClient::sends_as(self, config, policy)
+    }
+
+    fn admitted_from(self, slot: ClientSlot<Self>) -> Self {
+        OpenRouterClient::admitted_from(self, slot)
+    }
+
+    fn leave_to_send(&self) -> Result<(), SendRefused> {
+        OpenRouterClient::leave_to_send(self)
     }
 }
 
-impl SendsAs for OpenRouterClient {
-    fn sends_as(&self, other: &Self) -> bool {
-        self.config() == other.config()
-            && self.content_egress_policy() == other.content_egress_policy()
-    }
-}
+/// The client a caller's own gate approved: its config and content policy.
+type ApprovedClient<T> = Option<(
+    <T as JobClient>::Config,
+    crate::asr::ProviderContentEgressPolicy,
+)>;
 
-impl<T: SendsAs> AdmittedClient<T> {
-    fn copy_of(slot: &Arc<Mutex<Option<T>>>) -> Self
-    where
-        T: Clone,
-    {
+impl<T: JobClient> AdmittedClient<T> {
+    fn copy_of(slot: &ClientSlot<T>) -> Self {
         match slot.lock() {
-            Ok(guard) => guard.as_ref().map_or(Self::Absent, |client| Self::Present {
-                client: client.clone(),
-                slot: slot.clone(),
+            Ok(guard) => guard.as_ref().map_or(Self::Absent, |client| {
+                Self::Present(client.clone().admitted_from(slot.clone()))
             }),
             Err(_) => Self::Poisoned,
+        }
+    }
+
+    /// The job's copy, whether or not it may still send.
+    fn copy(&self) -> Option<&T> {
+        match self {
+            Self::Present(client) => Some(client),
+            Self::Absent | Self::Poisoned => None,
         }
     }
 
@@ -380,25 +401,37 @@ impl<T: SendsAs> AdmittedClient<T> {
     /// The job never sends from the slot's client. The slot is read to refuse:
     /// a save that tightened the routing or content policy while the job
     /// waited stops it here, as it did when the worker read the slot at
-    /// dispatch. Every send asks again, so a save between a projection's draft
-    /// and its repair stops the repair.
-    fn get(&self) -> Result<Option<&T>, ClientRefused> {
+    /// dispatch. Asked here before a dial's route is stamped, and again by the
+    /// client before each transport attempt of that dial.
+    fn get(&self) -> Result<Option<&T>, SendRefused> {
         match self {
-            Self::Present { client, slot } => match slot.lock() {
-                Ok(current)
-                    if current
-                        .as_ref()
-                        .is_some_and(|current| current.sends_as(client)) =>
-                {
-                    Ok(Some(client))
-                }
-                Ok(_) => Err(ClientRefused::Replaced),
-                Err(_) => Err(ClientRefused::Poisoned),
-            },
+            Self::Present(client) => client.leave_to_send().map(|()| Some(client)),
             Self::Absent => Ok(None),
-            Self::Poisoned => Err(ClientRefused::Poisoned),
+            Self::Poisoned => Err(SendRefused::Poisoned),
         }
     }
+
+    /// Whether this copy is the client `approved` describes: an equal client,
+    /// or none on both sides.
+    fn is_approved(&self, approved: &ApprovedClient<T>) -> Result<(), SendRefused> {
+        match (self, approved) {
+            (Self::Poisoned, _) => Err(SendRefused::Poisoned),
+            (Self::Present(client), Some((config, policy))) if client.sends_as(config, *policy) => {
+                Ok(())
+            }
+            (Self::Absent, None) => Ok(()),
+            _ => Err(SendRefused::Replaced),
+        }
+    }
+}
+
+/// The HTTP clients a caller's own gate approved: what the client cache would
+/// hold for the settings that gate read, built by the function the cache is
+/// synced with.
+#[derive(Default)]
+pub struct AdmittedClients {
+    pub api: Option<(ApiConfig, crate::asr::ProviderContentEgressPolicy)>,
+    pub openrouter: Option<(OpenRouterConfig, crate::asr::ProviderContentEgressPolicy)>,
 }
 
 impl LlmExecutor {
@@ -508,30 +541,34 @@ impl LlmExecutor {
     /// real count (the native `LlmEngine`) populate `tokens_used`; the others
     /// report 0 (see the `chat_*` attempt fns) — never fabricated.
     ///
-    /// `admitted_routing_policy` is the OpenRouter routing policy the caller's
-    /// request was admitted under. The job's client is taken here. If a
-    /// settings save since that admission left it with another policy, the
-    /// chat is refused with `policy_blocked` and nothing is queued.
+    /// `admitted` is what the caller's own gate approved. The job's client is
+    /// taken here, later than that gate, and a settings save in between can
+    /// have replaced it with one for another destination, model or policy.
+    /// Unless the client taken is the one approved, the chat is refused with
+    /// `policy_blocked` and nothing is queued.
     pub fn chat_with_history(
         &self,
         messages: Vec<ChatMessage>,
         graph_context: String,
         provider: LlmProvider,
-        admitted_routing_policy: Option<OpenRouterRoutingPolicy>,
+        admitted: AdmittedClients,
     ) -> Result<ChatOutcome, RuntimeDiagnostic> {
         let backends = self.backends.admit(&provider);
-        if let AdmittedClient::Present { client, .. } = &backends.openrouter_client {
-            // What a request admitted with that policy is sent under: the
-            // policy, else the provider's legacy order.
-            let admitted = admitted_routing_policy.or_else(|| match &provider {
-                LlmProvider::OpenRouter { provider_order, .. } => {
-                    OpenRouterRoutingPolicy::from_provider_order(provider_order.as_deref())
-                }
-                _ => None,
-            });
-            if client.config().provider_routing_policy() != admitted {
+        let approved = match crate::llm::route::resolve_route(&provider).blocking_backend {
+            Some(BlockingBackend::OpenAiCompatible) => {
+                backends.api_client.is_approved(&admitted.api)
+            }
+            Some(BlockingBackend::OpenRouter) => {
+                backends.openrouter_client.is_approved(&admitted.openrouter)
+            }
+            Some(BlockingBackend::NativeLlama) | Some(BlockingBackend::MistralRs) | None => Ok(()),
+        };
+        match approved {
+            Ok(()) => {}
+            Err(SendRefused::Poisoned) => return Err(executor_failure(Code::Internal)),
+            Err(SendRefused::Replaced) => {
                 log::warn!(
-                    "LLM chat refused: the OpenRouter routing policy changed after admission"
+                    "LLM chat refused: its client is not the one its request was admitted with"
                 );
                 return Err(executor_failure(Code::PolicyBlocked));
             }
@@ -627,27 +664,36 @@ impl LlmExecutor {
 
     fn enqueue(&self, priority: LlmPriority, job: LlmJob) {
         let (lock, cvar) = &*self.queue;
-        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.worker == Worker::Retired {
-            self.start_worker(&mut state);
-        }
-        if state.worker == Worker::Running {
-            push_job(&mut state, priority, job);
-            cvar.notify_one();
-        }
-        // Otherwise the job is dropped on return, and its reply sender with
-        // it: the caller's `recv` fails at once instead of waiting on a queue
-        // nobody drains.
+        let unqueued = {
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if state.worker == Worker::Retired {
+                self.start_worker(&mut state);
+            }
+            if state.worker == Worker::Running {
+                let evicted = push_job(&mut state, priority, job);
+                cvar.notify_one();
+                evicted
+            } else {
+                // Nothing would take it from the queue.
+                vec![job]
+            }
+        };
+        // Dropped with the queue unlocked: a job holds a client and can hold a
+        // whole ledger. Its reply sender goes with it, so that caller's `recv`
+        // fails at once instead of waiting on a result nobody will send.
+        drop(unqueued);
     }
 }
 
 /// Push a job onto the appropriate priority queue, applying the drop-oldest
-/// bound to background work.
+/// bound to background work. Returns the jobs that bound evicted, for the
+/// caller to drop once it has released the queue lock.
 ///
 /// Pure data-structure logic, lifted out of `enqueue` so the bound +
 /// drop-oldest ordering can be unit-tested without spawning the worker
-/// thread. Behaviour is identical to the prior inline body.
-fn push_job(state: &mut QueueState, priority: LlmPriority, job: LlmJob) {
+/// thread.
+fn push_job(state: &mut QueueState, priority: LlmPriority, job: LlmJob) -> Vec<LlmJob> {
+    let mut evicted = Vec::new();
     match priority {
         LlmPriority::Interactive => state.interactive.push_back(job),
         LlmPriority::Background => {
@@ -655,7 +701,7 @@ fn push_job(state: &mut QueueState, priority: LlmPriority, job: LlmJob) {
             // job drops its `response_tx`, so the blocked caller's `recv()`
             // returns Err → None → rule-based fallback.
             while state.background.len() >= MAX_BACKGROUND_QUEUE {
-                state.background.pop_front();
+                evicted.extend(state.background.pop_front());
                 let n = DROPPED_BACKGROUND_JOBS.fetch_add(1, Ordering::Relaxed) + 1;
                 if n % 10 == 1 {
                     log::warn!(
@@ -670,6 +716,7 @@ fn push_job(state: &mut QueueState, priority: LlmPriority, job: LlmJob) {
             state.background.push_back(job);
         }
     }
+    evicted
 }
 
 /// Pop the next job to run: interactive work is drained before background
@@ -805,15 +852,11 @@ fn requested_completion_budget(handles: &BackendHandles, route: &AuthorizedRoute
     match route.descriptor().blocking_backend {
         Some(BlockingBackend::OpenAiCompatible) => handles
             .api_client
-            .get()
-            .ok()
-            .flatten()
+            .copy()
             .map(|client| client.config().max_tokens),
         Some(BlockingBackend::OpenRouter) => handles
             .openrouter_client
-            .get()
-            .ok()
-            .flatten()
+            .copy()
             .map(|client| client.config().max_tokens),
         Some(BlockingBackend::NativeLlama) | Some(BlockingBackend::MistralRs) | None => None,
     }
@@ -1347,7 +1390,7 @@ fn projection_api(
     let client = handles
         .api_client
         .get()
-        .map_err(|refused| refused.diagnostic().to_string())?
+        .map_err(|refused| executor_failure(refused.report()).to_string())?
         .ok_or_else(|| "API LLM client is not configured".to_string())?;
     let live = api_route_for_client(route, client)?;
     // Stamped from the job's client endpoint, BEFORE the fallible network
@@ -1428,7 +1471,7 @@ fn projection_openrouter(
     let client = handles
         .openrouter_client
         .get()
-        .map_err(|refused| refused.diagnostic().to_string())?
+        .map_err(|refused| executor_failure(refused.report()).to_string())?
         .ok_or_else(|| "OpenRouter client is not configured".to_string())?;
     let live = openrouter_route_for_client(route, client)?;
     // OpenRouter has no loopback deployment, so unlike the API route above no
@@ -1651,14 +1694,14 @@ fn extraction_slot<T>(slot: &Mutex<Option<T>>) -> Option<std::sync::MutexGuard<'
 /// The job's client for extraction. A poisoned slot is refused for the reason
 /// [`extraction_slot`] gives, and a replaced client for the reason
 /// [`AdmittedClient::get`] gives.
-fn extraction_client<T: SendsAs>(client: &AdmittedClient<T>) -> Option<&T> {
+fn extraction_client<T: JobClient>(client: &AdmittedClient<T>) -> Option<&T> {
     match client.get() {
         Ok(client) => client,
-        Err(ClientRefused::Poisoned) => {
+        Err(SendRefused::Poisoned) => {
             log::warn!("LLM extraction falling back: the backend slot is poisoned");
             None
         }
-        Err(ClientRefused::Replaced) => {
+        Err(SendRefused::Replaced) => {
             log::warn!(
                 "LLM extraction falling back: its client was replaced after the job was queued"
             );
@@ -1763,7 +1806,7 @@ fn chat_api(
     let client = handles
         .api_client
         .get()
-        .map_err(|refused| refused.diagnostic())?
+        .map_err(|refused| executor_failure(refused.report()))?
         .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?;
     // A client pointed outside the authorized provider is refused.
     let live =
@@ -1787,7 +1830,7 @@ fn chat_openrouter(
     let client = handles
         .openrouter_client
         .get()
-        .map_err(|refused| refused.diagnostic())?
+        .map_err(|refused| executor_failure(refused.report()))?
         .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?;
     let live = openrouter_route_for_client(route, client)
         .map_err(|_| executor_failure(Code::PolicyBlocked))?;
@@ -2849,13 +2892,15 @@ mod tests {
     /// `captured[0]` is the first request's body, `captured[1]` the second's,
     /// etc.
     async fn spawn_capturing_mock(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<String>>>) {
-        spawn_capturing_mock_with(responses, |_| {}).await
+        let ok = responses.into_iter().map(|body| (200, body)).collect();
+        spawn_capturing_mock_with(ok, |_| {}).await
     }
 
-    /// [`spawn_capturing_mock`], calling `before_reply` with a request's index
-    /// once that request is captured and before it is answered.
+    /// [`spawn_capturing_mock`] with a status for each reply, calling
+    /// `before_reply` with a request's index once that request is captured and
+    /// before it is answered.
     async fn spawn_capturing_mock_with(
-        responses: Vec<String>,
+        responses: Vec<(u16, String)>,
         before_reply: impl Fn(usize) + Send + 'static,
     ) -> (String, Arc<StdMutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2866,7 +2911,7 @@ mod tests {
         let captured_for_task = captured.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for (index, body) in responses.into_iter().enumerate() {
+            for (index, (status, body)) in responses.into_iter().enumerate() {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
@@ -2906,8 +2951,8 @@ mod tests {
                 }
                 before_reply(index);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body,
                 );
@@ -2930,11 +2975,9 @@ mod tests {
     }
 
     /// A job's client whose slot still holds it.
-    fn present<T: Clone>(client: T) -> AdmittedClient<T> {
-        AdmittedClient::Present {
-            slot: Arc::new(Mutex::new(Some(client.clone()))),
-            client,
-        }
+    fn present<T: JobClient>(client: T) -> AdmittedClient<T> {
+        let slot = Arc::new(Mutex::new(Some(client.clone())));
+        AdmittedClient::Present(client.admitted_from(slot))
     }
 
     fn handles_with_only_api_client(endpoint: &str) -> BackendHandles {
@@ -3609,7 +3652,7 @@ mod tests {
                 Vec::new(),
                 String::new(),
                 LlmProvider::LocalLlama,
-                None,
+                AdmittedClients::default(),
             );
             let (job, ledger) = projection_test_job(ProjectionKind::Notes);
             let patch = executor.generate_projection_patch(
@@ -3689,7 +3732,12 @@ mod tests {
         let (executor, tag) = (executor.clone(), tag.to_string());
         spawn_caller(move || {
             executor
-                .chat_with_history(Vec::new(), tag, LlmProvider::LocalLlama, None)
+                .chat_with_history(
+                    Vec::new(),
+                    tag,
+                    LlmProvider::LocalLlama,
+                    AdmittedClients::default(),
+                )
                 .map(|outcome| outcome.text)
         })
     }
@@ -4055,8 +4103,12 @@ mod tests {
             Arc::new(Mutex::new(None)),
         );
         // Drives enqueue → worker_loop → run_chat → response over the channel.
-        let result =
-            exec.chat_with_history(Vec::new(), String::new(), LlmProvider::LocalLlama, None);
+        let result = exec.chat_with_history(
+            Vec::new(),
+            String::new(),
+            LlmProvider::LocalLlama,
+            AdmittedClients::default(),
+        );
         assert!(result.is_err(), "chat with no backends resolves to an Err");
     }
 
@@ -4085,11 +4137,11 @@ mod tests {
     const ADMISSION_MODEL: &str = "admission-probe-model";
 
     /// The restrictions a user approves a request under.
-    fn strict_routing() -> OpenRouterRoutingPolicy {
-        OpenRouterRoutingPolicy {
+    fn strict_routing() -> crate::llm::openrouter::OpenRouterRoutingPolicy {
+        crate::llm::openrouter::OpenRouterRoutingPolicy {
             data_collection: Some(crate::llm::openrouter::OpenRouterDataCollectionPolicy::Deny),
             zdr: Some(true),
-            ..OpenRouterRoutingPolicy::default()
+            ..Default::default()
         }
     }
 
@@ -4105,13 +4157,21 @@ mod tests {
 
     fn openrouter_client(
         base: &str,
-        routing_policy: Option<OpenRouterRoutingPolicy>,
+        routing_policy: Option<crate::llm::openrouter::OpenRouterRoutingPolicy>,
     ) -> OpenRouterClient {
         OpenRouterClient::new(crate::llm::openrouter::OpenRouterConfig {
             routing_policy,
             ..openrouter_config(base)
         })
         .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+    }
+
+    /// What a caller whose gate approved `client` passes to the executor.
+    fn approved(client: &OpenRouterClient) -> AdmittedClients {
+        AdmittedClients {
+            openrouter: Some((client.config().clone(), client.content_egress_policy())),
+            ..AdmittedClients::default()
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -4126,7 +4186,7 @@ mod tests {
         executor: LlmExecutor,
         kind: Queued,
         provider: LlmProvider,
-        admitted_routing_policy: Option<OpenRouterRoutingPolicy>,
+        admitted: AdmittedClients,
     ) -> mpsc::Receiver<String> {
         spawn_caller(move || match kind {
             Queued::Projection => {
@@ -4160,7 +4220,7 @@ mod tests {
                     Vec::new(),
                     "context".to_string(),
                     provider,
-                    admitted_routing_policy,
+                    admitted,
                 );
                 format!("{:?}", reply.map(|outcome| outcome.text))
             }
@@ -4246,38 +4306,35 @@ mod tests {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
         let rt = tokio::runtime::Runtime::new().expect("rt");
         // An endpoint that would answer, so a request would be counted.
-        let (base, requests) = rt.block_on(spawn_counting_mock(vec![completed_reply("notes"); 9]));
+        let (base, requests) = rt.block_on(spawn_counting_mock(vec![completed_reply("notes"); 12]));
         let strict = Some(strict_routing());
         let allow = crate::asr::ProviderContentEgressPolicy::allow();
         let block = crate::asr::ProviderContentEgressPolicy::block("explicit_policy_required");
 
-        // (the routing the job entered with, the routing and the content
-        // policy saved while it waited)
-        for (entered_with, saved_routing, saved_content) in [
+        // (the routing the job entered with, what is saved while it waits: a
+        // client's routing and content policy, or no client)
+        for (entered_with, saved) in [
             // Routing loosened.
-            (strict.clone(), None, allow),
+            (strict.clone(), Some((None, allow))),
             // Routing tightened.
-            (None, strict.clone(), allow),
+            (None, Some((strict.clone(), allow))),
             // Cloud content blocked.
-            (strict.clone(), strict.clone(), block),
+            (strict.clone(), Some((strict.clone(), block))),
+            // The key removed: the slot is emptied.
+            (strict.clone(), None),
         ] {
             for kind in [Queued::Projection, Queued::Extraction, Queued::Chat] {
-                let (shared, slot) =
-                    shared_with_openrouter(openrouter_client(&base, entered_with.clone()));
+                let entered = openrouter_client(&base, entered_with.clone());
+                let admitted = approved(&entered);
+                let (shared, slot) = shared_with_openrouter(entered);
                 let (executor, taken, release) = gated_executor(shared);
-                let ended = queue_job(
-                    executor,
-                    kind,
-                    openrouter_provider(&base, None),
-                    entered_with.clone(),
-                );
+                let ended = queue_job(executor, kind, openrouter_provider(&base, None), admitted);
                 taken
                     .recv_timeout(JOB_WAIT)
                     .expect("the worker takes the job");
-                *slot.lock().unwrap() = Some(
-                    openrouter_client(&base, saved_routing.clone())
-                        .with_content_egress_policy(saved_content),
-                );
+                *slot.lock().unwrap() = saved.clone().map(|(routing, content)| {
+                    openrouter_client(&base, routing).with_content_egress_policy(content)
+                });
                 release.send(()).expect("release the job");
 
                 let refused = match kind {
@@ -4308,7 +4365,7 @@ mod tests {
         // The save lands after the draft's request arrived and before it is
         // answered.
         let (base, requests) = rt.block_on(spawn_capturing_mock_with(
-            vec![unusable_patch_reply(), unusable_patch_reply()],
+            vec![(200, unusable_patch_reply()), (200, unusable_patch_reply())],
             {
                 let (slot, replacement) = (slot.clone(), replacement.clone());
                 move |index| {
@@ -4357,6 +4414,71 @@ mod tests {
     }
 
     #[test]
+    fn a_save_between_two_transport_attempts_stops_the_second() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        for (status, second_attempt) in [
+            // A transient failure, which the client retries after a backoff.
+            (503, "the retry"),
+            // A refused schema, which the projection resends in JSON mode.
+            (400, "the format downgrade"),
+        ] {
+            let slot: OpenRouterSlot = Arc::new(Mutex::new(None));
+            let replacement: OpenRouterSlot = Arc::new(Mutex::new(None));
+            // The save lands after the first request arrived and before it is
+            // answered. The second reply would be served if it were asked for.
+            let (base, requests) = rt.block_on(spawn_capturing_mock_with(
+                vec![(status, "{}".to_string()), (200, unusable_patch_reply())],
+                {
+                    let (slot, replacement) = (slot.clone(), replacement.clone());
+                    move |index| {
+                        if index == 0 {
+                            // Swapped, not dropped: a blocking client cannot
+                            // be dropped on the mock's runtime.
+                            std::mem::swap(
+                                &mut *slot.lock().unwrap(),
+                                &mut *replacement.lock().unwrap(),
+                            );
+                        }
+                    }
+                },
+            ));
+            *slot.lock().unwrap() = Some(openrouter_client(&base, Some(strict_routing())));
+            // The saved client differs only in blocking cloud content.
+            *replacement.lock().unwrap() = Some(
+                openrouter_client(&base, Some(strict_routing())).with_content_egress_policy(
+                    crate::asr::ProviderContentEgressPolicy::block("explicit_policy_required"),
+                ),
+            );
+            let executor = LlmExecutor::new(
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                slot.clone(),
+                Arc::new(Mutex::new(None)),
+            );
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+
+            let attempt = executor.generate_projection_patch(
+                job,
+                ledger,
+                None::<crate::projections::MaterializedNotes>,
+                openrouter_provider(&base, None),
+                1,
+                100,
+            );
+
+            assert_eq!(
+                attempt.outcome.expect_err(second_attempt),
+                "runtime/policy_blocked",
+                "{second_attempt} must be refused"
+            );
+            // Taken out on this thread, for the reason the swap gives.
+            assert!(slot.lock().unwrap().take().is_some());
+            assert!(replacement.lock().unwrap().take().is_some());
+            assert_sent_under_strict_routing(&requests, 1);
+        }
+    }
+
+    #[test]
     fn a_job_whose_client_was_rebuilt_unchanged_is_sent_under_the_policy_it_entered_with() {
         let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
@@ -4379,15 +4501,11 @@ mod tests {
             (Queued::Extraction, None),
             (Queued::Chat, Some("Ok(\"notes\")")),
         ] {
-            let (shared, slot) =
-                shared_with_openrouter(openrouter_client(&base, Some(strict_routing())));
+            let entered = openrouter_client(&base, Some(strict_routing()));
+            let admitted = approved(&entered);
+            let (shared, slot) = shared_with_openrouter(entered);
             let (executor, taken, release) = gated_executor(shared);
-            let ended = queue_job(
-                executor,
-                kind,
-                openrouter_provider(&base, None),
-                Some(strict_routing()),
-            );
+            let ended = queue_job(executor, kind, openrouter_provider(&base, None), admitted);
             taken
                 .recv_timeout(JOB_WAIT)
                 .expect("the worker takes the job");
@@ -4404,67 +4522,102 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_whose_policy_changed_since_its_admission_is_refused_and_not_queued() {
+    fn a_chat_is_refused_unless_its_client_is_the_one_its_gate_approved() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         // An endpoint that would answer, so a request would be counted.
         let (base, requests) = rt.block_on(spawn_counting_mock(vec![
             completed_reply("notes"),
             completed_reply("notes"),
         ]));
-        let sent = || requests.load(std::sync::atomic::Ordering::SeqCst);
+        let (other, other_requests) =
+            rt.block_on(spawn_counting_mock(vec![completed_reply("notes")]));
+        let sent = |count: &std::sync::atomic::AtomicUsize| {
+            count.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let allow = crate::asr::ProviderContentEgressPolicy::allow();
+        let refused_and_not_queued =
+            |shared: SharedBackends, provider: LlmProvider, admitted: AdmittedClients| {
+                let executor = LlmExecutor::with_runner(
+                    shared,
+                    Arc::new(|_| unreachable!("a refused chat is not queued")),
+                );
+                let capture = ThreadLogCapture::start();
+                let reply = executor
+                    .chat_with_history(Vec::new(), "context".to_string(), provider, admitted)
+                    .map(|outcome| outcome.text);
+                let logs = render(&capture.finish());
+                assert_eq!(reply, Err(executor_failure(Code::PolicyBlocked)));
+                assert!(
+                    logs.contains(
+                        "LLM chat refused: its client is not the one its request was admitted with"
+                    ),
+                    "{logs}"
+                );
+            };
 
-        for (saved, admitted) in [
-            // Loosened since the request was admitted.
-            (None, Some(strict_routing())),
-            // Tightened: still not the policy the request was admitted with.
-            (Some(strict_routing()), None),
+        // OpenRouter: the gate approved strict routing, and a save since then
+        // loosened it, tightened it the other way round, or removed the key.
+        let strict = openrouter_client(&base, Some(strict_routing()));
+        let loose = openrouter_client(&base, None);
+        for (in_the_slot, admitted) in [
+            (Some(loose.clone()), approved(&strict)),
+            (Some(strict.clone()), approved(&loose)),
+            (None, approved(&strict)),
         ] {
-            let (shared, _slot) = shared_with_openrouter(openrouter_client(&base, saved));
-            let executor = LlmExecutor::with_runner(
-                shared,
-                Arc::new(|_| unreachable!("a refused chat is not queued")),
-            );
-            let capture = ThreadLogCapture::start();
-            let reply = executor
-                .chat_with_history(
-                    Vec::new(),
-                    "context".to_string(),
-                    openrouter_provider(&base, None),
-                    admitted,
-                )
-                .map(|outcome| outcome.text);
-            let logs = render(&capture.finish());
-
-            assert_eq!(reply, Err(executor_failure(Code::PolicyBlocked)));
-            assert!(
-                logs.contains(
-                    "LLM chat refused: the OpenRouter routing policy changed after admission"
-                ),
-                "{logs}"
-            );
+            let shared = SharedBackends {
+                openrouter_client: Arc::new(Mutex::new(in_the_slot)),
+                ..empty_shared()
+            };
+            refused_and_not_queued(shared, openrouter_provider(&base, None), admitted);
         }
-        assert_eq!(sent(), 0);
 
-        // A legacy provider order is a routing policy too. The same order on
-        // both sides is the same policy, and the chat is sent.
-        let order = Some(vec!["numbat".to_string(), "quokka".to_string()]);
-        let client = OpenRouterClient::new(crate::llm::openrouter::OpenRouterConfig {
-            provider_order: order.clone(),
-            ..openrouter_config(&base)
-        })
-        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-        let (shared, _slot) = shared_with_openrouter(client);
+        // The generic endpoint: the gate approved `base`, and a save since
+        // then pointed the client at `other`. Both resolve to the same
+        // provider id, so nothing but this comparison tells them apart.
+        let gated = probe_api_client(&base);
+        let shared = SharedBackends {
+            api_client: Arc::new(Mutex::new(Some(probe_api_client(&other)))),
+            ..empty_shared()
+        };
+        refused_and_not_queued(
+            shared,
+            LlmProvider::Api {
+                endpoint: base.clone(),
+                api_key: "sk-route-removal-probe".to_string(),
+                model: "probe-model".to_string(),
+            },
+            AdmittedClients {
+                api: Some((gated.config().clone(), allow)),
+                ..AdmittedClients::default()
+            },
+        );
+        assert_eq!(sent(&requests), 0);
+        assert_eq!(sent(&other_requests), 0);
+
+        // The client the gate approved is sent.
+        let shared = SharedBackends {
+            api_client: Arc::new(Mutex::new(Some(gated.clone()))),
+            ..empty_shared()
+        };
         let executor = LlmExecutor::with_runner(shared, Arc::new(run_job));
         let reply = executor
             .chat_with_history(
                 Vec::new(),
                 "context".to_string(),
-                openrouter_provider(&base, order),
-                None,
+                LlmProvider::Api {
+                    endpoint: base.clone(),
+                    api_key: "sk-route-removal-probe".to_string(),
+                    model: "probe-model".to_string(),
+                },
+                AdmittedClients {
+                    api: Some((gated.config().clone(), allow)),
+                    ..AdmittedClients::default()
+                },
             )
             .map(|outcome| outcome.text);
         assert_eq!(reply, Ok("notes".to_string()));
-        assert_eq!(sent(), 1);
+        assert_eq!(sent(&requests), 1);
+        assert_eq!(sent(&other_requests), 0);
     }
 
     #[test]

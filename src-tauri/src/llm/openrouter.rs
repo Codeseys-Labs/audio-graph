@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::admission::{ClientSlot, SendRefused, leave_to_send};
 use crate::llm::http_diag::{
     HttpFailure, INFERENCE, diagnostic, http_context, same_origin_redirects,
 };
@@ -1366,6 +1367,9 @@ pub struct OpenRouterClient {
     /// closed rather than retrying construction in a path that panics.
     client: Option<reqwest::blocking::Client>,
     content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+    /// For the copy an executor job sends from: the slot it was copied from.
+    /// `None` for every other client, the slot's own included.
+    admitted_from: Option<ClientSlot<OpenRouterClient>>,
 }
 
 impl OpenRouterClient {
@@ -1403,6 +1407,7 @@ impl OpenRouterClient {
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
                 "explicit_policy_required",
             ),
+            admitted_from: None,
         }
     }
 
@@ -1425,8 +1430,37 @@ impl OpenRouterClient {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn content_egress_policy(&self) -> crate::asr::ProviderContentEgressPolicy {
         self.content_egress_policy
+    }
+
+    /// Whether this client sends to `config`'s destination under `policy`.
+    /// This is the one notion of "the same client", for the client cache and
+    /// for the executor.
+    pub(crate) fn sends_as(
+        &self,
+        config: &OpenRouterConfig,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> bool {
+        &self.config == config && self.content_egress_policy == policy
+    }
+
+    /// Mark this client as an executor job's copy of the client in `slot`.
+    pub(crate) fn admitted_from(mut self, slot: ClientSlot<Self>) -> Self {
+        self.admitted_from = Some(slot);
+        self
+    }
+
+    /// See [`crate::llm::admission`]. A client that is not a job's copy may
+    /// always send.
+    pub(crate) fn leave_to_send(&self) -> Result<(), SendRefused> {
+        match &self.admitted_from {
+            Some(slot) => leave_to_send(slot, |current| {
+                current.sends_as(&self.config, self.content_egress_policy)
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Returns `true` when the config has the minimum fields populated to
@@ -1702,6 +1736,9 @@ impl OpenRouterClient {
             // Attempts are 1-based; the request body must be rebuilt each try
             // because `.json()` + `.send()` consume the builder.
             let attempt = attempt_number;
+            // Asked before every attempt, a retry after backoff included.
+            self.leave_to_send()
+                .map_err(|refused| HttpFailure::new(refused.report(), INFERENCE))?;
             let outcome = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.config.api_key))
