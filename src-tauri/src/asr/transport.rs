@@ -174,8 +174,8 @@ mod tests {
                     size: 691,
                     max_size: 379,
                 }),
-                Code::CapacityExhausted,
-                Recovery::ReviewConfiguration,
+                Code::ProtocolError,
+                Recovery::None,
             ),
             (
                 Error::Protocol(ProtocolError::SendAfterClosing),
@@ -184,8 +184,8 @@ mod tests {
             ),
             (
                 Error::WriteBufferFull(Box::new(Message::Text("asr-secret-canary".into()))),
-                Code::CapacityExhausted,
-                Recovery::ReviewConfiguration,
+                Code::Internal,
+                Recovery::None,
             ),
         ] {
             let error = guard.write_error(AsrTransportPayloadKind::Audio, native);
