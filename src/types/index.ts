@@ -1625,6 +1625,12 @@ export interface ProviderReadiness {
   language_catalog?: ProviderModelCatalogItem[];
   openrouter_models?: OpenRouterModel[];
   runtime?: ProviderRuntimeReadiness | null;
+  /**
+   * Typed cause of an `error` status, when the probe produced one. Present it
+   * through `runtimeDiagnosticPresentation`; `message` is then only the closed
+   * `runtime/<code>` token.
+   */
+  diagnostic?: RuntimeDiagnostic;
   effective_stt_fidelity?: EffectiveSttFidelity;
 }
 

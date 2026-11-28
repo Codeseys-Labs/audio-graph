@@ -15,10 +15,16 @@ use std::sync::Arc;
 #[cfg(feature = "llm-mistralrs")]
 use mistralrs::{GgufModelBuilder, Model, RequestBuilder, TextMessageRole, TextMessages};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+
 use crate::graph::entities::ExtractionResult;
-use crate::llm::engine::ChatMessage;
+#[cfg(feature = "llm-mistralrs")]
+use crate::llm::engine::engine_not_loaded;
+use crate::llm::engine::{ChatMessage, engine_failure};
 #[cfg(feature = "llm-mistralrs")]
 use crate::llm::engine::{LlmChatParams, LlmStreamEvent};
+#[cfg(feature = "llm-mistralrs")]
+use crate::llm::stream_contract::FinishReason;
 #[cfg(feature = "llm-mistralrs")]
 use crate::projection_llm::ProjectionPatchDraft;
 #[cfg(feature = "llm-mistralrs")]
@@ -48,14 +54,16 @@ fn usage_total_to_u32(total_tokens: usize) -> u32 {
 ///
 /// mistral.rs 0.8 streams content as `Chunk` frames; the final chunk also sets
 /// `choices[0].finish_reason` and the request `usage`. `content` is the delta to
-/// forward (possibly empty); `terminal_usage` is `Some((prompt, completion,
-/// total))` exactly on the terminal chunk (the token counts already cast to
-/// `u32` via [`usage_total_to_u32`]), and `None` on intermediate chunks. Pure +
+/// forward (possibly empty); `finish_reason` is the chunk's reason, normalized,
+/// when it carries one; `terminal_usage` is `Some((prompt, completion, total))`
+/// exactly on the terminal chunk (the token counts already cast to `u32` via
+/// [`usage_total_to_u32`]), and `None` on intermediate chunks. Pure +
 /// model-free so the drain logic is unit-tested without a loaded GGUF.
 #[cfg(feature = "llm-mistralrs")]
 #[derive(Debug, PartialEq, Eq)]
 struct StreamChunkStep {
     content: String,
+    finish_reason: Option<FinishReason>,
     terminal_usage: Option<(u32, u32, u32)>,
 }
 
@@ -69,7 +77,10 @@ struct StreamChunkStep {
 fn interpret_stream_chunk(chunk: mistralrs::ChatCompletionChunkResponse) -> StreamChunkStep {
     let usage = chunk.usage;
     let choice = chunk.choices.into_iter().next();
-    let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
+    let finish_reason = choice
+        .as_ref()
+        .and_then(|c| c.finish_reason.as_deref())
+        .map(FinishReason::from_provider);
     let content = choice.and_then(|c| c.delta.content).unwrap_or_default();
 
     let terminal_usage = if finish_reason.is_some() || usage.is_some() {
@@ -86,6 +97,7 @@ fn interpret_stream_chunk(chunk: mistralrs::ChatCompletionChunkResponse) -> Stre
 
     StreamChunkStep {
         content,
+        finish_reason,
         terminal_usage,
     }
 }
@@ -130,20 +142,24 @@ fn mistralrs_response_to_event(resp: Response) -> LlmStreamEvent {
             let prompt_tokens = usage_total_to_u32(response.usage.prompt_tokens);
             let completion_tokens = usage_total_to_u32(response.usage.completion_tokens);
             let total_tokens = usage_total_to_u32(response.usage.total_tokens);
-            let full_text = response
-                .choices
-                .into_iter()
-                .next()
+            let choice = response.choices.into_iter().next();
+            let finish_reason = choice.as_ref().map_or(FinishReason::Stop, |choice| {
+                FinishReason::from_provider(&choice.finish_reason)
+            });
+            let full_text = choice
                 .and_then(|choice| choice.message.content)
                 .unwrap_or_default();
             LlmStreamEvent::Done {
                 full_text,
+                finish_reason,
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
             }
         }
-        Response::ModelError(message, partial) => {
+        // The model's own error text and the validation detail stay here: only
+        // the variant classifies the failure.
+        Response::ModelError(_, partial) => {
             let full_text = partial
                 .choices
                 .into_iter()
@@ -151,16 +167,16 @@ fn mistralrs_response_to_event(resp: Response) -> LlmStreamEvent {
                 .and_then(|choice| choice.message.content)
                 .unwrap_or_default();
             LlmStreamEvent::Error {
-                message: format!("mistral.rs model error: {}", message),
+                diagnostic: engine_failure(Code::Internal),
                 full_text,
             }
         }
-        Response::InternalError(err) => LlmStreamEvent::Error {
-            message: format!("mistral.rs internal error: {}", err),
+        Response::InternalError(_) => LlmStreamEvent::Error {
+            diagnostic: engine_failure(Code::Internal),
             full_text: String::new(),
         },
-        Response::ValidationError(err) => LlmStreamEvent::Error {
-            message: format!("mistral.rs validation error: {}", err),
+        Response::ValidationError(_) => LlmStreamEvent::Error {
+            diagnostic: engine_failure(Code::RequestRejected),
             full_text: String::new(),
         },
         // A chat stream never yields the completion / image / speech / raw /
@@ -168,7 +184,7 @@ fn mistralrs_response_to_event(resp: Response) -> LlmStreamEvent {
         // than silently dropping the frame (which would hang the drain loop
         // waiting for a terminal that never arrives).
         _ => LlmStreamEvent::Error {
-            message: "mistral.rs returned an unexpected non-chat stream response".to_string(),
+            diagnostic: engine_failure(Code::ProtocolError),
             full_text: String::new(),
         },
     }
@@ -207,17 +223,13 @@ impl MistralRsEngine {
             .enable_all()
             .thread_name("mistralrs-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime for mistral.rs: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal).to_string())?;
 
         let model = rt
             .block_on(GgufModelBuilder::new(model_dir, vec![model_filename.to_string()]).build())
-            .map_err(|e| format!("Failed to build mistral.rs model: {}", e))?;
+            .map_err(|_| engine_not_loaded().to_string())?;
 
-        log::info!(
-            "mistral.rs model loaded from: {}/{}",
-            model_dir,
-            model_filename
-        );
+        log::info!("mistral.rs model loaded");
 
         Ok(Self {
             model,
@@ -241,7 +253,11 @@ impl MistralRsEngine {
     /// JSON Schema from [`ExtractionResult`]'s `schemars::JsonSchema`
     /// implementation, constraining the model to produce valid JSON that
     /// deserializes without error.
-    pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
+    pub fn extract_entities(
+        &self,
+        text: &str,
+        speaker: &str,
+    ) -> Result<ExtractionResult, RuntimeDiagnostic> {
         // ADR-0008 follow-up #1: adopt the shared conversation ontology as the
         // system prompt so the typed vocabulary (entity + relation types,
         // conservative-extraction rules) matches every other backend. The JSON
@@ -264,7 +280,8 @@ Output JSON:"#,
         let result: ExtractionResult = self
             .rt
             .block_on(self.model.generate_structured::<ExtractionResult>(messages))
-            .map_err(|e| format!("mistral.rs structured extraction failed: {}", e))?;
+            // The source may quote the model's output; it is not classified.
+            .map_err(|_| engine_failure(Code::Internal))?;
 
         log::debug!(
             "mistral.rs extraction: {} entities, {} relations",
@@ -283,7 +300,11 @@ Output JSON:"#,
     ///
     /// Returns the reply text only; use [`Self::chat_with_usage`] when the
     /// caller needs the token count too.
-    pub fn chat(&self, messages: &[ChatMessage], graph_context: &str) -> Result<String, String> {
+    pub fn chat(
+        &self,
+        messages: &[ChatMessage],
+        graph_context: &str,
+    ) -> Result<String, RuntimeDiagnostic> {
         self.chat_with_usage(messages, graph_context)
             .map(|(text, _tokens)| text)
     }
@@ -300,7 +321,7 @@ Output JSON:"#,
         &self,
         messages: &[ChatMessage],
         graph_context: &str,
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
         let system_prompt = format!(
             "You are a helpful assistant that answers questions about an \
              audio conversation and its knowledge graph. Use the following context from \
@@ -325,7 +346,7 @@ Output JSON:"#,
         let response = self
             .rt
             .block_on(self.model.send_chat_request(text_messages))
-            .map_err(|e| format!("mistral.rs chat request failed: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
 
         let tokens_used = usage_total_to_u32(response.usage.total_tokens);
 
@@ -334,7 +355,7 @@ Output JSON:"#,
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| "No response content from mistral.rs".to_string())?;
+            .ok_or(engine_failure(Code::InvalidResponse))?;
 
         Ok((text, tokens_used))
     }
@@ -344,7 +365,7 @@ Output JSON:"#,
         &self,
         messages: &[ChatMessage],
         graph_context: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, RuntimeDiagnostic> {
         self.chat(messages, graph_context)
     }
 
@@ -356,7 +377,7 @@ Output JSON:"#,
         &self,
         messages: &[ChatMessage],
         graph_context: &str,
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
         self.chat_with_usage(messages, graph_context)
     }
 
@@ -367,7 +388,7 @@ Output JSON:"#,
     pub fn projection_patch_draft_with_usage(
         &self,
         messages: &[ChatMessage],
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
         let mut text_messages = TextMessages::new();
         for msg in messages {
             let role = match msg.role.as_str() {
@@ -385,9 +406,8 @@ Output JSON:"#,
                 self.model
                     .generate_structured::<ProjectionPatchDraft>(text_messages),
             )
-            .map_err(|e| format!("mistral.rs structured projection failed: {}", e))?;
-        let raw_json = serde_json::to_string(&draft)
-            .map_err(|e| format!("failed to serialize structured projection draft: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
+        let raw_json = serde_json::to_string(&draft).map_err(|_| engine_failure(Code::Internal))?;
 
         Ok((raw_json, 0))
     }
@@ -417,7 +437,7 @@ Output JSON:"#,
         params: LlmChatParams,
         cancel: CancellationToken,
         events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeDiagnostic> {
         let system_prompt = format!(
             "You are a helpful assistant that answers questions about an \
              audio conversation and its knowledge graph. Use the following context from \
@@ -446,10 +466,10 @@ Output JSON:"#,
             // fully drained inside this async block (it cannot escape `block_on`).
             let mut stream = match self.model.stream_chat_request(request).await {
                 Ok(stream) => stream,
-                Err(e) => {
+                Err(_) => {
                     let _ = events
                         .send(LlmStreamEvent::Error {
-                            message: format!("mistral.rs stream request failed: {}", e),
+                            diagnostic: engine_failure(Code::Internal),
                             full_text: String::new(),
                         })
                         .await;
@@ -487,6 +507,7 @@ Output JSON:"#,
                             Some(Response::Chunk(chunk)) => {
                                 let StreamChunkStep {
                                     content,
+                                    finish_reason,
                                     terminal_usage,
                                 } = interpret_stream_chunk(chunk);
                                 if !content.is_empty() {
@@ -508,6 +529,10 @@ Output JSON:"#,
                                     let _ = events
                                         .send(LlmStreamEvent::Done {
                                             full_text,
+                                            // Usage alone can end the stream; with
+                                            // no reason given that is a plain stop.
+                                            finish_reason: finish_reason
+                                                .unwrap_or(FinishReason::Stop),
                                             prompt_tokens,
                                             completion_tokens,
                                             total_tokens,
@@ -525,12 +550,12 @@ Output JSON:"#,
                             }
                             None => {
                                 // Stream ended without a terminal (finish_reason)
-                                // chunk: surface a single defensive Error carrying
+                                // chunk. It was cut off: report the failure every
+                                // streaming adapter reports for that, carrying
                                 // whatever text was generated so far.
                                 let _ = events
                                     .send(LlmStreamEvent::Error {
-                                        message: "mistral.rs stream ended without a terminal chunk"
-                                            .to_string(),
+                                        diagnostic: engine_failure(Code::InvalidResponse),
                                         full_text,
                                     })
                                     .await;
@@ -570,38 +595,42 @@ impl MistralRsEngine {
         &self,
         _text: &str,
         _speaker: &str,
-    ) -> Result<ExtractionResult, String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<ExtractionResult, RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
-    pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    pub fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<String, RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn chat_with_usage(
         &self,
         _messages: &[ChatMessage],
         _graph_context: &str,
-    ) -> Result<(String, u32), String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn chat_with_history(
         &self,
         _messages: &[ChatMessage],
         _graph_context: &str,
-    ) -> Result<String, String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<String, RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn chat_with_history_usage(
         &self,
         _messages: &[ChatMessage],
         _graph_context: &str,
-    ) -> Result<(String, u32), String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn projection_patch_draft_with_usage(
         &self,
         _messages: &[ChatMessage],
-    ) -> Result<(String, u32), String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<(String, u32), RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn stream_chat(
         &self,
@@ -610,8 +639,8 @@ impl MistralRsEngine {
         _params: crate::llm::engine::LlmChatParams,
         _cancel: tokio_util::sync::CancellationToken,
         _events: tokio::sync::mpsc::Sender<crate::llm::engine::LlmStreamEvent>,
-    ) -> Result<(), String> {
-        Err(MISTRALRS_UNAVAILABLE.to_string())
+    ) -> Result<(), RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
 }
 
@@ -648,6 +677,17 @@ mod tests {
         assert_eq!(usage_total_to_u32(usize::MAX), u32::MAX);
     }
 
+    /// Needs no model: the directory does not exist.
+    #[cfg(feature = "llm-mistralrs")]
+    #[test]
+    fn a_failed_load_returns_only_the_closed_token() {
+        let directory = std::env::temp_dir().join("marmot-missing-models");
+        let error = super::MistralRsEngine::new(&directory.to_string_lossy(), "marmot.gguf")
+            .err()
+            .expect("the model cannot load");
+        assert_eq!(error, "runtime/provider_unavailable");
+    }
+
     // ------------------------------------------------------------------
     // Streaming response-mapping seam (model-free)
     //
@@ -661,7 +701,9 @@ mod tests {
     #[cfg(feature = "llm-mistralrs")]
     mod stream_mapping {
         use super::super::{StreamChunkStep, interpret_stream_chunk, mistralrs_response_to_event};
-        use crate::llm::engine::LlmStreamEvent;
+        use crate::llm::engine::{LlmStreamEvent, engine_failure};
+        use crate::llm::stream_contract::FinishReason;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
         use mistralrs::{
             ChatCompletionChunkResponse, ChatCompletionResponse, Choice, ChunkChoice, Delta,
             Response, ResponseMessage, Usage,
@@ -762,6 +804,7 @@ mod tests {
                 mistralrs_response_to_event(resp),
                 LlmStreamEvent::Done {
                     full_text: "full answer".to_string(),
+                    finish_reason: FinishReason::Stop,
                     prompt_tokens: 11,
                     completion_tokens: 4,
                     total_tokens: 15,
@@ -770,36 +813,34 @@ mod tests {
         }
 
         #[test]
-        fn model_error_carries_partial_text() {
+        fn model_error_keeps_partial_text_and_drops_the_model_message() {
             let resp = Response::ModelError(
-                "boom".to_string(),
+                "engine-message-canary".to_string(),
                 completion(Some("partial"), usage(2, 1, 3)),
             );
-            match mistralrs_response_to_event(resp) {
-                LlmStreamEvent::Error { message, full_text } => {
-                    assert!(
-                        message.contains("boom"),
-                        "message should carry cause: {message}"
-                    );
-                    assert_eq!(full_text, "partial");
+            let event = mistralrs_response_to_event(resp);
+            assert_eq!(
+                event,
+                LlmStreamEvent::Error {
+                    diagnostic: engine_failure(Code::Internal),
+                    full_text: "partial".to_string(),
                 }
-                other => panic!("expected Error, got {other:?}"),
-            }
+            );
+            assert!(!format!("{event:?}").contains("engine-message-canary"));
         }
 
         #[test]
         fn internal_error_maps_to_error_without_partial_text() {
-            let resp = Response::InternalError("io".to_string().into());
-            match mistralrs_response_to_event(resp) {
-                LlmStreamEvent::Error { message, full_text } => {
-                    assert!(
-                        message.contains("io"),
-                        "message should carry cause: {message}"
-                    );
-                    assert!(full_text.is_empty());
+            let resp = Response::InternalError("engine-source-canary".to_string().into());
+            let event = mistralrs_response_to_event(resp);
+            assert_eq!(
+                event,
+                LlmStreamEvent::Error {
+                    diagnostic: engine_failure(Code::Internal),
+                    full_text: String::new(),
                 }
-                other => panic!("expected Error, got {other:?}"),
-            }
+            );
+            assert!(!format!("{event:?}").contains("engine-source-canary"));
         }
 
         #[test]
@@ -828,6 +869,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: "Hel".to_string(),
+                    finish_reason: None,
                     terminal_usage: None,
                 }
             );
@@ -846,6 +888,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: "lo".to_string(),
+                    finish_reason: Some(FinishReason::Stop),
                     terminal_usage: Some((8, 5, 13)),
                 }
             );
@@ -860,6 +903,7 @@ mod tests {
                 step,
                 StreamChunkStep {
                     content: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
                     terminal_usage: Some((0, 0, 0)),
                 }
             );
@@ -871,6 +915,12 @@ mod tests {
             // treat usage presence alone as terminal.
             let step = interpret_stream_chunk(chunk_response(None, None, Some(usage(3, 2, 5))));
             assert_eq!(step.terminal_usage, Some((3, 2, 5)));
+        }
+
+        #[test]
+        fn a_truncated_reply_keeps_its_finish_reason() {
+            let step = interpret_stream_chunk(chunk_response(None, Some("length"), None));
+            assert_eq!(step.finish_reason, Some(FinishReason::Length));
         }
     }
 }

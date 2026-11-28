@@ -8,7 +8,7 @@ use super::service::{
     CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
     PreparedCredentialActivation, ReplaceCredentialSet,
 };
-use crate::crash_handler::{RedactedPanicOp, with_redacted_panic_scope};
+use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use audio_graph_ipc_contract::credential_contract::{
     AuthMethodId, BuiltInCredentialSetId, CredentialBackendAvailability, CredentialBackendKind,
     CredentialError, CredentialErrorCode, CredentialIdempotencyToken, CredentialMigrationState,
@@ -16,7 +16,6 @@ use audio_graph_ipc_contract::credential_contract::{
     CredentialSafeRecoveryAction, CredentialServiceStatus, CredentialSetId,
     CredentialSetRecordState, CredentialWorkerState, CredentialWorkerStatus,
 };
-use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -1242,9 +1241,12 @@ fn runtime_worker_loop(
         let Some(shared) = shared.upgrade() else {
             break;
         };
-        let panicked = with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-            catch_unwind(AssertUnwindSafe(|| worker.handle(request, &shared))).is_err()
-        });
+        // The payload, and any panic from its destructor, is disposed of inside
+        // the redaction scope, so the worker survives and keeps serving.
+        let panicked = catch_redacted_panic(RedactedPanicOp::CredentialBoundary, || {
+            worker.handle(request, &shared)
+        })
+        .is_err();
         if panicked {
             shared.terminal_stall(None);
         }
@@ -1400,8 +1402,23 @@ mod tests {
     use uuid::Uuid;
     use zeroize::Zeroizing;
 
+    /// How a scripted commit panics.
+    enum CommitPanic {
+        Message(String),
+        /// An opaque payload whose destructor panics with the canary.
+        DestructorPayload(String),
+    }
+
+    struct DestructorPanic(String);
+
+    impl Drop for DestructorPanic {
+        fn drop(&mut self) {
+            panic!("{}", self.0)
+        }
+    }
+
     struct DelayedCommitControl {
-        panic_on_commit: Option<String>,
+        panic_on_commit: Option<CommitPanic>,
         block_next_commit: AtomicBool,
         entered: Mutex<bool>,
         entered_cv: Condvar,
@@ -1442,8 +1459,12 @@ mod tests {
         }
 
         fn block_commit_if_requested(&self) {
-            if let Some(canary) = &self.panic_on_commit {
-                panic!("{canary}");
+            match &self.panic_on_commit {
+                Some(CommitPanic::Message(canary)) => panic!("{canary}"),
+                Some(CommitPanic::DestructorPayload(canary)) => {
+                    std::panic::panic_any(DestructorPanic(canary.clone()))
+                }
+                None => {}
             }
             if !self.block_next_commit.swap(false, Ordering::AcqRel) {
                 return;
@@ -1974,22 +1995,30 @@ mod tests {
     }
 
     const PANIC_CANARY_ENV: &str = "AUDIOGRAPH_TEST_RUNTIME_PANIC_CANARY";
+    const PANIC_KIND_ENV: &str = "AUDIOGRAPH_TEST_RUNTIME_PANIC_KIND";
+    const REDACTED_BOUNDARY_REPORT: &str =
+        "AudioGraph crash report\n\nPayload:\n[redacted panic payload: credential.boundary]\n";
 
     #[tokio::test]
-    #[ignore = "invoked in isolation by store_panic_is_redacted_at_hook_time"]
+    #[ignore = "invoked in isolation by the store panic hook-time tests"]
     async fn store_panic_child() {
         let Ok(canary) = std::env::var(PANIC_CANARY_ENV) else {
             return;
+        };
+        let panic = match std::env::var(PANIC_KIND_ENV).as_deref() {
+            Ok("destructor") => CommitPanic::DestructorPayload(canary),
+            _ => CommitPanic::Message(canary),
         };
         crate::crash_handler::install();
         let initial_journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
         let store = Arc::new(DelayedCredentialStore::new(
             initial_journal.clone(),
             Arc::new(DelayedCommitControl {
-                panic_on_commit: Some(canary),
+                panic_on_commit: Some(panic),
                 ..DelayedCommitControl::new()
             }),
         ));
+        let worker_held_store = Arc::clone(&store);
         let (event_tx, event_rx) = mpsc::channel();
         let runtime = CredentialRuntime::dormant(CredentialBackendKind::InMemory);
         runtime
@@ -2018,10 +2047,19 @@ mod tests {
             CredentialRuntimeLifecycle::Stalled
         );
         assert!(event_rx.try_recv().is_err());
+        // The worker thread owns the backend, which holds the store. Had a
+        // panic escaped the dispatch catch, that thread would have unwound
+        // and released them.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            Arc::strong_count(&worker_held_store) > 1,
+            "credential worker thread ended"
+        );
     }
 
-    #[test]
-    fn store_panic_is_redacted_at_hook_time() {
+    /// Runs `store_panic_child` with the real crash hook and returns its
+    /// sorted crash reports.
+    fn store_panic_reports(kind: &str) -> Vec<String> {
         let nonce = Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("audiograph-runtime-panic-{nonce}"));
         let canary = format!("private store payload {nonce}");
@@ -2034,21 +2072,35 @@ mod tests {
             ])
             .env(crate::user_data::DATA_DIR_ENV, &root)
             .env(PANIC_CANARY_ENV, &canary)
+            .env(PANIC_KIND_ENV, kind)
+            .env("RUST_BACKTRACE", "0")
             .output()
             .unwrap();
-        let reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
+        let mut reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
             .unwrap()
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect();
         std::fs::remove_dir_all(root).unwrap();
+        reports.sort();
 
         assert!(output.status.success(), "child status {}", output.status);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&canary));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(&canary));
+        reports
+    }
+
+    #[test]
+    fn store_panic_is_redacted_at_hook_time() {
+        assert_eq!(store_panic_reports("message"), [REDACTED_BOUNDARY_REPORT]);
+    }
+
+    /// The destructor of the caught payload panics again. Both panics are
+    /// reported as the closed marker, and the worker thread survives.
+    #[test]
+    fn panicking_payload_destructor_is_redacted_and_the_worker_survives() {
         assert_eq!(
-            reports,
-            [
-                "AudioGraph crash report\n\nPayload:\n[redacted panic payload: credential.boundary]\n"
-            ]
+            store_panic_reports("destructor"),
+            [REDACTED_BOUNDARY_REPORT, REDACTED_BOUNDARY_REPORT]
         );
     }
 

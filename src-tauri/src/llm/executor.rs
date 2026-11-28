@@ -8,9 +8,13 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeOperation,
+};
+
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
-use crate::llm::engine::{ChatMessage, ChatOutcome};
+use crate::llm::engine::{ChatMessage, ChatOutcome, engine_not_loaded};
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::projection_llm::{
     PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionContext,
@@ -22,6 +26,7 @@ use crate::projection_llm::{
 use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
 
+use super::http_diag::{SchemaRejection, diagnostic};
 use super::route::{
     AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
     ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
@@ -59,30 +64,6 @@ fn note_openrouter_schema_unsupported(model: &str) {
     if let Ok(mut set) = OPENROUTER_SCHEMA_UNSUPPORTED.lock() {
         set.insert(model.to_string());
     }
-}
-
-/// Whether a provider error means the structured-outputs request should **retry
-/// without the schema** — a 400/404/422-class rejection, as opposed to a
-/// transient failure or an auth error (which must NOT trigger the schema-less
-/// retry: a schema-less call would just fail the same way on auth, and transient
-/// errors are already retried in-client). Both blocking error strings carry
-/// `status=<code>` (`openrouter_http_error_message` / `api_error_message`).
-///
-/// The retry it authorizes is a MODE downgrade on the SAME authorized route —
-/// json_schema to json_object — never a provider substitution (ADR-0038).
-fn is_schema_rejection(err: &str) -> bool {
-    err.contains("status=400") || err.contains("status=404") || err.contains("status=422")
-}
-
-/// Whether a schema rejection is **model-level** evidence worth caching (vs. a
-/// single-provider validation quirk). With `require_parameters=true` on the
-/// request, a 404-class response means "no endpoint for this model supports the
-/// requested params" — that applies to the whole model slug, so it is
-/// cache-worthy. A 400/422 came from a provider that WAS routed to (it advertised
-/// support) and is schema-specific, not model-level, so it is not cached (seed
-/// audio-graph-a324, Codex P2).
-fn is_openrouter_schema_unsupported_by_model(err: &str) -> bool {
-    err.contains("status=404")
 }
 
 // ---------------------------------------------------------------------------
@@ -129,18 +110,12 @@ pub fn extraction_in_cooldown() -> bool {
     now_ms() < EXTRACTION_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed)
 }
 
-fn is_rate_limited(err: &str) -> bool {
-    err.contains("429")
-        || err.contains("Too Many Requests")
-        || err.to_ascii_lowercase().contains("rate limit")
-}
-
-/// If `err` looks like a rate-limit, start/extend the extraction cooldown.
-fn note_extraction_error(err: &str) {
-    if is_rate_limited(err) {
+/// Back off background work only on typed provider rate-limit evidence.
+fn note_extraction_error(diagnostic: &RuntimeDiagnostic) {
+    if matches!(diagnostic, RuntimeDiagnostic::Runtime(error) if error.code == Code::RateLimited) {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(now_ms() + EXTRACTION_COOLDOWN_MS, Ordering::Relaxed);
         log::warn!(
-            "Extraction rate-limited (429) — pausing background extraction for {}s to preserve \
+            "Extraction rate-limited — pausing background extraction for {}s to preserve \
              quota for chat. Consider a non-`:free` OpenRouter model or adding credits.",
             EXTRACTION_COOLDOWN_MS / 1000
         );
@@ -156,6 +131,9 @@ pub enum LlmPriority {
 #[derive(Clone)]
 pub struct LlmExecutor {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
+    /// False when the worker thread never started. Nothing would take a job,
+    /// so none is queued.
+    has_worker: bool,
 }
 
 struct QueueState {
@@ -205,7 +183,7 @@ enum LlmJob {
 #[allow(clippy::large_enum_variant)]
 enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
-    Chat(Result<ChatOutcome, String>),
+    Chat(Result<ChatOutcome, RuntimeDiagnostic>),
     ProjectionPatch(ProjectionPatchAttempt),
 }
 
@@ -269,12 +247,16 @@ impl LlmExecutor {
             mistralrs_engine,
         };
 
-        let _ = std::thread::Builder::new()
+        // The spawn error is OS prose; the failure itself is the whole signal.
+        let has_worker = std::thread::Builder::new()
             .name("llm-executor".to_string())
             .spawn(move || worker_loop(worker_queue, handles))
-            .map_err(|e| log::error!("Failed to spawn LLM executor thread: {}", e));
+            .is_ok();
+        if !has_worker {
+            log::error!("Failed to spawn LLM executor thread");
+        }
 
-        Self { queue }
+        Self { queue, has_worker }
     }
 
     pub fn extract_entities(
@@ -323,7 +305,7 @@ impl LlmExecutor {
         messages: Vec<ChatMessage>,
         graph_context: String,
         provider: LlmProvider,
-    ) -> Result<ChatOutcome, String> {
+    ) -> Result<ChatOutcome, RuntimeDiagnostic> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Interactive,
@@ -337,13 +319,11 @@ impl LlmExecutor {
 
         match response_rx.recv() {
             Ok(LlmJobResult::Chat(result)) => result,
-            Ok(LlmJobResult::Extraction(_)) => {
-                Err("LLM executor returned extraction result for chat request".to_string())
+            // The worker answered a chat job with another job's result.
+            Ok(LlmJobResult::Extraction(_) | LlmJobResult::ProjectionPatch(_)) => {
+                Err(executor_failure(Code::Internal))
             }
-            Ok(LlmJobResult::ProjectionPatch(_)) => {
-                Err("LLM executor returned projection result for chat request".to_string())
-            }
-            Err(e) => Err(format!("LLM executor chat response failed: {}", e)),
+            Err(_) => Err(no_worker_reply()),
         }
     }
 
@@ -396,14 +376,19 @@ impl LlmExecutor {
                 outcome: Err("LLM executor returned chat result for projection request".to_string()),
                 attempted_route: None,
             },
-            Err(e) => ProjectionPatchAttempt {
-                outcome: Err(format!("LLM executor projection response failed: {}", e)),
+            Err(_) => ProjectionPatchAttempt {
+                outcome: Err(no_worker_reply().to_string()),
                 attempted_route: None,
             },
         }
     }
 
     fn enqueue(&self, priority: LlmPriority, job: LlmJob) {
+        if !self.has_worker {
+            // Dropping the job drops its reply sender, so the caller's `recv`
+            // fails at once instead of waiting on a queue nobody drains.
+            return;
+        }
         let (lock, cvar) = &*self.queue;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         push_job(&mut state, priority, job);
@@ -609,9 +594,8 @@ fn run_chat(
     provider: &LlmProvider,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let route = authorize_and_budget_route_dispatch(handles, provider)
-        .map_err(|error| error.to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let route = authorize_and_budget_route_dispatch(handles, provider).map_err(route_refusal)?;
     match route.descriptor().blocking_backend {
         Some(BlockingBackend::NativeLlama) => chat_native(handles, messages, graph_context),
         Some(BlockingBackend::OpenAiCompatible) => {
@@ -621,7 +605,29 @@ fn run_chat(
             chat_openrouter(handles, &route, messages, graph_context)
         }
         Some(BlockingBackend::MistralRs) => chat_mistralrs(handles, messages, graph_context),
-        None => Err(no_blocking_route_error(&route)),
+        // This provider serves streaming chat only.
+        None => Err(executor_failure(Code::Unsupported)),
+    }
+}
+
+/// A closed diagnostic for a failure the executor detects itself, outside any
+/// backend call.
+fn executor_failure(code: Code) -> RuntimeDiagnostic {
+    diagnostic(
+        code,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+}
+
+/// The closed diagnostic for a chat dispatch the route layer refused before
+/// any backend was reached.
+fn route_refusal(error: AppError) -> RuntimeDiagnostic {
+    match error {
+        AppError::RuntimeDiagnostic(diagnostic) => diagnostic,
+        // The provider is compiled out of this build.
+        AppError::ProviderUnavailable { .. } => executor_failure(Code::Unsupported),
+        // The start gate, the privacy mode, or a wire skin not admitted.
+        _ => executor_failure(Code::PolicyBlocked),
     }
 }
 
@@ -635,6 +641,17 @@ fn no_blocking_route_error(route: &AuthorizedRoute) -> String {
         "{} has no blocking route; this provider serves streaming chat only",
         route.id()
     )
+}
+
+/// Terminal for a model reply that never became a valid patch, on any route.
+fn unusable_reply() -> String {
+    executor_failure(Code::InvalidResponse).to_string()
+}
+
+/// Terminal for a job no worker answered: the worker thread never started, or
+/// it dropped the reply channel.
+fn no_worker_reply() -> RuntimeDiagnostic {
+    executor_failure(Code::Internal)
 }
 
 /// One route attempt's content-free result.
@@ -875,11 +892,10 @@ fn run_projection_patch_on_route(
                 PROJECTION_PATCH_REPAIR_PROMPT_ID,
                 Some("repair"),
             )
-            .map_err(|repair_error| {
-                format!(
-                    "projection patch draft invalid and repair failed: {first_error}; repair: {repair_error}"
-                )
-            })?;
+            // The validator's errors served the repair prompt and stop here:
+            // a parse error can quote the reply and a validation error can
+            // carry a model-chosen operation id.
+            .map_err(|_| unusable_reply())?;
             outcome.tokens_used = output.tokens_used.saturating_add(repair_output.tokens_used);
             Ok(outcome)
         }
@@ -1080,7 +1096,11 @@ fn projection_api(
         Some(form) => match client.chat_completion_with_wire_outcome(prompt_tuples(messages), form)
         {
             Ok(result) => result,
-            Err(error) if is_schema_rejection(&error) => {
+            // A missing model (404) is not a refused schema; only OpenRouter
+            // reads a 404 as "no provider for this model takes the schema".
+            // Any 400 or 422 still resends once, for the reason given at the
+            // extraction downgrade in `api_client.rs`.
+            Err(error) if error.schema_rejection == Some(SchemaRejection::Request) => {
                 // A MODE downgrade on the SAME route, recorded rather than only
                 // logged: the returned `WireOutcome` carries `Unconstrained`.
                 log::warn!(
@@ -1093,7 +1113,7 @@ fn projection_api(
                     RequestOutputForm::JsonObject,
                 )?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         },
         None => client.chat_completion_with_wire_outcome(
             prompt_tuples(messages),
@@ -1160,11 +1180,8 @@ fn projection_openrouter(
             name: "projection_patch".to_string(),
             schema: projection_patch_strict_json_schema(&cache.kind),
         };
-        match client.chat_completion_with_wire_outcome(
-            prompt_tuples(messages),
-            &form,
-            Some(hint.clone()),
-        ) {
+        match client.chat_completion_diagnostic(prompt_tuples(messages), &form, Some(hint.clone()))
+        {
             Ok((raw_json, tokens_used, wire)) => {
                 return Ok(projection_output_from_wire(
                     route,
@@ -1175,8 +1192,8 @@ fn projection_openrouter(
                     wire,
                 ));
             }
-            Err(e) if is_schema_rejection(&e) => {
-                if is_openrouter_schema_unsupported_by_model(&e) {
+            Err(e) if e.schema_rejection.is_some() => {
+                if e.schema_rejection == Some(SchemaRejection::Model) {
                     log::warn!(
                         "OpenRouter structured projection output: no schema-capable provider for \
                          model (caching + falling back to JSON mode for the session): {e}"
@@ -1191,11 +1208,11 @@ fn projection_openrouter(
                 }
                 // fall through to JSON mode below, on the SAME route
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
-    let (raw_json, tokens_used, wire) = client.chat_completion_with_wire_outcome(
+    let (raw_json, tokens_used, wire) = client.chat_completion_diagnostic(
         prompt_tuples(messages),
         &RequestOutputForm::JsonObject,
         Some(hint),
@@ -1258,7 +1275,7 @@ fn projection_native(
     let engine = guard
         .as_ref()
         .ok_or_else(|| "Native LLM is not loaded".to_string())?;
-    let outcome = engine.chat(messages, "")?;
+    let outcome = engine.chat(messages, "").map_err(|e| e.to_string())?;
     Ok(ProjectionBackendOutput {
         raw_json: outcome.text,
         route_id: route.id(),
@@ -1307,7 +1324,9 @@ fn projection_mistralrs(
             log::warn!(
                 "mistral.rs structured projection output failed, falling back to chat JSON mode: {e}"
             );
-            let (raw_json, tokens_used) = engine.chat_with_history_usage(messages, "")?;
+            let (raw_json, tokens_used) = engine
+                .chat_with_history_usage(messages, "")
+                .map_err(|e| e.to_string())?;
             (
                 raw_json,
                 tokens_used,
@@ -1365,11 +1384,11 @@ fn extract_api(
         log::warn!("LLM extraction route refused: {error}");
         return None;
     }
-    match client.extract_entities(text, speaker, context) {
+    match client.extract_entities_diagnostic(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("API extraction failed: {}", e);
-            note_extraction_error(&e);
+            note_extraction_error(&e.diagnostic);
             None
         }
     }
@@ -1394,11 +1413,11 @@ fn extract_openrouter(
         log::warn!("LLM extraction route refused: {error}");
         return None;
     }
-    match client.extract_entities(text, speaker, context) {
+    match client.extract_entities_diagnostic(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("OpenRouter extraction failed: {}", e);
-            note_extraction_error(&e);
+            note_extraction_error(&e.diagnostic);
             None
         }
     }
@@ -1427,11 +1446,12 @@ fn chat_native(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
-    let engine = guard
-        .as_ref()
-        .ok_or_else(|| "Native LLM is not loaded".to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let guard = handles
+        .llm_engine
+        .lock()
+        .map_err(|_| executor_failure(Code::Internal))?;
+    let engine = guard.as_ref().ok_or_else(engine_not_loaded)?;
     // The native engine's inference loop counts prompt + completion tokens, so
     // this is the one blocking backend that surfaces a real `tokens_used`.
     engine.chat(messages, graph_context)
@@ -1442,16 +1462,21 @@ fn chat_api(
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
-        let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
+        let guard = handles
+            .api_client
+            .lock()
+            .map_err(|_| executor_failure(Code::Internal))?;
         guard
             .as_ref()
-            .ok_or_else(|| "API LLM client is not configured".to_string())?
+            .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?
             .clone()
     };
-    let live = api_route_for_client(route, &client)?;
+    // A client repointed outside the authorized provider is refused.
+    let live =
+        api_route_for_client(route, &client).map_err(|_| executor_failure(Code::PolicyBlocked))?;
     // `ApiClient::chat_with_history_with_usage` (and the Bedrock requests routed
     // through it) surfaces the OpenAI `usage.total_tokens` from the response.
     // A provider that omits the `usage` block reports 0 — never fabricated
@@ -1467,19 +1492,20 @@ fn chat_openrouter(
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
         let guard = handles
             .openrouter_client
             .lock()
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| executor_failure(Code::Internal))?;
         guard
             .as_ref()
-            .ok_or_else(|| "OpenRouter client is not configured".to_string())?
+            .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?
             .clone()
     };
-    let live = openrouter_route_for_client(route, &client)?;
+    let live = openrouter_route_for_client(route, &client)
+        .map_err(|_| executor_failure(Code::PolicyBlocked))?;
     // OpenRouter is OpenAI-compatible: the non-streaming response carries
     // `usage.total_tokens`. It is 0 only when the upstream provider omits the
     // usage block — never fabricated (FA-7c).
@@ -1509,11 +1535,12 @@ fn chat_mistralrs(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
-    let engine = guard
-        .as_ref()
-        .ok_or_else(|| "mistral.rs LLM is not loaded".to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let guard = handles
+        .mistralrs_engine
+        .lock()
+        .map_err(|_| executor_failure(Code::Internal))?;
+    let engine = guard.as_ref().ok_or_else(engine_not_loaded)?;
     // `MistralRsEngine::chat_with_history_usage` surfaces the real token count
     // from mistral.rs's `ChatCompletionResponse.usage.total_tokens` (FA-7c).
     engine
@@ -1528,10 +1555,12 @@ fn chat_mistralrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::http_diag::canary::assert_absent;
     use crate::projections::{
         ProjectionKind, ProjectionOperation, ProjectionPriority, TranscriptEvent,
         TranscriptEventStability,
     };
+    use crate::test_log_capture::{ThreadLogCapture, render};
     use std::sync::Mutex as StdMutex;
 
     /// Serialize the cooldown tests: they read/mutate the process-wide
@@ -1548,26 +1577,6 @@ mod tests {
         }
     }
 
-    // ----- is_rate_limited --------------------------------------------------
-
-    #[test]
-    fn is_rate_limited_matches_known_signals() {
-        assert!(is_rate_limited("API error 429 from endpoint"));
-        assert!(is_rate_limited("Too Many Requests"));
-        assert!(is_rate_limited("rate limit exceeded"));
-        // case-insensitive on the "rate limit" phrase
-        assert!(is_rate_limited("RATE LIMIT reached"));
-        assert!(is_rate_limited("Provider says: Rate Limit hit"));
-    }
-
-    #[test]
-    fn is_rate_limited_rejects_plain_errors() {
-        assert!(!is_rate_limited("connection refused"));
-        assert!(!is_rate_limited("500 Internal Server Error"));
-        assert!(!is_rate_limited("No LLM backend configured"));
-        assert!(!is_rate_limited(""));
-    }
-
     // ----- cooldown set / observe ------------------------------------------
 
     #[test]
@@ -1577,7 +1586,10 @@ mod tests {
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
         assert!(!extraction_in_cooldown());
 
-        note_extraction_error("HTTP 429 Too Many Requests");
+        note_extraction_error(&super::super::http_diag::diagnostic(
+            Code::RateLimited,
+            super::super::http_diag::INFERENCE,
+        ));
         assert!(
             extraction_in_cooldown(),
             "a 429 error must start the cooldown window"
@@ -1592,7 +1604,10 @@ mod tests {
         let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
 
-        note_extraction_error("connection refused");
+        note_extraction_error(&super::super::http_diag::diagnostic(
+            Code::NetworkUnreachable,
+            super::super::http_diag::INFERENCE,
+        ));
         assert!(
             !extraction_in_cooldown(),
             "a non-rate-limit error must NOT start the cooldown"
@@ -1824,24 +1839,41 @@ mod tests {
     fn projection_patch_fails_after_one_repair_attempt() {
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
         let call_count = Arc::new(Mutex::new(0usize));
-        let invalid = serde_json::json!({
-            "operations": [{
-                "type": "upsert_graph_node",
-                "id": "person:alice",
-                "name": "Alice",
-                "entity_type": "person",
-                "description": null
-            }]
-        })
+        // Each reply fails to parse, and the parser's error quotes the value.
+        let reply = |value: &str| {
+            serde_json::json!({
+                "operations": [{ "type": value, "id": "validation-id-canary" }]
+            })
+            .to_string()
+        };
+        let draft = reply("validation-value-canary");
+        let repair = reply("repair-value-canary");
+        let private_detail = projection_outcome_from_output(
+            &projection_output(draft.clone(), 3),
+            &job,
+            &ledger,
+            None.into(),
+            4,
+            123,
+            PROJECTION_PATCH_PROMPT_ID,
+            None,
+        )
+        .expect_err("the draft is invalid")
         .to_string();
+        assert!(
+            private_detail.contains("validation-value-canary"),
+            "the validator error must carry the value for this to be a canary: {private_detail}"
+        );
 
+        let capture = ThreadLogCapture::start();
         let err = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
                 move |_messages| {
                     let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
-                    Ok(projection_output(invalid.clone(), 3))
+                    let raw = if *count == 1 { &draft } else { &repair };
+                    Ok(projection_output(raw.clone(), 3))
                 }
             },
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
@@ -1852,10 +1884,24 @@ mod tests {
             123,
         )
         .expect_err("repair remains invalid");
+        let logs = render(&capture.finish());
 
         assert_eq!(*call_count.lock().unwrap_or_else(|e| e.into_inner()), 2);
-        assert!(err.contains("projection patch draft invalid and repair failed"));
-        assert!(err.contains("upsert_graph_node"));
+        assert_eq!(err, "runtime/invalid_response");
+        // The draft and the repair were each logged, by route identity only.
+        assert_eq!(
+            logs.matches("Projection patch route output").count(),
+            2,
+            "{logs}"
+        );
+        assert_absent(
+            &format!("{err}\n{logs}"),
+            &[
+                "validation-value-canary",
+                "repair-value-canary",
+                "validation-id-canary",
+            ],
+        );
     }
 
     #[test]
@@ -2192,48 +2238,25 @@ mod tests {
     // ----- a324: OpenRouter structured-output rejection classification ------
 
     #[test]
-    fn schema_rejection_matches_4xx_class_only() {
-        // A model that lacks structured-output support returns a 400/404/422;
-        // those trigger the schema-less retry.
-        assert!(is_schema_rejection(
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=400 body_bytes=12"
-        ));
-        assert!(is_schema_rejection("... status=404 ..."));
-        assert!(is_schema_rejection("... status=422 ..."));
-        // Auth and transient failures must NOT be treated as schema rejections —
-        // a schema-less retry would fail the same way (401/403) or should have
-        // been retried in-client (429/5xx).
-        assert!(!is_schema_rejection("... status=401 ..."));
-        assert!(!is_schema_rejection("... status=403 ..."));
-        assert!(!is_schema_rejection("... status=429 ..."));
-        assert!(!is_schema_rejection("... status=502 ..."));
-        assert!(!is_schema_rejection(
-            "OpenRouter chat completion request failed: timed out"
-        ));
-    }
+    fn only_schema_related_statuses_authorize_a_downgrade() {
+        use super::super::http_diag::{HttpFailure, INFERENCE};
 
-    #[test]
-    fn only_model_level_404_is_cacheable_as_schema_unsupported() {
-        // With require_parameters=true, a 404 (no provider for the model supports
-        // the schema) is model-level → cache-worthy. A 400/422 came from a
-        // routed-to provider that advertised support and is schema-specific → NOT
-        // model-level, must not demote the whole model for the session (Codex P2).
-        assert!(is_openrouter_schema_unsupported_by_model(
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404 body_bytes=30"
-        ));
-        assert!(
-            !is_openrouter_schema_unsupported_by_model("... status=400 ..."),
-            "a 400 is a per-provider validation quirk, not model-level evidence"
-        );
-        assert!(
-            !is_openrouter_schema_unsupported_by_model("... status=422 ..."),
-            "a 422 is a per-provider validation quirk, not model-level evidence"
-        );
-        // Sanity: every model-level signal is also a (broader) schema rejection.
-        let no_providers =
-            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404";
-        assert!(is_schema_rejection(no_providers));
-        assert!(is_openrouter_schema_unsupported_by_model(no_providers));
+        for (status, expected) in [
+            (400, Some(SchemaRejection::Request)),
+            (404, Some(SchemaRejection::Model)),
+            (422, Some(SchemaRejection::Request)),
+            (401, None),
+            (403, None),
+            (429, None),
+            (502, None),
+        ] {
+            let failure = HttpFailure::status(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                INFERENCE,
+                true,
+            );
+            assert_eq!(failure.schema_rejection, expected, "status {status}");
+        }
     }
 
     #[test]
@@ -2366,11 +2389,8 @@ mod tests {
         // error that can surface is the native engine's.
         let err =
             run_chat(&handles, &LlmProvider::LocalLlama, &[], "ctx").expect_err("no backend → Err");
-        assert_eq!(err, "Native LLM is not loaded");
-        assert!(
-            !err.contains("mistral.rs") && !err.contains("OpenRouter") && !err.contains("API LLM"),
-            "a single-route dispatch must not mention any other provider, got: {err}"
-        );
+        // Only the native engine's own diagnostic: no other route was tried.
+        assert_eq!(err, engine_not_loaded());
     }
 
     #[test]
@@ -2396,11 +2416,8 @@ mod tests {
             "ctx",
         )
         .expect_err("no OpenRouter client → Err");
-        assert_eq!(err, "OpenRouter client is not configured");
-        assert!(
-            !err.contains("mistral.rs") && !err.contains("Native LLM"),
-            "the OpenRouter route must never reach a local engine, got: {err}"
-        );
+        // The missing client, not a local engine's "not loaded".
+        assert_eq!(err, executor_failure(Code::InvalidConfiguration));
     }
 
     #[test]
@@ -2419,12 +2436,8 @@ mod tests {
             "ctx",
         )
         .expect_err("bedrock has no blocking route");
-        assert!(err.contains("route.aws_bedrock"), "got: {err}");
-        assert!(err.contains("streaming chat only"), "got: {err}");
-        assert!(
-            !err.contains("API LLM client is not configured"),
-            "the old misleading diagnostic must be gone, got: {err}"
-        );
+        // Not "client is not configured", which named the wrong client.
+        assert_eq!(err, executor_failure(Code::Unsupported));
     }
 
     #[test]
@@ -2450,6 +2463,27 @@ mod tests {
             "with no backend on the authorized route, extraction yields None → the \
              LOCAL rule-based extractor, which is not a provider substitution"
         );
+    }
+
+    // The cloud build's engine stub fails every call, which is enough to reach
+    // the log site; a real engine needs a model file.
+    #[cfg(not(feature = "llm-llama"))]
+    #[test]
+    fn native_extraction_failure_logs_only_the_diagnostic() {
+        let handles = BackendHandles {
+            llm_engine: Arc::new(Mutex::new(Some(LlmEngine))),
+            ..empty_handles()
+        };
+        let capture = ThreadLogCapture::start();
+        let result = extract_native(&handles, "heron transcript", "osprey");
+        let logs = render(&capture.finish());
+
+        assert!(result.is_none());
+        assert!(
+            logs.contains("Native LLM extraction failed: runtime/unsupported"),
+            "{logs}"
+        );
+        assert_absent(&logs, &["heron", "osprey"]);
     }
 
     // ----- ADR-0038: the removal, proven against a real wire ----------------
@@ -2599,6 +2633,49 @@ mod tests {
     }
 
     #[test]
+    fn api_extraction_failure_logs_only_the_diagnostic() {
+        let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // A 200 whose body is not a chat completion.
+        let body = format!("walrus reply {}", "w".repeat(4000));
+        let body_length = body.len().to_string();
+        let (base, request_count) = rt.block_on(spawn_counting_mock(vec![body]));
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base,
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+
+        let (result, logs) = std::thread::spawn(move || {
+            let capture = ThreadLogCapture::start();
+            let result = run_extraction(&handles, &provider, "heron transcript", "osprey", "");
+            (result, render(&capture.finish()))
+        })
+        .join()
+        .expect("worker thread panic");
+
+        assert!(result.is_none());
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(
+            logs.contains("API extraction failed: runtime/invalid_response"),
+            "{logs}"
+        );
+        assert_absent(
+            &logs,
+            &[
+                "walrus",
+                "heron",
+                "osprey",
+                "sk-route-removal-probe",
+                "127.0.0.1",
+                &body_length,
+            ],
+        );
+    }
+
+    #[test]
     fn a_refused_response_does_not_reach_a_second_provider() {
         // THE removal proof (seed audio-graph-3624). The one configured route
         // returns HTTP 200 with finish_reason "content_filter" — a provider
@@ -2704,10 +2781,7 @@ mod tests {
             2,
             "one draft + one SAME-route repair, and no third attempt"
         );
-        assert!(
-            err.contains("projection patch draft invalid and repair failed"),
-            "got: {err}"
-        );
+        assert_eq!(err, "runtime/invalid_response");
     }
 
     /// ADR-0037 x ADR-0038: a draft rejected for MISSING CLAIM EVIDENCE
@@ -3094,6 +3168,109 @@ mod tests {
             "job 2's ACTUAL WIRE REQUEST must carry job 1's applied note id — got: {}",
             requests_two[0]
         );
+    }
+
+    #[test]
+    fn executor_thread_logs_no_reply_content_when_draft_and_repair_both_fail() {
+        use crate::test_log_capture::{assert_process_logs_exclude, install, process_records};
+
+        install();
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // Two completed replies that are not valid patches: each carries an
+        // unknown operation type and a model-chosen operation id.
+        let reply = |value: &str| {
+            let patch = serde_json::json!({
+                "operations": [{ "type": value, "id": "quokka-operation" }]
+            });
+            serde_json::json!({
+                "choices": [{
+                    "message": { "content": patch.to_string() },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string()
+        };
+        let (base, requests) = rt.block_on(spawn_capturing_mock(vec![
+            reply("numbat-draft"),
+            reply("bilby-repair"),
+        ]));
+        let BackendHandles {
+            llm_engine,
+            api_client,
+            openrouter_client,
+            mistralrs_engine,
+        } = handles_with_only_api_client(&base);
+        let executor =
+            LlmExecutor::new(llm_engine, api_client, openrouter_client, mistralrs_engine);
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+
+        let logged_before = process_records().len();
+        let attempt = executor.generate_projection_patch(
+            job,
+            ledger,
+            None::<crate::projections::MaterializedNotes>,
+            LlmProvider::Api {
+                endpoint: base,
+                api_key: "sk-route-removal-probe".to_string(),
+                model: "probe-model".to_string(),
+            },
+            1,
+            100,
+        );
+
+        assert_eq!(
+            requests.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            2,
+            "the draft and the repair must both reach the wire"
+        );
+        assert_eq!(
+            attempt.outcome.expect_err("the repair is still invalid"),
+            "runtime/invalid_response"
+        );
+        // The worker thread is not this one, so its records are only in the
+        // process log. Those logged since the job started must include the
+        // path's own line.
+        assert!(
+            process_records()[logged_before..]
+                .iter()
+                .any(|record| record.message.contains("Projection patch route output"))
+        );
+        assert_process_logs_exclude(&["numbat-draft", "bilby-repair", "quokka-operation"]);
+    }
+
+    #[test]
+    fn an_executor_whose_worker_never_started_fails_at_once() {
+        let executor = LlmExecutor {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    interactive: VecDeque::new(),
+                    background: VecDeque::new(),
+                }),
+                Condvar::new(),
+            )),
+            has_worker: false,
+        };
+        // On its own thread: a regression would block here forever.
+        let (done, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let chat =
+                executor.chat_with_history(Vec::new(), String::new(), LlmProvider::LocalLlama);
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+            let patch = executor.generate_projection_patch(
+                job,
+                ledger,
+                None::<crate::projections::MaterializedNotes>,
+                LlmProvider::LocalLlama,
+                1,
+                100,
+            );
+            let _ = done.send((chat.map(|_| ()), patch.outcome.map(|_| ())));
+        });
+        let (chat, patch) = outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a job nobody will run must not wait for a reply");
+        assert_eq!(chat, Err(executor_failure(Code::Internal)));
+        assert_eq!(patch, Err("runtime/internal".to_string()));
     }
 
     #[test]

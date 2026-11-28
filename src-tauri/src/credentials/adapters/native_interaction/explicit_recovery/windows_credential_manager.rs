@@ -10,6 +10,7 @@ use super::{
 };
 use crate::credentials::domain::CredentialStoreFailure;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "windows")]
 use super::super::super::windows_credential_manager_ffi::NativeWinCredStore;
@@ -60,11 +61,10 @@ impl KeyringBoundary for WindowsCredentialManagerBoundary {
         &self,
         prompt: &ForbidPrompt<'_>,
         locator: &EntryLocator,
-    ) -> Result<Vec<u8>, CredentialStoreFailure> {
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
         ensure_forbid_prompt(prompt)?;
         let target = prepare_target(locator.windows_target()).map_err(Self::map_prepare_failure)?;
-        let mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;
-        Ok(std::mem::take(&mut *secret))
+        self.raw.read(target).map_err(Self::map_read_failure)
     }
 
     fn set_secret(
@@ -161,6 +161,16 @@ mod tests {
     // declare, for the status symbol its `-sys` crate does not bind. Any other
     // `extern` in that file, and any WinCred link anywhere, stays a violation.
     const MACOS_PERMITTED_EXTERN: &str = "unsafe extern \"C\" {\n    fn SecKeychainGetStatus(keychain: SecKeychainRef, keychain_status: *mut u32) -> OSStatus;\n}";
+    const MACOS_ACL_RAW_SOURCE: &str = "credentials/adapters/macos_acl_ffi.rs";
+    // The one `extern` block the authority journal's macOS ACL raw core may
+    // declare: the libSystem calls that clear and re-read an extended ACL.
+    const MACOS_ACL_PERMITTED_EXTERN: &str = "unsafe extern \"C\" {\n    fn acl_init(count: c_int) -> *mut c_void;\n    fn acl_set_fd_np(fd: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;\n    fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;\n    fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;\n    fn acl_free(object: *mut c_void) -> c_int;\n}";
+    /// Each raw core outside WinCred that may declare exactly one reviewed
+    /// `extern` block, and that block.
+    const PERMITTED_EXTERN_BLOCKS: [(&str, &str); 2] = [
+        (MACOS_RAW_SOURCE, MACOS_PERMITTED_EXTERN),
+        (MACOS_ACL_RAW_SOURCE, MACOS_ACL_PERMITTED_EXTERN),
+    ];
     const POLICY_SOURCE: &str =
         "credentials/adapters/native_interaction/explicit_recovery/windows_credential_manager.rs";
 
@@ -382,7 +392,6 @@ mod tests {
 
     fn source_violations(crate_src: &std::path::Path) -> std::io::Result<Vec<SourceViolation>> {
         let raw_source = std::path::Path::new(RAW_SOURCE);
-        let macos_raw_source = std::path::Path::new(MACOS_RAW_SOURCE);
         let policy_source = std::path::Path::new(POLICY_SOURCE);
         let mut violations = Vec::new();
         for path in production_rust_sources(crate_src)? {
@@ -403,14 +412,16 @@ mod tests {
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            let extern_scan = if relative == macos_raw_source {
-                normalized_tokens(&production).replacen(
-                    &normalized_tokens(&masked_rust_code(MACOS_PERMITTED_EXTERN)),
+            let permitted_extern = PERMITTED_EXTERN_BLOCKS
+                .iter()
+                .find(|(source, _)| relative == std::path::Path::new(source));
+            let extern_scan = match permitted_extern {
+                Some((_, declaration)) => normalized_tokens(&production).replacen(
+                    &normalized_tokens(&masked_rust_code(declaration)),
                     " ",
                     1,
-                )
-            } else {
-                production.clone()
+                ),
+                None => production.clone(),
             };
             let has_extern = extern_scan
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -807,8 +818,8 @@ mod tests {
         let policy = masked_production_code(include_str!("windows_credential_manager.rs"), "tests")
             .expect("one root policy test module");
         let method_mutant = policy.replacen(
-            "let mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;",
-            "let _ = self.raw.as_ref().read(target);\nlet mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;",
+            "self.raw.read(target).map_err(Self::map_read_failure)",
+            "let _ = self.raw.as_ref().read(target);\nself.raw.read(target).map_err(Self::map_read_failure)",
             1,
         );
         assert_ne!(method_mutant, policy);

@@ -7,6 +7,10 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeOperation,
+};
+
 use serde::{Deserialize, Serialize};
 
 use crate::asr::ProviderContentEgressPolicy;
@@ -118,27 +122,18 @@ pub struct StreamBackendMetadata {
 
 impl StreamBackendMetadata {
     pub fn from_provider(provider: &LlmProvider) -> Self {
-        match provider {
-            LlmProvider::LocalLlama => Self {
-                provider: "LocalLlama".to_string(),
-                model: None,
-            },
-            LlmProvider::Api { model, .. } => Self {
-                provider: "Api".to_string(),
-                model: Some(model.clone()),
-            },
-            LlmProvider::OpenRouter { model, .. } => Self {
-                provider: "OpenRouter".to_string(),
-                model: Some(model.clone()),
-            },
-            LlmProvider::AwsBedrock { model_id, .. } => Self {
-                provider: "AwsBedrock".to_string(),
-                model: Some(model_id.clone()),
-            },
-            LlmProvider::MistralRs { model_id } => Self {
-                provider: "MistralRs".to_string(),
-                model: Some(model_id.clone()),
-            },
+        let model = match provider {
+            LlmProvider::LocalLlama => None,
+            LlmProvider::Api { model, .. } | LlmProvider::OpenRouter { model, .. } => {
+                Some(model.clone())
+            }
+            LlmProvider::AwsBedrock { model_id, .. } | LlmProvider::MistralRs { model_id } => {
+                Some(model_id.clone())
+            }
+        };
+        Self {
+            provider: provider_kind(provider).to_string(),
+            model,
         }
     }
 }
@@ -232,23 +227,80 @@ impl StreamChatRequest {
     }
 }
 
+/// Closed kind of an [`LlmProvider`], without its endpoint, model, or key.
+const fn provider_kind(provider: &LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::LocalLlama => "LocalLlama",
+        LlmProvider::Api { .. } => "Api",
+        LlmProvider::OpenRouter { .. } => "OpenRouter",
+        LlmProvider::AwsBedrock { .. } => "AwsBedrock",
+        LlmProvider::MistralRs { .. } => "MistralRs",
+    }
+}
+
 impl fmt::Debug for StreamChatRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Presence only: an endpoint or an exact content size is not for logs.
         f.debug_struct("StreamChatRequest")
-            .field("provider", &self.provider)
-            .field("message_count", &self.history.len())
-            .field("graph_context_chars", &self.graph_context.chars().count())
+            .field(
+                "provider",
+                &format_args!("{}", provider_kind(&self.provider)),
+            )
+            .field("has_history", &!self.history.is_empty())
+            .field("has_graph_context", &!self.graph_context.is_empty())
             .field("params", &self.params)
             .field("policy", &self.content_egress_policy)
             .finish()
     }
 }
 
-/// Shared terminal-frame semantics for all streaming providers.
+/// Closed finish-reason vocabulary shared by every streaming adapter.
+///
+/// A provider's raw value never crosses the terminal boundary: it either
+/// matches this allowlist or becomes [`FinishReason::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ContentFilter,
+    ToolCalls,
+    /// The provider ended the turn itself reporting a fault.
+    Error,
+    Unknown,
+}
+
+impl FinishReason {
+    pub fn from_provider(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "stop" | "end_turn" | "stop_sequence" => Self::Stop,
+            "length" | "max_tokens" | "model_length" => Self::Length,
+            "content_filter" | "content_filtered" | "guardrail_intervened" | "refusal" => {
+                Self::ContentFilter
+            }
+            "tool_calls" | "tool_use" | "function_call" => Self::ToolCalls,
+            "error" => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ContentFilter => "content_filter",
+            Self::ToolCalls => "tool_calls",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Shared terminal-frame semantics for all streaming providers. Every variant
+/// is closed: there is no free-text terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamTerminalReason {
-    Done { finish_reason: String },
-    Error { message: String },
+    Done { finish_reason: FinishReason },
+    Diagnostic(RuntimeDiagnostic),
     Cancelled,
 }
 
@@ -261,12 +313,19 @@ pub struct StreamTerminalEvent {
 }
 
 impl StreamTerminalEvent {
+    /// A completed turn. A turn the provider ended by reporting its own fault
+    /// is a failure whatever text came before it, classified like any other
+    /// fault that names no code.
     pub fn done(
         full_text: String,
         usage: Option<StreamUsage>,
-        finish_reason: String,
+        finish_reason: FinishReason,
         metadata: StreamContextMetadata,
     ) -> Self {
+        if finish_reason == FinishReason::Error {
+            let context = RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference);
+            return Self::failure(RuntimeDiagnostic::internal(context), full_text, metadata);
+        }
         Self {
             reason: StreamTerminalReason::Done { finish_reason },
             full_text,
@@ -275,9 +334,13 @@ impl StreamTerminalEvent {
         }
     }
 
-    pub fn error(message: String, full_text: String, metadata: StreamContextMetadata) -> Self {
+    pub(super) fn failure(
+        diagnostic: RuntimeDiagnostic,
+        full_text: String,
+        metadata: StreamContextMetadata,
+    ) -> Self {
         Self {
-            reason: StreamTerminalReason::Error { message },
+            reason: StreamTerminalReason::Diagnostic(diagnostic),
             full_text,
             usage: None,
             metadata,
@@ -300,7 +363,9 @@ mod tests {
 
     #[test]
     fn stream_chat_request_debug_reports_shape_without_prompt_or_graph_content() {
-        let graph_context = "FAKE_GRAPH_CONTEXT_DO_NOT_LOG";
+        let graph_context = format!("FAKE_GRAPH_CONTEXT_DO_NOT_LOG{}", "x".repeat(7890));
+        let graph_context = graph_context.as_str();
+        assert_eq!(graph_context.chars().count(), 7919);
         let request = StreamChatRequest::new(
             LlmProvider::LocalLlama,
             vec![
@@ -327,14 +392,46 @@ mod tests {
         assert!(!debug.contains("SECOND_FAKE_PROMPT_DO_NOT_LOG"));
         assert!(!debug.contains(graph_context));
         assert!(debug.contains("provider: LocalLlama"));
-        assert!(debug.contains("message_count: 2"));
-        assert!(debug.contains(&format!(
-            "graph_context_chars: {}",
-            graph_context.chars().count()
-        )));
+        assert!(debug.contains("has_history: true"));
+        assert!(debug.contains("has_graph_context: true"));
         assert!(debug.contains("params: StreamParams"));
         assert!(debug.contains("max_tokens: 42"));
         assert!(debug.contains("temperature: 0.2"));
         assert!(debug.contains("policy: ProviderContentEgressPolicy"));
+        // Neither an exact content size nor a provider endpoint is rendered.
+        assert!(!debug.contains("7919"));
+
+        let remote = StreamChatRequest::new(
+            LlmProvider::Api {
+                endpoint: "https://private-endpoint-canary.example/v1".to_string(),
+                api_key: "debug-credential-canary".to_string(),
+                model: "test-model".to_string(),
+            },
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        );
+        let debug = format!("{remote:?}");
+        assert!(debug.contains("provider: Api"));
+        assert!(debug.contains("has_history: false"));
+        assert!(!debug.contains("private-endpoint-canary"));
+        assert!(!debug.contains("debug-credential-canary"));
+    }
+
+    #[test]
+    fn finish_reason_is_an_allowlist() {
+        for (raw, reason) in [
+            ("stop", FinishReason::Stop),
+            (" END_TURN ", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("content_filter", FinishReason::ContentFilter),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("error", FinishReason::Error),
+            ("cancelled", FinishReason::Unknown),
+            ("error: finish-reason-canary", FinishReason::Unknown),
+            ("", FinishReason::Unknown),
+        ] {
+            assert_eq!(FinishReason::from_provider(raw), reason, "{raw:?}");
+        }
     }
 }

@@ -35,6 +35,37 @@ pub(crate) fn try_set_owner_only_file(file: &std::fs::File) -> std::io::Result<(
     windows_owner_only_acl::set_file_dacl(file)
 }
 
+/// Apply the current user's protected DACL to a directory through a handle
+/// that was opened with `WRITE_DAC`, without reopening it, which
+/// [`try_set_owner_only_file`] cannot do for a directory. The one owner ACE is
+/// inherited by the directory's existing and future children.
+#[cfg(windows)]
+pub(crate) fn try_set_owner_only_directory_handle(
+    directory: &std::fs::File,
+) -> std::io::Result<()> {
+    windows_owner_only_acl::set_directory_handle_dacl(directory)
+}
+
+/// Create `path` as a directory that carries the current user's protected,
+/// inheritable owner-only DACL from the moment it exists, so no other
+/// principal can open it before it is hardened. Fails with `AlreadyExists` if
+/// something is already at `path`.
+#[cfg(windows)]
+pub(crate) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    windows_owner_only_acl::create_owner_only_directory(path)
+}
+
+/// Whether a trusted principal owns the open object: the current user,
+/// `BUILTIN\Administrators`, or `LocalSystem`. An elevated run owns what it
+/// creates as Administrators, and both of those principals can take
+/// ownership of any object anyway, so their ownership grants nothing extra.
+/// Every other owner keeps implicit `WRITE_DAC` and could undo a DACL applied
+/// on the user's behalf. Needs `READ_CONTROL` on the handle.
+#[cfg(windows)]
+pub(crate) fn owner_is_trusted(file: &std::fs::File) -> std::io::Result<bool> {
+    windows_owner_only_acl::owner_is_trusted(file)
+}
+
 /// Set owner-only permissions on paths whose callers can tolerate best-effort hardening.
 pub fn set_owner_only(path: &Path) {
     if let Err(e) = try_set_owner_only(path) {
@@ -216,10 +247,26 @@ mod windows_owner_only_acl {
         ),
         String,
     > {
+        build_owner_only_dacl_with_ace_flags(path, "")
+    }
+
+    /// [`build_owner_only_dacl`] with SDDL ACE flags on its single ACE, so a
+    /// directory can pass its one owner ACE on to the objects inside it.
+    fn build_owner_only_dacl_with_ace_flags(
+        path: &Path,
+        ace_flags: &str,
+    ) -> Result<
+        (
+            LocalSecurityDescriptor,
+            *const windows::Win32::Security::ACL,
+        ),
+        String,
+    > {
         let sid = current_token_sid_string(path)?;
-        // D:PAI(A;;FA;;;<SID>) — Protected, Auto-inherited, one Allow ACE of
-        // Full Access (FA) for the resolved current-user SID and nothing else.
-        let sddl = format!("D:PAI(A;;FA;;;{sid})");
+        // D:PAI(A;<flags>;FA;;;<SID>) — Protected, Auto-inherited, one Allow
+        // ACE of Full Access (FA) for the resolved current-user SID and nothing
+        // else.
+        let sddl = format!("D:PAI(A;{ace_flags};FA;;;{sid})");
 
         // Encode SDDL as a NUL-terminated wide string.
         let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
@@ -281,7 +328,6 @@ mod windows_owner_only_acl {
 
     pub(super) fn set_file_dacl(file: &std::fs::File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Security::Authorization::SetSecurityInfo;
         use windows::Win32::Storage::FileSystem::{
             FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             ReOpenFile, WRITE_DAC,
@@ -301,10 +347,31 @@ mod windows_owner_only_acl {
             }
             .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))?,
         );
-        // SAFETY: the descriptor backing dacl and the file handle remain alive.
+        apply_protected_dacl(handle.0, dacl)
+    }
+
+    /// Applies an owner-only DACL whose one ACE is inherited by files and
+    /// subdirectories (`OICI`) through `directory` itself, which must already
+    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. Applying a
+    /// DACL to a directory rewrites the inherited ACEs of its existing
+    /// children, so they keep owner access and lose every other principal.
+    pub(super) fn set_directory_handle_dacl(directory: &std::fs::File) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let (_descriptor, dacl) =
+            build_owner_only_dacl_with_ace_flags(Path::new("open directory"), "OICI")
+                .map_err(std::io::Error::other)?;
+        apply_protected_dacl(HANDLE(directory.as_raw_handle()), dacl)
+    }
+
+    fn apply_protected_dacl(
+        handle: HANDLE,
+        dacl: *const windows::Win32::Security::ACL,
+    ) -> std::io::Result<()> {
+        use windows::Win32::Security::Authorization::SetSecurityInfo;
+        // SAFETY: the caller keeps the descriptor backing dacl and the handle alive.
         let result = unsafe {
             SetSecurityInfo(
-                handle.0,
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
@@ -317,6 +384,77 @@ mod windows_owner_only_acl {
             return Err(std::io::Error::from_raw_os_error(result.0 as i32));
         }
         Ok(())
+    }
+
+    pub(super) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+        let (descriptor, _dacl) =
+            build_owner_only_dacl_with_ace_flags(Path::new("new directory"), "OICI")
+                .map_err(std::io::Error::other)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: false.into(),
+        };
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `path_wide` is NUL-terminated and `attributes` points to the
+        // descriptor owned by `descriptor`; both outlive the call.
+        unsafe { CreateDirectoryW(PCWSTR(path_wide.as_ptr()), Some(&attributes)) }
+            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+    }
+
+    const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+    const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+    pub(super) fn owner_is_trusted(file: &std::fs::File) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Security::Authorization::GetSecurityInfo;
+        use windows::Win32::Security::OWNER_SECURITY_INFORMATION;
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the handle stays open for the call. On success `owner`
+        // points into the LocalAlloc'd `descriptor`, which the guard frees.
+        let result = unsafe {
+            GetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        let _descriptor = LocalSecurityDescriptor(descriptor);
+        if result != NO_ERROR {
+            return Err(std::io::Error::from_raw_os_error(result.0 as i32));
+        }
+        if owner.0.is_null() {
+            return Ok(false);
+        }
+        let mut owner_wide = windows::core::PWSTR::null();
+        // SAFETY: `owner` is a valid SID inside `descriptor`; the converter
+        // LocalAlloc's the string, freed below.
+        unsafe { ConvertSidToStringSidW(owner, &mut owner_wide) }
+            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))?;
+        // SAFETY: on success `owner_wide` is a valid NUL-terminated string.
+        let owner_sid = unsafe { owner_wide.to_string() };
+        // SAFETY: allocated by ConvertSidToStringSidW; freed exactly once.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(owner_wide.0.cast())));
+        }
+        let owner_sid = owner_sid.map_err(std::io::Error::other)?;
+        let user_sid =
+            current_token_sid_string(Path::new("open handle")).map_err(std::io::Error::other)?;
+        Ok(owner_sid == user_sid
+            || owner_sid == ADMINISTRATORS_SID
+            || owner_sid == LOCAL_SYSTEM_SID)
     }
 
     pub fn set_owner_only_dacl(path: &Path) -> Result<(), String> {

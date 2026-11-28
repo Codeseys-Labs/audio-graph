@@ -28,6 +28,7 @@ pub enum RedactedPanicOp {
     LegacyStateIo,
     CredentialBoundary,
     LlmClientBuild,
+    LlmModelLoad,
 }
 
 impl RedactedPanicOp {
@@ -41,6 +42,7 @@ impl RedactedPanicOp {
             Self::LegacyStateIo => "credential.legacy_state_io",
             Self::CredentialBoundary => "credential.boundary",
             Self::LlmClientBuild => "llm.client_build",
+            Self::LlmModelLoad => "llm.model_load",
         }
     }
 }

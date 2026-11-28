@@ -24,28 +24,32 @@
 //! types into [`BedrockStreamEvent`] (see [`bedrock_event_from_sdk`]); the
 //! drainer ([`drive_bedrock_events`]) is what the tests exercise directly.
 //!
-//! # Secrets
-//!
-//! Errors are routed through [`crate::aws_util::classify_aws_error`] and never
-//! interpolate credential material. We follow the same redaction discipline as
-//! the rest of the AWS code: no access keys, secrets, or session tokens are
-//! ever logged or surfaced in error strings.
+//! Classify SDK failures before constructing a terminal event. SDK sources,
+//! service messages, and request identifiers never enter the diagnostic.
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeTransport,
+};
+use aws_sdk_bedrockruntime::config::http::HttpResponse;
+use aws_sdk_bedrockruntime::error::SdkError;
+use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::ChatMessage;
-use crate::llm::stream_contract::{StreamContextMetadata, StreamTerminalEvent, StreamUsage};
+use crate::llm::http_diag::{diagnostic, with_status};
+use crate::llm::stream_contract::{
+    FinishReason, StreamContextMetadata, StreamTerminalEvent, StreamUsage,
+};
 use crate::llm::streaming::TokenDelta;
 use crate::settings::AwsCredentialSource;
 
-/// Provider-neutral identifier used by [`crate::aws_util::classify_aws_error`]
-/// hints and log lines. Never carries secret material.
-const PROVIDER_NAME: &str = "aws_bedrock";
+const INFERENCE: RuntimeDiagnosticContext =
+    RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference)
+        .with_transport(RuntimeTransport::Sdk);
 
-/// Provider tag used in content-egress policy error strings. Matches the
-/// `llm.aws_bedrock` tag the streaming router already passes so blocked-mode
-/// errors are uniform regardless of which layer caught the egress attempt.
 const POLICY_PROVIDER: &str = "llm.aws_bedrock";
 
 /// Default `privacy_mode` label baked into a fail-closed
@@ -64,29 +68,11 @@ pub enum BedrockStreamEvent {
     /// A `contentBlockDelta` carrying a chunk of generated text.
     TextDelta(String),
     /// `messageStop` with the raw Bedrock `stopReason` (e.g. `"end_turn"`,
-    /// `"max_tokens"`). Mapped to an OpenAI-style `finish_reason` via
-    /// [`map_stop_reason`].
+    /// `"max_tokens"`), normalized by [`FinishReason::from_provider`]. A reason
+    /// that vocabulary does not know stays `unknown`.
     MessageStop { stop_reason: String },
     /// `metadata` token-usage block.
     Usage(StreamUsage),
-}
-
-/// Map a Bedrock `stopReason` to the OpenAI-style `finish_reason` the rest of
-/// the streaming pipeline (and the frontend) already understands.
-///
-/// Bedrock reasons (`StopReason`): `end_turn`, `tool_use`, `max_tokens`,
-/// `stop_sequence`, `guardrail_intervened`, `content_filtered`. Anything else
-/// (including future SDK additions) falls back to `"stop"` so the stream still
-/// terminates cleanly rather than surfacing a raw SDK token.
-pub fn map_stop_reason(stop_reason: &str) -> String {
-    match stop_reason.trim().to_ascii_lowercase().as_str() {
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "content_filtered" | "guardrail_intervened" => "content_filter",
-        // `end_turn`, `stop_sequence`, and anything unknown -> "stop".
-        _ => "stop",
-    }
-    .to_string()
 }
 
 /// Build a [`StreamUsage`] from Bedrock metadata token counts.
@@ -110,11 +96,10 @@ pub fn stream_usage_from_counts(input: i32, output: i32, total: i32) -> StreamUs
 /// (`Done` / `Error` / `Cancelled`). The terminal frame is built through
 /// [`StreamTerminalEvent`] so Done/Error/Cancelled semantics stay shared.
 ///
-/// `events` yields `Ok(event)` for a decoded stream event, or `Err(message)`
-/// for a transport/decode error (already classified + redacted by the caller).
-/// `None` means the stream closed without a `messageStop`, which we treat as a
-/// clean end (`finish_reason = "stop"`) using whatever text was accumulated.
-pub async fn drive_bedrock_events<S>(
+/// `events` yields a decoded event or a closed terminal diagnostic.
+/// `None` means the stream closed without a `messageStop`: it was cut off, so
+/// the text accumulated so far is a partial reply and the terminal is a failure.
+async fn drive_bedrock_events<S>(
     mut events: S,
     tx: mpsc::Sender<TokenDelta>,
     cancel: CancellationToken,
@@ -178,30 +163,33 @@ pub async fn drive_bedrock_events<S>(
                     StreamTerminalEvent::done(
                         std::mem::take(&mut full_text),
                         usage.take(),
-                        map_stop_reason(&stop_reason),
+                        FinishReason::from_provider(&stop_reason),
                         metadata,
                     ),
                 )
                 .await;
                 return;
             }
-            Some(Err(message)) => {
+            Some(Err(diagnostic)) => {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, std::mem::take(&mut full_text), metadata),
+                    StreamTerminalEvent::failure(
+                        diagnostic,
+                        std::mem::take(&mut full_text),
+                        metadata,
+                    ),
                 )
                 .await;
                 return;
             }
             None => {
-                // Stream closed without an explicit messageStop. Emit a Done with
-                // whatever we accumulated (some providers/edge cases do this).
+                // The stream closed without `messageStop`. It was cut off: what
+                // arrived is a partial reply, not an answer.
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::done(
+                    StreamTerminalEvent::failure(
+                        diagnostic(Code::InvalidResponse, INFERENCE),
                         std::mem::take(&mut full_text),
-                        usage.take(),
-                        "stop".to_string(),
                         metadata,
                     ),
                 )
@@ -221,29 +209,29 @@ async fn send_terminal(tx: &mpsc::Sender<TokenDelta>, event: StreamTerminalEvent
 /// Abstracted as a trait so [`drive_bedrock_events`] can be unit-tested with a
 /// synthetic, in-memory source (no SDK, no AWS creds) while the live adapter
 /// wraps the real `aws_sdk_bedrockruntime` event receiver.
-pub trait BedrockEventSource: Send {
-    /// Yield the next event. `Ok(event)` for a decoded event, `Err(message)`
-    /// for an already-redacted/classified terminal error, `None` for clean EOF.
+trait BedrockEventSource: Send {
     fn next(
         &mut self,
-    ) -> impl std::future::Future<Output = Option<Result<BedrockStreamEvent, String>>> + Send;
+    ) -> impl Future<Output = Option<Result<BedrockStreamEvent, RuntimeDiagnostic>>> + Send;
 }
 
-/// In-memory event source over a pre-built `Vec`, used by unit tests.
-pub struct VecBedrockEventSource {
-    events: std::collections::VecDeque<Result<BedrockStreamEvent, String>>,
+#[cfg(test)]
+struct VecBedrockEventSource {
+    events: std::collections::VecDeque<Result<BedrockStreamEvent, RuntimeDiagnostic>>,
 }
 
+#[cfg(test)]
 impl VecBedrockEventSource {
-    pub fn new(events: Vec<Result<BedrockStreamEvent, String>>) -> Self {
+    fn new(events: Vec<Result<BedrockStreamEvent, RuntimeDiagnostic>>) -> Self {
         Self {
             events: events.into(),
         }
     }
 }
 
+#[cfg(test)]
 impl BedrockEventSource for VecBedrockEventSource {
-    async fn next(&mut self) -> Option<Result<BedrockStreamEvent, String>> {
+    async fn next(&mut self) -> Option<Result<BedrockStreamEvent, RuntimeDiagnostic>> {
         self.events.pop_front()
     }
 }
@@ -333,22 +321,20 @@ impl BedrockConverseStreamAdapter {
         // adapter; re-checking here means a direct caller that bypasses the
         // router still cannot ship prompt/graph content to AWS in a blocked
         // privacy mode. We refuse BEFORE building the SDK config/client so no
-        // request — not even a handshake — leaves the machine. The error string
-        // is the policy helper's redacted message (no prompt/graph/secret text).
-        if let Err(message) = self
+        // request — not even a handshake — leaves the machine.
+        if self
             .content_egress_policy
             .check_prompt(POLICY_PROVIDER)
             .and_then(|()| self.content_egress_policy.check_json(POLICY_PROVIDER))
+            .is_err()
         {
             send_terminal(
                 &tx,
-                StreamTerminalEvent::error(message, String::new(), metadata),
+                StreamTerminalEvent::failure(policy_blocked(), String::new(), metadata),
             )
             .await;
             return;
         }
-
-        let region = self.region.clone();
 
         // Build SDK config + client — the exact two-line pattern from
         // asr::aws_transcribe. Inherits STS/profile refresh for free.
@@ -356,11 +342,11 @@ impl BedrockConverseStreamAdapter {
             match crate::aws_util::build_aws_sdk_config(&self.region, self.credential_source).await
             {
                 Ok(cfg) => cfg,
-                Err(message) => {
+                Err(_) => {
                     send_terminal(
                         &tx,
-                        StreamTerminalEvent::error(
-                            classify_bedrock_error(&message, Some(&region)),
+                        StreamTerminalEvent::failure(
+                            RuntimeDiagnostic::internal(INFERENCE),
                             String::new(),
                             metadata,
                         ),
@@ -380,10 +366,10 @@ impl BedrockConverseStreamAdapter {
         let system_blocks = build_system_content_blocks(system_prompt, &self.model_id);
         let messages = match build_converse_messages(&self.history) {
             Ok(messages) => messages,
-            Err(message) => {
+            Err(diagnostic) => {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
                 )
                 .await;
                 return;
@@ -414,8 +400,8 @@ impl BedrockConverseStreamAdapter {
                 Err(err) => {
                     send_terminal(
                         &tx,
-                        StreamTerminalEvent::error(
-                            classify_bedrock_error(&render_sdk_error(&err), Some(&region)),
+                        StreamTerminalEvent::failure(
+                            converse_start_failure(&err),
                             String::new(),
                             metadata,
                         ),
@@ -430,7 +416,6 @@ impl BedrockConverseStreamAdapter {
         // unit-tested event loop.
         let source = SdkBedrockEventSource {
             stream: output.stream,
-            region,
         };
         drive_bedrock_events(source, tx, cancel, metadata).await;
     }
@@ -444,11 +429,10 @@ struct SdkBedrockEventSource {
         aws_sdk_bedrockruntime::types::ConverseStreamOutput,
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
     >,
-    region: String,
 }
 
 impl BedrockEventSource for SdkBedrockEventSource {
-    async fn next(&mut self) -> Option<Result<BedrockStreamEvent, String>> {
+    async fn next(&mut self) -> Option<Result<BedrockStreamEvent, RuntimeDiagnostic>> {
         loop {
             match self.stream.recv().await {
                 Ok(Some(event)) => match bedrock_event_from_sdk(event) {
@@ -458,10 +442,7 @@ impl BedrockEventSource for SdkBedrockEventSource {
                     None => continue,
                 },
                 Ok(None) => return None,
-                Err(err) => {
-                    let raw = render_sdk_error(&err);
-                    return Some(Err(classify_bedrock_error(&raw, Some(&self.region))));
-                }
+                Err(error) => return Some(Err(converse_event_failure(&error))),
             }
         }
     }
@@ -503,35 +484,79 @@ fn bedrock_event_from_sdk(
     }
 }
 
-/// Render an `aws-sdk` error plus its full `std::error::Error` source chain
-/// into a single diagnostic string.
-///
-/// This is the same expansion `aws_smithy_types::error::display::DisplayErrorContext`
-/// performs (top-level message + `: <source>` for each cause), reproduced here
-/// so the adapter does not need a direct dependency on `aws-smithy-types`. The
-/// source chain is where the AWS service code (`ExpiredToken`,
-/// `AccessDeniedException`, `DispatchFailure`, ...) lives, which
-/// [`crate::aws_util::classify_aws_error`] keys on. SDK error strings carry
-/// service codes / transport detail only — never credential material.
-fn render_sdk_error<E: std::error::Error>(err: &E) -> String {
-    let mut rendered = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        rendered.push_str(": ");
-        rendered.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    rendered
+pub(super) fn policy_blocked() -> RuntimeDiagnostic {
+    diagnostic(Code::PolicyBlocked, INFERENCE)
 }
 
-/// Map an error string into a redacted, user-facing terminal message using the
-/// shared AWS error taxonomy. Never interpolates credential material — the
-/// `raw` string comes from [`render_sdk_error`] (service codes / transport
-/// detail) or from `build_aws_sdk_config` (credential-store status, already
-/// redaction-safe).
-fn classify_bedrock_error(raw: &str, region: Option<&str>) -> String {
-    let classified = crate::aws_util::classify_aws_error(raw, region);
-    format!("Bedrock ConverseStream error (provider={PROVIDER_NAME}): {classified:?}")
+fn sdk_failure<E, R>(
+    error: &SdkError<E, R>,
+    service_failure: impl FnOnce(&E, &R) -> RuntimeDiagnostic,
+) -> RuntimeDiagnostic {
+    let code = match error {
+        SdkError::TimeoutError(_) => Code::Timeout,
+        SdkError::DispatchFailure(failure) if failure.is_timeout() => Code::Timeout,
+        SdkError::DispatchFailure(failure) if failure.is_io() => Code::NetworkUnreachable,
+        SdkError::DispatchFailure(failure) if failure.is_user() => Code::RequestRejected,
+        SdkError::ResponseError(_) => Code::InvalidResponse,
+        SdkError::ServiceError(service) => return service_failure(service.err(), service.raw()),
+        SdkError::ConstructionFailure(_) | SdkError::DispatchFailure(_) => Code::Internal,
+        _ => Code::Internal,
+    };
+    diagnostic(code, INFERENCE)
+}
+
+fn converse_start_failure(
+    error: &SdkError<ConverseStreamError, HttpResponse>,
+) -> RuntimeDiagnostic {
+    use ConverseStreamError::*;
+
+    sdk_failure(error, |service, response| {
+        let status = response.status().as_u16();
+        let context = with_status(INFERENCE, status);
+        let code = match service {
+            AccessDeniedException(_) => {
+                return RuntimeErrorDiagnostic::permission_denied(context).into();
+            }
+            ResourceNotFoundException(_) | ValidationException(_) => Code::RequestRejected,
+            ModelTimeoutException(_) => Code::Timeout,
+            ThrottlingException(_) => Code::RateLimited,
+            InternalServerException(_)
+            | ModelNotReadyException(_)
+            | ServiceUnavailableException(_) => Code::ProviderUnavailable,
+            ModelErrorException(_) | ModelStreamErrorException(_) => Code::InvalidResponse,
+            // An unmodeled error: its code and the response status are the only
+            // evidence. The service text is never read.
+            _ => {
+                return match service.meta().code() {
+                    // An expired session token arrives unmodeled, under these codes.
+                    Some("ExpiredToken" | "ExpiredTokenException") => {
+                        RuntimeErrorDiagnostic::credential_expired(context)
+                    }
+                    // Every request is signed, so a 401 is about that credential.
+                    _ => RuntimeErrorDiagnostic::from_http_status(status, true, INFERENCE),
+                }
+                .into();
+            }
+        };
+        diagnostic(code, context)
+    })
+}
+
+fn converse_event_failure<R>(error: &SdkError<ConverseStreamOutputError, R>) -> RuntimeDiagnostic {
+    use ConverseStreamOutputError::*;
+
+    sdk_failure(error, |service, _| {
+        let code = match service {
+            ValidationException(_) => Code::RequestRejected,
+            ThrottlingException(_) => Code::RateLimited,
+            InternalServerException(_) | ServiceUnavailableException(_) => {
+                Code::ProviderUnavailable
+            }
+            ModelStreamErrorException(_) => Code::InvalidResponse,
+            _ => Code::Internal,
+        };
+        diagnostic(code, INFERENCE)
+    })
 }
 
 /// Build the graph-context system prompt. Mirrors the system prompt the SSE
@@ -640,7 +665,7 @@ fn build_system_content_blocks(
 /// requires at least one message.
 fn build_converse_messages(
     history: &[ChatMessage],
-) -> Result<Vec<aws_sdk_bedrockruntime::types::Message>, String> {
+) -> Result<Vec<aws_sdk_bedrockruntime::types::Message>, RuntimeDiagnostic> {
     use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole, Message};
 
     let mut messages = Vec::with_capacity(history.len());
@@ -657,16 +682,12 @@ fn build_converse_messages(
             .role(role)
             .content(ContentBlock::Text(msg.content.clone()))
             .build()
-            .map_err(|e| {
-                format!("Failed to build Bedrock Converse message (provider={PROVIDER_NAME}): {e}")
-            })?;
+            .map_err(|_| RuntimeDiagnostic::internal(INFERENCE))?;
         messages.push(built);
     }
 
     if messages.is_empty() {
-        return Err(format!(
-            "Bedrock ConverseStream requires at least one user message (provider={PROVIDER_NAME})"
-        ));
+        return Err(diagnostic(Code::RequestRejected, INFERENCE));
     }
     Ok(messages)
 }
@@ -688,7 +709,7 @@ mod tests {
         })
     }
 
-    async fn drain(events: Vec<Result<BedrockStreamEvent, String>>) -> Vec<TokenDelta> {
+    async fn drain(events: Vec<Result<BedrockStreamEvent, RuntimeDiagnostic>>) -> Vec<TokenDelta> {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let source = VecBedrockEventSource::new(events);
@@ -700,17 +721,30 @@ mod tests {
         frames
     }
 
-    #[test]
-    fn stop_reason_maps_to_openai_finish_reason() {
-        assert_eq!(map_stop_reason("end_turn"), "stop");
-        assert_eq!(map_stop_reason("stop_sequence"), "stop");
-        assert_eq!(map_stop_reason("max_tokens"), "length");
-        assert_eq!(map_stop_reason("tool_use"), "tool_calls");
-        assert_eq!(map_stop_reason("content_filtered"), "content_filter");
-        assert_eq!(map_stop_reason("guardrail_intervened"), "content_filter");
-        // Case-insensitive + unknown fallback.
-        assert_eq!(map_stop_reason("END_TURN"), "stop");
-        assert_eq!(map_stop_reason("something_new_from_aws"), "stop");
+    #[tokio::test]
+    async fn stop_reason_maps_to_the_closed_finish_reason() {
+        for (sdk, expected) in [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("max_tokens", "length"),
+            ("tool_use", "tool_calls"),
+            ("content_filtered", "content_filter"),
+            ("guardrail_intervened", "content_filter"),
+            ("END_TURN", "stop"),
+            // A reason this app does not know is reported as such, not as a
+            // clean stop.
+            ("something_new_from_aws", "unknown"),
+        ] {
+            let frames = drain(vec![Ok(BedrockStreamEvent::MessageStop {
+                stop_reason: sdk.to_string(),
+            })])
+            .await;
+            assert!(
+                matches!(frames.as_slice(), [TokenDelta::Done { finish_reason, .. }]
+                    if finish_reason == expected),
+                "{sdk}: {frames:?}"
+            );
+        }
     }
 
     #[test]
@@ -791,27 +825,25 @@ mod tests {
 
     #[tokio::test]
     async fn transport_error_maps_to_terminal_error_with_partial_text() {
-        // The event source (SdkBedrockEventSource) classifies + redacts the raw
-        // SDK error into the wrapped message BEFORE it reaches the drainer; the
-        // drainer forwards that message verbatim on the Error terminal frame.
-        let classified =
-            classify_bedrock_error("dispatch failure: io error: connection reset", None);
+        let source = std::io::Error::other("private-profile-path-canary");
+        let sdk = SdkError::<ConverseStreamOutputError, ()>::dispatch_failure(
+            aws_sdk_bedrockruntime::error::ConnectorError::io(Box::new(source)),
+        );
         let frames = drain(vec![
             Ok(BedrockStreamEvent::TextDelta("partial".to_string())),
-            Err(classified.clone()),
+            Err(converse_event_failure(&sdk)),
         ])
         .await;
 
         // First the partial delta, then exactly one Error terminal frame.
         assert!(matches!(frames.first(), Some(TokenDelta::Delta { .. })));
         match frames.last().expect("terminal frame") {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert_eq!(full_text, "partial");
-                assert_eq!(
-                    message, &classified,
-                    "the drainer must forward the already-classified error verbatim"
-                );
-                assert!(message.contains("Bedrock ConverseStream error"));
+                assert_eq!(diagnostic.to_string(), "runtime/network_unreachable");
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
@@ -819,73 +851,136 @@ mod tests {
     }
 
     #[test]
-    fn classify_bedrock_error_wraps_with_provider_context_and_taxonomy() {
-        // Network/transport failure -> NetworkUnreachable, wrapped with the
-        // Bedrock provider context. The raw SDK string is never echoed back
-        // (we surface the classified taxonomy, not the free-form message).
-        let network = classify_bedrock_error("dispatch failure: io error: connection reset", None);
-        assert!(network.contains("Bedrock ConverseStream error"));
-        assert!(network.contains("provider=aws_bedrock"));
-        assert!(
-            network.contains("NetworkUnreachable"),
-            "transport failure must classify as NetworkUnreachable: {network}"
+    fn classify_construction_timeout_and_response_errors_without_formatting_sources() {
+        use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        let capture = ThreadLogCapture::start();
+        let source = || std::io::Error::other("sdk-source-canary prompt_bytes=7907");
+        let cases = [
+            (SdkError::construction_failure(source()), Code::Internal),
+            (SdkError::timeout_error(source()), Code::Timeout),
+            (
+                SdkError::response_error(source(), "sdk-response-body-canary"),
+                Code::InvalidResponse,
+            ),
+        ];
+        let mut observed = String::new();
+        for (error, code) in cases {
+            let actual = converse_event_failure(&error);
+            assert_eq!(actual, diagnostic(code, INFERENCE));
+            observed.push_str(&format!("{actual} {actual:?}\n"));
+        }
+        // Nothing on this path logs today; the capture is for the day something does.
+        observed.push_str(&render(&capture.finish()));
+        assert_absent(
+            &observed,
+            &["sdk-source-canary", "sdk-response-body-canary", "7907"],
         );
-
-        // Expired STS session token -> ExpiredToken.
-        let expired = classify_bedrock_error(
-            "service error: ExpiredTokenException: The security token included in the request is expired",
-            Some("us-east-1"),
-        );
-        assert!(expired.contains("ExpiredToken"), "got: {expired}");
-    }
-
-    #[test]
-    fn render_sdk_error_walks_source_chain() {
-        use std::fmt;
-
-        #[derive(Debug)]
-        struct Inner;
-        impl fmt::Display for Inner {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "InvalidAccessKeyId: bad key")
-            }
-        }
-        impl std::error::Error for Inner {}
-
-        #[derive(Debug)]
-        struct Outer(Inner);
-        impl fmt::Display for Outer {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "service error")
-            }
-        }
-        impl std::error::Error for Outer {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                Some(&self.0)
-            }
-        }
-
-        let rendered = render_sdk_error(&Outer(Inner));
-        assert_eq!(rendered, "service error: InvalidAccessKeyId: bad key");
-        // And feeding the expanded chain into the classifier resolves the code
-        // that lives in the source, not the top-level message.
-        assert!(classify_bedrock_error(&rendered, None).contains("InvalidAccessKey"));
     }
 
     #[tokio::test]
-    async fn stream_end_without_message_stop_emits_done() {
-        let frames = drain(vec![Ok(BedrockStreamEvent::TextDelta("hi".to_string()))]).await;
-        match frames.last().expect("terminal frame") {
-            TokenDelta::Done {
-                full_text,
-                finish_reason,
-                ..
-            } => {
-                assert_eq!(full_text, "hi");
-                assert_eq!(finish_reason, "stop");
-            }
-            other => panic!("expected Done on clean EOF, got {other:?}"),
+    async fn sdk_service_error_messages_and_metadata_never_reach_terminals_or_logs() {
+        use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
+        use aws_sdk_bedrockruntime::error::ErrorMetadata;
+        use aws_sdk_bedrockruntime::types::error::ThrottlingException;
+
+        let capture = ThreadLogCapture::start();
+        let request_id = "bedrock-request-canary";
+        let message = "sdk-message-canary aws-key-canary private-prompt-canary prompt_bytes=7919";
+        let meta = ErrorMetadata::builder()
+            .message(message)
+            .custom("aws_request_id", request_id)
+            .build();
+        let service = ThrottlingException::builder()
+            .message(message)
+            .meta(meta.clone())
+            .build();
+        let event =
+            SdkError::service_error(ConverseStreamOutputError::ThrottlingException(service), ());
+        let frames = drain(vec![Err(converse_event_failure(&event))]).await;
+        assert!(
+            matches!(frames.as_slice(), [TokenDelta::Error { diagnostic, full_text }]
+            if diagnostic.to_string() == "runtime/rate_limited" && full_text.is_empty())
+        );
+
+        // An unmodeled error is classified by its response status alone, never
+        // by its message; a status that is not an HTTP failure fails closed.
+        let mut observed = format!("{frames:?}\n");
+        for (status, token) in [
+            (429u16, "runtime/rate_limited"),
+            (418, "runtime/request_rejected"),
+            (200, "runtime/internal"),
+        ] {
+            let mut response =
+                HttpResponse::new(status.try_into().unwrap(), "bedrock-body-canary".into());
+            response
+                .headers_mut()
+                .insert("x-amzn-requestid", request_id);
+            let error =
+                SdkError::service_error(ConverseStreamError::generic(meta.clone()), response);
+            let actual = converse_start_failure(&error);
+            assert_eq!(actual.to_string(), token, "status {status}");
+            observed.push_str(&format!("{actual} {actual:?}\n"));
         }
+        // Nothing on this path logs today; the capture is for the day something does.
+        observed.push_str(&render(&capture.finish()));
+        assert_absent(
+            &observed,
+            &[
+                request_id,
+                "sdk-message-canary",
+                "aws-key-canary",
+                "private-prompt-canary",
+                "bedrock-body-canary",
+                "7919",
+            ],
+        );
+    }
+
+    #[test]
+    fn auth_evidence_maps_to_the_provider_auth_codes() {
+        use aws_sdk_bedrockruntime::error::ErrorMetadata;
+        use aws_sdk_bedrockruntime::types::error::AccessDeniedException;
+
+        let start = |service: ConverseStreamError, status: u16| {
+            let response = HttpResponse::new(status.try_into().unwrap(), "".into());
+            converse_start_failure(&SdkError::service_error(service, response)).to_string()
+        };
+        let unmodeled =
+            |code: &str| ConverseStreamError::generic(ErrorMetadata::builder().code(code).build());
+
+        let denied =
+            ConverseStreamError::AccessDeniedException(AccessDeniedException::builder().build());
+        assert_eq!(start(denied, 403), "runtime/permission_denied");
+        // An expired session token arrives unmodeled, as a 403 with this code.
+        assert_eq!(
+            start(unmodeled("ExpiredTokenException"), 403),
+            "runtime/credential_expired"
+        );
+        assert_eq!(
+            start(unmodeled("AnUnmodeledCode"), 403),
+            "runtime/permission_denied"
+        );
+        assert_eq!(
+            start(unmodeled("AnUnmodeledCode"), 401),
+            "runtime/credential_rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_message_stop_is_a_failure_that_keeps_the_text() {
+        let frames = drain(vec![Ok(BedrockStreamEvent::TextDelta("hi".to_string()))]).await;
+        assert!(
+            matches!(frames.as_slice(), [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "hi"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "hi"),
+            "{frames:?}"
+        );
     }
 
     #[tokio::test]
@@ -958,7 +1053,7 @@ mod tests {
     #[test]
     fn build_converse_messages_rejects_empty_history() {
         let err = build_converse_messages(&[]).expect_err("empty history must be rejected");
-        assert!(err.contains("at least one user message"), "got: {err}");
+        assert_eq!(err, diagnostic(Code::RequestRejected, INFERENCE));
     }
 
     #[test]
@@ -1128,26 +1223,12 @@ mod tests {
 
         let frame = rx.recv().await.expect("terminal frame");
         match &frame {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert!(full_text.is_empty(), "no partial text before any AWS call");
-                assert!(
-                    message.contains("Privacy policy blocked"),
-                    "expected redacted policy error, got: {message}"
-                );
-                assert!(
-                    message.contains("local_only"),
-                    "error should name the blocked privacy mode, got: {message}"
-                );
-                // The error must NOT leak the prompt, graph context, or any
-                // secret/payload material.
-                assert!(
-                    !message.contains("PATIENT_SAID_PRIVATE_DIAGNOSIS"),
-                    "policy error leaked prompt content: {message}"
-                );
-                assert!(
-                    !message.contains("SECRET_GRAPH_CONTEXT_NODE"),
-                    "policy error leaked graph context: {message}"
-                );
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
@@ -1170,12 +1251,8 @@ mod tests {
             .await;
 
         match rx.recv().await.expect("terminal frame") {
-            TokenDelta::Error { message, .. } => {
-                assert!(message.contains("Privacy policy blocked"));
-                assert!(
-                    message.contains("explicit_policy_required"),
-                    "default policy should require an explicit allow, got: {message}"
-                );
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected fail-closed Error terminal, got {other:?}"),
         }

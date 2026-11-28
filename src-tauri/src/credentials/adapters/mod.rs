@@ -1,7 +1,8 @@
 mod authority_journal;
 mod keyring_entry;
-// Capability-blind raw cores: the only modules allowed to hold platform
-// `unsafe`. Their policy adapters live under `native_interaction`.
+// Capability-blind raw cores. Their policy adapters live under
+// `native_interaction`, which forbids `unsafe`.
+mod macos_acl_ffi;
 mod macos_keychain_ffi;
 mod native_interaction;
 pub(crate) mod native_keyring;

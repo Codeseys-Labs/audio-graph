@@ -333,6 +333,56 @@ describe("ProviderReadinessPanel", () => {
     );
   });
 
+  it("recognizes the closed credential-rejected token exactly", () => {
+    // A migrated probe's whole message is the token. Anything that merely
+    // contains it, or a different closed token, is not a rejected credential.
+    expect(
+      isCredentialRejectedReadinessMessage("runtime/credential_rejected"),
+    ).toBe(true);
+    for (const other of [
+      "runtime/request_rejected",
+      "runtime/permission_denied",
+      "credential/access_denied",
+      "provider said runtime/credential_rejected",
+      "runtime/credential_rejected_elsewhere",
+    ]) {
+      expect(isCredentialRejectedReadinessMessage(other)).toBe(false);
+    }
+  });
+
+  it("gives each closed provider-auth token the recovery copy for its cause", () => {
+    const recovery = (message: string) =>
+      providerRecoveryAction(
+        readiness({
+          provider_id: "llm.openrouter",
+          status: "error",
+          message,
+          credentials: [{ key: "openrouter_api_key", present: true }],
+        }),
+        t,
+      );
+    const generic = /replace the saved key or adjust provider settings/i;
+
+    expect(recovery("runtime/credential_rejected")).toMatch(
+      /rejected \(401\)/i,
+    );
+    // Replacing the key fixes neither an expired credential nor a valid key
+    // the provider will not let do this.
+    expect(recovery("runtime/credential_expired")).toMatch(/expired/i);
+    expect(recovery("runtime/permission_denied")).toMatch(
+      /account permissions or plan/i,
+    );
+    for (const token of [
+      "runtime/credential_rejected",
+      "runtime/credential_expired",
+      "runtime/permission_denied",
+    ]) {
+      expect(recovery(token)).not.toMatch(generic);
+    }
+    // A generic rejection is not evidence about the credential.
+    expect(recovery("runtime/request_rejected")).toMatch(generic);
+  });
+
   it("distinguishes a 401 credential rejection from a generic saved-key error", () => {
     // A generic (non-401) error with a saved credential still gets the
     // pre-existing "replace or adjust settings" copy...
@@ -382,6 +432,45 @@ describe("ProviderReadinessPanel", () => {
     expect(
       screen.queryByText(/replace the saved key or adjust provider settings/i),
     ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["en", "permission_denied", /denied access to this operation/i],
+    ["en", "credential_rejected", /rejected the credential/i],
+    ["pt", "permission_denied", /negou o acesso a esta operação/i],
+    ["pt", "credential_rejected", /rejeitou a credencial/i],
+  ] as const)("presents a typed readiness failure in %s (%s) as a sentence, never its token", (locale, code, sentence) => {
+    const { container } = render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          provider_id: "llm.openrouter",
+          status: "error",
+          // What the backend sends beside the typed cause of a 403 or 401.
+          message: `runtime/${code}`,
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code,
+              retryable: false,
+              recovery_action:
+                code === "credential_rejected"
+                  ? "reenter_credential"
+                  : "review_configuration",
+              context: { operation: "provider_readiness", transport: "http" },
+            },
+          },
+          credentials: [{ key: "openrouter_api_key", present: true }],
+        })}
+        loading={false}
+        t={i18n.getFixedT(locale)}
+      />,
+    );
+
+    // Once: a sentence that is its own next step is not repeated as one.
+    expect(screen.getAllByText(sentence)).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent(sentence);
+    expect(container).not.toHaveTextContent("runtime/");
+    expect(container).not.toHaveTextContent(code);
   });
 
   it("guides unchecked saved credentials toward validation checks", () => {
