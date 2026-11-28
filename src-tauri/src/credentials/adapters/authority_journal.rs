@@ -1256,6 +1256,46 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("remove isolated Windows swap test directory");
     }
 
+    /// The stray sweep lists the held root itself, so an ancestor swapped to
+    /// a directory with no journal root neither hides a stray nor fails the
+    /// replace.
+    #[cfg(windows)]
+    #[test]
+    fn windows_stray_sweep_lists_the_held_root_after_an_ancestor_swap() {
+        let base = scratch("windows-swap-sweep");
+        let held = base.join("held").join("journal");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(&decoy).expect("create decoy without a journal root");
+        point_parent_junction(&base, "held");
+        let stray = held.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+
+        let journal = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(SwapBeforeStaging { base: base.clone() }),
+        );
+        assert_eq!(journal.replace(b"journal"), Ok(()));
+
+        assert!(!stray.exists(), "stray staged file survived");
+        assert_eq!(
+            std::fs::read(held.join(JOURNAL_FILE_NAME)).expect("read held journal"),
+            b"journal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&decoy).expect("list decoy").count(),
+            0,
+            "an entry reached the decoy"
+        );
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows sweep test directory");
+    }
+
     /// Points the `parent` junction in `base` at `target`, replacing it if it
     /// already exists.
     #[cfg(windows)]

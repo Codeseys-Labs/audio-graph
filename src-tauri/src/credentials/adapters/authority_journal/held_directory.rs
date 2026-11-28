@@ -191,8 +191,10 @@ mod unix_held {
         }
 
         /// Unlinks every staged file a failed discard left for `name`,
-        /// relative to the held descriptor. Anything that cannot be removed
-        /// fails closed as `Unavailable` rather than being ignored.
+        /// relative to the held descriptor. Callers hold the authority
+        /// mutation lock, so no other writer's staged file is in flight.
+        /// Anything that cannot be removed fails closed as `Unavailable`
+        /// rather than being ignored.
         fn sweep_staged(&self, name: &str) -> Result<(), CredentialStoreFailure> {
             let entries =
                 Dir::read_from(&self.fd).map_err(|_| CredentialStoreFailure::Unavailable)?;
@@ -310,10 +312,13 @@ mod windows_held {
 
     /// A directory handle opened without `FILE_SHARE_DELETE`, so the held
     /// directory cannot be renamed or deleted out from under its operations.
-    /// Renames into it are resolved relative to this handle.
+    /// Children are opened and renamed relative to this handle.
     pub(in crate::credentials::adapters) struct HeldDirectory {
         handle: File,
-        path: PathBuf,
+        /// The volume-GUID path the handle resolved to at open, with every
+        /// junction already resolved. It keeps naming the held directory: the
+        /// directory cannot be renamed while held, and NTFS refuses to rename
+        /// an ancestor of a held directory.
         final_path: PathBuf,
     }
 
@@ -595,11 +600,7 @@ mod windows_held {
             harden_directory(&handle)?;
             let final_path =
                 final_path(&handle).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
-            Ok(Some(Self {
-                handle,
-                path: path.to_owned(),
-                final_path,
-            }))
+            Ok(Some(Self { handle, final_path }))
         }
 
         pub(in crate::credentials::adapters) fn open_or_create(
@@ -684,13 +685,16 @@ mod windows_held {
         }
 
         /// Deletes every staged file a failed discard left for `name`, each
-        /// through a handle opened relative to the held directory. Names come
-        /// from a listing of the root's path; one that does not resolve in the
-        /// held directory is skipped. Anything that cannot be deleted fails
-        /// closed as `Unavailable` rather than being ignored.
+        /// through a handle opened relative to the held directory. Callers
+        /// hold the authority mutation lock, so no other writer's staged file
+        /// is in flight. Names come from listing the held directory's final
+        /// path, never the caller's path, whose ancestors can be swapped; a
+        /// name that no longer resolves in the held directory is skipped.
+        /// Anything that cannot be deleted fails closed as `Unavailable`
+        /// rather than being ignored.
         fn sweep_staged(&self, name: &str) -> Result<(), CredentialStoreFailure> {
-            let entries =
-                std::fs::read_dir(&self.path).map_err(|_| CredentialStoreFailure::Unavailable)?;
+            let entries = std::fs::read_dir(&self.final_path)
+                .map_err(|_| CredentialStoreFailure::Unavailable)?;
             for entry in entries {
                 let entry = entry.map_err(|_| CredentialStoreFailure::Unavailable)?;
                 let Some(candidate) = entry.file_name().to_str().map(str::to_owned) else {
