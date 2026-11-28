@@ -198,6 +198,8 @@ append, synchronization and descriptor retirement from ADR-0041. Qualified
 storage uses its platform barrier. Other writable storage can issue
 `SyncedUnqualified` after synchronization succeeds.
 
+Live writers and projection readers check the physical head frame before reusing a verified prefix. An in-place edit to earlier records that preserves the head frame can go undetected until the next full verification, an accepted limit because cooperating live writers append under the session lock and never edit a committed prefix in place.
+
 Only a receipt permits the live lane to advance. The resulting cache includes
 the projection frame sequence and record hash. A cache write failure leaves
 a committed patch available for local replay. Opening Notes or Graph checks

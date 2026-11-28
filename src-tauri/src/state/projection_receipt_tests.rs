@@ -232,7 +232,13 @@ fn a_queued_projection_rechecks_cited_revisions_before_any_append() {
 #[test]
 #[ignore = "explicit release measurement of projection apply and cache save"]
 fn release_projection_receipt_latency() {
-    for depth in [1_000_usize, 10_000, 50_000] {
+    let depths: &[usize] =
+        if std::env::var("AUDIOGRAPH_PROJECTION_LATENCY_10K_ONLY").as_deref() == Ok("1") {
+            &[10_000]
+        } else {
+            &[1_000, 10_000, 50_000]
+        };
+    for &depth in depths {
         let prepared = std::time::Instant::now();
         let mut f = ReceiptFixture::new();
         let path = f

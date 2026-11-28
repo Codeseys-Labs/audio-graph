@@ -3,6 +3,36 @@ use crate::persistence::shutdown_tests::transcript_event;
 use crate::projections::{ProjectionBasis, ProjectionKind};
 const SESSION: &str = "session-orchard";
 
+struct CoarseTimestamps(bool);
+impl CoarseTimestamps {
+    fn enable() -> Self {
+        Self(COARSE_STAMP.replace(true))
+    }
+}
+impl Drop for CoarseTimestamps {
+    fn drop(&mut self) {
+        COARSE_STAMP.set(self.0);
+    }
+}
+
+/// Overwrite the open file without replacing its identity. Assert the
+/// collision itself so a fixture size change cannot silently fix the test.
+fn overwrite_colliding_generation(destination: &Path, replacement: &Path) {
+    let bytes = fs::read(replacement).unwrap();
+    let old = fs::read(destination).unwrap();
+    assert!(bytes != old);
+    assert_eq!(bytes.len(), old.len());
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .unwrap();
+    let before = SourceStamp::read(&file).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    assert!(SourceStamp::read(&file).unwrap() == before);
+}
+
 fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
     ProjectionPatch {
         route: None,
@@ -220,40 +250,223 @@ fn live_basis_matches_ledger_currency_and_cited_evidence_as_revisions_change() {
 }
 
 #[test]
-fn replaced_or_rewritten_transcript_never_reuses_the_old_projection_proof() {
+fn warmed_transcript_writer_chains_its_next_receipt_to_the_rewritten_file() {
+    let _clock = CoarseTimestamps::enable();
     let f = Fixture::new();
-    let mut old = f.seeded_patch();
-    f.projection.commit_after(&old, Some(1)).unwrap();
-    old.sequence = 2;
+    f.seeded_patch();
     let fork = Fixture::new();
     let changed = transcript_event("branch", "sand");
     fork.transcript.commit_after(&changed, None).unwrap();
-    // An external equal-height in-place rewrite, then a legitimate append.
-    fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
+    overwrite_colliding_generation(&f.transcript.path, &fork.transcript.path);
+    let next = transcript_event("stem", "reed");
+    let receipt = f.transcript.commit_after(&next, Some(1)).unwrap();
+    assert_eq!(receipt.sequence, 2);
+    let physical = read_committed::<TranscriptEvent>(&f.transcript.path, SESSION).unwrap();
+    assert_eq!(physical.records.len(), 2);
+    assert_eq!(physical.records[0].payload, changed);
+    assert_eq!(physical.records[1].payload, next);
+    assert_eq!(
+        physical.records[1].previous_hash,
+        physical.records[0].record_hash
+    );
+}
+
+#[test]
+fn warmed_group_planner_never_appends_to_a_superseded_prefix() {
+    let _clock = CoarseTimestamps::enable();
+    let f = Fixture::new();
+    f.seeded_patch();
+    let fork = Fixture::new();
+    let changed = transcript_event("branch", "sand");
+    fork.transcript.commit_after(&changed, None).unwrap();
+    overwrite_colliding_generation(&f.transcript.path, &fork.transcript.path);
+    let members = [
+        transcript_event("stem", "reed"),
+        transcript_event("twig", "fern"),
+    ];
+    match f.transcript.commit_group_after(&members, 1).unwrap() {
+        Some(receipts) => {
+            assert_eq!(
+                receipts.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+                [2, 3]
+            );
+        }
+        None => {
+            // Group preflight may hand off to singleton admission, but it
+            // must leave the fork exactly as it found it until handoff.
+            assert_eq!(
+                fs::read(&f.transcript.path).unwrap(),
+                fs::read(&fork.transcript.path).unwrap()
+            );
+            assert!(!f.transcript.path.with_added_extension("attempt").exists());
+            for (i, event) in members.iter().enumerate() {
+                assert_eq!(
+                    f.transcript
+                        .commit_after(event, Some(1 + i as u64))
+                        .unwrap()
+                        .sequence,
+                    2 + i as u64
+                );
+            }
+        }
+    }
+    let physical = read_committed::<TranscriptEvent>(&f.transcript.path, SESSION).unwrap();
+    assert_eq!(physical.records.len(), 3);
+    assert_eq!(physical.records[0].payload, changed);
+    for (pair, member) in physical.records.windows(2).zip(&members) {
+        assert_eq!(pair[1].previous_hash, pair[0].record_hash);
+        assert_eq!(&pair[1].payload, member);
+    }
+}
+
+#[test]
+fn head_frame_tracks_the_last_nonblank_record_and_its_preceding_delimiter() {
+    let f = Fixture::new();
+    let path = f.root.join("anchor");
+    let first = serde_json::to_vec(&transcript_event("reed", "wood")).unwrap();
+    assert!(HeadFrame::from_verified(&first, 0).is_none());
+    fs::write(&f.transcript.path, &first).unwrap();
     f.transcript
-        .commit_after(&transcript_event("stem", "reed"), None)
+        .commit_after(&transcript_event("twig", "fern"), Some(1))
         .unwrap();
+    let verified = fs::read(&f.transcript.path).unwrap();
+    assert_eq!(verified[first.len()], b'\n');
     assert_eq!(
-        f.projection.commit_after(&old, Some(1)),
-        Err(TranscriptCommitError::InvalidRevision)
-    );
-    // A replacement file with a shorter verified history invalidates the cursor too.
-    let moved = f.root.join("retired");
-    fs::rename(&f.transcript.path, &moved).unwrap();
-    fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
-    assert_eq!(
-        f.projection.commit_after(&old, Some(1)),
-        Err(TranscriptCommitError::InvalidRevision)
-    );
-    old.basis = ProjectionBasis::from_transcript_events(&[changed]);
-    assert_eq!(
-        f.projection
-            .commit_after(&old, Some(1))
+        read_committed::<TranscriptEvent>(&f.transcript.path, SESSION)
             .unwrap()
-            .head
-            .sequence,
+            .records
+            .len(),
         2
     );
+    for suffix in [b"".as_slice(), b"\n \t\r\n\n"] {
+        let mut content = verified.clone();
+        content.extend_from_slice(suffix);
+        fs::write(&path, &content).unwrap();
+        let check = |frame: &HeadFrame| frame.matches(&mut File::open(&path).unwrap()).unwrap();
+        let from_full_file = HeadFrame::from_verified(&content, 0).unwrap();
+        // The appended bytes carry the missing separator for an earlier
+        // unterminated legacy row. Both origins must bind the same head.
+        let from_append =
+            HeadFrame::from_verified(&content[first.len()..], first.len() as u64).unwrap();
+        assert!(check(&from_full_file) && check(&from_append));
+        let mut tampered = content.clone();
+        tampered[first.len()] = b' ';
+        fs::write(&path, tampered).unwrap();
+        assert!(!check(&from_full_file) && !check(&from_append));
+        let value = content.windows(4).position(|word| word == b"fern").unwrap();
+        content[value] = b't';
+        fs::write(&path, content).unwrap();
+        assert!(!check(&from_full_file) && !check(&from_append));
+    }
+}
+
+#[test]
+fn speaker_proofs_reject_a_colliding_rewrite_with_or_without_an_append() {
+    use crate::{
+        identity::tests::span,
+        persistence::speaker_log::{SpeakerWrite, append},
+        projections::SpeakerTimeline,
+    };
+    let _clock = CoarseTimestamps::enable();
+    for append_after_rewrite in [false, true] {
+        let f = Fixture::new();
+        let mut patch = f.seeded_patch();
+        let path = |fixture: &Fixture| {
+            fixture
+                .transcript
+                .path
+                .with_file_name(format!("{SESSION}.speaker.jsonl"))
+        };
+        let path_here = path(&f);
+        let fork = Fixture::new();
+        let fork_path = path(&fork);
+        let write = |path: &Path, revision| {
+            append(path, SESSION, SpeakerWrite::SpanRevision { revision }).unwrap()
+        };
+        let old = span("reed", "mic");
+        let changed = span("fern", "mic");
+        let tail = span("twig", "mic");
+        write(&path_here, &old);
+        patch.basis.diarization_span_revisions = SpeakerTimeline::replay(SESSION, [old.clone()])
+            .unwrap()
+            .current_basis_spans();
+        let candidate = f.projection.live_basis(&patch, 1).unwrap();
+        write(&fork_path, &changed);
+        overwrite_colliding_generation(&path_here, &fork_path);
+        let mut timeline = SpeakerTimeline::replay(SESSION, [changed.clone()]).unwrap();
+        if append_after_rewrite {
+            write(&path_here, &tail);
+            timeline.apply_event(tail.clone()).unwrap();
+        }
+        assert_eq!(
+            f.projection
+                .commit_at_lane(&patch, Some(1), &[], Some(0), Some(candidate.heads())),
+            Err(TranscriptCommitError::InvalidRevision)
+        );
+        assert!(!f.projection.path.exists());
+        patch.basis.diarization_span_revisions = timeline.current_basis_spans();
+        f.projection.commit_after(&patch, Some(1)).unwrap();
+        let projection =
+            read_committed_projection::<ProjectionPatch>(&f.projection.path, SESSION).unwrap();
+        let source = load_canonical_stream::<serde_json::Value>(
+            &path_here,
+            SESSION,
+            "speaker_revisions",
+            2,
+            CanonicalTailRecovery::Strict,
+        )
+        .unwrap();
+        let head = source.head.unwrap();
+        assert_eq!(head.sequence, if append_after_rewrite { 2 } else { 1 });
+        assert_eq!(
+            projection.records[0].basis_heads["speaker_revisions"].record_hash,
+            head.record_hash
+        );
+    }
+}
+
+#[test]
+fn replaced_or_rewritten_transcript_never_reuses_the_old_projection_proof() {
+    let _clock = CoarseTimestamps::enable();
+    for append_after_rewrite in [false, true] {
+        let f = Fixture::new();
+        let mut old = f.seeded_patch();
+        f.projection.commit_after(&old, Some(1)).unwrap();
+        old.sequence = 2;
+        let fork = Fixture::new();
+        let changed = transcript_event("branch", "sand");
+        fork.transcript.commit_after(&changed, None).unwrap();
+        overwrite_colliding_generation(&f.transcript.path, &fork.transcript.path);
+        if append_after_rewrite {
+            // A fresh writer appends against the actual fork. This tests the
+            // projection source cache independently of the warmed writer test.
+            PreparedTranscriptStorage::open(&f.transcript.path, SESSION)
+                .unwrap()
+                .commit_after(&transcript_event("stem", "reed"), Some(1))
+                .unwrap();
+        }
+        assert_eq!(
+            f.projection.commit_after(&old, Some(1)),
+            Err(TranscriptCommitError::InvalidRevision)
+        );
+        // A replacement file with a shorter verified history invalidates the cursor too.
+        let moved = f.root.join("retired");
+        fs::rename(&f.transcript.path, &moved).unwrap();
+        fs::copy(&fork.transcript.path, &f.transcript.path).unwrap();
+        assert_eq!(
+            f.projection.commit_after(&old, Some(1)),
+            Err(TranscriptCommitError::InvalidRevision)
+        );
+        old.basis = ProjectionBasis::from_transcript_events(&[changed]);
+        assert_eq!(
+            f.projection
+                .commit_after(&old, Some(1))
+                .unwrap()
+                .head
+                .sequence,
+            2
+        );
+    }
 }
 
 #[test]

@@ -255,26 +255,87 @@ impl SourceStamp {
         };
         #[cfg(not(any(unix, windows)))]
         let change_time = None;
+        let modified = metadata.modified()?;
+        #[cfg(test)]
+        let (modified, change_time) = if COARSE_STAMP.get() {
+            (std::time::UNIX_EPOCH, Some(0))
+        } else {
+            (modified, change_time)
+        };
         Ok(Self {
             change_time,
             identity: super::super::canonical_durability::handle_identity(file, &metadata)?,
             length: metadata.len(),
-            modified: metadata.modified()?,
+            modified,
         })
     }
 }
 
 #[cfg(test)]
+thread_local! { static COARSE_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
 thread_local! { static PREFIX_SCANS: std::cell::Cell<u64> = const {std::cell::Cell::new(0)}; }
 
 struct VerifiedPrefix {
     stamp: Option<SourceStamp>,
+    head_frame: Option<HeadFrame>,
     stream: CachedStreamState,
     revisions: HashMap<String, u64>,
     bases: HashMap<String, CanonicalBasisHeadVector>,
     // Physical frame -> previous logical sequence in that projection lane.
     // A late retry cannot fast-forward the materializer past intervening rows.
     projection_predecessors: HashMap<u64, u64>,
+}
+
+/// Fingerprint the physical head line, including its terminator and any
+/// trailing blank lines. A timestamp collision cannot certify these bytes.
+struct HeadFrame {
+    offset: u64,
+    length: usize,
+    hash: [u8; 32],
+}
+
+impl HeadFrame {
+    fn from_verified(bytes: &[u8], base: u64) -> Option<Self> {
+        let start = bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .and_then(|end| bytes[..end].iter().rposition(|&b| b == b'\n'))
+            .map_or(0, |newline| newline + 1);
+        let tail = &bytes[start..];
+        // A legacy JSONL head does not carry the hash of its preceding record.
+        if !tail.is_empty() && !tail.starts_with(FRAME_PREFIX_V1) {
+            return None;
+        }
+        // Oversized legacy rows or trailing padding remain readable via full verification.
+        let limit = MAX_FRAME_JSON_BYTES + FRAME_PREFIX_V1.len() + FRAME_LENGTH_HEX_BYTES + 3;
+        (tail.len() <= limit).then(|| Self {
+            offset: base + start as u64,
+            length: tail.len(),
+            hash: Sha256::digest(tail).into(),
+        })
+    }
+
+    fn matches(&self, file: &mut File) -> io::Result<bool> {
+        let delimiter = usize::from(self.offset != 0);
+        file.seek(SeekFrom::Start(self.offset - delimiter as u64))?;
+        let mut bytes = vec![0; self.length + delimiter];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => Ok((delimiter == 0 || bytes[0] == b'\n')
+                && <[u8; 32]>::from(Sha256::digest(&bytes[delimiter..])) == self.hash),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl VerifiedPrefix {
+    fn matches(&self, file: &mut File, stamp: Option<&SourceStamp>) -> io::Result<bool> {
+        match (&self.stamp, &self.head_frame) {
+            (Some(cached), Some(frame)) if Some(cached) == stamp => frame.matches(file),
+            _ => Ok(false),
+        }
+    }
 }
 enum TranscriptGuard<'a> {
     Qualified(
@@ -643,13 +704,16 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
         let stamp = source
             .as_ref()
             .and_then(|file| SourceStamp::read(file).ok());
-        let reusable = stamp.is_some()
-            && verified
-                .as_ref()
-                .is_some_and(|cached| cached.stamp == stamp);
+        let reusable = match (verified.as_ref(), source.as_mut()) {
+            (Some(cached), Some(file)) => cached
+                .matches(file, stamp.as_ref())
+                .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?,
+            _ => false,
+        };
         let mut bytes = Vec::new();
         if !reusable && let Some(file) = &mut source {
-            file.read_to_end(&mut bytes)
+            file.rewind()
+                .and_then(|()| file.read_to_end(&mut bytes))
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?;
         }
         if !reusable {
@@ -671,6 +735,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             })?;
             *verified = Some(VerifiedPrefix {
                 stamp,
+                head_frame: HeadFrame::from_verified(&bytes, 0),
                 stream,
                 revisions,
                 bases,
@@ -831,6 +896,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             return Err(error);
         }
         lease.pending = None;
+        prefix.head_frame = HeadFrame::from_verified(&frame.frame, frame.base_byte_len);
         cache.byte_len = frame.base_byte_len + frame.frame.len() as u64;
         cache.ends_with_newline = true;
         cache.head = Some(CanonicalStreamHead {

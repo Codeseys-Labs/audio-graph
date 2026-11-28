@@ -46,6 +46,7 @@ fn published_head(path: &Path, stamp: &SourceStamp) -> Option<CanonicalStreamHea
 
 struct SourceRows<T> {
     stamp: Option<SourceStamp>,
+    head_frame: Option<HeadFrame>,
     rows: Vec<CanonicalRecord<T>>,
     ids: HashSet<String>,
     #[cfg(test)]
@@ -57,6 +58,7 @@ impl<T> Default for SourceRows<T> {
     fn default() -> Self {
         Self {
             stamp: None,
+            head_frame: None,
             rows: vec![],
             ids: HashSet::new(),
             #[cfg(test)]
@@ -83,6 +85,7 @@ impl<T: DeserializeOwned> SourceRows<T> {
         self.ids = rows.iter().map(|r| r.event_id.clone()).collect();
         self.rows = rows;
         self.stamp = stamp;
+        self.head_frame = None;
     }
 
     /// The caller took a shared lock and ruled out an attempt. Read through
@@ -97,10 +100,8 @@ impl<T: DeserializeOwned> SourceRows<T> {
         mut file: File,
         stamp: SourceStamp,
     ) -> Result<Option<bool>, Error> {
-        if stamp.change_time.is_some() && self.stamp.as_ref() == Some(&stamp) {
-            return Ok(Some(false));
-        }
-        let append = self
+        let unchanged = stamp.change_time.is_some() && self.stamp.as_ref() == Some(&stamp);
+        let mut append = self
             .stamp
             .as_ref()
             .filter(|prev| {
@@ -109,6 +110,20 @@ impl<T: DeserializeOwned> SourceRows<T> {
                     && prev.length < stamp.length
             })
             .and_then(|prev| Some((prev.length, published_head(path, &stamp)?)));
+        if unchanged || append.is_some() {
+            let matches = match &self.head_frame {
+                Some(frame) => frame
+                    .matches(&mut file)
+                    .map_err(|_| Error::InvalidHistory)?,
+                None => false,
+            };
+            if matches && unchanged {
+                return Ok(Some(false));
+            }
+            if !matches {
+                append = None;
+            }
+        }
         let start = append.as_ref().map_or(0, |(offset, _)| *offset);
         file.seek(SeekFrom::Start(start))
             .map_err(|_| Error::InvalidHistory)?;
@@ -166,12 +181,14 @@ impl<T: DeserializeOwned> SourceRows<T> {
             }
             self.rows.extend(parsed.records);
             self.stamp = Some(stamp);
+            self.head_frame = HeadFrame::from_verified(&bytes, start);
             Ok(Some(false))
         } else {
             self.replace(
                 parsed.ok_or(Error::InvalidHistory)?.records,
                 (!has_speaker_tail).then_some(stamp),
             );
+            self.head_frame = HeadFrame::from_verified(&bytes, start);
             Ok(Some(true))
         }
     }

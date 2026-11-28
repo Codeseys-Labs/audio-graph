@@ -171,7 +171,11 @@ impl Commit<'_> {
             }) => return Ok(None),
             Err(error) => return Err(TranscriptCommitError::Rejected(error)),
         };
-        if SourceStamp::read(&file).ok() != prefix.stamp {
+        let stamp = SourceStamp::read(&file).ok();
+        if !prefix
+            .matches(&mut file, stamp.as_ref())
+            .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
+        {
             return Ok(None);
         }
         let Some(plan) = self.plan_group(events, prefix)? else {
@@ -214,6 +218,7 @@ impl Commit<'_> {
             return Err(error);
         }
         lease.pending = None;
+        prefix.head_frame = HeadFrame::from_verified(&plan.bytes, intent.base_len);
         for (frame, event) in plan.frames.into_iter().zip(events) {
             prefix.stream.head = Some(CanonicalStreamHead {
                 sequence: frame.sequence,
