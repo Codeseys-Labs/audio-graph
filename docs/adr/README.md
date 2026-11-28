@@ -25,7 +25,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0016] | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally | accepted | 2026-06-29 "two channels only" clause amended by ADR-0047 (third channel: `.ag-*` recipes) | 2026-05-29 |
 | [0017] | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering | accepted | Engine, worker, downloads, and pipeline wiring landed; multi-speaker accuracy gate pending | 2026-05-30 |
 | [0018] | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC | accepted | Supersedes interim echo guard `172edbf` | 2026-05-30 |
-| [0019] | Credential And Config Storage Migration | proposed | — | 2026-06-25 |
+| [0019] | Credential And Config Storage Migration | proposed | Credential v2 runtime, fallback, and migration narrowed by ADR-0052; `ConfigCodec` unchanged | 2026-06-25 |
 | [0020] | Adopt a Source-Aware Processed PCM Contract | accepted | — | 2026-07-09 |
 | [0021] | Storage Architecture — File-Canonical Event Logs, DB Gated on Evidence | superseded | Superseded by ADR-0027 | 2026-06-27 |
 | [0022] | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; symphonia Only at the Fixture/Import Edge | accepted | symphonia adoption gated on first import consumer; relates to ADR-0020, ADR-0004, ADR-0007 | 2026-06-28 |
@@ -58,6 +58,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 | [0049] | Route System-One Decisions Through a Named Decision Route Table | accepted | Sits beside ADR-0038 (mirrors its no-walker discipline); extends ADR-0033/0034 to `decision.*` producers (local shadow vs Cloud admission); feeds ADR-0037's judge and ADR-0050 batch records; M1/M2 shadow landed in PR #112 (`audio-graph-0ac0`); authority deferred to #328; ratified 2026-11-27 (epic #133, seed `audio-graph-8b3e`) | 2026-11-27 |
 | [0050] | Bind Speaker Identity Lazily Through `speaker_revisions` v2 Relabel Batches | accepted | Implements `docs/designs/lazy-speaker-identification.md`; refines ADR-0043 without advancing ADR-0041/0042 Session floor; embeds ADR-0049 `DecisionRecord`s at batch level; seed `audio-graph-c32b` | 2026-11-26 |
 | [0051] | Screen Snapshots Evidence Storage, v1 Basis Isolation, and Offline OCR Baseline | proposed | Phase 0 contract for `docs/designs/conversation-aware-screen-snapshots.md`; preserves golden v1 hashes; selects Tesseract 5 + `tessdata_fast` Apache-2.0 baseline; seed `audio-graph-40ad` / `058f` | 2026-11-26 |
+| [0052] | Serialize Credential v2 Operations on One Backend Worker | accepted | Narrows ADR-0019 for v2; dormant core only (#149, #156), Tauri composition tracked in #157 | 2026-11-27 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -110,6 +111,7 @@ after acceptance — to change one, write a new ADR that supersedes it.
 [0049]: 0049-decision-route-layer.md
 [0050]: 0050-lazy-speaker-identity-relabels.md
 [0051]: 0051-screen-snapshots-evidence-and-ocr-contract.md
+[0052]: 0052-credential-runtime-worker-and-v2-cutover.md
 
 > **ADR-0043 lineage warning:** The immutable restored ADR was authored in a
 > non-ancestor canonical-log lineage. Its internal ADR-0035 and ADR-0036

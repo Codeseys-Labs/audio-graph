@@ -1,0 +1,87 @@
+---
+status: accepted
+date: 2026-11-27
+deciders: [AudioGraph maintainers]
+---
+
+# ADR-0052: Serialize Credential v2 Operations on One Backend Worker
+
+## Context and Problem Statement
+
+Credential storage and provider use belong to Rust, but native store calls can
+block longer than a UI deadline and cannot reliably be cancelled. A replacement
+that times out may still commit. Releasing admission at the deadline would let
+another operation overtake the first; querying the store for passive status
+could block or prompt. A panic caught after the global hook runs can still leak
+private data unless the worker marks the redaction boundary before dispatch.
+
+[ADR-0019](0019-credential-and-config-storage.md) established the settings and
+credential split. This record narrows its credential runtime, fallback, and
+migration decisions for v2 only. The proposed `ConfigCodec` is unchanged.
+
+## Decision Drivers
+
+- Passive status never touches disk, the native store, or a prompt path.
+- A caller deadline does not weaken revision checks or change write ordering.
+- Unknown commits, store failures, and missing credentials are distinct.
+- Saved secret values, private locators, and native diagnostics never cross the
+  UI or diagnostic boundary.
+- The backend can land and be verified independently of Tauri composition.
+
+## Considered Options
+
+- **Execute directly on the async executor.** A blocking store can occupy an
+  executor thread; a dropped future does not make the native call cancellable.
+- **Use a blocking-pool job per request.** This still needs separate admission,
+  cache reconciliation, and event ordering; a post-timeout job can outlive its
+  caller and must not race a successor.
+- **Use a dedicated worker and a cached status projection.** One owner keeps
+  store access, cache publication, and event delivery in the same order.
+
+## Decision Outcome
+
+Use one backend-owned `CredentialRuntime`. Dormant construction performs no
+I/O and starts no thread. Configuration installs the backend and sink and
+starts one named `std::thread` with a bounded request channel; it does not open
+an authority. The worker alone runs the synchronous service and its store
+operations. Production operation IDs and revisions are opaque UUID v4 tokens,
+not counters or fingerprints.
+
+Expose `dormant`, `opening`, `uninitialized`, `ready`, `recovery_required`,
+`unavailable`, and `stalled` from a cached, content-free projection. Status
+never enqueues work. Ordinary operations must not prompt. Explicit diagnosis
+or unlock is the only interactive path; successful recovery is followed by a
+noninteractive reopen. A recovery-required or unavailable authority does not
+fall back to v1 or to a plaintext store.
+
+Atomic admission allows one live operation, not a backlog of mutations. An
+async deadline limits only the caller's wait: it neither cancels nor retries
+the worker call, and it does not release admission. The worker reconciles a
+late definite commit into the cache and emits its one content-free event before
+releasing admission. An unverified commit is not success and emits no commit
+event. An unhandled dispatch panic latches a terminal stall; dispatch enters
+the crash handler's credential redaction scope before `catch_unwind` so the
+panic hook sees the same boundary as the caller.
+
+## Cutover and Consequences
+
+- [#149](https://github.com/Codeseys-Labs/audio-graph/issues/149) and
+  [#156](https://github.com/Codeseys-Labs/audio-graph/issues/156) land the
+  dormant core and crate-private declarations, ported from reviewed commit
+  `8fd7132` onto `d325001` with the existing IPC contract and redacted panic
+  hook. They do not select a platform backend or change live v1 behavior.
+- Dark Tauri composition is tracked in
+  [#157](https://github.com/Codeseys-Labs/audio-graph/issues/157). The consumer
+  cutover and rollback proof in
+  [#209](https://github.com/Codeseys-Labs/audio-graph/issues/209) are separate.
+  Backend consumers obtain scoped zeroizing leases; IPC exposes typed status
+  and receipts, not saved secret readback or renderer-selected audiences.
+- V2 migration is explicit. Legacy YAML is import-only: no live override,
+  automatic fallback, or v1 dual-write. Verify exact native readback before
+  legacy cleanup, keep tombstones authoritative, and gate v1 retirement on
+  migration, rollback, and packaged platform evidence. Optional file-v2 is a
+  separate decision, not a prerequisite for native rollout.
+- A wedged native call leaves the runtime stalled rather than pretending it
+  can safely proceed. Deterministic delayed-call and panic-canary tests prove
+  the worker contract; they do not prove native prompt, durability, migration,
+  or packaged behavior on any platform.
