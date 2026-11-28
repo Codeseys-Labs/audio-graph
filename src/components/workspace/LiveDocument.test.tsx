@@ -110,6 +110,7 @@ describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
     useAudioGraphStore.setState({
       materializedNotes: null,
       isCapturing: false,
+      captureStarting: false,
     });
   });
 
@@ -130,6 +131,15 @@ describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
     expect(screen.getByTestId("document-skeleton")).toBeInTheDocument();
     expect(screen.queryByTestId("document-empty")).not.toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Building notes");
+  });
+
+  it("offers no sample preview while a capture is starting", () => {
+    useAudioGraphStore.setState({ captureStarting: true });
+    render(<DocumentTileHarness />);
+    expect(screen.getByTestId("document-skeleton")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Preview sample session" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders legacy-mode notes as flat bullets, in order, with the title as a bold lead", () => {

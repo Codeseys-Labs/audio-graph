@@ -407,7 +407,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
 
     // Acknowledged: Capture would mount with none of A's data resident.
     await act(async () => {
-      startAck.resolve(null);
+      startAck.resolve({ generation: 1, sources: ["system-default"] });
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),

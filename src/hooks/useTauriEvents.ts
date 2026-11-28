@@ -430,7 +430,11 @@ export function useTauriEvents(): void {
           addOrUpdateSpeaker(event.payload);
         }),
         safeListen<CaptureErrorPayload>(CAPTURE_ERROR, (event) => {
-          console.error("Capture error:", event.payload);
+          // The payload's source id can carry an application name: log only
+          // the closed recoverability flag.
+          console.error("Capture error", {
+            recoverable: event.payload.recoverable,
+          });
           setError(event.payload.error);
         }),
         safeListen<CaptureBackpressurePayload>(

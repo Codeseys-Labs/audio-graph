@@ -308,7 +308,11 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     await listSourcesMock.mockReturnValue([MOCK_SOURCE]);
 
     const startMock = await browser.tauri.mock("start_capture");
-    await startMock.mockResolvedValueOnce(null);
+    // A real acknowledgement: the store treats a missing one as a failure.
+    await startMock.mockResolvedValueOnce({
+      generation: 1,
+      sources: [MOCK_SOURCE.id],
+    });
     await startMock.mockRejectedValueOnce(
       new Error("e2e-mocked-capture-failure"),
     );

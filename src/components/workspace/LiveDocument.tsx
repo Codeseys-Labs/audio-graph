@@ -540,6 +540,7 @@ function DocChangeAnchor({
 export function LiveDocument({ vm }: { vm: LiveDocumentVM }) {
   const { t, i18n } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  const captureStarting = useAudioGraphStore((s) => s.captureStarting);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
   );
@@ -724,11 +725,12 @@ export function LiveDocument({ vm }: { vm: LiveDocumentVM }) {
   };
 
   if (vm.sections.length === 0) {
-    // design-a §1.7 row 2: while actively capturing and nothing has landed
-    // yet, show three aria-hidden skeleton rows plus an sr-only "building"
-    // announcement — NOT a spinner, and not the "nothing started yet" hero
-    // below (which would otherwise falsely suggest capture hasn't begun).
-    if (isCapturing) {
+    // design-a §1.7 row 2: while actively capturing (or starting to) and
+    // nothing has landed yet, show three aria-hidden skeleton rows plus an
+    // sr-only "building" announcement — NOT a spinner, and not the "nothing
+    // started yet" hero below, whose sample preview would land in the store
+    // the capture is opening into.
+    if (isCapturing || captureStarting) {
       return (
         <div
           className="flex flex-col gap-(--space-3) py-(--space-4) px-(--space-5)"

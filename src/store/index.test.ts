@@ -1178,6 +1178,9 @@ describe("AudioGraphStore", () => {
     });
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === "load_session") return pendingHistorical;
+      if (command === "start_capture") {
+        return { generation: 1, sources: ["system-default"] };
+      }
       return undefined;
     });
     useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
@@ -3611,6 +3614,111 @@ describe("AudioGraphStore", () => {
     expect(state.transcriptSegments).toEqual([]);
   });
 
+  it("keeps a capture that ended before its acknowledgement arrived stopped", async () => {
+    let acknowledge: (ack: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_capture") {
+        return new Promise((resolve) => {
+          acknowledge = resolve;
+        });
+      }
+      return undefined;
+    });
+    useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
+    const running = useAudioGraphStore.getState().pipelineStatus;
+
+    const start = useAudioGraphStore.getState().startCapture();
+    // The start's Running event, then its source's fatal reconciliation,
+    // both land before the start's own response.
+    useAudioGraphStore.getState().setPipelineStatus({
+      ...running,
+      capture: { type: "Running", processed_count: 0 },
+    });
+    useAudioGraphStore.getState().setPipelineStatus({
+      ...running,
+      capture: { type: "Idle" },
+    });
+    acknowledge({ generation: 4, sources: ["system-default"] });
+    await start;
+
+    const state = useAudioGraphStore.getState();
+    expect(state.pipelineStatus.capture.type).toBe("Idle");
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureStarting).toBe(false);
+    expect(state.captureSourceIds).toEqual([]);
+  });
+
+  it("treats a missing or malformed acknowledgement as a failed start", async () => {
+    for (const reply of [
+      null,
+      undefined,
+      { generation: 1, sources: [] },
+      { sources: ["system-default"] },
+    ]) {
+      vi.mocked(invoke).mockImplementation(async (cmd) =>
+        cmd === "start_capture" ? reply : undefined,
+      );
+      useAudioGraphStore.setState({
+        selectedSourceIds: ["system-default"],
+        isCapturing: false,
+        error: null,
+      });
+
+      await useAudioGraphStore.getState().startCapture();
+
+      const state = useAudioGraphStore.getState();
+      expect(state.isCapturing, JSON.stringify(reply)).toBe(false);
+      expect(state.captureStarting).toBe(false);
+      expect(state.error).toBe(
+        i18n.t("errors.captureStart.backend_unavailable"),
+      );
+    }
+  });
+
+  it("locks the sample preview and the selection while a start is pending, and stops it by canonical id", async () => {
+    let acknowledge: (ack: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_capture") {
+        return new Promise((resolve) => {
+          acknowledge = resolve;
+        });
+      }
+      return undefined;
+    });
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["mic-row"],
+      audioSources: [
+        {
+          id: "mic-row",
+          name: "Desk Mic",
+          source_type: { type: "Device", device_id: "mic" },
+          capture_target: "device:mic",
+          is_active: false,
+        },
+      ],
+    });
+
+    const start = useAudioGraphStore.getState().startCapture();
+    useAudioGraphStore.getState().loadSampleSessionPreview("en");
+    expect(useAudioGraphStore.getState().samplePreviewActive).toBe(false);
+    useAudioGraphStore.getState().toggleSourceId("mic-row");
+    expect(useAudioGraphStore.getState().selectedSourceIds).toEqual([
+      "mic-row",
+    ]);
+
+    // A Stop before the acknowledgement names what the backend registers.
+    await useAudioGraphStore.getState().stopCapture();
+    expect(invoke).toHaveBeenCalledWith("stop_capture", {
+      sourceId: "device:mic",
+    });
+    expect(invoke).not.toHaveBeenCalledWith("stop_capture", {
+      sourceId: "mic-row",
+    });
+
+    acknowledge({ generation: 1, sources: ["device:mic"] });
+    await start;
+  });
+
   it("passes the selected backend source descriptor when starting capture", async () => {
     const source: AudioSourceInfo = {
       id: "opaque-rsac-row",
@@ -5740,11 +5848,19 @@ describe("openSessionsBrowser — SHELL-R2 navigates instead of opening a modal"
 // registry's one `ui_selectable: false` ASR descriptor, so it is the
 // faithful "no route configured" fixture, not a synthetic stand-in.
 // ---------------------------------------------------------------------------
+/** `start_capture`'s acknowledgement for the single `system-default` source. */
+const SYSTEM_DEFAULT_CAPTURE_ACK = {
+  generation: 1,
+  sources: ["system-default"],
+};
+
 describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () => {
   beforeEach(() => {
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default"],
       isCapturing: false,
+      captureStarting: false,
+      captureSourceIds: [],
       isTranscribing: false,
       error: null,
     });
@@ -5754,7 +5870,7 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
     const invoked: string[] = [];
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return null;
+      if (cmd === "start_capture") return SYSTEM_DEFAULT_CAPTURE_ACK;
       return undefined;
     });
     useAudioGraphStore.setState({
@@ -5788,7 +5904,7 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
     const invoked: string[] = [];
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return null;
+      if (cmd === "start_capture") return SYSTEM_DEFAULT_CAPTURE_ACK;
       if (cmd === "start_transcribe") return null;
       return undefined;
     });
@@ -5805,7 +5921,7 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
     const invoked: string[] = [];
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return null;
+      if (cmd === "start_capture") return SYSTEM_DEFAULT_CAPTURE_ACK;
       return undefined;
     });
     // Reachable pre-hydration window: App's credential probe can resolve

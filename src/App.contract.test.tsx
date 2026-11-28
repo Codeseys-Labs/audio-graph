@@ -185,7 +185,9 @@ function installInvokeMocks() {
         return [];
       case "start_capture":
         startCaptureCalls += 1;
-        if (startCaptureCalls === 1) return null;
+        if (startCaptureCalls === 1) {
+          return { generation: 1, sources: [MOCK_SOURCE.id] };
+        }
         throw new Error("e2e-mocked-capture-failure");
       case "stop_capture":
         return null;

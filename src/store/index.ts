@@ -120,6 +120,7 @@ import type {
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import {
   artifactTooLargeDetails,
+  captureStartFailureMessage,
   errorToMessage,
   isAppErrorPayload,
   notifyCredentialWarning,
@@ -1876,6 +1877,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   setAudioSources: (sources) => set({ audioSources: sources }),
   toggleSourceId: (id) =>
     set((state) => {
+      // The selection a pending start resolved must not change under it.
+      if (state.captureStarting) return {};
       const idx = state.selectedSourceIds.indexOf(id);
       if (idx >= 0) {
         return {
@@ -2658,8 +2661,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       autoAnswerAttemptedProposalIds: new Set<string>(),
     }));
   },
-  loadSampleSessionPreview: (language?: string) =>
-    set(sampleSessionPreviewState(language)),
+  loadSampleSessionPreview: (language?: string) => {
+    // Capture owns the store from Start onwards: the sample must not land in
+    // the store a starting or running capture opens into.
+    if (liveCaptureHoldsStore(get())) return;
+    set(sampleSessionPreviewState(language));
+  },
   loadSessionTimeline: async (sessionId: string) => {
     set({ sessionTimelineLoading: true });
     // Stale-async guard: if the user loads session B while session A's fold is
@@ -2917,7 +2924,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     entity_extraction: idleStage,
     graph: idleStage,
   },
-  setPipelineStatus: (status) =>
+  setPipelineStatus: (status) => {
+    if (pendingCaptureStart) {
+      if (status.capture.type === "Running") {
+        pendingCaptureStart.runningSeen = true;
+      } else if (
+        status.capture.type === "Idle" &&
+        pendingCaptureStart.runningSeen
+      ) {
+        pendingCaptureStart.ended = true;
+      }
+    }
     set((state) => {
       const captureRunning =
         status.capture.type === "Running"
@@ -2939,7 +2956,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           ? (state.captureStartTime ?? Date.now())
           : null,
       };
-    }),
+    });
+  },
   pipelineLatencies: {},
   setPipelineLatency: (sample: PipelineLatencyEvent) =>
     set((state) => ({
@@ -3079,26 +3097,51 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       if (source.capture_target)
         sourcesBySelectionId.set(source.capture_target, source);
     }
-    const sources = selectedSourceIds.map((sourceId) => {
-      const source = sourcesBySelectionId.get(sourceId);
-      return source ? { sourceId, source } : { sourceId };
+    const sources: { sourceId: string; source?: AudioSourceInfo }[] =
+      selectedSourceIds.map((sourceId) => {
+        const source = sourcesBySelectionId.get(sourceId);
+        return source ? { sourceId, source } : { sourceId };
+      });
+    const watch = { runningSeen: false, ended: false };
+    pendingCaptureStart = watch;
+    // The ids the backend resolves them to, so a Stop before the
+    // acknowledgement names what the backend owns, not a selection alias.
+    set({
+      captureSourceIds: sources.map(
+        (entry) => entry.source?.capture_target ?? entry.sourceId,
+      ),
     });
     try {
       // One aggregate start: the backend acknowledges every source or rolls
       // all of them back, so there is nothing to undo here on failure.
-      const ack = await invoke<CaptureStartAck | null>("start_capture", {
-        sources,
-      });
+      const ack = await invoke<unknown>("start_capture", { sources });
+      if (pendingCaptureStart === watch) pendingCaptureStart = null;
+      if (!isCaptureStartAck(ack, sources.length)) {
+        set({
+          captureStarting: false,
+          captureSourceIds: [],
+          error: captureStartFailureMessage(undefined),
+        });
+        return;
+      }
+      if (watch.ended) {
+        // Running and then Idle already arrived: the capture ended before
+        // its acknowledgement did.
+        set({ captureStarting: false, captureSourceIds: [] });
+        return;
+      }
       set({
         captureStarting: false,
         isCapturing: true,
-        captureSourceIds: ack?.sources ?? selectedSourceIds,
+        captureSourceIds: ack.sources,
         captureStartTime: Date.now(),
         error: null,
       });
     } catch (e) {
+      if (pendingCaptureStart === watch) pendingCaptureStart = null;
       set({
         captureStarting: false,
+        captureSourceIds: [],
         error: captureStartErrorMessage(e, (index) => {
           const id = selectedSourceIds[index];
           return id === undefined ? undefined : sourcesBySelectionId.get(id);
